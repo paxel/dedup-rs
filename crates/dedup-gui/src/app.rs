@@ -1,6 +1,7 @@
-//! The eframe application: a tabbed LCARS shell whose Repository Management tab
-//! is fully wired to the core store and background update worker. The Duplicate
-//! and File tabs are placeholders for Phases 6 and 7.
+//! The eframe application: a tabbed LCARS shell (Repository / Duplicate / File
+//! management) wired to the core store and a background update worker. This
+//! module owns the Repository Management tab and delegates the other two to
+//! [`crate::dupes_view`] and [`crate::files_view`].
 
 use crate::dupes_view::DupesView;
 use crate::files_view::FilesView;
@@ -12,6 +13,7 @@ use dedup_core::store::{RepoStats, Store};
 use dedup_core::update::{CancellationToken, ProgressEvent, update_repo};
 use egui::{Align, Color32, Id, Layout, RichText};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -70,6 +72,9 @@ enum Action {
     },
     CommitDelete(String),
     CancelEdit,
+    OpenAdd,
+    CloseAdd,
+    ChooseFolder,
     Create,
 }
 
@@ -79,9 +84,13 @@ pub struct DedupApp {
     repos: Vec<RepoRow>,
     load_error: Option<String>,
 
+    show_add: bool,
     new_name: String,
     new_path: String,
     form_error: Option<String>,
+    /// Native folder-picker results delivered from a background thread.
+    folder_tx: Sender<PathBuf>,
+    folder_rx: Receiver<PathBuf>,
     edit: Option<Edit>,
 
     show_settings: bool,
@@ -98,14 +107,18 @@ pub struct DedupApp {
 impl DedupApp {
     pub fn new(store: Arc<Store>) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
+        let (folder_tx, folder_rx) = crossbeam_channel::unbounded();
         let mut app = Self {
             store,
             tab: Tab::Repositories,
             repos: Vec::new(),
             load_error: None,
+            show_add: false,
             new_name: String::new(),
             new_path: String::new(),
             form_error: None,
+            folder_tx,
+            folder_rx,
             edit: None,
             show_settings: false,
             threads: 0,
@@ -250,17 +263,42 @@ impl DedupApp {
                 }
                 self.reload_all();
             }
+            Action::OpenAdd => {
+                self.show_add = true;
+                self.new_name.clear();
+                self.new_path.clear();
+                self.form_error = None;
+            }
+            Action::CloseAdd => {
+                self.show_add = false;
+                self.form_error = None;
+            }
+            Action::ChooseFolder => {
+                let tx = self.folder_tx.clone();
+                let repaint = ctx.clone();
+                std::thread::spawn(move || {
+                    if let Some(dir) = rfd::FileDialog::new()
+                        .set_title("Choose a folder")
+                        .pick_folder()
+                    {
+                        let _ = tx.send(dir);
+                        repaint.request_repaint();
+                    }
+                });
+            }
             Action::Create => {
-                let name = self.new_name.trim().to_string();
                 let path = self.new_path.trim().to_string();
+                // Default the name to the folder's own name when left blank.
+                let name = effective_name(&self.new_name, &self.new_path);
                 if name.is_empty() || path.is_empty() {
-                    self.form_error = Some("Name and path are required.".into());
+                    self.form_error = Some("A folder is required.".into());
                 } else if let Err(e) = self.store.create_repo(&name, &path) {
                     self.form_error = Some(e.to_string());
                 } else {
                     self.new_name.clear();
                     self.new_path.clear();
                     self.form_error = None;
+                    self.show_add = false;
                     self.reload_all();
                 }
             }
@@ -290,6 +328,18 @@ impl eframe::App for DedupApp {
             }
         }
 
+        // Folder-picker results: fill the path and auto-name from the last path
+        // component unless the user already typed a name.
+        while let Ok(dir) = self.folder_rx.try_recv() {
+            if self.new_name.trim().is_empty()
+                && let Some(base) = dir.file_name()
+            {
+                self.new_name = base.to_string_lossy().into_owned();
+            }
+            self.new_path = dir.to_string_lossy().into_owned();
+            ctx.request_repaint();
+        }
+
         let mut actions: Vec<Action> = Vec::new();
         self.top_bar(ui);
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
@@ -299,6 +349,9 @@ impl eframe::App for DedupApp {
         });
         if self.show_settings {
             self.settings_modal(&ctx);
+        }
+        if self.show_add {
+            self.add_modal(&ctx, &mut actions);
         }
         for action in actions {
             self.apply(&ctx, action);
@@ -371,19 +424,36 @@ impl DedupApp {
             ui.colored_label(theme::RED, err);
         }
 
+        // The registry is locked while any repo is updating, so adding a repo
+        // (which reads every repo's stats) must wait until scans finish.
+        let busy = self.worker.active_count() > 0;
+        ui.horizontal(|ui| {
+            let add = egui::Button::new(RichText::new("＋ ADD REPOSITORY").color(theme::BLACK))
+                .fill(theme::BLUE);
+            if ui.add_enabled(!busy, add).clicked() {
+                actions.push(Action::OpenAdd);
+            }
+            if busy {
+                ui.label(
+                    RichText::new("· busy: a scan is running")
+                        .color(theme::TAN)
+                        .size(12.0),
+                );
+            }
+        });
+        ui.add_space(4.0);
+
         let rows = self.repos.clone();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if rows.is_empty() {
                     ui.add_space(8.0);
-                    ui.colored_label(theme::TEXT, "No repositories yet. Add one below to begin.");
+                    ui.colored_label(theme::TEXT, "No repositories yet. Press ＋ ADD REPOSITORY.");
                 }
                 for row in &rows {
                     self.repo_card(ui, row, actions);
                 }
-                ui.add_space(12.0);
-                self.add_form(ui, actions);
             });
     }
 
@@ -567,42 +637,79 @@ impl DedupApp {
         });
     }
 
-    fn add_form(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        egui::Frame::new()
-            .fill(theme::PANEL)
-            .corner_radius(theme::PILL)
-            .inner_margin(12.0)
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new("＋ ADD REPOSITORY")
-                        .color(theme::BLUE)
-                        .strong(),
-                );
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("NAME").color(theme::TEXT).size(12.0));
-                    ui.text_edit_singleline(&mut self.new_name);
-                });
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("PATH").color(theme::TEXT).size(12.0));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.new_path)
-                            .desired_width(360.0)
-                            .hint_text("/absolute/or/relative/path"),
-                    );
-                });
-                if let Some(err) = &self.form_error {
-                    ui.colored_label(theme::RED, err);
-                }
+    fn add_modal(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let busy = self.worker.active_count() > 0;
+        // Effective name = what Create would use (typed name, or the folder's
+        // own name when blank). Adding is blocked if it clashes with an existing
+        // repo, so the user sees the problem before submitting.
+        let effective = effective_name(&self.new_name, &self.new_path);
+        let clashes = !effective.is_empty() && self.repos.iter().any(|r| r.name == effective);
+        let has_path = !self.new_path.trim().is_empty();
+        let can_add = !busy && has_path && !effective.is_empty() && !clashes;
+
+        let response = egui::Modal::new(Id::new("add-repo")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.label(
+                RichText::new("ADD REPOSITORY")
+                    .color(theme::AMBER)
+                    .size(18.0)
+                    .strong(),
+            );
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("FOLDER").color(theme::TEXT).size(12.0));
                 if ui
-                    .add(
-                        egui::Button::new(RichText::new("ADD").color(theme::BLACK))
-                            .fill(theme::BLUE),
-                    )
+                    .button(RichText::new("📁 CHOOSE…").color(theme::BLACK))
                     .clicked()
                 {
+                    actions.push(Action::ChooseFolder);
+                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.new_path)
+                        .desired_width(300.0)
+                        .hint_text("/path/to/folder"),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("NAME  ").color(theme::TEXT).size(12.0));
+                let mut name_edit = egui::TextEdit::singleline(&mut self.new_name)
+                    .desired_width(300.0)
+                    .hint_text("defaults to the folder name");
+                if clashes {
+                    name_edit = name_edit.text_color(theme::RED);
+                }
+                ui.add(name_edit);
+            });
+
+            if clashes {
+                ui.add_space(4.0);
+                ui.colored_label(
+                    theme::RED,
+                    format!("A repository named '{effective}' already exists."),
+                );
+            } else if let Some(err) = &self.form_error {
+                ui.add_space(4.0);
+                ui.colored_label(theme::RED, err);
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let add =
+                    egui::Button::new(RichText::new("ADD").color(theme::BLACK)).fill(theme::BLUE);
+                if ui.add_enabled(can_add, add).clicked() {
                     actions.push(Action::Create);
                 }
+                if ui
+                    .button(RichText::new("CANCEL").color(theme::BLACK))
+                    .clicked()
+                {
+                    actions.push(Action::CloseAdd);
+                }
             });
+        });
+        if response.should_close() {
+            actions.push(Action::CloseAdd);
+        }
     }
 
     fn settings_modal(&mut self, ctx: &egui::Context) {
@@ -663,6 +770,19 @@ fn stat(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
     ui.add_space(10.0);
 }
 
+/// The repo name Create will use: the typed name, or the chosen folder's own
+/// name when the name field is left blank.
+fn effective_name(name: &str, path: &str) -> String {
+    let name = name.trim();
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    std::path::Path::new(path.trim())
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 fn progress_line(event: &ProgressEvent) -> String {
     match event {
         ProgressEvent::Scanning { files, dirs } => {
@@ -671,5 +791,23 @@ fn progress_line(event: &ProgressEvent) -> String {
         ProgressEvent::Hashing { done, total, .. } => format!("hashing {done}/{total}"),
         ProgressEvent::Error { message, .. } => format!("warning: {message}"),
         ProgressEvent::Finished { .. } => "finishing…".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_name;
+
+    #[test]
+    fn effective_name_prefers_typed_name() {
+        assert_eq!(effective_name("photos", "/data/holiday"), "photos");
+        assert_eq!(effective_name("  photos  ", "/data/holiday"), "photos");
+    }
+
+    #[test]
+    fn effective_name_falls_back_to_folder_basename() {
+        assert_eq!(effective_name("", "/data/holiday"), "holiday");
+        assert_eq!(effective_name("   ", "/data/holiday/"), "holiday");
+        assert_eq!(effective_name("", ""), "");
     }
 }
