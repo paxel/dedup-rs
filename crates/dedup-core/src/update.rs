@@ -7,6 +7,7 @@
 //! gets hashed. Index writes are batched (~1000 entries per transaction) to
 //! keep write transactions short.
 
+use crate::fingerprint;
 use crate::store::{self, FileEntry, Store, StoreError};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -215,7 +216,18 @@ pub fn update_repo(
         .build()
         .map_err(|e| UpdateError::ThreadPool(e.to_string()))?;
     let total = to_hash.len() as u64;
-    let (sender, receiver) = mpsc::channel::<(&WalkedFile, std::io::Result<[u8; 32]>)>();
+    let (sender, receiver) = mpsc::channel::<(&WalkedFile, std::io::Result<HashedFile>)>();
+
+    // Perceptual fingerprints (images/video/pdf/audio) are computed alongside
+    // the content hash. Probe ffmpeg once and warn (once) if videos will go
+    // unfingerprinted for lack of it.
+    let ffmpeg_available = fingerprint::ffmpeg_available();
+    if !ffmpeg_available && to_hash.iter().any(|f| is_video_ext(&f.rel)) {
+        progress.on(ProgressEvent::Error {
+            path: String::new(),
+            message: "ffmpeg not found on PATH; video fingerprints are disabled".to_string(),
+        });
+    }
 
     let write_result = std::thread::scope(|scope| -> Result<(), StoreError> {
         scope.spawn(|| {
@@ -225,7 +237,10 @@ pub fn update_repo(
                     if cancel.is_cancelled() {
                         return;
                     }
-                    let result = hash_file(&file.abs);
+                    let result = hash_file(&file.abs).map(|hash| HashedFile {
+                        hash,
+                        fingerprints: fingerprint::compute(&file.abs, ffmpeg_available),
+                    });
                     // Receiver gone means the writer failed; just stop sending.
                     let _ = sender.send((file, result));
                 });
@@ -236,26 +251,27 @@ pub fn update_repo(
         for (index, (file, result)) in receiver.iter().enumerate() {
             let done = index as u64 + 1;
             match result {
-                Ok(hash) => {
+                Ok(hashed) => {
                     if existing.contains_key(&file.rel) {
                         stats.updated += 1;
                     } else {
                         stats.added += 1;
                     }
                     stats.hashed_bytes += file.size;
+                    let fp = hashed.fingerprints;
                     batch.push((
                         file.rel.as_str(),
                         FileEntry {
                             size: file.size,
-                            hash,
+                            hash: hashed.hash,
                             modified_ms: file.modified_ms,
                             missing: false,
-                            mime: None,
-                            img_fingerprint: None,
-                            video_hash: None,
-                            pdf_hash: None,
-                            audio: None,
-                            img_size: None,
+                            mime: fp.mime,
+                            img_fingerprint: fp.img_fingerprint,
+                            video_hash: fp.video_hash,
+                            pdf_hash: fp.pdf_hash,
+                            audio: fp.audio,
+                            img_size: fp.img_size,
                         },
                     ));
                     if batch.len() >= BATCH_SIZE {
@@ -293,6 +309,25 @@ pub fn update_repo(
 
     progress.on(ProgressEvent::Finished { stats });
     Ok(stats)
+}
+
+/// A file's content hash together with its perceptual fingerprints, carried
+/// from the parallel hashing stage to the single writer.
+struct HashedFile {
+    hash: [u8; 32],
+    fingerprints: fingerprint::Fingerprints,
+}
+
+/// Cheap extension check used only to decide whether to warn about a missing
+/// ffmpeg; authoritative MIME detection happens in [`fingerprint::compute`].
+fn is_video_ext(rel: &str) -> bool {
+    matches!(
+        rel.rsplit('.')
+            .next()
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("mp4" | "mkv" | "avi" | "mov" | "webm" | "wmv" | "flv" | "m4v" | "mpg" | "mpeg")
+    )
 }
 
 fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {

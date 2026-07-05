@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use dedup_core::diff::{DiffItem, diff_copy, diff_delete, diff_print, diff_sync};
-use dedup_core::dupes::{delete_duplicates, find_exact_duplicates, wasted_bytes};
+use dedup_core::dupes::{DupeGroup, delete_duplicates, find_exact_duplicates, wasted_bytes};
+use dedup_core::similar::find_similar;
 use dedup_core::store::Store;
 use dedup_core::update::{CancellationToken, Progress, ProgressEvent, update_repo};
 
@@ -136,7 +137,7 @@ enum RepoCommands {
         #[arg(short, long, default_value_t = 0)]
         threads: usize,
     },
-    /// Find exact duplicates in one or more repositories
+    /// Find exact duplicates (or, with --threshold, similar files) in repositories
     Dupes {
         /// Names of the repositories to search
         #[arg(required_unless_present = "all")]
@@ -147,6 +148,9 @@ enum RepoCommands {
         /// Delete all but the best copy of each group
         #[arg(long)]
         delete: bool,
+        /// Similarity search: group perceptually similar files at >= this percent (1-100)
+        #[arg(long)]
+        threshold: Option<u32>,
     },
 }
 
@@ -216,8 +220,13 @@ fn main() -> anyhow::Result<()> {
                 } => {
                     update_repos(&store, names, all, threads)?;
                 }
-                RepoCommands::Dupes { names, all, delete } => {
-                    dupes(&store, names, all, delete)?;
+                RepoCommands::Dupes {
+                    names,
+                    all,
+                    delete,
+                    threshold,
+                } => {
+                    dupes(&store, names, all, delete, threshold)?;
                 }
             }
         }
@@ -356,7 +365,13 @@ fn run_diff(store: &Store, command: DiffCommands) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn dupes(store: &Store, names: Vec<String>, all: bool, delete: bool) -> anyhow::Result<()> {
+fn dupes(
+    store: &Store,
+    names: Vec<String>,
+    all: bool,
+    delete: bool,
+    threshold: Option<u32>,
+) -> anyhow::Result<()> {
     let names: Vec<String> = if all {
         store
             .list_repos()?
@@ -370,7 +385,13 @@ fn dupes(store: &Store, names: Vec<String>, all: bool, delete: bool) -> anyhow::
         anyhow::bail!("No repositories registered. Use 'dedup repo create <name> <path>' first.");
     }
 
-    let groups = find_exact_duplicates(store, &names)?;
+    let groups: Vec<DupeGroup> = match threshold {
+        Some(t) if t > 0 => {
+            println!("Similarity search (threshold: {}%)", t);
+            find_similar(store, &names, f64::from(t))?
+        }
+        _ => find_exact_duplicates(store, &names)?,
+    };
     let mut total_wasted = 0u64;
     for group in &groups {
         let first = match group.first() {

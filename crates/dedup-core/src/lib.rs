@@ -4,6 +4,8 @@
 pub mod diff;
 pub mod dupes;
 pub mod filter;
+pub mod fingerprint;
+pub mod similar;
 pub mod store;
 pub mod update;
 

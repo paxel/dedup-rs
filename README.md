@@ -10,6 +10,7 @@ This project is a greenfield rewrite of the legacy Java/Javalin/React `dedup` im
 - **UI**: `egui` via `eframe` (native, lightweight immediate-mode GUI)
 - **CLI**: `clap` (derive-based CLI arguments parser)
 - **Hashing**: `blake3` (modern, ultra-fast parallel hashing)
+- **Fingerprints**: image/video dHash (`image`), PDF text (`lopdf`), audio (`symphonia`), MIME via `infer`/`mime_guess`; video frames via `ffmpeg`
 
 ---
 
@@ -53,6 +54,7 @@ dedup-rs/
 | `dedup repo rel <name> <new-path>` | Point a repository at a new directory |
 | `dedup repo update <name>... \| --all [-t N]` | Scan directories, hash new/changed files (BLAKE3), mark vanished files missing |
 | `dedup repo dupes <name>... \| --all [--delete]` | Find exact duplicate groups (also across repos); `--delete` keeps the best copy |
+| `dedup repo dupes <name>... --threshold <1-100>` | Similarity search: group perceptually similar images/video/PDF/audio at the given percent |
 | `dedup diff print <source> <reference>` | Classify source files as new / equal / deleted-in-reference (by content) |
 | `dedup diff cp <source> <reference> <dir>` | Copy files whose content the reference does not know into a directory |
 | `dedup diff mv <source> <reference> <dir>` | Same as `cp` but moves and marks the source entries missing |
@@ -61,7 +63,7 @@ dedup-rs/
 
 All `diff` commands take `-f/--filter` with `mime:<substring>`, `name:<substring>`, or `size:<op><bytes>` (e.g. `size:>=1000`). Content equality is always size + BLAKE3 hash — paths never matter.
 
-`repo update` shows live scan/hash progress and can be cancelled with Ctrl-C; already-hashed files stay committed.
+`repo update` shows live scan/hash progress and can be cancelled with Ctrl-C; already-hashed files stay committed. Alongside the content hash it detects each file's MIME type and computes a perceptual fingerprint by kind: a 64-bit image dHash (rotation/mirror invariant, with pixel dimensions), a 192-bit video temporal hash (three frames via `ffmpeg`/`ffprobe` — install ffmpeg to enable it; video degrades to content hash only when absent), a normalized-text hash for PDFs, and a duration + chunk hash for audio. `repo dupes --threshold <1-100>` then groups perceptually similar files (`similarity % = (1 - hamming_distance / bits) * 100`).
 
 ### Quality Checks
 Ensure the code passes all standards before committing:
