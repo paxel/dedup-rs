@@ -209,6 +209,55 @@ fn rel_unknown_repo_fails() -> TestResult {
 }
 
 #[test]
+fn cp_duplicates_repo_to_new_path() -> TestResult {
+    let sb = Sandbox::new()?;
+    let data = sb.data_dir("photos")?;
+    let copy_dir = sb.data_dir("photos-backup")?;
+
+    sb.dedup()?
+        .args(["repo", "create", "photos", &data])
+        .assert()
+        .success();
+    sb.dedup()?
+        .args(["repo", "cp", "photos", "photos-copy", &copy_dir])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("photos-copy"));
+
+    // Both the source and the copy are now registered, the copy at the new path.
+    sb.dedup()?
+        .args(["repo", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("photos"))
+        .stdout(predicate::str::contains("photos-copy"))
+        .stdout(predicate::str::contains("photos-backup"));
+    Ok(())
+}
+
+#[test]
+fn cp_to_existing_name_fails() -> TestResult {
+    let sb = Sandbox::new()?;
+    let a = sb.data_dir("a")?;
+    let b = sb.data_dir("b")?;
+
+    sb.dedup()?
+        .args(["repo", "create", "a", &a])
+        .assert()
+        .success();
+    sb.dedup()?
+        .args(["repo", "create", "b", &b])
+        .assert()
+        .success();
+    sb.dedup()?
+        .args(["repo", "cp", "a", "b", "/tmp/whatever"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already exists"));
+    Ok(())
+}
+
+#[test]
 fn ls_handles_multibyte_paths() -> TestResult {
     let sb = Sandbox::new()?;
     // Long enough to trigger path truncation in `ls`, with multi-byte chars

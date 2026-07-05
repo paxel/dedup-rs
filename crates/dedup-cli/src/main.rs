@@ -125,6 +125,15 @@ enum RepoCommands {
         /// New target directory path
         new_path: String,
     },
+    /// Copy a repository's index into a new one at a new path (source unchanged)
+    Cp {
+        /// Source repository to copy from
+        source: String,
+        /// Name of the new repository
+        dest: String,
+        /// Target directory path for the new repository
+        path: String,
+    },
     /// Scan repository directories and update their indices
     Update {
         /// Names of the repositories to update
@@ -211,6 +220,13 @@ fn main() -> anyhow::Result<()> {
                     println!(
                         "Successfully relocated repository '{}' to path '{}'.",
                         name, new_path
+                    );
+                }
+                RepoCommands::Cp { source, dest, path } => {
+                    store.duplicate_repo(&source, &dest, &path)?;
+                    println!(
+                        "Successfully copied repository '{}' to '{}' at path '{}'.",
+                        source, dest, path
                     );
                 }
                 RepoCommands::Update {

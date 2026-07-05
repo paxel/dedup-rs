@@ -5,4 +5,6 @@ edition = "2024"
 
 [dependencies]
 dedup-core = { path = "../dedup-core" }
-# We'll add eframe/egui in Phase 5 when implementing the GUI shell.
+eframe = "0.35"
+egui = "0.35"
+crossbeam-channel = "0.5"

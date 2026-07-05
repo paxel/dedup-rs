@@ -143,6 +143,19 @@ fn get_config_dir() -> PathBuf {
     }
 }
 
+/// Absolute paths are kept verbatim; relative ones are canonicalized against
+/// the current directory, falling back to the original string on failure.
+fn canonicalize_path(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        path.to_string()
+    } else {
+        std::fs::canonicalize(p)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| path.to_string())
+    }
+}
+
 fn serialize_value<T: Serialize>(schema_ver: u8, value: &T) -> Result<Vec<u8>, StoreError> {
     let mut bytes = vec![schema_ver];
     let serialized =
@@ -400,6 +413,60 @@ impl Store {
         {
             let mut reg_table = reg_write_txn.open_table(REPOS)?;
             reg_table.insert(name, serialized.as_slice())?;
+        }
+        reg_write_txn.commit()?;
+
+        Ok(())
+    }
+
+    /// Duplicate `source` into a new repo `dest` pointing at `new_path`, keeping
+    /// every index entry (and its stats) from the original. The source is left
+    /// unmodified. Ported from the legacy `repo cp` / `CopyRepoProcess`.
+    pub fn duplicate_repo(
+        &self,
+        source: &str,
+        dest: &str,
+        new_path: &str,
+    ) -> Result<(), StoreError> {
+        if source == dest {
+            return Err(StoreError::AlreadyExists(dest.to_string()));
+        }
+        let source_meta = self.get_repo(source)?;
+
+        let meta = RepoMeta {
+            abs_path: canonicalize_path(new_path),
+            created: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            hash_algo: source_meta.hash_algo,
+            schema_ver: source_meta.schema_ver,
+        };
+        let serialized = serialize_value(SCHEMA_VERSION, &meta)?;
+
+        // Byte-copy the source index (a redb file at rest is self-consistent);
+        // this carries FILES, the BY_* indexes, META, and MIME_STATS verbatim.
+        let src_db = self.get_repo_db_path(source);
+        let dst_db = self.get_repo_db_path(dest);
+        if let Some(parent) = dst_db.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // Reserve the destination name atomically before writing any files, so a
+        // clash cannot leave an orphan index behind.
+        let reg_write_txn = self.registry.begin_write()?;
+        {
+            let mut reg_table = reg_write_txn.open_table(REPOS)?;
+            if reg_table.get(dest)?.is_some() {
+                return Err(StoreError::AlreadyExists(dest.to_string()));
+            }
+            if src_db.exists() {
+                std::fs::copy(&src_db, &dst_db)?;
+            } else {
+                // Source was never scanned: start the copy with empty tables.
+                self.open_repo_db(dest)?;
+            }
+            reg_table.insert(dest, serialized.as_slice())?;
         }
         reg_write_txn.commit()?;
 

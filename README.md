@@ -43,6 +43,15 @@ dedup-rs/
 - **Run GUI**: `cargo run` (runs the CLI binary which boots up the GUI window)
 - **Run CLI Subcommand**: `cargo run -- <subcommand>` (e.g. `cargo run -- --version`)
 
+### Desktop GUI
+Launching with no subcommand opens an LCARS-inspired (`eframe`/`egui`) desktop window with three tabs and a settings cog:
+
+- **Repository management** (implemented) — an overview of registered repositories with cached stats (files, size, missing) and controls to add, delete, rename, relocate, duplicate, and update/scan. Scans run on a background thread with live, coalesced progress and a per-repo cancel button, so the UI stays responsive on large repositories.
+- **Duplicate management** — the review grid (thumbnails, keep/delete) arrives in Phase 6.
+- **File management** — copy/move/delete flows arrive in Phase 7.
+
+Settings (cog, top-right) currently exposes the hashing thread count used by scans.
+
 ### CLI Commands
 
 | Command | Description |
@@ -52,6 +61,7 @@ dedup-rs/
 | `dedup repo rm <name>` | Remove a repository and its local index database |
 | `dedup repo mv <name> <new-name>` | Rename a repository |
 | `dedup repo rel <name> <new-path>` | Point a repository at a new directory |
+| `dedup repo cp <source> <dest> <path>` | Copy a repository's index into a new one at a new path (source unchanged) |
 | `dedup repo update <name>... \| --all [-t N]` | Scan directories, hash new/changed files (BLAKE3), mark vanished files missing |
 | `dedup repo dupes <name>... \| --all [--delete]` | Find exact duplicate groups (also across repos); `--delete` keeps the best copy |
 | `dedup repo dupes <name>... --threshold <1-100>` | Similarity search: group perceptually similar images/video/PDF/audio at the given percent |
