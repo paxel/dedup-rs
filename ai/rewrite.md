@@ -149,9 +149,9 @@ Workspace, CI (`cargo fmt --check`, `clippy -D warnings`, `cargo test`), `dedup 
 `update` operation: walkdir → compare (path, size, mtime) against `FILES` → hash changed/new files with rayon (`-t` thread count) → batch writes (commit every ~1000 entries to keep write txns short) → mark vanished files missing. Progress events + cancellation. CLI: `dedup repo update <name>... | -a` with indicatif bars.
 **Accept:** integration test on a tempdir (create/modify/delete files, assert index state); re-running update on unchanged tree does zero hashing; Ctrl-C cancels cleanly mid-hash. Covered by `crates/dedup-core/tests/update_repo.rs` (lifecycle, zero-rehash, mid-hash cancellation, unreadable files) and `crates/dedup-cli/tests/update_cli.rs`.
 
-### Phase 3 — Dupes & diff (headless)
+### Phase 3 — Dupes & diff (headless) ✅ (2026-07-05)
 Exact dupes via `BY_SIZE_HASH` range scans (single repo and cross-repo). Diff print/cp/mv/rm/sync ported from `DiffProcess`/`FilesProcess` semantics (source vs reference by size+hash). Group sorting: image area desc, size desc, oldest first (the fixed B3 behavior from improvements.md — sorted from day one).
-**Accept:** port the scenarios from `DiffProcessSyncTest`/`DiffProcessMoveTest`/`DuplicateRepoProcessTest` as Rust tests.
+**Accept:** port the scenarios from `DiffProcessSyncTest`/`DiffProcessMoveTest`/`DuplicateRepoProcessTest` as Rust tests. Covered by `crates/dedup-core/tests/diff_ops.rs` and `dupes_test.rs` (exact-duplicate scenarios; similarity scenarios follow in Phase 4), plus `crates/dedup-cli/tests/diff_dupes_cli.rs`. Md/HTML report generation was not ported — the Phase 6 review UI replaces it.
 
 ### Phase 4 — Fingerprints & similarity
 dHash for images (+ dimensions), ffmpeg-based temporal hash, pdf text hash, audio chunk hash — computed during `update` per MIME. Similarity grouping: band-bucket `u64` fingerprints (4×16-bit bands; candidates share ≥1 band), then exact Hamming with `count_ones()`; threshold semantics identical to Java (`similarity % = (1 - dist/bits) * 100`).

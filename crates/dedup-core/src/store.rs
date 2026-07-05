@@ -422,13 +422,7 @@ impl Store {
         rel_path: &str,
     ) -> Result<Option<FileEntry>, StoreError> {
         let db = self.open_repo_db(repo_name)?;
-        let read_txn = db.begin_read()?;
-        let files_table = read_txn.open_table(FILES)?;
-
-        match files_table.get(rel_path)? {
-            Some(guard) => Ok(Some(deserialize_value(SCHEMA_VERSION, guard.value())?)),
-            None => Ok(None),
-        }
+        get_entry(&db, rel_path)
     }
 
     pub fn remove_file_entry(&self, repo_name: &str, rel_path: &str) -> Result<(), StoreError> {
@@ -625,6 +619,76 @@ where
     }
     write_txn.commit()?;
     Ok(())
+}
+
+/// Read one file entry from an open repo database.
+pub fn get_entry(db: &redb::Database, rel_path: &str) -> Result<Option<FileEntry>, StoreError> {
+    let read_txn = db.begin_read()?;
+    let files_table = read_txn.open_table(FILES)?;
+    match files_table.get(rel_path)? {
+        Some(guard) => Ok(Some(deserialize_value(SCHEMA_VERSION, guard.value())?)),
+        None => Ok(None),
+    }
+}
+
+/// Stream every file entry (including missing ones) to a callback without
+/// materializing the whole index.
+pub fn for_each_file_entry<F>(db: &redb::Database, mut f: F) -> Result<(), StoreError>
+where
+    F: FnMut(&str, FileEntry) -> Result<(), StoreError>,
+{
+    let read_txn = db.begin_read()?;
+    let files_table = read_txn.open_table(FILES)?;
+    for item in files_table.iter()? {
+        let (key_guard, val_guard) = item?;
+        let entry: FileEntry = deserialize_value(SCHEMA_VERSION, val_guard.value())?;
+        f(key_guard.value(), entry)?;
+    }
+    Ok(())
+}
+
+/// Presence state of one content key (size, hash) in a repo.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContentState {
+    /// At least one non-missing entry has this content.
+    pub present: bool,
+    /// At least one missing entry had this content.
+    pub missing: bool,
+}
+
+/// Content key of a file: equality is by size and hash, never by path.
+pub type ContentKey = (u64, [u8; 32]);
+
+/// Build a map of every content key in the repo to its presence state.
+pub fn read_content_index(
+    db: &redb::Database,
+) -> Result<std::collections::HashMap<ContentKey, ContentState>, StoreError> {
+    let mut index = std::collections::HashMap::new();
+    for_each_file_entry(db, |_, entry| {
+        let state: &mut ContentState = index.entry((entry.size, entry.hash)).or_default();
+        if entry.missing {
+            state.missing = true;
+        } else {
+            state.present = true;
+        }
+        Ok(())
+    })?;
+    Ok(index)
+}
+
+/// Paths of all non-missing entries with the given size and hash.
+pub fn get_paths_by_size_hash(
+    db: &redb::Database,
+    size: u64,
+    hash: &[u8; 32],
+) -> Result<Vec<String>, StoreError> {
+    let read_txn = db.begin_read()?;
+    let by_size_hash = read_txn.open_multimap_table(BY_SIZE_HASH)?;
+    let mut paths = Vec::new();
+    for item in by_size_hash.get((size, &hash[..]))? {
+        paths.push(item?.value().to_string());
+    }
+    Ok(paths)
 }
 
 /// The subset of a [`FileEntry`] the update scan needs for change detection.

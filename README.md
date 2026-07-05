@@ -52,6 +52,14 @@ dedup-rs/
 | `dedup repo mv <name> <new-name>` | Rename a repository |
 | `dedup repo rel <name> <new-path>` | Point a repository at a new directory |
 | `dedup repo update <name>... \| --all [-t N]` | Scan directories, hash new/changed files (BLAKE3), mark vanished files missing |
+| `dedup repo dupes <name>... \| --all [--delete]` | Find exact duplicate groups (also across repos); `--delete` keeps the best copy |
+| `dedup diff print <source> <reference>` | Classify source files as new / equal / deleted-in-reference (by content) |
+| `dedup diff cp <source> <reference> <dir>` | Copy files whose content the reference does not know into a directory |
+| `dedup diff mv <source> <reference> <dir>` | Same as `cp` but moves and marks the source entries missing |
+| `dedup diff rm <source> <reference>` | Delete source files whose content the reference already has |
+| `dedup diff sync <source> <target>` | Copy new content into the target repo; `--delete-missing` / `--mirror` also delete |
+
+All `diff` commands take `-f/--filter` with `mime:<substring>`, `name:<substring>`, or `size:<op><bytes>` (e.g. `size:>=1000`). Content equality is always size + BLAKE3 hash — paths never matter.
 
 `repo update` shows live scan/hash progress and can be cancelled with Ctrl-C; already-hashed files stay committed.
 

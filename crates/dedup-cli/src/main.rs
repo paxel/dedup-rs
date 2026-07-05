@@ -1,4 +1,6 @@
 use clap::{Parser, Subcommand};
+use dedup_core::diff::{DiffItem, diff_copy, diff_delete, diff_print, diff_sync};
+use dedup_core::dupes::{delete_duplicates, find_exact_duplicates, wasted_bytes};
 use dedup_core::store::Store;
 use dedup_core::update::{CancellationToken, Progress, ProgressEvent, update_repo};
 
@@ -17,6 +19,78 @@ enum Commands {
     Repo {
         #[command(subcommand)]
         command: RepoCommands,
+    },
+    /// Compare a source repo against a reference repo (by content, not path)
+    Diff {
+        #[command(subcommand)]
+        command: DiffCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum DiffCommands {
+    /// Print differences between source and reference
+    Print {
+        /// Source repository
+        source: String,
+        /// Reference repository
+        reference: String,
+        /// Filter: mime:<substring>, name:<substring>, or size:<expr>
+        #[arg(short, long)]
+        filter: Option<String>,
+    },
+    /// Copy files in source whose content the reference does not know to a target directory
+    Cp {
+        /// Source repository
+        source: String,
+        /// Reference repository
+        reference: String,
+        /// Target directory
+        target: String,
+        /// Filter: mime:<substring>, name:<substring>, or size:<expr>
+        #[arg(short, long)]
+        filter: Option<String>,
+    },
+    /// Move files in source whose content the reference does not know to a target directory
+    Mv {
+        /// Source repository
+        source: String,
+        /// Reference repository
+        reference: String,
+        /// Target directory
+        target: String,
+        /// Filter: mime:<substring>, name:<substring>, or size:<expr>
+        #[arg(short, long)]
+        filter: Option<String>,
+    },
+    /// Delete files in source whose content the reference already knows
+    Rm {
+        /// Source repository
+        source: String,
+        /// Reference repository
+        reference: String,
+        /// Filter: mime:<substring>, name:<substring>, or size:<expr>
+        #[arg(short, long)]
+        filter: Option<String>,
+    },
+    /// Sync target repo with source: copy new contents, optionally delete missing
+    Sync {
+        /// Source repository (A)
+        source: String,
+        /// Target repository (B)
+        target: String,
+        /// Copy contents that exist in A but not in B
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        copy_new: bool,
+        /// Delete in B contents that A marks as missing
+        #[arg(long)]
+        delete_missing: bool,
+        /// Equivalent to --copy-new true --delete-missing
+        #[arg(long)]
+        mirror: bool,
+        /// Filter: mime:<substring>, name:<substring>, or size:<expr>
+        #[arg(short, long)]
+        filter: Option<String>,
     },
 }
 
@@ -61,6 +135,18 @@ enum RepoCommands {
         /// Number of hashing threads (0 = one per CPU core)
         #[arg(short, long, default_value_t = 0)]
         threads: usize,
+    },
+    /// Find exact duplicates in one or more repositories
+    Dupes {
+        /// Names of the repositories to search
+        #[arg(required_unless_present = "all")]
+        names: Vec<String>,
+        /// Search all registered repositories
+        #[arg(short, long)]
+        all: bool,
+        /// Delete all but the best copy of each group
+        #[arg(long)]
+        delete: bool,
     },
 }
 
@@ -130,7 +216,14 @@ fn main() -> anyhow::Result<()> {
                 } => {
                     update_repos(&store, names, all, threads)?;
                 }
+                RepoCommands::Dupes { names, all, delete } => {
+                    dupes(&store, names, all, delete)?;
+                }
             }
+        }
+        Some(Commands::Diff { command }) => {
+            let store = Store::open()?;
+            run_diff(&store, command)?;
         }
         None => {
             println!("Starting GUI...");
@@ -142,6 +235,192 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn run_diff(store: &Store, command: DiffCommands) -> anyhow::Result<()> {
+    let cancel = CancellationToken::new();
+    {
+        let cancel = cancel.clone();
+        ctrlc::set_handler(move || cancel.cancel())?;
+    }
+    match command {
+        DiffCommands::Print {
+            source,
+            reference,
+            filter,
+        } => {
+            let items = diff_print(store, &source, &reference, filter.as_deref())?;
+            let mut new = 0u64;
+            let mut equal = 0u64;
+            let mut deleted = 0u64;
+            for item in &items {
+                match item {
+                    DiffItem::New { rel_path } => {
+                        new += 1;
+                        println!("New: {}", rel_path);
+                    }
+                    DiffItem::Equal { .. } => equal += 1,
+                    DiffItem::DeletedInReference { rel_path } => {
+                        deleted += 1;
+                        println!("Deleted in reference: {}", rel_path);
+                    }
+                }
+            }
+            println!(
+                "{} new, {} equal, {} deleted in reference",
+                new, equal, deleted
+            );
+        }
+        DiffCommands::Cp {
+            source,
+            reference,
+            target,
+            filter,
+        } => {
+            let stats = diff_copy(
+                store,
+                &source,
+                &reference,
+                std::path::Path::new(&target),
+                false,
+                filter.as_deref(),
+                &cancel,
+            )?;
+            println!("Copied {} files to '{}'.", stats.copied, target);
+            if stats.cancelled {
+                println!("Copy cancelled by user.");
+            }
+        }
+        DiffCommands::Mv {
+            source,
+            reference,
+            target,
+            filter,
+        } => {
+            let stats = diff_copy(
+                store,
+                &source,
+                &reference,
+                std::path::Path::new(&target),
+                true,
+                filter.as_deref(),
+                &cancel,
+            )?;
+            println!("Moved {} files to '{}'.", stats.copied, target);
+            if stats.cancelled {
+                println!("Move cancelled by user.");
+            }
+        }
+        DiffCommands::Rm {
+            source,
+            reference,
+            filter,
+        } => {
+            let stats = diff_delete(store, &source, &reference, filter.as_deref(), &cancel)?;
+            println!("Deleted {} files from '{}'.", stats.deleted, source);
+            if stats.cancelled {
+                println!("Delete cancelled by user.");
+            }
+        }
+        DiffCommands::Sync {
+            source,
+            target,
+            copy_new,
+            delete_missing,
+            mirror,
+            filter,
+        } => {
+            let (copy_new, delete_missing) = if mirror {
+                (true, true)
+            } else {
+                (copy_new, delete_missing)
+            };
+            let stats = diff_sync(
+                store,
+                &source,
+                &target,
+                copy_new,
+                delete_missing,
+                filter.as_deref(),
+                &cancel,
+            )?;
+            println!(
+                "copied: {}, equal: {}, skipped: {}, deleted: {}, errors: {}",
+                stats.copied, stats.equal, stats.skipped, stats.deleted, stats.errors
+            );
+            if stats.cancelled {
+                println!("Sync cancelled by user.");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dupes(store: &Store, names: Vec<String>, all: bool, delete: bool) -> anyhow::Result<()> {
+    let names: Vec<String> = if all {
+        store
+            .list_repos()?
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect()
+    } else {
+        names
+    };
+    if names.is_empty() {
+        anyhow::bail!("No repositories registered. Use 'dedup repo create <name> <path>' first.");
+    }
+
+    let groups = find_exact_duplicates(store, &names)?;
+    let mut total_wasted = 0u64;
+    for group in &groups {
+        let first = match group.first() {
+            Some(first) => first,
+            None => continue,
+        };
+        total_wasted += wasted_bytes(group);
+        println!(
+            "{} ({}, {} wasted)",
+            hex(&first.entry.hash),
+            format_size(first.entry.size),
+            format_size(wasted_bytes(group))
+        );
+        for file in group {
+            println!(
+                "  {}: {}/{} (modified: {})",
+                file.repo,
+                file.repo_root,
+                file.rel_path,
+                format_time_ms(file.entry.modified_ms)
+            );
+        }
+    }
+    println!(
+        "{} duplicate groups, {} wasted",
+        groups.len(),
+        format_size(total_wasted)
+    );
+
+    if delete {
+        let stats = delete_duplicates(store, &groups)?;
+        println!(
+            "Deleted {} duplicate files (kept the best copy of each group), {} errors.",
+            stats.deleted, stats.errors
+        );
+    }
+    Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn format_time_ms(ms: i64) -> String {
+    use chrono::{Local, TimeZone};
+    if let chrono::LocalResult::Single(dt) = Local.timestamp_millis_opt(ms) {
+        dt.format("%Y-%m-%d %H:%M:%S").to_string()
+    } else {
+        "Unknown".to_string()
+    }
 }
 
 fn update_repos(

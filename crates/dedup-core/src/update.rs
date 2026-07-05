@@ -302,7 +302,7 @@ fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
     Ok(*hasher.finalize().as_bytes())
 }
 
-fn system_time_to_ms(time: std::time::SystemTime) -> i64 {
+pub(crate) fn system_time_to_ms(time: std::time::SystemTime) -> i64 {
     match time.duration_since(std::time::UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
         Err(err) => -i64::try_from(err.duration().as_millis()).unwrap_or(i64::MAX),
