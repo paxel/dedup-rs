@@ -114,25 +114,31 @@ pub fn delete_duplicates(
     store: &Store,
     groups: &[DupeGroup],
 ) -> Result<DupeDeleteStats, StoreError> {
+    let extra: Vec<&DupeFile> = groups.iter().flat_map(|g| g.iter().skip(1)).collect();
+    delete_files(store, &extra)
+}
+
+/// Delete an explicit set of files from disk and mark their index entries
+/// missing — grouped so each repo's updates land in a single write transaction.
+/// Files already absent from disk are skipped; failures are counted, not fatal.
+pub fn delete_files(store: &Store, files: &[&DupeFile]) -> Result<DupeDeleteStats, StoreError> {
     let mut stats = DupeDeleteStats::default();
     let mut deleted_per_repo: HashMap<&str, Vec<&str>> = HashMap::new();
 
-    for group in groups {
-        for file in group.iter().skip(1) {
-            let path = file.absolute_path();
-            if !path.exists() {
-                continue;
+    for file in files {
+        let path = file.absolute_path();
+        if !path.exists() {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                stats.deleted += 1;
+                deleted_per_repo
+                    .entry(file.repo.as_str())
+                    .or_default()
+                    .push(file.rel_path.as_str());
             }
-            match std::fs::remove_file(&path) {
-                Ok(()) => {
-                    stats.deleted += 1;
-                    deleted_per_repo
-                        .entry(file.repo.as_str())
-                        .or_default()
-                        .push(file.rel_path.as_str());
-                }
-                Err(_) => stats.errors += 1,
-            }
+            Err(_) => stats.errors += 1,
         }
     }
 

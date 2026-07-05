@@ -47,7 +47,7 @@ dedup-rs/
 Launching with no subcommand opens an LCARS-inspired (`eframe`/`egui`) desktop window with three tabs and a settings cog:
 
 - **Repository management** (implemented) — an overview of registered repositories with cached stats (files, size, missing) and controls to add, delete, rename, relocate, duplicate, and update/scan. Scans run on a background thread with live, coalesced progress and a per-repo cancel button, so the UI stays responsive on large repositories.
-- **Duplicate management** — the review grid (thumbnails, keep/delete) arrives in Phase 6.
+- **Duplicate management** (implemented) — toggle which repos to search (each with a read-only flag whose files are never selected for deletion), choose exact duplicates or perceptual similars (threshold slider), and review paged groups (50 per page) of file cards with thumbnail, path, size, dimensions, mtime, and a KEEP/DELETE toggle (best copy starred). Thumbnails are cached on disk (`~/.cache/dedup/thumbs`) and decoded on background threads into an LRU texture cache. Deletions are batched per repo and always confirmed; "Auto-resolve rest" preselects every non-best copy in a deletable repo.
 - **File management** — copy/move/delete flows arrive in Phase 7.
 
 Settings (cog, top-right) currently exposes the hashing thread count used by scans.

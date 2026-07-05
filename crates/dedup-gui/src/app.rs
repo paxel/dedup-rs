@@ -2,7 +2,9 @@
 //! is fully wired to the core store and background update worker. The Duplicate
 //! and File tabs are placeholders for Phases 6 and 7.
 
+use crate::dupes_view::DupesView;
 use crate::theme;
+use crate::util::format_size;
 use crate::worker::{ChannelProgress, WorkerMsg, WorkerState};
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::store::{RepoStats, Store};
@@ -88,6 +90,7 @@ pub struct DedupApp {
     rx: Receiver<WorkerMsg>,
     worker: WorkerState,
     cancels: HashMap<String, CancellationToken>,
+    dupes: DupesView,
 }
 
 impl DedupApp {
@@ -108,6 +111,7 @@ impl DedupApp {
             rx,
             worker: WorkerState::default(),
             cancels: HashMap::new(),
+            dupes: DupesView::new(),
         };
         app.reload_all();
         app
@@ -287,7 +291,7 @@ impl eframe::App for DedupApp {
         self.top_bar(ui);
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Repositories => self.repositories_view(ui, &mut actions),
-            Tab::Duplicates => placeholder(ui, "DUPLICATE MANAGEMENT", "Arrives in Phase 6."),
+            Tab::Duplicates => self.dupes.show(ui, &self.store),
             Tab::Files => placeholder(ui, "FILE MANAGEMENT", "Arrives in Phase 7."),
         });
         if self.show_settings {
@@ -673,23 +677,5 @@ fn progress_line(event: &ProgressEvent) -> String {
         ProgressEvent::Hashing { done, total, .. } => format!("hashing {done}/{total}"),
         ProgressEvent::Error { message, .. } => format!("warning: {message}"),
         ProgressEvent::Finished { .. } => "finishing…".into(),
-    }
-}
-
-fn format_size(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    const TB: u64 = GB * 1024;
-    if bytes >= TB {
-        format!("{:.2} TB", bytes as f64 / TB as f64)
-    } else if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{bytes} B")
     }
 }

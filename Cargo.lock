@@ -1303,6 +1303,7 @@ dependencies = [
 name = "dedup-gui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "crossbeam-channel",
  "dedup-core",
  "eframe",

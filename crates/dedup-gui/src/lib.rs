@@ -2,7 +2,10 @@
 //! LCARS-themed eframe/egui desktop shell for dedup.
 
 mod app;
+mod dupes_view;
 mod theme;
+mod thumbs;
+mod util;
 mod worker;
 
 use dedup_core::store::Store;

@@ -115,6 +115,41 @@ fn deletes_duplicates_keeping_the_best_copy() -> TestResult {
 }
 
 #[test]
+fn delete_files_removes_an_explicit_selection_and_marks_it_missing() -> TestResult {
+    let tempdir = tempfile::tempdir()?;
+    let store = Store::open_at(tempdir.path().join("config"))?;
+    let root = tempdir.path().join("repo");
+    std::fs::create_dir_all(&root)?;
+    store.create_repo("repo", &root.to_string_lossy())?;
+
+    // Three identical copies; the review UI marks a specific subset.
+    for name in ["a.jpg", "b.jpg", "c.jpg"] {
+        std::fs::write(root.join(name), b"same bytes")?;
+    }
+    update_repo(&store, "repo", 1, &NoProgress, &CancellationToken::new())?;
+    let groups = find_exact_duplicates(&store, &["repo".to_string()])?;
+    assert_eq!(groups.len(), 1);
+
+    // Delete exactly the two files whose rel_path is b.jpg / c.jpg, keep a.jpg.
+    let selection: Vec<&_> = groups[0]
+        .iter()
+        .filter(|f| f.rel_path == "b.jpg" || f.rel_path == "c.jpg")
+        .collect();
+    let stats = dedup_core::dupes::delete_files(&store, &selection)?;
+    assert_eq!(stats.deleted, 2);
+    assert_eq!(stats.errors, 0);
+
+    assert!(root.join("a.jpg").exists());
+    assert!(!root.join("b.jpg").exists());
+    assert!(!root.join("c.jpg").exists());
+    assert!(!store.get_file_entry("repo", "a.jpg")?.ok_or("a")?.missing);
+    assert!(store.get_file_entry("repo", "b.jpg")?.ok_or("b")?.missing);
+    // No duplicates remain (only a.jpg is present).
+    assert!(find_exact_duplicates(&store, &["repo".to_string()])?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn finds_duplicates_across_repos() -> TestResult {
     let tempdir = tempfile::tempdir()?;
     let store = Store::open_at(tempdir.path().join("config"))?;

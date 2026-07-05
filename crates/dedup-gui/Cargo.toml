@@ -8,3 +8,4 @@ dedup-core = { path = "../dedup-core" }
 eframe = "0.35"
 egui = "0.35"
 crossbeam-channel = "0.5"
+chrono = "0.4"

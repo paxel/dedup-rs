@@ -7,6 +7,7 @@ pub mod filter;
 pub mod fingerprint;
 pub mod similar;
 pub mod store;
+pub mod thumbnail;
 pub mod update;
 
 pub fn version() -> &'static str {
