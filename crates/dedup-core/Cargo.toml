@@ -1,0 +1,7 @@
+[package]
+name = "dedup-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# We'll add actual store/hash/fingerprint dependencies in later phases.
