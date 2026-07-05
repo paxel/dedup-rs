@@ -137,17 +137,17 @@ No migration: there are no existing users. The old `~/.config/dedup` layout and 
 
 ## 4. Phases
 
-### Phase 0 — Skeleton
+### Phase 0 — Skeleton ✅ (2026-07-05)
 Workspace, CI (`cargo fmt --check`, `clippy -D warnings`, `cargo test`), `dedup --version`.
 **Accept:** builds on stable; CI green.
 
-### Phase 1 — Store + registry
+### Phase 1 — Store + registry ✅ (2026-07-05)
 `dedup-core::store` with the tables above; repo create/ls/rm/rename/relocate in core + CLI (`dedup repo create <name> <path>`, `ls`, `rm`, `mv`, `rel`).
-**Accept:** unit tests cover invariants (index-table consistency, missing-exclusion); `repo ls` shows stats from `META` without scanning `FILES`.
+**Accept:** unit tests cover invariants (index-table consistency, missing-exclusion); `repo ls` shows stats from `META` without scanning `FILES`. Covered by `store.rs` unit tests plus CLI integration tests (`crates/dedup-cli/tests/repo_cli.rs`).
 
-### Phase 2 — Scan & update
+### Phase 2 — Scan & update ✅ (2026-07-05)
 `update` operation: walkdir → compare (path, size, mtime) against `FILES` → hash changed/new files with rayon (`-t` thread count) → batch writes (commit every ~1000 entries to keep write txns short) → mark vanished files missing. Progress events + cancellation. CLI: `dedup repo update <name>... | -a` with indicatif bars.
-**Accept:** integration test on a tempdir (create/modify/delete files, assert index state); re-running update on unchanged tree does zero hashing; Ctrl-C cancels cleanly mid-hash.
+**Accept:** integration test on a tempdir (create/modify/delete files, assert index state); re-running update on unchanged tree does zero hashing; Ctrl-C cancels cleanly mid-hash. Covered by `crates/dedup-core/tests/update_repo.rs` (lifecycle, zero-rehash, mid-hash cancellation, unreadable files) and `crates/dedup-cli/tests/update_cli.rs`.
 
 ### Phase 3 — Dupes & diff (headless)
 Exact dupes via `BY_SIZE_HASH` range scans (single repo and cross-repo). Diff print/cp/mv/rm/sync ported from `DiffProcess`/`FilesProcess` semantics (source vs reference by size+hash). Group sorting: image area desc, size desc, oldest first (the fixed B3 behavior from improvements.md — sorted from day one).

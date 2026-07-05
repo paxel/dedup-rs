@@ -1,0 +1,785 @@
+//! Storage implementation using redb for registry and repo-specific databases.
+
+use redb::{ReadableMultimapTable, ReadableTable};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+const SCHEMA_VERSION: u8 = 1;
+
+// Registry table definition
+const REPOS: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("repos");
+
+// Repo-specific table definitions
+const FILES: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("files");
+const BY_SIZE_HASH: redb::MultimapTableDefinition<(u64, &[u8]), &str> =
+    redb::MultimapTableDefinition::new("by_size_hash");
+const BY_FPRINT: redb::MultimapTableDefinition<u64, &str> =
+    redb::MultimapTableDefinition::new("by_fprint");
+const META: redb::TableDefinition<&str, u64> = redb::TableDefinition::new("meta");
+const MIME_STATS: redb::TableDefinition<&str, u64> = redb::TableDefinition::new("mime_stats");
+
+#[derive(thiserror::Error, Debug)]
+pub enum StoreError {
+    #[error("Database error: {0}")]
+    Database(Box<redb::Error>),
+
+    #[error("Database open error: {0}")]
+    DatabaseOpen(Box<redb::DatabaseError>),
+
+    #[error("Database transaction error: {0}")]
+    Transaction(Box<redb::TransactionError>),
+
+    #[error("Table error: {0}")]
+    Table(Box<redb::TableError>),
+
+    #[error("Storage error: {0}")]
+    Storage(Box<redb::StorageError>),
+
+    #[error("Commit error: {0}")]
+    Commit(Box<redb::CommitError>),
+
+    #[error("Storage I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Serialization error: {0}")]
+    Serialization(String),
+
+    #[error("Deserialization error: {0}")]
+    Deserialization(String),
+
+    #[error("Schema version mismatch: expected {expected}, found {found}")]
+    SchemaVersionMismatch { expected: u8, found: u8 },
+
+    #[error("Repository '{0}' already exists")]
+    AlreadyExists(String),
+
+    #[error("Repository '{0}' not found")]
+    NotFound(String),
+}
+
+impl From<redb::Error> for StoreError {
+    fn from(err: redb::Error) -> Self {
+        StoreError::Database(Box::new(err))
+    }
+}
+
+impl From<redb::DatabaseError> for StoreError {
+    fn from(err: redb::DatabaseError) -> Self {
+        StoreError::DatabaseOpen(Box::new(err))
+    }
+}
+
+impl From<redb::TransactionError> for StoreError {
+    fn from(err: redb::TransactionError) -> Self {
+        StoreError::Transaction(Box::new(err))
+    }
+}
+
+impl From<redb::TableError> for StoreError {
+    fn from(err: redb::TableError) -> Self {
+        StoreError::Table(Box::new(err))
+    }
+}
+
+impl From<redb::StorageError> for StoreError {
+    fn from(err: redb::StorageError) -> Self {
+        StoreError::Storage(Box::new(err))
+    }
+}
+
+impl From<redb::CommitError> for StoreError {
+    fn from(err: redb::CommitError) -> Self {
+        StoreError::Commit(Box::new(err))
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RepoMeta {
+    pub abs_path: String,
+    pub created: u64,
+    pub hash_algo: String,
+    pub schema_ver: u8,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FileEntry {
+    pub size: u64,
+    pub hash: [u8; 32], // blake3
+    pub modified_ms: i64,
+    pub missing: bool,
+    pub mime: Option<String>,
+    pub img_fingerprint: Option<u64>, // dHash
+    pub video_hash: Option<[u64; 3]>, // temporal hash
+    pub pdf_hash: Option<[u8; 32]>,   // blake3 of normalized text
+    pub audio: Option<AudioFp>,       // duration_ms + chunk hashes
+    pub img_size: Option<(u32, u32)>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AudioFp {
+    pub duration_ms: u32,
+    pub chunk_hashes: Vec<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepoStats {
+    pub file_count: u64,
+    pub total_size: u64,
+    pub missing_count: u64,
+}
+
+pub type DuplicateGroup = (u64, [u8; 32], Vec<String>);
+
+pub struct Store {
+    config_dir: PathBuf,
+    registry: redb::Database,
+}
+
+fn get_config_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(".config").join("dedup")
+    } else {
+        PathBuf::from(".config").join("dedup")
+    }
+}
+
+fn serialize_value<T: Serialize>(schema_ver: u8, value: &T) -> Result<Vec<u8>, StoreError> {
+    let mut bytes = vec![schema_ver];
+    let serialized =
+        postcard::to_allocvec(value).map_err(|e| StoreError::Serialization(e.to_string()))?;
+    bytes.extend_from_slice(&serialized);
+    Ok(bytes)
+}
+
+fn deserialize_value<'a, T: Deserialize<'a>>(
+    schema_ver: u8,
+    bytes: &'a [u8],
+) -> Result<T, StoreError> {
+    if bytes.is_empty() {
+        return Err(StoreError::Deserialization("Empty bytes".to_string()));
+    }
+    if bytes[0] != schema_ver {
+        return Err(StoreError::SchemaVersionMismatch {
+            expected: schema_ver,
+            found: bytes[0],
+        });
+    }
+    postcard::from_bytes(&bytes[1..]).map_err(|e| StoreError::Deserialization(e.to_string()))
+}
+
+impl Store {
+    pub fn open() -> Result<Self, StoreError> {
+        Self::open_at(get_config_dir())
+    }
+
+    pub fn open_at(config_dir: PathBuf) -> Result<Self, StoreError> {
+        std::fs::create_dir_all(&config_dir)?;
+
+        let registry_path = config_dir.join("repos.redb");
+        let registry = redb::Database::create(&registry_path)?;
+
+        // Ensure registry table exists
+        let write_txn = registry.begin_write()?;
+        {
+            let _table = write_txn.open_table(REPOS)?;
+        }
+        write_txn.commit()?;
+
+        Ok(Self {
+            config_dir,
+            registry,
+        })
+    }
+
+    pub fn get_repo_db_path(&self, name: &str) -> PathBuf {
+        self.config_dir.join("repos").join(name).join("index.redb")
+    }
+
+    pub fn open_repo_db(&self, name: &str) -> Result<redb::Database, StoreError> {
+        let path = self.get_repo_db_path(name);
+        if let Some(parent) = path.parent()
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let db = redb::Database::create(&path)?;
+
+        // Ensure tables exist
+        let write_txn = db.begin_write()?;
+        {
+            let _files = write_txn.open_table(FILES)?;
+            let _by_size_hash = write_txn.open_multimap_table(BY_SIZE_HASH)?;
+            let _by_fprint = write_txn.open_multimap_table(BY_FPRINT)?;
+            let _meta = write_txn.open_table(META)?;
+            let _mime_stats = write_txn.open_table(MIME_STATS)?;
+        }
+        write_txn.commit()?;
+
+        Ok(db)
+    }
+
+    pub fn create_repo(&self, name: &str, path: &str) -> Result<(), StoreError> {
+        let abs_path = std::path::Path::new(path);
+        let abs_path_str = if abs_path.is_absolute() {
+            path.to_string()
+        } else {
+            std::fs::canonicalize(abs_path)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| path.to_string())
+        };
+
+        let created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let meta = RepoMeta {
+            abs_path: abs_path_str,
+            created,
+            hash_algo: "BLAKE3".to_string(),
+            schema_ver: SCHEMA_VERSION,
+        };
+        let serialized = serialize_value(SCHEMA_VERSION, &meta)?;
+
+        // Check and insert within one write transaction so a concurrent create
+        // cannot slip in between; the check also runs before the repo database
+        // is touched, so an existing repo's stats are never reset.
+        let reg_write_txn = self.registry.begin_write()?;
+        {
+            let mut reg_table = reg_write_txn.open_table(REPOS)?;
+            if reg_table.get(name)?.is_some() {
+                return Err(StoreError::AlreadyExists(name.to_string()));
+            }
+
+            // Initialize the repository B-tree file and its meta stats
+            let repo_db = self.open_repo_db(name)?;
+            let write_txn = repo_db.begin_write()?;
+            {
+                let mut meta_table = write_txn.open_table(META)?;
+                meta_table.insert("file_count", 0u64)?;
+                meta_table.insert("total_size", 0u64)?;
+                meta_table.insert("missing_count", 0u64)?;
+            }
+            write_txn.commit()?;
+
+            reg_table.insert(name, serialized.as_slice())?;
+        }
+        reg_write_txn.commit()?;
+
+        Ok(())
+    }
+
+    pub fn get_repo(&self, name: &str) -> Result<RepoMeta, StoreError> {
+        let read_txn = self.registry.begin_read()?;
+        let table = read_txn.open_table(REPOS)?;
+        match table.get(name)? {
+            Some(guard) => deserialize_value(SCHEMA_VERSION, guard.value()),
+            None => Err(StoreError::NotFound(name.to_string())),
+        }
+    }
+
+    pub fn list_repos(&self) -> Result<Vec<(String, RepoMeta, RepoStats)>, StoreError> {
+        let read_txn = self.registry.begin_read()?;
+        let table = read_txn.open_table(REPOS)?;
+
+        let mut repos = Vec::new();
+        for item in table.iter()? {
+            let (name_guard, val_guard) = item?;
+            let name = name_guard.value().to_string();
+            let meta: RepoMeta = deserialize_value(SCHEMA_VERSION, val_guard.value())?;
+            let stats = self.get_repo_stats(&name)?;
+            repos.push((name, meta, stats));
+        }
+
+        Ok(repos)
+    }
+
+    pub fn get_repo_stats(&self, name: &str) -> Result<RepoStats, StoreError> {
+        let db_path = self.get_repo_db_path(name);
+        if !db_path.exists() {
+            return Ok(RepoStats {
+                file_count: 0,
+                total_size: 0,
+                missing_count: 0,
+            });
+        }
+
+        let db = redb::Database::open(&db_path)?;
+        let read_txn = db.begin_read()?;
+        let meta_table = read_txn.open_table(META)?;
+
+        let file_count = meta_table
+            .get("file_count")?
+            .map(|v| v.value())
+            .unwrap_or(0);
+        let total_size = meta_table
+            .get("total_size")?
+            .map(|v| v.value())
+            .unwrap_or(0);
+        let missing_count = meta_table
+            .get("missing_count")?
+            .map(|v| v.value())
+            .unwrap_or(0);
+
+        Ok(RepoStats {
+            file_count,
+            total_size,
+            missing_count,
+        })
+    }
+
+    pub fn remove_repo(&self, name: &str) -> Result<(), StoreError> {
+        let reg_write_txn = self.registry.begin_write()?;
+        {
+            let mut reg_table = reg_write_txn.open_table(REPOS)?;
+            if reg_table.remove(name)?.is_none() {
+                return Err(StoreError::NotFound(name.to_string()));
+            }
+        }
+        reg_write_txn.commit()?;
+
+        let db_dir = self.config_dir.join("repos").join(name);
+        if db_dir.exists() {
+            std::fs::remove_dir_all(&db_dir)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn rename_repo(&self, name: &str, new_name: &str) -> Result<(), StoreError> {
+        let reg_write_txn = self.registry.begin_write()?;
+        {
+            let mut reg_table = reg_write_txn.open_table(REPOS)?;
+            let bytes = match reg_table.get(name)? {
+                Some(guard) => guard.value().to_vec(),
+                None => return Err(StoreError::NotFound(name.to_string())),
+            };
+            if reg_table.get(new_name)?.is_some() {
+                return Err(StoreError::AlreadyExists(new_name.to_string()));
+            }
+            reg_table.remove(name)?;
+            reg_table.insert(new_name, bytes.as_slice())?;
+        }
+        reg_write_txn.commit()?;
+
+        let old_db_dir = self.config_dir.join("repos").join(name);
+        let new_db_dir = self.config_dir.join("repos").join(new_name);
+        if old_db_dir.exists() {
+            if let Some(parent) = new_db_dir.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(old_db_dir, new_db_dir)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn relocate_repo(&self, name: &str, new_path: &str) -> Result<(), StoreError> {
+        let reg_write_txn = self.registry.begin_write()?;
+        let mut meta = {
+            let reg_table = reg_write_txn.open_table(REPOS)?;
+            let meta_bytes = match reg_table.get(name)? {
+                Some(guard) => guard.value().to_vec(),
+                None => return Err(StoreError::NotFound(name.to_string())),
+            };
+            deserialize_value::<RepoMeta>(SCHEMA_VERSION, &meta_bytes)?
+        };
+
+        let abs_path = std::path::Path::new(new_path);
+        let abs_path_str = if abs_path.is_absolute() {
+            new_path.to_string()
+        } else {
+            std::fs::canonicalize(abs_path)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| new_path.to_string())
+        };
+
+        meta.abs_path = abs_path_str;
+        let serialized = serialize_value(SCHEMA_VERSION, &meta)?;
+
+        {
+            let mut reg_table = reg_write_txn.open_table(REPOS)?;
+            reg_table.insert(name, serialized.as_slice())?;
+        }
+        reg_write_txn.commit()?;
+
+        Ok(())
+    }
+
+    pub fn update_file_entry(
+        &self,
+        repo_name: &str,
+        rel_path: &str,
+        entry: &FileEntry,
+    ) -> Result<(), StoreError> {
+        let db = self.open_repo_db(repo_name)?;
+        apply_entries(&db, std::iter::once((rel_path, entry)))
+    }
+
+    pub fn get_file_entry(
+        &self,
+        repo_name: &str,
+        rel_path: &str,
+    ) -> Result<Option<FileEntry>, StoreError> {
+        let db = self.open_repo_db(repo_name)?;
+        let read_txn = db.begin_read()?;
+        let files_table = read_txn.open_table(FILES)?;
+
+        match files_table.get(rel_path)? {
+            Some(guard) => Ok(Some(deserialize_value(SCHEMA_VERSION, guard.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn remove_file_entry(&self, repo_name: &str, rel_path: &str) -> Result<(), StoreError> {
+        let db = self.open_repo_db(repo_name)?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut tables = RepoTables::open(&write_txn)?;
+            tables.remove(rel_path)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_duplicate_groups(&self, repo_name: &str) -> Result<Vec<DuplicateGroup>, StoreError> {
+        let db = self.open_repo_db(repo_name)?;
+        let read_txn = db.begin_read()?;
+        let by_size_hash = read_txn.open_multimap_table(BY_SIZE_HASH)?;
+
+        let mut groups = Vec::new();
+        for item in by_size_hash.iter()? {
+            let (key_guard, val_iter) = item?;
+            let (size, hash_slice) = key_guard.value();
+
+            let mut paths = Vec::new();
+            for path_res in val_iter {
+                paths.push(path_res?.value().to_string());
+            }
+
+            if paths.len() > 1 {
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(hash_slice);
+                groups.push((size, hash, paths));
+            }
+        }
+
+        Ok(groups)
+    }
+}
+
+/// The open tables of one repo database inside a single write transaction.
+///
+/// All index maintenance goes through this type so the invariant holds in one
+/// place: every mutation of `FILES` updates `BY_SIZE_HASH`, `BY_FPRINT`,
+/// `META`, and `MIME_STATS` in the same transaction, and `missing` entries are
+/// excluded from index tables and stats.
+struct RepoTables<'txn> {
+    files: redb::Table<'txn, &'static str, &'static [u8]>,
+    by_size_hash: redb::MultimapTable<'txn, (u64, &'static [u8]), &'static str>,
+    by_fprint: redb::MultimapTable<'txn, u64, &'static str>,
+    meta: redb::Table<'txn, &'static str, u64>,
+    mime_stats: redb::Table<'txn, &'static str, u64>,
+}
+
+impl<'txn> RepoTables<'txn> {
+    fn open(txn: &'txn redb::WriteTransaction) -> Result<Self, StoreError> {
+        Ok(Self {
+            files: txn.open_table(FILES)?,
+            by_size_hash: txn.open_multimap_table(BY_SIZE_HASH)?,
+            by_fprint: txn.open_multimap_table(BY_FPRINT)?,
+            meta: txn.open_table(META)?,
+            mime_stats: txn.open_table(MIME_STATS)?,
+        })
+    }
+
+    fn get_entry(&self, rel_path: &str) -> Result<Option<FileEntry>, StoreError> {
+        match self.files.get(rel_path)? {
+            Some(guard) => Ok(Some(deserialize_value(SCHEMA_VERSION, guard.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Insert or replace one file entry, keeping index tables and stats consistent.
+    fn upsert(&mut self, rel_path: &str, entry: &FileEntry) -> Result<(), StoreError> {
+        if let Some(old) = self.get_entry(rel_path)? {
+            self.unindex(rel_path, &old)?;
+        }
+        self.index(rel_path, entry)?;
+        let serialized = serialize_value(SCHEMA_VERSION, entry)?;
+        self.files.insert(rel_path, serialized.as_slice())?;
+        Ok(())
+    }
+
+    /// Remove one file entry and its index/stats contributions entirely.
+    fn remove(&mut self, rel_path: &str) -> Result<(), StoreError> {
+        if let Some(old) = self.get_entry(rel_path)? {
+            self.unindex(rel_path, &old)?;
+            self.files.remove(rel_path)?;
+        }
+        Ok(())
+    }
+
+    /// Undo the index/stats contributions of an existing entry.
+    fn unindex(&mut self, rel_path: &str, old: &FileEntry) -> Result<(), StoreError> {
+        if !old.missing {
+            self.by_size_hash
+                .remove((old.size, &old.hash[..]), rel_path)?;
+            if let Some(fp) = old.img_fingerprint {
+                self.by_fprint.remove(fp, rel_path)?;
+            }
+            self.bump_meta("file_count", -1)?;
+            self.bump_meta_by("total_size", old.size, false)?;
+            if let Some(ref mime) = old.mime {
+                let count = self
+                    .mime_stats
+                    .get(mime.as_str())?
+                    .map(|v| v.value())
+                    .unwrap_or(0);
+                if count <= 1 {
+                    self.mime_stats.remove(mime.as_str())?;
+                } else {
+                    self.mime_stats.insert(mime.as_str(), count - 1)?;
+                }
+            }
+        } else {
+            self.bump_meta("missing_count", -1)?;
+        }
+        Ok(())
+    }
+
+    /// Apply the index/stats contributions of a new entry.
+    fn index(&mut self, rel_path: &str, entry: &FileEntry) -> Result<(), StoreError> {
+        if !entry.missing {
+            self.by_size_hash
+                .insert((entry.size, &entry.hash[..]), rel_path)?;
+            if let Some(fp) = entry.img_fingerprint {
+                self.by_fprint.insert(fp, rel_path)?;
+            }
+            self.bump_meta("file_count", 1)?;
+            self.bump_meta_by("total_size", entry.size, true)?;
+            if let Some(ref mime) = entry.mime {
+                let count = self
+                    .mime_stats
+                    .get(mime.as_str())?
+                    .map(|v| v.value())
+                    .unwrap_or(0);
+                self.mime_stats.insert(mime.as_str(), count + 1)?;
+            }
+        } else {
+            self.bump_meta("missing_count", 1)?;
+        }
+        Ok(())
+    }
+
+    fn bump_meta(&mut self, key: &str, delta: i64) -> Result<(), StoreError> {
+        let amount = delta.unsigned_abs();
+        self.bump_meta_by(key, amount, delta >= 0)
+    }
+
+    fn bump_meta_by(&mut self, key: &str, amount: u64, add: bool) -> Result<(), StoreError> {
+        let current = self.meta.get(key)?.map(|v| v.value()).unwrap_or(0);
+        let next = if add {
+            current.saturating_add(amount)
+        } else {
+            current.saturating_sub(amount)
+        };
+        self.meta.insert(key, next)?;
+        Ok(())
+    }
+}
+
+/// Insert or replace many file entries within a single write transaction.
+pub fn apply_entries<'a, I>(db: &redb::Database, entries: I) -> Result<(), StoreError>
+where
+    I: IntoIterator<Item = (&'a str, &'a FileEntry)>,
+{
+    let write_txn = db.begin_write()?;
+    {
+        let mut tables = RepoTables::open(&write_txn)?;
+        for (rel_path, entry) in entries {
+            tables.upsert(rel_path, entry)?;
+        }
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+
+/// Mark the given paths missing within a single write transaction.
+/// Paths without an entry or already missing are left untouched.
+pub fn mark_missing<'a, I>(db: &redb::Database, rel_paths: I) -> Result<(), StoreError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let write_txn = db.begin_write()?;
+    {
+        let mut tables = RepoTables::open(&write_txn)?;
+        for rel_path in rel_paths {
+            if let Some(mut entry) = tables.get_entry(rel_path)?
+                && !entry.missing
+            {
+                entry.missing = true;
+                tables.upsert(rel_path, &entry)?;
+            }
+        }
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+
+/// The subset of a [`FileEntry`] the update scan needs for change detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanEntry {
+    pub size: u64,
+    pub modified_ms: i64,
+    pub missing: bool,
+}
+
+/// Read the scan-relevant state of every indexed file.
+pub fn read_scan_index(
+    db: &redb::Database,
+) -> Result<std::collections::HashMap<String, ScanEntry>, StoreError> {
+    let read_txn = db.begin_read()?;
+    let files_table = read_txn.open_table(FILES)?;
+    let mut index = std::collections::HashMap::new();
+    for item in files_table.iter()? {
+        let (key_guard, val_guard) = item?;
+        let entry: FileEntry = deserialize_value(SCHEMA_VERSION, val_guard.value())?;
+        index.insert(
+            key_guard.value().to_string(),
+            ScanEntry {
+                size: entry.size,
+                modified_ms: entry.modified_ms,
+                missing: entry.missing,
+            },
+        );
+    }
+    Ok(index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_store_invariants() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = Store::open_at(temp_dir.path().to_path_buf())?;
+
+        // 1. Create a repository
+        let repo_dir = temp_dir.path().join("mock_repo");
+        std::fs::create_dir_all(&repo_dir)?;
+        store.create_repo("test-repo", &repo_dir.to_string_lossy())?;
+
+        // Check initial state
+        let stats = store.get_repo_stats("test-repo")?;
+        assert_eq!(stats.file_count, 0);
+        assert_eq!(stats.total_size, 0);
+        assert_eq!(stats.missing_count, 0);
+
+        // 2. Insert some file entries
+        let file1 = FileEntry {
+            size: 100,
+            hash: [1; 32],
+            modified_ms: 123456,
+            missing: false,
+            mime: Some("image/png".to_string()),
+            img_fingerprint: Some(42),
+            video_hash: None,
+            pdf_hash: None,
+            audio: None,
+            img_size: None,
+        };
+
+        let file2 = FileEntry {
+            size: 200,
+            hash: [2; 32],
+            modified_ms: 123457,
+            missing: false,
+            mime: Some("image/png".to_string()),
+            img_fingerprint: Some(43),
+            video_hash: None,
+            pdf_hash: None,
+            audio: None,
+            img_size: None,
+        };
+
+        store.update_file_entry("test-repo", "file1.png", &file1)?;
+        store.update_file_entry("test-repo", "file2.png", &file2)?;
+
+        // Verify stats updated correctly
+        let stats = store.get_repo_stats("test-repo")?;
+        assert_eq!(stats.file_count, 2);
+        assert_eq!(stats.total_size, 300);
+        assert_eq!(stats.missing_count, 0);
+
+        // 3. Verify duplicate lookup (add file3.png with same size and hash as file1)
+        let file3 = FileEntry {
+            size: 100,
+            hash: [1; 32], // Same as file1
+            modified_ms: 123458,
+            missing: false,
+            mime: Some("image/png".to_string()),
+            img_fingerprint: Some(42),
+            video_hash: None,
+            pdf_hash: None,
+            audio: None,
+            img_size: None,
+        };
+        store.update_file_entry("test-repo", "file3.png", &file3)?;
+
+        let stats = store.get_repo_stats("test-repo")?;
+        assert_eq!(stats.file_count, 3);
+        assert_eq!(stats.total_size, 400);
+
+        let dup_groups = store.get_duplicate_groups("test-repo")?;
+        assert_eq!(dup_groups.len(), 1);
+        assert_eq!(dup_groups[0].0, 100);
+        assert_eq!(dup_groups[0].1, [1; 32]);
+        assert!(dup_groups[0].2.contains(&"file1.png".to_string()));
+        assert!(dup_groups[0].2.contains(&"file3.png".to_string()));
+
+        // 4. Mark file3 missing, check it gets excluded from index & stats
+        let mut file3_missing = file3.clone();
+        file3_missing.missing = true;
+        store.update_file_entry("test-repo", "file3.png", &file3_missing)?;
+
+        let stats = store.get_repo_stats("test-repo")?;
+        assert_eq!(stats.file_count, 2); // Decremented from 3 to 2
+        assert_eq!(stats.total_size, 300); // Decremented from 400 to 300
+        assert_eq!(stats.missing_count, 1);
+
+        // Check it is excluded from duplicates
+        let dup_groups = store.get_duplicate_groups("test-repo")?;
+        assert!(dup_groups.is_empty()); // No duplicate groups now as file3 is missing
+
+        // 5. Test repo list stats are loaded from META directly
+        let list = store.list_repos()?;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].0, "test-repo");
+        assert_eq!(list[0].2.file_count, 2);
+        assert_eq!(list[0].2.total_size, 300);
+        assert_eq!(list[0].2.missing_count, 1);
+
+        // 6. Test rename and relocate
+        store.rename_repo("test-repo", "renamed-repo")?;
+        assert!(
+            store.get_repo_stats("test-repo").is_err()
+                || !store.get_repo_db_path("test-repo").exists()
+        );
+        let stats = store.get_repo_stats("renamed-repo")?;
+        assert_eq!(stats.file_count, 2);
+
+        store.relocate_repo("renamed-repo", "/mock/relocated/path")?;
+        let repos = store.list_repos()?;
+        assert_eq!(repos[0].0, "renamed-repo");
+        assert_eq!(repos[0].1.abs_path, "/mock/relocated/path");
+
+        // 7. Test remove
+        store.remove_repo("renamed-repo")?;
+        let repos = store.list_repos()?;
+        assert!(repos.is_empty());
+
+        Ok(())
+    }
+}
