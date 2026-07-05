@@ -3,6 +3,7 @@
 //! and File tabs are placeholders for Phases 6 and 7.
 
 use crate::dupes_view::DupesView;
+use crate::files_view::FilesView;
 use crate::theme;
 use crate::util::format_size;
 use crate::worker::{ChannelProgress, WorkerMsg, WorkerState};
@@ -91,6 +92,7 @@ pub struct DedupApp {
     worker: WorkerState,
     cancels: HashMap<String, CancellationToken>,
     dupes: DupesView,
+    files: FilesView,
 }
 
 impl DedupApp {
@@ -112,6 +114,7 @@ impl DedupApp {
             worker: WorkerState::default(),
             cancels: HashMap::new(),
             dupes: DupesView::new(),
+            files: FilesView::new(),
         };
         app.reload_all();
         app
@@ -292,7 +295,7 @@ impl eframe::App for DedupApp {
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Repositories => self.repositories_view(ui, &mut actions),
             Tab::Duplicates => self.dupes.show(ui, &self.store),
-            Tab::Files => placeholder(ui, "FILE MANAGEMENT", "Arrives in Phase 7."),
+            Tab::Files => self.files.show(ui, &self.store),
         });
         if self.show_settings {
             self.settings_modal(&ctx);
@@ -658,15 +661,6 @@ fn stat(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
     );
     ui.label(RichText::new(value).color(color).strong());
     ui.add_space(10.0);
-}
-
-fn placeholder(ui: &mut egui::Ui, title: &str, note: &str) {
-    ui.add_space(40.0);
-    ui.vertical_centered(|ui| {
-        ui.label(RichText::new(title).color(theme::LILAC).size(24.0).strong());
-        ui.add_space(8.0);
-        ui.label(RichText::new(note).color(theme::TEXT));
-    });
 }
 
 fn progress_line(event: &ProgressEvent) -> String {

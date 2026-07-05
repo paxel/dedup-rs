@@ -1,0 +1,18 @@
+# cargo-audit policy. Each ignore is a transitive advisory we cannot resolve at
+# our level (they enter through the eframe/egui -> winit -> Wayland stack and
+# indicatif) and that is not reachable with attacker-controlled input in dedup.
+# Revisit whenever eframe/winit are bumped.
+[advisories]
+ignore = [
+    # quick-xml 0.39 (fixed >=0.41) is used only by wayland-scanner at BUILD time
+    # to parse the trusted, bundled Wayland protocol XML — never runtime input.
+    # wayland-scanner pins "^0.39", so the fix must come from winit/smithay.
+    "RUSTSEC-2026-0194", # quick-xml: quadratic run time on duplicate attributes
+    "RUSTSEC-2026-0195", # quick-xml: unbounded namespace-declaration allocation
+
+    # Unmaintained transitive crates (warnings, not vulnerabilities):
+    "RUSTSEC-2023-0089", # atomic-polyfill (unmaintained)
+    "RUSTSEC-2025-0119", # number_prefix (via indicatif)
+    "RUSTSEC-2024-0436", # paste (unmaintained)
+    "RUSTSEC-2026-0192", # ttf-parser (via egui font stack)
+]

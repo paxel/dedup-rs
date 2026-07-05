@@ -12,6 +12,9 @@ use dedup_core::update::{CancellationToken, Progress, ProgressEvent, update_repo
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+    /// GUI only: scale the interface by this factor (0.5–3.0)
+    #[arg(long, global = true)]
+    ui_scale: Option<f32>,
 }
 
 #[derive(Subcommand)]
@@ -252,7 +255,7 @@ fn main() -> anyhow::Result<()> {
         }
         None => {
             println!("Starting GUI...");
-            if let Err(e) = dedup_gui::run() {
+            if let Err(e) = dedup_gui::run(cli.ui_scale) {
                 eprintln!("GUI Error: {}", e);
                 std::process::exit(1);
             }

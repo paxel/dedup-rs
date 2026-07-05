@@ -48,9 +48,9 @@ Launching with no subcommand opens an LCARS-inspired (`eframe`/`egui`) desktop w
 
 - **Repository management** (implemented) — an overview of registered repositories with cached stats (files, size, missing) and controls to add, delete, rename, relocate, duplicate, and update/scan. Scans run on a background thread with live, coalesced progress and a per-repo cancel button, so the UI stays responsive on large repositories.
 - **Duplicate management** (implemented) — toggle which repos to search (each with a read-only flag whose files are never selected for deletion), choose exact duplicates or perceptual similars (threshold slider), and review paged groups (50 per page) of file cards with thumbnail, path, size, dimensions, mtime, and a KEEP/DELETE toggle (best copy starred). Thumbnails are cached on disk (`~/.cache/dedup/thumbs`) and decoded on background threads into an LRU texture cache. Deletions are batched per repo and always confirmed; "Auto-resolve rest" preselects every non-best copy in a deletable repo.
-- **File management** — copy/move/delete flows arrive in Phase 7.
+- **File management** (implemented) — pick a source repo and a target repo, choose copy / move / delete, narrow with a mime/name/size filter, preview the first `from → to` transfers, and run it on a background thread behind a confirmation (copy/move transfer content the target lacks; delete removes source files the target already has). Content is compared by size + hash, never path.
 
-Settings (cog, top-right) currently exposes the hashing thread count used by scans.
+Settings (cog, top-right) currently exposes the hashing thread count used by scans. Launch with `--ui-scale <0.5–3.0>` to scale the interface (e.g. `dedup --ui-scale 1.25`).
 
 ### CLI Commands
 

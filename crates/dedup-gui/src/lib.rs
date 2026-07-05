@@ -3,6 +3,7 @@
 
 mod app;
 mod dupes_view;
+mod files_view;
 mod theme;
 mod thumbs;
 mod util;
@@ -12,7 +13,10 @@ use dedup_core::store::Store;
 use std::sync::Arc;
 
 /// Open the desktop window. Blocks until the user closes it.
-pub fn run() -> Result<(), String> {
+///
+/// `ui_scale` (from `--ui-scale`) multiplies the interface size; `None` keeps
+/// the default.
+pub fn run(ui_scale: Option<f32>) -> Result<(), String> {
     let store = Arc::new(Store::open().map_err(|e| e.to_string())?);
 
     let options = eframe::NativeOptions {
@@ -28,6 +32,9 @@ pub fn run() -> Result<(), String> {
         options,
         Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
+            if let Some(scale) = ui_scale {
+                cc.egui_ctx.set_zoom_factor(scale.clamp(0.5, 3.0));
+            }
             Ok(Box::new(app::DedupApp::new(store)))
         }),
     )
