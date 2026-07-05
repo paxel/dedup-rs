@@ -305,6 +305,11 @@ pub fn update_repo(
         let vanished: Vec<&str> = remaining.into_keys().collect();
         stats.marked_missing = vanished.len() as u64;
         store::mark_missing(&db, vanished)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        store::set_last_scan(&db, now_ms)?;
     }
 
     progress.on(ProgressEvent::Finished { stats });

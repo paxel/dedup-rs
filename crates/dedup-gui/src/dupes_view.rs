@@ -2,6 +2,7 @@
 //! duplicates or perceptual similars, review paged groups with thumbnails, and
 //! delete the worse copies — batched per repo, never without a confirmation.
 
+use crate::icon;
 use crate::theme;
 use crate::thumbs::ThumbCache;
 use crate::util::{format_mtime, format_size};
@@ -187,7 +188,10 @@ impl DupesView {
                 }
                 ui.add_space(8.0);
             }
-            if ui.button(RichText::new("↻").color(theme::BLACK)).clicked() {
+            if ui
+                .button(RichText::new(icon::REFRESH).color(theme::BLACK))
+                .clicked()
+            {
                 acts.push(Act::ReloadRepos);
             }
         });
@@ -220,7 +224,10 @@ impl DupesView {
             }
             if ui
                 .add(
-                    egui::Button::new(RichText::new("FIND").color(theme::BLACK)).fill(theme::AMBER),
+                    egui::Button::new(
+                        RichText::new(format!("{} FIND", icon::SEARCH)).color(theme::BLACK),
+                    )
+                    .fill(theme::AMBER),
                 )
                 .clicked()
             {
@@ -259,7 +266,10 @@ impl DupesView {
         let pages = self.groups.len().div_ceil(PAGE_SIZE);
         let page = self.page.min(pages.saturating_sub(1));
         ui.horizontal(|ui| {
-            if ui.add_enabled(page > 0, egui::Button::new("◀")).clicked() {
+            if ui
+                .add_enabled(page > 0, egui::Button::new(icon::CARET_LEFT))
+                .clicked()
+            {
                 acts.push(Act::SetPage(page - 1));
             }
             ui.label(
@@ -272,7 +282,7 @@ impl DupesView {
                 .color(theme::TAN),
             );
             if ui
-                .add_enabled(page + 1 < pages, egui::Button::new("▶"))
+                .add_enabled(page + 1 < pages, egui::Button::new(icon::CARET_RIGHT))
                 .clicked()
             {
                 acts.push(Act::SetPage(page + 1));
@@ -368,7 +378,7 @@ impl DupesView {
 
                     if is_best {
                         ui.label(
-                            RichText::new("★ BEST")
+                            RichText::new(format!("{} BEST", icon::STAR))
                                 .color(theme::BLUE)
                                 .size(12.0)
                                 .strong(),
@@ -420,7 +430,8 @@ impl DupesView {
             .inner_margin(18.0)
             .show(ui, |ui| {
                 ui.set_width(160.0);
-                ui.centered_and_justified(|ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new(icon::IMAGE).color(theme::LILAC).size(28.0));
                     ui.label(RichText::new(label).color(theme::LILAC).size(11.0));
                 });
             });

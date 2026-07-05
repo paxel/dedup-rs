@@ -203,8 +203,12 @@ fn cancelled_before_start_hashes_nothing() -> TestResult {
 fn cancel_mid_hash_stops_cleanly_and_keeps_index_consistent() -> TestResult {
     let tempdir = tempfile::tempdir()?;
     let (store, data) = setup(tempdir.path())?;
-    for i in 0..20 {
-        write(&data, &format!("f{i}.bin"), &[i as u8; 1000])?;
+    // Files big enough that hashing each takes real time; with tiny files the
+    // single hashing thread can drain all of them into the unbounded channel
+    // before the consumer emits the first Hashing event and cancels.
+    const N: usize = 20;
+    for i in 0..N {
+        write(&data, &format!("f{i}.bin"), &vec![i as u8; 2 * 1024 * 1024])?;
     }
 
     let cancel = CancellationToken::new();
@@ -213,7 +217,11 @@ fn cancel_mid_hash_stops_cleanly_and_keeps_index_consistent() -> TestResult {
     };
     let stats = update_repo(&store, "test", 1, &progress, &cancel)?;
     assert!(stats.cancelled);
-    assert!(stats.added < 20, "cancellation should stop hashing early");
+    assert!(
+        (stats.added as usize) < N,
+        "cancellation should stop hashing early (added {})",
+        stats.added
+    );
     // Whatever was committed is consistent: META matches the entries.
     assert_eq!(store.get_repo_stats("test")?.file_count, stats.added);
     // Nothing is marked missing on a cancelled run.

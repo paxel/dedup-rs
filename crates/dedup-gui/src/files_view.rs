@@ -7,6 +7,7 @@
 //!   target repo's directory (move also marks the source entries missing).
 //! - **Delete** removes source files whose content the target already has.
 
+use crate::icon;
 use crate::theme;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::diff::{DiffItem, diff_copy, diff_delete, diff_print};
@@ -189,7 +190,10 @@ impl FilesView {
                     acts.push(Act::PickSource(name.clone()));
                 }
             }
-            if ui.button(RichText::new("↻").color(theme::BLACK)).clicked() {
+            if ui
+                .button(RichText::new(icon::REFRESH).color(theme::BLACK))
+                .clicked()
+            {
                 acts.push(Act::Reload);
             }
         });
@@ -338,7 +342,7 @@ impl FilesView {
                 for row in &self.preview {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&row.from).color(theme::TEXT).size(12.0));
-                        ui.label(RichText::new("→").color(theme::ORANGE));
+                        ui.label(RichText::new(icon::ARROW_RIGHT).color(theme::ORANGE));
                         ui.label(RichText::new(&row.to).color(theme::BLUE).size(12.0));
                     });
                 }

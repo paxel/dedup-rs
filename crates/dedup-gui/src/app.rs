@@ -5,6 +5,7 @@
 
 use crate::dupes_view::DupesView;
 use crate::files_view::FilesView;
+use crate::icon;
 use crate::theme;
 use crate::util::format_size;
 use crate::worker::{ChannelProgress, WorkerMsg, WorkerState};
@@ -30,6 +31,8 @@ struct RepoRow {
     name: String,
     path: String,
     stats: RepoStats,
+    /// MIME distribution (`mime → count`), sorted by count descending.
+    mimes: Vec<(String, u64)>,
     /// Result of the most recent update, if any (for a one-line status).
     last: Option<String>,
 }
@@ -140,18 +143,19 @@ impl DedupApp {
             Ok(list) => {
                 let prev: HashMap<String, Option<String>> =
                     self.repos.drain(..).map(|r| (r.name, r.last)).collect();
-                self.repos = list
-                    .into_iter()
-                    .map(|(name, meta, stats)| {
-                        let last = prev.get(&name).cloned().flatten();
-                        RepoRow {
-                            name,
-                            path: meta.abs_path,
-                            stats,
-                            last,
-                        }
-                    })
-                    .collect();
+                let mut rows = Vec::with_capacity(list.len());
+                for (name, meta, stats) in list {
+                    let last = prev.get(&name).cloned().flatten();
+                    let mimes = self.store.get_mime_stats(&name).unwrap_or_default();
+                    rows.push(RepoRow {
+                        name,
+                        path: meta.abs_path,
+                        stats,
+                        mimes,
+                        last,
+                    });
+                }
+                self.repos = rows;
                 self.load_error = None;
             }
             Err(e) => self.load_error = Some(e.to_string()),
@@ -161,10 +165,15 @@ impl DedupApp {
     /// Refresh a single repo's stats — used right after its update finishes,
     /// when its db is released again.
     fn refresh_repo(&mut self, name: &str) {
-        if let Ok(stats) = self.store.get_repo_stats(name)
-            && let Some(row) = self.repos.iter_mut().find(|r| r.name == name)
-        {
-            row.stats = stats;
+        let stats = self.store.get_repo_stats(name).ok();
+        let mimes = self.store.get_mime_stats(name).ok();
+        if let Some(row) = self.repos.iter_mut().find(|r| r.name == name) {
+            if let Some(stats) = stats {
+                row.stats = stats;
+            }
+            if let Some(mimes) = mimes {
+                row.mimes = mimes;
+            }
         }
     }
 
@@ -399,7 +408,8 @@ impl DedupApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
                             .add(egui::Button::new(
-                                RichText::new("⚙ SETTINGS").color(theme::BLACK),
+                                RichText::new(format!("{} SETTINGS", icon::GEAR))
+                                    .color(theme::BLACK),
                             ))
                             .clicked()
                         {
@@ -428,8 +438,10 @@ impl DedupApp {
         // (which reads every repo's stats) must wait until scans finish.
         let busy = self.worker.active_count() > 0;
         ui.horizontal(|ui| {
-            let add = egui::Button::new(RichText::new("＋ ADD REPOSITORY").color(theme::BLACK))
-                .fill(theme::BLUE);
+            let add = egui::Button::new(
+                RichText::new(format!("{} ADD REPOSITORY", icon::PLUS)).color(theme::BLACK),
+            )
+            .fill(theme::BLUE);
             if ui.add_enabled(!busy, add).clicked() {
                 actions.push(Action::OpenAdd);
             }
@@ -449,7 +461,7 @@ impl DedupApp {
             .show(ui, |ui| {
                 if rows.is_empty() {
                     ui.add_space(8.0);
-                    ui.colored_label(theme::TEXT, "No repositories yet. Press ＋ ADD REPOSITORY.");
+                    ui.colored_label(theme::TEXT, "No repositories yet — use ADD REPOSITORY.");
                 }
                 for row in &rows {
                     self.repo_card(ui, row, actions);
@@ -462,12 +474,13 @@ impl DedupApp {
         egui::Frame::new()
             .fill(theme::PANEL)
             .corner_radius(theme::PILL)
+            .stroke(egui::Stroke::new(1.5, theme::ORANGE))
             .inner_margin(12.0)
             .outer_margin(egui::Margin {
                 left: 0,
                 right: 0,
                 top: 0,
-                bottom: 8,
+                bottom: 10,
             })
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -477,7 +490,12 @@ impl DedupApp {
                             .size(17.0)
                             .strong(),
                     );
-                    ui.label(RichText::new(&row.path).color(theme::TEXT).size(12.0));
+                    ui.label(RichText::new(&row.path).color(theme::TEXT).size(12.0))
+                        .on_hover_text(&row.path);
+                    // MIME breakdown, share-sorted, pinned to the top-right.
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        mime_tags(ui, row);
+                    });
                 });
                 ui.horizontal(|ui| {
                     stat(
@@ -485,13 +503,28 @@ impl DedupApp {
                         "FILES",
                         &row.stats.file_count.to_string(),
                         theme::ORANGE,
+                        "Indexed files (missing files excluded)",
                     );
-                    stat(ui, "SIZE", &format_size(row.stats.total_size), theme::BLUE);
+                    stat(
+                        ui,
+                        "SIZE",
+                        &format_size(row.stats.total_size),
+                        theme::BLUE,
+                        "Total size of indexed files",
+                    );
                     stat(
                         ui,
                         "MISSING",
                         &row.stats.missing_count.to_string(),
                         theme::LILAC,
+                        "Indexed before but no longer on disk",
+                    );
+                    stat(
+                        ui,
+                        "SCANNED",
+                        &format_last_scan(row.stats.last_scan_ms),
+                        theme::TAN,
+                        "When this repository was last scanned",
                     );
                 });
 
@@ -506,9 +539,13 @@ impl DedupApp {
                         ui.label(RichText::new(line).color(theme::AMBER));
                         if ui
                             .add(
-                                egui::Button::new(RichText::new("CANCEL").color(theme::BLACK))
-                                    .fill(theme::RED),
+                                egui::Button::new(
+                                    RichText::new(format!("{} CANCEL", icon::X))
+                                        .color(theme::BLACK),
+                                )
+                                .fill(theme::RED),
                             )
+                            .on_hover_text("Stop the scan (already-hashed files stay indexed)")
                             .clicked()
                         {
                             actions.push(Action::Cancel(row.name.clone()));
@@ -530,10 +567,16 @@ impl DedupApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("RENAME →").color(theme::LILAC));
                     ui.text_edit_singleline(buf);
-                    if ui.button(RichText::new("OK").color(theme::BLACK)).clicked() {
+                    if ui
+                        .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::BLACK))
+                        .clicked()
+                    {
                         actions.push(Action::CommitRename(name.clone(), buf.trim().to_string()));
                     }
-                    if ui.button(RichText::new("×").color(theme::BLACK)).clicked() {
+                    if ui
+                        .button(RichText::new(icon::X).color(theme::BLACK))
+                        .clicked()
+                    {
                         actions.push(Action::CancelEdit);
                     }
                 });
@@ -543,10 +586,16 @@ impl DedupApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("RELOCATE →").color(theme::LILAC));
                     ui.text_edit_singleline(buf);
-                    if ui.button(RichText::new("OK").color(theme::BLACK)).clicked() {
+                    if ui
+                        .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::BLACK))
+                        .clicked()
+                    {
                         actions.push(Action::CommitRelocate(name.clone(), buf.trim().to_string()));
                     }
-                    if ui.button(RichText::new("×").color(theme::BLACK)).clicked() {
+                    if ui
+                        .button(RichText::new(icon::X).color(theme::BLACK))
+                        .clicked()
+                    {
                         actions.push(Action::CancelEdit);
                     }
                 });
@@ -562,14 +611,20 @@ impl DedupApp {
                             .desired_width(240.0)
                             .hint_text("/new/repo/path"),
                     );
-                    if ui.button(RichText::new("OK").color(theme::BLACK)).clicked() {
+                    if ui
+                        .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::BLACK))
+                        .clicked()
+                    {
                         actions.push(Action::CommitDuplicate {
                             source: name.clone(),
                             dest: dest.trim().to_string(),
                             path: path.trim().to_string(),
                         });
                     }
-                    if ui.button(RichText::new("×").color(theme::BLACK)).clicked() {
+                    if ui
+                        .button(RichText::new(icon::X).color(theme::BLACK))
+                        .clicked()
+                    {
                         actions.push(Action::CancelEdit);
                     }
                 });
@@ -602,34 +657,42 @@ impl DedupApp {
         ui.horizontal(|ui| {
             if ui
                 .add(egui::Button::new(
-                    RichText::new("UPDATE / SCAN").color(theme::BLACK),
+                    RichText::new(format!("{} UPDATE / SCAN", icon::REFRESH)).color(theme::BLACK),
                 ))
+                .on_hover_text("Scan the folder and index new or changed files")
                 .clicked()
             {
                 actions.push(Action::Update(row.name.clone()));
             }
             if ui
-                .button(RichText::new("RENAME").color(theme::BLACK))
+                .button(RichText::new(format!("{} RENAME", icon::PENCIL)).color(theme::BLACK))
+                .on_hover_text("Rename this repository")
                 .clicked()
             {
                 actions.push(Action::BeginRename(row.name.clone()));
             }
             if ui
-                .button(RichText::new("RELOCATE").color(theme::BLACK))
+                .button(RichText::new(format!("{} RELOCATE", icon::RELOCATE)).color(theme::BLACK))
+                .on_hover_text("Point this repository at a different folder")
                 .clicked()
             {
                 actions.push(Action::BeginRelocate(row.name.clone()));
             }
             if ui
-                .button(RichText::new("DUPLICATE").color(theme::BLACK))
+                .button(RichText::new(format!("{} DUPLICATE", icon::COPY)).color(theme::BLACK))
+                .on_hover_text("Copy this repository's index into a new one at a new path")
                 .clicked()
             {
                 actions.push(Action::BeginDuplicate(row.name.clone()));
             }
             if ui
                 .add(
-                    egui::Button::new(RichText::new("DELETE").color(theme::BLACK)).fill(theme::RED),
+                    egui::Button::new(
+                        RichText::new(format!("{} DELETE", icon::TRASH)).color(theme::BLACK),
+                    )
+                    .fill(theme::RED),
                 )
+                .on_hover_text("Remove this repository and delete its index")
                 .clicked()
             {
                 actions.push(Action::BeginDelete(row.name.clone()));
@@ -660,7 +723,9 @@ impl DedupApp {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("FOLDER").color(theme::TEXT).size(12.0));
                 if ui
-                    .button(RichText::new("📁 CHOOSE…").color(theme::BLACK))
+                    .button(
+                        RichText::new(format!("{} CHOOSE…", icon::FOLDER_OPEN)).color(theme::BLACK),
+                    )
                     .clicked()
                 {
                     actions.push(Action::ChooseFolder);
@@ -759,15 +824,102 @@ fn tab_button(ui: &mut egui::Ui, current: &mut Tab, tab: Tab, label: &str, color
     }
 }
 
-fn stat(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
+fn stat(ui: &mut egui::Ui, label: &str, value: &str, color: Color32, tip: &str) {
     ui.add_space(2.0);
     ui.label(
         RichText::new(format!("{label} "))
             .color(theme::TEXT)
             .size(12.0),
-    );
-    ui.label(RichText::new(value).color(color).strong());
+    )
+    .on_hover_text(tip);
+    ui.label(RichText::new(value).color(color).strong())
+        .on_hover_text(tip);
     ui.add_space(10.0);
+}
+
+/// Last-scan timestamp as a short date, or "never".
+fn format_last_scan(ms: u64) -> String {
+    if ms == 0 {
+        "never".to_string()
+    } else {
+        crate::util::format_mtime(i64::try_from(ms).unwrap_or(i64::MAX))
+    }
+}
+
+/// Number of MIME tags shown on a repo card.
+const MIME_TAG_LIMIT: usize = 5;
+
+/// Render the repo's MIME distribution as the top few share-sorted tags, each in
+/// a stable pastel color derived from the MIME name. Rendered inside a
+/// right-to-left layout, so the largest share sits in the top-right corner.
+fn mime_tags(ui: &mut egui::Ui, row: &RepoRow) {
+    let total = row.stats.file_count;
+    if total == 0 || row.mimes.is_empty() {
+        return;
+    }
+    let extra = row.mimes.len().saturating_sub(MIME_TAG_LIMIT);
+    if extra > 0 {
+        ui.label(
+            RichText::new(format!("+{extra}"))
+                .color(theme::TEXT)
+                .size(11.0),
+        )
+        .on_hover_text(format!("{extra} more MIME type(s)"));
+    }
+    for (mime, count) in row.mimes.iter().take(MIME_TAG_LIMIT) {
+        egui::Frame::new()
+            .fill(mime_color(mime))
+            .corner_radius(6)
+            .inner_margin(egui::Margin::symmetric(6, 2))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(format!("{mime} {}", mime_pct(*count, total)))
+                        .color(theme::BLACK)
+                        .size(11.0),
+                )
+                .on_hover_text(format!("{count} file(s) · {mime}"));
+            });
+    }
+}
+
+/// A share as a percentage that never rounds a real value down to `0%`.
+fn mime_pct(count: u64, total: u64) -> String {
+    let pct = count as f64 / total as f64 * 100.0;
+    if pct >= 1.0 {
+        format!("{pct:.0}%")
+    } else if pct >= 0.01 {
+        format!("{pct:.2}%")
+    } else {
+        "<0.01%".to_string()
+    }
+}
+
+/// A stable pastel color for a MIME type: the name is hashed to a hue, with
+/// fixed saturation/lightness so every tag shares one cohesive palette.
+fn mime_color(mime: &str) -> Color32 {
+    let mut hash: u32 = 2166136261; // FNV-1a
+    for b in mime.bytes() {
+        hash ^= u32::from(b);
+        hash = hash.wrapping_mul(16777619);
+    }
+    hsl_to_color((hash % 360) as f32, 0.50, 0.74)
+}
+
+fn hsl_to_color(h: f32, s: f32, l: f32) -> Color32 {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = h / 60.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r, g, b) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    let to = |v: f32| (((v + m) * 255.0).round()).clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(to(r), to(g), to(b))
 }
 
 /// The repo name Create will use: the typed name, or the chosen folder's own
@@ -809,5 +961,25 @@ mod tests {
         assert_eq!(effective_name("", "/data/holiday"), "holiday");
         assert_eq!(effective_name("   ", "/data/holiday/"), "holiday");
         assert_eq!(effective_name("", ""), "");
+    }
+
+    #[test]
+    fn mime_pct_never_shows_bare_zero() {
+        use super::mime_pct;
+        assert_eq!(mime_pct(50, 100), "50%");
+        assert_eq!(mime_pct(1, 100), "1%");
+        assert_eq!(mime_pct(1, 1000), "0.10%");
+        assert_eq!(mime_pct(1, 100_000), "<0.01%");
+        // A real, present type is never rendered as "0%".
+        for total in [1u64, 7, 999, 100_000, 10_000_000] {
+            assert_ne!(mime_pct(1, total), "0%");
+        }
+    }
+
+    #[test]
+    fn mime_color_is_stable_per_name() {
+        use super::mime_color;
+        assert_eq!(mime_color("image/png"), mime_color("image/png"));
+        assert_ne!(mime_color("image/png"), mime_color("application/pdf"));
     }
 }

@@ -126,6 +126,8 @@ pub struct RepoStats {
     pub file_count: u64,
     pub total_size: u64,
     pub missing_count: u64,
+    /// Epoch milliseconds of the last completed scan; 0 if never scanned.
+    pub last_scan_ms: u64,
 }
 
 pub type DuplicateGroup = (u64, [u8; 32], Vec<String>);
@@ -314,6 +316,7 @@ impl Store {
                 file_count: 0,
                 total_size: 0,
                 missing_count: 0,
+                last_scan_ms: 0,
             });
         }
 
@@ -321,24 +324,36 @@ impl Store {
         let read_txn = db.begin_read()?;
         let meta_table = read_txn.open_table(META)?;
 
-        let file_count = meta_table
-            .get("file_count")?
-            .map(|v| v.value())
-            .unwrap_or(0);
-        let total_size = meta_table
-            .get("total_size")?
-            .map(|v| v.value())
-            .unwrap_or(0);
-        let missing_count = meta_table
-            .get("missing_count")?
-            .map(|v| v.value())
-            .unwrap_or(0);
+        let get = |key: &str| -> Result<u64, StoreError> {
+            Ok(meta_table.get(key)?.map(|v| v.value()).unwrap_or(0))
+        };
 
         Ok(RepoStats {
-            file_count,
-            total_size,
-            missing_count,
+            file_count: get("file_count")?,
+            total_size: get("total_size")?,
+            missing_count: get("missing_count")?,
+            last_scan_ms: get("last_scan_ms")?,
         })
+    }
+
+    /// MIME-type distribution for a repo (`mime → count`), sorted by count
+    /// descending then name. Reads the maintained `MIME_STATS` table only — no
+    /// scan of `FILES`.
+    pub fn get_mime_stats(&self, name: &str) -> Result<Vec<(String, u64)>, StoreError> {
+        let db_path = self.get_repo_db_path(name);
+        if !db_path.exists() {
+            return Ok(Vec::new());
+        }
+        let db = redb::Database::open(&db_path)?;
+        let read_txn = db.begin_read()?;
+        let table = read_txn.open_table(MIME_STATS)?;
+        let mut stats = Vec::new();
+        for item in table.iter()? {
+            let (key, value) = item?;
+            stats.push((key.value().to_string(), value.value()));
+        }
+        stats.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(stats)
     }
 
     pub fn remove_repo(&self, name: &str) -> Result<(), StoreError> {
@@ -661,6 +676,17 @@ where
         for (rel_path, entry) in entries {
             tables.upsert(rel_path, entry)?;
         }
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+
+/// Record the epoch-millisecond timestamp of a completed scan in `META`.
+pub fn set_last_scan(db: &redb::Database, ms: u64) -> Result<(), StoreError> {
+    let write_txn = db.begin_write()?;
+    {
+        let mut meta = write_txn.open_table(META)?;
+        meta.insert("last_scan_ms", ms)?;
     }
     write_txn.commit()?;
     Ok(())
