@@ -1,1 +1,6 @@
 target
+
+# egui_kittest snapshot scratch outputs (keep only the committed *.png baselines)
+**/tests/snapshots/*.new.png
+**/tests/snapshots/*.diff.png
+crates/dedup-gui/tests/snapshots

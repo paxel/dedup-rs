@@ -10,10 +10,26 @@ use dedup_core::dupes::{DupeFile, DupeGroup, delete_files, find_exact_duplicates
 use dedup_core::similar::find_similar;
 use dedup_core::store::Store;
 use dedup_core::thumbnail::hash_hex;
-use egui::{Id, RichText};
+use egui::{Color32, Id, RichText};
 use std::collections::HashSet;
 
 const PAGE_SIZE: usize = 50;
+
+/// A bold-bordered LCARS section container in the given accent color, used to
+/// group a row of related controls.
+fn section(color: Color32) -> egui::Frame {
+    egui::Frame::new()
+        .fill(theme::PANEL)
+        .corner_radius(theme::PILL)
+        .stroke(egui::Stroke::new(2.0, color))
+        .inner_margin(8.0)
+        .outer_margin(egui::Margin {
+            left: 0,
+            right: 0,
+            top: 0,
+            bottom: 8,
+        })
+}
 
 #[derive(PartialEq, Clone, Copy)]
 enum Mode {
@@ -54,7 +70,7 @@ pub struct DupesView {
     repos: Vec<RepoSel>,
     repos_loaded: bool,
     mode: Mode,
-    threshold: u32,
+    threshold: f64,
     groups: Vec<DupeGroup>,
     marked: HashSet<FileKey>,
     page: usize,
@@ -70,7 +86,7 @@ impl DupesView {
             repos: Vec::new(),
             repos_loaded: false,
             mode: Mode::Exact,
-            threshold: 90,
+            threshold: 90.0,
             groups: Vec::new(),
             marked: HashSet::new(),
             page: 0,
@@ -121,23 +137,19 @@ impl DupesView {
     fn load_repos(&mut self, store: &Store) {
         match store.list_repos() {
             Ok(list) => {
-                let ro: HashSet<String> = self
-                    .repos
-                    .iter()
-                    .filter(|r| r.read_only)
-                    .map(|r| r.name.clone())
-                    .collect();
                 let excluded: HashSet<String> = self
                     .repos
                     .iter()
                     .filter(|r| !r.included)
                     .map(|r| r.name.clone())
                     .collect();
+                // Every (re)load re-locks all repos: read-only is the safe
+                // default, so deleting duplicates is always a deliberate unlock.
                 self.repos = list
                     .into_iter()
                     .map(|(name, _, _)| RepoSel {
                         included: !excluded.contains(&name),
-                        read_only: ro.contains(&name),
+                        read_only: true,
                         name,
                     })
                     .collect();
@@ -149,89 +161,172 @@ impl DupesView {
     }
 
     fn repo_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("REPOS").color(theme::TEXT).size(12.0));
-            for (i, repo) in self.repos.iter().enumerate() {
-                let fill = if repo.included {
-                    theme::ORANGE
-                } else {
-                    theme::PANEL
-                };
-                let text = if repo.included {
-                    theme::BLACK
-                } else {
-                    theme::TEXT
-                };
-                if ui
-                    .add(egui::Button::new(RichText::new(&repo.name).color(text)).fill(fill))
-                    .on_hover_text("Toggle whether this repo is searched")
-                    .clicked()
-                {
-                    acts.push(Act::ToggleInclude(i));
+        section(theme::LILAC).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("REPOS").color(theme::TEXT).size(12.0));
+                // Top-align the chips. A centered row (`horizontal`/
+                // `horizontal_wrapped`) places earlier items progressively higher
+                // as the row height converges, leaving the first repo a few px
+                // above the rest (see the `repo_row_is_aligned` test). Top-align
+                // pins every chip to one line. It stays bounded because it's
+                // nested inside this outer `horizontal`.
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                    for (i, repo) in self.repos.iter().enumerate() {
+                    // Name + lock read as one bordered unit per repo, with room
+                    // between the border and the buttons.
+                    egui::Frame::new()
+                        .stroke(egui::Stroke::new(1.0, theme::BLUE))
+                        .corner_radius(8)
+                        .inner_margin(egui::Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let (fill, text) = if repo.included {
+                                    (theme::ORANGE, theme::BLACK)
+                                } else {
+                                    (theme::PANEL, theme::TEXT)
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(RichText::new(&repo.name).color(text))
+                                            .fill(fill),
+                                    )
+                                    .on_hover_text("Toggle whether this repo is searched")
+                                    .clicked()
+                                {
+                                    acts.push(Act::ToggleInclude(i));
+                                }
+                                // Closed padlock = read-only (protected); open
+                                // padlock = deletable.
+                                let (glyph, ro_fill, ro_text, hover) = if repo.read_only {
+                                    (
+                                        icon::LOCK,
+                                        theme::BLUE,
+                                        theme::BLACK,
+                                        "Locked: files here are protected from deletion — click to allow deleting",
+                                    )
+                                } else {
+                                    (
+                                        icon::LOCK_OPEN,
+                                        theme::PANEL,
+                                        theme::BLUE,
+                                        "Unlocked: files here can be deleted — click to protect",
+                                    )
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(RichText::new(glyph).color(ro_text))
+                                            .fill(ro_fill),
+                                    )
+                                    .on_hover_text(hover)
+                                    .clicked()
+                                {
+                                    acts.push(Act::ToggleRo(i));
+                                }
+                            });
+                        });
+                    ui.add_space(8.0);
                 }
-                let ro_fill = if repo.read_only {
-                    theme::BLUE
-                } else {
-                    theme::PANEL
-                };
-                let ro_text = if repo.read_only {
-                    theme::BLACK
-                } else {
-                    theme::BLUE
-                };
-                if ui
-                    .add(egui::Button::new(RichText::new("RO").color(ro_text)).fill(ro_fill))
-                    .on_hover_text("Read-only: files here are never selected for deletion")
-                    .clicked()
-                {
-                    acts.push(Act::ToggleRo(i));
-                }
-                ui.add_space(8.0);
-            }
-            if ui
-                .button(RichText::new(icon::REFRESH).color(theme::BLACK))
-                .clicked()
-            {
-                acts.push(Act::ReloadRepos);
-            }
+                // Inset the refresh button by the chips' frame margin so its top
+                // lines up with the (inset) repo name buttons, not the chip tops.
+                egui::Frame::new()
+                    .inner_margin(egui::Margin {
+                        left: 0,
+                        right: 0,
+                        top: 7,
+                        bottom: 7,
+                    })
+                    .show(ui, |ui| {
+                        let refresh = egui::Button::new(
+                            RichText::new(format!("{} REFRESH", icon::REFRESH))
+                                .color(theme::BLACK),
+                        )
+                        .fill(theme::LILAC);
+                        if ui
+                            .add(refresh)
+                            .on_hover_text("Reload the repository list")
+                            .clicked()
+                        {
+                            acts.push(Act::ReloadRepos);
+                        }
+                    });
+                });
+            });
         });
     }
 
     fn controls(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        ui.horizontal(|ui| {
-            let exact = self.mode == Mode::Exact;
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("DUPLICATES").color(theme::BLACK))
-                        .fill(if exact { theme::ORANGE } else { theme::PANEL }),
-                )
-                .clicked()
-            {
-                self.mode = Mode::Exact;
-            }
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("SIMILAR").color(theme::BLACK))
-                        .fill(if exact { theme::PANEL } else { theme::LILAC }),
-                )
-                .clicked()
-            {
-                self.mode = Mode::Similar;
-            }
-            if self.mode == Mode::Similar {
-                ui.label(RichText::new("threshold").color(theme::TEXT).size(12.0));
-                ui.add(egui::Slider::new(&mut self.threshold, 50..=100).suffix("%"));
-            }
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new(format!("{} FIND", icon::SEARCH)).color(theme::BLACK),
+        section(theme::AMBER).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("MODE").color(theme::TEXT).size(12.0));
+                let exact = self.mode == Mode::Exact;
+                // The two match modes form one segmented toggle.
+                egui::Frame::new()
+                    .stroke(egui::Stroke::new(1.0, theme::BLUE))
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::symmetric(4, 2))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            // Selected = filled accent + black text; unselected =
+                            // panel fill with accent-colored text (an outline),
+                            // so both stay readable instead of black-on-black.
+                            let (dup_fill, dup_text) = if exact {
+                                (theme::ORANGE, theme::BLACK)
+                            } else {
+                                (theme::PANEL, theme::ORANGE)
+                            };
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new("DUPLICATES").color(dup_text))
+                                        .fill(dup_fill),
+                                )
+                                .on_hover_text("Exact byte-for-byte duplicates")
+                                .clicked()
+                            {
+                                self.mode = Mode::Exact;
+                            }
+                            let (sim_fill, sim_text) = if exact {
+                                (theme::PANEL, theme::LILAC)
+                            } else {
+                                (theme::LILAC, theme::BLACK)
+                            };
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new("SIMILAR").color(sim_text))
+                                        .fill(sim_fill),
+                                )
+                                .on_hover_text("Perceptually similar images/videos")
+                                .clicked()
+                            {
+                                self.mode = Mode::Similar;
+                            }
+                        });
+                    });
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(format!("{} FIND", icon::SEARCH)).color(theme::BLACK),
+                        )
+                        .fill(theme::AMBER),
                     )
-                    .fill(theme::AMBER),
-                )
-                .clicked()
-            {
-                acts.push(Act::Find);
+                    .clicked()
+                {
+                    acts.push(Act::Find);
+                }
+            });
+
+            // The similarity threshold gets its own row so the slider has room
+            // to read as a slider (cramming it into the button row hid the track
+            // behind the value box). The value box still accepts typed floats.
+            if self.mode == Mode::Similar {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("similarity").color(theme::TEXT).size(12.0));
+                    ui.add(
+                        egui::Slider::new(&mut self.threshold, 50.0..=100.0)
+                            .suffix("%")
+                            .max_decimals(1),
+                    );
+                });
             }
         });
 
@@ -310,6 +405,7 @@ impl DupesView {
         egui::Frame::new()
             .fill(theme::PANEL)
             .corner_radius(theme::PILL)
+            .stroke(egui::Stroke::new(1.5, theme::ORANGE))
             .inner_margin(10.0)
             .outer_margin(egui::Margin {
                 left: 0,
@@ -524,7 +620,7 @@ impl DupesView {
         }
         let result = match self.mode {
             Mode::Exact => find_exact_duplicates(store, &names),
-            Mode::Similar => find_similar(store, &names, f64::from(self.threshold)),
+            Mode::Similar => find_similar(store, &names, self.threshold),
         };
         match result {
             Ok(groups) => {
@@ -576,5 +672,211 @@ impl DupesView {
 
     fn repo_is_ro(&self, name: &str) -> bool {
         self.repos.iter().any(|r| r.name == name && r.read_only)
+    }
+}
+
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+    use dedup_core::store::Store;
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+    use tempfile::TempDir;
+
+    const SAMPLE_REPOS: [&str; 5] = [
+        "Automatic Upload",
+        "Videos",
+        "data",
+        "entertainment_media",
+        "private_media",
+    ];
+
+    /// A temp store pre-populated with `names` as (empty) repos.
+    fn sample_store(names: &[&str]) -> (TempDir, Store) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_at(tmp.path().join("cfg")).unwrap();
+        for n in names {
+            let dir = tmp.path().join(n);
+            std::fs::create_dir_all(&dir).unwrap();
+            store.create_repo(n, &dir.to_string_lossy()).unwrap();
+        }
+        (tmp, store)
+    }
+
+    /// Build a driven harness showing the Duplicates view for `store`. The
+    /// closure owns `view`/`store`; the theme + icon font are installed once so
+    /// glyph metrics match the real app.
+    fn dupes_harness<'a>(store: Store) -> Harness<'a> {
+        let mut view = DupesView::new();
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 360.0))
+            .build_ui(move |ui| {
+                if !init {
+                    crate::icon::install(ui.ctx());
+                    crate::theme::apply(ui.ctx());
+                    init = true;
+                }
+                view.show(ui, &store);
+            });
+        harness.run();
+        harness
+    }
+
+    /// Regression test for the recurring "first repo sits higher" bug: every
+    /// repo's name button — and the REFRESH button — must share one top edge.
+    #[test]
+    fn repo_row_is_aligned() {
+        let (_tmp, store) = sample_store(&SAMPLE_REPOS);
+        let harness = dupes_harness(store);
+
+        let tops: Vec<f32> = SAMPLE_REPOS
+            .iter()
+            .map(|n| harness.get_by_label(n).rect().top())
+            .collect();
+        let base = tops[0];
+        for (name, top) in SAMPLE_REPOS.iter().zip(&tops) {
+            assert!(
+                (top - base).abs() < 0.75,
+                "repo '{name}' top {top} != first repo top {base} — row misaligned (tops: {tops:?})"
+            );
+        }
+        let refresh_top = harness.get_by_label_contains("REFRESH").rect().top();
+        assert!(
+            (refresh_top - base).abs() < 0.75,
+            "REFRESH top {refresh_top} != repo name-button top {base}"
+        );
+    }
+
+    /// Guards against the REPOS section expanding to fill the viewport (a real
+    /// regression we hit): the MODE row's FIND button must stay near the top,
+    /// not be pushed hundreds of px down by an over-tall section above it.
+    #[test]
+    fn sections_stay_compact() {
+        let (_tmp, store) = sample_store(&SAMPLE_REPOS);
+        let harness = dupes_harness(store);
+        // Exact label (the help text also contains "FIND").
+        let find_label = format!("{} FIND", icon::SEARCH);
+        let find_top = harness.get_by_label(&find_label).rect().top();
+        assert!(
+            find_top < 160.0,
+            "FIND button at y={find_top}; the REPOS section is too tall (expanded?)"
+        );
+    }
+
+    /// In SIMILAR mode a threshold control appears in the MODE row. It must not
+    /// drift the row vertically: the DUPLICATES and FIND buttons stay aligned.
+    #[test]
+    fn similar_mode_row_is_aligned() {
+        let (_tmp, store) = sample_store(&SAMPLE_REPOS);
+        let mut view = DupesView::new();
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 360.0))
+            .build_ui(move |ui| {
+                if !init {
+                    crate::icon::install(ui.ctx());
+                    crate::theme::apply(ui.ctx());
+                    init = true;
+                }
+                view.show(ui, &store);
+            });
+        harness.run();
+        harness.get_by_label("SIMILAR").click();
+        harness.run();
+
+        let dup_top = harness.get_by_label("DUPLICATES").rect().top();
+        let find_top = harness
+            .get_by_label(&format!("{} FIND", icon::SEARCH))
+            .rect()
+            .top();
+        assert!(
+            (dup_top - find_top).abs() < 0.75,
+            "SIMILAR row misaligned: DUPLICATES top {dup_top} vs FIND top {find_top}"
+        );
+    }
+
+    /// Image-diff regression test against `tests/snapshots/dupes_view.png`.
+    /// Rendered with wgpu (lavapipe headless). Regenerate the baseline after an
+    /// intentional visual change with:
+    ///   UPDATE_SNAPSHOTS=1 cargo test -p dedup-gui dupes_view_snapshot -- --ignored
+    /// Ignored by default because the baseline is renderer-specific (commit the
+    /// baseline produced on your machine).
+    #[test]
+    #[ignore = "renderer-specific image snapshot; run explicitly"]
+    fn dupes_view_snapshot() {
+        let (_tmp, store) = sample_store(&SAMPLE_REPOS);
+        let mut view = DupesView::new();
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 260.0))
+            .wgpu()
+            .build_ui(move |ui| {
+                if !init {
+                    crate::icon::install(ui.ctx());
+                    crate::theme::apply(ui.ctx());
+                    init = true;
+                }
+                view.show(ui, &store);
+            });
+        harness.run();
+        harness.snapshot("dupes_view");
+    }
+
+    /// Not run by default: renders the view to `target/dupes_view.png` for a
+    /// human to eyeball. Needs a wgpu backend (lavapipe works headless):
+    ///   cargo test -p dedup-gui render_dupes_view -- --ignored --nocapture
+    #[test]
+    #[ignore = "renders a PNG for manual inspection"]
+    fn render_dupes_view() {
+        let (_tmp, store) = sample_store(&SAMPLE_REPOS);
+        let mut view = DupesView::new();
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 360.0))
+            .wgpu()
+            .build_ui(move |ui| {
+                if !init {
+                    crate::icon::install(ui.ctx());
+                    crate::theme::apply(ui.ctx());
+                    init = true;
+                }
+                view.show(ui, &store);
+            });
+        harness.run();
+        let img = harness.render().expect("wgpu render failed");
+        let out =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/dupes_view.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Renders the view in SIMILAR mode (threshold slider visible) to
+    /// `target/dupes_similar.png`. Run with `--ignored`.
+    #[test]
+    #[ignore = "renders a PNG for manual inspection"]
+    fn render_dupes_similar() {
+        let (_tmp, store) = sample_store(&SAMPLE_REPOS);
+        let mut view = DupesView::new();
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 360.0))
+            .wgpu()
+            .build_ui(move |ui| {
+                if !init {
+                    crate::icon::install(ui.ctx());
+                    crate::theme::apply(ui.ctx());
+                    init = true;
+                }
+                view.show(ui, &store);
+            });
+        harness.run();
+        harness.get_by_label("SIMILAR").click();
+        harness.run();
+        let img = harness.render().expect("wgpu render failed");
+        let out =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/dupes_similar.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 }

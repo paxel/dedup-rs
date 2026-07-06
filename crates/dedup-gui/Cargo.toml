@@ -10,3 +10,7 @@ egui = "0.35"
 crossbeam-channel = "0.5"
 chrono = "0.4"
 rfd = "0.17"
+
+[dev-dependencies]
+egui_kittest = { version = "0.35", features = ["wgpu", "snapshot"] }
+tempfile = "3.10"
