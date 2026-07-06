@@ -5,6 +5,7 @@ mod app;
 mod dupes_view;
 mod files_view;
 mod icon;
+mod status;
 mod theme;
 mod thumbs;
 mod util;

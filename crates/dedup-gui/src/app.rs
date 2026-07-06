@@ -6,23 +6,39 @@
 use crate::dupes_view::DupesView;
 use crate::files_view::FilesView;
 use crate::icon;
+use crate::status::{self, Location};
 use crate::theme;
 use crate::util::format_size;
-use crate::worker::{ChannelProgress, WorkerMsg, WorkerState};
+use crate::worker::{ChannelProgress, JobKind, JobOutcome, RepoStatus, WorkerMsg, WorkerState};
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::store::{RepoStats, Store};
-use dedup_core::update::{CancellationToken, ProgressEvent, update_repo};
+use dedup_core::update::{CancellationToken, ProgressEvent, check_repo, update_repo};
 use egui::{Align, Color32, Id, Layout, RichText};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Repos scan one at a time (each scan already parallelizes across all CPU
+/// cores), so the queue starts a new scan only while fewer than this many run.
+const MAX_CONCURRENT: usize = 1;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Tab {
     Repositories,
     Duplicates,
     Files,
+}
+
+/// Freshness of a repo's index relative to disk, from the last CHECK.
+#[derive(Clone, Copy)]
+enum Freshness {
+    /// Not checked yet this session.
+    Unknown,
+    /// The last check found nothing new, changed, or vanished.
+    UpToDate,
+    /// The last check found work an update would do.
+    Stale { changed: u64, missing: u64 },
 }
 
 /// A snapshot of one registered repo for rendering.
@@ -35,6 +51,10 @@ struct RepoRow {
     mimes: Vec<(String, u64)>,
     /// Result of the most recent update, if any (for a one-line status).
     last: Option<String>,
+    /// Location + reachability, from the last status refresh.
+    location: Option<Location>,
+    /// Index freshness, from the last CHECK.
+    freshness: Freshness,
 }
 
 /// In-progress inline edit for a repo row.
@@ -61,6 +81,9 @@ enum Edit {
 /// so the immediate-mode closures never borrow `self` mutably twice.
 enum Action {
     Update(String),
+    UpdateAll,
+    Check(String),
+    RefreshStatus,
     Cancel(String),
     BeginRename(String),
     BeginRelocate(String),
@@ -97,12 +120,20 @@ pub struct DedupApp {
     edit: Option<Edit>,
 
     show_settings: bool,
+    show_about: bool,
+    /// Whether the one-time startup status probe has been kicked off.
+    did_initial_status: bool,
     threads: usize,
 
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
     worker: WorkerState,
+    /// Repos waiting for a job, in FIFO order. Drained one at a time.
+    queue: VecDeque<(String, JobKind)>,
     cancels: HashMap<String, CancellationToken>,
+    /// Location/reachability results delivered from the status-refresh thread.
+    status_tx: Sender<(String, Location)>,
+    status_rx: Receiver<(String, Location)>,
     dupes: DupesView,
     files: FilesView,
 }
@@ -111,6 +142,7 @@ impl DedupApp {
     pub fn new(store: Arc<Store>) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
         let (folder_tx, folder_rx) = crossbeam_channel::unbounded();
+        let (status_tx, status_rx) = crossbeam_channel::unbounded();
         let mut app = Self {
             store,
             tab: Tab::Repositories,
@@ -124,11 +156,16 @@ impl DedupApp {
             folder_rx,
             edit: None,
             show_settings: false,
+            show_about: false,
+            did_initial_status: false,
             threads: 0,
             tx,
             rx,
             worker: WorkerState::default(),
+            queue: VecDeque::new(),
             cancels: HashMap::new(),
+            status_tx,
+            status_rx,
             dupes: DupesView::new(),
             files: FilesView::new(),
         };
@@ -136,16 +173,39 @@ impl DedupApp {
         app
     }
 
+    /// Kick off a background probe of every repo's location + reachability.
+    /// Results arrive on `status_rx` and are applied per frame. The probe runs
+    /// off the UI thread because a dead network mount can block on `stat`.
+    fn refresh_status(&self, ctx: &egui::Context) {
+        for row in &self.repos {
+            let tx = self.status_tx.clone();
+            let name = row.name.clone();
+            let path = row.path.clone();
+            let repaint = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send((name, status::classify(&path)));
+                repaint.request_repaint();
+            });
+        }
+    }
+
     /// Reload every repo row from the registry. Safe only when no update is
     /// running (it opens each repo db to read stats); callers gate on that.
     fn reload_all(&mut self) {
         match self.store.list_repos() {
             Ok(list) => {
-                let prev: HashMap<String, Option<String>> =
-                    self.repos.drain(..).map(|r| (r.name, r.last)).collect();
+                // Carry the last-result line and status across a reload, keyed
+                // by name (a renamed/relocated repo simply re-probes).
+                let mut prev: HashMap<String, (Option<String>, Option<Location>, Freshness)> = self
+                    .repos
+                    .drain(..)
+                    .map(|r| (r.name, (r.last, r.location, r.freshness)))
+                    .collect();
                 let mut rows = Vec::with_capacity(list.len());
                 for (name, meta, stats) in list {
-                    let last = prev.get(&name).cloned().flatten();
+                    let (last, location, freshness) =
+                        prev.remove(&name)
+                            .unwrap_or((None, None, Freshness::Unknown));
                     let mimes = self.store.get_mime_stats(&name).unwrap_or_default();
                     rows.push(RepoRow {
                         name,
@@ -153,6 +213,8 @@ impl DedupApp {
                         stats,
                         mimes,
                         last,
+                        location,
+                        freshness,
                     });
                 }
                 self.repos = rows;
@@ -177,39 +239,100 @@ impl DedupApp {
         }
     }
 
-    fn start_update(&mut self, ctx: &egui::Context, name: String) {
-        if self.worker.is_active(&name) {
+    /// Add a `kind` job for a repo to the queue. No-op if it is already queued
+    /// or running. The worker thread is started later by [`Self::pump_queue`].
+    fn enqueue(&mut self, name: String, kind: JobKind) {
+        if self.worker.is_tracked(&name) {
             return;
         }
-        let cancel = CancellationToken::new();
-        self.cancels.insert(name.clone(), cancel.clone());
-        self.worker.mark_started(&name);
+        self.worker.mark_queued(&name, kind);
         if let Some(row) = self.repos.iter_mut().find(|r| r.name == name) {
             row.last = None;
         }
+        self.queue.push_back((name, kind));
+    }
 
-        let store = Arc::clone(&self.store);
-        let tx = self.tx.clone();
-        let threads = self.threads;
-        let repaint = ctx.clone();
-        std::thread::spawn(move || {
-            let progress = ChannelProgress::new(name.clone(), tx.clone());
-            let outcome =
-                update_repo(&store, &name, threads, &progress, &cancel).map_err(|e| e.to_string());
-            let _ = tx.send(WorkerMsg::Completed {
-                repo: name,
-                outcome,
+    /// Start queued jobs until [`MAX_CONCURRENT`] are running. Called once per
+    /// frame after completions are drained and new work is enqueued.
+    fn pump_queue(&mut self, ctx: &egui::Context) {
+        while self.worker.running_count() < MAX_CONCURRENT {
+            let Some((name, kind)) = self.queue.pop_front() else {
+                break;
+            };
+            self.worker.mark_running(&name);
+
+            let cancel = CancellationToken::new();
+            self.cancels.insert(name.clone(), cancel.clone());
+
+            let store = Arc::clone(&self.store);
+            let tx = self.tx.clone();
+            let threads = self.threads;
+            let repaint = ctx.clone();
+            std::thread::spawn(move || {
+                let progress = ChannelProgress::new(name.clone(), tx.clone());
+                let outcome = match kind {
+                    JobKind::Update => JobOutcome::Update(
+                        update_repo(&store, &name, threads, &progress, &cancel)
+                            .map_err(|e| e.to_string()),
+                    ),
+                    JobKind::Check => JobOutcome::Check(
+                        check_repo(&store, &name, &progress, &cancel).map_err(|e| e.to_string()),
+                    ),
+                };
+                let _ = tx.send(WorkerMsg::Completed {
+                    repo: name,
+                    outcome,
+                });
+                repaint.request_repaint();
             });
-            repaint.request_repaint();
-        });
+        }
     }
 
     fn apply(&mut self, ctx: &egui::Context, action: Action) {
         match action {
-            Action::Update(name) => self.start_update(ctx, name),
+            Action::Update(name) => self.enqueue(name, JobKind::Update),
+            Action::UpdateAll => {
+                // Skip known-unreachable repos so a dead mount can't hang a
+                // worker; not-yet-probed (Unknown) repos are still included.
+                let names: Vec<String> = self
+                    .repos
+                    .iter()
+                    .filter(|r| r.location.is_none_or(|l| l.reachable()))
+                    .map(|r| r.name.clone())
+                    .collect();
+                for name in names {
+                    self.enqueue(name, JobKind::Update);
+                }
+            }
+            Action::Check(name) => self.enqueue(name, JobKind::Check),
+            Action::RefreshStatus => {
+                // Re-probe location/reachability, and run a freshness CHECK on
+                // every reachable repo — the status analog of UPDATE ALL. Repos
+                // already known to need an update are skipped (re-checking would
+                // only confirm what the pill already shows).
+                self.refresh_status(ctx);
+                let names: Vec<String> = self
+                    .repos
+                    .iter()
+                    .filter(|r| {
+                        r.location.is_none_or(|l| l.reachable())
+                            && !matches!(r.freshness, Freshness::Stale { .. })
+                    })
+                    .map(|r| r.name.clone())
+                    .collect();
+                for name in names {
+                    self.enqueue(name, JobKind::Check);
+                }
+            }
             Action::Cancel(name) => {
                 if let Some(token) = self.cancels.get(&name) {
+                    // Running: signal cooperative cancellation; the worker
+                    // reports completion when it stops.
                     token.cancel();
+                } else {
+                    // Still queued: drop it before it ever starts.
+                    self.queue.retain(|(n, _)| n != &name);
+                    self.worker.remove(&name);
                 }
             }
             Action::BeginRename(name) => {
@@ -318,22 +441,66 @@ impl DedupApp {
 impl eframe::App for DedupApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        // Drain worker messages; refresh stats for anything that just finished.
+        // One-time startup probe of every repo's location/reachability.
+        if !self.did_initial_status {
+            self.did_initial_status = true;
+            self.refresh_status(&ctx);
+        }
+
+        // Drain worker messages; a completed job updates the repo's row.
         for (repo, outcome) in self.worker.drain(&self.rx) {
             self.cancels.remove(&repo);
-            let summary = match outcome {
-                Ok(s) if s.cancelled => {
-                    format!("cancelled — added {}, updated {}", s.added, s.updated)
+            match outcome {
+                JobOutcome::Update(result) => {
+                    // A clean, uncancelled update brings the index in sync.
+                    let clean = matches!(&result, Ok(s) if !s.cancelled);
+                    let summary = match result {
+                        Ok(s) if s.cancelled => {
+                            format!("cancelled — added {}, updated {}", s.added, s.updated)
+                        }
+                        Ok(s) => format!(
+                            "added {}, updated {}, unchanged {}, missing {}, errors {}",
+                            s.added, s.updated, s.unchanged, s.marked_missing, s.errors
+                        ),
+                        Err(e) => format!("error: {e}"),
+                    };
+                    self.refresh_repo(&repo);
+                    if let Some(row) = self.repos.iter_mut().find(|r| r.name == repo) {
+                        row.last = Some(summary);
+                        if clean {
+                            row.freshness = Freshness::UpToDate;
+                        }
+                    }
                 }
-                Ok(s) => format!(
-                    "added {}, updated {}, unchanged {}, missing {}, errors {}",
-                    s.added, s.updated, s.unchanged, s.marked_missing, s.errors
-                ),
-                Err(e) => format!("error: {e}"),
-            };
-            self.refresh_repo(&repo);
+                JobOutcome::Check(result) => {
+                    if let Some(row) = self.repos.iter_mut().find(|r| r.name == repo) {
+                        match result {
+                            Ok(c) if c.cancelled => row.last = Some("check cancelled".into()),
+                            Ok(c) => {
+                                row.freshness = if c.up_to_date() {
+                                    Freshness::UpToDate
+                                } else {
+                                    Freshness::Stale {
+                                        changed: c.changed,
+                                        missing: c.missing,
+                                    }
+                                };
+                                row.last = Some(format!(
+                                    "checked — {} changed, {} missing, {} unchanged",
+                                    c.changed, c.missing, c.unchanged
+                                ));
+                            }
+                            Err(e) => row.last = Some(format!("check error: {e}")),
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply any location/reachability results from the status thread.
+        while let Ok((repo, location)) = self.status_rx.try_recv() {
             if let Some(row) = self.repos.iter_mut().find(|r| r.name == repo) {
-                row.last = Some(summary);
+                row.location = Some(location);
             }
         }
 
@@ -359,6 +526,9 @@ impl eframe::App for DedupApp {
         if self.show_settings {
             self.settings_modal(&ctx);
         }
+        if self.show_about {
+            self.about_modal(&ctx);
+        }
         if self.show_add {
             self.add_modal(&ctx, &mut actions);
         }
@@ -366,7 +536,12 @@ impl eframe::App for DedupApp {
             self.apply(&ctx, action);
         }
 
+        // Completions (drained above) free the running slot; the actions loop
+        // may have enqueued more. Start whatever can run now.
+        self.pump_queue(&ctx);
+
         // Poll at ~10 Hz while work is running instead of repainting per event.
+        // This also ticks the queued/scanning timers.
         if self.worker.active_count() > 0 {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -387,7 +562,11 @@ impl DedupApp {
                             .strong(),
                     );
                     ui.add_space(6.0);
-                    ui.label(RichText::new("LCARS 47").color(theme::LILAC).size(13.0));
+                    ui.label(
+                        RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                            .color(theme::LILAC)
+                            .size(13.0),
+                    );
                     ui.add_space(16.0);
                     tab_button(
                         ui,
@@ -414,6 +593,16 @@ impl DedupApp {
                             .clicked()
                         {
                             self.show_settings = true;
+                        }
+                        // Added after SETTINGS so it renders immediately to its
+                        // left in this right-to-left layout.
+                        if ui
+                            .add(egui::Button::new(
+                                RichText::new("ABOUT").color(theme::BLACK),
+                            ))
+                            .clicked()
+                        {
+                            self.show_about = true;
                         }
                     });
                 });
@@ -445,6 +634,30 @@ impl DedupApp {
             if ui.add_enabled(!busy, add).clicked() {
                 actions.push(Action::OpenAdd);
             }
+            // Enqueues every repo; it only touches names (no db access), so it
+            // stays enabled even while a batch is running.
+            let update_all = egui::Button::new(
+                RichText::new(format!("{} UPDATE ALL", icon::REFRESH)).color(theme::BLACK),
+            )
+            .fill(theme::ORANGE);
+            if ui.add_enabled(!self.repos.is_empty(), update_all).clicked() {
+                actions.push(Action::UpdateAll);
+            }
+            // Re-probe every repo's location/reachability (filesystem only, no
+            // db access), so it is fine to run any time.
+            let refresh = egui::Button::new(
+                RichText::new(format!("{} REFRESH STATUS", icon::REFRESH)).color(theme::BLACK),
+            )
+            .fill(theme::LILAC);
+            if ui
+                .add_enabled(!self.repos.is_empty(), refresh)
+                .on_hover_text(
+                    "Re-check every repository's location and scan for file changes since the last update",
+                )
+                .clicked()
+            {
+                actions.push(Action::RefreshStatus);
+            }
             if busy {
                 ui.label(
                     RichText::new("· busy: a scan is running")
@@ -470,7 +683,17 @@ impl DedupApp {
     }
 
     fn repo_card(&mut self, ui: &mut egui::Ui, row: &RepoRow, actions: &mut Vec<Action>) {
-        let active = self.worker.is_active(&row.name);
+        // Owned snapshot of this repo's queue state, taken before the frame
+        // closure so it doesn't borrow `self.worker` across `card_controls`.
+        let tracked = self.worker.get(&row.name).map(|r| {
+            (
+                r.kind,
+                r.status,
+                r.queued_at.elapsed(),
+                r.started_at.map(|s| s.elapsed()),
+                r.event.clone(),
+            )
+        });
         egui::Frame::new()
             .fill(theme::PANEL)
             .corner_radius(theme::PILL)
@@ -490,6 +713,7 @@ impl DedupApp {
                             .size(17.0)
                             .strong(),
                     );
+                    status_pills(ui, row);
                     ui.label(RichText::new(&row.path).color(theme::TEXT).size(12.0))
                         .on_hover_text(&row.path);
                     // MIME breakdown, share-sorted, pinned to the top-right.
@@ -528,33 +752,88 @@ impl DedupApp {
                     );
                 });
 
-                if active {
-                    let line = self
-                        .worker
-                        .progress(&row.name)
-                        .map(progress_line)
-                        .unwrap_or_else(|| "working…".into());
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Spinner::new().color(theme::AMBER));
-                        ui.label(RichText::new(line).color(theme::AMBER));
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(format!("{} CANCEL", icon::X))
-                                        .color(theme::BLACK),
+                match tracked {
+                    Some((kind, RepoStatus::Queued, waited, _, _)) => {
+                        let verb = if kind == JobKind::Check {
+                            "check"
+                        } else {
+                            "scan"
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "queued to {verb} — waiting {}",
+                                    format_elapsed(waited)
+                                ))
+                                .color(theme::TAN),
+                            );
+                            if cancel_button(ui, "Remove from the queue").clicked() {
+                                actions.push(Action::Cancel(row.name.clone()));
+                            }
+                        });
+                    }
+                    Some((kind, RepoStatus::Running, _, elapsed, event)) => {
+                        let elapsed = elapsed.unwrap_or_default();
+                        let checking = kind == JobKind::Check;
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new().color(theme::AMBER));
+                            match &event {
+                                // Only a full update hashes; a check never does.
+                                ProgressEvent::Hashing { done, total, .. }
+                                    if *total > 0 && !checking =>
+                                {
+                                    let frac = *done as f32 / *total as f32;
+                                    let pct = (frac * 100.0) as u32;
+                                    ui.add(
+                                        egui::ProgressBar::new(frac)
+                                            .desired_width(240.0)
+                                            .text(format!("{pct}% · {done}/{total}")),
+                                    );
+                                }
+                                ProgressEvent::Scanning { files, dirs } if checking => {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "checking — {files} files, {dirs} dirs"
+                                        ))
+                                        .color(theme::AMBER),
+                                    );
+                                }
+                                other => {
+                                    ui.label(
+                                        RichText::new(progress_line(other)).color(theme::AMBER),
+                                    );
+                                }
+                            }
+                            let hover = if checking {
+                                "Stop the check"
+                            } else {
+                                "Stop the scan (already-hashed files stay indexed)"
+                            };
+                            if cancel_button(ui, hover).clicked() {
+                                actions.push(Action::Cancel(row.name.clone()));
+                            }
+                        });
+                        let verb = if checking { "checking" } else { "scanning" };
+                        let timing = match &event {
+                            ProgressEvent::Hashing { done, total, .. }
+                                if *total > 0 && *done > 0 && !checking =>
+                            {
+                                let eta = elapsed.mul_f64((*total - *done) as f64 / *done as f64);
+                                format!(
+                                    "scanning for {} · ETA {}",
+                                    format_elapsed(elapsed),
+                                    format_elapsed(eta)
                                 )
-                                .fill(theme::RED),
-                            )
-                            .on_hover_text("Stop the scan (already-hashed files stay indexed)")
-                            .clicked()
-                        {
-                            actions.push(Action::Cancel(row.name.clone()));
+                            }
+                            _ => format!("{verb} for {}", format_elapsed(elapsed)),
+                        };
+                        ui.label(RichText::new(timing).color(theme::TAN).size(12.0));
+                    }
+                    None => {
+                        self.card_controls(ui, row, actions);
+                        if let Some(last) = &row.last {
+                            ui.label(RichText::new(last).color(theme::TAN).size(12.0));
                         }
-                    });
-                } else {
-                    self.card_controls(ui, row, actions);
-                    if let Some(last) = &row.last {
-                        ui.label(RichText::new(last).color(theme::TAN).size(12.0));
                     }
                 }
             });
@@ -654,15 +933,31 @@ impl DedupApp {
             _ => {}
         }
 
+        // An unreachable folder can't be scanned or walked (and a dead network
+        // mount would hang the worker), so gate both jobs on reachability.
+        let reachable = row.location.is_none_or(|l| l.reachable());
         ui.horizontal(|ui| {
+            let update = egui::Button::new(
+                RichText::new(format!("{} UPDATE / SCAN", icon::REFRESH)).color(theme::BLACK),
+            );
             if ui
-                .add(egui::Button::new(
-                    RichText::new(format!("{} UPDATE / SCAN", icon::REFRESH)).color(theme::BLACK),
-                ))
+                .add_enabled(reachable, update)
                 .on_hover_text("Scan the folder and index new or changed files")
                 .clicked()
             {
                 actions.push(Action::Update(row.name.clone()));
+            }
+            let check = egui::Button::new(
+                RichText::new(format!("{} CHECK", icon::SEARCH)).color(theme::BLACK),
+            );
+            if ui
+                .add_enabled(reachable, check)
+                .on_hover_text(
+                    "Dry-run: report new, changed, and missing files without hashing or writing",
+                )
+                .clicked()
+            {
+                actions.push(Action::Check(row.name.clone()));
             }
             if ui
                 .button(RichText::new(format!("{} RENAME", icon::PENCIL)).color(theme::BLACK))
@@ -810,6 +1105,106 @@ impl DedupApp {
             self.show_settings = false;
         }
     }
+
+    fn about_modal(&mut self, ctx: &egui::Context) {
+        let response = egui::Modal::new(Id::new("about")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.label(
+                RichText::new("ABOUT")
+                    .color(theme::AMBER)
+                    .size(18.0)
+                    .strong(),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!("DEDUP  v{}", env!("CARGO_PKG_VERSION"))).color(theme::TEXT),
+            );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("License:").color(theme::TAN).size(12.0));
+                ui.hyperlink_to(
+                    RichText::new("MIT").color(theme::LILAC).size(12.0),
+                    "https://opensource.org/license/mit",
+                );
+            });
+            ui.label(
+                RichText::new("© 2026 Patrick Zimmer")
+                    .color(theme::TAN)
+                    .size(12.0),
+            );
+            ui.hyperlink_to(
+                RichText::new("dedup@tuta.io")
+                    .color(theme::LILAC)
+                    .size(12.0),
+                "mailto:dedup@tuta.io",
+            );
+            ui.add_space(12.0);
+            if ui
+                .add(egui::Button::new(
+                    RichText::new("CLOSE").color(theme::BLACK),
+                ))
+                .clicked()
+            {
+                self.show_about = false;
+            }
+        });
+        if response.should_close() {
+            self.show_about = false;
+        }
+    }
+}
+
+/// A small rounded status chip with black text on `fill`.
+fn pill(ui: &mut egui::Ui, text: &str, fill: Color32) -> egui::Response {
+    egui::Frame::new()
+        .fill(fill)
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).color(theme::BLACK).size(11.0))
+        })
+        .inner
+}
+
+/// Render a repo's location + freshness as chips next to its name. Anything
+/// still `Unknown` (not yet probed/checked) draws nothing.
+fn status_pills(ui: &mut egui::Ui, row: &RepoRow) {
+    match row.location {
+        Some(Location::Local) => {
+            pill(ui, "LOCAL", theme::BLUE);
+        }
+        Some(Location::Remote) => {
+            pill(ui, "REMOTE", theme::LILAC);
+        }
+        Some(Location::Offline) => {
+            pill(ui, "OFFLINE", theme::AMBER)
+                .on_hover_text("Network mount is not reachable right now");
+        }
+        Some(Location::Missing) => {
+            pill(ui, "MISSING", theme::RED).on_hover_text("Local folder is not accessible");
+        }
+        None => {}
+    }
+    match row.freshness {
+        Freshness::Unknown => {}
+        Freshness::UpToDate => {
+            pill(ui, "UP TO DATE", theme::TAN);
+        }
+        Freshness::Stale { changed, missing } => {
+            pill(ui, "UPDATE REQUIRED", theme::ORANGE).on_hover_text(format!(
+                "{changed} new/changed, {missing} missing since the last scan"
+            ));
+        }
+    }
+}
+
+/// The RED "CANCEL" button shared by queued and running repo cards.
+fn cancel_button(ui: &mut egui::Ui, hover: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(RichText::new(format!("{} CANCEL", icon::X)).color(theme::BLACK))
+            .fill(theme::RED),
+    )
+    .on_hover_text(hover)
 }
 
 fn tab_button(ui: &mut egui::Ui, current: &mut Tab, tab: Tab, label: &str, color: Color32) {
@@ -933,6 +1328,18 @@ fn effective_name(name: &str, path: &str) -> String {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// Format a duration compactly: `"45s"`, `"3m 12s"`, or `"1h 04m"`.
+fn format_elapsed(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    }
 }
 
 fn progress_line(event: &ProgressEvent) -> String {

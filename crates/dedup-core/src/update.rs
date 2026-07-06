@@ -107,42 +107,48 @@ struct WalkedFile {
     modified_ms: i64,
 }
 
-/// Scan the repository directory of `name` and bring its index up to date.
-///
-/// `threads` is the hashing thread count; `0` uses one thread per CPU core.
-/// The operation checks `cancel` per file and stops cleanly mid-hash: entries
-/// already hashed are committed, vanished files are only marked missing on a
-/// complete, uncancelled walk.
-pub fn update_repo(
-    store: &Store,
-    name: &str,
-    threads: usize,
+/// Outcome of walking the tree and diffing it against the stored index. Shared
+/// by [`update_repo`] (which then hashes `to_hash`) and [`check_repo`] (which
+/// only reports the counts).
+struct WalkSplit {
+    /// Files that are new or whose (size, mtime) differ from the index.
+    to_hash: Vec<WalkedFile>,
+    /// Non-missing index entries not seen on disk this walk (vanished).
+    vanished: Vec<String>,
+    /// Files whose (size, mtime) matched the index.
+    unchanged: u64,
+    /// Files or directories that could not be read.
+    errors: u64,
+    /// True if the walk was cancelled before it completed.
+    cancelled: bool,
+}
+
+/// Walk `root`, skipping unreadable entries (reported, then continue), and
+/// split what is found against `existing` into unchanged vs new/changed, plus
+/// the index entries that have vanished from disk. Emits `Scanning` progress.
+fn walk_and_split(
+    root: &Path,
+    existing: &std::collections::HashMap<String, store::ScanEntry>,
     progress: &dyn Progress,
     cancel: &CancellationToken,
-) -> Result<UpdateStats, UpdateError> {
-    let meta = store.get_repo(name)?;
-    let root = PathBuf::from(&meta.abs_path);
-    if !root.is_dir() {
-        return Err(UpdateError::RootMissing(meta.abs_path.clone()));
-    }
-
-    let db = store.open_repo_db(name)?;
-    let existing = store::read_scan_index(&db)?;
-    let mut stats = UpdateStats::default();
-
-    // Walk the tree, skipping unreadable entries (report, continue).
+) -> WalkSplit {
     let mut walked: Vec<WalkedFile> = Vec::new();
     let mut dirs = 0u64;
-    for item in walkdir::WalkDir::new(&root).follow_links(false) {
+    let mut errors = 0u64;
+    for item in walkdir::WalkDir::new(root).follow_links(false) {
         if cancel.is_cancelled() {
-            stats.cancelled = true;
-            progress.on(ProgressEvent::Finished { stats });
-            return Ok(stats);
+            return WalkSplit {
+                to_hash: Vec::new(),
+                vanished: Vec::new(),
+                unchanged: 0,
+                errors,
+                cancelled: true,
+            };
         }
         let entry = match item {
             Ok(entry) => entry,
             Err(err) => {
-                stats.errors += 1;
+                errors += 1;
                 progress.on(ProgressEvent::Error {
                     path: err
                         .path()
@@ -163,7 +169,7 @@ pub fn update_repo(
         let metadata = match entry.metadata() {
             Ok(metadata) => metadata,
             Err(err) => {
-                stats.errors += 1;
+                errors += 1;
                 progress.on(ProgressEvent::Error {
                     path: entry.path().display().to_string(),
                     message: err.to_string(),
@@ -171,7 +177,7 @@ pub fn update_repo(
                 continue;
             }
         };
-        let rel = match entry.path().strip_prefix(&root) {
+        let rel = match entry.path().strip_prefix(root) {
             Ok(rel) => rel.to_string_lossy().into_owned(),
             Err(_) => continue,
         };
@@ -196,6 +202,7 @@ pub fn update_repo(
         .map(|(rel, _)| (rel.as_str(), ()))
         .collect();
     let mut to_hash: Vec<WalkedFile> = Vec::new();
+    let mut unchanged = 0u64;
     for file in walked {
         remaining.remove(file.rel.as_str());
         match existing.get(&file.rel) {
@@ -204,11 +211,56 @@ pub fn update_repo(
                     && entry.size == file.size
                     && entry.modified_ms == file.modified_ms =>
             {
-                stats.unchanged += 1;
+                unchanged += 1;
             }
             _ => to_hash.push(file),
         }
     }
+    let vanished: Vec<String> = remaining.into_keys().map(|s| s.to_string()).collect();
+
+    WalkSplit {
+        to_hash,
+        vanished,
+        unchanged,
+        errors,
+        cancelled: false,
+    }
+}
+
+/// Scan the repository directory of `name` and bring its index up to date.
+///
+/// `threads` is the hashing thread count; `0` uses one thread per CPU core.
+/// The operation checks `cancel` per file and stops cleanly mid-hash: entries
+/// already hashed are committed, vanished files are only marked missing on a
+/// complete, uncancelled walk.
+pub fn update_repo(
+    store: &Store,
+    name: &str,
+    threads: usize,
+    progress: &dyn Progress,
+    cancel: &CancellationToken,
+) -> Result<UpdateStats, UpdateError> {
+    let meta = store.get_repo(name)?;
+    let root = PathBuf::from(&meta.abs_path);
+    if !root.is_dir() {
+        return Err(UpdateError::RootMissing(meta.abs_path.clone()));
+    }
+
+    let db = store.open_repo_db(name)?;
+    let existing = store::read_scan_index(&db)?;
+    let mut stats = UpdateStats::default();
+
+    // Walk the tree and diff it against the stored index.
+    let split = walk_and_split(&root, &existing, progress, cancel);
+    stats.errors = split.errors;
+    stats.unchanged = split.unchanged;
+    if split.cancelled {
+        stats.cancelled = true;
+        progress.on(ProgressEvent::Finished { stats });
+        return Ok(stats);
+    }
+    let to_hash = split.to_hash;
+    let remaining = split.vanished;
 
     // Hash in parallel; a single consumer batches index writes.
     let pool = rayon::ThreadPoolBuilder::new()
@@ -302,9 +354,8 @@ pub fn update_repo(
     if cancel.is_cancelled() {
         stats.cancelled = true;
     } else {
-        let vanished: Vec<&str> = remaining.into_keys().collect();
-        stats.marked_missing = vanished.len() as u64;
-        store::mark_missing(&db, vanished)?;
+        stats.marked_missing = remaining.len() as u64;
+        store::mark_missing(&db, remaining.iter().map(|s| s.as_str()))?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -314,6 +365,68 @@ pub fn update_repo(
 
     progress.on(ProgressEvent::Finished { stats });
     Ok(stats)
+}
+
+/// Result of a dry-run [`check_repo`]: how the tree differs from the stored
+/// index, computed without hashing file contents or writing anything.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CheckStats {
+    /// Files that are new or whose (size, mtime) differ from the index.
+    pub changed: u64,
+    /// Non-missing index entries no longer present on disk.
+    pub missing: u64,
+    /// Files whose (size, mtime) match the index.
+    pub unchanged: u64,
+    /// Files or directories that could not be read.
+    pub errors: u64,
+    /// True if the check was cancelled before completion.
+    pub cancelled: bool,
+}
+
+impl CheckStats {
+    /// Whether an update would leave the index unchanged (nothing new, changed,
+    /// or vanished).
+    pub fn up_to_date(&self) -> bool {
+        self.changed == 0 && self.missing == 0
+    }
+}
+
+/// Dry-run the change detection for `name`: walk the tree and diff it against
+/// the stored index, reporting new/changed and vanished counts **without
+/// hashing file contents or writing to the index**.
+///
+/// Change detection compares each file's `(size, mtime)` against its stored
+/// record — not against the last-scan wall-clock time — so a file synced in
+/// with a preserved (older) timestamp is still flagged. It cannot detect a
+/// content change that kept both size and mtime identical; only a full
+/// [`update_repo`] re-hash catches that.
+pub fn check_repo(
+    store: &Store,
+    name: &str,
+    progress: &dyn Progress,
+    cancel: &CancellationToken,
+) -> Result<CheckStats, UpdateError> {
+    let meta = store.get_repo(name)?;
+    let root = PathBuf::from(&meta.abs_path);
+    if !root.is_dir() {
+        return Err(UpdateError::RootMissing(meta.abs_path.clone()));
+    }
+
+    let db = store.open_repo_db(name)?;
+    let existing = store::read_scan_index(&db)?;
+    let split = walk_and_split(&root, &existing, progress, cancel);
+
+    Ok(CheckStats {
+        changed: split.to_hash.len() as u64,
+        missing: if split.cancelled {
+            0
+        } else {
+            split.vanished.len() as u64
+        },
+        unchanged: split.unchanged,
+        errors: split.errors,
+        cancelled: split.cancelled,
+    })
 }
 
 /// A file's content hash together with its perceptual fingerprints, carried
