@@ -118,15 +118,22 @@ where
     groups
 }
 
-/// One file staged for similarity comparison, paired with its fingerprint.
+/// One file staged for similarity comparison: a lightweight locator plus its
+/// fingerprint. The full [`FileEntry`] is fetched only for files that end up in
+/// a group (see [`materialize`]), so staging holds ~8-byte keys per media file
+/// instead of a cloned entry each.
 struct Candidate<K> {
-    file: DupeFile,
+    repo_idx: usize,
+    rel_path: String,
     key: K,
 }
 
-/// Collect non-missing entries across `repo_names`, bucketed by media kind and
-/// deduplicated by absolute path.
+/// Non-missing media entries across `repo_names`, bucketed by kind and
+/// deduplicated by absolute path. `names`/`roots` are parallel and indexed by
+/// each candidate's `repo_idx`.
 struct Staged {
+    names: Vec<String>,
+    roots: Vec<String>,
     images: Vec<Candidate<u64>>,
     videos: Vec<Candidate<[u64; 3]>>,
     pdfs: Vec<Candidate<[u8; 32]>>,
@@ -135,6 +142,8 @@ struct Staged {
 
 fn stage(store: &Store, repo_names: &[String]) -> Result<Staged, StoreError> {
     let mut staged = Staged {
+        names: repo_names.to_vec(),
+        roots: Vec::with_capacity(repo_names.len()),
         images: Vec::new(),
         videos: Vec::new(),
         pdfs: Vec::new(),
@@ -142,8 +151,9 @@ fn stage(store: &Store, repo_names: &[String]) -> Result<Staged, StoreError> {
     };
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
-    for name in repo_names {
+    for (repo_idx, name) in repo_names.iter().enumerate() {
         let meta = store.get_repo(name)?;
+        staged.roots.push(meta.abs_path.clone());
         let db = store.open_repo_db(name)?;
         store::for_each_file_entry(&db, |rel_path, entry| {
             if entry.missing {
@@ -153,34 +163,32 @@ fn stage(store: &Store, repo_names: &[String]) -> Result<Staged, StoreError> {
             if !seen.insert(abs) {
                 return Ok(());
             }
-            let file = || DupeFile {
-                repo: name.clone(),
-                repo_root: meta.abs_path.clone(),
-                rel_path: rel_path.to_string(),
-                entry: entry.clone(),
-            };
             if let Some(fp) = entry.img_fingerprint {
                 staged.images.push(Candidate {
-                    file: file(),
+                    repo_idx,
+                    rel_path: rel_path.to_string(),
                     key: fp,
                 });
             }
             if let Some(vh) = entry.video_hash {
                 staged.videos.push(Candidate {
-                    file: file(),
+                    repo_idx,
+                    rel_path: rel_path.to_string(),
                     key: vh,
                 });
             }
             if let Some(ph) = entry.pdf_hash {
                 staged.pdfs.push(Candidate {
-                    file: file(),
+                    repo_idx,
+                    rel_path: rel_path.to_string(),
                     key: ph,
                 });
             }
-            if let Some(ref af) = entry.audio {
+            if let Some(af) = entry.audio {
                 staged.audios.push(Candidate {
-                    file: file(),
-                    key: (af.duration_ms, af.chunk_hashes.clone()),
+                    repo_idx,
+                    rel_path: rel_path.to_string(),
+                    key: (af.duration_ms, af.chunk_hashes),
                 });
             }
             Ok(())
@@ -189,16 +197,31 @@ fn stage(store: &Store, repo_names: &[String]) -> Result<Staged, StoreError> {
     Ok(staged)
 }
 
-fn materialize<K>(candidates: &[Candidate<K>], index_groups: Vec<Vec<usize>>) -> Vec<DupeGroup> {
-    index_groups
-        .into_iter()
-        .map(|indices| {
-            indices
-                .into_iter()
-                .map(|i| candidates[i].file.clone())
-                .collect()
-        })
-        .collect()
+/// Build [`DupeFile`]s for the grouped candidates, fetching each member's
+/// [`FileEntry`] from its repo DB (`dbs` is parallel to `staged.names`).
+fn materialize<K>(
+    dbs: &[redb::Database],
+    staged: &Staged,
+    candidates: &[Candidate<K>],
+    index_groups: Vec<Vec<usize>>,
+) -> Result<Vec<DupeGroup>, StoreError> {
+    let mut out = Vec::with_capacity(index_groups.len());
+    for indices in index_groups {
+        let mut group: DupeGroup = Vec::with_capacity(indices.len());
+        for i in indices {
+            let c = &candidates[i];
+            if let Some(entry) = store::get_entry(&dbs[c.repo_idx], &c.rel_path)? {
+                group.push(DupeFile {
+                    repo: staged.names[c.repo_idx].clone(),
+                    repo_root: staged.roots[c.repo_idx].clone(),
+                    rel_path: c.rel_path.clone(),
+                    entry,
+                });
+            }
+        }
+        out.push(group);
+    }
+    Ok(out)
 }
 
 /// Find similar-file groups across the given repos at the given threshold
@@ -212,23 +235,30 @@ pub fn find_similar(
 ) -> Result<Vec<DupeGroup>, StoreError> {
     let staged = stage(store, repo_names)?;
 
+    // Open each repo DB once; grouped members' entries are fetched from these.
+    let mut dbs: Vec<redb::Database> = Vec::with_capacity(staged.names.len());
+    for name in &staged.names {
+        dbs.push(store.open_repo_db(name)?);
+    }
+
     let mut groups: Vec<DupeGroup> = Vec::new();
 
     let img_fps: Vec<u64> = staged.images.iter().map(|c| c.key).collect();
-    groups.extend(materialize(&staged.images, group_u64(&img_fps, threshold)));
+    let img_groups = group_u64(&img_fps, threshold);
+    groups.extend(materialize(&dbs, &staged, &staged.images, img_groups)?);
 
     let video_groups = group_by(&staged.videos, |a, b| {
         similarity_192(&a.key, &b.key) >= threshold
     });
-    groups.extend(materialize(&staged.videos, video_groups));
+    groups.extend(materialize(&dbs, &staged, &staged.videos, video_groups)?);
 
     let pdf_groups = group_by(&staged.pdfs, |a, b| a.key == b.key);
-    groups.extend(materialize(&staged.pdfs, pdf_groups));
+    groups.extend(materialize(&dbs, &staged, &staged.pdfs, pdf_groups)?);
 
     let audio_groups = group_by(&staged.audios, |a, b| {
         a.key.1 == b.key.1 && a.key.0.abs_diff(b.key.0) <= AUDIO_DURATION_TOLERANCE_MS
     });
-    groups.extend(materialize(&staged.audios, audio_groups));
+    groups.extend(materialize(&dbs, &staged, &staged.audios, audio_groups)?);
 
     sort_groups(&mut groups);
     Ok(groups)

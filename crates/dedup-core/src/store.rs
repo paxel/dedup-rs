@@ -132,6 +132,10 @@ pub struct RepoStats {
 
 pub type DuplicateGroup = (u64, [u8; 32], Vec<String>);
 
+/// The head of one `BY_SIZE_HASH` cursor during a k-way merge: the smallest
+/// not-yet-consumed `(size, hash)` and its member rel-paths, or `None` at end.
+type MergeHead = Option<(u64, [u8; 32], Vec<String>)>;
+
 pub struct Store {
     config_dir: PathBuf,
     registry: redb::Database,
@@ -541,6 +545,101 @@ impl Store {
         }
 
         Ok(groups)
+    }
+
+    /// Enumerate exact-duplicate group descriptors `(size, hash, count)` across
+    /// `repo_names`, streamed from each repo's sorted `BY_SIZE_HASH` index via a
+    /// k-way merge. Members are deduplicated by absolute path across repos (like
+    /// [`crate::dupes::find_exact_duplicates`]); only groups with `count > 1`
+    /// are emitted. `progress` is called periodically with the running count.
+    ///
+    /// Peak memory is O(number of duplicate groups): unique files stream past
+    /// without being retained.
+    pub fn plan_duplicate_group_keys(
+        &self,
+        repo_names: &[String],
+        mut progress: impl FnMut(usize),
+    ) -> Result<Vec<(u64, [u8; 32], u32)>, StoreError> {
+        // Keep every read layer alive for the whole merge. redb 2.x read handles
+        // are owned (Arc-based), so these Vecs don't borrow one another; the
+        // `iters` borrow `tables`, which must outlive them.
+        let mut roots: Vec<String> = Vec::with_capacity(repo_names.len());
+        let mut dbs: Vec<redb::Database> = Vec::with_capacity(repo_names.len());
+        for name in repo_names {
+            roots.push(self.get_repo(name)?.abs_path);
+            dbs.push(self.open_repo_db(name)?);
+        }
+        let mut txns = Vec::with_capacity(dbs.len());
+        for db in &dbs {
+            txns.push(db.begin_read()?);
+        }
+        let mut tables = Vec::with_capacity(txns.len());
+        for txn in &txns {
+            tables.push(txn.open_multimap_table(BY_SIZE_HASH)?);
+        }
+        let mut iters = Vec::with_capacity(tables.len());
+        for table in &tables {
+            iters.push(table.iter()?);
+        }
+
+        // Pull the next `(size, hash, member rel_paths)` from one cursor.
+        macro_rules! pull {
+            ($it:expr) => {{
+                match $it.next() {
+                    None => None,
+                    Some(item) => {
+                        let (key_guard, val_iter) = item?;
+                        let (size, hash_slice) = key_guard.value();
+                        let mut hash = [0u8; 32];
+                        hash.copy_from_slice(hash_slice);
+                        let mut members: Vec<String> = Vec::new();
+                        for v in val_iter {
+                            members.push(v?.value().to_string());
+                        }
+                        Some((size, hash, members))
+                    }
+                }
+            }};
+        }
+
+        // Head of each cursor: the smallest not-yet-consumed key + its members.
+        let mut heads: Vec<MergeHead> = Vec::with_capacity(iters.len());
+        for it in &mut iters {
+            heads.push(pull!(it));
+        }
+
+        let mut out: Vec<(u64, [u8; 32], u32)> = Vec::new();
+        loop {
+            let min = heads
+                .iter()
+                .flatten()
+                .map(|(size, hash, _)| (*size, *hash))
+                .min();
+            let Some((msize, mhash)) = min else { break };
+
+            // Union every cursor sitting on the min key, deduping by abs path.
+            let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+            for i in 0..heads.len() {
+                let on_min = matches!(&heads[i], Some((s, h, _)) if *s == msize && *h == mhash);
+                if on_min {
+                    if let Some((_, _, members)) = &heads[i] {
+                        for rel in members {
+                            seen.insert(std::path::Path::new(&roots[i]).join(rel));
+                        }
+                    }
+                    heads[i] = pull!(iters[i]);
+                }
+            }
+
+            if seen.len() > 1 {
+                out.push((msize, mhash, seen.len() as u32));
+                if out.len().is_multiple_of(1024) {
+                    progress(out.len());
+                }
+            }
+        }
+        progress(out.len());
+        Ok(out)
     }
 }
 

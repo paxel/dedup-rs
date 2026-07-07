@@ -6,14 +6,54 @@ use crate::icon;
 use crate::theme;
 use crate::thumbs::ThumbCache;
 use crate::util::{format_mtime, format_size};
-use dedup_core::dupes::{DupeFile, DupeGroup, delete_files, find_exact_duplicates, wasted_bytes};
+use crossbeam_channel::{Receiver, Sender};
+use dedup_core::dupes::{
+    DupeDeleteStats, DupeFile, DupeGroup, DupeGroupKey, delete_paths, load_groups,
+    plan_exact_duplicates, wasted_bytes,
+};
 use dedup_core::similar::find_similar;
 use dedup_core::store::Store;
 use dedup_core::thumbnail::hash_hex;
 use egui::{Color32, Id, RichText};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 const PAGE_SIZE: usize = 50;
+/// Load groups from the DB in batches of this many during auto-resolve.
+const AUTO_BATCH: usize = 128;
+
+/// The current result set: exact duplicates are a lightweight *plan* of
+/// descriptors (members loaded a page at a time), while similar results are the
+/// full (small) group list held in memory.
+enum Results {
+    Exact(Vec<DupeGroupKey>),
+    Similar(Vec<DupeGroup>),
+}
+
+impl Results {
+    fn len(&self) -> usize {
+        match self {
+            Results::Exact(plan) => plan.len(),
+            Results::Similar(groups) => groups.len(),
+        }
+    }
+}
+
+/// A background operation in flight (drives the spinner and disables actions).
+enum Op {
+    Find(usize),
+    AutoResolve { done: usize, total: usize },
+    Delete,
+}
+
+/// Messages from background operation threads back to the UI.
+enum Msg {
+    FindProgress(usize),
+    FindDone(Result<Results, String>),
+    AutoProgress { done: usize, total: usize },
+    AutoDone(Result<Vec<FileKey>, String>),
+    DeleteDone(Result<DupeDeleteStats, String>),
+}
 
 /// A bold-bordered LCARS section container in the given accent color, used to
 /// group a row of related controls.
@@ -71,9 +111,22 @@ pub struct DupesView {
     repos_loaded: bool,
     mode: Mode,
     threshold: f64,
-    groups: Vec<DupeGroup>,
+    /// The result set (plan for exact, full groups for similar), if a search has
+    /// run. `None` before the first FIND.
+    results: Option<Results>,
+    /// Repo names the current `results` were computed for (used to load pages).
+    result_names: Vec<String>,
+    /// The current page's materialized groups, and which page they are.
+    page_groups: Vec<DupeGroup>,
+    cached_page: Option<usize>,
+    /// Cached rendered height per group index (absolute); `0.0` = not measured.
+    group_heights: Vec<f32>,
     marked: HashSet<FileKey>,
     page: usize,
+    /// A background operation in flight, if any.
+    busy: Option<Op>,
+    tx: Sender<Msg>,
+    rx: Receiver<Msg>,
     status: Option<String>,
     error: Option<String>,
     confirm: Option<String>,
@@ -82,14 +135,22 @@ pub struct DupesView {
 
 impl DupesView {
     pub fn new() -> Self {
+        let (tx, rx) = crossbeam_channel::unbounded();
         Self {
             repos: Vec::new(),
             repos_loaded: false,
             mode: Mode::Exact,
             threshold: 90.0,
-            groups: Vec::new(),
+            results: None,
+            result_names: Vec::new(),
+            page_groups: Vec::new(),
+            cached_page: None,
+            group_heights: Vec::new(),
             marked: HashSet::new(),
             page: 0,
+            busy: None,
+            tx,
+            rx,
             status: None,
             error: None,
             confirm: None,
@@ -97,10 +158,17 @@ impl DupesView {
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, store: &Store) {
-        if self.thumbs.poll(&ui.ctx().clone()) {
-            ui.ctx().request_repaint();
+    /// Total number of result groups (0 if no search yet).
+    fn total_groups(&self) -> usize {
+        self.results.as_ref().map_or(0, Results::len)
+    }
+
+    pub fn show(&mut self, ui: &mut egui::Ui, store: &Arc<Store>) {
+        let ctx = ui.ctx().clone();
+        if self.thumbs.poll(&ctx) {
+            ctx.request_repaint();
         }
+        self.drain_messages(store, &ctx);
         if !self.repos_loaded {
             self.load_repos(store);
         }
@@ -123,14 +191,73 @@ impl DupesView {
             ui.label(RichText::new(status).color(theme::TAN).size(13.0));
         }
         ui.separator();
-        self.results(ui, &mut acts);
+        self.results(ui, store, &mut acts);
 
         if let Some(prompt) = self.confirm.clone() {
             self.confirm_modal(ui, &prompt, &mut acts);
         }
 
         for act in acts {
-            self.apply(store, act);
+            self.apply(&ctx, store, act);
+        }
+
+        // Keep the spinner/progress ticking while a background op runs.
+        if self.busy.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// Apply results/marks from finished background operations.
+    fn drain_messages(&mut self, store: &Arc<Store>, ctx: &egui::Context) {
+        while let Ok(msg) = self.rx.try_recv() {
+            match msg {
+                Msg::FindProgress(n) => self.busy = Some(Op::Find(n)),
+                Msg::FindDone(result) => {
+                    self.busy = None;
+                    match result {
+                        Ok(results) => {
+                            self.group_heights = vec![0.0; results.len()];
+                            self.status = Some(format!("{} group(s)", results.len()));
+                            self.results = Some(results);
+                            self.marked.clear();
+                            self.page = 0;
+                            self.cached_page = None;
+                            self.error = None;
+                        }
+                        Err(e) => self.error = Some(e),
+                    }
+                }
+                Msg::AutoProgress { done, total } => {
+                    self.busy = Some(Op::AutoResolve { done, total });
+                }
+                Msg::AutoDone(result) => {
+                    self.busy = None;
+                    match result {
+                        Ok(keys) => {
+                            for k in keys {
+                                self.marked.insert(k);
+                            }
+                            self.status =
+                                Some(format!("{} marked for deletion", self.marked.len()));
+                        }
+                        Err(e) => self.error = Some(e),
+                    }
+                }
+                Msg::DeleteDone(result) => {
+                    self.busy = None;
+                    match result {
+                        Ok(stats) => {
+                            self.status = Some(format!(
+                                "Deleted {} file(s), {} error(s). Re-running search…",
+                                stats.deleted, stats.errors
+                            ));
+                            self.marked.clear();
+                            self.start_find(store, ctx);
+                        }
+                        Err(e) => self.error = Some(e),
+                    }
+                }
+            }
         }
     }
 
@@ -301,16 +428,24 @@ impl DupesView {
                             }
                         });
                     });
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new(format!("{} FIND", icon::SEARCH)).color(theme::BLACK),
-                        )
-                        .fill(theme::AMBER),
-                    )
-                    .clicked()
-                {
+                let find = egui::Button::new(
+                    RichText::new(format!("{} FIND", icon::SEARCH)).color(theme::BLACK),
+                )
+                .fill(theme::AMBER);
+                if ui.add_enabled(self.busy.is_none(), find).clicked() {
                     acts.push(Act::Find);
+                }
+                // Progress while a background op runs.
+                if let Some(op) = &self.busy {
+                    ui.add(egui::Spinner::new().color(theme::AMBER));
+                    let text = match op {
+                        Op::Find(n) => format!("searching… {n} groups"),
+                        Op::AutoResolve { done, total } => {
+                            format!("auto-resolving… {done}/{total}")
+                        }
+                        Op::Delete => "deleting…".to_string(),
+                    };
+                    ui.label(RichText::new(text).color(theme::AMBER).size(12.0));
                 }
             });
 
@@ -330,11 +465,14 @@ impl DupesView {
             }
         });
 
-        if !self.groups.is_empty() {
+        if self.total_groups() > 0 {
             ui.horizontal(|ui| {
                 let n = self.marked.len();
+                let idle = self.busy.is_none();
+                let auto =
+                    egui::Button::new(RichText::new("AUTO-RESOLVE REST").color(theme::BLACK));
                 if ui
-                    .button(RichText::new("AUTO-RESOLVE REST").color(theme::BLACK))
+                    .add_enabled(idle, auto)
                     .on_hover_text("Mark every non-best copy in a deletable repo")
                     .clicked()
                 {
@@ -344,21 +482,27 @@ impl DupesView {
                     RichText::new(format!("DELETE MARKED ({n})")).color(theme::BLACK),
                 )
                 .fill(theme::RED);
-                if ui.add_enabled(n > 0, del).clicked() {
+                if ui.add_enabled(idle && n > 0, del).clicked() {
                     acts.push(Act::AskDelete);
                 }
             });
         }
     }
 
-    fn results(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        if self.groups.is_empty() {
+    fn results(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, acts: &mut Vec<Act>) {
+        let total = self.total_groups();
+        if total == 0 {
             ui.add_space(8.0);
-            ui.colored_label(theme::TEXT, "No groups. Pick repos and press FIND.");
+            let msg = if self.busy.is_some() {
+                "Searching…"
+            } else {
+                "No groups. Pick repos and press FIND."
+            };
+            ui.colored_label(theme::TEXT, msg);
             return;
         }
 
-        let pages = self.groups.len().div_ceil(PAGE_SIZE);
+        let pages = total.div_ceil(PAGE_SIZE);
         let page = self.page.min(pages.saturating_sub(1));
         ui.horizontal(|ui| {
             if ui
@@ -368,13 +512,8 @@ impl DupesView {
                 acts.push(Act::SetPage(page - 1));
             }
             ui.label(
-                RichText::new(format!(
-                    "page {}/{} · {} groups",
-                    page + 1,
-                    pages,
-                    self.groups.len()
-                ))
-                .color(theme::TAN),
+                RichText::new(format!("page {}/{} · {} groups", page + 1, pages, total))
+                    .color(theme::TAN),
             );
             if ui
                 .add_enabled(page + 1 < pages, egui::Button::new(icon::CARET_RIGHT))
@@ -385,20 +524,75 @@ impl DupesView {
         });
 
         let start = page * PAGE_SIZE;
-        let end = (start + PAGE_SIZE).min(self.groups.len());
+        let end = (start + PAGE_SIZE).min(total);
+        if self.group_heights.len() != total {
+            self.group_heights = vec![0.0; total];
+        }
+        // Materialize just this page's groups (exact loads from the DB).
+        self.ensure_page(store, page);
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                let avail_w = ui.available_width();
+                let spacing = ui.spacing().item_spacing.y;
                 for gi in start..end {
-                    self.group_card(ui, gi, acts);
+                    // Virtualize: a group we've measured before and that lies
+                    // outside the viewport just reserves its known height — we
+                    // skip building (and cloning) its widgets entirely. Unmeasured
+                    // groups always render once so their height is recorded.
+                    let known = self.group_heights[gi];
+                    let top = ui.next_widget_position();
+                    let visible = known <= 0.0
+                        || ui.is_rect_visible(egui::Rect::from_min_size(
+                            top,
+                            egui::vec2(avail_w, known),
+                        ));
+                    if visible {
+                        let before = top.y;
+                        self.group_card(ui, gi, start, acts);
+                        self.group_heights[gi] = ui.next_widget_position().y - before;
+                    } else {
+                        // `allocate_space` adds a trailing item-spacing itself, so
+                        // reserve the slot minus that to match the rendered advance.
+                        ui.allocate_space(egui::vec2(avail_w, (known - spacing).max(0.0)));
+                    }
                 }
             });
     }
 
-    fn group_card(&mut self, ui: &mut egui::Ui, gi: usize, acts: &mut Vec<Act>) {
-        // Clone the (small) group so the render closure can borrow `self` mutably
-        // for thumbnails and mark state without aliasing `self.groups`.
-        let group: Vec<DupeFile> = self.groups[gi].clone();
+    /// Load the current page's groups into `page_groups` if not already cached.
+    fn ensure_page(&mut self, store: &Arc<Store>, page: usize) {
+        if self.cached_page == Some(page) {
+            return;
+        }
+        let total = self.total_groups();
+        let start = page * PAGE_SIZE;
+        let end = (start + PAGE_SIZE).min(total);
+        let loaded = match &self.results {
+            Some(Results::Exact(plan)) => {
+                load_groups(store, &self.result_names, &plan[start..end]).map_err(|e| e.to_string())
+            }
+            Some(Results::Similar(groups)) => Ok(groups[start..end].to_vec()),
+            None => Ok(Vec::new()),
+        };
+        match loaded {
+            Ok(groups) => self.page_groups = groups,
+            Err(e) => {
+                self.error = Some(e);
+                self.page_groups = Vec::new();
+            }
+        }
+        self.cached_page = Some(page);
+    }
+
+    fn group_card(&mut self, ui: &mut egui::Ui, gi: usize, page_start: usize, acts: &mut Vec<Act>) {
+        // The page's groups are already materialized; clone the (small) one so the
+        // render closure can borrow `self` mutably for thumbnails/mark state.
+        let group: DupeGroup = self
+            .page_groups
+            .get(gi - page_start)
+            .cloned()
+            .unwrap_or_default();
         let count = group.len();
         let size = group.first().map(|f| f.entry.size).unwrap_or(0);
         let wasted = wasted_bytes(&group);
@@ -507,15 +701,24 @@ impl DupesView {
             .as_deref()
             .is_some_and(|m| m.starts_with("image/"));
         if is_image {
-            let hex = hash_hex(&file.entry.hash);
-            let source = file.absolute_path();
-            if let Some(tex) = self.thumbs.get(&hex, &source) {
-                ui.add(
-                    egui::Image::new(egui::load::SizedTexture::from_handle(&tex))
-                        .max_height(120.0)
-                        .corner_radius(6),
-                );
-                return;
+            // Only fetch a texture for on-screen cards. The results list is not
+            // virtualized, so a page can lay out far more thumbnails than the GPU
+            // texture cache holds; requesting every one each frame thrashes the
+            // LRU (evict → re-decode → repaint), which spikes CPU and makes the
+            // images flicker. Off-screen cards fall through to the placeholder.
+            let thumb_rect =
+                egui::Rect::from_min_size(ui.next_widget_position(), egui::vec2(160.0, 120.0));
+            if ui.is_rect_visible(thumb_rect) {
+                let hex = hash_hex(&file.entry.hash);
+                let source = file.absolute_path();
+                if let Some(tex) = self.thumbs.get(&hex, &source) {
+                    ui.add(
+                        egui::Image::new(egui::load::SizedTexture::from_handle(&tex))
+                            .max_height(120.0)
+                            .corner_radius(6),
+                    );
+                    return;
+                }
             }
         }
         // Placeholder for non-images or not-yet-ready thumbnails.
@@ -565,7 +768,7 @@ impl DupesView {
         });
     }
 
-    fn apply(&mut self, store: &Store, act: Act) {
+    fn apply(&mut self, ctx: &egui::Context, store: &Arc<Store>, act: Act) {
         match act {
             Act::ToggleInclude(i) => {
                 if let Some(r) = self.repos.get_mut(i) {
@@ -582,13 +785,13 @@ impl DupesView {
                 }
             }
             Act::ReloadRepos => self.load_repos(store),
-            Act::Find => self.find(store),
+            Act::Find => self.start_find(store, ctx),
             Act::ToggleMark(k) => {
                 if !self.marked.remove(&k) {
                     self.marked.insert(k);
                 }
             }
-            Act::AutoResolve => self.preselect_worse(),
+            Act::AutoResolve => self.start_auto_resolve(store, ctx),
             Act::SetPage(p) => self.page = p,
             Act::AskDelete => {
                 let n = self.marked.len();
@@ -602,72 +805,140 @@ impl DupesView {
             Act::CancelDelete => self.confirm = None,
             Act::ConfirmDelete => {
                 self.confirm = None;
-                self.delete_marked(store);
+                self.start_delete(store, ctx);
             }
         }
     }
 
-    fn find(&mut self, store: &Store) {
-        let names: Vec<String> = self
-            .repos
+    fn included_names(&self) -> Vec<String> {
+        self.repos
             .iter()
             .filter(|r| r.included)
             .map(|r| r.name.clone())
-            .collect();
+            .collect()
+    }
+
+    fn read_only_names(&self) -> HashSet<String> {
+        self.repos
+            .iter()
+            .filter(|r| r.read_only)
+            .map(|r| r.name.clone())
+            .collect()
+    }
+
+    /// Run the search on a background thread; results/progress arrive via `rx`.
+    fn start_find(&mut self, store: &Arc<Store>, ctx: &egui::Context) {
+        if self.busy.is_some() {
+            return;
+        }
+        let names = self.included_names();
         if names.is_empty() {
             self.error = Some("Select at least one repo.".into());
             return;
         }
-        let result = match self.mode {
-            Mode::Exact => find_exact_duplicates(store, &names),
-            Mode::Similar => find_similar(store, &names, self.threshold),
-        };
-        match result {
-            Ok(groups) => {
-                self.groups = groups;
-                self.marked.clear();
-                self.page = 0;
-                self.error = None;
-                self.preselect_worse();
-                self.status = Some(format!(
-                    "{} group(s); {} preselected for deletion",
-                    self.groups.len(),
-                    self.marked.len()
-                ));
-            }
-            Err(e) => self.error = Some(e.to_string()),
-        }
-    }
-
-    /// Mark every non-best copy whose repo is not read-only.
-    fn preselect_worse(&mut self) {
-        for group in &self.groups {
-            for file in group.iter().skip(1) {
-                if !self.repo_is_ro(&file.repo) {
-                    self.marked.insert(key(file));
+        self.result_names = names.clone();
+        self.busy = Some(Op::Find(0));
+        self.status = None;
+        self.error = None;
+        let store = Arc::clone(store);
+        let tx = self.tx.clone();
+        let mode = self.mode;
+        let threshold = self.threshold;
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result = match mode {
+                Mode::Exact => {
+                    let tx2 = tx.clone();
+                    let r = repaint.clone();
+                    plan_exact_duplicates(&store, &names, move |n| {
+                        let _ = tx2.send(Msg::FindProgress(n));
+                        r.request_repaint();
+                    })
+                    .map(Results::Exact)
+                    .map_err(|e| e.to_string())
                 }
+                Mode::Similar => find_similar(&store, &names, threshold)
+                    .map(Results::Similar)
+                    .map_err(|e| e.to_string()),
+            };
+            let _ = tx.send(Msg::FindDone(result));
+            repaint.request_repaint();
+        });
+    }
+
+    /// Mark every non-best copy in a non-read-only repo. Similar results are in
+    /// memory (marked inline); exact streams the plan on a background thread.
+    fn start_auto_resolve(&mut self, store: &Arc<Store>, ctx: &egui::Context) {
+        if self.busy.is_some() {
+            return;
+        }
+        let ro = self.read_only_names();
+        match &self.results {
+            Some(Results::Similar(groups)) => {
+                for group in groups {
+                    for file in group.iter().skip(1) {
+                        if !ro.contains(&file.repo) {
+                            self.marked.insert(key(file));
+                        }
+                    }
+                }
+                self.status = Some(format!("{} marked for deletion", self.marked.len()));
             }
+            Some(Results::Exact(plan)) => {
+                let plan = plan.clone();
+                let names = self.result_names.clone();
+                let total = plan.len();
+                self.busy = Some(Op::AutoResolve { done: 0, total });
+                let store = Arc::clone(store);
+                let tx = self.tx.clone();
+                let repaint = ctx.clone();
+                std::thread::spawn(move || {
+                    let mut marks: Vec<FileKey> = Vec::new();
+                    let mut done = 0;
+                    for chunk in plan.chunks(AUTO_BATCH) {
+                        match load_groups(&store, &names, chunk) {
+                            Ok(groups) => {
+                                for group in &groups {
+                                    for file in group.iter().skip(1) {
+                                        if !ro.contains(&file.repo) {
+                                            marks.push((file.repo.clone(), file.rel_path.clone()));
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Msg::AutoDone(Err(e.to_string())));
+                                repaint.request_repaint();
+                                return;
+                            }
+                        }
+                        done += chunk.len();
+                        let _ = tx.send(Msg::AutoProgress { done, total });
+                        repaint.request_repaint();
+                    }
+                    let _ = tx.send(Msg::AutoDone(Ok(marks)));
+                    repaint.request_repaint();
+                });
+            }
+            None => {}
         }
     }
 
-    fn delete_marked(&mut self, store: &Store) {
-        let targets: Vec<&DupeFile> = self
-            .groups
-            .iter()
-            .flatten()
-            .filter(|f| self.marked.contains(&key(f)))
-            .collect();
-        match delete_files(store, &targets) {
-            Ok(stats) => {
-                self.status = Some(format!(
-                    "Deleted {} file(s), {} error(s). Re-running search…",
-                    stats.deleted, stats.errors
-                ));
-                self.marked.clear();
-                self.find(store);
-            }
-            Err(e) => self.error = Some(e.to_string()),
+    /// Delete the marked selection on a background thread, then re-run the search.
+    fn start_delete(&mut self, store: &Arc<Store>, ctx: &egui::Context) {
+        if self.busy.is_some() || self.marked.is_empty() {
+            return;
         }
+        let keys: Vec<(String, String)> = self.marked.iter().cloned().collect();
+        self.busy = Some(Op::Delete);
+        let store = Arc::clone(store);
+        let tx = self.tx.clone();
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result = delete_paths(&store, &keys).map_err(|e| e.to_string());
+            let _ = tx.send(Msg::DeleteDone(result));
+            repaint.request_repaint();
+        });
     }
 
     fn repo_is_ro(&self, name: &str) -> bool {
@@ -692,7 +963,7 @@ mod ui_tests {
     ];
 
     /// A temp store pre-populated with `names` as (empty) repos.
-    fn sample_store(names: &[&str]) -> (TempDir, Store) {
+    fn sample_store(names: &[&str]) -> (TempDir, Arc<Store>) {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open_at(tmp.path().join("cfg")).unwrap();
         for n in names {
@@ -700,13 +971,13 @@ mod ui_tests {
             std::fs::create_dir_all(&dir).unwrap();
             store.create_repo(n, &dir.to_string_lossy()).unwrap();
         }
-        (tmp, store)
+        (tmp, Arc::new(store))
     }
 
     /// Build a driven harness showing the Duplicates view for `store`. The
     /// closure owns `view`/`store`; the theme + icon font are installed once so
     /// glyph metrics match the real app.
-    fn dupes_harness<'a>(store: Store) -> Harness<'a> {
+    fn dupes_harness<'a>(store: Arc<Store>) -> Harness<'a> {
         let mut view = DupesView::new();
         let mut init = false;
         let mut harness = Harness::builder()
@@ -794,6 +1065,239 @@ mod ui_tests {
             (dup_top - find_top).abs() < 0.75,
             "SIMILAR row misaligned: DUPLICATES top {dup_top} vs FIND top {find_top}"
         );
+    }
+
+    /// A dummy image-type duplicate file with a unique hash (→ unique thumbnail).
+    fn image_file(i: usize) -> DupeFile {
+        let mut hash = [0u8; 32];
+        hash[0] = i as u8;
+        hash[1] = (i >> 8) as u8;
+        DupeFile {
+            repo: "r".into(),
+            repo_root: "/nonexistent-dedup-test".into(),
+            rel_path: format!("img{i}.png"),
+            entry: dedup_core::store::FileEntry {
+                size: 1000,
+                hash,
+                modified_ms: 0,
+                missing: false,
+                mime: Some("image/png".into()),
+                img_fingerprint: None,
+                video_hash: None,
+                pdf_hash: None,
+                audio: None,
+                img_size: Some((100, 100)),
+            },
+        }
+    }
+
+    /// Regression test for the SIMILAR results melting the CPU: the results list
+    /// isn't virtualized, so a page can lay out far more thumbnails than the
+    /// texture cache holds. Requesting them all every frame thrashes the LRU and
+    /// spins repaints. The fix only fetches textures for on-screen cards — so
+    /// with many off-screen cards, only the visible handful should be requested.
+    #[test]
+    fn offscreen_thumbnails_are_not_requested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let total = 40usize;
+        let groups: Vec<DupeGroup> = (0..total).map(|i| vec![image_file(i)]).collect();
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true; // no repos needed; render fabricated groups
+        view.results = Some(Results::Similar(groups));
+
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(600.0, 400.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store);
+                },
+                view,
+            );
+        harness.run();
+
+        let sent = harness.state().thumbs.requests_sent();
+        assert!(sent > 0, "expected on-screen cards to request thumbnails");
+        assert!(
+            sent <= 8,
+            "requested {sent} of {total} thumbnails in a 400px viewport; \
+             off-screen cards should be skipped (not virtualized → cache thrash)"
+        );
+    }
+
+    /// Off-screen groups must not be laid out at all (virtualization): their
+    /// widgets should be absent from the tree, so rendering cost tracks the
+    /// visible groups rather than the whole page.
+    #[test]
+    fn offscreen_groups_are_virtualized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let groups: Vec<DupeGroup> = (0..40).map(|i| vec![image_file(i)]).collect();
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(groups));
+
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(600.0, 400.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store);
+                },
+                view,
+            );
+        // First frame renders all to measure heights; later frames virtualize.
+        harness.run();
+        harness.run();
+
+        // A top group is on-screen and rendered; a bottom group is off-screen
+        // and must have been skipped (its file label is absent from the tree).
+        assert!(
+            harness.query_by_label("img0.png").is_some(),
+            "top group should be rendered"
+        );
+        assert!(
+            harness.query_by_label("img39.png").is_none(),
+            "bottom group should be virtualized (not laid out)"
+        );
+    }
+
+    /// Seed `repo` with `n` distinct 2-member exact-duplicate groups (metadata
+    /// only — no files on disk, which plan/load don't need). Batched into one
+    /// write transaction so seeding many groups stays fast.
+    fn seed_groups(store: &Store, n: usize) {
+        let mut entries: Vec<(String, dedup_core::store::FileEntry)> = Vec::with_capacity(n * 2);
+        for g in 0..n {
+            let mut hash = [0u8; 32];
+            hash[0] = g as u8;
+            hash[1] = (g >> 8) as u8;
+            let e = dedup_core::store::FileEntry {
+                size: 1000,
+                hash,
+                modified_ms: 0,
+                missing: false,
+                mime: None,
+                img_fingerprint: None,
+                video_hash: None,
+                pdf_hash: None,
+                audio: None,
+                img_size: None,
+            };
+            for c in 0..2 {
+                entries.push((format!("g{g}_c{c}.bin"), e.clone()));
+            }
+        }
+        let db = store.open_repo_db("repo").unwrap();
+        dedup_core::store::apply_entries(&db, entries.iter().map(|(p, e)| (p.as_str(), e)))
+            .unwrap();
+    }
+
+    fn seeded_store(n: usize) -> (TempDir, Arc<Store>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_at(tmp.path().join("cfg")).unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        store.create_repo("repo", &root.to_string_lossy()).unwrap();
+        seed_groups(&store, n);
+        (tmp, Arc::new(store))
+    }
+
+    /// The whole point of the redesign: with many exact-duplicate groups, only
+    /// the current page's members are materialized in memory (the rest stay as
+    /// lightweight plan descriptors).
+    #[test]
+    fn exact_results_load_only_the_current_page() {
+        let (_tmp, store) = seeded_store(120);
+        let plan = plan_exact_duplicates(&store, &["repo".to_string()], |_| {}).unwrap();
+        assert_eq!(plan.len(), 120);
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Exact(plan));
+        view.result_names = vec!["repo".to_string()];
+
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(600.0, 400.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store_ui);
+                },
+                view,
+            );
+        harness.run();
+
+        let loaded = harness.state().page_groups.len();
+        assert!(loaded > 0, "current page should be materialized");
+        assert!(
+            loaded <= PAGE_SIZE,
+            "only one page of {PAGE_SIZE} groups should be in memory, got {loaded}"
+        );
+        assert_eq!(harness.state().total_groups(), 120);
+    }
+
+    /// FIND runs on a background thread and its result lands via the channel.
+    #[test]
+    fn find_runs_async_and_populates_results() {
+        let (_tmp, store) = seeded_store(5);
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(700.0, 400.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store_ui);
+                },
+                DupesView::new(),
+            );
+        harness.run(); // load_repos (all included), initial render
+
+        harness
+            .get_by_label(&format!("{} FIND", icon::SEARCH))
+            .click();
+
+        // Use `step` (single frame) not `run`: the spinner requests continuous
+        // repaints while the op is in flight, which trips `run`'s step cap.
+        let mut done = false;
+        for _ in 0..200 {
+            harness.step();
+            if harness.state().results.is_some() {
+                done = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            done,
+            "async FIND never populated results (error={:?})",
+            harness.state().error
+        );
+        assert_eq!(harness.state().total_groups(), 5);
+        assert!(harness.state().busy.is_none(), "op should have settled");
     }
 
     /// Image-diff regression test against `tests/snapshots/dupes_view.png`.

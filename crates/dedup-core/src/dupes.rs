@@ -8,7 +8,7 @@
 //!
 //! The first file of each sorted group is the "best" copy — deletion keeps it.
 
-use crate::store::{self, ContentKey, FileEntry, Store, StoreError};
+use crate::store::{self, FileEntry, Store, StoreError};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -37,58 +37,133 @@ pub struct DupeDeleteStats {
     pub errors: u64,
 }
 
+/// A lightweight descriptor of one exact-duplicate group — its content key and
+/// member count, but none of the (potentially many) file entries. This is what
+/// a streamed "plan" holds, so peak memory is O(number of duplicate groups)
+/// rather than O(number of files).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DupeGroupKey {
+    pub size: u64,
+    pub hash: [u8; 32],
+    pub count: u32,
+}
+
+impl DupeGroupKey {
+    /// Bytes reclaimable by keeping a single copy of this group.
+    pub fn wasted_bytes(&self) -> u64 {
+        (u64::from(self.count) - 1) * self.size
+    }
+}
+
+/// Enumerate every exact-duplicate group across `repo_names` as lightweight
+/// descriptors, ordered by wasted bytes descending (ties broken deterministically
+/// by size then content hash). Streams from the DB index without materializing
+/// file entries — see [`store::Store::plan_duplicate_group_keys`]. `progress`
+/// receives the running group count during the scan.
+pub fn plan_exact_duplicates(
+    store: &Store,
+    repo_names: &[String],
+    progress: impl FnMut(usize),
+) -> Result<Vec<DupeGroupKey>, StoreError> {
+    let mut plan: Vec<DupeGroupKey> = store
+        .plan_duplicate_group_keys(repo_names, progress)?
+        .into_iter()
+        .map(|(size, hash, count)| DupeGroupKey { size, hash, count })
+        .collect();
+    plan.sort_by(|a, b| {
+        b.wasted_bytes()
+            .cmp(&a.wasted_bytes())
+            .then(b.size.cmp(&a.size))
+            .then(a.hash.cmp(&b.hash))
+    });
+    Ok(plan)
+}
+
+/// Materialize the full [`DupeFile`]s for a batch of group descriptors. Opens
+/// each repo database once, so loading a page of groups is cheap. Members are
+/// deduplicated by absolute path across repos and sorted best-copy-first.
+pub fn load_groups(
+    store: &Store,
+    repo_names: &[String],
+    keys: &[DupeGroupKey],
+) -> Result<Vec<DupeGroup>, StoreError> {
+    let mut roots: Vec<String> = Vec::with_capacity(repo_names.len());
+    let mut dbs: Vec<redb::Database> = Vec::with_capacity(repo_names.len());
+    for name in repo_names {
+        roots.push(store.get_repo(name)?.abs_path);
+        dbs.push(store.open_repo_db(name)?);
+    }
+
+    let mut out = Vec::with_capacity(keys.len());
+    for key in keys {
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let mut files: DupeGroup = Vec::new();
+        for (i, name) in repo_names.iter().enumerate() {
+            for rel in store::get_paths_by_size_hash(&dbs[i], key.size, &key.hash)? {
+                let abs = Path::new(&roots[i]).join(&rel);
+                if seen.insert(abs)
+                    && let Some(entry) = store::get_entry(&dbs[i], &rel)?
+                {
+                    files.push(DupeFile {
+                        repo: name.clone(),
+                        repo_root: roots[i].clone(),
+                        rel_path: rel,
+                        entry,
+                    });
+                }
+            }
+        }
+        sort_group_members(&mut files);
+        out.push(files);
+    }
+    Ok(out)
+}
+
+/// Materialize a single group's [`DupeFile`]s (see [`load_groups`]).
+pub fn load_group(
+    store: &Store,
+    repo_names: &[String],
+    key: &DupeGroupKey,
+) -> Result<DupeGroup, StoreError> {
+    Ok(load_groups(store, repo_names, std::slice::from_ref(key))?
+        .pop()
+        .unwrap_or_default())
+}
+
 /// Find all exact duplicate groups across the given repos, sorted.
 /// A file registered under the same absolute path in several repos is
 /// counted once.
+///
+/// This is now a thin wrapper over [`plan_exact_duplicates`] + [`load_groups`],
+/// so it no longer holds every (unique) file in memory. Callers that only show
+/// a window of results should use the plan + load directly.
 pub fn find_exact_duplicates(
     store: &Store,
     repo_names: &[String],
 ) -> Result<Vec<DupeGroup>, StoreError> {
-    let mut by_content: HashMap<ContentKey, (Vec<DupeFile>, HashSet<PathBuf>)> = HashMap::new();
-
-    for name in repo_names {
-        let meta = store.get_repo(name)?;
-        let db = store.open_repo_db(name)?;
-        store::for_each_file_entry(&db, |rel_path, entry| {
-            if entry.missing {
-                return Ok(());
-            }
-            let (files, seen_paths) = by_content.entry((entry.size, entry.hash)).or_default();
-            let abs = Path::new(&meta.abs_path).join(rel_path);
-            if seen_paths.insert(abs) {
-                files.push(DupeFile {
-                    repo: name.clone(),
-                    repo_root: meta.abs_path.clone(),
-                    rel_path: rel_path.to_string(),
-                    entry,
-                });
-            }
-            Ok(())
-        })?;
-    }
-
-    let mut groups: Vec<DupeGroup> = by_content
-        .into_values()
-        .map(|(files, _)| files)
-        .filter(|group| group.len() > 1)
-        .collect();
-    sort_groups(&mut groups);
-    Ok(groups)
+    let plan = plan_exact_duplicates(store, repo_names, |_| {})?;
+    load_groups(store, repo_names, &plan)
 }
 
 /// Sort files within each group (best copy first) and order the groups by
 /// wasted bytes descending.
 pub fn sort_groups(groups: &mut [DupeGroup]) {
     for group in groups.iter_mut() {
-        group.sort_by(|a, b| {
-            image_area(&b.entry)
-                .cmp(&image_area(&a.entry))
-                .then(b.entry.size.cmp(&a.entry.size))
-                .then(a.entry.modified_ms.cmp(&b.entry.modified_ms))
-                .then_with(|| a.rel_path.to_lowercase().cmp(&b.rel_path.to_lowercase()))
-        });
+        sort_group_members(group);
     }
     groups.sort_by_key(|group| std::cmp::Reverse(wasted_bytes(group)));
+}
+
+/// Order one group's files best-copy-first: image area desc, size desc, oldest
+/// mtime first, then relative path (case-insensitive).
+fn sort_group_members(group: &mut DupeGroup) {
+    group.sort_by(|a, b| {
+        image_area(&b.entry)
+            .cmp(&image_area(&a.entry))
+            .then(b.entry.size.cmp(&a.entry.size))
+            .then(a.entry.modified_ms.cmp(&b.entry.modified_ms))
+            .then_with(|| a.rel_path.to_lowercase().cmp(&b.rel_path.to_lowercase()))
+    });
 }
 
 /// Bytes that could be reclaimed by keeping only one copy of the group.
@@ -137,6 +212,50 @@ pub fn delete_files(store: &Store, files: &[&DupeFile]) -> Result<DupeDeleteStat
                     .entry(file.repo.as_str())
                     .or_default()
                     .push(file.rel_path.as_str());
+            }
+            Err(_) => stats.errors += 1,
+        }
+    }
+
+    for (repo, rel_paths) in deleted_per_repo {
+        let db = store.open_repo_db(repo)?;
+        store::mark_missing(&db, rel_paths.iter().copied())?;
+    }
+    Ok(stats)
+}
+
+/// Delete files identified by `(repo_name, rel_path)` — the same behavior as
+/// [`delete_files`] but without needing a materialized [`DupeFile`]. Lets a
+/// paged UI delete its marked selection (which may span groups not currently
+/// loaded) straight from the keys. Each repo's root is resolved once.
+pub fn delete_paths(
+    store: &Store,
+    files: &[(String, String)],
+) -> Result<DupeDeleteStats, StoreError> {
+    let mut stats = DupeDeleteStats::default();
+    let mut roots: HashMap<&str, String> = HashMap::new();
+    let mut deleted_per_repo: HashMap<&str, Vec<&str>> = HashMap::new();
+
+    for (repo, rel) in files {
+        let root = match roots.get(repo.as_str()) {
+            Some(root) => root.clone(),
+            None => {
+                let root = store.get_repo(repo)?.abs_path;
+                roots.insert(repo.as_str(), root.clone());
+                root
+            }
+        };
+        let path = Path::new(&root).join(rel);
+        if !path.exists() {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                stats.deleted += 1;
+                deleted_per_repo
+                    .entry(repo.as_str())
+                    .or_default()
+                    .push(rel.as_str());
             }
             Err(_) => stats.errors += 1,
         }

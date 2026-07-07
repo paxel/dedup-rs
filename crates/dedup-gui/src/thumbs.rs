@@ -29,6 +29,9 @@ pub struct ThumbCache {
     order: Vec<String>,
     pending: HashSet<String>,
     failed: HashSet<String>,
+    /// Cumulative count of generation requests sent (test-only diagnostic).
+    #[cfg(test)]
+    sent: usize,
 }
 
 impl ThumbCache {
@@ -60,7 +63,15 @@ impl ThumbCache {
             order: Vec::new(),
             pending: HashSet::new(),
             failed: HashSet::new(),
+            #[cfg(test)]
+            sent: 0,
         }
+    }
+
+    /// Cumulative number of generation requests sent since creation.
+    #[cfg(test)]
+    pub fn requests_sent(&self) -> usize {
+        self.sent
     }
 
     /// Upload any freshly decoded thumbnails into textures. Call once per frame.
@@ -97,6 +108,10 @@ impl ThumbCache {
             return None;
         }
         if self.pending.insert(hex.to_string()) {
+            #[cfg(test)]
+            {
+                self.sent += 1;
+            }
             let _ = self.requests.send(Request {
                 hex: hex.to_string(),
                 source: source.to_path_buf(),
