@@ -515,16 +515,14 @@ impl DupesView {
             // its marked files instantly (no per-group confirmation).
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let (fill, text) = if self.quick_delete {
-                    (theme::RED, theme::BLACK)
+                // Filled pill when on, text-only (frameless) when off — matches
+                // the other LCARS toggles.
+                let label = format!("{} QUICK DELETE", icon::LIGHTNING);
+                let qd = if self.quick_delete {
+                    egui::Button::new(RichText::new(label).color(theme::BLACK)).fill(theme::RED)
                 } else {
-                    (theme::PANEL, theme::RED)
+                    egui::Button::new(RichText::new(label).color(theme::RED)).frame(false)
                 };
-                let glyph = if self.quick_delete { icon::CHECK } else { icon::X };
-                let qd = egui::Button::new(
-                    RichText::new(format!("{glyph} QUICK DELETE")).color(text),
-                )
-                .fill(fill);
                 if ui
                     .add(qd)
                     .on_hover_text(
@@ -816,9 +814,9 @@ impl DupesView {
                         ui.label(RichText::new("read-only").color(theme::BLUE).size(11.0));
                     } else {
                         let (label, fill) = if marked {
-                            ("DELETE ✓", theme::RED)
+                            (format!("{} DELETE", icon::CHECK), theme::RED)
                         } else {
-                            ("KEEP", theme::PANEL)
+                            ("KEEP".to_string(), theme::PANEL)
                         };
                         let color = if marked { theme::BLACK } else { theme::TEXT };
                         if ui

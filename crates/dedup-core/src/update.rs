@@ -111,7 +111,8 @@ struct WalkedFile {
 /// by [`update_repo`] (which then hashes `to_hash`) and [`check_repo`] (which
 /// only reports the counts).
 struct WalkSplit {
-    /// Files that are new or whose (size, mtime) differ from the index.
+    /// Files that are new, whose (size, mtime) differ from the index, or whose
+    /// stored entry predates the current fingerprint format.
     to_hash: Vec<WalkedFile>,
     /// Non-missing index entries not seen on disk this walk (vanished).
     vanished: Vec<String>,
@@ -208,6 +209,7 @@ fn walk_and_split(
         match existing.get(&file.rel) {
             Some(entry)
                 if !entry.missing
+                    && !entry.stale
                     && entry.size == file.size
                     && entry.modified_ms == file.modified_ms =>
             {
@@ -459,5 +461,46 @@ pub(crate) fn system_time_to_ms(time: std::time::SystemTime) -> i64 {
     match time.duration_since(std::time::UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
         Err(err) => -i64::try_from(err.duration().as_millis()).unwrap_or(i64::MAX),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stale index entry (pre-upgrade fingerprint format) must be re-hashed
+    /// even though its (size, mtime) still match the file on disk.
+    #[test]
+    fn walk_and_split_rehashes_stale_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("photo.jpg");
+        std::fs::write(&path, b"not really a jpeg").expect("write");
+        let meta = std::fs::metadata(&path).expect("metadata");
+        let entry = |stale| store::ScanEntry {
+            size: meta.len(),
+            modified_ms: meta.modified().map(system_time_to_ms).unwrap_or(0),
+            missing: false,
+            stale,
+        };
+
+        let existing = std::collections::HashMap::from([("photo.jpg".to_string(), entry(false))]);
+        let split = walk_and_split(
+            dir.path(),
+            &existing,
+            &NoProgress,
+            &CancellationToken::new(),
+        );
+        assert_eq!(split.unchanged, 1);
+        assert!(split.to_hash.is_empty());
+
+        let existing = std::collections::HashMap::from([("photo.jpg".to_string(), entry(true))]);
+        let split = walk_and_split(
+            dir.path(),
+            &existing,
+            &NoProgress,
+            &CancellationToken::new(),
+        );
+        assert_eq!(split.unchanged, 0);
+        assert_eq!(split.to_hash.len(), 1);
     }
 }

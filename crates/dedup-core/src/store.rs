@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 const SCHEMA_VERSION: u8 = 1;
+/// Version byte of serialized [`FileEntry`] values. Bumped to 2 when the image
+/// fingerprint grew from a 64-bit dHash to the 512-bit [`ImgHash`]; version-1
+/// entries still decode (see [`decode_entry`]) but their image fingerprint is
+/// dropped and the entry is flagged stale so the next update re-hashes it.
+const ENTRY_VERSION: u8 = 2;
 
 // Registry table definition
 const REPOS: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("repos");
@@ -13,7 +18,10 @@ const REPOS: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("re
 const FILES: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("files");
 const BY_SIZE_HASH: redb::MultimapTableDefinition<(u64, &[u8]), &str> =
     redb::MultimapTableDefinition::new("by_size_hash");
-const BY_FPRINT: redb::MultimapTableDefinition<u64, &str> =
+const BY_FPRINT: redb::MultimapTableDefinition<ImgHash, &str> =
+    redb::MultimapTableDefinition::new("by_fprint2");
+/// Pre-[`ImgHash`] fingerprint index; dropped on repo open.
+const BY_FPRINT_LEGACY: redb::MultimapTableDefinition<u64, &str> =
     redb::MultimapTableDefinition::new("by_fprint");
 const META: redb::TableDefinition<&str, u64> = redb::TableDefinition::new("meta");
 const MIME_STATS: redb::TableDefinition<&str, u64> = redb::TableDefinition::new("mime_stats");
@@ -101,6 +109,9 @@ pub struct RepoMeta {
     pub schema_ver: u8,
 }
 
+/// 512-bit perceptual image hash; see `fingerprint::image_hash`.
+pub type ImgHash = [u64; 8];
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
     pub size: u64,
@@ -108,11 +119,27 @@ pub struct FileEntry {
     pub modified_ms: i64,
     pub missing: bool,
     pub mime: Option<String>,
-    pub img_fingerprint: Option<u64>, // dHash
-    pub video_hash: Option<[u64; 3]>, // temporal hash
-    pub pdf_hash: Option<[u8; 32]>,   // blake3 of normalized text
-    pub audio: Option<AudioFp>,       // duration_ms + chunk hashes
+    pub img_fingerprint: Option<ImgHash>, // gradient hash
+    pub video_hash: Option<[u64; 3]>,     // temporal hash
+    pub pdf_hash: Option<[u8; 32]>,       // blake3 of normalized text
+    pub audio: Option<AudioFp>,           // duration_ms + chunk hashes
     pub img_size: Option<(u32, u32)>,
+}
+
+/// Version-1 [`FileEntry`] layout, whose image fingerprint was a 64-bit dHash.
+/// Kept so pre-upgrade indexes stay readable; see [`decode_entry`].
+#[derive(Serialize, Deserialize)]
+struct FileEntryV1 {
+    size: u64,
+    hash: [u8; 32],
+    modified_ms: i64,
+    missing: bool,
+    mime: Option<String>,
+    img_fingerprint: Option<u64>,
+    video_hash: Option<[u64; 3]>,
+    pdf_hash: Option<[u8; 32]>,
+    audio: Option<AudioFp>,
+    img_size: Option<(u32, u32)>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -186,6 +213,37 @@ fn deserialize_value<'a, T: Deserialize<'a>>(
     postcard::from_bytes(&bytes[1..]).map_err(|e| StoreError::Deserialization(e.to_string()))
 }
 
+/// Decode a stored [`FileEntry`] value, returning it with its version byte.
+/// Version-1 entries convert losslessly except for the image fingerprint,
+/// which used an incompatible 64-bit format and comes back as `None`; callers
+/// that drive rescans use the version to flag such entries stale.
+fn decode_entry(bytes: &[u8]) -> Result<(FileEntry, u8), StoreError> {
+    match bytes.first() {
+        Some(&ENTRY_VERSION) => Ok((deserialize_value(ENTRY_VERSION, bytes)?, ENTRY_VERSION)),
+        Some(1) => {
+            let v1: FileEntryV1 = deserialize_value(1, bytes)?;
+            let entry = FileEntry {
+                size: v1.size,
+                hash: v1.hash,
+                modified_ms: v1.modified_ms,
+                missing: v1.missing,
+                mime: v1.mime,
+                img_fingerprint: None,
+                video_hash: v1.video_hash,
+                pdf_hash: v1.pdf_hash,
+                audio: v1.audio,
+                img_size: v1.img_size,
+            };
+            Ok((entry, 1))
+        }
+        Some(&found) => Err(StoreError::SchemaVersionMismatch {
+            expected: ENTRY_VERSION,
+            found,
+        }),
+        None => Err(StoreError::Deserialization("Empty bytes".to_string())),
+    }
+}
+
 impl Store {
     pub fn open() -> Result<Self, StoreError> {
         Self::open_at(get_config_dir())
@@ -231,6 +289,8 @@ impl Store {
             let _by_fprint = write_txn.open_multimap_table(BY_FPRINT)?;
             let _meta = write_txn.open_table(META)?;
             let _mime_stats = write_txn.open_table(MIME_STATS)?;
+            // Drop the pre-ImgHash fingerprint index if this repo predates it.
+            let _ = write_txn.delete_multimap_table(BY_FPRINT_LEGACY);
         }
         write_txn.commit()?;
 
@@ -652,7 +712,7 @@ impl Store {
 struct RepoTables<'txn> {
     files: redb::Table<'txn, &'static str, &'static [u8]>,
     by_size_hash: redb::MultimapTable<'txn, (u64, &'static [u8]), &'static str>,
-    by_fprint: redb::MultimapTable<'txn, u64, &'static str>,
+    by_fprint: redb::MultimapTable<'txn, ImgHash, &'static str>,
     meta: redb::Table<'txn, &'static str, u64>,
     mime_stats: redb::Table<'txn, &'static str, u64>,
 }
@@ -670,7 +730,7 @@ impl<'txn> RepoTables<'txn> {
 
     fn get_entry(&self, rel_path: &str) -> Result<Option<FileEntry>, StoreError> {
         match self.files.get(rel_path)? {
-            Some(guard) => Ok(Some(deserialize_value(SCHEMA_VERSION, guard.value())?)),
+            Some(guard) => Ok(Some(decode_entry(guard.value())?.0)),
             None => Ok(None),
         }
     }
@@ -681,7 +741,7 @@ impl<'txn> RepoTables<'txn> {
             self.unindex(rel_path, &old)?;
         }
         self.index(rel_path, entry)?;
-        let serialized = serialize_value(SCHEMA_VERSION, entry)?;
+        let serialized = serialize_value(ENTRY_VERSION, entry)?;
         self.files.insert(rel_path, serialized.as_slice())?;
         Ok(())
     }
@@ -818,7 +878,7 @@ pub fn get_entry(db: &redb::Database, rel_path: &str) -> Result<Option<FileEntry
     let read_txn = db.begin_read()?;
     let files_table = read_txn.open_table(FILES)?;
     match files_table.get(rel_path)? {
-        Some(guard) => Ok(Some(deserialize_value(SCHEMA_VERSION, guard.value())?)),
+        Some(guard) => Ok(Some(decode_entry(guard.value())?.0)),
         None => Ok(None),
     }
 }
@@ -833,7 +893,7 @@ where
     let files_table = read_txn.open_table(FILES)?;
     for item in files_table.iter()? {
         let (key_guard, val_guard) = item?;
-        let entry: FileEntry = deserialize_value(SCHEMA_VERSION, val_guard.value())?;
+        let (entry, _) = decode_entry(val_guard.value())?;
         f(key_guard.value(), entry)?;
     }
     Ok(())
@@ -889,6 +949,9 @@ pub struct ScanEntry {
     pub size: u64,
     pub modified_ms: i64,
     pub missing: bool,
+    /// Entry predates the current image-fingerprint format and must be
+    /// re-hashed even if (size, mtime) still match.
+    pub stale: bool,
 }
 
 /// Read the scan-relevant state of every indexed file.
@@ -900,13 +963,19 @@ pub fn read_scan_index(
     let mut index = std::collections::HashMap::new();
     for item in files_table.iter()? {
         let (key_guard, val_guard) = item?;
-        let entry: FileEntry = deserialize_value(SCHEMA_VERSION, val_guard.value())?;
+        let (entry, version) = decode_entry(val_guard.value())?;
+        let stale = version < ENTRY_VERSION
+            && entry
+                .mime
+                .as_deref()
+                .is_some_and(|m| m.starts_with("image/"));
         index.insert(
             key_guard.value().to_string(),
             ScanEntry {
                 size: entry.size,
                 modified_ms: entry.modified_ms,
                 missing: entry.missing,
+                stale,
             },
         );
     }
@@ -940,7 +1009,7 @@ mod tests {
             modified_ms: 123456,
             missing: false,
             mime: Some("image/png".to_string()),
-            img_fingerprint: Some(42),
+            img_fingerprint: Some([42; 8]),
             video_hash: None,
             pdf_hash: None,
             audio: None,
@@ -953,7 +1022,7 @@ mod tests {
             modified_ms: 123457,
             missing: false,
             mime: Some("image/png".to_string()),
-            img_fingerprint: Some(43),
+            img_fingerprint: Some([43; 8]),
             video_hash: None,
             pdf_hash: None,
             audio: None,
@@ -976,7 +1045,7 @@ mod tests {
             modified_ms: 123458,
             missing: false,
             mime: Some("image/png".to_string()),
-            img_fingerprint: Some(42),
+            img_fingerprint: Some([42; 8]),
             video_hash: None,
             pdf_hash: None,
             audio: None,
@@ -1035,6 +1104,73 @@ mod tests {
         store.remove_repo("renamed-repo")?;
         let repos = store.list_repos()?;
         assert!(repos.is_empty());
+
+        Ok(())
+    }
+
+    /// Version-1 entries (64-bit image dHash) must stay readable: fields carry
+    /// over, the incompatible fingerprint is dropped, and the scan index flags
+    /// image entries stale so the next update re-fingerprints them.
+    #[test]
+    fn v1_entries_decode_and_flag_images_stale() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = Store::open_at(temp_dir.path().to_path_buf())?;
+        let repo_dir = temp_dir.path().join("mock_repo");
+        std::fs::create_dir_all(&repo_dir)?;
+        store.create_repo("legacy", &repo_dir.to_string_lossy())?;
+
+        let v1_image = FileEntryV1 {
+            size: 100,
+            hash: [1; 32],
+            modified_ms: 123456,
+            missing: false,
+            mime: Some("image/jpeg".to_string()),
+            img_fingerprint: Some(0xf8f0_f0f0_f0f0_f0f8),
+            video_hash: None,
+            pdf_hash: None,
+            audio: None,
+            img_size: Some((100, 100)),
+        };
+        let v1_pdf = FileEntryV1 {
+            size: 200,
+            hash: [2; 32],
+            modified_ms: 123457,
+            missing: false,
+            mime: Some("application/pdf".to_string()),
+            img_fingerprint: None,
+            video_hash: None,
+            pdf_hash: Some([3; 32]),
+            audio: None,
+            img_size: None,
+        };
+
+        let db = store.open_repo_db("legacy")?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut files = write_txn.open_table(FILES)?;
+            files.insert("photo.jpg", serialize_value(1, &v1_image)?.as_slice())?;
+            files.insert("doc.pdf", serialize_value(1, &v1_pdf)?.as_slice())?;
+        }
+        write_txn.commit()?;
+
+        let entry = get_entry(&db, "photo.jpg")?.expect("v1 entry decodes");
+        assert_eq!(entry.size, 100);
+        assert_eq!(entry.mime.as_deref(), Some("image/jpeg"));
+        assert_eq!(entry.img_fingerprint, None, "64-bit fingerprint dropped");
+        assert_eq!(entry.img_size, Some((100, 100)));
+
+        let index = read_scan_index(&db)?;
+        assert!(index["photo.jpg"].stale, "v1 image entry is stale");
+        assert!(!index["doc.pdf"].stale, "non-image v1 entry is not stale");
+
+        // Rewriting the image entry at the current version clears staleness.
+        let mut upgraded = entry;
+        upgraded.img_fingerprint = Some([42; 8]);
+        drop(db);
+        store.update_file_entry("legacy", "photo.jpg", &upgraded)?;
+        let db = store.open_repo_db("legacy")?;
+        let index = read_scan_index(&db)?;
+        assert!(!index["photo.jpg"].stale);
 
         Ok(())
     }

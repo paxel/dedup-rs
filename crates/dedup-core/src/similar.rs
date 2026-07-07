@@ -5,26 +5,29 @@
 //! `similarity % = (1 - distance/bits) * 100 >= threshold`, where `distance` is
 //! the Hamming distance (`count_ones` of the XOR).
 //!
-//! Image fingerprints (`u64`) are candidate-pruned with LSH banding — the hash
-//! is split into four 16-bit bands and only items sharing at least one band are
-//! compared. By the pigeonhole principle this is exact for distances ≤ 3
-//! (similarity ≥ ~95 %) and a fast approximation below that; it keeps grouping
-//! of tens of thousands of images near-linear instead of O(n²). Video/audio/PDF
-//! populations are small, so those group by direct scan.
+//! Image fingerprints ([`ImgHash`], 512 bits) are candidate-pruned with LSH
+//! banding — the hash is split into 32 16-bit bands and only items sharing at
+//! least one band are compared. By the pigeonhole principle this is exact for
+//! distances ≤ 31 (similarity ≥ ~94 %) and a fast approximation below that; it
+//! keeps grouping of tens of thousands of images near-linear instead of O(n²).
+//! Video/audio/PDF populations are small, so those group by direct scan.
 
 use crate::dupes::{DupeFile, DupeGroup, sort_groups};
-use crate::store::{self, FileEntry, Store, StoreError};
+use crate::store::{self, FileEntry, ImgHash, Store, StoreError};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-const IMG_BITS: f64 = 64.0;
+const IMG_BITS: f64 = 512.0;
+/// 16-bit LSH bands per image hash: 512 / 16.
+const IMG_BANDS: u8 = 32;
 const VIDEO_BITS: f64 = 192.0;
 /// Audio duration tolerance when matching, in milliseconds (Java used 2 s).
 const AUDIO_DURATION_TOLERANCE_MS: u32 = 2000;
 
-/// Image dHash similarity as a percentage in `0.0..=100.0`.
-pub fn similarity_u64(a: u64, b: u64) -> f64 {
-    (1.0 - f64::from((a ^ b).count_ones()) / IMG_BITS) * 100.0
+/// Image-hash similarity as a percentage in `0.0..=100.0`.
+pub fn similarity_img(a: &ImgHash, b: &ImgHash) -> f64 {
+    let distance: u32 = (0..8).map(|k| (a[k] ^ b[k]).count_ones()).sum();
+    (1.0 - f64::from(distance) / IMG_BITS) * 100.0
 }
 
 /// 192-bit temporal-hash similarity as a percentage in `0.0..=100.0`.
@@ -33,18 +36,22 @@ pub fn similarity_192(a: &[u64; 3], b: &[u64; 3]) -> f64 {
     (1.0 - f64::from(distance) / VIDEO_BITS) * 100.0
 }
 
-/// Greedily group `u64` fingerprints whose similarity meets `threshold`,
-/// returning groups of indices into `fingerprints` (singletons excluded).
+/// The `b`-th 16-bit band of an image hash.
+fn img_band(fp: &ImgHash, b: u8) -> u16 {
+    (fp[usize::from(b) / 4] >> ((u32::from(b) % 4) * 16)) as u16
+}
+
+/// Greedily group image hashes whose similarity meets `threshold`, returning
+/// groups of indices into `fingerprints` (singletons excluded).
 ///
 /// Candidates are pruned via 16-bit LSH banding; see the module docs for the
 /// exactness bound.
-pub fn group_u64(fingerprints: &[u64], threshold: f64) -> Vec<Vec<usize>> {
+pub fn group_img(fingerprints: &[ImgHash], threshold: f64) -> Vec<Vec<usize>> {
     // Band index: (band, 16-bit value) -> item indices sharing that band.
     let mut bands: HashMap<(u8, u16), Vec<usize>> = HashMap::new();
-    for (idx, &fp) in fingerprints.iter().enumerate() {
-        for b in 0..4u8 {
-            let key = ((fp >> (u32::from(b) * 16)) & 0xffff) as u16;
-            bands.entry((b, key)).or_default().push(idx);
+    for (idx, fp) in fingerprints.iter().enumerate() {
+        for b in 0..IMG_BANDS {
+            bands.entry((b, img_band(fp, b))).or_default().push(idx);
         }
     }
 
@@ -60,9 +67,8 @@ pub fn group_u64(fingerprints: &[u64], threshold: f64) -> Vec<Vec<usize>> {
         // Gather not-yet-handled candidates that share a band with i.
         let mut seen = HashSet::new();
         let mut candidates = Vec::new();
-        for b in 0..4u8 {
-            let key = ((fingerprints[i] >> (u32::from(b) * 16)) & 0xffff) as u16;
-            if let Some(bucket) = bands.get(&(b, key)) {
+        for b in 0..IMG_BANDS {
+            if let Some(bucket) = bands.get(&(b, img_band(&fingerprints[i], b))) {
                 for &j in bucket {
                     if j > i && !handled[j] && seen.insert(j) {
                         candidates.push(j);
@@ -76,7 +82,7 @@ pub fn group_u64(fingerprints: &[u64], threshold: f64) -> Vec<Vec<usize>> {
             if handled[j] {
                 continue;
             }
-            if similarity_u64(fingerprints[i], fingerprints[j]) >= threshold {
+            if similarity_img(&fingerprints[i], &fingerprints[j]) >= threshold {
                 group.push(j);
                 handled[j] = true;
             }
@@ -134,7 +140,7 @@ struct Candidate<K> {
 struct Staged {
     names: Vec<String>,
     roots: Vec<String>,
-    images: Vec<Candidate<u64>>,
+    images: Vec<Candidate<ImgHash>>,
     videos: Vec<Candidate<[u64; 3]>>,
     pdfs: Vec<Candidate<[u8; 32]>>,
     audios: Vec<Candidate<(u32, Vec<[u8; 32]>)>>,
@@ -243,8 +249,8 @@ pub fn find_similar(
 
     let mut groups: Vec<DupeGroup> = Vec::new();
 
-    let img_fps: Vec<u64> = staged.images.iter().map(|c| c.key).collect();
-    let img_groups = group_u64(&img_fps, threshold);
+    let img_fps: Vec<ImgHash> = staged.images.iter().map(|c| c.key).collect();
+    let img_groups = group_img(&img_fps, threshold);
     groups.extend(materialize(&dbs, &staged, &staged.images, img_groups)?);
 
     let video_groups = group_by(&staged.videos, |a, b| {
@@ -281,17 +287,20 @@ mod tests {
 
     #[test]
     fn similarity_is_100_for_equal_and_0_for_inverse() {
-        assert_eq!(similarity_u64(0xdead_beef, 0xdead_beef), 100.0);
-        assert_eq!(similarity_u64(0, u64::MAX), 0.0);
+        let fp: ImgHash = [0xdead_beef; 8];
+        assert_eq!(similarity_img(&fp, &fp), 100.0);
+        assert_eq!(similarity_img(&[0; 8], &[u64::MAX; 8]), 0.0);
     }
 
     #[test]
     fn near_identical_images_group_together() {
-        // Base and base with one bit flipped (distance 1, similarity ~98.4%).
-        let base = 0x0123_4567_89ab_cdefu64;
-        let near = base ^ 1;
-        let far = !base;
-        let groups = group_u64(&[base, near, far], 95.0);
+        // Base and base with two bits flipped (distance 2, similarity ~99.6%).
+        let base: ImgHash = [0x0123_4567_89ab_cdef; 8];
+        let mut near = base;
+        near[0] ^= 1;
+        near[7] ^= 1 << 63;
+        let far = base.map(|w| !w);
+        let groups = group_img(&[base, near, far], 95.0);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 2);
         assert!(groups[0].contains(&0) && groups[0].contains(&1));
@@ -299,7 +308,7 @@ mod tests {
 
     #[test]
     fn dissimilar_images_do_not_group() {
-        let groups = group_u64(&[0u64, u64::MAX], 90.0);
+        let groups = group_img(&[[0u64; 8], [u64::MAX; 8]], 90.0);
         assert!(groups.is_empty());
     }
 

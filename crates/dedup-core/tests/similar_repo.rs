@@ -74,7 +74,10 @@ fn update_computes_fingerprints_and_find_similar_groups_them() {
     assert_eq!(a.img_size, Some((100, 100)));
 
     // Similarity search groups a.png and b.png but excludes the solid image.
-    let groups = dedup_core::similar::find_similar(&store, &["pics".to_string()], 80.0)
+    // (The 512-bit hash is sparse for synthetic flat-background images, which
+    // inflates their similarity to the all-zero hash of a solid color; realistic
+    // thresholds sit well above that floor.)
+    let groups = dedup_core::similar::find_similar(&store, &["pics".to_string()], 95.0)
         .expect("find similar");
     assert_eq!(groups.len(), 1, "exactly one similar group");
     let paths: Vec<&str> = groups[0].iter().map(|f| f.rel_path.as_str()).collect();
