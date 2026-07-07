@@ -52,7 +52,23 @@ enum Msg {
     FindDone(Result<Results, String>),
     AutoProgress { done: usize, total: usize },
     AutoDone(Result<Vec<FileKey>, String>),
-    DeleteDone(Result<DupeDeleteStats, String>),
+    DeleteDone(Result<DupeDeleteStats, String>, DeleteFollow),
+}
+
+/// What to do after a background delete finishes.
+#[derive(Clone, Copy)]
+enum DeleteFollow {
+    /// Global delete: clear marks and re-run the search.
+    Refind,
+    /// Per-group delete: drop this group's marks and collapse it (no re-plan).
+    Resolve(usize),
+}
+
+/// The action a pending confirmation applies when accepted.
+#[derive(Clone, Copy)]
+enum ConfirmAction {
+    EnableQuickDelete,
+    DeleteAll,
 }
 
 /// A bold-bordered LCARS section container in the given accent color, used to
@@ -99,7 +115,9 @@ enum Act {
     ReloadRepos,
     Find,
     ToggleMark(FileKey),
+    ToggleQuickDelete,
     AutoResolve,
+    DeleteGroup(usize),
     AskDelete,
     ConfirmDelete,
     CancelDelete,
@@ -122,6 +140,15 @@ pub struct DupesView {
     /// Cached rendered height per group index (absolute); `0.0` = not measured.
     group_heights: Vec<f32>,
     marked: HashSet<FileKey>,
+    /// Pages whose non-best copies have already been marked by default, so
+    /// revisiting a page doesn't clobber the user's manual KEEP/DELETE choices.
+    preselected_pages: HashSet<usize>,
+    /// Group indices deleted this session (rendered collapsed). Reset on FIND.
+    resolved: HashSet<usize>,
+    /// When on, per-group DELETE NOW buttons appear and delete immediately.
+    quick_delete: bool,
+    /// Keys handed to the in-flight delete, applied to `marked` on completion.
+    delete_batch: Vec<FileKey>,
     page: usize,
     /// A background operation in flight, if any.
     busy: Option<Op>,
@@ -129,7 +156,7 @@ pub struct DupesView {
     rx: Receiver<Msg>,
     status: Option<String>,
     error: Option<String>,
-    confirm: Option<String>,
+    confirm: Option<(String, ConfirmAction)>,
     thumbs: ThumbCache,
 }
 
@@ -147,6 +174,10 @@ impl DupesView {
             cached_page: None,
             group_heights: Vec::new(),
             marked: HashSet::new(),
+            preselected_pages: HashSet::new(),
+            resolved: HashSet::new(),
+            quick_delete: false,
+            delete_batch: Vec::new(),
             page: 0,
             busy: None,
             tx,
@@ -193,8 +224,12 @@ impl DupesView {
         ui.separator();
         self.results(ui, store, &mut acts);
 
-        if let Some(prompt) = self.confirm.clone() {
-            self.confirm_modal(ui, &prompt, &mut acts);
+        if let Some((prompt, action)) = self.confirm.clone() {
+            let verb = match action {
+                ConfirmAction::EnableQuickDelete => "ENABLE",
+                ConfirmAction::DeleteAll => "DELETE",
+            };
+            self.confirm_modal(ui, &prompt, verb, &mut acts);
         }
 
         for act in acts {
@@ -220,6 +255,8 @@ impl DupesView {
                             self.status = Some(format!("{} group(s)", results.len()));
                             self.results = Some(results);
                             self.marked.clear();
+                            self.preselected_pages.clear();
+                            self.resolved.clear();
                             self.page = 0;
                             self.cached_page = None;
                             self.error = None;
@@ -243,17 +280,27 @@ impl DupesView {
                         Err(e) => self.error = Some(e),
                     }
                 }
-                Msg::DeleteDone(result) => {
+                Msg::DeleteDone(result, follow) => {
                     self.busy = None;
+                    let batch = std::mem::take(&mut self.delete_batch);
                     match result {
-                        Ok(stats) => {
-                            self.status = Some(format!(
-                                "Deleted {} file(s), {} error(s). Re-running search…",
-                                stats.deleted, stats.errors
-                            ));
-                            self.marked.clear();
-                            self.start_find(store, ctx);
-                        }
+                        Ok(stats) => match follow {
+                            DeleteFollow::Refind => {
+                                self.status = Some(format!(
+                                    "Deleted {} file(s), {} error(s). Re-running search…",
+                                    stats.deleted, stats.errors
+                                ));
+                                self.marked.clear();
+                                self.start_find(store, ctx);
+                            }
+                            DeleteFollow::Resolve(gi) => {
+                                self.status = Some(format!("Deleted {} file(s)", stats.deleted));
+                                for k in &batch {
+                                    self.marked.remove(k);
+                                }
+                                self.resolved.insert(gi);
+                            }
+                        },
                         Err(e) => self.error = Some(e),
                     }
                 }
@@ -463,6 +510,38 @@ impl DupesView {
                     );
                 });
             }
+
+            // Quick Delete: gives each group a DELETE NOW button that removes
+            // its marked files instantly (no per-group confirmation).
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let (fill, text) = if self.quick_delete {
+                    (theme::RED, theme::BLACK)
+                } else {
+                    (theme::PANEL, theme::RED)
+                };
+                let glyph = if self.quick_delete { icon::CHECK } else { icon::X };
+                let qd = egui::Button::new(
+                    RichText::new(format!("{glyph} QUICK DELETE")).color(text),
+                )
+                .fill(fill);
+                if ui
+                    .add(qd)
+                    .on_hover_text(
+                        "Show a DELETE NOW button on each group that deletes its marked files immediately, no confirmation",
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::ToggleQuickDelete);
+                }
+                if self.quick_delete {
+                    ui.label(
+                        RichText::new("on — DELETE NOW removes files instantly")
+                            .color(theme::RED)
+                            .size(12.0),
+                    );
+                }
+            });
         });
 
         if self.total_groups() > 0 {
@@ -583,9 +662,47 @@ impl DupesView {
             }
         }
         self.cached_page = Some(page);
+
+        // Default-mark this page's worse (non-best) copies once, so the extras
+        // show DELETE by default. Read-only repos are never marked, and a page
+        // is only preselected once so manual KEEP choices survive a revisit.
+        if self.preselected_pages.insert(page) {
+            let ro = self.read_only_names();
+            let keys: Vec<FileKey> = self
+                .page_groups
+                .iter()
+                .flat_map(|g| g.iter().skip(1))
+                .filter(|f| !ro.contains(&f.repo))
+                .map(key)
+                .collect();
+            self.marked.extend(keys);
+        }
     }
 
     fn group_card(&mut self, ui: &mut egui::Ui, gi: usize, page_start: usize, acts: &mut Vec<Act>) {
+        // A group deleted this session collapses to a one-line note.
+        if self.resolved.contains(&gi) {
+            egui::Frame::new()
+                .fill(theme::PANEL)
+                .corner_radius(theme::PILL)
+                .stroke(egui::Stroke::new(1.0, theme::TAN))
+                .inner_margin(10.0)
+                .outer_margin(egui::Margin {
+                    left: 0,
+                    right: 0,
+                    top: 0,
+                    bottom: 8,
+                })
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!("{} deleted", icon::CHECK))
+                            .color(theme::TAN)
+                            .strong(),
+                    );
+                });
+            return;
+        }
+
         // The page's groups are already materialized; clone the (small) one so the
         // render closure can borrow `self` mutably for thumbnails/mark state.
         let group: DupeGroup = self
@@ -596,6 +713,10 @@ impl DupesView {
         let count = group.len();
         let size = group.first().map(|f| f.entry.size).unwrap_or(0);
         let wasted = wasted_bytes(&group);
+        // Flags read before the render closure (which borrows `self` mutably).
+        let quick = self.quick_delete;
+        let idle = self.busy.is_none();
+        let has_marked = group.iter().any(|f| self.marked.contains(&key(f)));
         egui::Frame::new()
             .fill(theme::PANEL)
             .corner_radius(theme::PILL)
@@ -608,15 +729,32 @@ impl DupesView {
                 bottom: 8,
             })
             .show(ui, |ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "{count} copies · {} each · {} reclaimable",
-                        format_size(size),
-                        format_size(wasted)
-                    ))
-                    .color(theme::AMBER)
-                    .strong(),
-                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{count} copies · {} each · {} reclaimable",
+                            format_size(size),
+                            format_size(wasted)
+                        ))
+                        .color(theme::AMBER)
+                        .strong(),
+                    );
+                    // Quick Delete: one-click removal of this group's marked files.
+                    if quick && has_marked {
+                        let del = egui::Button::new(
+                            RichText::new(format!("{} DELETE NOW", icon::TRASH))
+                                .color(theme::BLACK),
+                        )
+                        .fill(theme::RED);
+                        if ui
+                            .add_enabled(idle, del)
+                            .on_hover_text("Delete this group's marked files now")
+                            .clicked()
+                        {
+                            acts.push(Act::DeleteGroup(gi));
+                        }
+                    }
+                });
                 ui.horizontal_wrapped(|ui| {
                     for (fi, file) in group.iter().enumerate() {
                         self.file_card(ui, file, fi == 0, acts);
@@ -736,11 +874,11 @@ impl DupesView {
             });
     }
 
-    fn confirm_modal(&mut self, ui: &mut egui::Ui, prompt: &str, acts: &mut Vec<Act>) {
+    fn confirm_modal(&mut self, ui: &mut egui::Ui, prompt: &str, verb: &str, acts: &mut Vec<Act>) {
         egui::Modal::new(Id::new("dupes-confirm")).show(&ui.ctx().clone(), |ui| {
             ui.set_width(360.0);
             ui.label(
-                RichText::new("CONFIRM DELETE")
+                RichText::new("CONFIRM")
                     .color(theme::AMBER)
                     .size(16.0)
                     .strong(),
@@ -751,8 +889,7 @@ impl DupesView {
             ui.horizontal(|ui| {
                 if ui
                     .add(
-                        egui::Button::new(RichText::new("DELETE").color(theme::BLACK))
-                            .fill(theme::RED),
+                        egui::Button::new(RichText::new(verb).color(theme::BLACK)).fill(theme::RED),
                     )
                     .clicked()
                 {
@@ -791,23 +928,63 @@ impl DupesView {
                     self.marked.insert(k);
                 }
             }
+            Act::ToggleQuickDelete => {
+                if self.quick_delete {
+                    self.quick_delete = false;
+                } else {
+                    self.confirm = Some((
+                        "Quick Delete removes a group's marked files immediately, \
+                         with no further confirmation. Enable?"
+                            .into(),
+                        ConfirmAction::EnableQuickDelete,
+                    ));
+                }
+            }
             Act::AutoResolve => self.start_auto_resolve(store, ctx),
+            Act::DeleteGroup(gi) => self.delete_group(store, ctx, gi),
             Act::SetPage(p) => self.page = p,
             Act::AskDelete => {
                 let n = self.marked.len();
                 if n > 0 {
-                    self.confirm = Some(format!(
-                        "Delete {n} marked file{} from disk? This cannot be undone.",
-                        if n == 1 { "" } else { "s" }
+                    self.confirm = Some((
+                        format!(
+                            "Delete {n} marked file{} from disk? This cannot be undone.",
+                            if n == 1 { "" } else { "s" }
+                        ),
+                        ConfirmAction::DeleteAll,
                     ));
                 }
             }
             Act::CancelDelete => self.confirm = None,
             Act::ConfirmDelete => {
-                self.confirm = None;
-                self.start_delete(store, ctx);
+                if let Some((_, action)) = self.confirm.take() {
+                    match action {
+                        ConfirmAction::EnableQuickDelete => self.quick_delete = true,
+                        ConfirmAction::DeleteAll => {
+                            let keys: Vec<FileKey> = self.marked.iter().cloned().collect();
+                            self.start_delete(store, ctx, keys, DeleteFollow::Refind);
+                        }
+                    }
+                }
             }
         }
+    }
+
+    /// Delete one group's marked files immediately (Quick Delete path).
+    fn delete_group(&mut self, store: &Arc<Store>, ctx: &egui::Context, gi: usize) {
+        let keys: Vec<FileKey> = {
+            let Some(page) = self.cached_page else { return };
+            let page_start = page * PAGE_SIZE;
+            let Some(group) = self.page_groups.get(gi.wrapping_sub(page_start)) else {
+                return;
+            };
+            group
+                .iter()
+                .map(key)
+                .filter(|k| self.marked.contains(k))
+                .collect()
+        };
+        self.start_delete(store, ctx, keys, DeleteFollow::Resolve(gi));
     }
 
     fn included_names(&self) -> Vec<String> {
@@ -924,19 +1101,25 @@ impl DupesView {
         }
     }
 
-    /// Delete the marked selection on a background thread, then re-run the search.
-    fn start_delete(&mut self, store: &Arc<Store>, ctx: &egui::Context) {
-        if self.busy.is_some() || self.marked.is_empty() {
+    /// Delete `keys` on a background thread; `follow` decides the aftermath.
+    fn start_delete(
+        &mut self,
+        store: &Arc<Store>,
+        ctx: &egui::Context,
+        keys: Vec<FileKey>,
+        follow: DeleteFollow,
+    ) {
+        if self.busy.is_some() || keys.is_empty() {
             return;
         }
-        let keys: Vec<(String, String)> = self.marked.iter().cloned().collect();
+        self.delete_batch = keys.clone();
         self.busy = Some(Op::Delete);
         let store = Arc::clone(store);
         let tx = self.tx.clone();
         let repaint = ctx.clone();
         std::thread::spawn(move || {
             let result = delete_paths(&store, &keys).map_err(|e| e.to_string());
-            let _ = tx.send(Msg::DeleteDone(result));
+            let _ = tx.send(Msg::DeleteDone(result, follow));
             repaint.request_repaint();
         });
     }
@@ -1300,6 +1483,194 @@ mod ui_tests {
         assert!(harness.state().busy.is_none(), "op should have settled");
     }
 
+    /// A duplicate file in `repo` with rel path `rel` (metadata only).
+    fn dfile(repo: &str, rel: &str) -> DupeFile {
+        DupeFile {
+            repo: repo.into(),
+            repo_root: "/nonexistent-dedup-test".into(),
+            rel_path: rel.into(),
+            entry: dedup_core::store::FileEntry {
+                size: 10,
+                hash: [0u8; 32],
+                modified_ms: 0,
+                missing: false,
+                mime: None,
+                img_fingerprint: None,
+                video_hash: None,
+                pdf_hash: None,
+                audio: None,
+                img_size: None,
+            },
+        }
+    }
+
+    fn similar_harness<'a>(view: DupesView) -> Harness<'a, DupesView> {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(700.0, 500.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    // keep tmp alive for the store's lifetime
+                    let _ = &tmp;
+                    view.show(ui, &store);
+                },
+                view,
+            );
+        harness.run();
+        harness
+    }
+
+    /// Worse (non-best) copies are marked DELETE by default, but never in a
+    /// read-only repo (fixes the "everything is KEEP" regression).
+    #[test]
+    fn default_marks_worse_copies_excluding_read_only() {
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.repos = vec![
+            RepoSel {
+                name: "w".into(),
+                included: true,
+                read_only: false,
+            },
+            RepoSel {
+                name: "ro".into(),
+                included: true,
+                read_only: true,
+            },
+        ];
+        view.results = Some(Results::Similar(vec![
+            vec![dfile("w", "a"), dfile("w", "b")], // worse "b" is writable → marked
+            vec![dfile("w", "c"), dfile("ro", "d")], // worse "d" is read-only → not marked
+        ]));
+
+        let harness = similar_harness(view);
+        let m = &harness.state().marked;
+        assert!(
+            m.contains(&("w".into(), "b".into())),
+            "worse writable copy marked"
+        );
+        assert!(
+            !m.contains(&("ro".into(), "d".into())),
+            "read-only copy is never marked"
+        );
+        assert!(!m.contains(&("w".into(), "a".into())), "best copy is kept");
+    }
+
+    /// Default marking is bounded to the current page, not the whole result.
+    #[test]
+    fn marking_is_bounded_to_the_current_page() {
+        let groups: Vec<DupeGroup> = (0..60)
+            .map(|i| {
+                vec![
+                    dfile("w", &format!("best{i}")),
+                    dfile("w", &format!("worse{i}")),
+                ]
+            })
+            .collect();
+        let mut view = DupesView::new();
+        view.repos_loaded = true; // repos empty → nothing read-only → all worse markable
+        view.results = Some(Results::Similar(groups));
+
+        let harness = similar_harness(view);
+        let n = harness.state().marked.len();
+        assert!(n > 0, "page 0's worse copies should be marked");
+        assert!(
+            n <= PAGE_SIZE,
+            "only the current page (≤{PAGE_SIZE}) should be marked, got {n} of 60"
+        );
+    }
+
+    /// Quick Delete's per-group DELETE NOW removes that group's marked files and
+    /// collapses the group, without wiping the (paged) plan.
+    #[test]
+    fn quick_delete_now_removes_files_and_resolves_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        store.create_repo("repo", &root.to_string_lossy()).unwrap();
+        for name in ["a.bin", "b.bin"] {
+            std::fs::write(root.join(name), b"dup").unwrap();
+            store
+                .update_file_entry(
+                    "repo",
+                    name,
+                    &dedup_core::store::FileEntry {
+                        size: 3,
+                        hash: [7u8; 32],
+                        modified_ms: 0,
+                        missing: false,
+                        mime: None,
+                        img_fingerprint: None,
+                        video_hash: None,
+                        pdf_hash: None,
+                        audio: None,
+                        img_size: None,
+                    },
+                )
+                .unwrap();
+        }
+        let plan = plan_exact_duplicates(&store, &["repo".to_string()], |_| {}).unwrap();
+        assert_eq!(plan.len(), 1);
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.repos = vec![RepoSel {
+            name: "repo".into(),
+            included: true,
+            read_only: false,
+        }];
+        view.result_names = vec!["repo".to_string()];
+        view.results = Some(Results::Exact(plan));
+        view.quick_delete = true;
+
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store_ui);
+                },
+                view,
+            );
+        harness.run();
+
+        harness
+            .get_by_label(&format!("{} DELETE NOW", icon::TRASH))
+            .click();
+
+        let mut resolved = false;
+        for _ in 0..200 {
+            harness.step();
+            if harness.state().resolved.contains(&0) {
+                resolved = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(resolved, "group was not resolved after DELETE NOW");
+        // The best copy (a.bin, alphabetically first) stays; the worse is gone.
+        assert!(root.join("a.bin").exists(), "best copy kept");
+        assert!(!root.join("b.bin").exists(), "worse copy deleted");
+        assert!(
+            harness.state().results.is_some(),
+            "per-group delete must not wipe the plan"
+        );
+    }
+
     /// Image-diff regression test against `tests/snapshots/dupes_view.png`.
     /// Rendered with wgpu (lavapipe headless). Regenerate the baseline after an
     /// intentional visual change with:
@@ -1380,6 +1751,48 @@ mod ui_tests {
         let img = harness.render().expect("wgpu render failed");
         let out =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/dupes_similar.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Renders populated results with worse copies pre-marked and Quick Delete
+    /// on (so DELETE NOW shows) to `target/dupes_populated.png`. `--ignored`.
+    #[test]
+    #[ignore = "renders a PNG for manual inspection"]
+    fn render_dupes_populated() {
+        let (_tmp, store) = seeded_store(3);
+        let plan = plan_exact_duplicates(&store, &["repo".to_string()], |_| {}).unwrap();
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.repos = vec![RepoSel {
+            name: "repo".into(),
+            included: true,
+            read_only: false,
+        }];
+        view.result_names = vec!["repo".to_string()];
+        view.results = Some(Results::Exact(plan));
+        view.quick_delete = true;
+
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 620.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store_ui);
+                },
+                view,
+            );
+        harness.run();
+        let img = harness.render().expect("wgpu render failed");
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/dupes_populated.png");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
