@@ -38,14 +38,6 @@ impl Command {
     }
 }
 
-#[derive(PartialEq, Clone, Copy)]
-enum FilterKind {
-    All,
-    Mime,
-    Name,
-    Size,
-}
-
 struct PreviewRow {
     from: String,
     to: String,
@@ -70,8 +62,9 @@ pub struct FilesView {
     source: Option<String>,
     target: Option<String>,
     command: Command,
-    filter_kind: FilterKind,
-    filter_value: String,
+    filter_mime: String,
+    filter_name: String,
+    filter_size: String,
     preview: Vec<PreviewRow>,
     preview_total: usize,
     status: Option<String>,
@@ -104,8 +97,9 @@ impl FilesView {
             source: None,
             target: None,
             command: Command::Copy,
-            filter_kind: FilterKind::All,
-            filter_value: String::new(),
+            filter_mime: String::new(),
+            filter_name: String::new(),
+            filter_size: String::new(),
             preview: Vec::new(),
             preview_total: 0,
             status: None,
@@ -136,6 +130,7 @@ impl FilesView {
         self.repo_rows(ui, &mut acts);
         self.command_bar(ui, &mut acts);
         self.filter_bar(ui, &mut acts);
+        self.action_bar(ui, &mut acts);
 
         if let Some(err) = &self.error {
             ui.colored_label(theme::RED, err);
@@ -241,7 +236,72 @@ impl FilesView {
                         acts.push(Act::SetCommand(cmd));
                     }
                 }
-                ui.separator();
+            });
+            self.hint(ui);
+        });
+    }
+
+    fn hint(&self, ui: &mut egui::Ui) {
+        let text = match self.command {
+            Command::Copy => "Copy source files the target does not have into the target repo.",
+            Command::Move => {
+                "Move source files the target does not have into the target repo \
+                 (they are removed from the source directory)."
+            }
+            Command::Delete => "Delete source files whose content the target already has.",
+        };
+        ui.label(RichText::new(text).color(theme::LILAC).size(11.0));
+    }
+
+    fn filter_bar(&mut self, ui: &mut egui::Ui, _acts: &mut [Act]) {
+        theme::section(theme::LILAC).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("FILTER").color(theme::TEXT).size(12.0));
+
+                ui.label(RichText::new("MIME:").color(theme::LILAC).size(11.0));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.filter_mime)
+                        .desired_width(100.0)
+                        .hint_text("image/"),
+                );
+
+                ui.label(RichText::new("NAME:").color(theme::LILAC).size(11.0));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.filter_name)
+                        .desired_width(120.0)
+                        .hint_text("substring"),
+                );
+
+                ui.label(RichText::new("SIZE:").color(theme::LILAC).size(11.0));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.filter_size)
+                        .desired_width(100.0)
+                        .hint_text(">=1000"),
+                );
+
+                let has_any = !self.filter_mime.is_empty()
+                    || !self.filter_name.is_empty()
+                    || !self.filter_size.is_empty();
+                if has_any {
+                    let fill = theme::RED;
+                    let col = theme::BLACK;
+                    if ui
+                        .add(egui::Button::new(RichText::new("CLEAR").color(col)).fill(fill))
+                        .clicked()
+                    {
+                        self.filter_mime.clear();
+                        self.filter_name.clear();
+                        self.filter_size.clear();
+                    }
+                }
+            });
+        });
+    }
+
+    fn action_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        theme::section(theme::AMBER).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("ACTION").color(theme::TEXT).size(12.0));
                 let ready = self.source.is_some() && self.target.is_some() && !self.running;
                 if ui
                     .add_enabled(
@@ -270,56 +330,6 @@ impl FilesView {
                     }
                 }
             });
-            self.hint(ui);
-        });
-    }
-
-    fn hint(&self, ui: &mut egui::Ui) {
-        let text = match self.command {
-            Command::Copy => "Copy source files the target does not have into the target repo.",
-            Command::Move => {
-                "Move source files the target does not have into the target repo \
-                 (they are removed from the source directory)."
-            }
-            Command::Delete => "Delete source files whose content the target already has.",
-        };
-        ui.label(RichText::new(text).color(theme::LILAC).size(11.0));
-    }
-
-    fn filter_bar(&mut self, ui: &mut egui::Ui, _acts: &mut [Act]) {
-        theme::section(theme::LILAC).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("FILTER").color(theme::TEXT).size(12.0));
-                for (kind, label) in [
-                    (FilterKind::All, "ALL"),
-                    (FilterKind::Mime, "MIME"),
-                    (FilterKind::Name, "NAME"),
-                    (FilterKind::Size, "SIZE"),
-                ] {
-                    let sel = self.filter_kind == kind;
-                    let fill = if sel { theme::LILAC } else { theme::PANEL };
-                    let col = if sel { theme::BLACK } else { theme::LILAC };
-                    if ui
-                        .add(egui::Button::new(RichText::new(label).color(col)).fill(fill))
-                        .clicked()
-                    {
-                        self.filter_kind = kind;
-                    }
-                }
-                if self.filter_kind != FilterKind::All {
-                    let hint = match self.filter_kind {
-                        FilterKind::Mime => "image/  ·  text/plain",
-                        FilterKind::Name => "substring of the path",
-                        FilterKind::Size => ">=1000  ·  <500  ·  =0",
-                        FilterKind::All => "",
-                    };
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.filter_value)
-                            .desired_width(240.0)
-                            .hint_text(hint),
-                    );
-                }
-            });
         });
     }
 
@@ -344,13 +354,18 @@ impl FilesView {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for row in &self.preview {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(&row.from).color(theme::TEXT).size(12.0));
-                        ui.label(RichText::new(icon::ARROW_RIGHT).color(theme::ORANGE));
-                        ui.label(RichText::new(&row.to).color(theme::BLUE).size(12.0));
+                egui::Grid::new("preview_grid")
+                    .num_columns(3)
+                    .striped(true)
+                    .spacing(egui::vec2(12.0, 4.0))
+                    .show(ui, |ui| {
+                        for row in &self.preview {
+                            ui.label(RichText::new(&row.from).color(theme::TEXT).size(12.0));
+                            ui.label(RichText::new(icon::ARROW_RIGHT).color(theme::ORANGE));
+                            ui.label(RichText::new(&row.to).color(theme::BLUE).size(12.0));
+                            ui.end_row();
+                        }
                     });
-                }
             });
     }
 
@@ -427,12 +442,23 @@ impl FilesView {
     }
 
     fn filter_string(&self) -> Option<String> {
-        let value = self.filter_value.trim();
-        match self.filter_kind {
-            FilterKind::All => None,
-            FilterKind::Mime => Some(format!("mime:{value}")),
-            FilterKind::Name => Some(format!("name:{value}")),
-            FilterKind::Size => Some(format!("size:{value}")),
+        let mut parts = Vec::new();
+        let mime = self.filter_mime.trim();
+        if !mime.is_empty() {
+            parts.push(format!("mime:{mime}"));
+        }
+        let name = self.filter_name.trim();
+        if !name.is_empty() {
+            parts.push(format!("name:{name}"));
+        }
+        let size = self.filter_size.trim();
+        if !size.is_empty() {
+            parts.push(format!("size:{size}"));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" "))
         }
     }
 

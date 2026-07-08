@@ -15,6 +15,8 @@ pub enum FileFilter {
     Name(String),
     /// Matches entries whose size satisfies the comparison.
     Size(SizeOp, u64),
+    /// Combine multiple filters with AND logic.
+    And(Vec<FileFilter>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +43,49 @@ impl FileFilter {
         let Some(filter) = filter else {
             return Ok(Self::All);
         };
+        let filter = filter.trim();
+        if filter.is_empty() {
+            return Ok(Self::All);
+        }
+
+        let tokens: Vec<&str> = filter.split_whitespace().collect();
+        if tokens.is_empty() {
+            return Ok(Self::All);
+        }
+
+        let mut groups: Vec<String> = Vec::new();
+        for token in tokens {
+            let has_prefix = token.starts_with("mime:")
+                || token.starts_with("name:")
+                || token.starts_with("size:");
+            if has_prefix || groups.is_empty() {
+                groups.push(token.to_string());
+            } else if let Some(last) = groups.last_mut() {
+                last.push(' ');
+                last.push_str(token);
+            }
+        }
+
+        let mut filters = Vec::new();
+        for group in groups {
+            let parsed = Self::parse_single(&group)?;
+            filters.push(parsed);
+        }
+
+        if filters.is_empty() {
+            Ok(Self::All)
+        } else if filters.len() == 1 {
+            if let Some(first) = filters.pop() {
+                Ok(first)
+            } else {
+                Ok(Self::All)
+            }
+        } else {
+            Ok(Self::And(filters))
+        }
+    }
+
+    fn parse_single(filter: &str) -> Result<Self, FilterError> {
         let filter = filter.trim();
         if filter.is_empty() {
             return Ok(Self::All);
@@ -93,6 +138,7 @@ impl FileFilter {
                 SizeOp::Ge => entry.size >= *value,
                 SizeOp::Eq => entry.size == *value,
             },
+            Self::And(filters) => filters.iter().all(|f| f.matches(rel_path, entry)),
         }
     }
 }
@@ -158,5 +204,22 @@ mod tests {
     fn invalid_filters_are_rejected() {
         assert!(FileFilter::parse(Some("bogus:x")).is_err());
         assert!(FileFilter::parse(Some("size:abc")).is_err());
+    }
+
+    #[test]
+    fn parse_multiple_filters() -> Result<(), FilterError> {
+        let filter = FileFilter::parse(Some("mime:image/ name:my cool photo size:>=100"))?;
+        let expected = FileFilter::And(vec![
+            FileFilter::Mime("image/".to_string()),
+            FileFilter::Name("my cool photo".to_string()),
+            FileFilter::Size(SizeOp::Ge, 100),
+        ]);
+        assert_eq!(filter, expected);
+
+        assert!(filter.matches("my cool photo.png", &entry(150, Some("image/png"))));
+        assert!(!filter.matches("my warm photo.png", &entry(150, Some("image/png"))));
+        assert!(!filter.matches("my cool photo.png", &entry(50, Some("image/png"))));
+        assert!(!filter.matches("my cool photo.txt", &entry(150, Some("text/plain"))));
+        Ok(())
     }
 }
