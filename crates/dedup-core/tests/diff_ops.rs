@@ -3,7 +3,7 @@
 //! for print/cp/rm. Real files and real indices in a tempdir replace the
 //! Java in-memory mock filesystem.
 
-use dedup_core::diff::{DiffItem, diff_copy, diff_delete, diff_print, diff_sync};
+use dedup_core::diff::{CopyDest, DiffItem, diff_copy, diff_delete, diff_print, diff_sync};
 use dedup_core::store::{FileEntry, Store};
 use dedup_core::update::{CancellationToken, NoProgress, update_repo};
 use std::path::{Path, PathBuf};
@@ -288,7 +288,10 @@ fn move_updates_source_index_to_missing() -> TestResult {
         &sb.store,
         "A",
         "B",
-        &target_dir,
+        CopyDest {
+            dir: &target_dir,
+            subdir: None,
+        },
         true,
         None,
         &CancellationToken::new(),
@@ -327,7 +330,10 @@ fn copy_only_transfers_content_the_reference_has_never_seen() -> TestResult {
         &sb.store,
         "A",
         "B",
-        &target_dir,
+        CopyDest {
+            dir: &target_dir,
+            subdir: None,
+        },
         false,
         None,
         &CancellationToken::new(),
@@ -339,6 +345,99 @@ fn copy_only_transfers_content_the_reference_has_never_seen() -> TestResult {
     assert!(!target_dir.join("was_there.txt").exists());
     // Plain copy leaves the source untouched.
     assert!(sb.a_root.join("unknown.txt").exists());
+    Ok(())
+}
+
+#[test]
+fn copy_into_subdir_preserves_relative_paths() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "photos/2020/a.jpg", b"img")?;
+    sb.update("A")?;
+    let target_dir = sb._tempdir.path().join("subdir-copy-target");
+
+    let stats = diff_copy(
+        &sb.store,
+        "A",
+        "B",
+        CopyDest {
+            dir: &target_dir,
+            subdir: Some("imports/batch1"),
+        },
+        false,
+        None,
+        &CancellationToken::new(),
+    )?;
+    assert_eq!(stats.copied, 1);
+    assert_eq!(
+        std::fs::read(target_dir.join("imports/batch1/photos/2020/a.jpg"))?,
+        b"img"
+    );
+    // Nothing landed directly at the target root.
+    assert!(!target_dir.join("photos/2020/a.jpg").exists());
+    Ok(())
+}
+
+#[test]
+fn move_into_subdir_places_files_and_marks_source_missing() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "docs/note.txt", b"hi")?;
+    sb.update("A")?;
+    let target_dir = sb._tempdir.path().join("subdir-move-target");
+
+    let stats = diff_copy(
+        &sb.store,
+        "A",
+        "B",
+        CopyDest {
+            dir: &target_dir,
+            subdir: Some("archive"),
+        },
+        true,
+        None,
+        &CancellationToken::new(),
+    )?;
+    assert_eq!(stats.copied, 1);
+    assert!(!sb.a_root.join("docs/note.txt").exists());
+    assert_eq!(
+        std::fs::read(target_dir.join("archive/docs/note.txt"))?,
+        b"hi"
+    );
+    let in_a = sb
+        .store
+        .get_file_entry("A", "docs/note.txt")?
+        .ok_or("docs/note.txt entry dropped")?;
+    assert!(
+        in_a.missing,
+        "Source file should be marked missing after move"
+    );
+    Ok(())
+}
+
+#[test]
+fn copy_with_escaping_subdir_is_rejected() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "file.txt", b"data")?;
+    sb.update("A")?;
+    let target_dir = sb._tempdir.path().join("escape-target");
+
+    let result = diff_copy(
+        &sb.store,
+        "A",
+        "B",
+        CopyDest {
+            dir: &target_dir,
+            subdir: Some("../outside"),
+        },
+        false,
+        None,
+        &CancellationToken::new(),
+    );
+    assert!(matches!(
+        result,
+        Err(dedup_core::diff::DiffError::InvalidSubdir { .. })
+    ));
+    // No files were written anywhere under the target.
+    assert!(!target_dir.exists());
     Ok(())
 }
 

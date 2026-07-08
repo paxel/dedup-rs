@@ -113,6 +113,51 @@ fn diff_rm_deletes_files_known_to_reference() -> TestResult {
 }
 
 #[test]
+fn diff_cp_into_places_files_under_subdir() -> TestResult {
+    let sb = Sandbox::new()?;
+    sb.write("A/photos/2020/a.jpg", b"img")?;
+    sb.repo("A")?;
+    sb.repo("B")?;
+    let target = sb.path("out");
+
+    sb.dedup()?
+        .args(["diff", "cp", "A", "B", &target, "--into", "imports/batch1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Copied 1 files to"));
+
+    assert_eq!(
+        std::fs::read(sb.home.path().join("out/imports/batch1/photos/2020/a.jpg"))?,
+        b"img"
+    );
+    // Source is left untouched by a copy.
+    assert!(sb.home.path().join("A/photos/2020/a.jpg").exists());
+    Ok(())
+}
+
+#[test]
+fn diff_mv_into_places_files_under_subdir_and_removes_source() -> TestResult {
+    let sb = Sandbox::new()?;
+    sb.write("A/docs/note.txt", b"hi")?;
+    sb.repo("A")?;
+    sb.repo("B")?;
+    let target = sb.path("out");
+
+    sb.dedup()?
+        .args(["diff", "mv", "A", "B", &target, "-i", "archive"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Moved 1 files to"));
+
+    assert_eq!(
+        std::fs::read(sb.home.path().join("out/archive/docs/note.txt"))?,
+        b"hi"
+    );
+    assert!(!sb.home.path().join("A/docs/note.txt").exists());
+    Ok(())
+}
+
+#[test]
 fn diff_with_invalid_filter_fails() -> TestResult {
     let sb = Sandbox::new()?;
     sb.repo("A")?;

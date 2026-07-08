@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use dedup_core::diff::{DiffItem, diff_copy, diff_delete, diff_print, diff_sync};
+use dedup_core::diff::{CopyDest, DiffItem, diff_copy, diff_delete, diff_print, diff_sync};
 use dedup_core::dupes::{DupeGroup, delete_duplicates, find_exact_duplicates, wasted_bytes};
 use dedup_core::similar::find_similar;
 use dedup_core::store::Store;
@@ -51,6 +51,9 @@ enum DiffCommands {
         reference: String,
         /// Target directory
         target: String,
+        /// Relative parent directory inside the target to place files under
+        #[arg(short = 'i', long)]
+        into: Option<String>,
         /// Filter: mime:<substring>, name:<substring>, or size:<expr>
         #[arg(short, long)]
         filter: Option<String>,
@@ -63,6 +66,9 @@ enum DiffCommands {
         reference: String,
         /// Target directory
         target: String,
+        /// Relative parent directory inside the target to place files under
+        #[arg(short = 'i', long)]
+        into: Option<String>,
         /// Filter: mime:<substring>, name:<substring>, or size:<expr>
         #[arg(short, long)]
         filter: Option<String>,
@@ -265,6 +271,15 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Build a human-readable destination label, appending the relative subdir
+/// (when set) to the target for the copy/move success messages.
+fn destination(target: &str, into: &Option<String>) -> String {
+    match into.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(sub) => format!("{target}/{sub}"),
+        None => target.to_string(),
+    }
+}
+
 fn run_diff(store: &Store, command: DiffCommands) -> anyhow::Result<()> {
     let cancel = CancellationToken::new();
     {
@@ -303,18 +318,26 @@ fn run_diff(store: &Store, command: DiffCommands) -> anyhow::Result<()> {
             source,
             reference,
             target,
+            into,
             filter,
         } => {
             let stats = diff_copy(
                 store,
                 &source,
                 &reference,
-                std::path::Path::new(&target),
+                CopyDest {
+                    dir: std::path::Path::new(&target),
+                    subdir: into.as_deref(),
+                },
                 false,
                 filter.as_deref(),
                 &cancel,
             )?;
-            println!("Copied {} files to '{}'.", stats.copied, target);
+            println!(
+                "Copied {} files to '{}'.",
+                stats.copied,
+                destination(&target, &into)
+            );
             if stats.cancelled {
                 println!("Copy cancelled by user.");
             }
@@ -323,18 +346,26 @@ fn run_diff(store: &Store, command: DiffCommands) -> anyhow::Result<()> {
             source,
             reference,
             target,
+            into,
             filter,
         } => {
             let stats = diff_copy(
                 store,
                 &source,
                 &reference,
-                std::path::Path::new(&target),
+                CopyDest {
+                    dir: std::path::Path::new(&target),
+                    subdir: into.as_deref(),
+                },
                 true,
                 filter.as_deref(),
                 &cancel,
             )?;
-            println!("Moved {} files to '{}'.", stats.copied, target);
+            println!(
+                "Moved {} files to '{}'.",
+                stats.copied,
+                destination(&target, &into)
+            );
             if stats.cancelled {
                 println!("Move cancelled by user.");
             }

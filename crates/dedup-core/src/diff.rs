@@ -32,6 +32,41 @@ pub enum DiffError {
         path: PathBuf,
         source: std::io::Error,
     },
+
+    #[error("invalid target subdirectory: {subdir}")]
+    InvalidSubdir { subdir: String },
+}
+
+/// Where a copy/move should place files: a target directory and an optional
+/// relative `subdir` inside it. Files keep their source-relative path under
+/// `dir`/`subdir`.
+#[derive(Debug, Clone, Copy)]
+pub struct CopyDest<'a> {
+    pub dir: &'a Path,
+    pub subdir: Option<&'a str>,
+}
+
+/// Resolve the destination root for a copy/move: `target_dir` optionally
+/// prefixed by a relative `subdir` inside it. An empty/blank subdir means the
+/// target root itself. A subdir that would escape the target root (absolute
+/// components, a prefix/root, or any `..`) is rejected as [`DiffError::InvalidSubdir`].
+fn resolve_subdir(target_dir: &Path, subdir: Option<&str>) -> Result<PathBuf, DiffError> {
+    let raw = subdir.unwrap_or("").trim();
+    if raw.is_empty() {
+        return Ok(target_dir.to_path_buf());
+    }
+    let rel = Path::new(raw);
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            _ => {
+                return Err(DiffError::InvalidSubdir {
+                    subdir: raw.to_string(),
+                });
+            }
+        }
+    }
+    Ok(target_dir.join(rel))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,11 +178,12 @@ pub fn diff_copy(
     store: &Store,
     source: &str,
     reference: &str,
-    target_dir: &Path,
+    dest: CopyDest<'_>,
     move_files: bool,
     filter: Option<&str>,
     cancel: &CancellationToken,
 ) -> Result<CopyStats, DiffError> {
+    let dest_root = resolve_subdir(dest.dir, dest.subdir)?;
     let filter = FileFilter::parse(filter)?;
     let source = open_repo(store, source)?;
     let reference = open_repo(store, reference)?;
@@ -169,7 +205,7 @@ pub fn diff_copy(
             break;
         }
         let from = source_root.join(rel_path);
-        let to = target_dir.join(rel_path);
+        let to = dest_root.join(rel_path);
         if let Err(err) = transfer_file(&from, &to, move_files) {
             failure = Some(err);
             break;

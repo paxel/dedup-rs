@@ -10,10 +10,11 @@
 use crate::icon;
 use crate::theme;
 use crossbeam_channel::{Receiver, Sender};
-use dedup_core::diff::{DiffItem, diff_copy, diff_delete, diff_print};
+use dedup_core::diff::{CopyDest, DiffItem, diff_copy, diff_delete, diff_print};
 use dedup_core::store::Store;
 use dedup_core::update::CancellationToken;
 use egui::{Id, RichText};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 const PREVIEW_LIMIT: usize = 30;
@@ -62,6 +63,9 @@ pub struct FilesView {
     source: Option<String>,
     target: Option<String>,
     command: Command,
+    subdir: String,
+    subdir_tx: Sender<Result<String, String>>,
+    subdir_rx: Receiver<Result<String, String>>,
     filter_mime: String,
     filter_name: String,
     filter_size: String,
@@ -80,6 +84,8 @@ enum Act {
     PickSource(String),
     PickTarget(String),
     SetCommand(Command),
+    SubdirChanged,
+    BrowseSubdir,
     Reload,
     Preview,
     Ask,
@@ -91,12 +97,16 @@ enum Act {
 impl FilesView {
     pub fn new() -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
+        let (subdir_tx, subdir_rx) = crossbeam_channel::unbounded();
         Self {
             repos: Vec::new(),
             loaded: false,
             source: None,
             target: None,
             command: Command::Copy,
+            subdir: String::new(),
+            subdir_tx,
+            subdir_rx,
             filter_mime: String::new(),
             filter_name: String::new(),
             filter_size: String::new(),
@@ -129,6 +139,7 @@ impl FilesView {
 
         self.repo_rows(ui, &mut acts);
         self.command_bar(ui, &mut acts);
+        self.subdir_bar(ui, &mut acts);
         self.filter_bar(ui, &mut acts);
         self.action_bar(ui, &mut acts);
 
@@ -145,8 +156,9 @@ impl FilesView {
             self.confirm_modal(ui, &prompt, &mut acts);
         }
 
+        let ctx = ui.ctx().clone();
         for act in acts {
-            self.apply(store, act);
+            self.apply(store, &ctx, act);
         }
     }
 
@@ -238,6 +250,49 @@ impl FilesView {
                 }
             });
             self.hint(ui);
+        });
+    }
+
+    fn subdir_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        // The relative target subdirectory only applies to copy/move; delete
+        // never writes into the target, so the group is hidden there.
+        if self.command == Command::Delete {
+            return;
+        }
+        theme::section(theme::BLUE).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("INTO").color(theme::TEXT).size(12.0));
+                let changed = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.subdir)
+                            .desired_width(220.0)
+                            .hint_text("relative/subdir (optional)"),
+                    )
+                    .changed();
+                if changed {
+                    acts.push(Act::SubdirChanged);
+                }
+                let can_browse = self.target.is_some();
+                if ui
+                    .add_enabled(
+                        can_browse,
+                        egui::Button::new(
+                            RichText::new(format!("{} BROWSE", icon::FOLDER_OPEN))
+                                .color(theme::BLACK),
+                        ),
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::BrowseSubdir);
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "Files keep their source-relative path under this folder inside the target.",
+                )
+                .color(theme::LILAC)
+                .size(11.0),
+            );
         });
     }
 
@@ -403,7 +458,7 @@ impl FilesView {
         });
     }
 
-    fn apply(&mut self, store: &Arc<Store>, act: Act) {
+    fn apply(&mut self, store: &Arc<Store>, ctx: &egui::Context, act: Act) {
         match act {
             Act::PickSource(name) => {
                 if self.target.as_deref() == Some(name.as_str()) {
@@ -420,6 +475,8 @@ impl FilesView {
                 self.command = cmd;
                 self.clear_preview();
             }
+            Act::SubdirChanged => self.clear_preview(),
+            Act::BrowseSubdir => self.browse_subdir(store, ctx),
             Act::Reload => self.reload(store),
             Act::Preview => self.run_preview(store),
             Act::Ask => {
@@ -439,6 +496,43 @@ impl FilesView {
     fn clear_preview(&mut self) {
         self.preview.clear();
         self.preview_total = 0;
+    }
+
+    /// The subdir trimmed of surrounding whitespace and slashes; empty means
+    /// "place files at the target root".
+    fn normalized_subdir(&self) -> String {
+        self.subdir.trim().trim_matches('/').to_string()
+    }
+
+    /// Open the native folder dialog rooted at the target repo and, on a pick,
+    /// store the chosen folder as a path relative to the target root.
+    fn browse_subdir(&mut self, store: &Arc<Store>, ctx: &egui::Context) {
+        let Some(target) = self.target.clone() else {
+            return;
+        };
+        let target_root = match store.get_repo(&target) {
+            Ok(meta) => PathBuf::from(meta.abs_path),
+            Err(e) => {
+                self.error = Some(e.to_string());
+                return;
+            }
+        };
+        let tx = self.subdir_tx.clone();
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            if let Some(dir) = rfd::FileDialog::new()
+                .set_title("Choose a subdirectory inside the target")
+                .set_directory(&target_root)
+                .pick_folder()
+            {
+                let msg = match dir.strip_prefix(&target_root) {
+                    Ok(rel) => Ok(rel.to_string_lossy().replace('\\', "/")),
+                    Err(_) => Err("The chosen folder is outside the target repo.".to_string()),
+                };
+                let _ = tx.send(msg);
+                repaint.request_repaint();
+            }
+        });
     }
 
     fn filter_string(&self) -> Option<String> {
@@ -497,11 +591,19 @@ impl FilesView {
     }
 
     fn preview_row(&self, source: &str, target: &str, item: &DiffItem) -> PreviewRow {
+        let subdir = self.normalized_subdir();
         match item {
-            DiffItem::New { rel_path } => PreviewRow {
-                from: format!("{source}/{rel_path}"),
-                to: format!("{target}/{rel_path}"),
-            },
+            DiffItem::New { rel_path } => {
+                let to = if subdir.is_empty() {
+                    format!("{target}/{rel_path}")
+                } else {
+                    format!("{target}/{subdir}/{rel_path}")
+                };
+                PreviewRow {
+                    from: format!("{source}/{rel_path}"),
+                    to,
+                }
+            }
             DiffItem::Equal { rel_path, .. } | DiffItem::DeletedInReference { rel_path } => {
                 PreviewRow {
                     from: format!("{source}/{rel_path}"),
@@ -515,13 +617,19 @@ impl FilesView {
         // Refresh the count so the confirmation reflects the current filter.
         self.run_preview(store);
         let (source, target) = (self.source.as_ref()?, self.target.as_ref()?);
+        let subdir = self.normalized_subdir();
+        let dest = if subdir.is_empty() {
+            target.to_string()
+        } else {
+            format!("{target}/{subdir}")
+        };
         Some(match self.command {
             Command::Copy => format!(
-                "Copy {} file(s) from '{source}' into '{target}'?",
+                "Copy {} file(s) from '{source}' into '{dest}'?",
                 self.preview_total
             ),
             Command::Move => format!(
-                "Move {} file(s) from '{source}' into '{target}'? They are removed from the source directory.",
+                "Move {} file(s) from '{source}' into '{dest}'? They are removed from the source directory.",
                 self.preview_total
             ),
             Command::Delete => format!(
@@ -536,6 +644,7 @@ impl FilesView {
             return;
         };
         let filter = self.filter_string();
+        let subdir = self.normalized_subdir();
         let command = self.command;
         let store = Arc::clone(store);
         let tx = self.tx.clone();
@@ -551,11 +660,19 @@ impl FilesView {
                     match store.get_repo(&target) {
                         Ok(meta) => {
                             let target_dir = std::path::PathBuf::from(meta.abs_path);
+                            let subdir = if subdir.is_empty() {
+                                None
+                            } else {
+                                Some(subdir.as_str())
+                            };
                             match diff_copy(
                                 &store,
                                 &source,
                                 &target,
-                                &target_dir,
+                                CopyDest {
+                                    dir: &target_dir,
+                                    subdir,
+                                },
                                 move_files,
                                 filter.as_deref(),
                                 &cancel,
@@ -587,6 +704,18 @@ impl FilesView {
 
     fn drain(&mut self, ui: &egui::Ui) {
         let mut got = false;
+        // Apply any folder picked by the native subdir dialog thread.
+        while let Ok(picked) = self.subdir_rx.try_recv() {
+            got = true;
+            match picked {
+                Ok(rel) => {
+                    self.subdir = rel;
+                    self.error = None;
+                    self.clear_preview();
+                }
+                Err(e) => self.error = Some(e),
+            }
+        }
         while let Ok(result) = self.rx.try_recv() {
             got = true;
             self.running = false;
