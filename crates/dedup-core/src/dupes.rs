@@ -166,12 +166,11 @@ fn sort_group_members(group: &mut DupeGroup) {
     });
 }
 
-/// Bytes that could be reclaimed by keeping only one copy of the group.
+/// Bytes that could be reclaimed by keeping only the first (best) copy of the
+/// group. Sums the other members' sizes, which similar groups need — their
+/// members are not byte-identical, so their sizes differ.
 pub fn wasted_bytes(group: &DupeGroup) -> u64 {
-    match group.first() {
-        Some(first) => (group.len() as u64 - 1) * first.entry.size,
-        None => 0,
-    }
+    group.iter().skip(1).map(|f| f.entry.size).sum()
 }
 
 fn image_area(entry: &FileEntry) -> i64 {

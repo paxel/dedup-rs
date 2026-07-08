@@ -709,8 +709,24 @@ impl DupesView {
             .cloned()
             .unwrap_or_default();
         let count = group.len();
-        let size = group.first().map(|f| f.entry.size).unwrap_or(0);
         let wasted = wasted_bytes(&group);
+        // Exact copies share one size; similar members don't, so their header
+        // shows the combined size instead of a per-copy one.
+        let header = if matches!(self.results, Some(Results::Similar(_))) {
+            let total: u64 = group.iter().map(|f| f.entry.size).sum();
+            format!(
+                "{count} similar · {} total · {} reclaimable",
+                format_size(total),
+                format_size(wasted)
+            )
+        } else {
+            let size = group.first().map(|f| f.entry.size).unwrap_or(0);
+            format!(
+                "{count} copies · {} each · {} reclaimable",
+                format_size(size),
+                format_size(wasted)
+            )
+        };
         // Flags read before the render closure (which borrows `self` mutably).
         let quick = self.quick_delete;
         let idle = self.busy.is_none();
@@ -728,15 +744,7 @@ impl DupesView {
             })
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "{count} copies · {} each · {} reclaimable",
-                            format_size(size),
-                            format_size(wasted)
-                        ))
-                        .color(theme::AMBER)
-                        .strong(),
-                    );
+                    ui.label(RichText::new(header).color(theme::AMBER).strong());
                     // Quick Delete: one-click removal of this group's marked files.
                     if quick && has_marked {
                         let del = egui::Button::new(
@@ -848,10 +856,17 @@ impl DupesView {
                 let hex = hash_hex(&file.entry.hash);
                 let source = file.absolute_path();
                 if let Some(tex) = self.thumbs.get(&hex, &source) {
-                    ui.add(
+                    let resp = ui.add(
                         egui::Image::new(egui::load::SizedTexture::from_handle(&tex))
                             .max_height(120.0)
                             .corner_radius(6),
+                    );
+                    // Hairline so dark photos stand off the dark panel.
+                    ui.painter().rect_stroke(
+                        resp.rect,
+                        6,
+                        egui::Stroke::new(1.0, theme::HAIRLINE),
+                        egui::StrokeKind::Inside,
                     );
                     return;
                 }
@@ -1582,6 +1597,31 @@ mod ui_tests {
         assert!(
             n <= PAGE_SIZE,
             "only the current page (≤{PAGE_SIZE}) should be marked, got {n} of 60"
+        );
+    }
+
+    /// Similar groups' members differ in size, so the header must show the
+    /// combined size and the summed reclaimable bytes — not the exact-dupe
+    /// "X each" wording, which assumed byte-identical copies.
+    #[test]
+    fn similar_header_shows_totals_not_per_copy_size() {
+        let mut best = dfile("w", "a");
+        best.entry.size = 3000;
+        let mut worse = dfile("w", "b");
+        worse.entry.size = 1000;
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![vec![best, worse]]));
+
+        let harness = similar_harness(view);
+        let expected = format!(
+            "2 similar · {} total · {} reclaimable",
+            format_size(4000),
+            format_size(1000)
+        );
+        assert!(
+            harness.query_by_label(&expected).is_some(),
+            "similar group header should read \"{expected}\""
         );
     }
 

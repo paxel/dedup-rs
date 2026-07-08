@@ -13,6 +13,8 @@ pub const BLUE: Color32 = Color32::from_rgb(0x66, 0x99, 0xFF);
 pub const RED: Color32 = Color32::from_rgb(0xE0, 0x66, 0x55);
 pub const TEXT: Color32 = Color32::from_rgb(0xEB, 0xD0, 0xA0);
 pub const PANEL: Color32 = Color32::from_rgb(0x0A, 0x08, 0x0C);
+/// Subtle warm outline that separates dark image content from the dark panels.
+pub const HAIRLINE: Color32 = Color32::from_rgb(0x5C, 0x4E, 0x40);
 
 /// Large corner radius gives widgets the rounded LCARS block look.
 pub const PILL: CornerRadius = CornerRadius::same(12);
@@ -56,5 +58,9 @@ pub fn apply(ctx: &egui::Context) {
     style.visuals = v;
     style.spacing.button_padding = egui::vec2(12.0, 6.0);
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    // Solid (non-floating) scrollbars: overflowing lists get a permanent bar
+    // instead of a hover-only overlay, so long result pages are visibly
+    // scrollable.
+    style.spacing.scroll = egui::style::ScrollStyle::solid();
     ctx.all_styles_mut(move |s| *s = style.clone());
 }
