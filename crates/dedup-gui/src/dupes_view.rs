@@ -115,6 +115,8 @@ enum Act {
     ReloadRepos,
     Find,
     ToggleMark(FileKey),
+    Unlock(FileKey),
+    Relock(FileKey),
     ToggleQuickDelete,
     AutoResolve,
     DeleteGroup(usize),
@@ -140,6 +142,11 @@ pub struct DupesView {
     /// Cached rendered height per group index (absolute); `0.0` = not measured.
     group_heights: Vec<f32>,
     marked: HashSet<FileKey>,
+    /// Per-file read-only overrides: files explicitly unlocked (via the
+    /// read-only badge's context menu / long press) so a single worse copy in
+    /// an otherwise protected repo can be marked. Deliberately inconvenient —
+    /// never bulk-set, ignored by auto-resolve, and reset on every FIND.
+    unlocked: HashSet<FileKey>,
     /// Pages whose non-best copies have already been marked by default, so
     /// revisiting a page doesn't clobber the user's manual KEEP/DELETE choices.
     preselected_pages: HashSet<usize>,
@@ -174,6 +181,7 @@ impl DupesView {
             cached_page: None,
             group_heights: Vec::new(),
             marked: HashSet::new(),
+            unlocked: HashSet::new(),
             preselected_pages: HashSet::new(),
             resolved: HashSet::new(),
             quick_delete: false,
@@ -255,6 +263,7 @@ impl DupesView {
                             self.status = Some(format!("{} group(s)", results.len()));
                             self.results = Some(results);
                             self.marked.clear();
+                            self.unlocked.clear();
                             self.preselected_pages.clear();
                             self.resolved.clear();
                             self.page = 0;
@@ -503,6 +512,12 @@ impl DupesView {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("similarity").color(theme::TEXT).size(12.0));
+                    // The value box draws on the orange pill, where the theme's
+                    // global cream text is unreadable — use black there, and a
+                    // light backdrop while the value is being typed.
+                    let visuals = ui.visuals_mut();
+                    visuals.override_text_color = Some(theme::BLACK);
+                    visuals.extreme_bg_color = theme::TAN;
                     ui.add(
                         egui::Slider::new(&mut self.threshold, 50.0..=100.0)
                             .suffix("%")
@@ -761,11 +776,18 @@ impl DupesView {
                         }
                     }
                 });
-                ui.horizontal_wrapped(|ui| {
-                    for (fi, file) in group.iter().enumerate() {
-                        self.file_card(ui, file, fi == 0, acts);
-                    }
-                });
+                // One row per group; wide groups scroll horizontally with their
+                // own (solid, always-allocated) scrollbar instead of wrapping.
+                egui::ScrollArea::horizontal()
+                    .id_salt(("group_row", gi))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (fi, file) in group.iter().enumerate() {
+                                self.file_card(ui, file, fi == 0, acts);
+                            }
+                        });
+                    });
             });
     }
 
@@ -778,7 +800,9 @@ impl DupesView {
     ) {
         let k = key(file);
         let marked = self.marked.contains(&k);
-        let ro = self.repo_is_ro(&file.repo);
+        let repo_ro = self.repo_is_ro(&file.repo);
+        let unlocked = repo_ro && self.unlocked.contains(&k);
+        let ro = repo_ro && !unlocked;
         egui::Frame::new()
             .fill(theme::BLACK)
             .corner_radius(theme::PILL)
@@ -819,8 +843,50 @@ impl DupesView {
                         );
                     }
                     if ro {
-                        ui.label(RichText::new("read-only").color(theme::BLUE).size(11.0));
+                        // Escape hatch for the occasional worse copy inside a
+                        // protected repo: unlock this one file via context menu
+                        // or long press — deliberately never a plain click.
+                        let resp = ui
+                            .add(
+                                egui::Label::new(
+                                    RichText::new("read-only").color(theme::BLUE).size(11.0),
+                                )
+                                .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text("Right-click or long-press to unlock this file");
+                        if resp.long_touched() {
+                            acts.push(Act::Unlock(k.clone()));
+                        }
+                        resp.context_menu(|ui| {
+                            if ui
+                                .button(format!("{} UNLOCK for deletion", icon::LOCK_OPEN))
+                                .clicked()
+                            {
+                                acts.push(Act::Unlock(k.clone()));
+                                ui.close();
+                            }
+                        });
                     } else {
+                        if unlocked {
+                            let resp = ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(format!("{} unlocked", icon::LOCK_OPEN))
+                                            .color(theme::RED)
+                                            .size(11.0),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                )
+                                .on_hover_text(
+                                    "Read-only override for this file — right-click to re-lock",
+                                );
+                            resp.context_menu(|ui| {
+                                if ui.button(format!("{} RE-LOCK", icon::LOCK)).clicked() {
+                                    acts.push(Act::Relock(k.clone()));
+                                    ui.close();
+                                }
+                            });
+                        }
                         let (label, fill) = if marked {
                             (format!("{} DELETE", icon::CHECK), theme::RED)
                         } else {
@@ -931,6 +997,8 @@ impl DupesView {
                     if r.read_only {
                         let name = r.name.clone();
                         self.marked.retain(|(repo, _)| repo != &name);
+                        // A repo turned read-only starts fully locked again.
+                        self.unlocked.retain(|(repo, _)| repo != &name);
                     }
                 }
             }
@@ -940,6 +1008,13 @@ impl DupesView {
                 if !self.marked.remove(&k) {
                     self.marked.insert(k);
                 }
+            }
+            Act::Unlock(k) => {
+                self.unlocked.insert(k);
+            }
+            Act::Relock(k) => {
+                self.unlocked.remove(&k);
+                self.marked.remove(&k);
             }
             Act::ToggleQuickDelete => {
                 if self.quick_delete {
@@ -1574,6 +1649,158 @@ mod ui_tests {
             "read-only copy is never marked"
         );
         assert!(!m.contains(&("w".into(), "a".into())), "best copy is kept");
+    }
+
+    /// A per-file unlock lets one read-only copy be marked: the locked card
+    /// shows only the "read-only" badge, while the unlocked card gets the
+    /// "unlocked" badge plus a working KEEP/DELETE toggle.
+    #[test]
+    fn unlocking_a_read_only_file_makes_it_markable() {
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.repos = vec![RepoSel {
+            name: "ro".into(),
+            included: true,
+            read_only: true,
+        }];
+        view.results = Some(Results::Similar(vec![vec![
+            dfile("ro", "best"),
+            dfile("ro", "worse"),
+        ]]));
+        view.unlocked.insert(("ro".into(), "worse".into()));
+
+        // Taller than `similar_harness`: the KEEP toggle sits near the bottom
+        // of the card and pointer clicks need it inside the viewport.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(700.0, 900.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store);
+                },
+                view,
+            );
+        harness.run();
+        assert!(
+            harness.query_by_label("read-only").is_some(),
+            "locked copy still shows the read-only badge"
+        );
+        assert!(
+            harness
+                .query_by_label(&format!("{} unlocked", icon::LOCK_OPEN))
+                .is_some(),
+            "unlocked copy shows the unlocked badge"
+        );
+
+        // Exactly one KEEP toggle (the locked best has none); clicking marks it.
+        harness.get_by_label("KEEP").click();
+        let mut marked = false;
+        for _ in 0..50 {
+            harness.step();
+            if harness
+                .state()
+                .marked
+                .contains(&("ro".into(), "worse".into()))
+            {
+                marked = true;
+                break;
+            }
+        }
+        assert!(marked, "unlocked copy can be marked for deletion");
+    }
+
+    /// The real interaction: right-clicking the read-only badge opens a
+    /// context menu whose UNLOCK entry lifts the per-file lock.
+    #[test]
+    fn right_click_menu_unlocks_a_read_only_file() {
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.repos = vec![
+            RepoSel {
+                name: "w".into(),
+                included: true,
+                read_only: false,
+            },
+            RepoSel {
+                name: "ro".into(),
+                included: true,
+                read_only: true,
+            },
+        ];
+        view.results = Some(Results::Similar(vec![vec![
+            dfile("w", "best"),
+            dfile("ro", "worse"),
+        ]]));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(700.0, 900.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store);
+                },
+                view,
+            );
+        harness.run();
+
+        harness.get_by_label("read-only").click_secondary();
+        harness.run();
+        harness
+            .get_by_label(&format!("{} UNLOCK for deletion", icon::LOCK_OPEN))
+            .click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .unlocked
+                .contains(&("ro".into(), "worse".into())),
+            "context-menu UNLOCK lifts the per-file lock"
+        );
+    }
+
+    /// Re-locking removes the override and any pending mark, and turning a
+    /// repo read-only clears its per-file unlocks.
+    #[test]
+    fn relock_and_repo_ro_toggle_clear_unlocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let ctx = egui::Context::default();
+        let k: FileKey = ("r".into(), "f".into());
+
+        let mut view = DupesView::new();
+        view.unlocked.insert(k.clone());
+        view.marked.insert(k.clone());
+        view.apply(&ctx, &store, Act::Relock(k.clone()));
+        assert!(!view.unlocked.contains(&k), "relock removes the override");
+        assert!(!view.marked.contains(&k), "relock unmarks the file");
+
+        view.repos = vec![RepoSel {
+            name: "r".into(),
+            included: true,
+            read_only: false,
+        }];
+        view.unlocked.insert(k.clone());
+        view.apply(&ctx, &store, Act::ToggleRo(0));
+        assert!(
+            !view.unlocked.contains(&k),
+            "turning a repo read-only relocks its files"
+        );
     }
 
     /// Default marking is bounded to the current page, not the whole result.
