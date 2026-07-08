@@ -3,10 +3,14 @@
 //! for print/cp/rm. Real files and real indices in a tempdir replace the
 //! Java in-memory mock filesystem.
 
-use dedup_core::diff::{CopyDest, DiffItem, diff_copy, diff_delete, diff_print, diff_sync};
+use dedup_core::diff::{
+    CopyDest, DiffAction, DiffEvent, DiffItem, DiffProgress, DiffRun, NoDiffProgress, diff_copy,
+    diff_delete, diff_print, diff_sync,
+};
 use dedup_core::store::{FileEntry, Store};
 use dedup_core::update::{CancellationToken, NoProgress, update_repo};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -294,7 +298,7 @@ fn move_updates_source_index_to_missing() -> TestResult {
         },
         true,
         None,
-        &CancellationToken::new(),
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
     )?;
     assert_eq!(stats.copied, 1);
     assert!(!sb.a_root.join("to_move.txt").exists());
@@ -336,7 +340,7 @@ fn copy_only_transfers_content_the_reference_has_never_seen() -> TestResult {
         },
         false,
         None,
-        &CancellationToken::new(),
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
     )?;
     // Even a missing reference entry blocks the copy (legacy semantics).
     assert_eq!(stats.copied, 1);
@@ -365,7 +369,7 @@ fn copy_into_subdir_preserves_relative_paths() -> TestResult {
         },
         false,
         None,
-        &CancellationToken::new(),
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
     )?;
     assert_eq!(stats.copied, 1);
     assert_eq!(
@@ -394,7 +398,7 @@ fn move_into_subdir_places_files_and_marks_source_missing() -> TestResult {
         },
         true,
         None,
-        &CancellationToken::new(),
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
     )?;
     assert_eq!(stats.copied, 1);
     assert!(!sb.a_root.join("docs/note.txt").exists());
@@ -430,7 +434,7 @@ fn copy_with_escaping_subdir_is_rejected() -> TestResult {
         },
         false,
         None,
-        &CancellationToken::new(),
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
     );
     assert!(matches!(
         result,
@@ -487,7 +491,13 @@ fn delete_removes_source_files_known_to_reference_and_marks_them_missing() -> Te
     sb.update("A")?;
     sb.update("B")?;
 
-    let stats = diff_delete(&sb.store, "A", "B", None, &CancellationToken::new())?;
+    let stats = diff_delete(
+        &sb.store,
+        "A",
+        "B",
+        None,
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
+    )?;
     assert_eq!(stats.deleted, 1);
     assert!(!sb.a_root.join("dupe.txt").exists());
     assert!(sb.a_root.join("unique.txt").exists());
@@ -497,5 +507,229 @@ fn delete_removes_source_files_known_to_reference_and_marks_them_missing() -> Te
         .get_file_entry("A", "dupe.txt")?
         .ok_or("dupe.txt entry dropped")?;
     assert!(dupe.missing);
+    Ok(())
+}
+
+/// A `DiffProgress` double that records every event it receives so tests can
+/// assert the live counts.
+#[derive(Default)]
+struct RecordingProgress {
+    events: Mutex<Vec<DiffEvent>>,
+}
+
+impl RecordingProgress {
+    /// The highest `done`/`total` seen across the recorded `Progress` events.
+    fn last_progress(&self) -> Option<(u64, u64)> {
+        self.events
+            .lock()
+            .ok()?
+            .iter()
+            .filter_map(|e| match e {
+                DiffEvent::Progress { done, total, .. } => Some((*done, *total)),
+                _ => None,
+            })
+            .next_back()
+    }
+
+    fn progress_count(&self) -> usize {
+        self.events
+            .lock()
+            .map(|e| {
+                e.iter()
+                    .filter(|e| matches!(e, DiffEvent::Progress { .. }))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+}
+
+impl DiffProgress for RecordingProgress {
+    fn on(&self, event: DiffEvent) {
+        if let Ok(mut events) = self.events.lock() {
+            events.push(event);
+        }
+    }
+}
+
+#[test]
+fn copy_into_target_repo_updates_target_index() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "dir/a.txt", b"fresh")?;
+    sb.update("A")?;
+
+    // Copy straight into B's own data directory so the file lands inside the
+    // reference (target) repo and must be indexed there.
+    let stats = diff_copy(
+        &sb.store,
+        "A",
+        "B",
+        CopyDest {
+            dir: &sb.b_root,
+            subdir: None,
+        },
+        false,
+        None,
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
+    )?;
+    assert_eq!(stats.copied, 1);
+    assert_eq!(std::fs::read(sb.b_root.join("dir/a.txt"))?, b"fresh");
+
+    // The target (B) index now knows the copied file at its relative path.
+    let in_b = sb
+        .store
+        .get_file_entry("B", "dir/a.txt")?
+        .ok_or("copied file not in B index")?;
+    assert!(!in_b.missing);
+    assert_eq!(in_b.hash, *blake3::hash(b"fresh").as_bytes());
+    assert_eq!(in_b.size, 5);
+
+    // The indexed mtime matches disk: a follow-up update must not re-add it.
+    let update_stats = update_repo(&sb.store, "B", 1, &NoProgress, &CancellationToken::new())?;
+    assert_eq!(update_stats.added, 0);
+
+    // Plain copy leaves the source index untouched (still present).
+    let in_a = sb
+        .store
+        .get_file_entry("A", "dir/a.txt")?
+        .ok_or("dir/a.txt entry dropped from A")?;
+    assert!(!in_a.missing);
+    Ok(())
+}
+
+#[test]
+fn move_into_target_repo_updates_both_indexes() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "note.txt", b"moved")?;
+    sb.update("A")?;
+
+    let stats = diff_copy(
+        &sb.store,
+        "A",
+        "B",
+        CopyDest {
+            dir: &sb.b_root,
+            subdir: None,
+        },
+        true,
+        None,
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
+    )?;
+    assert_eq!(stats.copied, 1);
+    assert!(!sb.a_root.join("note.txt").exists());
+    assert_eq!(std::fs::read(sb.b_root.join("note.txt"))?, b"moved");
+
+    // Target index gains the file; source index marks it missing.
+    let in_b = sb
+        .store
+        .get_file_entry("B", "note.txt")?
+        .ok_or("moved file not in B index")?;
+    assert!(!in_b.missing);
+    let in_a = sb
+        .store
+        .get_file_entry("A", "note.txt")?
+        .ok_or("note.txt entry dropped from A")?;
+    assert!(in_a.missing);
+    Ok(())
+}
+
+#[test]
+fn copy_reports_progress_counts_matching_stats() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "one.txt", b"1")?;
+    Sandbox::write(&sb.a_root, "two.txt", b"22")?;
+    Sandbox::write(&sb.a_root, "three.txt", b"333")?;
+    sb.update("A")?;
+    let target_dir = sb._tempdir.path().join("progress-copy");
+
+    let progress = RecordingProgress::default();
+    let stats = diff_copy(
+        &sb.store,
+        "A",
+        "B",
+        CopyDest {
+            dir: &target_dir,
+            subdir: None,
+        },
+        false,
+        None,
+        &DiffRun::new(&progress, &CancellationToken::new()),
+    )?;
+    assert_eq!(stats.copied, 3);
+    assert_eq!(progress.progress_count(), 3);
+    let (done, total) = progress
+        .last_progress()
+        .ok_or("no progress events recorded")?;
+    assert_eq!(total, 3);
+    assert_eq!(done, stats.copied);
+    let last_action = progress
+        .events
+        .lock()
+        .map_err(|_| "progress mutex poisoned")?
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            DiffEvent::Progress { action, .. } => Some(*action),
+            _ => None,
+        })
+        .ok_or("no progress action recorded")?;
+    assert_eq!(last_action, DiffAction::Copy);
+    Ok(())
+}
+
+#[test]
+fn delete_reports_progress_counts_matching_stats() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "d1.txt", b"shared1")?;
+    Sandbox::write(&sb.a_root, "d2.txt", b"shared2")?;
+    Sandbox::write(&sb.b_root, "b1.txt", b"shared1")?;
+    Sandbox::write(&sb.b_root, "b2.txt", b"shared2")?;
+    sb.update("A")?;
+    sb.update("B")?;
+
+    let progress = RecordingProgress::default();
+    let stats = diff_delete(
+        &sb.store,
+        "A",
+        "B",
+        None,
+        &DiffRun::new(&progress, &CancellationToken::new()),
+    )?;
+    assert_eq!(stats.deleted, 2);
+    assert_eq!(progress.progress_count(), 2);
+    let (done, total) = progress
+        .last_progress()
+        .ok_or("no progress events recorded")?;
+    assert_eq!(total, 2);
+    assert_eq!(done, stats.deleted);
+    Ok(())
+}
+
+#[test]
+fn cancelled_delete_leaves_indexes_consistent_with_disk() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "gone.txt", b"shared")?;
+    Sandbox::write(&sb.b_root, "keep.txt", b"shared")?;
+    sb.update("A")?;
+    sb.update("B")?;
+
+    // A token cancelled up front: the loop breaks before touching any file.
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let stats = diff_delete(
+        &sb.store,
+        "A",
+        "B",
+        None,
+        &DiffRun::new(&NoDiffProgress, &cancel),
+    )?;
+    assert_eq!(stats.deleted, 0);
+    assert!(stats.cancelled);
+    // Nothing was removed, so the source index still lists the file present.
+    assert!(sb.a_root.join("gone.txt").exists());
+    let in_a = sb
+        .store
+        .get_file_entry("A", "gone.txt")?
+        .ok_or("gone.txt entry dropped from A")?;
+    assert!(!in_a.missing);
     Ok(())
 }

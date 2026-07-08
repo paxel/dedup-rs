@@ -10,14 +10,20 @@
 use crate::icon;
 use crate::theme;
 use crossbeam_channel::{Receiver, Sender};
-use dedup_core::diff::{CopyDest, DiffItem, diff_copy, diff_delete, diff_print};
+use dedup_core::diff::{
+    CopyDest, DiffAction, DiffEvent, DiffItem, DiffProgress, DiffRun, diff_copy, diff_delete,
+    diff_print,
+};
 use dedup_core::store::Store;
 use dedup_core::update::CancellationToken;
 use egui::{Id, RichText};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 const PREVIEW_LIMIT: usize = 30;
+/// How many recent actions the running panel keeps in its scrolling log.
+const RUN_LOG_LIMIT: usize = 10;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Command {
@@ -57,6 +63,25 @@ enum OpResult {
     Error(String),
 }
 
+/// Messages flowing from the worker thread to the UI thread: live per-file
+/// progress events plus the single terminal result.
+enum Msg {
+    Progress(DiffEvent),
+    Done(OpResult),
+}
+
+/// [`DiffProgress`] adapter that forwards every diff event onto the FilesView
+/// channel. Sends never block; a dropped receiver is fine.
+struct ChannelDiffProgress {
+    tx: Sender<Msg>,
+}
+
+impl DiffProgress for ChannelDiffProgress {
+    fn on(&self, event: DiffEvent) {
+        let _ = self.tx.send(Msg::Progress(event));
+    }
+}
+
 pub struct FilesView {
     repos: Vec<String>,
     loaded: bool,
@@ -76,8 +101,14 @@ pub struct FilesView {
     confirm: Option<String>,
     running: bool,
     cancel: CancellationToken,
-    tx: Sender<OpResult>,
-    rx: Receiver<OpResult>,
+    // Live run progress: the last N actions, the running counters and the
+    // file currently being handled.
+    run_log: VecDeque<String>,
+    run_done: u64,
+    run_total: u64,
+    run_current: String,
+    tx: Sender<Msg>,
+    rx: Receiver<Msg>,
 }
 
 enum Act {
@@ -117,6 +148,10 @@ impl FilesView {
             confirm: None,
             running: false,
             cancel: CancellationToken::new(),
+            run_log: VecDeque::new(),
+            run_done: 0,
+            run_total: 0,
+            run_current: String::new(),
             tx,
             rx,
         }
@@ -150,7 +185,13 @@ impl FilesView {
             ui.label(RichText::new(status).color(theme::TAN).size(13.0));
         }
         ui.separator();
-        self.preview_panel(ui);
+        // RUN and PREVIEW are mutually exclusive: while a run is active or has
+        // left a log, show the live run panel; otherwise show the preview.
+        if self.running || !self.run_log.is_empty() {
+            self.run_panel(ui);
+        } else {
+            self.preview_panel(ui);
+        }
 
         if let Some(prompt) = self.confirm.clone() {
             self.confirm_modal(ui, &prompt, &mut acts);
@@ -424,6 +465,44 @@ impl FilesView {
             });
     }
 
+    /// The live run panel: a spinner, the file currently being handled, a
+    /// scrolling list of the last N actions and a running summary line. Styled
+    /// like the repo scan progress in `app.rs`.
+    fn run_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if self.running {
+                ui.add(egui::Spinner::new().color(theme::AMBER));
+            }
+            let current = if self.run_current.is_empty() {
+                "preparing…".to_string()
+            } else {
+                self.run_current.clone()
+            };
+            ui.label(RichText::new(current).color(theme::AMBER).strong());
+        });
+
+        let summary = if self.run_total > 0 {
+            format!("{} / {}", self.run_done, self.run_total)
+        } else {
+            self.run_done.to_string()
+        };
+        ui.label(
+            RichText::new(format!("Processed {summary}"))
+                .color(theme::TAN)
+                .size(12.0),
+        );
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .max_height(180.0)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for line in &self.run_log {
+                    ui.label(RichText::new(line).color(theme::TEXT).size(12.0));
+                }
+            });
+    }
+
     fn confirm_modal(&mut self, ui: &mut egui::Ui, prompt: &str, acts: &mut Vec<Act>) {
         egui::Modal::new(Id::new("files-confirm")).show(&ui.ctx().clone(), |ui| {
             ui.set_width(380.0);
@@ -560,6 +639,8 @@ impl FilesView {
         let (Some(source), Some(target)) = (self.source.clone(), self.target.clone()) else {
             return;
         };
+        // PREVIEW and RUN are mutually exclusive: previewing drops any run log.
+        self.reset_run();
         let filter = self.filter_string();
         match diff_print(store, &source, &target, filter.as_deref()) {
             Ok(items) => {
@@ -652,8 +733,14 @@ impl FilesView {
         let cancel = self.cancel.clone();
         self.running = true;
         self.status = Some(format!("{}…", command.label().to_lowercase()));
+        // RUN and PREVIEW are mutually exclusive: starting a run drops the
+        // stale preview and resets the live run log/counters.
+        self.clear_preview();
+        self.reset_run();
 
         std::thread::spawn(move || {
+            let progress = ChannelDiffProgress { tx: tx.clone() };
+            let run = DiffRun::new(&progress, &cancel);
             let result = match command {
                 Command::Copy | Command::Move => {
                     let move_files = command == Command::Move;
@@ -675,7 +762,7 @@ impl FilesView {
                                 },
                                 move_files,
                                 filter.as_deref(),
-                                &cancel,
+                                &run,
                             ) {
                                 Ok(s) => OpResult::Copied {
                                     copied: s.copied,
@@ -689,7 +776,7 @@ impl FilesView {
                     }
                 }
                 Command::Delete => {
-                    match diff_delete(&store, &source, &target, filter.as_deref(), &cancel) {
+                    match diff_delete(&store, &source, &target, filter.as_deref(), &run) {
                         Ok(s) => OpResult::Deleted {
                             deleted: s.deleted,
                             cancelled: s.cancelled,
@@ -698,8 +785,49 @@ impl FilesView {
                     }
                 }
             };
-            let _ = tx.send(result);
+            let _ = tx.send(Msg::Done(result));
         });
+    }
+
+    /// Clear the live run log and counters (used when a run starts or a
+    /// preview replaces it).
+    fn reset_run(&mut self) {
+        self.run_log.clear();
+        self.run_done = 0;
+        self.run_total = 0;
+        self.run_current.clear();
+    }
+
+    /// Fold one live progress event into the running counters, current line
+    /// and last-N action log.
+    fn apply_progress(&mut self, event: DiffEvent) {
+        match event {
+            DiffEvent::Progress {
+                action,
+                done,
+                total,
+                rel_path,
+            } => {
+                let verb = match action {
+                    DiffAction::Copy => "Copied",
+                    DiffAction::Move => "Moved",
+                    DiffAction::Delete => "Deleted",
+                };
+                self.run_done = done;
+                self.run_total = total;
+                self.run_current = rel_path.clone();
+                self.run_log.push_back(format!("{verb} {rel_path}"));
+                while self.run_log.len() > RUN_LOG_LIMIT {
+                    self.run_log.pop_front();
+                }
+            }
+            DiffEvent::Error { path, message } => {
+                self.run_log.push_back(format!("✗ {path}: {message}"));
+                while self.run_log.len() > RUN_LOG_LIMIT {
+                    self.run_log.pop_front();
+                }
+            }
+        }
     }
 
     fn drain(&mut self, ui: &egui::Ui) {
@@ -716,32 +844,36 @@ impl FilesView {
                 Err(e) => self.error = Some(e),
             }
         }
-        while let Ok(result) = self.rx.try_recv() {
+        while let Ok(msg) = self.rx.try_recv() {
             got = true;
-            self.running = false;
-            match result {
-                OpResult::Copied {
-                    copied,
-                    cancelled,
-                    moved,
-                } => {
-                    let verb = if moved { "Moved" } else { "Copied" };
-                    self.status = Some(format!(
-                        "{verb} {copied} file(s){}.",
-                        if cancelled { " (cancelled)" } else { "" }
-                    ));
-                    self.error = None;
+            match msg {
+                Msg::Progress(event) => self.apply_progress(event),
+                Msg::Done(result) => {
+                    self.running = false;
+                    match result {
+                        OpResult::Copied {
+                            copied,
+                            cancelled,
+                            moved,
+                        } => {
+                            let verb = if moved { "Moved" } else { "Copied" };
+                            self.status = Some(format!(
+                                "{verb} {copied} file(s){}.",
+                                if cancelled { " (cancelled)" } else { "" }
+                            ));
+                            self.error = None;
+                        }
+                        OpResult::Deleted { deleted, cancelled } => {
+                            self.status = Some(format!(
+                                "Deleted {deleted} file(s){}.",
+                                if cancelled { " (cancelled)" } else { "" }
+                            ));
+                            self.error = None;
+                        }
+                        OpResult::Error(e) => self.error = Some(e),
+                    }
                 }
-                OpResult::Deleted { deleted, cancelled } => {
-                    self.status = Some(format!(
-                        "Deleted {deleted} file(s){}.",
-                        if cancelled { " (cancelled)" } else { "" }
-                    ));
-                    self.error = None;
-                }
-                OpResult::Error(e) => self.error = Some(e),
             }
-            self.clear_preview();
         }
         if got || self.running {
             ui.ctx()

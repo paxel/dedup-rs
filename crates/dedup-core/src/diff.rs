@@ -69,6 +69,65 @@ fn resolve_subdir(target_dir: &Path, subdir: Option<&str>) -> Result<PathBuf, Di
     Ok(target_dir.join(rel))
 }
 
+/// Flush accumulated index changes to disk every this many processed files,
+/// so both repo indexes stay close to real time without a redb write
+/// transaction per file (mirrors the scan pipeline's batching).
+const INDEX_BATCH: u64 = 200;
+
+/// The kind of file operation a [`DiffEvent`] refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffAction {
+    Copy,
+    Move,
+    Delete,
+}
+
+/// A live progress event emitted by [`diff_copy`] / [`diff_delete`] while they
+/// run, so a caller (e.g. the GUI) can render the current file, a running
+/// count and a last-N action log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffEvent {
+    /// A file has just been processed. `done` is the number of files handled so
+    /// far, `total` the size of the candidate set, `rel_path` the file touched.
+    Progress {
+        action: DiffAction,
+        done: u64,
+        total: u64,
+        rel_path: String,
+    },
+    /// A file could not be processed; the operation is about to stop.
+    Error { path: String, message: String },
+}
+
+/// Callback trait used by the diff operations to report per-file progress
+/// across the crate boundary (the core crate must not depend on the GUI/CLI).
+pub trait DiffProgress: Send + Sync {
+    fn on(&self, event: DiffEvent);
+}
+
+/// A no-op [`DiffProgress`] for callers that do not render live progress
+/// (e.g. the CLI).
+pub struct NoDiffProgress;
+
+impl DiffProgress for NoDiffProgress {
+    fn on(&self, _event: DiffEvent) {}
+}
+
+/// The execution context shared by the mutating diff operations: where to
+/// report live progress and how to observe cancellation. Grouping the two
+/// keeps the operation signatures compact.
+#[derive(Clone, Copy)]
+pub struct DiffRun<'a> {
+    pub progress: &'a dyn DiffProgress,
+    pub cancel: &'a CancellationToken,
+}
+
+impl<'a> DiffRun<'a> {
+    pub fn new(progress: &'a dyn DiffProgress, cancel: &'a CancellationToken) -> Self {
+        Self { progress, cancel }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffItem {
     /// Content exists in source but the reference has never seen it.
@@ -172,8 +231,15 @@ pub fn diff_print(
 
 /// Copy (or move) every source file whose content the reference has never
 /// seen — not even as a missing entry — into `target_dir`, preserving the
-/// relative path. A move marks the source index entries missing (one write
-/// transaction, applied even when the operation fails midway).
+/// relative path.
+///
+/// Both repo indexes are kept in sync as the run proceeds: each copied file
+/// that lands inside the reference (target) repo's directory is added to the
+/// reference index with its on-disk mtime, and a move marks the source entries
+/// missing. Index changes are flushed in periodic batches (plus a final flush,
+/// applied even when the operation fails or is cancelled midway) so the indexes
+/// always match what is actually on disk. Per-file progress is reported through
+/// `progress`.
 pub fn diff_copy(
     store: &Store,
     source: &str,
@@ -181,7 +247,7 @@ pub fn diff_copy(
     dest: CopyDest<'_>,
     move_files: bool,
     filter: Option<&str>,
-    cancel: &CancellationToken,
+    run: &DiffRun<'_>,
 ) -> Result<CopyStats, DiffError> {
     let dest_root = resolve_subdir(dest.dir, dest.subdir)?;
     let filter = FileFilter::parse(filter)?;
@@ -195,29 +261,69 @@ pub fn diff_copy(
         .collect();
 
     let source_root = PathBuf::from(&source.meta.abs_path);
+    let reference_root = PathBuf::from(&reference.meta.abs_path);
+    let total = candidates.len() as u64;
+    let action = if move_files {
+        DiffAction::Move
+    } else {
+        DiffAction::Copy
+    };
     let mut stats = CopyStats::default();
+    // Entries to add to the reference (target) index and source paths to mark
+    // missing, buffered until the next batch flush.
+    let mut to_index: Vec<(String, FileEntry)> = Vec::new();
     let mut moved: Vec<String> = Vec::new();
+    let mut since_flush = 0u64;
     let mut failure: Option<DiffError> = None;
 
-    for (rel_path, _) in &candidates {
-        if cancel.is_cancelled() {
+    for (rel_path, entry) in &candidates {
+        if run.cancel.is_cancelled() {
             stats.cancelled = true;
             break;
         }
         let from = source_root.join(rel_path);
         let to = dest_root.join(rel_path);
         if let Err(err) = transfer_file(&from, &to, move_files) {
+            run.progress.on(DiffEvent::Error {
+                path: from.to_string_lossy().into_owned(),
+                message: err.to_string(),
+            });
             failure = Some(err);
             break;
+        }
+        // Index the copy into the reference (target) repo when it actually
+        // lands inside that repo's directory (always true from the GUI).
+        if let Ok(target_rel) = to.strip_prefix(&reference_root) {
+            let target_rel = target_rel.to_string_lossy().replace('\\', "/");
+            let modified_ms = std::fs::metadata(&to)
+                .and_then(|md| md.modified())
+                .map(crate::update::system_time_to_ms)
+                .unwrap_or(entry.modified_ms);
+            let mut new_entry = entry.clone();
+            new_entry.missing = false;
+            new_entry.modified_ms = modified_ms;
+            to_index.push((target_rel, new_entry));
         }
         if move_files {
             moved.push(rel_path.clone());
         }
         stats.copied += 1;
+        since_flush += 1;
+        run.progress.on(DiffEvent::Progress {
+            action,
+            done: stats.copied,
+            total,
+            rel_path: rel_path.clone(),
+        });
+        if since_flush >= INDEX_BATCH {
+            flush_copy(&reference.db, &source.db, &mut to_index, &mut moved)?;
+            since_flush = 0;
+        }
     }
 
-    // Files already moved off disk must be marked missing even on failure.
-    store::mark_missing(&source.db, moved.iter().map(String::as_str))?;
+    // Final flush: anything already transferred on disk must be reflected in
+    // the indexes, even on cancel or failure.
+    flush_copy(&reference.db, &source.db, &mut to_index, &mut moved)?;
 
     match failure {
         Some(err) => Err(err),
@@ -225,14 +331,37 @@ pub fn diff_copy(
     }
 }
 
+/// Apply the buffered target-index additions and source missing-marks in a
+/// single pair of write transactions, then clear the buffers.
+fn flush_copy(
+    reference_db: &redb::Database,
+    source_db: &redb::Database,
+    to_index: &mut Vec<(String, FileEntry)>,
+    moved: &mut Vec<String>,
+) -> Result<(), StoreError> {
+    if !to_index.is_empty() {
+        store::apply_entries(reference_db, to_index.iter().map(|(p, e)| (p.as_str(), e)))?;
+        to_index.clear();
+    }
+    if !moved.is_empty() {
+        store::mark_missing(source_db, moved.iter().map(String::as_str))?;
+        moved.clear();
+    }
+    Ok(())
+}
+
 /// Delete every source file whose content the reference knows about (present
 /// or missing) and mark the deleted entries missing in the source index.
+///
+/// The source index is kept in sync as the run proceeds: deleted paths are
+/// marked missing in periodic batches (plus a final flush, applied even on
+/// cancel or failure). Per-file progress is reported through `progress`.
 pub fn diff_delete(
     store: &Store,
     source: &str,
     reference: &str,
     filter: Option<&str>,
-    cancel: &CancellationToken,
+    run: &DiffRun<'_>,
 ) -> Result<DeleteStats, DiffError> {
     let filter = FileFilter::parse(filter)?;
     let source = open_repo(store, source)?;
@@ -245,12 +374,14 @@ pub fn diff_delete(
         .collect();
 
     let source_root = PathBuf::from(&source.meta.abs_path);
+    let total = candidates.len() as u64;
     let mut stats = DeleteStats::default();
     let mut deleted: Vec<String> = Vec::new();
+    let mut since_flush = 0u64;
     let mut failure: Option<DiffError> = None;
 
     for (rel_path, _) in &candidates {
-        if cancel.is_cancelled() {
+        if run.cancel.is_cancelled() {
             stats.cancelled = true;
             break;
         }
@@ -260,6 +391,10 @@ pub fn diff_delete(
             // Already gone: just record it as missing.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
+                run.progress.on(DiffEvent::Error {
+                    path: path.to_string_lossy().into_owned(),
+                    message: err.to_string(),
+                });
                 failure = Some(DiffError::Io {
                     action: "delete",
                     path,
@@ -270,9 +405,25 @@ pub fn diff_delete(
         }
         deleted.push(rel_path.clone());
         stats.deleted += 1;
+        since_flush += 1;
+        run.progress.on(DiffEvent::Progress {
+            action: DiffAction::Delete,
+            done: stats.deleted,
+            total,
+            rel_path: rel_path.clone(),
+        });
+        if since_flush >= INDEX_BATCH {
+            store::mark_missing(&source.db, deleted.iter().map(String::as_str))?;
+            deleted.clear();
+            since_flush = 0;
+        }
     }
 
-    store::mark_missing(&source.db, deleted.iter().map(String::as_str))?;
+    // Final flush: files already removed from disk must be marked missing,
+    // even on cancel or failure.
+    if !deleted.is_empty() {
+        store::mark_missing(&source.db, deleted.iter().map(String::as_str))?;
+    }
 
     match failure {
         Some(err) => Err(err),

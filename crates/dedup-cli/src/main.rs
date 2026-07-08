@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
-use dedup_core::diff::{CopyDest, DiffItem, diff_copy, diff_delete, diff_print, diff_sync};
+use dedup_core::diff::{
+    CopyDest, DiffItem, DiffRun, NoDiffProgress, diff_copy, diff_delete, diff_print, diff_sync,
+};
 use dedup_core::dupes::{DupeGroup, delete_duplicates, find_exact_duplicates, wasted_bytes};
 use dedup_core::similar::find_similar;
 use dedup_core::store::Store;
@@ -331,7 +333,7 @@ fn run_diff(store: &Store, command: DiffCommands) -> anyhow::Result<()> {
                 },
                 false,
                 filter.as_deref(),
-                &cancel,
+                &DiffRun::new(&NoDiffProgress, &cancel),
             )?;
             println!(
                 "Copied {} files to '{}'.",
@@ -359,7 +361,7 @@ fn run_diff(store: &Store, command: DiffCommands) -> anyhow::Result<()> {
                 },
                 true,
                 filter.as_deref(),
-                &cancel,
+                &DiffRun::new(&NoDiffProgress, &cancel),
             )?;
             println!(
                 "Moved {} files to '{}'.",
@@ -375,7 +377,13 @@ fn run_diff(store: &Store, command: DiffCommands) -> anyhow::Result<()> {
             reference,
             filter,
         } => {
-            let stats = diff_delete(store, &source, &reference, filter.as_deref(), &cancel)?;
+            let stats = diff_delete(
+                store,
+                &source,
+                &reference,
+                filter.as_deref(),
+                &DiffRun::new(&NoDiffProgress, &cancel),
+            )?;
             println!("Deleted {} files from '{}'.", stats.deleted, source);
             if stats.cancelled {
                 println!("Delete cancelled by user.");
