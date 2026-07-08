@@ -19,6 +19,22 @@ pub const HAIRLINE: Color32 = Color32::from_rgb(0x5C, 0x4E, 0x40);
 /// Large corner radius gives widgets the rounded LCARS block look.
 pub const PILL: CornerRadius = CornerRadius::same(12);
 
+/// A bold-bordered LCARS section container in the given accent color, used to
+/// group a row of related controls.
+pub fn section(color: Color32) -> egui::Frame {
+    egui::Frame::new()
+        .fill(PANEL)
+        .corner_radius(PILL)
+        .stroke(Stroke::new(2.0, color))
+        .inner_margin(8.0)
+        .outer_margin(egui::Margin {
+            left: 0,
+            right: 0,
+            top: 0,
+            bottom: 8,
+        })
+}
+
 fn pill(bg: Color32, fg: Color32) -> WidgetVisuals {
     WidgetVisuals {
         bg_fill: bg,

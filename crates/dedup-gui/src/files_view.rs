@@ -177,106 +177,109 @@ impl FilesView {
     }
 
     fn repo_rows(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("SOURCE").color(theme::TEXT).size(12.0));
-            for name in &self.repos {
-                let sel = self.source.as_deref() == Some(name.as_str());
-                let fill = if sel { theme::ORANGE } else { theme::PANEL };
-                let col = if sel { theme::BLACK } else { theme::TEXT };
+        theme::section(theme::LILAC).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("SOURCE").color(theme::TEXT).size(12.0));
+                for name in &self.repos {
+                    let sel = self.source.as_deref() == Some(name.as_str());
+                    let fill = if sel { theme::ORANGE } else { theme::PANEL };
+                    let col = if sel { theme::BLACK } else { theme::TEXT };
+                    if ui
+                        .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
+                        .clicked()
+                    {
+                        acts.push(Act::PickSource(name.clone()));
+                    }
+                }
                 if ui
-                    .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
+                    .button(RichText::new(icon::REFRESH).color(theme::BLACK))
                     .clicked()
                 {
-                    acts.push(Act::PickSource(name.clone()));
+                    acts.push(Act::Reload);
                 }
-            }
-            if ui
-                .button(RichText::new(icon::REFRESH).color(theme::BLACK))
-                .clicked()
-            {
-                acts.push(Act::Reload);
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("TARGET").color(theme::TEXT).size(12.0));
-            for name in &self.repos {
-                // The target is chosen from the repos that are not the source.
-                if self.source.as_deref() == Some(name.as_str()) {
-                    continue;
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("TARGET").color(theme::TEXT).size(12.0));
+                for name in &self.repos {
+                    // The target is chosen from the repos that are not the source.
+                    if self.source.as_deref() == Some(name.as_str()) {
+                        continue;
+                    }
+                    let sel = self.target.as_deref() == Some(name.as_str());
+                    let fill = if sel { theme::BLUE } else { theme::PANEL };
+                    let col = if sel { theme::BLACK } else { theme::BLUE };
+                    if ui
+                        .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
+                        .clicked()
+                    {
+                        acts.push(Act::PickTarget(name.clone()));
+                    }
                 }
-                let sel = self.target.as_deref() == Some(name.as_str());
-                let fill = if sel { theme::BLUE } else { theme::PANEL };
-                let col = if sel { theme::BLACK } else { theme::BLUE };
-                if ui
-                    .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
-                    .clicked()
-                {
-                    acts.push(Act::PickTarget(name.clone()));
-                }
-            }
+            });
         });
     }
 
     fn command_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        ui.horizontal(|ui| {
-            for cmd in [Command::Copy, Command::Move, Command::Delete] {
-                let sel = self.command == cmd;
-                let fill = if sel {
-                    if cmd.destructive() {
+        theme::section(theme::ORANGE).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("COMMAND").color(theme::TEXT).size(12.0));
+                for cmd in [Command::Copy, Command::Move, Command::Delete] {
+                    let sel = self.command == cmd;
+                    let accent = if cmd.destructive() {
                         theme::RED
                     } else {
                         theme::AMBER
+                    };
+                    let fill = if sel { accent } else { theme::PANEL };
+                    // Unselected pills sit on the dark panel — black text would
+                    // vanish there, so they carry their accent color instead.
+                    let col = if sel { theme::BLACK } else { accent };
+                    if ui
+                        .add(egui::Button::new(RichText::new(cmd.label()).color(col)).fill(fill))
+                        .clicked()
+                    {
+                        acts.push(Act::SetCommand(cmd));
                     }
-                } else {
-                    theme::PANEL
-                };
+                }
+                ui.separator();
+                let ready = self.source.is_some() && self.target.is_some() && !self.running;
                 if ui
-                    .add(
-                        egui::Button::new(RichText::new(cmd.label()).color(theme::BLACK))
-                            .fill(fill),
+                    .add_enabled(
+                        ready,
+                        egui::Button::new(RichText::new("PREVIEW").color(theme::BLACK)),
                     )
                     .clicked()
                 {
-                    acts.push(Act::SetCommand(cmd));
+                    acts.push(Act::Preview);
                 }
-            }
-            ui.separator();
-            let ready = self.source.is_some() && self.target.is_some() && !self.running;
-            if ui
-                .add_enabled(
-                    ready,
-                    egui::Button::new(RichText::new("PREVIEW").color(theme::BLACK)),
-                )
-                .clicked()
-            {
-                acts.push(Act::Preview);
-            }
-            let run =
-                egui::Button::new(RichText::new("RUN").color(theme::BLACK)).fill(theme::AMBER);
-            if ui.add_enabled(ready, run).clicked() {
-                acts.push(Act::Ask);
-            }
-            if self.running {
-                ui.add(egui::Spinner::new().color(theme::AMBER));
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("CANCEL").color(theme::BLACK))
-                            .fill(theme::RED),
-                    )
-                    .clicked()
-                {
-                    acts.push(Act::CancelRun);
+                let run =
+                    egui::Button::new(RichText::new("RUN").color(theme::BLACK)).fill(theme::AMBER);
+                if ui.add_enabled(ready, run).clicked() {
+                    acts.push(Act::Ask);
                 }
-            }
+                if self.running {
+                    ui.add(egui::Spinner::new().color(theme::AMBER));
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("CANCEL").color(theme::BLACK))
+                                .fill(theme::RED),
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::CancelRun);
+                    }
+                }
+            });
+            self.hint(ui);
         });
-        self.hint(ui);
     }
 
     fn hint(&self, ui: &mut egui::Ui) {
         let text = match self.command {
             Command::Copy => "Copy source files the target does not have into the target repo.",
             Command::Move => {
-                "Move source files the target does not have (source entries marked missing)."
+                "Move source files the target does not have into the target repo \
+                 (they are removed from the source directory)."
             }
             Command::Delete => "Delete source files whose content the target already has.",
         };
@@ -284,37 +287,39 @@ impl FilesView {
     }
 
     fn filter_bar(&mut self, ui: &mut egui::Ui, _acts: &mut [Act]) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("FILTER").color(theme::TEXT).size(12.0));
-            for (kind, label) in [
-                (FilterKind::All, "ALL"),
-                (FilterKind::Mime, "MIME"),
-                (FilterKind::Name, "NAME"),
-                (FilterKind::Size, "SIZE"),
-            ] {
-                let sel = self.filter_kind == kind;
-                let fill = if sel { theme::LILAC } else { theme::PANEL };
-                let col = if sel { theme::BLACK } else { theme::LILAC };
-                if ui
-                    .add(egui::Button::new(RichText::new(label).color(col)).fill(fill))
-                    .clicked()
-                {
-                    self.filter_kind = kind;
+        theme::section(theme::LILAC).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("FILTER").color(theme::TEXT).size(12.0));
+                for (kind, label) in [
+                    (FilterKind::All, "ALL"),
+                    (FilterKind::Mime, "MIME"),
+                    (FilterKind::Name, "NAME"),
+                    (FilterKind::Size, "SIZE"),
+                ] {
+                    let sel = self.filter_kind == kind;
+                    let fill = if sel { theme::LILAC } else { theme::PANEL };
+                    let col = if sel { theme::BLACK } else { theme::LILAC };
+                    if ui
+                        .add(egui::Button::new(RichText::new(label).color(col)).fill(fill))
+                        .clicked()
+                    {
+                        self.filter_kind = kind;
+                    }
                 }
-            }
-            if self.filter_kind != FilterKind::All {
-                let hint = match self.filter_kind {
-                    FilterKind::Mime => "image/  ·  text/plain",
-                    FilterKind::Name => "substring of the path",
-                    FilterKind::Size => ">=1000  ·  <500  ·  =0",
-                    FilterKind::All => "",
-                };
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.filter_value)
-                        .desired_width(240.0)
-                        .hint_text(hint),
-                );
-            }
+                if self.filter_kind != FilterKind::All {
+                    let hint = match self.filter_kind {
+                        FilterKind::Mime => "image/  ·  text/plain",
+                        FilterKind::Name => "substring of the path",
+                        FilterKind::Size => ">=1000  ·  <500  ·  =0",
+                        FilterKind::All => "",
+                    };
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.filter_value)
+                            .desired_width(240.0)
+                            .hint_text(hint),
+                    );
+                }
+            });
         });
     }
 
@@ -490,7 +495,7 @@ impl FilesView {
                 self.preview_total
             ),
             Command::Move => format!(
-                "Move {} file(s) from '{source}' into '{target}'? Source entries will be marked missing.",
+                "Move {} file(s) from '{source}' into '{target}'? They are removed from the source directory.",
                 self.preview_total
             ),
             Command::Delete => format!(
