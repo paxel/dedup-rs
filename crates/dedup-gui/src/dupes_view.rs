@@ -16,6 +16,7 @@ use dedup_core::store::Store;
 use dedup_core::thumbnail::hash_hex;
 use egui::{Color32, Id, RichText};
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 const PAGE_SIZE: usize = 50;
@@ -117,6 +118,8 @@ enum Act {
     ToggleMark(FileKey),
     Unlock(FileKey),
     Relock(FileKey),
+    Open(PathBuf),
+    Reveal(PathBuf),
     ToggleQuickDelete,
     AutoResolve,
     DeleteGroup(usize),
@@ -809,66 +812,80 @@ impl DupesView {
             .inner_margin(8.0)
             .outer_margin(egui::Margin::same(4))
             .show(ui, |ui| {
-                ui.vertical(|ui| {
-                    ui.set_width(200.0);
-                    self.thumbnail(ui, file);
-                    ui.label(
-                        RichText::new(&file.rel_path)
-                            .color(theme::TEXT)
-                            .size(12.0)
-                            .strong(),
-                    );
-                    ui.label(
-                        RichText::new(format!("{} · {}", file.repo, format_size(file.entry.size)))
-                            .color(theme::TAN)
-                            .size(11.0),
-                    );
-                    let dims = file
-                        .entry
-                        .img_size
-                        .map(|(w, h)| format!("{w}×{h}"))
-                        .unwrap_or_else(|| "—".into());
-                    ui.label(
-                        RichText::new(format!("{dims} · {}", format_mtime(file.entry.modified_ms)))
-                            .color(theme::TAN)
-                            .size(11.0),
-                    );
+                // The whole card senses clicks *behind* its children (a
+                // trailing `interact` would sit on top and swallow the KEEP
+                // button and badge menus), carrying the external-open menu.
+                let card =
+                    ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(200.0);
+                            self.thumbnail(ui, file);
+                            ui.label(
+                                RichText::new(&file.rel_path)
+                                    .color(theme::TEXT)
+                                    .size(12.0)
+                                    .strong(),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} · {}",
+                                    file.repo,
+                                    format_size(file.entry.size)
+                                ))
+                                .color(theme::TAN)
+                                .size(11.0),
+                            );
+                            let dims = file
+                                .entry
+                                .img_size
+                                .map(|(w, h)| format!("{w}×{h}"))
+                                .unwrap_or_else(|| "—".into());
+                            ui.label(
+                                RichText::new(format!(
+                                    "{dims} · {}",
+                                    format_mtime(file.entry.modified_ms)
+                                ))
+                                .color(theme::TAN)
+                                .size(11.0),
+                            );
 
-                    if is_best {
-                        ui.label(
-                            RichText::new(format!("{} BEST", icon::STAR))
-                                .color(theme::BLUE)
-                                .size(12.0)
-                                .strong(),
-                        );
-                    }
-                    if ro {
-                        // Escape hatch for the occasional worse copy inside a
-                        // protected repo: unlock this one file via context menu
-                        // or long press — deliberately never a plain click.
-                        let resp = ui
-                            .add(
-                                egui::Label::new(
-                                    RichText::new("read-only").color(theme::BLUE).size(11.0),
-                                )
-                                .sense(egui::Sense::click()),
-                            )
-                            .on_hover_text("Right-click or long-press to unlock this file");
-                        if resp.long_touched() {
-                            acts.push(Act::Unlock(k.clone()));
-                        }
-                        resp.context_menu(|ui| {
-                            if ui
-                                .button(format!("{} UNLOCK for deletion", icon::LOCK_OPEN))
-                                .clicked()
-                            {
-                                acts.push(Act::Unlock(k.clone()));
-                                ui.close();
+                            if is_best {
+                                ui.label(
+                                    RichText::new(format!("{} BEST", icon::STAR))
+                                        .color(theme::BLUE)
+                                        .size(12.0)
+                                        .strong(),
+                                );
                             }
-                        });
-                    } else {
-                        if unlocked {
-                            let resp = ui
+                            if ro {
+                                // Escape hatch for the occasional worse copy inside a
+                                // protected repo: unlock this one file via context menu
+                                // or long press — deliberately never a plain click.
+                                let resp = ui
+                                    .add(
+                                        egui::Label::new(
+                                            RichText::new("read-only")
+                                                .color(theme::BLUE)
+                                                .size(11.0),
+                                        )
+                                        .sense(egui::Sense::click()),
+                                    )
+                                    .on_hover_text("Right-click or long-press to unlock this file");
+                                if resp.long_touched() {
+                                    acts.push(Act::Unlock(k.clone()));
+                                }
+                                resp.context_menu(|ui| {
+                                    if ui
+                                        .button(format!("{} UNLOCK for deletion", icon::LOCK_OPEN))
+                                        .clicked()
+                                    {
+                                        acts.push(Act::Unlock(k.clone()));
+                                        ui.close();
+                                    }
+                                });
+                            } else {
+                                if unlocked {
+                                    let resp = ui
                                 .add(
                                     egui::Label::new(
                                         RichText::new(format!("{} unlocked", icon::LOCK_OPEN))
@@ -880,25 +897,44 @@ impl DupesView {
                                 .on_hover_text(
                                     "Read-only override for this file — right-click to re-lock",
                                 );
-                            resp.context_menu(|ui| {
-                                if ui.button(format!("{} RE-LOCK", icon::LOCK)).clicked() {
-                                    acts.push(Act::Relock(k.clone()));
-                                    ui.close();
+                                    resp.context_menu(|ui| {
+                                        if ui.button(format!("{} RE-LOCK", icon::LOCK)).clicked() {
+                                            acts.push(Act::Relock(k.clone()));
+                                            ui.close();
+                                        }
+                                    });
                                 }
-                            });
-                        }
-                        let (label, fill) = if marked {
-                            (format!("{} DELETE", icon::CHECK), theme::RED)
-                        } else {
-                            ("KEEP".to_string(), theme::PANEL)
-                        };
-                        let color = if marked { theme::BLACK } else { theme::TEXT };
-                        if ui
-                            .add(egui::Button::new(RichText::new(label).color(color)).fill(fill))
-                            .clicked()
-                        {
-                            acts.push(Act::ToggleMark(k.clone()));
-                        }
+                                let (label, fill) = if marked {
+                                    (format!("{} DELETE", icon::CHECK), theme::RED)
+                                } else {
+                                    ("KEEP".to_string(), theme::PANEL)
+                                };
+                                let color = if marked { theme::BLACK } else { theme::TEXT };
+                                if ui
+                                    .add(
+                                        egui::Button::new(RichText::new(label).color(color))
+                                            .fill(fill),
+                                    )
+                                    .clicked()
+                                {
+                                    acts.push(Act::ToggleMark(k.clone()));
+                                }
+                            }
+                        });
+                    });
+                // Full-fidelity escape hatch: hand the file to the system's
+                // default app.
+                card.response.context_menu(|ui| {
+                    if ui.button(format!("{} OPEN", icon::ARROW_RIGHT)).clicked() {
+                        acts.push(Act::Open(file.absolute_path()));
+                        ui.close();
+                    }
+                    if ui
+                        .button(format!("{} SHOW IN FOLDER", icon::FOLDER_OPEN))
+                        .clicked()
+                    {
+                        acts.push(Act::Reveal(file.absolute_path()));
+                        ui.close();
                     }
                 });
             });
@@ -1015,6 +1051,16 @@ impl DupesView {
             Act::Relock(k) => {
                 self.unlocked.remove(&k);
                 self.marked.remove(&k);
+            }
+            Act::Open(path) => {
+                if let Err(e) = crate::external::open(&path) {
+                    self.error = Some(format!("Open failed: {e}"));
+                }
+            }
+            Act::Reveal(path) => {
+                if let Err(e) = crate::external::reveal(&path) {
+                    self.error = Some(format!("Show in folder failed: {e}"));
+                }
             }
             Act::ToggleQuickDelete => {
                 if self.quick_delete {
@@ -1771,6 +1817,54 @@ mod ui_tests {
                 .unlocked
                 .contains(&("ro".into(), "worse".into())),
             "context-menu UNLOCK lifts the per-file lock"
+        );
+    }
+
+    /// Every file card is an external escape hatch: right-clicking it offers
+    /// OPEN (system default app) and SHOW IN FOLDER entries.
+    #[test]
+    fn right_click_card_offers_open_and_show_in_folder() {
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![vec![
+            dfile("w", "best"),
+            dfile("w", "worse"),
+        ]]));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(700.0, 900.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store);
+                },
+                view,
+            );
+        harness.run();
+
+        // The name label doesn't sense clicks, so the right-click falls
+        // through to the card's own interact response.
+        harness.get_by_label("best").click_secondary();
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(&format!("{} OPEN", icon::ARROW_RIGHT))
+                .is_some(),
+            "card context menu should offer OPEN"
+        );
+        assert!(
+            harness
+                .query_by_label(&format!("{} SHOW IN FOLDER", icon::FOLDER_OPEN))
+                .is_some(),
+            "card context menu should offer SHOW IN FOLDER"
         );
     }
 

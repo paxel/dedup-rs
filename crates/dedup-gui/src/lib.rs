@@ -3,6 +3,7 @@
 
 mod app;
 mod dupes_view;
+mod external;
 mod files_view;
 mod icon;
 mod status;
