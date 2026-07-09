@@ -268,6 +268,12 @@ impl Store {
         })
     }
 
+    /// The directory where dedup stores its configuration and repo databases
+    /// (e.g. `~/.config/dedup`).
+    pub fn config_dir(&self) -> &std::path::Path {
+        &self.config_dir
+    }
+
     pub fn get_repo_db_path(&self, name: &str) -> PathBuf {
         self.config_dir.join("repos").join(name).join("index.redb")
     }

@@ -3,7 +3,7 @@
 //! `size:<op><bytes>` with the operators `>=`, `<=`, `>`, `<`, `=`
 //! (a bare number means equality).
 
-use crate::store::FileEntry;
+use crate::store::{FileEntry, StoreError, for_each_file_entry};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileFilter {
@@ -155,6 +155,19 @@ impl FileFilter {
     }
 }
 
+/// Count the number of present (non-missing) entries in a repo database that
+/// satisfy the given filter. Streams the index without materializing it.
+pub fn count_matches(db: &redb::Database, filter: &FileFilter) -> Result<usize, StoreError> {
+    let mut count = 0usize;
+    for_each_file_entry(db, |rel_path, entry| {
+        if !entry.missing && filter.matches(rel_path, &entry) {
+            count += 1;
+        }
+        Ok(())
+    })?;
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +229,57 @@ mod tests {
     fn invalid_filters_are_rejected() {
         assert!(FileFilter::parse(Some("bogus:x")).is_err());
         assert!(FileFilter::parse(Some("size:abc")).is_err());
+    }
+
+    #[test]
+    fn count_matches_counts_present_entries() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::store::Store;
+
+        let temp_dir = tempfile::tempdir()?;
+        let store = Store::open_at(temp_dir.path().to_path_buf())?;
+        let repo_dir = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&repo_dir)?;
+        store.create_repo("r", &repo_dir.to_string_lossy())?;
+
+        let make = |size: u64, mime: Option<&str>, missing: bool| FileEntry {
+            size,
+            hash: [size as u8; 32],
+            modified_ms: 0,
+            missing,
+            mime: mime.map(str::to_string),
+            img_fingerprint: None,
+            video_hash: None,
+            pdf_hash: None,
+            audio: None,
+            img_size: None,
+        };
+
+        store.update_file_entry("r", "photos/a.png", &make(100, Some("image/png"), false))?;
+        store.update_file_entry("r", "photos/b.png", &make(300, Some("image/png"), false))?;
+        store.update_file_entry("r", "docs/c.txt", &make(50, Some("text/plain"), false))?;
+        // Missing entry must be excluded even if it matches.
+        store.update_file_entry("r", "photos/d.png", &make(400, Some("image/png"), true))?;
+
+        let db = store.open_repo_db("r")?;
+
+        assert_eq!(count_matches(&db, &FileFilter::All)?, 3);
+        assert_eq!(
+            count_matches(&db, &FileFilter::parse(Some("mime:image"))?)?,
+            2
+        );
+        assert_eq!(
+            count_matches(&db, &FileFilter::parse(Some("name:photos/"))?)?,
+            2
+        );
+        assert_eq!(
+            count_matches(&db, &FileFilter::parse(Some("size:>=100"))?)?,
+            2
+        );
+        assert_eq!(
+            count_matches(&db, &FileFilter::parse(Some("mime:image size:>=200"))?)?,
+            1
+        );
+        Ok(())
     }
 
     #[test]

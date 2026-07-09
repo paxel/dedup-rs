@@ -2,14 +2,13 @@
 
 All notable changes to the `dedup-rs` project will be documented in this file.
 
-## [0.1.0] - 2026-07-05
-
-### Changed
-- `diff` filters can now combine multiple fields: `-f/--filter` accepts any of `mime:`, `name:`, and `size:` together (space-separated), combined with AND, and the GUI's File Management tab exposes them as three separate MIME / NAME / SIZE fields (editing any one now clears the stale preview). `name:`/`mime:` substring values are taken verbatim, so internal or repeated spaces are preserved rather than collapsed.
-- The GUI's File Management tab was reorganised into labelled sections (repos, command, target subdir, filter, action) for a clearer layout.
-- File Management operations now keep both repo indexes in sync as they run: COPY/MOVE record each transferred file in the target repo index (with its on-disk mtime, so a later scan sees it as unchanged) and MOVE/DELETE mark the source entries missing, flushed in periodic batches (plus a final flush on cancel/error) so the indexes always match what is on disk. The tab shows live progress — a spinner, the file being handled right now, the last actions, and a running count — mirroring the repo scan progress, and PREVIEW and RUN are now mutually exclusive (starting a run clears the preview and vice versa).
+## [0.1.0] - 2026-07-09
 
 ### Added
+- Assisted filter builder in the File Management tab: the section shows just `FILTER +`; pressing `+` offers the MIME / NAME / SIZE condition types and each added condition becomes a removable pill with an inline value editor. The editor helps with data: MIME values get clickable suggestions from the source repo's actual MIME types (with counts, narrowed as you type), NAME values show a live debounced count of matching files, and every kind offers the recently used values as one-click quick-picks. Entered values are remembered across sessions (`filter_history.json` in the config dir), whole condition sets can be saved as named presets and re-applied with one click, and the history + presets can be exported to / imported from a JSON file.
+- `diff` filters combine multiple fields: `-f/--filter` accepts any of `mime:`, `name:`, and `size:` together (space-separated), combined with AND; the GUI's filter builder maps to these same three fields (editing a condition clears the stale preview). `name:`/`mime:` substring values are taken verbatim, so internal or repeated spaces are preserved rather than collapsed.
+- The GUI's File Management tab is organised into labelled sections (repos, command, target subdir, filter, action) for a clear layout.
+- File Management operations keep both repo indexes in sync as they run: COPY/MOVE record each transferred file in the target repo index (with its on-disk mtime, so a later scan sees it as unchanged) and MOVE/DELETE mark the source entries missing, flushed in periodic batches (plus a final flush on cancel/error) so the indexes always match what is on disk. The tab shows live progress — a spinner, the file being handled right now, the last actions, and a running count — mirroring the repo scan progress, and PREVIEW and RUN are mutually exclusive (starting a run clears the preview and vice versa).
 - Phase 0 Skeleton: Created Cargo workspace with crates `dedup-core`, `dedup-cli`, and `dedup-gui`.
 - Integrated `clap` for version reporting and basic command line arguments.
 - Copied `rewrite.md` planning document into `ai/rewrite.md`.

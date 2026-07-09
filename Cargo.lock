@@ -1320,6 +1320,8 @@ dependencies = [
  "egui",
  "egui_kittest",
  "rfd",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 
