@@ -292,17 +292,16 @@ pub fn diff_copy(
             break;
         }
         // Index the copy into the reference (target) repo when it actually
-        // lands inside that repo's directory (always true from the GUI).
+        // lands inside that repo's directory. This relies on `dest_root`
+        // resolving under the reference repo's registered `abs_path` as an
+        // exact path-string prefix, which is always true from the GUI (both
+        // derive from the same repo metadata). A CLI destination spelled
+        // differently (relative, trailing-slash or symlinked form) will not
+        // match here, so the target index is left untouched until the next
+        // scan rather than risking a wrong entry.
         if let Ok(target_rel) = to.strip_prefix(&reference_root) {
             let target_rel = target_rel.to_string_lossy().replace('\\', "/");
-            let modified_ms = std::fs::metadata(&to)
-                .and_then(|md| md.modified())
-                .map(crate::update::system_time_to_ms)
-                .unwrap_or(entry.modified_ms);
-            let mut new_entry = entry.clone();
-            new_entry.missing = false;
-            new_entry.modified_ms = modified_ms;
-            to_index.push((target_rel, new_entry));
+            to_index.push((target_rel, entry_for_copied_file(entry, &to)));
         }
         if move_files {
             moved.push(rel_path.clone());
@@ -515,13 +514,7 @@ fn sync_copy(
 
     // Index the copy with the mtime the file actually has on the target so
     // the next update run sees it as unchanged.
-    let modified_ms = std::fs::metadata(&target_file)
-        .and_then(|md| md.modified())
-        .map(crate::update::system_time_to_ms)
-        .unwrap_or(entry.modified_ms);
-    let mut new_entry = entry.clone();
-    new_entry.missing = false;
-    new_entry.modified_ms = modified_ms;
+    let new_entry = entry_for_copied_file(entry, &target_file);
     store::apply_entries(&target.db, std::iter::once((rel_path, &new_entry)))?;
     target_index.entry(key).or_default().present = true;
     Ok(())
@@ -557,6 +550,22 @@ fn sync_delete(
         state.missing = true;
     }
     Ok(())
+}
+
+/// Build the index entry for a file that was just copied to `path`: the
+/// original content entry with its `missing` flag cleared and `modified_ms`
+/// set to the file's real on-disk mtime, so a later scan sees the copy as
+/// unchanged. Falls back to the source entry's mtime if the target's cannot
+/// be read.
+fn entry_for_copied_file(entry: &FileEntry, path: &Path) -> FileEntry {
+    let modified_ms = std::fs::metadata(path)
+        .and_then(|md| md.modified())
+        .map(crate::update::system_time_to_ms)
+        .unwrap_or(entry.modified_ms);
+    let mut new_entry = entry.clone();
+    new_entry.missing = false;
+    new_entry.modified_ms = modified_ms;
+    new_entry
 }
 
 /// Move a file, falling back to copy+delete across filesystems; parent

@@ -116,6 +116,7 @@ enum Act {
     PickTarget(String),
     SetCommand(Command),
     SubdirChanged,
+    FilterChanged,
     BrowseSubdir,
     Reload,
     Preview,
@@ -349,31 +350,40 @@ impl FilesView {
         ui.label(RichText::new(text).color(theme::LILAC).size(11.0));
     }
 
-    fn filter_bar(&mut self, ui: &mut egui::Ui, _acts: &mut [Act]) {
+    fn filter_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        // Editing any filter field invalidates the current preview, exactly
+        // like changing the target subdir does.
+        let mut changed = false;
         theme::section(theme::LILAC).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("FILTER").color(theme::TEXT).size(12.0));
 
                 ui.label(RichText::new("MIME:").color(theme::LILAC).size(11.0));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.filter_mime)
-                        .desired_width(100.0)
-                        .hint_text("image/"),
-                );
+                changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.filter_mime)
+                            .desired_width(100.0)
+                            .hint_text("image/"),
+                    )
+                    .changed();
 
                 ui.label(RichText::new("NAME:").color(theme::LILAC).size(11.0));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.filter_name)
-                        .desired_width(120.0)
-                        .hint_text("substring"),
-                );
+                changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.filter_name)
+                            .desired_width(120.0)
+                            .hint_text("substring"),
+                    )
+                    .changed();
 
                 ui.label(RichText::new("SIZE:").color(theme::LILAC).size(11.0));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.filter_size)
-                        .desired_width(100.0)
-                        .hint_text(">=1000"),
-                );
+                changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.filter_size)
+                            .desired_width(100.0)
+                            .hint_text(">=1000"),
+                    )
+                    .changed();
 
                 let has_any = !self.filter_mime.is_empty()
                     || !self.filter_name.is_empty()
@@ -388,10 +398,14 @@ impl FilesView {
                         self.filter_mime.clear();
                         self.filter_name.clear();
                         self.filter_size.clear();
+                        changed = true;
                     }
                 }
             });
         });
+        if changed {
+            acts.push(Act::FilterChanged);
+        }
     }
 
     fn action_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
@@ -555,6 +569,7 @@ impl FilesView {
                 self.clear_preview();
             }
             Act::SubdirChanged => self.clear_preview(),
+            Act::FilterChanged => self.clear_preview(),
             Act::BrowseSubdir => self.browse_subdir(store, ctx),
             Act::Reload => self.reload(store),
             Act::Preview => self.run_preview(store),

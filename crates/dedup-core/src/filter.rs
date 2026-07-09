@@ -48,41 +48,53 @@ impl FileFilter {
             return Ok(Self::All);
         }
 
-        let tokens: Vec<&str> = filter.split_whitespace().collect();
-        if tokens.is_empty() {
-            return Ok(Self::All);
-        }
-
-        let mut groups: Vec<String> = Vec::new();
-        for token in tokens {
-            let has_prefix = token.starts_with("mime:")
-                || token.starts_with("name:")
-                || token.starts_with("size:");
-            if has_prefix || groups.is_empty() {
-                groups.push(token.to_string());
-            } else if let Some(last) = groups.last_mut() {
-                last.push(' ');
-                last.push_str(token);
-            }
-        }
-
+        // Split into groups at whitespace-delimited known prefixes, keeping
+        // each group's value verbatim (only surrounding whitespace trimmed), so
+        // a name/mime substring may itself contain spaces or repeated spaces.
+        // Note: because the expression is a flat string, a value that embeds
+        // another field's prefix (e.g. `name:report size:big`) is still split
+        // into separate filters — keep such tokens out of substring values.
         let mut filters = Vec::new();
-        for group in groups {
-            let parsed = Self::parse_single(&group)?;
-            filters.push(parsed);
+        for group in Self::split_groups(filter) {
+            filters.push(Self::parse_single(group)?);
         }
 
-        if filters.is_empty() {
-            Ok(Self::All)
-        } else if filters.len() == 1 {
-            if let Some(first) = filters.pop() {
-                Ok(first)
-            } else {
-                Ok(Self::All)
-            }
-        } else {
-            Ok(Self::And(filters))
+        match filters.len() {
+            0 => Ok(Self::All),
+            1 => Ok(filters.remove(0)),
+            _ => Ok(Self::And(filters)),
         }
+    }
+
+    /// Split a filter expression into groups, each beginning at a known
+    /// `mime:` / `name:` / `size:` prefix found at the start of the string or
+    /// immediately after whitespace. The text spanning one prefix to the next
+    /// is kept verbatim (only its surrounding whitespace is trimmed), so
+    /// substring values are not mangled by internal or repeated spaces. Any
+    /// leading text before the first prefix is kept as its own group so
+    /// genuinely unknown input is still rejected by `parse_single`.
+    fn split_groups(filter: &str) -> Vec<&str> {
+        const PREFIXES: [&str; 3] = ["mime:", "name:", "size:"];
+        let bytes = filter.as_bytes();
+        let mut starts: Vec<usize> = Vec::new();
+        for i in 0..filter.len() {
+            if !filter.is_char_boundary(i) {
+                continue;
+            }
+            let at_boundary = i == 0 || bytes[i - 1].is_ascii_whitespace();
+            if at_boundary && PREFIXES.iter().any(|p| filter[i..].starts_with(p)) {
+                starts.push(i);
+            }
+        }
+        if starts.first() != Some(&0) {
+            starts.insert(0, 0);
+        }
+        let mut groups = Vec::with_capacity(starts.len());
+        for (k, &start) in starts.iter().enumerate() {
+            let end = starts.get(k + 1).copied().unwrap_or(filter.len());
+            groups.push(filter[start..end].trim());
+        }
+        groups
     }
 
     fn parse_single(filter: &str) -> Result<Self, FilterError> {
@@ -220,6 +232,26 @@ mod tests {
         assert!(!filter.matches("my warm photo.png", &entry(150, Some("image/png"))));
         assert!(!filter.matches("my cool photo.png", &entry(50, Some("image/png"))));
         assert!(!filter.matches("my cool photo.txt", &entry(150, Some("text/plain"))));
+        Ok(())
+    }
+
+    #[test]
+    fn name_value_keeps_internal_spacing() -> Result<(), FilterError> {
+        // Repeated and surrounding spaces inside a value are preserved verbatim
+        // rather than collapsed by whitespace splitting.
+        let filter = FileFilter::parse(Some("name:a  b"))?;
+        assert_eq!(filter, FileFilter::Name("a  b".to_string()));
+        assert!(filter.matches("x/a  b.txt", &entry(1, None)));
+        assert!(!filter.matches("x/a b.txt", &entry(1, None)));
+
+        let combo = FileFilter::parse(Some("name:two  spaces size:>=10"))?;
+        assert_eq!(
+            combo,
+            FileFilter::And(vec![
+                FileFilter::Name("two  spaces".to_string()),
+                FileFilter::Size(SizeOp::Ge, 10),
+            ])
+        );
         Ok(())
     }
 }

@@ -5,6 +5,8 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 ## [0.1.0] - 2026-07-05
 
 ### Changed
+- `diff` filters can now combine multiple fields: `-f/--filter` accepts any of `mime:`, `name:`, and `size:` together (space-separated), combined with AND, and the GUI's File Management tab exposes them as three separate MIME / NAME / SIZE fields (editing any one now clears the stale preview). `name:`/`mime:` substring values are taken verbatim, so internal or repeated spaces are preserved rather than collapsed.
+- The GUI's File Management tab was reorganised into labelled sections (repos, command, target subdir, filter, action) for a clearer layout.
 - File Management operations now keep both repo indexes in sync as they run: COPY/MOVE record each transferred file in the target repo index (with its on-disk mtime, so a later scan sees it as unchanged) and MOVE/DELETE mark the source entries missing, flushed in periodic batches (plus a final flush on cancel/error) so the indexes always match what is on disk. The tab shows live progress — a spinner, the file being handled right now, the last actions, and a running count — mirroring the repo scan progress, and PREVIEW and RUN are now mutually exclusive (starting a run clears the preview and vice versa).
 
 ### Added
