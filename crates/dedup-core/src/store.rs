@@ -32,6 +32,9 @@ const BY_FPRINT_LEGACY: redb::MultimapTableDefinition<u64, &str> =
     redb::MultimapTableDefinition::new("by_fprint");
 const META: redb::TableDefinition<&str, u64> = redb::TableDefinition::new("meta");
 const MIME_STATS: redb::TableDefinition<&str, u64> = redb::TableDefinition::new("mime_stats");
+/// Archive rel-path → postcard-encoded `Vec<ArchiveMember>` (opt-in index).
+const ARCHIVE_MEMBERS: redb::TableDefinition<&str, &[u8]> =
+    redb::TableDefinition::new("archive_members");
 
 #[derive(thiserror::Error, Debug)]
 pub enum StoreError {
@@ -206,6 +209,15 @@ struct FileEntryV3 {
 pub struct AudioFp {
     pub duration_ms: u32,
     pub chunk_hashes: Vec<[u8; 32]>,
+}
+
+/// One file inside an archive: its path within the archive plus the content
+/// identity (size + BLAKE3) used to check it against loose repo content.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveMember {
+    pub rel_path: String,
+    pub size: u64,
+    pub hash: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -437,6 +449,7 @@ impl Store {
             let _by_fprint = write_txn.open_multimap_table(BY_FPRINT)?;
             let _meta = write_txn.open_table(META)?;
             let _mime_stats = write_txn.open_table(MIME_STATS)?;
+            let _archive_members = write_txn.open_table(ARCHIVE_MEMBERS)?;
             // Drop the pre-ImgHash fingerprint index if this repo predates it.
             let _ = write_txn.delete_multimap_table(BY_FPRINT_LEGACY);
         }
@@ -1052,6 +1065,44 @@ pub fn set_last_scan(db: &redb::Database, ms: u64) -> Result<(), StoreError> {
         meta.insert("last_scan_ms", ms)?;
     }
     write_txn.commit()?;
+    Ok(())
+}
+
+/// Store an archive's member list (replacing any existing) in `ARCHIVE_MEMBERS`.
+pub fn set_archive_members(
+    db: &redb::Database,
+    rel_path: &str,
+    members: &[ArchiveMember],
+) -> Result<(), StoreError> {
+    let bytes =
+        postcard::to_allocvec(members).map_err(|e| StoreError::Serialization(e.to_string()))?;
+    let write_txn = db.begin_write()?;
+    {
+        let mut table = write_txn.open_table(ARCHIVE_MEMBERS)?;
+        table.insert(rel_path, bytes.as_slice())?;
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+
+/// Iterate every indexed archive's `(rel_path, members)`.
+pub fn for_each_archive_members<F>(db: &redb::Database, mut f: F) -> Result<(), StoreError>
+where
+    F: FnMut(&str, Vec<ArchiveMember>) -> Result<(), StoreError>,
+{
+    let read_txn = db.begin_read()?;
+    let table = match read_txn.open_table(ARCHIVE_MEMBERS) {
+        Ok(t) => t,
+        // A repo whose db predates the table simply has no archives indexed.
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for item in table.iter()? {
+        let (key, value) = item?;
+        let members: Vec<ArchiveMember> = postcard::from_bytes(value.value())
+            .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+        f(key.value(), members)?;
+    }
     Ok(())
 }
 

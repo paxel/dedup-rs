@@ -72,6 +72,8 @@ Settings (cog, top-right) currently exposes the hashing thread count used by sca
 | `dedup diff rm <source> <reference>` | Delete source files whose content the reference already has |
 | `dedup diff sync <source> <target>` | Copy new content into the target repo; `--delete-missing` / `--mirror` also delete |
 | `dedup sanitize <disk> <sanitized> [--ref <repo>...]` | Scan a disk, copy its content unique against the sanitized repo and any extra references into the sanitized repo, then mark the disk triage-done |
+| `dedup archive index <repo>` | Index each archive's members (zip/tar/tar.gz) by content identity (opt-in, reads each archive) |
+| `dedup archive coverage <repo> [--ref <repo>...]` | Report how much of each archive already exists as loose content; `--redundant-only` lists fully-redundant archives |
 
 `diff print`/`cp`/`mv`/`rm` accept additional reference repos via a repeatable `--ref <repo>` (the positional reference stays as sugar): a source file counts as "new" only when *none* of the references already has its content, so `dedup diff cp A sanitized /out --ref disk1 --ref disk2` copies only what is unique against the sanitized dir and every already-processed disk. The primary (positional) reference is the copy-back target. In the GUI's File Management tab, the "ALSO REF" row toggles extra reference repos beyond the target.
 

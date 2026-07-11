@@ -31,6 +31,11 @@ enum Commands {
         #[command(subcommand)]
         command: DiffCommands,
     },
+    /// Index archive members and report how redundant archives are
+    Archive {
+        #[command(subcommand)]
+        command: ArchiveCommands,
+    },
     /// Triage a disk: scan it, copy its unique content into a sanitized repo
     /// (diffing against the sanitized repo and any extra references), then mark
     /// the source repo triage-done. The one-shot disk-inheritance workflow.
@@ -140,6 +145,26 @@ enum DiffCommands {
         /// Filter: mime:<substring>, name:<substring>, or size:<expr>
         #[arg(short, long)]
         filter: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ArchiveCommands {
+    /// Index every archive's members in a repo (opt-in; reads each archive)
+    Index {
+        /// Repository holding the archives
+        repo: String,
+    },
+    /// Report how much of each archive already exists as loose content
+    Coverage {
+        /// Repository holding the (already indexed) archives
+        repo: String,
+        /// Extra repos to count as "already have it"; repeatable
+        #[arg(long = "ref", value_name = "REPO")]
+        refs: Vec<String>,
+        /// Only list archives that are fully redundant (100% covered)
+        #[arg(long)]
+        redundant_only: bool,
     },
 }
 
@@ -298,6 +323,10 @@ fn main() -> anyhow::Result<()> {
             let store = Store::open()?;
             run_diff(&store, command)?;
         }
+        Some(Commands::Archive { command }) => {
+            let store = Store::open()?;
+            run_archive(&store, command)?;
+        }
         Some(Commands::Sanitize {
             source,
             sanitized,
@@ -339,6 +368,47 @@ fn diff_refs<'a>(reference: &'a str, extra: &'a [String]) -> Vec<&'a str> {
     std::iter::once(reference)
         .chain(extra.iter().map(String::as_str))
         .collect()
+}
+
+fn run_archive(store: &Store, command: ArchiveCommands) -> anyhow::Result<()> {
+    match command {
+        ArchiveCommands::Index { repo } => {
+            let n = dedup_core::archive::index_repo_archives(store, &repo)?;
+            println!("Indexed {n} archive(s) in '{repo}'.");
+        }
+        ArchiveCommands::Coverage {
+            repo,
+            refs,
+            redundant_only,
+        } => {
+            // Count against the repo's own loose content plus any extra refs.
+            let references = diff_refs(&repo, &refs);
+            let report = dedup_core::archive::repo_archive_coverage(store, &repo, &references)?;
+            let mut redundant = 0;
+            for cov in &report {
+                if redundant_only && !cov.redundant {
+                    continue;
+                }
+                if cov.redundant {
+                    redundant += 1;
+                }
+                println!(
+                    "{:>5.1}%  {}/{}  {}{}",
+                    cov.percent(),
+                    cov.present,
+                    cov.members,
+                    cov.rel_path,
+                    if cov.redundant { "  [REDUNDANT]" } else { "" }
+                );
+            }
+            println!(
+                "{} archive(s), {} fully redundant.",
+                report.len(),
+                redundant
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The one-shot disk-triage workflow: scan the source, copy its unique content
