@@ -15,7 +15,7 @@
 //! Every step is best-effort: a decode or tool failure yields `None` for that
 //! field, never an error — the content hash already identifies the file.
 
-use crate::store::{AudioFp, ImgHash};
+use crate::store::{AudioFp, ExifInfo, ImgHash};
 use std::path::Path;
 use std::process::Command;
 
@@ -28,6 +28,7 @@ pub struct Fingerprints {
     pub video_hash: Option<[u64; 3]>,
     pub pdf_hash: Option<[u8; 32]>,
     pub audio: Option<AudioFp>,
+    pub exif: Option<ExifInfo>,
 }
 
 /// Detect a file's MIME type: magic bytes first (`infer`), then extension
@@ -59,6 +60,7 @@ pub fn compute(path: &Path, ffmpeg_available: bool) -> Fingerprints {
             fp.img_fingerprint = Some(hash);
             fp.img_size = Some(size);
         }
+        fp.exif = read_exif(path);
     } else if mime.starts_with("video/") {
         if ffmpeg_available {
             fp.video_hash = video_temporal_hash(path);
@@ -81,6 +83,64 @@ pub fn ffmpeg_available() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+// --- EXIF -------------------------------------------------------------------
+
+/// Read capture date and camera from an image's EXIF, if present. Best-effort:
+/// any parse failure yields `None` (like all fingerprints). The capture time is
+/// stored as naive-local epoch milliseconds — EXIF carries no timezone.
+pub fn read_exif(path: &Path) -> Option<ExifInfo> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let exif = exif::Reader::new().read_from_container(&mut reader).ok()?;
+
+    let text = |tag: exif::Tag| -> Option<String> {
+        exif.get_field(tag, exif::In::PRIMARY).map(|f| {
+            f.display_value()
+                .to_string()
+                .trim_matches('"')
+                .trim()
+                .to_string()
+        })
+    };
+    let make = text(exif::Tag::Make).filter(|s| !s.is_empty());
+    let model = text(exif::Tag::Model).filter(|s| !s.is_empty());
+    let camera = match (make, model) {
+        (Some(mk), Some(md)) if md.starts_with(&mk) => Some(md),
+        (Some(mk), Some(md)) => Some(format!("{mk} {md}")),
+        (Some(mk), None) => Some(mk),
+        (None, Some(md)) => Some(md),
+        (None, None) => None,
+    };
+
+    let taken_ms = exif
+        .get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)
+        .or_else(|| exif.get_field(exif::Tag::DateTime, exif::In::PRIMARY))
+        .and_then(|f| match &f.value {
+            exif::Value::Ascii(vec) if !vec.is_empty() => exif::DateTime::from_ascii(&vec[0]).ok(),
+            _ => None,
+        })
+        .map(|dt| exif_datetime_to_ms(&dt));
+
+    if taken_ms.is_none() && camera.is_none() {
+        return None;
+    }
+    Some(ExifInfo { taken_ms, camera })
+}
+
+/// Convert an EXIF `DateTime` (naive, no timezone) to epoch milliseconds,
+/// treated as if UTC. Uses Howard Hinnant's days-from-civil algorithm.
+fn exif_datetime_to_ms(dt: &exif::DateTime) -> i64 {
+    let (y, m, d) = (dt.year as i64, dt.month as i64, dt.day as i64);
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let secs = days * 86400 + dt.hour as i64 * 3600 + dt.minute as i64 * 60 + dt.second as i64;
+    secs * 1000
 }
 
 // --- Images -----------------------------------------------------------------
@@ -518,5 +578,25 @@ mod tests {
         let vertical = gradient(|_, y| (y * 2) as u8);
         let diagonal = gradient(|x, y| (x + y) as u8);
         assert_ne!(image_hash(&vertical), image_hash(&diagonal));
+    }
+
+    #[test]
+    fn exif_datetime_converts_to_epoch_ms() {
+        // 2021-01-01 00:00:00 == 1609459200 s since the epoch (as UTC).
+        let dt = exif::DateTime {
+            year: 2021,
+            month: 1,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            nanosecond: None,
+            offset: None,
+        };
+        assert_eq!(exif_datetime_to_ms(&dt), 1_609_459_200_000);
+
+        // A later timestamp is greater.
+        let dt2 = exif::DateTime { second: 1, ..dt };
+        assert_eq!(exif_datetime_to_ms(&dt2), 1_609_459_201_000);
     }
 }

@@ -16,6 +16,7 @@ infer = "0.19"
 mime_guess = "2.0"
 lopdf = "0.43"
 symphonia = { version = "0.5", features = ["all"] }
+kamadak-exif = "0.6.1"
 
 [dev-dependencies]
 tempfile = "3.10"

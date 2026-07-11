@@ -70,6 +70,7 @@ fn entry(size: u64, hash_byte: u8, mime: &str, missing: bool) -> FileEntry {
         audio: None,
         img_size: None,
         origin: None,
+        exif: None,
     }
 }
 

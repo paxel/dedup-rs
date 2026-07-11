@@ -154,16 +154,37 @@ pub fn sort_groups(groups: &mut [DupeGroup]) {
     groups.sort_by_key(|group| std::cmp::Reverse(wasted_bytes(group)));
 }
 
-/// Order one group's files best-copy-first: image area desc, size desc, oldest
+/// Order one group's files best-copy-first: image area desc, then (for
+/// pixel-equal copies) the one with EXIF and the earliest capture date — an
+/// original beats a re-save that stripped its metadata — then size desc, oldest
 /// mtime first, then relative path (case-insensitive).
 fn sort_group_members(group: &mut DupeGroup) {
     group.sort_by(|a, b| {
         image_area(&b.entry)
             .cmp(&image_area(&a.entry))
+            .then_with(|| has_exif(&b.entry).cmp(&has_exif(&a.entry)))
+            .then_with(|| taken_or_max(&a.entry).cmp(&taken_or_max(&b.entry)))
             .then(b.entry.size.cmp(&a.entry.size))
             .then(a.entry.modified_ms.cmp(&b.entry.modified_ms))
             .then_with(|| a.rel_path.to_lowercase().cmp(&b.rel_path.to_lowercase()))
     });
+}
+
+/// Whether an entry carries any EXIF (capture date or camera).
+fn has_exif(entry: &FileEntry) -> bool {
+    entry
+        .exif
+        .as_ref()
+        .is_some_and(|e| e.taken_ms.is_some() || e.camera.is_some())
+}
+
+/// EXIF capture time, or `i64::MAX` when absent (so undated copies sort last).
+fn taken_or_max(entry: &FileEntry) -> i64 {
+    entry
+        .exif
+        .as_ref()
+        .and_then(|e| e.taken_ms)
+        .unwrap_or(i64::MAX)
 }
 
 /// Bytes that could be reclaimed by keeping only the first (best) copy of the
@@ -265,4 +286,73 @@ pub fn delete_paths(
         store::mark_missing(&db, rel_paths.iter().copied())?;
     }
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::ExifInfo;
+
+    fn img_file(rel: &str, area: (u32, u32), exif: Option<ExifInfo>) -> DupeFile {
+        DupeFile {
+            repo: "r".into(),
+            repo_root: "/x".into(),
+            rel_path: rel.into(),
+            entry: FileEntry {
+                size: 100,
+                hash: [7; 32],
+                modified_ms: 0,
+                missing: false,
+                mime: Some("image/jpeg".into()),
+                img_fingerprint: None,
+                video_hash: None,
+                pdf_hash: None,
+                audio: None,
+                img_size: Some(area),
+                origin: None,
+                exif,
+            },
+        }
+    }
+
+    /// Among pixel-equal copies, the one with EXIF (and the earlier capture
+    /// date) ranks as the best copy — an original beats a metadata-stripped
+    /// re-save.
+    #[test]
+    fn exif_original_beats_resave_when_pixel_equal() {
+        let with_exif = img_file(
+            "original.jpg",
+            (4000, 3000),
+            Some(ExifInfo {
+                taken_ms: Some(1_000_000),
+                camera: Some("Canon".into()),
+            }),
+        );
+        let stripped = img_file("copy.jpg", (4000, 3000), None);
+
+        let mut group = vec![stripped, with_exif];
+        sort_group_members(&mut group);
+        assert_eq!(group[0].rel_path, "original.jpg", "EXIF original is best");
+
+        // Two dated copies: the earlier capture wins.
+        let earlier = img_file(
+            "a.jpg",
+            (4000, 3000),
+            Some(ExifInfo {
+                taken_ms: Some(500),
+                camera: None,
+            }),
+        );
+        let later = img_file(
+            "b.jpg",
+            (4000, 3000),
+            Some(ExifInfo {
+                taken_ms: Some(9_000),
+                camera: None,
+            }),
+        );
+        let mut group = vec![later, earlier];
+        sort_group_members(&mut group);
+        assert_eq!(group[0].rel_path, "a.jpg", "earliest capture is best");
+    }
 }

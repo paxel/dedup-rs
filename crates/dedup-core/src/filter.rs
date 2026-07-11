@@ -196,6 +196,7 @@ mod tests {
             audio: None,
             img_size: None,
             origin: None,
+            exif: None,
         }
     }
 
@@ -265,6 +266,7 @@ mod tests {
             audio: None,
             img_size: None,
             origin: None,
+            exif: None,
         };
 
         store.update_file_entry("r", "photos/a.png", &make(100, Some("image/png"), false))?;

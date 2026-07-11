@@ -327,6 +327,7 @@ pub fn update_repo(
                             audio: fp.audio,
                             img_size: fp.img_size,
                             origin: None,
+                            exif: fp.exif,
                         },
                     ));
                     if batch.len() >= BATCH_SIZE {

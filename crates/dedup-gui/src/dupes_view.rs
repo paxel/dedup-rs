@@ -2096,6 +2096,7 @@ mod ui_tests {
                 audio: None,
                 img_size: Some((100, 100)),
                 origin: None,
+                exif: None,
             },
         }
     }
@@ -2205,6 +2206,7 @@ mod ui_tests {
                 audio: None,
                 img_size: None,
                 origin: None,
+                exif: None,
             };
             for c in 0..2 {
                 entries.push((format!("g{g}_c{c}.bin"), e.clone()));
@@ -2328,6 +2330,7 @@ mod ui_tests {
                 audio: None,
                 img_size: None,
                 origin: None,
+                exif: None,
             },
         }
     }
@@ -2659,6 +2662,7 @@ mod ui_tests {
                 }),
                 img_size: None,
                 origin: None,
+                exif: None,
             },
         }
     }
@@ -2890,6 +2894,7 @@ mod ui_tests {
                         audio: None,
                         img_size: None,
                         origin: None,
+                        exif: None,
                     },
                 )
                 .unwrap();
@@ -3109,6 +3114,7 @@ mod ui_tests {
                     audio: None,
                     img_size: Some((640, 480)),
                     origin: None,
+                    exif: None,
                 },
             });
         }
@@ -3193,6 +3199,7 @@ mod ui_tests {
                 audio: None,
                 img_size: None,
                 origin: None,
+                exif: None,
             },
         };
 
