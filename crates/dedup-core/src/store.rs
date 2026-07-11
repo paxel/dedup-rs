@@ -14,9 +14,9 @@ const SCHEMA_VERSION: u8 = 1;
 /// None` and are NOT re-flagged stale); v4 added image `exif`, which requires
 /// re-reading image files, so images below v4 are flagged stale; v5 added
 /// office-document text hashes (reusing the `pdf_hash` slot), so document files
-/// below v5 are flagged stale. The v4→v5 layout is unchanged. See
-/// [`decode_entry`].
-const ENTRY_VERSION: u8 = 5;
+/// below v5 are flagged stale; v6 added text/CSV hashes, so text files below v6
+/// are flagged stale. The v4→v5→v6 layout is unchanged. See [`decode_entry`].
+const ENTRY_VERSION: u8 = 6;
 
 // Registry table definition
 const REPOS: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("repos");
@@ -293,8 +293,9 @@ fn deserialize_value<'a, T: Deserialize<'a>>(
 fn decode_entry(bytes: &[u8]) -> Result<(FileEntry, u8), StoreError> {
     match bytes.first() {
         Some(&ENTRY_VERSION) => Ok((deserialize_value(ENTRY_VERSION, bytes)?, ENTRY_VERSION)),
-        // v4 and v5 share the same layout; only the stale policy differs.
+        // v4/v5/v6 share the same layout; only the stale policy differs.
         Some(4) => Ok((deserialize_value(4, bytes)?, 4)),
+        Some(5) => Ok((deserialize_value(5, bytes)?, 5)),
         Some(3) => {
             let v3: FileEntryV3 = deserialize_value(3, bytes)?;
             let entry = FileEntry {
@@ -1173,6 +1174,7 @@ pub fn read_scan_index(
         let stale = match entry.mime.as_deref() {
             Some(m) if m.starts_with("image/") => version < 4,
             Some(m) if crate::fingerprint::is_office_doc(m) => version < 5,
+            Some(m) if m.starts_with("text/") => version < 6,
             _ => false,
         };
         index.insert(

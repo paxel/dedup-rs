@@ -71,6 +71,10 @@ pub fn compute(path: &Path, ffmpeg_available: bool) -> Fingerprints {
         // Office documents share the PDF text-hash slot: text identity groups
         // them together (and with matching PDFs) regardless of container.
         fp.pdf_hash = doc_text_hash(path, &mime);
+    } else if mime.starts_with("text/") {
+        // Plain text / CSV: group exports and logs that differ only by BOM,
+        // line endings or trailing whitespace.
+        fp.pdf_hash = text_file_hash(path);
     } else if mime.starts_with("audio/") {
         fp.audio = audio_fingerprint(path);
     }
@@ -497,6 +501,29 @@ fn zip_doc_text(path: &Path, mime: &str) -> Option<String> {
     Some(out)
 }
 
+/// Above this size a text file is hashed raw (no normalization) to bound cost.
+const TEXT_NORMALIZE_CAP: u64 = 32 * 1024 * 1024;
+
+/// BLAKE3 of a normalized text/CSV file so exports and logs that differ only by
+/// BOM, line endings (CRLF vs LF) or trailing whitespace group together. Files
+/// larger than [`TEXT_NORMALIZE_CAP`] are hashed raw (bounded cost); a
+/// one-row/one-line difference still changes the hash.
+pub fn text_file_hash(path: &Path) -> Option<[u8; 32]> {
+    let meta = std::fs::metadata(path).ok()?;
+    let bytes = std::fs::read(path).ok()?;
+    if meta.len() > TEXT_NORMALIZE_CAP {
+        return Some(*blake3::hash(&bytes).as_bytes());
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(&text); // strip BOM
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized = normalized.trim_end();
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(*blake3::hash(normalized.as_bytes()).as_bytes())
+}
+
 /// Concatenated cell text of a legacy `.xls` workbook, via calamine.
 fn xls_text(path: &Path) -> Option<String> {
     use calamine::Reader;
@@ -774,5 +801,29 @@ mod tests {
             )],
         );
         assert_ne!(doc_text_hash(&other, DOCX).unwrap(), h_docx);
+    }
+
+    /// The same CSV with CRLF vs LF (and a trailing newline / BOM) groups; a
+    /// one-row difference does not.
+    #[test]
+    fn text_files_group_across_line_endings() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let lf = dir.path().join("a.csv");
+        std::fs::write(&lf, b"id,name\n1,alice\n2,bob").unwrap();
+        let crlf = dir.path().join("b.csv");
+        std::fs::write(&crlf, "\u{FEFF}id,name\r\n1,alice\r\n2,bob\r\n".as_bytes()).unwrap();
+
+        let h_lf = text_file_hash(&lf).expect("lf");
+        let h_crlf = text_file_hash(&crlf).expect("crlf");
+        assert_eq!(h_lf, h_crlf, "line-ending/BOM drift groups");
+
+        let changed = dir.path().join("c.csv");
+        std::fs::write(&changed, b"id,name\n1,alice\n2,carol").unwrap();
+        assert_ne!(
+            text_file_hash(&changed).unwrap(),
+            h_lf,
+            "row change differs"
+        );
     }
 }
