@@ -31,6 +31,14 @@ enum Commands {
         #[command(subcommand)]
         command: DiffCommands,
     },
+    /// Scan repos for likely-critical files (wallets, keys, vaults, docs)
+    Scan {
+        /// Repositories to scan
+        names: Vec<String>,
+        /// Scan all registered repositories
+        #[arg(long)]
+        all: bool,
+    },
     /// Index archive members and report how redundant archives are
     Archive {
         #[command(subcommand)]
@@ -323,6 +331,10 @@ fn main() -> anyhow::Result<()> {
             let store = Store::open()?;
             run_diff(&store, command)?;
         }
+        Some(Commands::Scan { names, all }) => {
+            let store = Store::open()?;
+            run_scan(&store, names, all)?;
+        }
         Some(Commands::Archive { command }) => {
             let store = Store::open()?;
             run_archive(&store, command)?;
@@ -368,6 +380,50 @@ fn diff_refs<'a>(reference: &'a str, extra: &'a [String]) -> Vec<&'a str> {
     std::iter::once(reference)
         .chain(extra.iter().map(String::as_str))
         .collect()
+}
+
+fn run_scan(store: &Store, names: Vec<String>, all: bool) -> anyhow::Result<()> {
+    let names: Vec<String> = if all {
+        store
+            .list_repos()?
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect()
+    } else {
+        names
+    };
+    if names.is_empty() {
+        anyhow::bail!("No repositories to scan. Pass repo names or --all.");
+    }
+
+    let flags = dedup_core::scan::scan_repos(store, &names)?;
+    if flags.is_empty() {
+        println!("No critical files flagged.");
+        return Ok(());
+    }
+    // Group by category for a reviewable report.
+    use dedup_core::scan::Category;
+    for category in [
+        Category::Wallet,
+        Category::Key,
+        Category::Vault,
+        Category::Identity,
+        Category::Financial,
+    ] {
+        let group: Vec<_> = flags.iter().filter(|f| f.category == category).collect();
+        if group.is_empty() {
+            continue;
+        }
+        println!("\n{} ({})", category.label(), group.len());
+        for f in group {
+            println!("  {}/{}  — {}", f.repo, f.rel_path, f.reason);
+        }
+    }
+    println!(
+        "\n{} file(s) flagged (advisory — nothing was modified).",
+        flags.len()
+    );
+    Ok(())
 }
 
 fn run_archive(store: &Store, command: ArchiveCommands) -> anyhow::Result<()> {
