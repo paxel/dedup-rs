@@ -3,7 +3,7 @@
 //! delete the worse copies — batched per repo, never without a confirmation.
 
 use crate::icon;
-use crate::lightbox::{FullResCache, LightboxState};
+use crate::lightbox::{CompareState, FullResCache, LightboxState};
 use crate::theme;
 use crate::thumbs::ThumbCache;
 use crate::util::{format_mtime, format_size};
@@ -108,6 +108,20 @@ type FileKey = (String, String);
 
 fn key(file: &DupeFile) -> FileKey {
     (file.repo.clone(), file.rel_path.clone())
+}
+
+/// One-line `path · size · WxH · mtime` description used by the lightbox.
+fn lightbox_meta(file: &DupeFile) -> String {
+    format!(
+        "{} · {} · {} · {}",
+        file.rel_path,
+        format_size(file.entry.size),
+        file.entry
+            .img_size
+            .map(|(w, h)| format!("{w}×{h}"))
+            .unwrap_or_else(|| "—".into()),
+        format_mtime(file.entry.modified_ms),
+    )
 }
 
 /// Deferred UI actions, applied after rendering to avoid double borrows.
@@ -1026,8 +1040,26 @@ impl DupesView {
             });
     }
 
+    /// Full-resolution texture for a file (thumbnail upscaled while decoding),
+    /// with the image's true pixel size (from the index, falling back to the
+    /// texture) so transforms stay stable across the thumb→full-res swap.
+    fn lightbox_texture(&mut self, file: &DupeFile) -> (Option<egui::TextureHandle>, egui::Vec2) {
+        let hex = hash_hex(&file.entry.hash);
+        let source = file.absolute_path();
+        let full = self.full_res.get(&hex, &source);
+        let tex = full.or_else(|| self.thumbs.get(&hex, &source));
+        let img = file
+            .entry
+            .img_size
+            .map(|(w, h)| egui::vec2(w as f32, h as f32))
+            .or_else(|| tex.as_ref().map(|t| t.size_vec2()))
+            .unwrap_or(egui::vec2(1.0, 1.0));
+        (tex, img)
+    }
+
     /// Full-window image lightbox: wheel zoom (around cursor), drag pan, `F`
-    /// fit / `1` 1:1, `←`/`→` step the group, `Del`/`K` toggle the mark, `Esc`
+    /// fit / `1` 1:1, `←`/`→` step the group, `Del`/`K` toggle the mark, `C`
+    /// A/B compare against the best copy (`space` swaps in flicker mode), `Esc`
     /// close. Marking respects read-only exactly like the cards.
     fn lightbox_modal(&mut self, ctx: &egui::Context, acts: &mut Vec<Act>) {
         // Take the state so `full_res`/`thumbs` can be borrowed mutably below;
@@ -1048,10 +1080,13 @@ impl DupesView {
         let count = group.len();
         let mut idx = state.index.min(count - 1);
 
-        // Keyboard: navigation, view modes, mark, close.
+        // Keyboard: navigation, view modes, mark, compare, close. Mode changes
+        // are recorded as flags and applied after drawing (uniform one-frame
+        // latency), so this frame draws a consistent state.
         let mut close = false;
         let mut new_idx = idx;
         let (mut do_fit, mut do_one, mut do_mark) = (false, false, false);
+        let (mut toggle_compare, mut toggle_flicker, mut swap) = (false, false, false);
         ctx.input(|i| {
             if i.key_pressed(egui::Key::Escape) {
                 close = true;
@@ -1071,6 +1106,12 @@ impl DupesView {
             if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::K) {
                 do_mark = true;
             }
+            if i.key_pressed(egui::Key::C) {
+                toggle_compare = true;
+            }
+            if i.key_pressed(egui::Key::Space) {
+                swap = true;
+            }
         });
         if close {
             return; // dropped state = closed
@@ -1081,38 +1122,69 @@ impl DupesView {
             state.reset_view();
         }
 
-        let file = &group[idx];
-        let k = key(file);
-        let markable = !self.repo_is_ro(&file.repo) || self.unlocked.contains(&k);
-        let is_marked = self.marked.contains(&k);
-        if do_mark && markable {
-            acts.push(Act::ToggleMark(k.clone()));
+        // The A file (always the current index) and its texture/metadata.
+        let a = group[idx].clone();
+        let a_key = key(&a);
+        let a_markable = !self.repo_is_ro(&a.repo) || self.unlocked.contains(&a_key);
+        let a_marked = self.marked.contains(&a_key);
+        let (a_tex, a_img) = self.lightbox_texture(&a);
+        let a_meta = lightbox_meta(&a);
+
+        // The B file (compare target), if comparing.
+        let b = state
+            .compare
+            .as_ref()
+            .map(|c| c.other.min(count - 1))
+            .map(|bi| group[bi].clone());
+        let b_bundle = b.as_ref().map(|b| {
+            let b_key = key(b);
+            let b_markable = !self.repo_is_ro(&b.repo) || self.unlocked.contains(&b_key);
+            let b_marked = self.marked.contains(&b_key);
+            let (b_tex, b_img) = self.lightbox_texture(b);
+            (b.clone(), b_key, b_markable, b_marked, b_tex, b_img)
+        });
+
+        // Del/K marks B when comparing (the candidate), else A.
+        if do_mark {
+            if let Some((_, b_key, b_markable, _, _, _)) = &b_bundle {
+                if *b_markable {
+                    acts.push(Act::ToggleMark(b_key.clone()));
+                }
+            } else if a_markable {
+                acts.push(Act::ToggleMark(a_key.clone()));
+            }
         }
 
-        // Full-resolution texture, falling back to the upscaled thumbnail while
-        // the decode is in flight. The transform uses the true pixel size
-        // (from the index) so the image doesn't jump when full-res lands.
-        let hex = hash_hex(&file.entry.hash);
-        let source = file.absolute_path();
-        let full = self.full_res.get(&hex, &source);
-        let tex = full.clone().or_else(|| self.thumbs.get(&hex, &source));
-        let img_size = file
-            .entry
-            .img_size
-            .map(|(w, h)| egui::vec2(w as f32, h as f32))
-            .or_else(|| tex.as_ref().map(|t| t.size_vec2()))
-            .unwrap_or(egui::vec2(1.0, 1.0));
+        // "Better" (larger) size/area gets highlighted in the compare strip.
+        let (a_size_col, b_size_col, a_dim_col, b_dim_col) = match &b_bundle {
+            Some((bf, _, _, _, _, _)) => {
+                let bigger = |x: u64, y: u64| {
+                    if x > y { theme::BLUE } else { theme::TAN }
+                };
+                let area = |f: &DupeFile| {
+                    f.entry
+                        .img_size
+                        .map(|(w, h)| w as u64 * h as u64)
+                        .unwrap_or(0)
+                };
+                (
+                    bigger(a.entry.size, bf.entry.size),
+                    bigger(bf.entry.size, a.entry.size),
+                    bigger(area(&a), area(bf)),
+                    bigger(area(bf), area(&a)),
+                )
+            }
+            None => (theme::TEXT, theme::TEXT, theme::TEXT, theme::TEXT),
+        };
 
-        let meta = format!(
-            "{} · {} · {} · {}",
-            file.rel_path,
-            format_size(file.entry.size),
-            file.entry
-                .img_size
-                .map(|(w, h)| format!("{w}×{h}"))
-                .unwrap_or_else(|| "—".into()),
-            format_mtime(file.entry.modified_ms),
-        );
+        // Destructure the B bundle into individual locals for the closure.
+        let (b_key, b_markable, b_marked, b_tex, b_img) = match &b_bundle {
+            Some((_, bk, bmk, bm, bt, bi)) => (Some(bk.clone()), *bmk, *bm, bt.clone(), Some(*bi)),
+            None => (None, false, false, None, None),
+        };
+        let b_meta = b.as_ref().map(lightbox_meta);
+        let flicker = state.compare.as_ref().is_some_and(|c| c.flicker);
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
 
         egui::Area::new(Id::new("lightbox"))
             .order(egui::Order::Foreground)
@@ -1126,38 +1198,94 @@ impl DupesView {
                 // Viewport = screen minus top control bar and bottom strip.
                 let viewport = egui::Rect::from_min_max(
                     egui::pos2(screen.min.x + 8.0, screen.min.y + 44.0),
-                    egui::pos2(screen.max.x - 8.0, screen.max.y - 56.0),
+                    egui::pos2(screen.max.x - 8.0, screen.max.y - 62.0),
                 );
-
-                // Wheel zoom around the cursor; drag pans.
-                if bg.dragged() {
-                    state.pan_by(bg.drag_delta(), viewport, img_size);
-                }
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                if scroll != 0.0
-                    && let Some(cursor) = ctx.pointer_hover_pos()
-                    && viewport.contains(cursor)
-                {
-                    state.zoom_at(cursor, (scroll * 0.005).exp(), viewport, img_size);
-                }
+                let cursor = ctx.pointer_hover_pos();
 
-                // Draw the image (clipped to the viewport).
-                if let Some(tex) = &tex {
-                    let rect = state.image_rect(viewport, img_size);
-                    ui.painter_at(viewport).image(
-                        tex.id(),
-                        rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
+                let draw = |ui: &egui::Ui, rect: egui::Rect, pane: egui::Rect, tex: &Option<egui::TextureHandle>| {
+                    if let Some(tex) = tex {
+                        ui.painter_at(pane).image(tex.id(), rect, uv, egui::Color32::WHITE);
+                    } else {
+                        ui.painter().text(
+                            pane.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "decoding…",
+                            egui::FontId::proportional(16.0),
+                            theme::TAN,
+                        );
+                    }
+                };
+
+                if let Some(cmp) = state.compare.as_mut() {
+                    // Shared zoom/pan across both panes.
+                    if bg.dragged() {
+                        cmp.pan_by(bg.drag_delta());
+                    }
+                    if scroll != 0.0
+                        && cursor.is_some_and(|c| viewport.contains(c))
+                    {
+                        cmp.zoom_by((scroll * 0.005).exp());
+                    }
+                    if cmp.flicker {
+                        // Overlay: show A or B in the whole viewport.
+                        let (tex, img) = if cmp.show_b {
+                            (&b_tex, b_img.unwrap_or(a_img))
+                        } else {
+                            (&a_tex, a_img)
+                        };
+                        let rect = cmp.pane_rect(viewport, img);
+                        draw(ui, rect, viewport, tex);
+                        let tag = if cmp.show_b { "B" } else { "A" };
+                        ui.painter().text(
+                            viewport.min + egui::vec2(6.0, 6.0),
+                            egui::Align2::LEFT_TOP,
+                            tag,
+                            egui::FontId::proportional(18.0),
+                            theme::AMBER,
+                        );
+                    } else {
+                        // Side by side.
+                        let gap = 6.0;
+                        let half = (viewport.width() - gap) / 2.0;
+                        let left = egui::Rect::from_min_size(
+                            viewport.min,
+                            egui::vec2(half, viewport.height()),
+                        );
+                        let right = egui::Rect::from_min_size(
+                            egui::pos2(viewport.min.x + half + gap, viewport.min.y),
+                            egui::vec2(half, viewport.height()),
+                        );
+                        draw(ui, cmp.pane_rect(left, a_img), left, &a_tex);
+                        draw(
+                            ui,
+                            cmp.pane_rect(right, b_img.unwrap_or(a_img)),
+                            right,
+                            &b_tex,
+                        );
+                        for (pane, tag) in [(left, "A"), (right, "B")] {
+                            ui.painter().text(
+                                pane.min + egui::vec2(6.0, 6.0),
+                                egui::Align2::LEFT_TOP,
+                                tag,
+                                egui::FontId::proportional(18.0),
+                                theme::AMBER,
+                            );
+                        }
+                    }
                 } else {
-                    ui.painter().text(
-                        viewport.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "decoding…",
-                        egui::FontId::proportional(16.0),
-                        theme::TAN,
-                    );
+                    // Single image: wheel zoom around cursor, drag pan.
+                    if bg.dragged() {
+                        state.pan_by(bg.drag_delta(), viewport, a_img);
+                    }
+                    if scroll != 0.0
+                        && let Some(c) = cursor
+                        && viewport.contains(c)
+                    {
+                        state.zoom_at(c, (scroll * 0.005).exp(), viewport, a_img);
+                    }
+                    let rect = state.image_rect(viewport, a_img);
+                    draw(ui, rect, viewport, &a_tex);
                 }
 
                 // Top control bar.
@@ -1170,25 +1298,14 @@ impl DupesView {
                         .max_rect(top)
                         .layout(egui::Layout::left_to_right(egui::Align::Center)),
                     |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(format!("{} CLOSE", icon::CHECK))
-                                        .color(theme::BLACK),
-                                )
-                                .fill(theme::AMBER),
-                            )
-                            .clicked()
-                        {
+                        let pill = |ui: &mut egui::Ui, text: &str, fill: egui::Color32, col: egui::Color32| {
+                            ui.add(egui::Button::new(RichText::new(text).color(col)).fill(fill))
+                                .clicked()
+                        };
+                        if pill(ui, &format!("{} CLOSE", icon::CHECK), theme::AMBER, theme::BLACK) {
                             close = true;
                         }
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new(icon::CARET_LEFT).color(theme::TEXT))
-                                    .fill(theme::PANEL),
-                            )
-                            .clicked()
-                        {
+                        if pill(ui, icon::CARET_LEFT, theme::PANEL, theme::TEXT) {
                             new_idx = (idx + count - 1) % count;
                         }
                         ui.label(
@@ -1196,54 +1313,67 @@ impl DupesView {
                                 .color(theme::TAN)
                                 .strong(),
                         );
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(icon::CARET_RIGHT).color(theme::TEXT),
-                                )
-                                .fill(theme::PANEL),
-                            )
-                            .clicked()
-                        {
+                        if pill(ui, icon::CARET_RIGHT, theme::PANEL, theme::TEXT) {
                             new_idx = (idx + 1) % count;
                         }
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new("FIT").color(theme::TEXT))
-                                    .fill(theme::PANEL),
-                            )
-                            .clicked()
-                        {
-                            do_fit = true;
-                        }
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new("1:1").color(theme::TEXT))
-                                    .fill(theme::PANEL),
-                            )
-                            .clicked()
-                        {
-                            do_one = true;
-                        }
-                        let (mlabel, mfill) = if is_marked {
-                            (format!("{} MARKED", icon::CHECK), theme::RED)
+                        if state.compare.is_none() {
+                            if pill(ui, "FIT", theme::PANEL, theme::TEXT) {
+                                do_fit = true;
+                            }
+                            if pill(ui, "1:1", theme::PANEL, theme::TEXT) {
+                                do_one = true;
+                            }
+                            let (ml, mf) = if a_marked {
+                                (format!("{} MARKED", icon::CHECK), theme::RED)
+                            } else {
+                                ("MARK".to_string(), theme::PANEL)
+                            };
+                            let mc = if a_marked { theme::BLACK } else { theme::TEXT };
+                            if a_markable && pill(ui, &ml, mf, mc) {
+                                acts.push(Act::ToggleMark(a_key.clone()));
+                            }
+                            if count >= 2 && pill(ui, "COMPARE", theme::PANEL, theme::BLUE) {
+                                toggle_compare = true;
+                            }
                         } else {
-                            ("MARK".to_string(), theme::PANEL)
-                        };
-                        let mcolor = if is_marked { theme::BLACK } else { theme::TEXT };
-                        if markable
-                            && ui
-                                .add(egui::Button::new(RichText::new(mlabel).color(mcolor)).fill(mfill))
-                                .clicked()
-                        {
-                            acts.push(Act::ToggleMark(k.clone()));
+                            if pill(ui, "EXIT COMPARE", theme::PANEL, theme::BLUE) {
+                                toggle_compare = true;
+                            }
+                            let mode = if flicker { "SIDE BY SIDE" } else { "FLICKER" };
+                            if pill(ui, mode, theme::PANEL, theme::TEXT) {
+                                toggle_flicker = true;
+                            }
+                            if flicker && pill(ui, "SWAP", theme::PANEL, theme::TEXT) {
+                                swap = true;
+                            }
+                            // Mark A / Mark B.
+                            let (al, af) = if a_marked {
+                                (format!("A {}", icon::CHECK), theme::RED)
+                            } else {
+                                ("MARK A".to_string(), theme::PANEL)
+                            };
+                            let ac = if a_marked { theme::BLACK } else { theme::TEXT };
+                            if a_markable && pill(ui, &al, af, ac) {
+                                acts.push(Act::ToggleMark(a_key.clone()));
+                            }
+                            if let Some(bk) = &b_key {
+                                let (bl, bf) = if b_marked {
+                                    (format!("B {}", icon::CHECK), theme::RED)
+                                } else {
+                                    ("MARK B".to_string(), theme::PANEL)
+                                };
+                                let bc = if b_marked { theme::BLACK } else { theme::TEXT };
+                                if b_markable && pill(ui, &bl, bf, bc) {
+                                    acts.push(Act::ToggleMark(bk.clone()));
+                                }
+                            }
                         }
                     },
                 );
 
                 // Bottom metadata + hint strip.
                 let bottom = egui::Rect::from_min_max(
-                    egui::pos2(screen.min.x + 8.0, screen.max.y - 50.0),
+                    egui::pos2(screen.min.x + 8.0, screen.max.y - 56.0),
                     egui::pos2(screen.max.x - 8.0, screen.max.y - 6.0),
                 );
                 ui.scope_builder(
@@ -1251,26 +1381,79 @@ impl DupesView {
                         .max_rect(bottom)
                         .layout(egui::Layout::top_down(egui::Align::LEFT)),
                     |ui| {
-                        ui.label(RichText::new(&meta).color(theme::TEXT).size(13.0));
-                        ui.label(
-                            RichText::new(format!(
-                                "wheel: zoom · drag: pan · F fit · 1 100% · {}/{} step · Del/K mark · Esc close",
-                                icon::CARET_LEFT,
-                                icon::CARET_RIGHT,
-                            ))
-                            .color(theme::LILAC)
-                            .size(11.0),
-                        );
+                        if let Some(b_meta) = &b_meta {
+                            let row = |ui: &mut egui::Ui, tag: &str, f: &DupeFile, sc: egui::Color32, dc: egui::Color32| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(tag).color(theme::AMBER).strong());
+                                    ui.label(RichText::new(&f.rel_path).color(theme::TEXT).size(12.0));
+                                    ui.label(RichText::new(format_size(f.entry.size)).color(sc).size(12.0));
+                                    ui.label(
+                                        RichText::new(
+                                            f.entry
+                                                .img_size
+                                                .map(|(w, h)| format!("{w}×{h}"))
+                                                .unwrap_or_else(|| "—".into()),
+                                        )
+                                        .color(dc)
+                                        .size(12.0),
+                                    );
+                                    ui.label(
+                                        RichText::new(format_mtime(f.entry.modified_ms))
+                                            .color(theme::TAN)
+                                            .size(12.0),
+                                    );
+                                });
+                            };
+                            row(ui, "A", &a, a_size_col, a_dim_col);
+                            if let Some((bf, _, _, _, _, _)) = &b_bundle {
+                                row(ui, "B", bf, b_size_col, b_dim_col);
+                            }
+                            let _ = b_meta;
+                            ui.label(
+                                RichText::new("C exit · flicker: space swaps · Del/K marks B · Esc close")
+                                    .color(theme::LILAC)
+                                    .size(11.0),
+                            );
+                        } else {
+                            ui.label(RichText::new(&a_meta).color(theme::TEXT).size(13.0));
+                            ui.label(
+                                RichText::new(format!(
+                                    "wheel: zoom · drag: pan · F fit · 1 100% · {}/{} step · Del/K mark · C compare · Esc close",
+                                    icon::CARET_LEFT,
+                                    icon::CARET_RIGHT,
+                                ))
+                                .color(theme::LILAC)
+                                .size(11.0),
+                            );
+                        }
                     },
                 );
             });
 
-        // Apply deferred view-mode changes now that we know the viewport.
+        // Apply deferred view-mode / compare changes now that drawing is done.
         if do_fit {
             state.fit();
         }
         if do_one {
             state.one_to_one();
+        }
+        if toggle_compare {
+            if state.compare.is_some() {
+                state.compare = None;
+                state.reset_view();
+            } else if count >= 2 {
+                let b_idx = if idx == 0 { 1 } else { 0 };
+                state.compare = Some(CompareState::new(b_idx));
+            }
+        }
+        if toggle_flicker && let Some(cmp) = state.compare.as_mut() {
+            cmp.flicker = !cmp.flicker;
+        }
+        if swap
+            && let Some(cmp) = state.compare.as_mut()
+            && cmp.flicker
+        {
+            cmp.show_b = !cmp.show_b;
         }
         if new_idx != idx {
             state.index = new_idx;
@@ -2238,6 +2421,80 @@ mod ui_tests {
         );
     }
 
+    /// `C` enters A/B compare, which exposes MARK B and a FLICKER toggle, marks
+    /// the B candidate, and exits back to single view.
+    #[test]
+    fn lightbox_compare_enters_marks_b_and_exits() {
+        let group: DupeGroup = (0..3).map(image_file).collect();
+        let b_key = key(&group[1]); // A is index 0 → B defaults to index 1
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store);
+                },
+                view,
+            );
+        harness.run();
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.run();
+
+        // Enter compare (applied after the frame; drawn on the next).
+        harness.key_press(egui::Key::C);
+        harness.run();
+        harness.run();
+        assert!(
+            harness.state().lightbox.as_ref().unwrap().compare.is_some(),
+            "C enters compare mode"
+        );
+        assert!(
+            harness.query_by_label("EXIT COMPARE").is_some(),
+            "compare exposes an EXIT COMPARE control"
+        );
+        assert!(
+            harness.query_by_label("FLICKER").is_some(),
+            "compare exposes the FLICKER toggle"
+        );
+
+        // Clear preselected marks so B shows the unmarked MARK B control.
+        harness.state_mut().marked.clear();
+        harness.run();
+        assert!(
+            harness.query_by_label("MARK B").is_some(),
+            "compare exposes a MARK B control for the candidate"
+        );
+
+        // Del marks the B candidate.
+        harness.key_press(egui::Key::Delete);
+        harness.run();
+        assert!(
+            harness.state().marked.contains(&b_key),
+            "Del marks the B candidate in compare mode"
+        );
+
+        // Exit compare.
+        harness.key_press(egui::Key::C);
+        harness.run();
+        assert!(
+            harness.state().lightbox.as_ref().unwrap().compare.is_none(),
+            "C exits compare mode"
+        );
+    }
+
     /// Re-locking removes the override and any pending mark, and turning a
     /// repo read-only clears its per-file unlocks.
     #[test]
@@ -2567,7 +2824,9 @@ mod ui_tests {
         let mut view = DupesView::new();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
-        view.lightbox = Some(LightboxState::new(0, 0));
+        let mut lb = LightboxState::new(0, 0);
+        lb.compare = Some(CompareState::new(1)); // render A/B side-by-side
+        view.lightbox = Some(lb);
 
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());

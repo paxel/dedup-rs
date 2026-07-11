@@ -23,6 +23,46 @@ const FULL_CACHE_CAP: usize = 3;
 const MIN_SCALE: f32 = 0.02;
 const MAX_SCALE: f32 = 32.0;
 
+/// A/B compare overlaid on the lightbox: `other` is the B member's index in the
+/// same group (A is the lightbox's current `index`). Zoom/pan are shared by both
+/// panes and normalized to each image's fit, so differing resolutions line up.
+pub struct CompareState {
+    pub other: usize,
+    pub flicker: bool,
+    /// In flicker mode, whether B (rather than A) is currently shown.
+    pub show_b: bool,
+    zoom: f32,
+    pan: Vec2,
+}
+
+impl CompareState {
+    pub fn new(other: usize) -> Self {
+        Self {
+            other,
+            flicker: false,
+            show_b: false,
+            zoom: 1.0,
+            pan: Vec2::ZERO,
+        }
+    }
+
+    pub fn zoom_by(&mut self, factor: f32) {
+        self.zoom = (self.zoom * factor).clamp(1.0, MAX_SCALE);
+    }
+
+    pub fn pan_by(&mut self, delta: Vec2) {
+        self.pan += delta;
+    }
+
+    /// Screen rectangle for `img` fitted into `pane`, then scaled by the shared
+    /// zoom and shifted by the shared pan (so both panes track together).
+    pub fn pane_rect(&self, pane: Rect, img: Vec2) -> Rect {
+        let fit = (pane.width() / img.x).min(pane.height() / img.y);
+        let size = img * (fit * self.zoom);
+        Rect::from_center_size(pane.center() + self.pan, size)
+    }
+}
+
 /// Live state of an open lightbox. `group`/`index` address a member of the
 /// current page's groups; `scale`/`pan` are the view transform. In `fit` mode
 /// the scale is recomputed from the viewport each frame (so window resizes stay
@@ -33,6 +73,8 @@ pub struct LightboxState {
     scale: f32,
     pan: Vec2,
     fit: bool,
+    /// Active A/B compare, if the user pressed `C`.
+    pub compare: Option<CompareState>,
 }
 
 impl LightboxState {
@@ -43,6 +85,7 @@ impl LightboxState {
             scale: 1.0,
             pan: Vec2::ZERO,
             fit: true,
+            compare: None,
         }
     }
 
@@ -148,18 +191,23 @@ impl FullResCache {
             let ctx = Arc::clone(&ctx);
             std::thread::spawn(move || {
                 while let Ok(req) = req_rx.recv() {
+                    // Only a successful decode has something new to show, so
+                    // only that wakes the UI; waking on failure would spin
+                    // repaints for missing files (and never settle).
                     match dedup_core::thumbnail::load_full_rgba(&req.source, MAX_TEXTURE_EDGE) {
                         Ok((w, h, rgba)) => {
                             let img =
                                 ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
                             let _ = dec_tx.send(Decoded::Ready(req.hex, img));
+                            if let Some(ctx) =
+                                ctx.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+                            {
+                                ctx.request_repaint();
+                            }
                         }
                         Err(_) => {
                             let _ = dec_tx.send(Decoded::Failed(req.hex));
                         }
-                    }
-                    if let Some(ctx) = ctx.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                        ctx.request_repaint();
                     }
                 }
             });
