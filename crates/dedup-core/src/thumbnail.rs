@@ -95,6 +95,58 @@ pub fn get_rgba(source: &Path, hash_hex: &str) -> Result<(u32, u32, Vec<u8>), Th
     load_rgba(&out)
 }
 
+/// Cache path for still `idx` of a video (`<hex>-v<idx>.jpg`).
+pub fn video_thumb_path(hash_hex: &str, idx: usize) -> PathBuf {
+    cache_dir().join(format!("{hash_hex}-v{idx}.jpg"))
+}
+
+/// Ensure still `idx` (of `count` evenly spaced stills) for the video `source`
+/// exists as a cached JPEG, extracting it with ffmpeg if missing. The still is
+/// sampled at the midpoint of its slice of the timeline.
+pub fn ensure_video_frame(
+    source: &Path,
+    hash_hex: &str,
+    idx: usize,
+    count: usize,
+) -> Result<PathBuf, ThumbError> {
+    let out = video_thumb_path(hash_hex, idx);
+    if out.exists() {
+        return Ok(out);
+    }
+    let count = count.max(1);
+    let duration = crate::fingerprint::media_duration_secs(source).unwrap_or(0.0);
+    let at = if duration > 0.0 {
+        duration * (idx as f64 + 0.5) / count as f64
+    } else {
+        0.0
+    };
+    let frame = crate::fingerprint::video_frame(source, at)
+        .ok_or_else(|| ThumbError::Image("video frame extraction failed".into()))?;
+    let thumb = frame.thumbnail(MAX_EDGE, MAX_EDGE);
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    thumb
+        .to_rgb8()
+        .save(&out)
+        .map_err(|e| ThumbError::Image(e.to_string()))?;
+    Ok(out)
+}
+
+/// Ensure and decode video still `idx` (of `count`) as `(w, h, rgba8)` — the
+/// one call a GUI worker needs for the video filmstrip / card frame. Requires
+/// ffmpeg; errors (no ffmpeg, unreadable video) propagate so the caller shows a
+/// placeholder.
+pub fn video_frame_rgba(
+    source: &Path,
+    hash_hex: &str,
+    idx: usize,
+    count: usize,
+) -> Result<(u32, u32, Vec<u8>), ThumbError> {
+    let out = ensure_video_frame(source, hash_hex, idx, count)?;
+    load_rgba(&out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,5 +203,38 @@ mod tests {
         let (w, h, _) = load_full_rgba(&big, 512).expect("load big");
         assert_eq!(w, 512);
         assert_eq!(h, 256);
+    }
+
+    #[test]
+    fn video_frame_extracts_and_caches_a_still() {
+        if !crate::fingerprint::ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("dir");
+        let video = dir.path().join("clip.mp4");
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc=duration=2:size=128x96:rate=10")
+            .args(["-pix_fmt", "yuv420p"])
+            .arg(&video)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("skipping: ffmpeg could not generate the test clip");
+            return;
+        }
+
+        // Redirect the cache into the tempdir so the test is hermetic.
+        // SAFETY: single-threaded test; no other thread reads HOME concurrently.
+        unsafe { std::env::set_var("HOME", dir.path()) };
+
+        let hex = "deadbeef";
+        let (w, h, rgba) = video_frame_rgba(&video, hex, 2, 10).expect("extract frame");
+        assert!(w > 0 && h > 0);
+        assert_eq!(rgba.len() as u32, w * h * 4);
+        // The still is cached where the GUI worker expects it.
+        assert!(video_thumb_path(hex, 2).exists(), "still is cached on disk");
     }
 }

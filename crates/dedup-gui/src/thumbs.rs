@@ -11,9 +11,21 @@ use std::path::{Path, PathBuf};
 /// Max number of live GPU textures kept at once (LRU-evicted beyond this).
 const TEXTURE_CAPACITY: usize = 200;
 
+/// What a worker should generate for a request.
+enum Job {
+    /// A ≤512px image thumbnail keyed by content hash.
+    Image,
+    /// Video still `idx` of `count` evenly spaced frames.
+    VideoFrame { idx: usize, count: usize },
+}
+
 struct Request {
+    /// Cache/texture key: the content hash for images, `<hash>-v<idx>` for
+    /// video stills.
+    key: String,
     hex: String,
     source: PathBuf,
+    job: Job,
 }
 
 enum Decoded {
@@ -43,14 +55,23 @@ impl ThumbCache {
             let dec_tx = dec_tx.clone();
             std::thread::spawn(move || {
                 while let Ok(req) = req_rx.recv() {
-                    match dedup_core::thumbnail::get_rgba(&req.source, &req.hex) {
+                    let result = match req.job {
+                        Job::Image => dedup_core::thumbnail::get_rgba(&req.source, &req.hex),
+                        Job::VideoFrame { idx, count } => dedup_core::thumbnail::video_frame_rgba(
+                            &req.source,
+                            &req.hex,
+                            idx,
+                            count,
+                        ),
+                    };
+                    match result {
                         Ok((w, h, rgba)) => {
                             let img =
                                 ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
-                            let _ = dec_tx.send(Decoded::Ready(req.hex, img));
+                            let _ = dec_tx.send(Decoded::Ready(req.key, img));
                         }
                         Err(_) => {
-                            let _ = dec_tx.send(Decoded::Failed(req.hex));
+                            let _ = dec_tx.send(Decoded::Failed(req.key));
                         }
                     }
                 }
@@ -97,24 +118,50 @@ impl ThumbCache {
         changed
     }
 
-    /// Fetch the texture for `hex`, requesting generation from `source` if it is
-    /// not cached yet. Returns `None` while the thumbnail is pending or failed.
+    /// Fetch the image thumbnail texture for `hex`, requesting generation from
+    /// `source` if not cached. `None` while pending or failed.
     pub fn get(&mut self, hex: &str, source: &Path) -> Option<TextureHandle> {
-        if self.textures.contains_key(hex) {
-            self.touch(hex);
-            return self.textures.get(hex).cloned();
+        let key = hex.to_string();
+        self.get_keyed(key, hex, source, Job::Image)
+    }
+
+    /// Fetch video still `idx` (of `count`) for `hex`, requesting extraction if
+    /// not cached. `None` while pending or failed (e.g. no ffmpeg).
+    pub fn get_video(
+        &mut self,
+        hex: &str,
+        source: &Path,
+        idx: usize,
+        count: usize,
+    ) -> Option<TextureHandle> {
+        let key = format!("{hex}-v{idx}");
+        self.get_keyed(key, hex, source, Job::VideoFrame { idx, count })
+    }
+
+    fn get_keyed(
+        &mut self,
+        key: String,
+        hex: &str,
+        source: &Path,
+        job: Job,
+    ) -> Option<TextureHandle> {
+        if self.textures.contains_key(&key) {
+            self.touch(&key);
+            return self.textures.get(&key).cloned();
         }
-        if self.failed.contains(hex) {
+        if self.failed.contains(&key) {
             return None;
         }
-        if self.pending.insert(hex.to_string()) {
+        if self.pending.insert(key.clone()) {
             #[cfg(test)]
             {
                 self.sent += 1;
             }
             let _ = self.requests.send(Request {
+                key,
                 hex: hex.to_string(),
                 source: source.to_path_buf(),
+                job,
             });
         }
         None

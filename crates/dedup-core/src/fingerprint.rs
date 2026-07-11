@@ -295,6 +295,17 @@ fn probe_duration_secs(path: &Path) -> Option<f64> {
     text.trim().parse::<f64>().ok()
 }
 
+/// Extract a single video frame at `at_secs` as an image (needs `ffmpeg`).
+/// Shared with the GUI's video preview (`thumbnail::video_frame_rgba`).
+pub fn video_frame(path: &Path, at_secs: f64) -> Option<image::DynamicImage> {
+    extract_frame(path, at_secs)
+}
+
+/// Probe a media file's duration in seconds (needs `ffprobe`).
+pub fn media_duration_secs(path: &Path) -> Option<f64> {
+    probe_duration_secs(path)
+}
+
 fn extract_frame(path: &Path, at_secs: f64) -> Option<image::DynamicImage> {
     let output = Command::new("ffmpeg")
         .args(["-v", "error", "-ss"])

@@ -1073,12 +1073,10 @@ impl DupesView {
         file: &DupeFile,
         acts: &mut Vec<Act>,
     ) {
-        let is_image = file
-            .entry
-            .mime
-            .as_deref()
-            .is_some_and(|m| m.starts_with("image/"));
-        if is_image {
+        let mime = file.entry.mime.as_deref();
+        let is_image = mime.is_some_and(|m| m.starts_with("image/"));
+        let is_video = mime.is_some_and(|m| m.starts_with("video/"));
+        if is_image || is_video {
             // Only fetch a texture for on-screen cards. The results list is not
             // virtualized, so a page can lay out far more thumbnails than the GPU
             // texture cache holds; requesting every one each frame thrashes the
@@ -1089,7 +1087,14 @@ impl DupesView {
             if ui.is_rect_visible(thumb_rect) {
                 let hex = hash_hex(&file.entry.hash);
                 let source = file.absolute_path();
-                if let Some(tex) = self.thumbs.get(&hex, &source) {
+                // Videos show their first still (ffmpeg-extracted, cached);
+                // absent ffmpeg the request fails and the placeholder shows.
+                let tex = if is_video {
+                    self.thumbs.get_video(&hex, &source, 0, 1)
+                } else {
+                    self.thumbs.get(&hex, &source)
+                };
+                if let Some(tex) = tex {
                     let resp = ui
                         .add(
                             egui::Image::new(egui::load::SizedTexture::from_handle(&tex))
@@ -1273,6 +1278,47 @@ impl DupesView {
         let flicker = state.compare.as_ref().is_some_and(|c| c.flicker);
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
 
+        // Video preview: a scrubbable filmstrip instead of a zoomable image.
+        // Frames are extracted lazily by the thumb pool and fill in as they
+        // land; the frame under the cursor's x fraction is shown enlarged.
+        const VIDEO_STRIP: usize = 10;
+        let a_is_video = a
+            .entry
+            .mime
+            .as_deref()
+            .is_some_and(|m| m.starts_with("video/"));
+        let vp_screen = ctx.content_rect();
+        let vp = egui::Rect::from_min_max(
+            egui::pos2(vp_screen.min.x + 8.0, vp_screen.min.y + 44.0),
+            egui::pos2(vp_screen.max.x - 8.0, vp_screen.max.y - 62.0),
+        );
+        let video = if a_is_video && state.compare.is_none() {
+            let strip_h = 92.0;
+            let big =
+                egui::Rect::from_min_max(vp.min, egui::pos2(vp.max.x, vp.max.y - strip_h - 6.0));
+            let strip = egui::Rect::from_min_max(egui::pos2(vp.min.x, vp.max.y - strip_h), vp.max);
+            let scrub = ctx
+                .pointer_hover_pos()
+                .filter(|c| vp.contains(*c))
+                .map(|c| {
+                    ((((c.x - vp.left()) / vp.width()) * VIDEO_STRIP as f32).floor() as i64)
+                        .clamp(0, VIDEO_STRIP as i64 - 1) as usize
+                })
+                .unwrap_or(VIDEO_STRIP / 2);
+            let hexa = hash_hex(&a.entry.hash);
+            let srca = a.absolute_path();
+            let big_tex = self.thumbs.get_video(&hexa, &srca, scrub, VIDEO_STRIP);
+            let frames: Vec<Option<egui::TextureHandle>> = (0..VIDEO_STRIP)
+                .map(|i| self.thumbs.get_video(&hexa, &srca, i, VIDEO_STRIP))
+                .collect();
+            Some((big, strip, scrub, big_tex, frames))
+        } else {
+            None
+        };
+        let video_pending = video
+            .as_ref()
+            .is_some_and(|(_, _, _, b, f)| b.is_none() || f.iter().any(Option::is_none));
+
         egui::Area::new(Id::new("lightbox"))
             .order(egui::Order::Foreground)
             .fixed_pos(egui::Pos2::ZERO)
@@ -1304,7 +1350,57 @@ impl DupesView {
                     }
                 };
 
-                if let Some(cmp) = state.compare.as_mut() {
+                let fit = |target: egui::Rect, size: egui::Vec2| {
+                    let s = (target.width() / size.x).min(target.height() / size.y);
+                    egui::Rect::from_center_size(target.center(), size * s)
+                };
+
+                if let Some((big, strip, scrub, big_tex, frames)) = &video {
+                    // Enlarged scrubbed frame.
+                    if let Some(t) = big_tex {
+                        let r = fit(*big, t.size_vec2());
+                        ui.painter_at(*big).image(t.id(), r, uv, egui::Color32::WHITE);
+                    } else {
+                        ui.painter().text(
+                            big.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "decoding…",
+                            egui::FontId::proportional(16.0),
+                            theme::TAN,
+                        );
+                    }
+                    ui.painter().text(
+                        big.min + egui::vec2(6.0, 6.0),
+                        egui::Align2::LEFT_TOP,
+                        "VIDEO — hover to scrub",
+                        egui::FontId::proportional(14.0),
+                        theme::AMBER,
+                    );
+                    // Filmstrip of stills; the current one is outlined.
+                    let n = frames.len().max(1);
+                    let cell_w = strip.width() / n as f32;
+                    for (i, f) in frames.iter().enumerate() {
+                        let cell = egui::Rect::from_min_size(
+                            egui::pos2(strip.left() + i as f32 * cell_w + 1.0, strip.top()),
+                            egui::vec2(cell_w - 2.0, strip.height()),
+                        );
+                        if let Some(t) = f {
+                            let r = fit(cell, t.size_vec2());
+                            ui.painter_at(cell).image(t.id(), r, uv, egui::Color32::WHITE);
+                        }
+                        let (col, w) = if i == *scrub {
+                            (theme::AMBER, 2.0)
+                        } else {
+                            (theme::HAIRLINE, 1.0)
+                        };
+                        ui.painter().rect_stroke(
+                            cell,
+                            0.0,
+                            egui::Stroke::new(w, col),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                } else if let Some(cmp) = state.compare.as_mut() {
                     // Shared zoom/pan across both panes.
                     if bg.dragged() {
                         cmp.pan_by(bg.drag_delta());
@@ -1419,7 +1515,7 @@ impl DupesView {
                             if a_markable && pill(ui, &ml, mf, mc) {
                                 acts.push(Act::ToggleMark(a_key.clone()));
                             }
-                            if count >= 2 && pill(ui, "COMPARE", theme::PANEL, theme::BLUE) {
+                            if count >= 2 && !a_is_video && pill(ui, "COMPARE", theme::PANEL, theme::BLUE) {
                                 toggle_compare = true;
                             }
                         } else {
@@ -1503,15 +1599,20 @@ impl DupesView {
                             );
                         } else {
                             ui.label(RichText::new(&a_meta).color(theme::TEXT).size(13.0));
-                            ui.label(
-                                RichText::new(format!(
+                            let hint = if a_is_video {
+                                format!(
+                                    "hover: scrub · {}/{} step · Del/K mark · Esc close",
+                                    icon::CARET_LEFT,
+                                    icon::CARET_RIGHT,
+                                )
+                            } else {
+                                format!(
                                     "wheel: zoom · drag: pan · F fit · 1 100% · {}/{} step · Del/K mark · C compare · Esc close",
                                     icon::CARET_LEFT,
                                     icon::CARET_RIGHT,
-                                ))
-                                .color(theme::LILAC)
-                                .size(11.0),
-                            );
+                                )
+                            };
+                            ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
                         }
                     },
                 );
@@ -1549,6 +1650,12 @@ impl DupesView {
 
         if !close {
             self.lightbox = Some(state);
+        }
+
+        // Keep polling while video stills are still being extracted so the
+        // filmstrip fills in without needing mouse movement.
+        if video_pending {
+            ctx.request_repaint_after(std::time::Duration::from_millis(150));
         }
     }
 
@@ -3026,6 +3133,85 @@ mod ui_tests {
         let img = harness.render().expect("wgpu render failed");
         let out =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/lightbox.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Renders the video lightbox (filmstrip + enlarged scrubbed frame) over a
+    /// real ffmpeg-generated clip to `target/lightbox_video.png`. `--ignored`.
+    #[test]
+    #[ignore = "renders a PNG for manual inspection (needs ffmpeg + wgpu)"]
+    fn render_video_lightbox() {
+        if !dedup_core::fingerprint::ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("clip.mp4");
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc=duration=4:size=320x240:rate=15")
+            .args(["-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("skipping: ffmpeg could not generate the clip");
+            return;
+        }
+
+        let mut hash = [0u8; 32];
+        hash[0] = 0x5a;
+        let file = DupeFile {
+            repo: "r".into(),
+            repo_root: dir.path().to_string_lossy().into_owned(),
+            rel_path: "clip.mp4".into(),
+            entry: dedup_core::store::FileEntry {
+                size: 1000,
+                hash,
+                modified_ms: 0,
+                missing: false,
+                mime: Some("video/mp4".into()),
+                img_fingerprint: None,
+                video_hash: None,
+                pdf_hash: None,
+                audio: None,
+                img_size: None,
+            },
+        };
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![vec![file]]));
+        view.lightbox = Some(LightboxState::new(0, 0));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 720.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = (&tmp, &dir);
+                    view.show(ui, &store);
+                },
+                view,
+            );
+        // Give the ffmpeg extraction workers time to produce all stills.
+        for _ in 0..30 {
+            harness.step();
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        let img = harness.render().expect("wgpu render failed");
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/lightbox_video.png");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
