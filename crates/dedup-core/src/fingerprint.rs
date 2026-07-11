@@ -25,7 +25,7 @@ pub struct Fingerprints {
     pub mime: Option<String>,
     pub img_fingerprint: Option<ImgHash>,
     pub img_size: Option<(u32, u32)>,
-    pub video_hash: Option<[u64; 3]>,
+    pub video_hash: Option<[ImgHash; 3]>,
     pub pdf_hash: Option<[u8; 32]>,
     pub audio: Option<AudioFp>,
     pub exif: Option<ExifInfo>,
@@ -329,18 +329,20 @@ fn flip_diagonal(img: &[u8], n: usize) -> Vec<u8> {
 
 // --- Video ------------------------------------------------------------------
 
-/// Temporal hash: dHash of frames at 10/50/90 % of the video's duration.
-/// Any frame that cannot be extracted contributes a zero hash. Returns `None`
-/// only if the duration cannot be probed at all.
-pub fn video_temporal_hash(path: &Path) -> Option<[u64; 3]> {
+/// Temporal hash: the 512-bit moment-canonicalized [`image_hash`] of frames at
+/// 10/50/90 % of the video's duration (three frames → 1536 bits). Any frame
+/// that cannot be extracted contributes a zero hash. Returns `None` only if the
+/// duration cannot be probed at all. The stronger per-frame hash avoids the
+/// degenerate collisions the old 64-bit dHash had on smooth/dark frames.
+pub fn video_temporal_hash(path: &Path) -> Option<[ImgHash; 3]> {
     let duration = probe_duration_secs(path)?;
     if duration <= 0.0 {
         return None;
     }
-    let mut hashes = [0u64; 3];
+    let mut hashes = [[0u64; 8]; 3];
     for (i, pct) in [0.1, 0.5, 0.9].into_iter().enumerate() {
         if let Some(frame) = extract_frame(path, duration * pct) {
-            hashes[i] = dhash_from_image(&frame);
+            hashes[i] = image_hash(&frame);
         }
     }
     Some(hashes)

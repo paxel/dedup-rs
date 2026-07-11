@@ -15,9 +15,10 @@ const SCHEMA_VERSION: u8 = 1;
 /// re-reading image files, so images below v4 are flagged stale; v5 added
 /// office-document text hashes (reusing the `pdf_hash` slot), so document files
 /// below v5 are flagged stale; v6 added text/CSV hashes, so text files below v6
-/// are flagged stale; v7 added `.eml` email hashes. The v4→v7 layout is
-/// unchanged. See [`decode_entry`].
-const ENTRY_VERSION: u8 = 7;
+/// are flagged stale; v7 added `.eml` email hashes (the v4→v7 layout is
+/// unchanged); v8 grew the video temporal hash from 64 to 512 bits per frame,
+/// so video files below v8 are flagged stale. See [`decode_entry`].
+const ENTRY_VERSION: u8 = 8;
 
 // Registry table definition
 const REPOS: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("repos");
@@ -134,7 +135,7 @@ pub struct FileEntry {
     pub missing: bool,
     pub mime: Option<String>,
     pub img_fingerprint: Option<ImgHash>, // gradient hash
-    pub video_hash: Option<[u64; 3]>,     // temporal hash
+    pub video_hash: Option<[ImgHash; 3]>, // 512-bit temporal hash (3 frames)
     pub pdf_hash: Option<[u8; 32]>,       // blake3 of normalized text
     pub audio: Option<AudioFp>,           // duration_ms + chunk hashes
     pub img_size: Option<(u32, u32)>,
@@ -204,6 +205,25 @@ struct FileEntryV3 {
     audio: Option<AudioFp>,
     img_size: Option<(u32, u32)>,
     origin: Option<String>,
+}
+
+/// Version-4..7 [`FileEntry`] layout: has `origin` and `exif` but the old
+/// 64-bit-per-frame video hash. Kept so pre-v8 indexes decode; the incompatible
+/// video hash comes back `None` and video files are flagged stale for re-hash.
+#[derive(Serialize, Deserialize)]
+struct FileEntryV7 {
+    size: u64,
+    hash: [u8; 32],
+    modified_ms: i64,
+    missing: bool,
+    mime: Option<String>,
+    img_fingerprint: Option<ImgHash>,
+    video_hash: Option<[u64; 3]>,
+    pdf_hash: Option<[u8; 32]>,
+    audio: Option<AudioFp>,
+    img_size: Option<(u32, u32)>,
+    origin: Option<String>,
+    exif: Option<ExifInfo>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -306,10 +326,26 @@ fn deserialize_value<'a, T: Deserialize<'a>>(
 fn decode_entry(bytes: &[u8]) -> Result<(FileEntry, u8), StoreError> {
     match bytes.first() {
         Some(&ENTRY_VERSION) => Ok((deserialize_value(ENTRY_VERSION, bytes)?, ENTRY_VERSION)),
-        // v4..v7 share the same layout; only the stale policy differs.
-        Some(4) => Ok((deserialize_value(4, bytes)?, 4)),
-        Some(5) => Ok((deserialize_value(5, bytes)?, 5)),
-        Some(6) => Ok((deserialize_value(6, bytes)?, 6)),
+        // v4..v7 share one layout with the old 64-bit video hash; decode via
+        // FileEntryV7 and drop the incompatible video hash (video → stale).
+        Some(&v @ 4..=7) => {
+            let old: FileEntryV7 = deserialize_value(v, bytes)?;
+            let entry = FileEntry {
+                size: old.size,
+                hash: old.hash,
+                modified_ms: old.modified_ms,
+                missing: old.missing,
+                mime: old.mime,
+                img_fingerprint: old.img_fingerprint,
+                video_hash: None,
+                pdf_hash: old.pdf_hash,
+                audio: old.audio,
+                img_size: old.img_size,
+                origin: old.origin,
+                exif: old.exif,
+            };
+            Ok((entry, v))
+        }
         Some(3) => {
             let v3: FileEntryV3 = deserialize_value(3, bytes)?;
             let entry = FileEntry {
@@ -319,7 +355,7 @@ fn decode_entry(bytes: &[u8]) -> Result<(FileEntry, u8), StoreError> {
                 missing: v3.missing,
                 mime: v3.mime,
                 img_fingerprint: v3.img_fingerprint,
-                video_hash: v3.video_hash,
+                video_hash: None, // old 64-bit hash dropped; video re-scans
                 pdf_hash: v3.pdf_hash,
                 audio: v3.audio,
                 img_size: v3.img_size,
@@ -337,7 +373,7 @@ fn decode_entry(bytes: &[u8]) -> Result<(FileEntry, u8), StoreError> {
                 missing: v2.missing,
                 mime: v2.mime,
                 img_fingerprint: v2.img_fingerprint,
-                video_hash: v2.video_hash,
+                video_hash: None,
                 pdf_hash: v2.pdf_hash,
                 audio: v2.audio,
                 img_size: v2.img_size,
@@ -355,7 +391,7 @@ fn decode_entry(bytes: &[u8]) -> Result<(FileEntry, u8), StoreError> {
                 missing: v1.missing,
                 mime: v1.mime,
                 img_fingerprint: None,
-                video_hash: v1.video_hash,
+                video_hash: None,
                 pdf_hash: v1.pdf_hash,
                 audio: v1.audio,
                 img_size: v1.img_size,
@@ -1229,6 +1265,7 @@ pub fn read_scan_index(
             Some(m) if crate::fingerprint::is_office_doc(m) => version < 5,
             Some(m) if m.starts_with("text/") => version < 6,
             Some("message/rfc822") => version < 7,
+            Some(m) if m.starts_with("video/") => version < 8,
             _ => false,
         };
         index.insert(

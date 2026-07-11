@@ -51,7 +51,7 @@ fn update_computes_video_temporal_hash() {
     let hash = entry.video_hash.expect("temporal hash computed");
     // testsrc's moving pattern gives distinct, non-zero frame hashes.
     assert!(
-        hash.iter().any(|&h| h != 0),
+        hash.iter().flatten().any(|&w| w != 0),
         "at least one sampled frame produced a non-zero hash"
     );
 }

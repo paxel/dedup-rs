@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 const IMG_BITS: f64 = 512.0;
 /// 16-bit LSH bands per image hash: 512 / 16.
 const IMG_BANDS: u8 = 32;
-const VIDEO_BITS: f64 = 192.0;
+const VIDEO_BITS: f64 = 1536.0;
 /// Audio duration tolerance when matching, in milliseconds (Java used 2 s).
 const AUDIO_DURATION_TOLERANCE_MS: u32 = 2000;
 
@@ -30,9 +30,13 @@ pub fn similarity_img(a: &ImgHash, b: &ImgHash) -> f64 {
     (1.0 - f64::from(distance) / IMG_BITS) * 100.0
 }
 
-/// 192-bit temporal-hash similarity as a percentage in `0.0..=100.0`.
-pub fn similarity_192(a: &[u64; 3], b: &[u64; 3]) -> f64 {
-    let distance: u32 = (0..3).map(|k| (a[k] ^ b[k]).count_ones()).sum();
+/// 1536-bit temporal-hash similarity (three 512-bit frame hashes) as a
+/// percentage in `0.0..=100.0`.
+pub fn similarity_video(a: &[ImgHash; 3], b: &[ImgHash; 3]) -> f64 {
+    let distance: u32 = (0..3)
+        .flat_map(|f| (0..8).map(move |w| (f, w)))
+        .map(|(f, w)| (a[f][w] ^ b[f][w]).count_ones())
+        .sum();
     (1.0 - f64::from(distance) / VIDEO_BITS) * 100.0
 }
 
@@ -141,7 +145,7 @@ struct Staged {
     names: Vec<String>,
     roots: Vec<String>,
     images: Vec<Candidate<ImgHash>>,
-    videos: Vec<Candidate<[u64; 3]>>,
+    videos: Vec<Candidate<[ImgHash; 3]>>,
     pdfs: Vec<Candidate<[u8; 32]>>,
     audios: Vec<Candidate<(u32, Vec<[u8; 32]>)>>,
 }
@@ -254,7 +258,7 @@ pub fn find_similar(
     groups.extend(materialize(&dbs, &staged, &staged.images, img_groups)?);
 
     let video_groups = group_by(&staged.videos, |a, b| {
-        similarity_192(&a.key, &b.key) >= threshold
+        similarity_video(&a.key, &b.key) >= threshold
     });
     groups.extend(materialize(&dbs, &staged, &staged.videos, video_groups)?);
 
@@ -313,9 +317,14 @@ mod tests {
     }
 
     #[test]
-    fn video_192_groups_by_temporal_distance() {
-        let a = [0u64, 0, 0];
-        let b = [1u64, 0, 0]; // distance 1 of 192 → ~99.5%
-        assert!(similarity_192(&a, &b) >= 99.0);
+    fn video_groups_by_temporal_distance() {
+        let a = [[0u64; 8]; 3];
+        let mut b = [[0u64; 8]; 3];
+        b[0][0] = 1; // distance 1 of 1536 → ~99.9%
+        assert!(similarity_video(&a, &b) >= 99.0);
+
+        let mut far = [[0u64; 8]; 3];
+        far[0] = [u64::MAX; 8]; // one frame entirely different → ~66%
+        assert!(similarity_video(&a, &far) < 70.0);
     }
 }
