@@ -8,6 +8,7 @@ mod files_view;
 mod icon;
 mod lightbox;
 mod player;
+mod settings;
 mod status;
 mod theme;
 mod thumbs;

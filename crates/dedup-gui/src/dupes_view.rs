@@ -242,6 +242,16 @@ impl DupesView {
         }
     }
 
+    /// The similarity slider position (persisted across launches).
+    pub fn threshold(&self) -> f64 {
+        self.threshold
+    }
+
+    /// Restore the similarity slider position from persisted settings.
+    pub fn set_threshold(&mut self, threshold: f64) {
+        self.threshold = threshold.clamp(50.0, 100.0);
+    }
+
     /// Stop any audio preview (called when leaving the tab).
     pub fn stop_audio(&self) {
         if self.player.is_active() {

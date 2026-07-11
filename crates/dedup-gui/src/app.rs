@@ -136,6 +136,8 @@ pub struct DedupApp {
     status_rx: Receiver<(String, Location)>,
     dupes: DupesView,
     files: FilesView,
+    /// Last settings written to disk, to avoid rewriting an unchanged file.
+    saved_settings: crate::settings::Settings,
 }
 
 impl DedupApp {
@@ -168,7 +170,13 @@ impl DedupApp {
             status_rx,
             dupes: DupesView::new(),
             files: FilesView::new(),
+            saved_settings: crate::settings::Settings::default(),
         };
+        // Restore persisted settings (thread count, similarity threshold).
+        let settings = crate::settings::Settings::load(app.store.config_dir());
+        app.threads = settings.threads;
+        app.dupes.set_threshold(settings.similarity_threshold);
+        app.saved_settings = settings;
         app.reload_all();
         app
     }
@@ -548,6 +556,18 @@ impl eframe::App for DedupApp {
         // This also ticks the queued/scanning timers.
         if self.worker.active_count() > 0 {
             ctx.request_repaint_after(Duration::from_millis(100));
+        }
+
+        // Persist settings the moment they change (eframe's own storage isn't
+        // enabled, so we own the file). Comparing first keeps this to one write
+        // per actual change, not one per frame.
+        let current = crate::settings::Settings {
+            threads: self.threads,
+            similarity_threshold: self.dupes.threshold(),
+        };
+        if current != self.saved_settings {
+            current.save(self.store.config_dir());
+            self.saved_settings = current;
         }
     }
 }
