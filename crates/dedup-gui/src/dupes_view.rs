@@ -216,7 +216,7 @@ impl DupesView {
             repos: Vec::new(),
             repos_loaded: false,
             mode: Mode::Exact,
-            threshold: 90.0,
+            threshold: 99.0,
             results: None,
             result_names: Vec::new(),
             page_groups: Vec::new(),
@@ -583,6 +583,11 @@ impl DupesView {
                             .suffix("%")
                             .max_decimals(1),
                     );
+                    // 100% is bit-identical (512-bit hash); ≥99.5% is visually
+                    // identical for practical purposes.
+                    if self.threshold >= 99.5 {
+                        ui.label(RichText::new("identical").color(theme::BLUE).size(11.0));
+                    }
                 });
             }
 
