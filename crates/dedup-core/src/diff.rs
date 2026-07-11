@@ -35,6 +35,9 @@ pub enum DiffError {
 
     #[error("invalid target subdirectory: {subdir}")]
     InvalidSubdir { subdir: String },
+
+    #[error("at least one reference repo is required")]
+    NoReference,
 }
 
 /// Where a copy/move should place files: a target directory and an optional
@@ -179,6 +182,32 @@ fn open_repo(store: &Store, name: &str) -> Result<OpenRepo, StoreError> {
     Ok(OpenRepo { meta, db })
 }
 
+/// Open the primary reference (`references[0]`) and merge the content indexes of
+/// *all* references into one presence map. A content key is `present` if any
+/// reference has a live copy and `missing` if any reference marks it missing —
+/// so "unique" means unique against every reference, not just one.
+///
+/// The primary is special: it is the repo whose index `diff_copy` writes copies
+/// back into, and whose paths `diff_print` reports for `Equal`. Callers must
+/// pass at least one reference.
+fn open_primary_and_index(
+    store: &Store,
+    references: &[&str],
+) -> Result<(OpenRepo, HashMap<ContentKey, ContentState>), DiffError> {
+    let (first, rest) = references.split_first().ok_or(DiffError::NoReference)?;
+    let primary = open_repo(store, first)?;
+    let mut merged = store::read_content_index(&primary.db)?;
+    for name in rest {
+        let extra = open_repo(store, name)?;
+        for (key, state) in store::read_content_index(&extra.db)? {
+            let slot = merged.entry(key).or_default();
+            slot.present |= state.present;
+            slot.missing |= state.missing;
+        }
+    }
+    Ok((primary, merged))
+}
+
 /// Collect the source entries (rel path + entry) that pass the filter.
 /// `include_missing` controls whether missing entries are streamed too.
 fn collect_source_entries(
@@ -196,28 +225,43 @@ fn collect_source_entries(
     Ok(entries)
 }
 
-/// Classify every non-missing source file against the reference repo.
+/// Classify every non-missing source file against the union of the reference
+/// repos. `Equal`'s `reference_path` is taken from the primary reference when it
+/// holds the content, else from the first reference that does.
 pub fn diff_print(
     store: &Store,
     source: &str,
-    reference: &str,
+    references: &[&str],
     filter: Option<&str>,
 ) -> Result<Vec<DiffItem>, DiffError> {
     let filter = FileFilter::parse(filter)?;
     let source = open_repo(store, source)?;
-    let reference = open_repo(store, reference)?;
-    let ref_index = store::read_content_index(&reference.db)?;
+    let (primary, ref_index) = open_primary_and_index(store, references)?;
 
     let mut items = Vec::new();
     for (rel_path, entry) in collect_source_entries(&source.db, &filter, false)? {
         match ref_index.get(&(entry.size, entry.hash)) {
             None => items.push(DiffItem::New { rel_path }),
             Some(state) if state.present => {
-                let reference_path =
-                    store::get_paths_by_size_hash(&reference.db, entry.size, &entry.hash)?
+                // Prefer a path from the primary; fall back to any reference.
+                let mut reference_path =
+                    store::get_paths_by_size_hash(&primary.db, entry.size, &entry.hash)?
                         .into_iter()
                         .next()
                         .unwrap_or_default();
+                if reference_path.is_empty() {
+                    for name in &references[1..] {
+                        let extra = open_repo(store, name)?;
+                        if let Some(p) =
+                            store::get_paths_by_size_hash(&extra.db, entry.size, &entry.hash)?
+                                .into_iter()
+                                .next()
+                        {
+                            reference_path = p;
+                            break;
+                        }
+                    }
+                }
                 items.push(DiffItem::Equal {
                     rel_path,
                     reference_path,
@@ -243,7 +287,7 @@ pub fn diff_print(
 pub fn diff_copy(
     store: &Store,
     source: &str,
-    reference: &str,
+    references: &[&str],
     dest: CopyDest<'_>,
     move_files: bool,
     filter: Option<&str>,
@@ -252,8 +296,9 @@ pub fn diff_copy(
     let dest_root = resolve_subdir(dest.dir, dest.subdir)?;
     let filter = FileFilter::parse(filter)?;
     let source = open_repo(store, source)?;
-    let reference = open_repo(store, reference)?;
-    let ref_index = store::read_content_index(&reference.db)?;
+    // The primary reference is the copy-back target; the merged index is the
+    // union of all references (a file is "new" only if no reference has it).
+    let (reference, ref_index) = open_primary_and_index(store, references)?;
 
     let candidates: Vec<(String, FileEntry)> = collect_source_entries(&source.db, &filter, false)?
         .into_iter()
@@ -358,14 +403,13 @@ fn flush_copy(
 pub fn diff_delete(
     store: &Store,
     source: &str,
-    reference: &str,
+    references: &[&str],
     filter: Option<&str>,
     run: &DiffRun<'_>,
 ) -> Result<DeleteStats, DiffError> {
     let filter = FileFilter::parse(filter)?;
     let source = open_repo(store, source)?;
-    let reference = open_repo(store, reference)?;
-    let ref_index = store::read_content_index(&reference.db)?;
+    let (_reference, ref_index) = open_primary_and_index(store, references)?;
 
     let candidates: Vec<(String, FileEntry)> = collect_source_entries(&source.db, &filter, false)?
         .into_iter()

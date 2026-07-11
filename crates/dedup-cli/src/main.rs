@@ -35,24 +35,31 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum DiffCommands {
-    /// Print differences between source and reference
+    /// Print differences between source and reference(s)
     Print {
         /// Source repository
         source: String,
-        /// Reference repository
+        /// Reference repository (content already known)
         reference: String,
+        /// Additional reference repos; repeatable. A file counts as "new" only
+        /// when none of the references (positional or `--ref`) has its content.
+        #[arg(long = "ref", value_name = "REPO")]
+        refs: Vec<String>,
         /// Filter: mime:<substring>, name:<substring>, or size:<expr>
         #[arg(short, long)]
         filter: Option<String>,
     },
-    /// Copy files in source whose content the reference does not know to a target directory
+    /// Copy files in source whose content no reference knows to a target directory
     Cp {
         /// Source repository
         source: String,
-        /// Reference repository
+        /// Reference repository (content already known)
         reference: String,
         /// Target directory
         target: String,
+        /// Additional reference repos; repeatable (see `diff print`).
+        #[arg(long = "ref", value_name = "REPO")]
+        refs: Vec<String>,
         /// Relative parent directory inside the target to place files under
         #[arg(short = 'i', long)]
         into: Option<String>,
@@ -60,14 +67,17 @@ enum DiffCommands {
         #[arg(short, long)]
         filter: Option<String>,
     },
-    /// Move files in source whose content the reference does not know to a target directory
+    /// Move files in source whose content no reference knows to a target directory
     Mv {
         /// Source repository
         source: String,
-        /// Reference repository
+        /// Reference repository (content already known)
         reference: String,
         /// Target directory
         target: String,
+        /// Additional reference repos; repeatable (see `diff print`).
+        #[arg(long = "ref", value_name = "REPO")]
+        refs: Vec<String>,
         /// Relative parent directory inside the target to place files under
         #[arg(short = 'i', long)]
         into: Option<String>,
@@ -75,12 +85,15 @@ enum DiffCommands {
         #[arg(short, long)]
         filter: Option<String>,
     },
-    /// Delete files in source whose content the reference already knows
+    /// Delete files in source whose content any reference already knows
     Rm {
         /// Source repository
         source: String,
-        /// Reference repository
+        /// Reference repository (content already known)
         reference: String,
+        /// Additional reference repos; repeatable (see `diff print`).
+        #[arg(long = "ref", value_name = "REPO")]
+        refs: Vec<String>,
         /// Filter: mime:<substring>, name:<substring>, or size:<expr>
         #[arg(short, long)]
         filter: Option<String>,
@@ -282,6 +295,14 @@ fn destination(target: &str, into: &Option<String>) -> String {
     }
 }
 
+/// Combine the positional reference with any repeatable `--ref` repos into the
+/// reference list the diff ops expect (primary first).
+fn diff_refs<'a>(reference: &'a str, extra: &'a [String]) -> Vec<&'a str> {
+    std::iter::once(reference)
+        .chain(extra.iter().map(String::as_str))
+        .collect()
+}
+
 fn run_diff(store: &Store, command: DiffCommands) -> anyhow::Result<()> {
     let cancel = CancellationToken::new();
     {
@@ -292,9 +313,11 @@ fn run_diff(store: &Store, command: DiffCommands) -> anyhow::Result<()> {
         DiffCommands::Print {
             source,
             reference,
+            refs,
             filter,
         } => {
-            let items = diff_print(store, &source, &reference, filter.as_deref())?;
+            let references = diff_refs(&reference, &refs);
+            let items = diff_print(store, &source, &references, filter.as_deref())?;
             let mut new = 0u64;
             let mut equal = 0u64;
             let mut deleted = 0u64;
@@ -320,13 +343,15 @@ fn run_diff(store: &Store, command: DiffCommands) -> anyhow::Result<()> {
             source,
             reference,
             target,
+            refs,
             into,
             filter,
         } => {
+            let references = diff_refs(&reference, &refs);
             let stats = diff_copy(
                 store,
                 &source,
-                &reference,
+                &references,
                 CopyDest {
                     dir: std::path::Path::new(&target),
                     subdir: into.as_deref(),
@@ -348,13 +373,15 @@ fn run_diff(store: &Store, command: DiffCommands) -> anyhow::Result<()> {
             source,
             reference,
             target,
+            refs,
             into,
             filter,
         } => {
+            let references = diff_refs(&reference, &refs);
             let stats = diff_copy(
                 store,
                 &source,
-                &reference,
+                &references,
                 CopyDest {
                     dir: std::path::Path::new(&target),
                     subdir: into.as_deref(),
@@ -375,12 +402,14 @@ fn run_diff(store: &Store, command: DiffCommands) -> anyhow::Result<()> {
         DiffCommands::Rm {
             source,
             reference,
+            refs,
             filter,
         } => {
+            let references = diff_refs(&reference, &refs);
             let stats = diff_delete(
                 store,
                 &source,
-                &reference,
+                &references,
                 filter.as_deref(),
                 &DiffRun::new(&NoDiffProgress, &cancel),
             )?;

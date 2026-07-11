@@ -253,6 +253,9 @@ pub struct FilesView {
     loaded: bool,
     source: Option<String>,
     target: Option<String>,
+    /// Extra reference repos beyond the target: a file counts as "new" only
+    /// when neither the target nor any of these already has its content.
+    extra_refs: Vec<String>,
     command: Command,
     subdir: String,
     subdir_tx: Sender<Result<String, String>>,
@@ -305,6 +308,7 @@ pub struct FilesView {
 enum Act {
     PickSource(String),
     PickTarget(String),
+    ToggleExtraRef(String),
     SetCommand(Command),
     SubdirChanged,
     FilterChanged,
@@ -338,6 +342,7 @@ impl FilesView {
             loaded: false,
             source: None,
             target: None,
+            extra_refs: Vec::new(),
             command: Command::Copy,
             subdir: String::new(),
             subdir_tx,
@@ -494,7 +499,42 @@ impl FilesView {
                     }
                 }
             });
+            // Optional extra reference repos: content present in any of them is
+            // treated as "already known" (so it is not copied / is deletable).
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("ALSO REF").color(theme::TEXT).size(12.0));
+                for name in &self.repos {
+                    // Extra refs exclude the source and target (target is always
+                    // a reference already).
+                    if self.source.as_deref() == Some(name.as_str())
+                        || self.target.as_deref() == Some(name.as_str())
+                    {
+                        continue;
+                    }
+                    let sel = self.extra_refs.iter().any(|r| r == name);
+                    let fill = if sel { theme::LILAC } else { theme::PANEL };
+                    let col = if sel { theme::BLACK } else { theme::LILAC };
+                    if ui
+                        .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
+                        .clicked()
+                    {
+                        acts.push(Act::ToggleExtraRef(name.clone()));
+                    }
+                }
+            });
         });
+    }
+
+    /// The reference list for the diff ops: the target (primary) plus any extra
+    /// references, skipping ones that are no longer valid repos.
+    fn references(&self, target: &str) -> Vec<String> {
+        let mut refs = vec![target.to_string()];
+        for r in &self.extra_refs {
+            if r != target && self.source.as_deref() != Some(r.as_str()) {
+                refs.push(r.clone());
+            }
+        }
+        refs
     }
 
     fn command_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
@@ -1001,13 +1041,23 @@ impl FilesView {
                 if self.target.as_deref() == Some(name.as_str()) {
                     self.target = None;
                 }
+                self.extra_refs.retain(|r| r != &name);
                 self.source = Some(name);
                 self.clear_preview();
                 self.schedule_count();
                 self.refresh_mime_stats(store);
             }
             Act::PickTarget(name) => {
+                self.extra_refs.retain(|r| r != &name);
                 self.target = Some(name);
+                self.clear_preview();
+            }
+            Act::ToggleExtraRef(name) => {
+                if let Some(pos) = self.extra_refs.iter().position(|r| r == &name) {
+                    self.extra_refs.remove(pos);
+                } else {
+                    self.extra_refs.push(name);
+                }
                 self.clear_preview();
             }
             Act::SetCommand(cmd) => {
@@ -1341,7 +1391,9 @@ impl FilesView {
             self.save_history(store);
         }
         let filter = self.filter_string();
-        match diff_print(store, &source, &target, filter.as_deref()) {
+        let references = self.references(&target);
+        let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
+        match diff_print(store, &source, &ref_slice, filter.as_deref()) {
             Ok(items) => {
                 let deleting = self.command == Command::Delete;
                 let matched: Vec<&DiffItem> = items
@@ -1423,6 +1475,7 @@ impl FilesView {
         let (Some(source), Some(target)) = (self.source.clone(), self.target.clone()) else {
             return;
         };
+        let references = self.references(&target);
         let filter = self.filter_string();
         let subdir = self.normalized_subdir();
         let command = self.command;
@@ -1438,6 +1491,7 @@ impl FilesView {
         self.reset_run();
 
         std::thread::spawn(move || {
+            let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
             let progress = ChannelDiffProgress { tx: tx.clone() };
             let run = DiffRun::new(&progress, &cancel);
             let result = match command {
@@ -1454,7 +1508,7 @@ impl FilesView {
                             match diff_copy(
                                 &store,
                                 &source,
-                                &target,
+                                &ref_slice,
                                 CopyDest {
                                     dir: &target_dir,
                                     subdir,
@@ -1475,7 +1529,7 @@ impl FilesView {
                     }
                 }
                 Command::Delete => {
-                    match diff_delete(&store, &source, &target, filter.as_deref(), &run) {
+                    match diff_delete(&store, &source, &ref_slice, filter.as_deref(), &run) {
                         Ok(s) => OpResult::Deleted {
                             deleted: s.deleted,
                             cancelled: s.cancelled,

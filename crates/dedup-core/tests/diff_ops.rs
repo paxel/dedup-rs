@@ -291,7 +291,7 @@ fn move_updates_source_index_to_missing() -> TestResult {
     let stats = diff_copy(
         &sb.store,
         "A",
-        "B",
+        &["B"],
         CopyDest {
             dir: &target_dir,
             subdir: None,
@@ -333,7 +333,7 @@ fn copy_only_transfers_content_the_reference_has_never_seen() -> TestResult {
     let stats = diff_copy(
         &sb.store,
         "A",
-        "B",
+        &["B"],
         CopyDest {
             dir: &target_dir,
             subdir: None,
@@ -362,7 +362,7 @@ fn copy_into_subdir_preserves_relative_paths() -> TestResult {
     let stats = diff_copy(
         &sb.store,
         "A",
-        "B",
+        &["B"],
         CopyDest {
             dir: &target_dir,
             subdir: Some("imports/batch1"),
@@ -391,7 +391,7 @@ fn move_into_subdir_places_files_and_marks_source_missing() -> TestResult {
     let stats = diff_copy(
         &sb.store,
         "A",
-        "B",
+        &["B"],
         CopyDest {
             dir: &target_dir,
             subdir: Some("archive"),
@@ -427,7 +427,7 @@ fn copy_with_escaping_subdir_is_rejected() -> TestResult {
     let result = diff_copy(
         &sb.store,
         "A",
-        "B",
+        &["B"],
         CopyDest {
             dir: &target_dir,
             subdir: Some("../outside"),
@@ -458,7 +458,7 @@ fn print_classifies_new_equal_and_deleted_in_reference() -> TestResult {
     std::fs::remove_file(sb.b_root.join("deleted.txt"))?;
     sb.update("B")?;
 
-    let mut items = diff_print(&sb.store, "A", "B", None)?;
+    let mut items = diff_print(&sb.store, "A", &["B"], None)?;
     items.sort_by_key(|item| match item {
         DiffItem::New { rel_path } => rel_path.clone(),
         DiffItem::Equal { rel_path, .. } => rel_path.clone(),
@@ -494,7 +494,7 @@ fn delete_removes_source_files_known_to_reference_and_marks_them_missing() -> Te
     let stats = diff_delete(
         &sb.store,
         "A",
-        "B",
+        &["B"],
         None,
         &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
     )?;
@@ -562,7 +562,7 @@ fn copy_into_target_repo_updates_target_index() -> TestResult {
     let stats = diff_copy(
         &sb.store,
         "A",
-        "B",
+        &["B"],
         CopyDest {
             dir: &sb.b_root,
             subdir: None,
@@ -605,7 +605,7 @@ fn move_into_target_repo_updates_both_indexes() -> TestResult {
     let stats = diff_copy(
         &sb.store,
         "A",
-        "B",
+        &["B"],
         CopyDest {
             dir: &sb.b_root,
             subdir: None,
@@ -645,7 +645,7 @@ fn copy_reports_progress_counts_matching_stats() -> TestResult {
     let stats = diff_copy(
         &sb.store,
         "A",
-        "B",
+        &["B"],
         CopyDest {
             dir: &target_dir,
             subdir: None,
@@ -690,7 +690,7 @@ fn delete_reports_progress_counts_matching_stats() -> TestResult {
     let stats = diff_delete(
         &sb.store,
         "A",
-        "B",
+        &["B"],
         None,
         &DiffRun::new(&progress, &CancellationToken::new()),
     )?;
@@ -718,7 +718,7 @@ fn cancelled_delete_leaves_indexes_consistent_with_disk() -> TestResult {
     let stats = diff_delete(
         &sb.store,
         "A",
-        "B",
+        &["B"],
         None,
         &DiffRun::new(&NoDiffProgress, &cancel),
     )?;
@@ -731,5 +731,72 @@ fn cancelled_delete_leaves_indexes_consistent_with_disk() -> TestResult {
         .get_file_entry("A", "gone.txt")?
         .ok_or("gone.txt entry dropped from A")?;
     assert!(!in_a.missing);
+    Ok(())
+}
+
+/// Multi-reference diff: a file counts as "new" only when *none* of the
+/// references has its content. A file unique vs one reference but present in
+/// another is not copied.
+#[test]
+fn copy_treats_union_of_references_as_known() -> TestResult {
+    let sb = Sandbox::new()?;
+    // A third reference repo C with its own data dir.
+    let c_root = sb._tempdir.path().join("Cdata");
+    std::fs::create_dir_all(&c_root)?;
+    sb.store.create_repo("C", &c_root.to_string_lossy())?;
+
+    // A has two distinct contents; B holds "one", C holds "two".
+    Sandbox::write(&sb.a_root, "f1.txt", b"one")?;
+    Sandbox::write(&sb.a_root, "f2.txt", b"two")?;
+    Sandbox::write(&sb.b_root, "b.txt", b"one")?;
+    Sandbox::write(&c_root, "c.txt", b"two")?;
+    sb.update("A")?;
+    sb.update("B")?;
+    sb.update("C")?;
+
+    let target = sb._tempdir.path().join("out");
+    std::fs::create_dir_all(&target)?;
+
+    // Against B and C together, both files are already known → nothing copied.
+    let stats = diff_copy(
+        &sb.store,
+        "A",
+        &["B", "C"],
+        CopyDest {
+            dir: &target,
+            subdir: None,
+        },
+        false,
+        None,
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
+    )?;
+    assert_eq!(stats.copied, 0, "both contents known across the references");
+    assert!(!target.join("f1.txt").exists());
+    assert!(!target.join("f2.txt").exists());
+
+    // Against B alone, "two" (f2) is unique and gets copied; "one" (f1) does not.
+    let stats = diff_copy(
+        &sb.store,
+        "A",
+        &["B"],
+        CopyDest {
+            dir: &target,
+            subdir: None,
+        },
+        false,
+        None,
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
+    )?;
+    assert_eq!(stats.copied, 1, "only content absent from B is copied");
+    assert_eq!(std::fs::read(target.join("f2.txt"))?, b"two");
+    assert!(!target.join("f1.txt").exists());
+
+    // diff_print agrees: with both refs, nothing is New.
+    let items = diff_print(&sb.store, "A", &["B", "C"], None)?;
+    let new = items
+        .iter()
+        .filter(|i| matches!(i, DiffItem::New { .. }))
+        .count();
+    assert_eq!(new, 0);
     Ok(())
 }
