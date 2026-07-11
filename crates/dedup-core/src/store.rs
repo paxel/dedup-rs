@@ -12,9 +12,11 @@ const SCHEMA_VERSION: u8 = 1;
 /// but drop the fingerprint and are flagged stale for re-hashing); v3 added
 /// `origin` provenance, a decode-compatible change (old entries get `origin =
 /// None` and are NOT re-flagged stale); v4 added image `exif`, which requires
-/// re-reading image files, so images below v4 are flagged stale. See
+/// re-reading image files, so images below v4 are flagged stale; v5 added
+/// office-document text hashes (reusing the `pdf_hash` slot), so document files
+/// below v5 are flagged stale. The v4→v5 layout is unchanged. See
 /// [`decode_entry`].
-const ENTRY_VERSION: u8 = 4;
+const ENTRY_VERSION: u8 = 5;
 
 // Registry table definition
 const REPOS: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("repos");
@@ -291,6 +293,8 @@ fn deserialize_value<'a, T: Deserialize<'a>>(
 fn decode_entry(bytes: &[u8]) -> Result<(FileEntry, u8), StoreError> {
     match bytes.first() {
         Some(&ENTRY_VERSION) => Ok((deserialize_value(ENTRY_VERSION, bytes)?, ENTRY_VERSION)),
+        // v4 and v5 share the same layout; only the stale policy differs.
+        Some(4) => Ok((deserialize_value(4, bytes)?, 4)),
         Some(3) => {
             let v3: FileEntryV3 = deserialize_value(3, bytes)?;
             let entry = FileEntry {
@@ -1163,14 +1167,14 @@ pub fn read_scan_index(
     for item in files_table.iter()? {
         let (key_guard, val_guard) = item?;
         let (entry, version) = decode_entry(val_guard.value())?;
-        // Images are re-scanned below v4: the v1→v2 image-hash upgrade and the
-        // v4 EXIF addition both need the image file re-read. (v3's `origin` was
-        // decode-compatible, but v4 supersedes it for images.)
-        let stale = version < 4
-            && entry
-                .mime
-                .as_deref()
-                .is_some_and(|m| m.starts_with("image/"));
+        // Per-mime rescan policy: images below v4 (image-hash + EXIF), and
+        // office documents below v5 (their text hash was added at v5). PDFs
+        // already had a text hash, so they are not re-scanned.
+        let stale = match entry.mime.as_deref() {
+            Some(m) if m.starts_with("image/") => version < 4,
+            Some(m) if crate::fingerprint::is_office_doc(m) => version < 5,
+            _ => false,
+        };
         index.insert(
             key_guard.value().to_string(),
             ScanEntry {

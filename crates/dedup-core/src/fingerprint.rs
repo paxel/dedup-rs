@@ -67,6 +67,10 @@ pub fn compute(path: &Path, ffmpeg_available: bool) -> Fingerprints {
         }
     } else if mime == "application/pdf" {
         fp.pdf_hash = pdf_text_hash(path);
+    } else if is_office_doc(&mime) {
+        // Office documents share the PDF text-hash slot: text identity groups
+        // them together (and with matching PDFs) regardless of container.
+        fp.pdf_hash = doc_text_hash(path, &mime);
     } else if mime.starts_with("audio/") {
         fp.audio = audio_fingerprint(path);
     }
@@ -381,14 +385,12 @@ fn extract_frame(path: &Path, at_secs: f64) -> Option<image::DynamicImage> {
     image::load_from_memory(&output.stdout).ok()
 }
 
-// --- PDF --------------------------------------------------------------------
+// --- Documents (PDF + office) -----------------------------------------------
 
-/// BLAKE3 of the normalized text of a PDF, or `None` if it has no extractable
-/// text. Normalization lowercases and strips all whitespace, matching Java.
-pub fn pdf_text_hash(path: &Path) -> Option<[u8; 32]> {
-    let doc = lopdf::Document::load(path).ok()?;
-    let pages: Vec<u32> = doc.get_pages().keys().copied().collect();
-    let text = doc.extract_text(&pages).ok()?;
+/// BLAKE3 of normalized document text: lowercase, all whitespace stripped
+/// (matching the Java scheme). `None` for empty text, so text-identity groups
+/// documents regardless of container. Shared by PDF and office extraction.
+fn text_hash(text: &str) -> Option<[u8; 32]> {
     let normalized: String = text
         .chars()
         .filter(|c| !c.is_whitespace())
@@ -398,6 +400,120 @@ pub fn pdf_text_hash(path: &Path) -> Option<[u8; 32]> {
         return None;
     }
     Some(*blake3::hash(normalized.as_bytes()).as_bytes())
+}
+
+/// BLAKE3 of the normalized text of a PDF, or `None` if it has no extractable
+/// text.
+pub fn pdf_text_hash(path: &Path) -> Option<[u8; 32]> {
+    let doc = lopdf::Document::load(path).ok()?;
+    let pages: Vec<u32> = doc.get_pages().keys().copied().collect();
+    text_hash(&doc.extract_text(&pages).ok()?)
+}
+
+/// MIME types handled by [`doc_text_hash`] (office documents). The same text
+/// saved in any of these — or as a PDF — hashes identically.
+pub fn is_office_doc(mime: &str) -> bool {
+    matches!(
+        mime,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" // docx
+            | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" // xlsx
+            | "application/vnd.openxmlformats-officedocument.presentationml.presentation" // pptx
+            | "application/vnd.oasis.opendocument.text" // odt
+            | "application/vnd.oasis.opendocument.spreadsheet" // ods
+            | "application/vnd.oasis.opendocument.presentation" // odp
+            | "application/vnd.ms-excel" // legacy xls
+    )
+}
+
+/// BLAKE3 of the normalized text of an office document (docx/xlsx/pptx/odt/ods/
+/// odp via zip+XML, legacy xls via calamine), or `None` if empty/unreadable or
+/// encrypted. Legacy `.doc`/`.ppt` are out of scope.
+pub fn doc_text_hash(path: &Path, mime: &str) -> Option<[u8; 32]> {
+    let text = if mime == "application/vnd.ms-excel" {
+        xls_text(path)?
+    } else {
+        zip_doc_text(path, mime)?
+    };
+    text_hash(&text)
+}
+
+/// Whether a zip entry holds body text for the given OOXML/ODF mime (styles,
+/// metadata and relationships are skipped so the same text in different apps
+/// hashes the same).
+fn is_content_entry(name: &str, mime: &str) -> bool {
+    match mime {
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
+            name == "word/document.xml"
+        }
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => {
+            name == "xl/sharedStrings.xml"
+        }
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => {
+            name.starts_with("ppt/slides/slide") && name.ends_with(".xml")
+        }
+        // ODF containers keep all body text in content.xml.
+        _ => name == "content.xml",
+    }
+}
+
+/// Concatenated text nodes of a zip-based office document's content parts.
+fn zip_doc_text(path: &Path, mime: &str) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).ok()?;
+    let names: Vec<String> = archive
+        .file_names()
+        .filter(|n| is_content_entry(n, mime))
+        .map(String::from)
+        .collect();
+
+    let mut out = String::new();
+    for name in names {
+        use std::io::Read;
+        let mut xml = String::new();
+        if archive
+            .by_name(&name)
+            .ok()?
+            .read_to_string(&mut xml)
+            .is_err()
+        {
+            continue;
+        }
+        let mut reader = quick_xml::Reader::from_str(&xml);
+        let mut buf = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(quick_xml::events::Event::Text(t)) => {
+                    if let Ok(text) = t.decode() {
+                        out.push_str(&text);
+                        out.push(' ');
+                    }
+                }
+                Ok(quick_xml::events::Event::Eof) | Err(_) => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+    }
+    Some(out)
+}
+
+/// Concatenated cell text of a legacy `.xls` workbook, via calamine.
+fn xls_text(path: &Path) -> Option<String> {
+    use calamine::Reader;
+    let mut workbook: calamine::Xls<_> = calamine::open_workbook(path).ok()?;
+    let mut out = String::new();
+    let sheets = workbook.sheet_names().to_vec();
+    for name in sheets {
+        if let Ok(range) = workbook.worksheet_range(&name) {
+            for row in range.rows() {
+                for cell in row {
+                    out.push_str(&cell.to_string());
+                    out.push(' ');
+                }
+            }
+        }
+    }
+    Some(out)
 }
 
 // --- Audio ------------------------------------------------------------------
@@ -598,5 +714,65 @@ mod tests {
         // A later timestamp is greater.
         let dt2 = exif::DateTime { second: 1, ..dt };
         assert_eq!(exif_datetime_to_ms(&dt2), 1_609_459_201_000);
+    }
+
+    /// Write a minimal zip with the given (name, xml) entries to `path`.
+    fn write_zip(path: &std::path::Path, entries: &[(&str, &str)]) {
+        use std::io::Write;
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, xml) in entries {
+            zip.start_file(*name, opts).unwrap();
+            zip.write_all(xml.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    const DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    const ODT: &str = "application/vnd.oasis.opendocument.text";
+
+    /// The same text saved as .docx and .odt hashes identically (text identity,
+    /// regardless of container), while different text does not.
+    #[test]
+    fn office_docs_group_by_text_across_containers() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let docx = dir.path().join("a.docx");
+        write_zip(
+            &docx,
+            &[(
+                "word/document.xml",
+                "<w:document><w:body><w:p><w:r><w:t>Hello World</w:t></w:r>\
+                 <w:r><w:t> again</w:t></w:r></w:p></w:body></w:document>",
+            )],
+        );
+
+        let odt = dir.path().join("a.odt");
+        write_zip(
+            &odt,
+            &[(
+                "content.xml",
+                "<office:document-content><office:body><text:p>Hello World\
+                 </text:p><text:p>again</text:p></office:body></office:document-content>",
+            )],
+        );
+
+        let h_docx = doc_text_hash(&docx, DOCX).expect("docx text");
+        let h_odt = doc_text_hash(&odt, ODT).expect("odt text");
+        assert_eq!(h_docx, h_odt, "same text groups across containers");
+
+        // A different document does not collide.
+        let other = dir.path().join("b.docx");
+        write_zip(
+            &other,
+            &[(
+                "word/document.xml",
+                "<w:document><w:body><w:p><w:r><w:t>Totally different</w:t></w:r>\
+                 </w:p></w:body></w:document>",
+            )],
+        );
+        assert_ne!(doc_text_hash(&other, DOCX).unwrap(), h_docx);
     }
 }

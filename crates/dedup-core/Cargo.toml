@@ -17,6 +17,9 @@ mime_guess = "2.0"
 lopdf = "0.43"
 symphonia = { version = "0.5", features = ["all"] }
 kamadak-exif = "0.6.1"
+zip = "8.6.0"
+quick-xml = "0.41.0"
+calamine = "0.36.0"
 
 [dev-dependencies]
 tempfile = "3.10"
