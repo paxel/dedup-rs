@@ -326,6 +326,7 @@ pub fn update_repo(
                             pdf_hash: fp.pdf_hash,
                             audio: fp.audio,
                             img_size: fp.img_size,
+                            origin: None,
                         },
                     ));
                     if batch.len() >= BATCH_SIZE {

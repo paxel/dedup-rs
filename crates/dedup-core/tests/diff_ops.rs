@@ -69,6 +69,7 @@ fn entry(size: u64, hash_byte: u8, mime: &str, missing: bool) -> FileEntry {
         pdf_hash: None,
         audio: None,
         img_size: None,
+        origin: None,
     }
 }
 
@@ -798,5 +799,41 @@ fn copy_treats_union_of_references_as_known() -> TestResult {
         .filter(|i| matches!(i, DiffItem::New { .. }))
         .count();
     assert_eq!(new, 0);
+    Ok(())
+}
+
+/// A file copied into a repo carries provenance: its index entry records the
+/// source repo it came from.
+#[test]
+fn copy_records_origin_in_target_index() -> TestResult {
+    let sb = Sandbox::new()?;
+    // Copy into B's own data dir so the copy lands inside the B repo and gets
+    // indexed there (the GUI's usual case).
+    Sandbox::write(&sb.a_root, "photo.txt", b"hello")?;
+    sb.update("A")?;
+
+    let stats = diff_copy(
+        &sb.store,
+        "A",
+        &["B"],
+        CopyDest {
+            dir: &sb.b_root,
+            subdir: None,
+        },
+        false,
+        None,
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
+    )?;
+    assert_eq!(stats.copied, 1);
+
+    let entry = sb
+        .store
+        .get_file_entry("B", "photo.txt")?
+        .ok_or("copied file indexed in B")?;
+    assert_eq!(
+        entry.origin.as_deref(),
+        Some("A"),
+        "origin records source repo"
+    );
     Ok(())
 }

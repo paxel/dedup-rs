@@ -23,6 +23,7 @@ fn entry(size: u64, hash_byte: u8, modified_ms: i64, img_size: Option<(u32, u32)
         pdf_hash: None,
         audio: None,
         img_size,
+        origin: None,
     }
 }
 

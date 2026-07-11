@@ -7,11 +7,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 const SCHEMA_VERSION: u8 = 1;
-/// Version byte of serialized [`FileEntry`] values. Bumped to 2 when the image
-/// fingerprint grew from a 64-bit dHash to the 512-bit [`ImgHash`]; version-1
-/// entries still decode (see [`decode_entry`]) but their image fingerprint is
-/// dropped and the entry is flagged stale so the next update re-hashes it.
-const ENTRY_VERSION: u8 = 2;
+/// Version byte of serialized [`FileEntry`] values. v2 grew the image
+/// fingerprint from a 64-bit dHash to the 512-bit [`ImgHash`] (v1 entries decode
+/// but drop the fingerprint and are flagged stale for re-hashing); v3 added
+/// `origin` provenance, a decode-compatible change (old entries get `origin =
+/// None` and are NOT re-flagged stale). See [`decode_entry`].
+const ENTRY_VERSION: u8 = 3;
 
 // Registry table definition
 const REPOS: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("repos");
@@ -129,6 +130,11 @@ pub struct FileEntry {
     pub pdf_hash: Option<[u8; 32]>,       // blake3 of normalized text
     pub audio: Option<AudioFp>,           // duration_ms + chunk hashes
     pub img_size: Option<(u32, u32)>,
+    /// Provenance: the source repo a file was copied/synced from (set by
+    /// `diff_copy`/`sync_copy` when the target is a repo). `None` for scanned
+    /// files and pre-provenance entries. A display/filter hint, never an
+    /// identity input.
+    pub origin: Option<String>,
 }
 
 /// Version-1 [`FileEntry`] layout, whose image fingerprint was a 64-bit dHash.
@@ -141,6 +147,22 @@ struct FileEntryV1 {
     missing: bool,
     mime: Option<String>,
     img_fingerprint: Option<u64>,
+    video_hash: Option<[u64; 3]>,
+    pdf_hash: Option<[u8; 32]>,
+    audio: Option<AudioFp>,
+    img_size: Option<(u32, u32)>,
+}
+
+/// Version-2 [`FileEntry`] layout: the 512-bit image hash but no `origin`.
+/// Kept so pre-provenance indexes decode unchanged (origin → `None`).
+#[derive(Serialize, Deserialize)]
+struct FileEntryV2 {
+    size: u64,
+    hash: [u8; 32],
+    modified_ms: i64,
+    missing: bool,
+    mime: Option<String>,
+    img_fingerprint: Option<ImgHash>,
     video_hash: Option<[u64; 3]>,
     pdf_hash: Option<[u8; 32]>,
     audio: Option<AudioFp>,
@@ -235,6 +257,23 @@ fn deserialize_value<'a, T: Deserialize<'a>>(
 fn decode_entry(bytes: &[u8]) -> Result<(FileEntry, u8), StoreError> {
     match bytes.first() {
         Some(&ENTRY_VERSION) => Ok((deserialize_value(ENTRY_VERSION, bytes)?, ENTRY_VERSION)),
+        Some(2) => {
+            let v2: FileEntryV2 = deserialize_value(2, bytes)?;
+            let entry = FileEntry {
+                size: v2.size,
+                hash: v2.hash,
+                modified_ms: v2.modified_ms,
+                missing: v2.missing,
+                mime: v2.mime,
+                img_fingerprint: v2.img_fingerprint,
+                video_hash: v2.video_hash,
+                pdf_hash: v2.pdf_hash,
+                audio: v2.audio,
+                img_size: v2.img_size,
+                origin: None,
+            };
+            Ok((entry, 2))
+        }
         Some(1) => {
             let v1: FileEntryV1 = deserialize_value(1, bytes)?;
             let entry = FileEntry {
@@ -248,6 +287,7 @@ fn decode_entry(bytes: &[u8]) -> Result<(FileEntry, u8), StoreError> {
                 pdf_hash: v1.pdf_hash,
                 audio: v1.audio,
                 img_size: v1.img_size,
+                origin: None,
             };
             Ok((entry, 1))
         }
@@ -1046,7 +1086,10 @@ pub fn read_scan_index(
     for item in files_table.iter()? {
         let (key_guard, val_guard) = item?;
         let (entry, version) = decode_entry(val_guard.value())?;
-        let stale = version < ENTRY_VERSION
+        // Only the v1→v2 image-hash upgrade forces a rescan. Later bumps (v3
+        // added `origin`, which defaults to `None`) are decode-compatible and
+        // must not re-mark images stale.
+        let stale = version < 2
             && entry
                 .mime
                 .as_deref()
@@ -1096,6 +1139,7 @@ mod tests {
             pdf_hash: None,
             audio: None,
             img_size: None,
+            origin: None,
         };
 
         let file2 = FileEntry {
@@ -1109,6 +1153,7 @@ mod tests {
             pdf_hash: None,
             audio: None,
             img_size: None,
+            origin: None,
         };
 
         store.update_file_entry("test-repo", "file1.png", &file1)?;
@@ -1132,6 +1177,7 @@ mod tests {
             pdf_hash: None,
             audio: None,
             img_size: None,
+            origin: None,
         };
         store.update_file_entry("test-repo", "file3.png", &file3)?;
 
@@ -1254,6 +1300,55 @@ mod tests {
         let index = read_scan_index(&db)?;
         assert!(!index["photo.jpg"].stale);
 
+        Ok(())
+    }
+
+    /// Version-2 entries (512-bit image hash, pre-provenance) decode unchanged:
+    /// `origin` defaults to `None` and — crucially — the v3 bump does NOT
+    /// re-flag images stale (it is a decode-compatible change, no rescan).
+    #[test]
+    fn v2_entries_decode_with_none_origin_and_no_restale() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let store = Store::open_at(temp_dir.path().to_path_buf())?;
+        let repo_dir = temp_dir.path().join("mock_repo");
+        std::fs::create_dir_all(&repo_dir)?;
+        store.create_repo("legacy", &repo_dir.to_string_lossy())?;
+
+        let v2_image = FileEntryV2 {
+            size: 100,
+            hash: [1; 32],
+            modified_ms: 123456,
+            missing: false,
+            mime: Some("image/jpeg".to_string()),
+            img_fingerprint: Some([7; 8]),
+            video_hash: None,
+            pdf_hash: None,
+            audio: None,
+            img_size: Some((100, 100)),
+        };
+
+        let db = store.open_repo_db("legacy")?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut files = write_txn.open_table(FILES)?;
+            files.insert("photo.jpg", serialize_value(2, &v2_image)?.as_slice())?;
+        }
+        write_txn.commit()?;
+
+        let entry = get_entry(&db, "photo.jpg")?.expect("v2 entry decodes");
+        assert_eq!(
+            entry.img_fingerprint,
+            Some([7; 8]),
+            "512-bit hash preserved"
+        );
+        assert_eq!(entry.origin, None, "origin defaults to None");
+
+        let index = read_scan_index(&db)?;
+        assert!(
+            !index["photo.jpg"].stale,
+            "v2 image is not re-marked stale by the v3 provenance bump"
+        );
         Ok(())
     }
 }

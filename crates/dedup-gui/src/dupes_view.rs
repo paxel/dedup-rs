@@ -914,6 +914,14 @@ impl DupesView {
                                 .size(11.0),
                             );
 
+                            if let Some(origin) = &file.entry.origin {
+                                ui.label(
+                                    RichText::new(format!("from {origin}"))
+                                        .color(theme::LILAC)
+                                        .size(11.0),
+                                );
+                            }
+
                             self.audio_controls(ui, file, acts);
 
                             if is_best {
@@ -2087,6 +2095,7 @@ mod ui_tests {
                 pdf_hash: None,
                 audio: None,
                 img_size: Some((100, 100)),
+                origin: None,
             },
         }
     }
@@ -2195,6 +2204,7 @@ mod ui_tests {
                 pdf_hash: None,
                 audio: None,
                 img_size: None,
+                origin: None,
             };
             for c in 0..2 {
                 entries.push((format!("g{g}_c{c}.bin"), e.clone()));
@@ -2317,6 +2327,7 @@ mod ui_tests {
                 pdf_hash: None,
                 audio: None,
                 img_size: None,
+                origin: None,
             },
         }
     }
@@ -2647,6 +2658,7 @@ mod ui_tests {
                     chunk_hashes: Vec::new(),
                 }),
                 img_size: None,
+                origin: None,
             },
         }
     }
@@ -2877,6 +2889,7 @@ mod ui_tests {
                         pdf_hash: None,
                         audio: None,
                         img_size: None,
+                        origin: None,
                     },
                 )
                 .unwrap();
@@ -3095,6 +3108,7 @@ mod ui_tests {
                     pdf_hash: None,
                     audio: None,
                     img_size: Some((640, 480)),
+                    origin: None,
                 },
             });
         }
@@ -3178,6 +3192,7 @@ mod ui_tests {
                 pdf_hash: None,
                 audio: None,
                 img_size: None,
+                origin: None,
             },
         };
 

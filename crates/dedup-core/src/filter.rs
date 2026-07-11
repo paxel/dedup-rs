@@ -15,6 +15,8 @@ pub enum FileFilter {
     Name(String),
     /// Matches entries whose size satisfies the comparison.
     Size(SizeOp, u64),
+    /// Matches entries whose provenance (`origin`) contains the substring.
+    Origin(String),
     /// Combine multiple filters with AND logic.
     And(Vec<FileFilter>),
 }
@@ -30,7 +32,9 @@ pub enum SizeOp {
 
 #[derive(thiserror::Error, Debug)]
 pub enum FilterError {
-    #[error("Unknown filter '{0}': expected mime:<substring>, name:<substring>, or size:<expr>")]
+    #[error(
+        "Unknown filter '{0}': expected mime:<substring>, name:<substring>, size:<expr>, or origin:<substring>"
+    )]
     UnknownFilter(String),
 
     #[error("Invalid size filter '{0}': expected an integer byte count, e.g. size:>=1000")]
@@ -74,7 +78,7 @@ impl FileFilter {
     /// leading text before the first prefix is kept as its own group so
     /// genuinely unknown input is still rejected by `parse_single`.
     fn split_groups(filter: &str) -> Vec<&str> {
-        const PREFIXES: [&str; 3] = ["mime:", "name:", "size:"];
+        const PREFIXES: [&str; 4] = ["mime:", "name:", "size:", "origin:"];
         let bytes = filter.as_bytes();
         let mut starts: Vec<usize> = Vec::new();
         for i in 0..filter.len() {
@@ -111,6 +115,9 @@ impl FileFilter {
         if let Some(rest) = filter.strip_prefix("size:") {
             return Self::parse_size(rest.trim());
         }
+        if let Some(rest) = filter.strip_prefix("origin:") {
+            return Ok(Self::Origin(rest.trim().to_string()));
+        }
         Err(FilterError::UnknownFilter(filter.to_string()))
     }
 
@@ -143,6 +150,10 @@ impl FileFilter {
                 .as_ref()
                 .is_some_and(|mime| mime.contains(substring)),
             Self::Name(substring) => rel_path.contains(substring),
+            Self::Origin(substring) => entry
+                .origin
+                .as_ref()
+                .is_some_and(|origin| origin.contains(substring)),
             Self::Size(op, value) => match op {
                 SizeOp::Lt => entry.size < *value,
                 SizeOp::Le => entry.size <= *value,
@@ -184,6 +195,7 @@ mod tests {
             pdf_hash: None,
             audio: None,
             img_size: None,
+            origin: None,
         }
     }
 
@@ -252,6 +264,7 @@ mod tests {
             pdf_hash: None,
             audio: None,
             img_size: None,
+            origin: None,
         };
 
         store.update_file_entry("r", "photos/a.png", &make(100, Some("image/png"), false))?;

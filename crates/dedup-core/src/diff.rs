@@ -295,6 +295,7 @@ pub fn diff_copy(
 ) -> Result<CopyStats, DiffError> {
     let dest_root = resolve_subdir(dest.dir, dest.subdir)?;
     let filter = FileFilter::parse(filter)?;
+    let source_name = source.to_string();
     let source = open_repo(store, source)?;
     // The primary reference is the copy-back target; the merged index is the
     // union of all references (a file is "new" only if no reference has it).
@@ -346,7 +347,7 @@ pub fn diff_copy(
         // scan rather than risking a wrong entry.
         if let Ok(target_rel) = to.strip_prefix(&reference_root) {
             let target_rel = target_rel.to_string_lossy().replace('\\', "/");
-            to_index.push((target_rel, entry_for_copied_file(entry, &to)));
+            to_index.push((target_rel, entry_for_copied_file(entry, &to, &source_name)));
         }
         if move_files {
             moved.push(rel_path.clone());
@@ -491,6 +492,7 @@ pub fn diff_sync(
     cancel: &CancellationToken,
 ) -> Result<SyncStats, DiffError> {
     let filter = FileFilter::parse(filter)?;
+    let source_name = source.to_string();
     let source = open_repo(store, source)?;
     let target = open_repo(store, target)?;
     let mut target_index = store::read_content_index(&target.db)?;
@@ -512,6 +514,7 @@ pub fn diff_sync(
         } else if copy_new {
             sync_copy(
                 &source_root,
+                &source_name,
                 &target,
                 &target_root,
                 &mut target_index,
@@ -524,8 +527,10 @@ pub fn diff_sync(
     Ok(stats)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync_copy(
     source_root: &Path,
+    source_name: &str,
     target: &OpenRepo,
     target_root: &Path,
     target_index: &mut HashMap<ContentKey, ContentState>,
@@ -558,7 +563,7 @@ fn sync_copy(
 
     // Index the copy with the mtime the file actually has on the target so
     // the next update run sees it as unchanged.
-    let new_entry = entry_for_copied_file(entry, &target_file);
+    let new_entry = entry_for_copied_file(entry, &target_file, source_name);
     store::apply_entries(&target.db, std::iter::once((rel_path, &new_entry)))?;
     target_index.entry(key).or_default().present = true;
     Ok(())
@@ -601,7 +606,7 @@ fn sync_delete(
 /// set to the file's real on-disk mtime, so a later scan sees the copy as
 /// unchanged. Falls back to the source entry's mtime if the target's cannot
 /// be read.
-fn entry_for_copied_file(entry: &FileEntry, path: &Path) -> FileEntry {
+fn entry_for_copied_file(entry: &FileEntry, path: &Path, origin: &str) -> FileEntry {
     let modified_ms = std::fs::metadata(path)
         .and_then(|md| md.modified())
         .map(crate::update::system_time_to_ms)
@@ -609,6 +614,11 @@ fn entry_for_copied_file(entry: &FileEntry, path: &Path) -> FileEntry {
     let mut new_entry = entry.clone();
     new_entry.missing = false;
     new_entry.modified_ms = modified_ms;
+    // Provenance: record which repo the file came from (unless the source
+    // already carried an origin, which we preserve through further copies).
+    if new_entry.origin.is_none() {
+        new_entry.origin = Some(origin.to_string());
+    }
     new_entry
 }
 
