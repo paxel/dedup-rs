@@ -269,14 +269,22 @@ pub struct FilesView {
     io_tx: Sender<HistoryIo>,
     io_rx: Receiver<HistoryIo>,
     // Debounced background NAME match count against the source repo index.
-    count_tx: Sender<(u64, usize)>,
-    count_rx: Receiver<(u64, usize)>,
+    // A `None` count means the count failed (unparsable filter or unreadable
+    // index).
+    count_tx: Sender<(u64, Option<usize>)>,
+    count_rx: Receiver<(u64, Option<usize>)>,
     /// Generation token so stale background counts are discarded.
     count_token: u64,
     /// When set, a count is (re)launched once this deadline passes.
     count_deadline: Option<Instant>,
+    /// Whether a launched count has not reported back yet.
+    count_in_flight: bool,
     /// The latest match count, if one has been computed.
     count_result: Option<usize>,
+    /// The source repo's MIME stats, cached for the MIME editor's suggestions;
+    /// refreshed when the source changes (fetching opens the repo database, so
+    /// it must not happen every frame).
+    mime_stats: Vec<(String, u64)>,
     preview: Vec<PreviewRow>,
     preview_total: usize,
     status: Option<String>,
@@ -344,7 +352,9 @@ impl FilesView {
             count_rx,
             count_token: 0,
             count_deadline: None,
+            count_in_flight: false,
             count_result: None,
+            mime_stats: Vec::new(),
             preview: Vec::new(),
             preview_total: 0,
             status: None,
@@ -380,7 +390,7 @@ impl FilesView {
         self.repo_rows(ui, &mut acts);
         self.command_bar(ui, &mut acts);
         self.subdir_bar(ui, &mut acts);
-        self.filter_bar(ui, store, &mut acts);
+        self.filter_bar(ui, &mut acts);
         self.action_bar(ui, &mut acts);
 
         if let Some(err) = &self.error {
@@ -429,9 +439,19 @@ impl FilesView {
                 }
                 self.loaded = true;
                 self.error = None;
+                self.refresh_mime_stats(store);
             }
             Err(e) => self.error = Some(e.to_string()),
         }
+    }
+
+    /// (Re)fetch the cached MIME stats for the current source repo, or clear
+    /// them when none is selected. Failures just leave the suggestions empty.
+    fn refresh_mime_stats(&mut self, store: &Store) {
+        self.mime_stats = match &self.source {
+            Some(source) => store.get_mime_stats(source).unwrap_or_default(),
+            None => Vec::new(),
+        };
     }
 
     fn repo_rows(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
@@ -559,7 +579,7 @@ impl FilesView {
         ui.label(RichText::new(text).color(theme::LILAC).size(11.0));
     }
 
-    fn filter_bar(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, acts: &mut Vec<Act>) {
+    fn filter_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         // Editing any condition invalidates the current preview, exactly like
         // changing the target subdir does.
         let mut changed = false;
@@ -642,7 +662,7 @@ impl FilesView {
 
             // Inline editor panel for the condition currently being edited.
             if let Some(idx) = editing_idx {
-                changed |= self.cond_editor(ui, store, idx, acts);
+                changed |= self.cond_editor(ui, idx, acts);
             }
 
             self.preset_row(ui, acts);
@@ -722,15 +742,9 @@ impl FilesView {
     }
 
     /// The inline editor for the condition at `idx`: a text field plus
-    /// data-driven assistance (MIME suggestions from the source repo, and
-    /// remembered-value quick-picks). Returns whether the value changed.
-    fn cond_editor(
-        &mut self,
-        ui: &mut egui::Ui,
-        store: &Arc<Store>,
-        idx: usize,
-        acts: &mut Vec<Act>,
-    ) -> bool {
+    /// data-driven assistance (cached MIME suggestions from the source repo,
+    /// and remembered-value quick-picks). Returns whether the value changed.
+    fn cond_editor(&mut self, ui: &mut egui::Ui, idx: usize, acts: &mut Vec<Act>) -> bool {
         let mut changed = false;
         let Some(kind) = self.filters.get(idx).map(|c| c.kind) else {
             return false;
@@ -767,21 +781,26 @@ impl FilesView {
             }
 
             // Live, debounced match count for NAME conditions (source-gated).
+            // Shows nothing when the last count failed (unparsable filter or
+            // unreadable index) rather than a forever-stuck "counting…".
             if kind == FilterKind::Name && self.source.is_some() {
+                let counting = self.count_deadline.is_some() || self.count_in_flight;
                 let text = match self.count_result {
-                    Some(n) => format!("{n} files match"),
-                    None => "counting…".to_string(),
+                    Some(n) => Some(format!("{n} files match")),
+                    None if counting => Some("counting…".to_string()),
+                    None => None,
                 };
-                ui.label(RichText::new(text).color(theme::AMBER).size(11.0));
+                if let Some(text) = text {
+                    ui.label(RichText::new(text).color(theme::AMBER).size(11.0));
+                }
             }
         });
 
         // MIME suggestions: the source repo's actual MIME types (with counts),
-        // filtered by the typed substring. Hidden when no source is selected.
-        if kind == FilterKind::Mime
-            && let Some(source) = self.source.clone()
-            && let Ok(stats) = store.get_mime_stats(&source)
-        {
+        // cached per source repo and filtered by the typed substring. Empty
+        // (and hidden) when no source is selected.
+        if kind == FilterKind::Mime && !self.mime_stats.is_empty() {
+            let stats = self.mime_stats.clone();
             let query = current.trim().to_lowercase();
             ui.horizontal_wrapped(|ui| {
                 let mut shown = 0;
@@ -985,6 +1004,7 @@ impl FilesView {
                 self.source = Some(name);
                 self.clear_preview();
                 self.schedule_count();
+                self.refresh_mime_stats(store);
             }
             Act::PickTarget(name) => {
                 self.target = Some(name);
@@ -1134,21 +1154,23 @@ impl FilesView {
         };
         self.count_token += 1;
         let token = self.count_token;
+        self.count_in_flight = true;
         let filter_str = self.filter_string();
         let store = Arc::clone(store);
         let tx = self.count_tx.clone();
         let repaint = ctx.clone();
         std::thread::spawn(move || {
-            let Ok(filter) = FileFilter::parse(filter_str.as_deref()) else {
-                return;
+            // A failed count (unparsable filter, unreadable index) must still
+            // report back, or the UI would show "counting…" forever.
+            let count = match FileFilter::parse(filter_str.as_deref()) {
+                Ok(filter) => store
+                    .open_repo_db(&source)
+                    .ok()
+                    .and_then(|db| count_matches(&db, &filter).ok()),
+                Err(_) => None,
             };
-            let Ok(db) = store.open_repo_db(&source) else {
-                return;
-            };
-            if let Ok(count) = count_matches(&db, &filter) {
-                let _ = tx.send((token, count));
-                repaint.request_repaint();
-            }
+            let _ = tx.send((token, count));
+            repaint.request_repaint();
         });
     }
 
@@ -1542,7 +1564,8 @@ impl FilesView {
         while let Ok((token, count)) = self.count_rx.try_recv() {
             got = true;
             if token == self.count_token {
-                self.count_result = Some(count);
+                self.count_in_flight = false;
+                self.count_result = count;
             }
         }
         while let Ok(msg) = self.rx.try_recv() {

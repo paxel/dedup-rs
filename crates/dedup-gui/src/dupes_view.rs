@@ -819,6 +819,12 @@ impl DupesView {
                     ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
                         ui.vertical(|ui| {
                             ui.set_width(200.0);
+                            // Selectable labels sense clicks and would swallow
+                            // right-clicks over the card's text, so the menu
+                            // would only open over the sparse non-text areas.
+                            // The read-only/unlocked badges keep their own
+                            // menus via an explicit click sense.
+                            ui.style_mut().interaction.selectable_labels = false;
                             self.thumbnail(ui, file);
                             ui.label(
                                 RichText::new(&file.rel_path)
@@ -1850,8 +1856,8 @@ mod ui_tests {
             );
         harness.run();
 
-        // The name label doesn't sense clicks, so the right-click falls
-        // through to the card's own interact response.
+        // Card labels are non-selectable (they must not sense clicks), so the
+        // right-click falls through to the card's own interact response.
         harness.get_by_label("best").click_secondary();
         harness.run();
         assert!(

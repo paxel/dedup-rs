@@ -2,9 +2,10 @@
 
 All notable changes to the `dedup-rs` project will be documented in this file.
 
-## [0.1.0] - 2026-07-09
+## [0.1.0] - 2026-07-11
 
 ### Added
+- File-card context menus in the Duplicate Management tab: right-clicking anywhere on a file card offers OPEN (hand the file to the system's default application, via the `open` crate) and SHOW IN FOLDER (open the file's directory in the file manager) — a full-fidelity escape hatch for inspecting any file before deciding what to delete. Card text is no longer mouse-selectable, since selectable labels would swallow the right-click; the read-only badge keeps its own unlock menu.
 - Assisted filter builder in the File Management tab: the section shows just `FILTER +`; pressing `+` offers the MIME / NAME / SIZE condition types and each added condition becomes a removable pill with an inline value editor. The editor helps with data: MIME values get clickable suggestions from the source repo's actual MIME types (with counts, narrowed as you type), NAME values show a live debounced count of matching files, and every kind offers the recently used values as one-click quick-picks. Entered values are remembered across sessions (`filter_history.json` in the config dir), whole condition sets can be saved as named presets and re-applied with one click, and the history + presets can be exported to / imported from a JSON file.
 - `diff` filters combine multiple fields: `-f/--filter` accepts any of `mime:`, `name:`, and `size:` together (space-separated), combined with AND; the GUI's filter builder maps to these same three fields (editing a condition clears the stale preview). `name:`/`mime:` substring values are taken verbatim, so internal or repeated spaces are preserved rather than collapsed.
 - The GUI's File Management tab is organised into labelled sections (repos, command, target subdir, filter, action) for a clear layout.
