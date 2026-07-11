@@ -31,6 +31,14 @@ enum Commands {
         #[command(subcommand)]
         command: DiffCommands,
     },
+    /// Print a Markdown triage report (stats, duplicates, flagged files)
+    Report {
+        /// Repositories to report on
+        names: Vec<String>,
+        /// Report on all registered repositories
+        #[arg(long)]
+        all: bool,
+    },
     /// Scan repos for likely-critical files (wallets, keys, vaults, docs)
     Scan {
         /// Repositories to scan
@@ -331,6 +339,10 @@ fn main() -> anyhow::Result<()> {
             let store = Store::open()?;
             run_diff(&store, command)?;
         }
+        Some(Commands::Report { names, all }) => {
+            let store = Store::open()?;
+            run_report(&store, names, all)?;
+        }
         Some(Commands::Scan { names, all }) => {
             let store = Store::open()?;
             run_scan(&store, names, all)?;
@@ -382,8 +394,9 @@ fn diff_refs<'a>(reference: &'a str, extra: &'a [String]) -> Vec<&'a str> {
         .collect()
 }
 
-fn run_scan(store: &Store, names: Vec<String>, all: bool) -> anyhow::Result<()> {
-    let names: Vec<String> = if all {
+/// Resolve a repo-name list, expanding `--all` to every registered repo.
+fn resolve_repo_names(store: &Store, names: Vec<String>, all: bool) -> anyhow::Result<Vec<String>> {
+    let names = if all {
         store
             .list_repos()?
             .into_iter()
@@ -393,8 +406,49 @@ fn run_scan(store: &Store, names: Vec<String>, all: bool) -> anyhow::Result<()> 
         names
     };
     if names.is_empty() {
-        anyhow::bail!("No repositories to scan. Pass repo names or --all.");
+        anyhow::bail!("No repositories. Pass repo names or --all.");
     }
+    Ok(names)
+}
+
+fn run_report(store: &Store, names: Vec<String>, all: bool) -> anyhow::Result<()> {
+    let names = resolve_repo_names(store, names, all)?;
+    let reports = dedup_core::report::build_report(store, &names)?;
+    println!("# dedup triage report\n");
+    for r in &reports {
+        println!("## {}\n", r.name);
+        println!("- Files: {} ({})", r.files, format_size(r.bytes));
+        println!("- Missing (indexed, gone from disk): {}", r.missing);
+        println!(
+            "- Exact-duplicate groups: {} · reclaimable {}",
+            r.dup_groups,
+            format_size(r.reclaimable)
+        );
+        let triaged = if r.triage_done_ms > 0 { "yes" } else { "no" };
+        println!("- Triaged: {triaged}");
+        if r.flags.is_empty() {
+            println!("- Flagged critical files: none");
+        } else {
+            let parts: Vec<String> = r
+                .flags
+                .iter()
+                .map(|(c, n)| format!("{} {}", n, c.label()))
+                .collect();
+            println!("- Flagged critical files: {}", parts.join(", "));
+        }
+        if !r.top_mimes.is_empty() {
+            println!("- Top types:");
+            for (mime, count) in &r.top_mimes {
+                println!("  - {mime}: {count}");
+            }
+        }
+        println!();
+    }
+    Ok(())
+}
+
+fn run_scan(store: &Store, names: Vec<String>, all: bool) -> anyhow::Result<()> {
+    let names = resolve_repo_names(store, names, all)?;
 
     let flags = dedup_core::scan::scan_repos(store, &names)?;
     if flags.is_empty() {
