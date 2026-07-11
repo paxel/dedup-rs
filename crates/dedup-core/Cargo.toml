@@ -22,6 +22,7 @@ quick-xml = "0.41.0"
 calamine = "0.36.0"
 tar = "0.4.46"
 flate2 = "1.1.9"
+mail-parser = "0.11.5"
 
 [dev-dependencies]
 tempfile = "3.10"

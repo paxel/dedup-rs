@@ -71,6 +71,9 @@ pub fn compute(path: &Path, ffmpeg_available: bool) -> Fingerprints {
         // Office documents share the PDF text-hash slot: text identity groups
         // them together (and with matching PDFs) regardless of container.
         fp.pdf_hash = doc_text_hash(path, &mime);
+    } else if mime == "message/rfc822" {
+        // A single email (.eml): dedup the same message exported twice.
+        fp.pdf_hash = eml_hash(path);
     } else if mime.starts_with("text/") {
         // Plain text / CSV: group exports and logs that differ only by BOM,
         // line endings or trailing whitespace.
@@ -501,6 +504,23 @@ fn zip_doc_text(path: &Path, mime: &str) -> Option<String> {
     Some(out)
 }
 
+/// BLAKE3 identity of an `.eml` email: its `Message-ID` when present (so the
+/// same mail exported twice dedups reliably), else a normalized subject+body
+/// digest. `None` if unparseable. mbox stores are out of scope here.
+pub fn eml_hash(path: &Path) -> Option<[u8; 32]> {
+    let bytes = std::fs::read(path).ok()?;
+    let msg = mail_parser::MessageParser::default().parse(&bytes)?;
+    let basis = match msg.message_id() {
+        Some(id) => format!("message-id:{id}"),
+        None => {
+            let subject = msg.subject().unwrap_or_default();
+            let body = msg.body_text(0).unwrap_or_default();
+            format!("{subject}\n{body}")
+        }
+    };
+    text_hash(&basis)
+}
+
 /// Above this size a text file is hashed raw (no normalization) to bound cost.
 const TEXT_NORMALIZE_CAP: u64 = 32 * 1024 * 1024;
 
@@ -824,6 +844,36 @@ mod tests {
             text_file_hash(&changed).unwrap(),
             h_lf,
             "row change differs"
+        );
+    }
+
+    /// The same email exported twice (same Message-ID) hashes identically;
+    /// a different message does not.
+    #[test]
+    fn eml_files_group_by_message_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mail = |mid: &str, body: &str| {
+            format!(
+                "From: a@example.com\r\nTo: b@example.com\r\nSubject: Hi\r\n\
+                 Message-ID: <{mid}>\r\n\r\n{body}\r\n"
+            )
+        };
+
+        let one = dir.path().join("one.eml");
+        std::fs::write(&one, mail("abc@host", "Hello there").as_bytes()).unwrap();
+        // Same Message-ID, trivially different body (a re-export).
+        let copy = dir.path().join("copy.eml");
+        std::fs::write(&copy, mail("abc@host", "Hello  there  ").as_bytes()).unwrap();
+        // Different Message-ID.
+        let other = dir.path().join("other.eml");
+        std::fs::write(&other, mail("xyz@host", "Hello there").as_bytes()).unwrap();
+
+        let h_one = eml_hash(&one).expect("one");
+        assert_eq!(h_one, eml_hash(&copy).unwrap(), "same Message-ID groups");
+        assert_ne!(
+            h_one,
+            eml_hash(&other).unwrap(),
+            "different Message-ID differs"
         );
     }
 }
