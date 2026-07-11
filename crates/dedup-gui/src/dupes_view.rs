@@ -3,6 +3,7 @@
 //! delete the worse copies — batched per repo, never without a confirmation.
 
 use crate::icon;
+use crate::lightbox::{FullResCache, LightboxState};
 use crate::theme;
 use crate::thumbs::ThumbCache;
 use crate::util::{format_mtime, format_size};
@@ -120,6 +121,8 @@ enum Act {
     Relock(FileKey),
     Open(PathBuf),
     Reveal(PathBuf),
+    /// Open the image lightbox at (group index, member index).
+    OpenLightbox(usize, usize),
     ToggleQuickDelete,
     AutoResolve,
     DeleteGroup(usize),
@@ -168,6 +171,10 @@ pub struct DupesView {
     error: Option<String>,
     confirm: Option<(String, ConfirmAction)>,
     thumbs: ThumbCache,
+    /// Open image lightbox (full-window zoom viewer), if any.
+    lightbox: Option<LightboxState>,
+    /// Full-resolution texture cache backing the lightbox.
+    full_res: FullResCache,
 }
 
 impl DupesView {
@@ -197,6 +204,8 @@ impl DupesView {
             error: None,
             confirm: None,
             thumbs: ThumbCache::new(3),
+            lightbox: None,
+            full_res: FullResCache::new(2),
         }
     }
 
@@ -208,6 +217,9 @@ impl DupesView {
     pub fn show(&mut self, ui: &mut egui::Ui, store: &Arc<Store>) {
         let ctx = ui.ctx().clone();
         if self.thumbs.poll(&ctx) {
+            ctx.request_repaint();
+        }
+        if self.full_res.poll(&ctx) {
             ctx.request_repaint();
         }
         self.drain_messages(store, &ctx);
@@ -243,11 +255,15 @@ impl DupesView {
             self.confirm_modal(ui, &prompt, verb, &mut acts);
         }
 
+        // The lightbox overlays everything else when open.
+        self.lightbox_modal(&ctx, &mut acts);
+
         for act in acts {
             self.apply(&ctx, store, act);
         }
 
-        // Keep the spinner/progress ticking while a background op runs.
+        // Keep the spinner/progress ticking while a background op runs. The
+        // full-res cache wakes the UI itself when a decode lands.
         if self.busy.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -787,7 +803,7 @@ impl DupesView {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             for (fi, file) in group.iter().enumerate() {
-                                self.file_card(ui, file, fi == 0, acts);
+                                self.file_card(ui, gi, fi, file, fi == 0, acts);
                             }
                         });
                     });
@@ -797,6 +813,8 @@ impl DupesView {
     fn file_card(
         &mut self,
         ui: &mut egui::Ui,
+        gi: usize,
+        fi: usize,
         file: &DupeFile,
         is_best: bool,
         acts: &mut Vec<Act>,
@@ -825,7 +843,7 @@ impl DupesView {
                             // The read-only/unlocked badges keep their own
                             // menus via an explicit click sense.
                             ui.style_mut().interaction.selectable_labels = false;
-                            self.thumbnail(ui, file);
+                            self.thumbnail(ui, gi, fi, file, acts);
                             ui.label(
                                 RichText::new(&file.rel_path)
                                     .color(theme::TEXT)
@@ -946,7 +964,14 @@ impl DupesView {
             });
     }
 
-    fn thumbnail(&mut self, ui: &mut egui::Ui, file: &DupeFile) {
+    fn thumbnail(
+        &mut self,
+        ui: &mut egui::Ui,
+        gi: usize,
+        fi: usize,
+        file: &DupeFile,
+        acts: &mut Vec<Act>,
+    ) {
         let is_image = file
             .entry
             .mime
@@ -964,11 +989,14 @@ impl DupesView {
                 let hex = hash_hex(&file.entry.hash);
                 let source = file.absolute_path();
                 if let Some(tex) = self.thumbs.get(&hex, &source) {
-                    let resp = ui.add(
-                        egui::Image::new(egui::load::SizedTexture::from_handle(&tex))
-                            .max_height(120.0)
-                            .corner_radius(6),
-                    );
+                    let resp = ui
+                        .add(
+                            egui::Image::new(egui::load::SizedTexture::from_handle(&tex))
+                                .max_height(120.0)
+                                .corner_radius(6)
+                                .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text("Click to open the lightbox");
                     // Hairline so dark photos stand off the dark panel.
                     ui.painter().rect_stroke(
                         resp.rect,
@@ -976,6 +1004,9 @@ impl DupesView {
                         egui::Stroke::new(1.0, theme::HAIRLINE),
                         egui::StrokeKind::Inside,
                     );
+                    if resp.clicked() {
+                        acts.push(Act::OpenLightbox(gi, fi));
+                    }
                     return;
                 }
             }
@@ -993,6 +1024,262 @@ impl DupesView {
                     ui.label(RichText::new(label).color(theme::LILAC).size(11.0));
                 });
             });
+    }
+
+    /// Full-window image lightbox: wheel zoom (around cursor), drag pan, `F`
+    /// fit / `1` 1:1, `←`/`→` step the group, `Del`/`K` toggle the mark, `Esc`
+    /// close. Marking respects read-only exactly like the cards.
+    fn lightbox_modal(&mut self, ctx: &egui::Context, acts: &mut Vec<Act>) {
+        // Take the state so `full_res`/`thumbs` can be borrowed mutably below;
+        // it is put back at the end unless the lightbox was closed.
+        let Some(mut state) = self.lightbox.take() else {
+            return;
+        };
+        // Locate the addressed group on the current page.
+        let page_start = self.cached_page.unwrap_or(0) * PAGE_SIZE;
+        let Some(group) = self
+            .page_groups
+            .get(state.group.wrapping_sub(page_start))
+            .filter(|g| !g.is_empty())
+            .cloned()
+        else {
+            return; // group gone (page changed / resolved) → stay closed
+        };
+        let count = group.len();
+        let mut idx = state.index.min(count - 1);
+
+        // Keyboard: navigation, view modes, mark, close.
+        let mut close = false;
+        let mut new_idx = idx;
+        let (mut do_fit, mut do_one, mut do_mark) = (false, false, false);
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::Escape) {
+                close = true;
+            }
+            if i.key_pressed(egui::Key::ArrowRight) {
+                new_idx = (idx + 1) % count;
+            }
+            if i.key_pressed(egui::Key::ArrowLeft) {
+                new_idx = (idx + count - 1) % count;
+            }
+            if i.key_pressed(egui::Key::F) {
+                do_fit = true;
+            }
+            if i.key_pressed(egui::Key::Num1) {
+                do_one = true;
+            }
+            if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::K) {
+                do_mark = true;
+            }
+        });
+        if close {
+            return; // dropped state = closed
+        }
+        if new_idx != idx {
+            idx = new_idx;
+            state.index = idx;
+            state.reset_view();
+        }
+
+        let file = &group[idx];
+        let k = key(file);
+        let markable = !self.repo_is_ro(&file.repo) || self.unlocked.contains(&k);
+        let is_marked = self.marked.contains(&k);
+        if do_mark && markable {
+            acts.push(Act::ToggleMark(k.clone()));
+        }
+
+        // Full-resolution texture, falling back to the upscaled thumbnail while
+        // the decode is in flight. The transform uses the true pixel size
+        // (from the index) so the image doesn't jump when full-res lands.
+        let hex = hash_hex(&file.entry.hash);
+        let source = file.absolute_path();
+        let full = self.full_res.get(&hex, &source);
+        let tex = full.clone().or_else(|| self.thumbs.get(&hex, &source));
+        let img_size = file
+            .entry
+            .img_size
+            .map(|(w, h)| egui::vec2(w as f32, h as f32))
+            .or_else(|| tex.as_ref().map(|t| t.size_vec2()))
+            .unwrap_or(egui::vec2(1.0, 1.0));
+
+        let meta = format!(
+            "{} · {} · {} · {}",
+            file.rel_path,
+            format_size(file.entry.size),
+            file.entry
+                .img_size
+                .map(|(w, h)| format!("{w}×{h}"))
+                .unwrap_or_else(|| "—".into()),
+            format_mtime(file.entry.modified_ms),
+        );
+
+        egui::Area::new(Id::new("lightbox"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                let screen = ctx.content_rect();
+                let bg = ui.allocate_rect(screen, egui::Sense::click_and_drag());
+                ui.painter()
+                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(238));
+
+                // Viewport = screen minus top control bar and bottom strip.
+                let viewport = egui::Rect::from_min_max(
+                    egui::pos2(screen.min.x + 8.0, screen.min.y + 44.0),
+                    egui::pos2(screen.max.x - 8.0, screen.max.y - 56.0),
+                );
+
+                // Wheel zoom around the cursor; drag pans.
+                if bg.dragged() {
+                    state.pan_by(bg.drag_delta(), viewport, img_size);
+                }
+                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                if scroll != 0.0
+                    && let Some(cursor) = ctx.pointer_hover_pos()
+                    && viewport.contains(cursor)
+                {
+                    state.zoom_at(cursor, (scroll * 0.005).exp(), viewport, img_size);
+                }
+
+                // Draw the image (clipped to the viewport).
+                if let Some(tex) = &tex {
+                    let rect = state.image_rect(viewport, img_size);
+                    ui.painter_at(viewport).image(
+                        tex.id(),
+                        rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                } else {
+                    ui.painter().text(
+                        viewport.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "decoding…",
+                        egui::FontId::proportional(16.0),
+                        theme::TAN,
+                    );
+                }
+
+                // Top control bar.
+                let top = egui::Rect::from_min_max(
+                    egui::pos2(screen.min.x + 8.0, screen.min.y + 6.0),
+                    egui::pos2(screen.max.x - 8.0, screen.min.y + 40.0),
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(top)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(format!("{} CLOSE", icon::CHECK))
+                                        .color(theme::BLACK),
+                                )
+                                .fill(theme::AMBER),
+                            )
+                            .clicked()
+                        {
+                            close = true;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new(icon::CARET_LEFT).color(theme::TEXT))
+                                    .fill(theme::PANEL),
+                            )
+                            .clicked()
+                        {
+                            new_idx = (idx + count - 1) % count;
+                        }
+                        ui.label(
+                            RichText::new(format!("{} / {count}", idx + 1))
+                                .color(theme::TAN)
+                                .strong(),
+                        );
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(icon::CARET_RIGHT).color(theme::TEXT),
+                                )
+                                .fill(theme::PANEL),
+                            )
+                            .clicked()
+                        {
+                            new_idx = (idx + 1) % count;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("FIT").color(theme::TEXT))
+                                    .fill(theme::PANEL),
+                            )
+                            .clicked()
+                        {
+                            do_fit = true;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("1:1").color(theme::TEXT))
+                                    .fill(theme::PANEL),
+                            )
+                            .clicked()
+                        {
+                            do_one = true;
+                        }
+                        let (mlabel, mfill) = if is_marked {
+                            (format!("{} MARKED", icon::CHECK), theme::RED)
+                        } else {
+                            ("MARK".to_string(), theme::PANEL)
+                        };
+                        let mcolor = if is_marked { theme::BLACK } else { theme::TEXT };
+                        if markable
+                            && ui
+                                .add(egui::Button::new(RichText::new(mlabel).color(mcolor)).fill(mfill))
+                                .clicked()
+                        {
+                            acts.push(Act::ToggleMark(k.clone()));
+                        }
+                    },
+                );
+
+                // Bottom metadata + hint strip.
+                let bottom = egui::Rect::from_min_max(
+                    egui::pos2(screen.min.x + 8.0, screen.max.y - 50.0),
+                    egui::pos2(screen.max.x - 8.0, screen.max.y - 6.0),
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(bottom)
+                        .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                    |ui| {
+                        ui.label(RichText::new(&meta).color(theme::TEXT).size(13.0));
+                        ui.label(
+                            RichText::new(format!(
+                                "wheel: zoom · drag: pan · F fit · 1 100% · {}/{} step · Del/K mark · Esc close",
+                                icon::CARET_LEFT,
+                                icon::CARET_RIGHT,
+                            ))
+                            .color(theme::LILAC)
+                            .size(11.0),
+                        );
+                    },
+                );
+            });
+
+        // Apply deferred view-mode changes now that we know the viewport.
+        if do_fit {
+            state.fit();
+        }
+        if do_one {
+            state.one_to_one();
+        }
+        if new_idx != idx {
+            state.index = new_idx;
+            state.reset_view();
+        }
+
+        if !close {
+            self.lightbox = Some(state);
+        }
     }
 
     fn confirm_modal(&mut self, ui: &mut egui::Ui, prompt: &str, verb: &str, acts: &mut Vec<Act>) {
@@ -1067,6 +1354,9 @@ impl DupesView {
                 if let Err(e) = crate::external::reveal(&path) {
                     self.error = Some(format!("Show in folder failed: {e}"));
                 }
+            }
+            Act::OpenLightbox(gi, fi) => {
+                self.lightbox = Some(LightboxState::new(gi, fi));
             }
             Act::ToggleQuickDelete => {
                 if self.quick_delete {
@@ -1874,6 +2164,80 @@ mod ui_tests {
         );
     }
 
+    /// The lightbox opens over a group, steps through its members with the
+    /// arrow keys, toggles the shown file's mark with `K`, and closes on `Esc`.
+    #[test]
+    fn lightbox_opens_navigates_marks_and_closes() {
+        let group: DupeGroup = (0..3).map(image_file).collect();
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true; // fabricated groups, no repos needed
+        view.results = Some(Results::Similar(vec![group.clone()]));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store);
+                },
+                view,
+            );
+        harness.run();
+
+        // Open the lightbox on the first (best) member.
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.run();
+        assert!(
+            harness.query_by_label("1 / 3").is_some(),
+            "lightbox shows the 1/3 position counter"
+        );
+        assert!(
+            harness
+                .query_by_label(&format!("{} CLOSE", icon::CHECK))
+                .is_some(),
+            "lightbox shows a CLOSE control"
+        );
+
+        // Mark the best copy (index 0 is never default-marked), via `K`.
+        let best_key = key(&group[0]);
+        harness.key_press(egui::Key::K);
+        harness.run();
+        assert!(
+            harness.state().marked.contains(&best_key),
+            "K marks the shown file"
+        );
+
+        // Step to the next member.
+        harness.key_press(egui::Key::ArrowRight);
+        harness.run();
+        assert_eq!(
+            harness.state().lightbox.as_ref().map(|l| l.index),
+            Some(1),
+            "ArrowRight advances to the second member"
+        );
+        assert!(
+            harness.query_by_label("2 / 3").is_some(),
+            "counter follows navigation"
+        );
+
+        // Close.
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        assert!(
+            harness.state().lightbox.is_none(),
+            "Escape closes the lightbox"
+        );
+    }
+
     /// Re-locking removes the override and any pending mark, and turning a
     /// repo read-only clears its per-file unlocks.
     #[test]
@@ -2158,6 +2522,80 @@ mod ui_tests {
         let img = harness.render().expect("wgpu render failed");
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/dupes_populated.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Renders the open lightbox over a real on-disk image to
+    /// `target/lightbox.png` for manual inspection. `--ignored` (needs wgpu).
+    #[test]
+    #[ignore = "renders a PNG for manual inspection"]
+    fn render_lightbox() {
+        // Real images on disk so the thumb/full-res pipeline has something to
+        // decode (the lightbox draws the actual pixels).
+        let dir = tempfile::tempdir().unwrap();
+        let mut group: DupeGroup = Vec::new();
+        for i in 0..3u8 {
+            let rel = format!("photo{i}.png");
+            let path = dir.path().join(&rel);
+            image::RgbImage::from_fn(640, 480, |x, y| {
+                image::Rgb([x as u8, y as u8, (i as u32 * 60) as u8])
+            })
+            .save(&path)
+            .unwrap();
+            let mut hash = [0u8; 32];
+            hash[0] = i;
+            group.push(DupeFile {
+                repo: "r".into(),
+                repo_root: dir.path().to_string_lossy().into_owned(),
+                rel_path: rel,
+                entry: dedup_core::store::FileEntry {
+                    size: 1000,
+                    hash,
+                    modified_ms: 0,
+                    missing: false,
+                    mime: Some("image/png".into()),
+                    img_fingerprint: None,
+                    video_hash: None,
+                    pdf_hash: None,
+                    audio: None,
+                    img_size: Some((640, 480)),
+                },
+            });
+        }
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+        view.lightbox = Some(LightboxState::new(0, 0));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 720.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = (&tmp, &dir);
+                    view.show(ui, &store);
+                },
+                view,
+            );
+        // Several frames with pauses so the background decode lands.
+        for _ in 0..12 {
+            harness.run();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        harness.run();
+        let img = harness.render().expect("wgpu render failed");
+        let out =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/lightbox.png");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }

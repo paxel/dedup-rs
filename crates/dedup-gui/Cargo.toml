@@ -17,3 +17,4 @@ serde_json = "1.0"
 [dev-dependencies]
 egui_kittest = { version = "0.35", features = ["wgpu", "snapshot"] }
 tempfile = "3.10"
+image = "0.25"

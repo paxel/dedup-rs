@@ -6,6 +6,7 @@ mod dupes_view;
 mod external;
 mod files_view;
 mod icon;
+mod lightbox;
 mod status;
 mod theme;
 mod thumbs;

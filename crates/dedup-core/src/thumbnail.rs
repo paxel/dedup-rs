@@ -71,6 +71,22 @@ pub fn load_rgba(path: &Path) -> Result<(u32, u32, Vec<u8>), ThumbError> {
     Ok((rgba.width(), rgba.height(), rgba.into_raw()))
 }
 
+/// Decode an image to `(width, height, rgba8)` at full resolution, downscaling
+/// only when its longest edge exceeds `max_edge` (to stay within GPU texture
+/// limits — a 50 MP photo is ~200 MB RGBA). Aspect ratio is preserved. Used by
+/// the lightbox's full-resolution viewer, so `max_edge` is large (e.g. 8192).
+pub fn load_full_rgba(path: &Path, max_edge: u32) -> Result<(u32, u32, Vec<u8>), ThumbError> {
+    let img = image::open(path).map_err(|e| ThumbError::Image(e.to_string()))?;
+    let max_edge = max_edge.max(1);
+    let img = if img.width().max(img.height()) > max_edge {
+        img.thumbnail(max_edge, max_edge)
+    } else {
+        img
+    };
+    let rgba = img.to_rgba8();
+    Ok((rgba.width(), rgba.height(), rgba.into_raw()))
+}
+
 /// Ensure a thumbnail for `source` (keyed by `hash_hex`) exists and return it
 /// decoded as `(width, height, rgba8)`. This is the one call a GUI worker needs.
 pub fn get_rgba(source: &Path, hash_hex: &str) -> Result<(u32, u32, Vec<u8>), ThumbError> {
@@ -112,5 +128,28 @@ mod tests {
         assert_eq!(rgba.len() as u32, w * h * 4);
         // Long edge scaled to the cap, aspect preserved (1000x600 -> 512x307).
         assert_eq!(w, MAX_EDGE);
+    }
+
+    #[test]
+    fn load_full_rgba_keeps_small_images_and_caps_large_ones() {
+        let dir = tempfile::tempdir().expect("dir");
+
+        // Below the cap: returned at native resolution.
+        let small = dir.path().join("small.png");
+        image::RgbImage::from_fn(300, 200, |_, _| image::Rgb([10, 20, 30]))
+            .save(&small)
+            .expect("write small");
+        let (w, h, rgba) = load_full_rgba(&small, 8192).expect("load small");
+        assert_eq!((w, h), (300, 200));
+        assert_eq!(rgba.len() as u32, w * h * 4);
+
+        // Above the cap: longest edge scaled down to the cap, aspect preserved.
+        let big = dir.path().join("big.png");
+        image::RgbImage::from_fn(2000, 1000, |_, _| image::Rgb([1, 2, 3]))
+            .save(&big)
+            .expect("write big");
+        let (w, h, _) = load_full_rgba(&big, 512).expect("load big");
+        assert_eq!(w, 512);
+        assert_eq!(h, 256);
     }
 }
