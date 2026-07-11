@@ -518,6 +518,10 @@ impl eframe::App for DedupApp {
 
         let mut actions: Vec<Action> = Vec::new();
         self.top_bar(ui);
+        // Audio preview belongs to the Duplicates tab; stop it elsewhere.
+        if self.tab != Tab::Duplicates {
+            self.dupes.stop_audio();
+        }
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Repositories => self.repositories_view(ui, &mut actions),
             Tab::Duplicates => self.dupes.show(ui, &self.store),

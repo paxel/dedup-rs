@@ -7,6 +7,7 @@ mod external;
 mod files_view;
 mod icon;
 mod lightbox;
+mod player;
 mod status;
 mod theme;
 mod thumbs;

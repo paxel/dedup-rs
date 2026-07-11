@@ -4,6 +4,7 @@
 
 use crate::icon;
 use crate::lightbox::{CompareState, FullResCache, LightboxState};
+use crate::player::Player;
 use crate::theme;
 use crate::thumbs::ThumbCache;
 use crate::util::{format_mtime, format_size};
@@ -110,6 +111,17 @@ fn key(file: &DupeFile) -> FileKey {
     (file.repo.clone(), file.rel_path.clone())
 }
 
+/// Format milliseconds as `m:ss` (or `h:mm:ss` past an hour) for the seek bar.
+fn fmt_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
 /// One-line `path · size · WxH · mtime` description used by the lightbox.
 fn lightbox_meta(file: &DupeFile) -> String {
     format!(
@@ -137,6 +149,10 @@ enum Act {
     Reveal(PathBuf),
     /// Open the image lightbox at (group index, member index).
     OpenLightbox(usize, usize),
+    /// Play an audio file: (content-hash hex, absolute path, total ms).
+    PlayAudio(String, PathBuf, u64),
+    /// Seek the current audio to a fraction [0,1] of its length.
+    SeekAudio(f32),
     ToggleQuickDelete,
     AutoResolve,
     DeleteGroup(usize),
@@ -189,6 +205,8 @@ pub struct DupesView {
     lightbox: Option<LightboxState>,
     /// Full-resolution texture cache backing the lightbox.
     full_res: FullResCache,
+    /// Global audio preview player (one file at a time).
+    player: Player,
 }
 
 impl DupesView {
@@ -220,6 +238,14 @@ impl DupesView {
             thumbs: ThumbCache::new(3),
             lightbox: None,
             full_res: FullResCache::new(2),
+            player: Player::new(),
+        }
+    }
+
+    /// Stop any audio preview (called when leaving the tab).
+    pub fn stop_audio(&self) {
+        if self.player.is_active() {
+            self.player.stop();
         }
     }
 
@@ -276,9 +302,10 @@ impl DupesView {
             self.apply(&ctx, store, act);
         }
 
-        // Keep the spinner/progress ticking while a background op runs. The
-        // full-res cache wakes the UI itself when a decode lands.
-        if self.busy.is_some() {
+        // Keep the spinner/progress ticking while a background op runs, and the
+        // seek bar moving while audio plays. The full-res cache wakes the UI
+        // itself when a decode lands.
+        if self.busy.is_some() || self.player.is_active() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
@@ -887,6 +914,8 @@ impl DupesView {
                                 .size(11.0),
                             );
 
+                            self.audio_controls(ui, file, acts);
+
                             if is_best {
                                 ui.label(
                                     RichText::new(format!("{} BEST", icon::STAR))
@@ -976,6 +1005,64 @@ impl DupesView {
                     }
                 });
             });
+    }
+
+    /// Play/pause + seek bar for audio files. One file plays at a time; the
+    /// controls reflect the global player and survive scrolling (the player is
+    /// not per-card). No-op for non-audio files.
+    fn audio_controls(&mut self, ui: &mut egui::Ui, file: &DupeFile, acts: &mut Vec<Act>) {
+        let is_audio = file
+            .entry
+            .mime
+            .as_deref()
+            .is_some_and(|m| m.starts_with("audio/"));
+        if !is_audio {
+            return;
+        }
+        let hex = hash_hex(&file.entry.hash);
+        let total_ms = file
+            .entry
+            .audio
+            .as_ref()
+            .map(|a| a.duration_ms as u64)
+            .unwrap_or(0);
+        let snap = self.player.snapshot();
+        let is_current = snap.loaded && snap.hex.as_deref() == Some(hex.as_str());
+        let playing = is_current && snap.playing;
+
+        ui.horizontal(|ui| {
+            let label = if playing { "PAUSE" } else { "PLAY" };
+            let fill = if playing { theme::AMBER } else { theme::PANEL };
+            let col = if playing { theme::BLACK } else { theme::TEXT };
+            if ui
+                .add(egui::Button::new(RichText::new(label).color(col)).fill(fill))
+                .clicked()
+            {
+                acts.push(Act::PlayAudio(hex.clone(), file.absolute_path(), total_ms));
+            }
+            let (pos, total) = if is_current {
+                (snap.pos_ms, snap.total_ms.max(total_ms))
+            } else {
+                (0, total_ms)
+            };
+            ui.label(
+                RichText::new(format!("{} / {}", fmt_ms(pos), fmt_ms(total)))
+                    .color(theme::TAN)
+                    .size(11.0),
+            );
+        });
+
+        // Seek bar (only meaningful for the currently-loaded file).
+        let total = snap.total_ms.max(total_ms);
+        if is_current && total > 0 {
+            let mut frac = (snap.pos_ms as f32 / total as f32).clamp(0.0, 1.0);
+            if ui
+                .add(egui::Slider::new(&mut frac, 0.0..=1.0).show_value(false))
+                .changed()
+            {
+                acts.push(Act::SeekAudio(frac));
+            }
+        }
     }
 
     fn thumbnail(
@@ -1541,6 +1628,16 @@ impl DupesView {
             Act::OpenLightbox(gi, fi) => {
                 self.lightbox = Some(LightboxState::new(gi, fi));
             }
+            Act::PlayAudio(hex, path, total_ms) => {
+                let snap = self.player.snapshot();
+                // Clicking the playing file toggles pause; another file starts it.
+                if snap.loaded && snap.hex.as_deref() == Some(hex.as_str()) {
+                    self.player.toggle_pause();
+                } else {
+                    self.player.play(&hex, &path, total_ms);
+                }
+            }
+            Act::SeekAudio(f) => self.player.seek_fraction(f),
             Act::ToggleQuickDelete => {
                 if self.quick_delete {
                     self.quick_delete = false;
@@ -2419,6 +2516,80 @@ mod ui_tests {
             harness.state().lightbox.is_none(),
             "Escape closes the lightbox"
         );
+    }
+
+    /// An audio dummy file (unique hash, audio mime, a stored duration).
+    fn audio_file(i: usize) -> DupeFile {
+        let mut hash = [0u8; 32];
+        hash[0] = 0xA0 | i as u8;
+        DupeFile {
+            repo: "r".into(),
+            repo_root: "/nonexistent-dedup-test".into(),
+            rel_path: format!("track{i}.mp3"),
+            entry: dedup_core::store::FileEntry {
+                size: 5_000,
+                hash,
+                modified_ms: 0,
+                missing: false,
+                mime: Some("audio/mpeg".into()),
+                img_fingerprint: None,
+                video_hash: None,
+                pdf_hash: None,
+                audio: Some(dedup_core::store::AudioFp {
+                    duration_ms: 185_000,
+                    chunk_hashes: Vec::new(),
+                }),
+                img_size: None,
+            },
+        }
+    }
+
+    /// Audio cards show a PLAY control; clicking it loads that file into the
+    /// single global player (which then shows PAUSE and a seek bar).
+    #[test]
+    fn audio_card_plays_and_reflects_player_state() {
+        let group: DupeGroup = (0..2).map(audio_file).collect();
+        let target_hex = dedup_core::thumbnail::hash_hex(&group[0].entry.hash);
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(900.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store);
+                },
+                view,
+            );
+        harness.run();
+
+        let plays: Vec<_> = harness.get_all_by_label("PLAY").collect();
+        assert_eq!(plays.len(), 2, "each audio card shows a PLAY control");
+
+        // Click the first card's PLAY → that file becomes the loaded one.
+        // A playing card keeps repainting (seek bar), so step a fixed number of
+        // frames instead of running to a settled state.
+        plays[0].click();
+        harness.step();
+        harness.step();
+        let snap = harness.state().player.snapshot();
+        assert_eq!(
+            snap.hex.as_deref(),
+            Some(target_hex.as_str()),
+            "clicking PLAY loads that file into the global player"
+        );
+        assert!(snap.loaded, "player reports a loaded track");
     }
 
     /// `C` enters A/B compare, which exposes MARK B and a FLICKER toggle, marks

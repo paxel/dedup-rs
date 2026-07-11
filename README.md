@@ -11,6 +11,7 @@ This project is a greenfield rewrite of the legacy Java/Javalin/React `dedup` im
 - **CLI**: `clap` (derive-based CLI arguments parser)
 - **Hashing**: `blake3` (modern, ultra-fast parallel hashing)
 - **Fingerprints**: image/video dHash (`image`), PDF text (`lopdf`), audio (`symphonia`), MIME via `infer`/`mime_guess`; video frames via `ffmpeg`
+- **Audio preview**: `rodio` (GUI). On Linux this links against ALSA, so building `dedup-gui` needs the ALSA development headers — install `libasound2-dev` (Debian/Ubuntu) or `alsa-lib-devel` (Fedora). At runtime, playback degrades gracefully when no audio device is present.
 
 ---
 
