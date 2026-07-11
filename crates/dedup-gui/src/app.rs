@@ -754,6 +754,15 @@ impl DedupApp {
                         theme::TAN,
                         "When this repository was last scanned",
                     );
+                    if row.stats.triage_done_ms > 0 {
+                        stat(
+                            ui,
+                            "TRIAGED",
+                            &format_last_scan(row.stats.triage_done_ms),
+                            theme::BLUE,
+                            "This repo's unique content was copied into a sanitized dir",
+                        );
+                    }
                 });
 
                 match tracked {

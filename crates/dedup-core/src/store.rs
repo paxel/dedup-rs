@@ -182,6 +182,9 @@ pub struct RepoStats {
     pub missing_count: u64,
     /// Epoch milliseconds of the last completed scan; 0 if never scanned.
     pub last_scan_ms: u64,
+    /// Epoch milliseconds when this repo was marked triage-done (its unique
+    /// content copied into a sanitized dir); 0 if not yet done.
+    pub triage_done_ms: u64,
 }
 
 pub type DuplicateGroup = (u64, [u8; 32], Vec<String>);
@@ -487,6 +490,7 @@ impl Store {
                 total_size: 0,
                 missing_count: 0,
                 last_scan_ms: 0,
+                triage_done_ms: 0,
             });
         }
 
@@ -503,7 +507,29 @@ impl Store {
             total_size: get("total_size")?,
             missing_count: get("missing_count")?,
             last_scan_ms: get("last_scan_ms")?,
+            triage_done_ms: get("triage_done_ms")?,
         })
+    }
+
+    /// Mark a repo triage-done now (or clear it with `done == false`). Records an
+    /// epoch-millisecond timestamp in the repo's `META` table.
+    pub fn set_triage_done(&self, name: &str, done: bool) -> Result<(), StoreError> {
+        let db = self.open_repo_db(name)?;
+        let ms = if done {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        } else {
+            0
+        };
+        let write_txn = db.begin_write()?;
+        {
+            let mut meta = write_txn.open_table(META)?;
+            meta.insert("triage_done_ms", ms)?;
+        }
+        write_txn.commit()?;
+        Ok(())
     }
 
     /// MIME-type distribution for a repo (`mime → count`), sorted by count

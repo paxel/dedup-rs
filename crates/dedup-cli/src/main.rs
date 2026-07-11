@@ -5,7 +5,7 @@ use dedup_core::diff::{
 use dedup_core::dupes::{DupeGroup, delete_duplicates, find_exact_duplicates, wasted_bytes};
 use dedup_core::similar::find_similar;
 use dedup_core::store::Store;
-use dedup_core::update::{CancellationToken, Progress, ProgressEvent, update_repo};
+use dedup_core::update::{CancellationToken, NoProgress, Progress, ProgressEvent, update_repo};
 
 #[derive(Parser)]
 #[command(name = "dedup")]
@@ -30,6 +30,30 @@ enum Commands {
     Diff {
         #[command(subcommand)]
         command: DiffCommands,
+    },
+    /// Triage a disk: scan it, copy its unique content into a sanitized repo
+    /// (diffing against the sanitized repo and any extra references), then mark
+    /// the source repo triage-done. The one-shot disk-inheritance workflow.
+    Sanitize {
+        /// Source repository (the disk to triage)
+        source: String,
+        /// Sanitized repository to copy unique content into (also a reference)
+        sanitized: String,
+        /// Additional already-processed reference repos; repeatable
+        #[arg(long = "ref", value_name = "REPO")]
+        refs: Vec<String>,
+        /// Relative subfolder inside the sanitized repo to place files under
+        #[arg(short = 'i', long)]
+        into: Option<String>,
+        /// Move instead of copy (marks source entries missing)
+        #[arg(long)]
+        move_files: bool,
+        /// Skip the initial scan of the source (use the existing index)
+        #[arg(long)]
+        no_scan: bool,
+        /// Filter: mime:/name:/size:/origin:
+        #[arg(short, long)]
+        filter: Option<String>,
     },
 }
 
@@ -274,6 +298,20 @@ fn main() -> anyhow::Result<()> {
             let store = Store::open()?;
             run_diff(&store, command)?;
         }
+        Some(Commands::Sanitize {
+            source,
+            sanitized,
+            refs,
+            into,
+            move_files,
+            no_scan,
+            filter,
+        }) => {
+            let store = Store::open()?;
+            run_sanitize(
+                &store, &source, &sanitized, &refs, into, move_files, no_scan, filter,
+            )?;
+        }
         None => {
             println!("Starting GUI...");
             if let Err(e) = dedup_gui::run(cli.ui_scale) {
@@ -301,6 +339,63 @@ fn diff_refs<'a>(reference: &'a str, extra: &'a [String]) -> Vec<&'a str> {
     std::iter::once(reference)
         .chain(extra.iter().map(String::as_str))
         .collect()
+}
+
+/// The one-shot disk-triage workflow: scan the source, copy its unique content
+/// into the sanitized repo (diffing against the sanitized repo plus any extra
+/// references), and mark the source triage-done.
+#[allow(clippy::too_many_arguments)]
+fn run_sanitize(
+    store: &Store,
+    source: &str,
+    sanitized: &str,
+    refs: &[String],
+    into: Option<String>,
+    move_files: bool,
+    no_scan: bool,
+    filter: Option<String>,
+) -> anyhow::Result<()> {
+    let cancel = CancellationToken::new();
+    {
+        let cancel = cancel.clone();
+        ctrlc::set_handler(move || cancel.cancel())?;
+    }
+
+    if !no_scan {
+        println!("Scanning '{source}'…");
+        update_repo(store, source, 0, &NoProgress, &cancel)?;
+    }
+
+    // The sanitized repo's directory receives the copies (and is a reference).
+    let sanitized_dir = store.get_repo(sanitized)?.abs_path;
+    let references = diff_refs(sanitized, refs);
+    let stats = diff_copy(
+        store,
+        source,
+        &references,
+        CopyDest {
+            dir: std::path::Path::new(&sanitized_dir),
+            subdir: into.as_deref(),
+        },
+        move_files,
+        filter.as_deref(),
+        &DiffRun::new(&NoDiffProgress, &cancel),
+    )?;
+
+    let verb = if move_files { "Moved" } else { "Copied" };
+    println!(
+        "{verb} {} unique file(s) from '{source}' into '{}'.",
+        stats.copied,
+        destination(sanitized, &into)
+    );
+    if stats.cancelled {
+        println!("Sanitize cancelled by user; source not marked done.");
+        return Ok(());
+    }
+
+    store.set_triage_done(source, true)?;
+    println!("Marked '{source}' triage-done.");
+    Ok(())
 }
 
 fn run_diff(store: &Store, command: DiffCommands) -> anyhow::Result<()> {

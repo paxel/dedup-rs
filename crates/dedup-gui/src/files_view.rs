@@ -309,6 +309,7 @@ enum Act {
     PickSource(String),
     PickTarget(String),
     ToggleExtraRef(String),
+    MarkSourceDone,
     SetCommand(Command),
     SubdirChanged,
     FilterChanged,
@@ -923,6 +924,20 @@ impl FilesView {
                         acts.push(Act::CancelRun);
                     }
                 }
+                // After sanitizing a disk, mark the source repo triage-done.
+                if self.source.is_some() && !self.running {
+                    ui.separator();
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("MARK SOURCE DONE").color(theme::BLUE))
+                                .fill(theme::PANEL),
+                        )
+                        .on_hover_text("Flag the source repo as triaged (its uniques copied out)")
+                        .clicked()
+                    {
+                        acts.push(Act::MarkSourceDone);
+                    }
+                }
             });
         });
     }
@@ -1059,6 +1074,17 @@ impl FilesView {
                     self.extra_refs.push(name);
                 }
                 self.clear_preview();
+            }
+            Act::MarkSourceDone => {
+                if let Some(source) = self.source.clone() {
+                    match store.set_triage_done(&source, true) {
+                        Ok(()) => {
+                            self.status = Some(format!("Marked '{source}' triage-done."));
+                            self.error = None;
+                        }
+                        Err(e) => self.error = Some(e.to_string()),
+                    }
+                }
             }
             Act::SetCommand(cmd) => {
                 self.command = cmd;
