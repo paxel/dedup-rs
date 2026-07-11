@@ -412,7 +412,12 @@ impl DupesView {
                 // as the row height converges, leaving the first repo a few px
                 // above the rest (see the `repo_row_is_aligned` test). Top-align
                 // pins every chip to one line. It stays bounded because it's
-                // nested inside this outer `horizontal`.
+                // nested inside this outer `horizontal`. A horizontal scroll
+                // area keeps many repos on one line instead of overflowing the
+                // window (solid scrollbar from the theme).
+                egui::ScrollArea::horizontal()
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
                     for (i, repo) in self.repos.iter().enumerate() {
                     // Name + lock read as one bordered unit per repo, with room
@@ -493,6 +498,7 @@ impl DupesView {
                         }
                     });
                 });
+                    });
             });
         });
     }
