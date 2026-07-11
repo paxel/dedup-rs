@@ -206,7 +206,7 @@ fn stage(store: &Store, repo_names: &[String]) -> Result<Staged, StoreError> {
 /// Build [`DupeFile`]s for the grouped candidates, fetching each member's
 /// [`FileEntry`] from its repo DB (`dbs` is parallel to `staged.names`).
 fn materialize<K>(
-    dbs: &[redb::Database],
+    dbs: &[std::sync::Arc<redb::Database>],
     staged: &Staged,
     candidates: &[Candidate<K>],
     index_groups: Vec<Vec<usize>>,
@@ -242,7 +242,7 @@ pub fn find_similar(
     let staged = stage(store, repo_names)?;
 
     // Open each repo DB once; grouped members' entries are fetched from these.
-    let mut dbs: Vec<redb::Database> = Vec::with_capacity(staged.names.len());
+    let mut dbs: Vec<std::sync::Arc<redb::Database>> = Vec::with_capacity(staged.names.len());
     for name in &staged.names {
         dbs.push(store.open_repo_db(name)?);
     }

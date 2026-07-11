@@ -2,7 +2,9 @@
 
 use redb::{ReadableMultimapTable, ReadableTable};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 const SCHEMA_VERSION: u8 = 1;
 /// Version byte of serialized [`FileEntry`] values. Bumped to 2 when the image
@@ -63,6 +65,9 @@ pub enum StoreError {
 
     #[error("Repository '{0}' not found")]
     NotFound(String),
+
+    #[error("Repository '{0}' is in use by another operation")]
+    Busy(String),
 }
 
 impl From<redb::Error> for StoreError {
@@ -163,9 +168,19 @@ pub type DuplicateGroup = (u64, [u8; 32], Vec<String>);
 /// not-yet-consumed `(size, hash)` and its member rel-paths, or `None` at end.
 type MergeHead = Option<(u64, [u8; 32], Vec<String>)>;
 
+/// The cache of shared repo index handles, keyed by repo name.
+type RepoDbMap = HashMap<String, Arc<redb::Database>>;
+
 pub struct Store {
     config_dir: PathBuf,
     registry: redb::Database,
+    /// One shared handle per repo index. redb permits a single live
+    /// [`redb::Database`] per file (it holds an exclusive file lock), but that
+    /// one instance supports any number of concurrent readers plus one writer
+    /// (MVCC) — so every user must share the cached handle instead of
+    /// re-opening the file, or concurrent operations fail with
+    /// "database already open".
+    repo_dbs: Mutex<RepoDbMap>,
 }
 
 fn get_config_dir() -> PathBuf {
@@ -265,7 +280,15 @@ impl Store {
         Ok(Self {
             config_dir,
             registry,
+            repo_dbs: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Lock the repo handle map. A poisoned lock only means another thread
+    /// panicked while holding it; the map itself (plain inserts/removes of
+    /// `Arc`s) is always consistent, so recover instead of propagating panics.
+    fn repo_dbs(&self) -> MutexGuard<'_, RepoDbMap> {
+        self.repo_dbs.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The directory where dedup stores its configuration and repo databases
@@ -278,7 +301,27 @@ impl Store {
         self.config_dir.join("repos").join(name).join("index.redb")
     }
 
-    pub fn open_repo_db(&self, name: &str) -> Result<redb::Database, StoreError> {
+    /// The shared handle for a repo's index database, creating the database
+    /// (and its tables) on first use. All callers — scans, diff ops, views —
+    /// get the same instance, so they can run concurrently under redb's MVCC
+    /// (readers never block; writers serialize per batch).
+    pub fn open_repo_db(&self, name: &str) -> Result<Arc<redb::Database>, StoreError> {
+        let mut dbs = self.repo_dbs();
+        self.open_repo_db_in(&mut dbs, name)
+    }
+
+    /// [`Self::open_repo_db`] against an already-locked handle map, so callers
+    /// that must hold the lock across a file operation can open without
+    /// re-locking (the map mutex is not reentrant).
+    fn open_repo_db_in(
+        &self,
+        dbs: &mut RepoDbMap,
+        name: &str,
+    ) -> Result<Arc<redb::Database>, StoreError> {
+        if let Some(db) = dbs.get(name) {
+            return Ok(Arc::clone(db));
+        }
+
         let path = self.get_repo_db_path(name);
         if let Some(parent) = path.parent()
             && !parent.exists()
@@ -300,7 +343,24 @@ impl Store {
         }
         write_txn.commit()?;
 
+        let db = Arc::new(db);
+        dbs.insert(name.to_string(), Arc::clone(&db));
         Ok(db)
+    }
+
+    /// Remove `name`'s cached handle so its index file may be deleted, renamed
+    /// or copied. Fails with [`StoreError::Busy`] while any operation still
+    /// holds the handle (e.g. a running scan). The caller must keep holding
+    /// `dbs` across the following file operation so no thread re-opens the
+    /// index mid-change.
+    fn evict_repo_db(&self, dbs: &mut RepoDbMap, name: &str) -> Result<(), StoreError> {
+        if let Some(db) = dbs.get(name) {
+            if Arc::strong_count(db) > 1 {
+                return Err(StoreError::Busy(name.to_string()));
+            }
+            dbs.remove(name);
+        }
+        Ok(())
     }
 
     pub fn create_repo(&self, name: &str, path: &str) -> Result<(), StoreError> {
@@ -390,7 +450,7 @@ impl Store {
             });
         }
 
-        let db = redb::Database::open(&db_path)?;
+        let db = self.open_repo_db(name)?;
         let read_txn = db.begin_read()?;
         let meta_table = read_txn.open_table(META)?;
 
@@ -414,7 +474,7 @@ impl Store {
         if !db_path.exists() {
             return Ok(Vec::new());
         }
-        let db = redb::Database::open(&db_path)?;
+        let db = self.open_repo_db(name)?;
         let read_txn = db.begin_read()?;
         let table = read_txn.open_table(MIME_STATS)?;
         let mut stats = Vec::new();
@@ -427,6 +487,11 @@ impl Store {
     }
 
     pub fn remove_repo(&self, name: &str) -> Result<(), StoreError> {
+        // Held across the registry removal and the directory delete so no
+        // thread can re-open the index mid-removal.
+        let mut dbs = self.repo_dbs();
+        self.evict_repo_db(&mut dbs, name)?;
+
         let reg_write_txn = self.registry.begin_write()?;
         {
             let mut reg_table = reg_write_txn.open_table(REPOS)?;
@@ -445,6 +510,11 @@ impl Store {
     }
 
     pub fn rename_repo(&self, name: &str, new_name: &str) -> Result<(), StoreError> {
+        // Held across the registry update and the directory rename so no
+        // thread can re-open either index mid-rename.
+        let mut dbs = self.repo_dbs();
+        self.evict_repo_db(&mut dbs, name)?;
+
         let reg_write_txn = self.registry.begin_write()?;
         {
             let mut reg_table = reg_write_txn.open_table(REPOS)?;
@@ -516,6 +586,12 @@ impl Store {
         if source == dest {
             return Err(StoreError::AlreadyExists(dest.to_string()));
         }
+        // A byte-copy is only consistent while nothing can write the source
+        // index, so evict its handle (fails while e.g. a scan holds it) and
+        // keep the map locked until the copy is done.
+        let mut dbs = self.repo_dbs();
+        self.evict_repo_db(&mut dbs, source)?;
+
         let source_meta = self.get_repo(source)?;
 
         let meta = RepoMeta {
@@ -549,7 +625,7 @@ impl Store {
                 std::fs::copy(&src_db, &dst_db)?;
             } else {
                 // Source was never scanned: start the copy with empty tables.
-                self.open_repo_db(dest)?;
+                self.open_repo_db_in(&mut dbs, dest)?;
             }
             reg_table.insert(dest, serialized.as_slice())?;
         }
@@ -630,7 +706,7 @@ impl Store {
         // are owned (Arc-based), so these Vecs don't borrow one another; the
         // `iters` borrow `tables`, which must outlive them.
         let mut roots: Vec<String> = Vec::with_capacity(repo_names.len());
-        let mut dbs: Vec<redb::Database> = Vec::with_capacity(repo_names.len());
+        let mut dbs: Vec<Arc<redb::Database>> = Vec::with_capacity(repo_names.len());
         for name in repo_names {
             roots.push(self.get_repo(name)?.abs_path);
             dbs.push(self.open_repo_db(name)?);

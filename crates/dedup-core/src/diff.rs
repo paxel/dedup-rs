@@ -170,7 +170,7 @@ pub struct SyncStats {
 
 struct OpenRepo {
     meta: RepoMeta,
-    db: redb::Database,
+    db: std::sync::Arc<redb::Database>,
 }
 
 fn open_repo(store: &Store, name: &str) -> Result<OpenRepo, StoreError> {

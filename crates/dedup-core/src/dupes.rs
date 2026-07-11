@@ -88,7 +88,7 @@ pub fn load_groups(
     keys: &[DupeGroupKey],
 ) -> Result<Vec<DupeGroup>, StoreError> {
     let mut roots: Vec<String> = Vec::with_capacity(repo_names.len());
-    let mut dbs: Vec<redb::Database> = Vec::with_capacity(repo_names.len());
+    let mut dbs: Vec<std::sync::Arc<redb::Database>> = Vec::with_capacity(repo_names.len());
     for name in repo_names {
         roots.push(store.get_repo(name)?.abs_path);
         dbs.push(store.open_repo_db(name)?);
