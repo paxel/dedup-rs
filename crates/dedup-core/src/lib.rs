@@ -6,6 +6,7 @@ pub mod diff;
 pub mod dupes;
 pub mod filter;
 pub mod fingerprint;
+pub mod organize;
 pub mod report;
 pub mod scan;
 pub mod similar;

@@ -17,8 +17,78 @@ pub enum FileFilter {
     Size(SizeOp, u64),
     /// Matches entries whose provenance (`origin`) contains the substring.
     Origin(String),
+    /// Matches entries whose best-known date is >= this epoch-ms.
+    TakenAfter(i64),
+    /// Matches entries whose best-known date is < this epoch-ms.
+    TakenBefore(i64),
     /// Combine multiple filters with AND logic.
     And(Vec<FileFilter>),
+}
+
+/// Best-known date of a file: EXIF capture time when present, else file mtime.
+/// Epoch milliseconds (naive-local for EXIF; see [`crate::store::ExifInfo`]).
+pub fn best_date_ms(entry: &FileEntry) -> i64 {
+    entry
+        .exif
+        .as_ref()
+        .and_then(|e| e.taken_ms)
+        .unwrap_or(entry.modified_ms)
+}
+
+/// Convert a civil date to epoch milliseconds (treated as UTC). Howard
+/// Hinnant's days-from-civil algorithm.
+pub fn ymd_to_ms(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era * 146097 + doe - 719468) * 86400 * 1000
+}
+
+/// Convert epoch milliseconds (as UTC) to a civil `(year, month, day)`.
+/// Inverse of [`ymd_to_ms`] (Howard Hinnant's civil-from-days).
+pub fn ms_to_ymd(ms: i64) -> (i64, u32, u32) {
+    let days = ms.div_euclid(86_400_000);
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m as u32, d as u32)
+}
+
+/// Parse a `YYYY[-MM[-DD]]` date prefix into the half-open epoch-ms span it
+/// covers (e.g. `2020` → all of 2020, `2020-03` → that month).
+fn parse_date_span(s: &str) -> Option<(i64, i64)> {
+    let mut parts = s.split('-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: Option<i64> = parts.next().map(|m| m.parse()).transpose().ok()?;
+    let day: Option<i64> = parts.next().map(|d| d.parse()).transpose().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    match (month, day) {
+        (None, _) => Some((ymd_to_ms(year, 1, 1), ymd_to_ms(year + 1, 1, 1))),
+        (Some(m), None) if (1..=12).contains(&m) => {
+            let (ny, nm) = if m == 12 {
+                (year + 1, 1)
+            } else {
+                (year, m + 1)
+            };
+            Some((ymd_to_ms(year, m, 1), ymd_to_ms(ny, nm, 1)))
+        }
+        (Some(m), Some(d)) if (1..=12).contains(&m) && (1..=31).contains(&d) => {
+            let start = ymd_to_ms(year, m, d);
+            Some((start, start + 86_400_000))
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +109,9 @@ pub enum FilterError {
 
     #[error("Invalid size filter '{0}': expected an integer byte count, e.g. size:>=1000")]
     InvalidSize(String),
+
+    #[error("Invalid date filter '{0}': expected YYYY[-MM[-DD]]")]
+    InvalidDate(String),
 }
 
 impl FileFilter {
@@ -78,7 +151,9 @@ impl FileFilter {
     /// leading text before the first prefix is kept as its own group so
     /// genuinely unknown input is still rejected by `parse_single`.
     fn split_groups(filter: &str) -> Vec<&str> {
-        const PREFIXES: [&str; 4] = ["mime:", "name:", "size:", "origin:"];
+        const PREFIXES: [&str; 7] = [
+            "mime:", "name:", "size:", "origin:", "date:", "before:", "after:",
+        ];
         let bytes = filter.as_bytes();
         let mut starts: Vec<usize> = Vec::new();
         for i in 0..filter.len() {
@@ -118,6 +193,24 @@ impl FileFilter {
         if let Some(rest) = filter.strip_prefix("origin:") {
             return Ok(Self::Origin(rest.trim().to_string()));
         }
+        if let Some(rest) = filter.strip_prefix("date:") {
+            let (start, end) = parse_date_span(rest.trim())
+                .ok_or_else(|| FilterError::InvalidDate(rest.trim().to_string()))?;
+            return Ok(Self::And(vec![
+                Self::TakenAfter(start),
+                Self::TakenBefore(end),
+            ]));
+        }
+        if let Some(rest) = filter.strip_prefix("after:") {
+            let (start, _) = parse_date_span(rest.trim())
+                .ok_or_else(|| FilterError::InvalidDate(rest.trim().to_string()))?;
+            return Ok(Self::TakenAfter(start));
+        }
+        if let Some(rest) = filter.strip_prefix("before:") {
+            let (start, _) = parse_date_span(rest.trim())
+                .ok_or_else(|| FilterError::InvalidDate(rest.trim().to_string()))?;
+            return Ok(Self::TakenBefore(start));
+        }
         Err(FilterError::UnknownFilter(filter.to_string()))
     }
 
@@ -154,6 +247,8 @@ impl FileFilter {
                 .origin
                 .as_ref()
                 .is_some_and(|origin| origin.contains(substring)),
+            Self::TakenAfter(ms) => best_date_ms(entry) >= *ms,
+            Self::TakenBefore(ms) => best_date_ms(entry) < *ms,
             Self::Size(op, value) => match op {
                 SizeOp::Lt => entry.size < *value,
                 SizeOp::Le => entry.size <= *value,
@@ -223,6 +318,40 @@ mod tests {
         assert!(filter.matches("sub/a.txt", &entry(1, None)));
         assert!(!filter.matches("other/a.txt", &entry(1, None)));
         Ok(())
+    }
+
+    #[test]
+    fn date_filters_use_best_date() -> Result<(), FilterError> {
+        use crate::store::ExifInfo;
+        // A file with mtime in 2019 but EXIF capture in 2021.
+        let mut e = entry(1, Some("image/jpeg"));
+        e.modified_ms = ymd_to_ms(2019, 6, 1);
+        e.exif = Some(ExifInfo {
+            taken_ms: Some(ymd_to_ms(2021, 3, 15)),
+            camera: None,
+        });
+        // best_date is the EXIF date → matches 2021, not 2019.
+        assert!(FileFilter::parse(Some("date:2021"))?.matches("p.jpg", &e));
+        assert!(!FileFilter::parse(Some("date:2019"))?.matches("p.jpg", &e));
+        assert!(FileFilter::parse(Some("date:2021-03"))?.matches("p.jpg", &e));
+        assert!(FileFilter::parse(Some("after:2020"))?.matches("p.jpg", &e));
+        assert!(FileFilter::parse(Some("before:2022"))?.matches("p.jpg", &e));
+        assert!(!FileFilter::parse(Some("before:2021"))?.matches("p.jpg", &e));
+
+        // Without EXIF, the mtime is used.
+        e.exif = None;
+        assert!(FileFilter::parse(Some("date:2019"))?.matches("p.jpg", &e));
+
+        assert!(FileFilter::parse(Some("date:notadate")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn ymd_ms_round_trips() {
+        for (y, m, d) in [(1970, 1, 1), (2000, 2, 29), (2021, 3, 15), (2024, 12, 31)] {
+            let ms = ymd_to_ms(y, m, d);
+            assert_eq!(ms_to_ymd(ms), (y, m as u32, d as u32), "{y}-{m}-{d}");
+        }
     }
 
     #[test]

@@ -31,6 +31,20 @@ enum Commands {
         #[command(subcommand)]
         command: DiffCommands,
     },
+    /// Browse or export files by date (EXIF capture time, else mtime)
+    Timeline {
+        /// Repositories to organize
+        names: Vec<String>,
+        /// Use all registered repositories
+        #[arg(long)]
+        all: bool,
+        /// Copy matching files into <dir>/<year>/<month>/ instead of listing buckets
+        #[arg(long, value_name = "DIR")]
+        export: Option<String>,
+        /// Filter: date:/before:/after: (YYYY[-MM[-DD]]) plus mime:/name:/size:
+        #[arg(short, long)]
+        filter: Option<String>,
+    },
     /// Print a Markdown triage report (stats, duplicates, flagged files)
     Report {
         /// Repositories to report on
@@ -339,6 +353,15 @@ fn main() -> anyhow::Result<()> {
             let store = Store::open()?;
             run_diff(&store, command)?;
         }
+        Some(Commands::Timeline {
+            names,
+            all,
+            export,
+            filter,
+        }) => {
+            let store = Store::open()?;
+            run_timeline(&store, names, all, export, filter)?;
+        }
         Some(Commands::Report { names, all }) => {
             let store = Store::open()?;
             run_report(&store, names, all)?;
@@ -409,6 +432,47 @@ fn resolve_repo_names(store: &Store, names: Vec<String>, all: bool) -> anyhow::R
         anyhow::bail!("No repositories. Pass repo names or --all.");
     }
     Ok(names)
+}
+
+fn run_timeline(
+    store: &Store,
+    names: Vec<String>,
+    all: bool,
+    export: Option<String>,
+    filter: Option<String>,
+) -> anyhow::Result<()> {
+    let names = resolve_repo_names(store, names, all)?;
+    match export {
+        Some(dir) => {
+            let stats = dedup_core::organize::export_by_date(
+                store,
+                &names,
+                std::path::Path::new(&dir),
+                filter.as_deref(),
+            )?;
+            println!(
+                "Exported {} file(s) into '{}' ({} error(s)).",
+                stats.copied, dir, stats.errors
+            );
+        }
+        None => {
+            let buckets = dedup_core::organize::timeline_buckets(store, &names, filter.as_deref())?;
+            if buckets.is_empty() {
+                println!("No files match.");
+                return Ok(());
+            }
+            for b in &buckets {
+                println!(
+                    "{}-{:02}  {:>6} files  {}",
+                    b.year,
+                    b.month,
+                    b.count,
+                    format_size(b.bytes)
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_report(store: &Store, names: Vec<String>, all: bool) -> anyhow::Result<()> {
