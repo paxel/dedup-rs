@@ -24,6 +24,10 @@ use std::sync::Arc;
 const PAGE_SIZE: usize = 50;
 /// Load groups from the DB in batches of this many during auto-resolve.
 const AUTO_BATCH: usize = 128;
+/// Evenly spaced stills sampled per video: the lightbox filmstrip's cells, and
+/// the grid the card preview samples from (frame `VIDEO_STRIP / 2`), so the
+/// card's still is reused by the filmstrip instead of extracted twice.
+const VIDEO_STRIP: usize = 10;
 
 /// The current result set: exact duplicates are a lightweight *plan* of
 /// descriptors (members loaded a page at a time), while similar results are the
@@ -1116,10 +1120,13 @@ impl DupesView {
             if ui.is_rect_visible(thumb_rect) {
                 let hex = hash_hex(&file.entry.hash);
                 let source = file.absolute_path();
-                // Videos show their first still (ffmpeg-extracted, cached);
+                // Videos show a mid-timeline still (ffmpeg-extracted, cached);
                 // absent ffmpeg the request fails and the placeholder shows.
+                // Sampling on the same grid as the lightbox filmstrip means
+                // the card's frame is reused there instead of extracted twice.
                 let tex = if is_video {
-                    self.thumbs.get_video(&hex, &source, 0, 1)
+                    self.thumbs
+                        .get_video(&hex, &source, VIDEO_STRIP / 2, VIDEO_STRIP)
                 } else {
                     self.thumbs.get(&hex, &source)
                 };
@@ -1310,7 +1317,6 @@ impl DupesView {
         // Video preview: a scrubbable filmstrip instead of a zoomable image.
         // Frames are extracted lazily by the thumb pool and fill in as they
         // land; the frame under the cursor's x fraction is shown enlarged.
-        const VIDEO_STRIP: usize = 10;
         let a_is_video = a
             .entry
             .mime
@@ -3108,6 +3114,8 @@ mod ui_tests {
         // Real images on disk so the thumb/full-res pipeline has something to
         // decode (the lightbox draws the actual pixels).
         let dir = tempfile::tempdir().unwrap();
+        // Dedicated cache so the test never writes into the user's real one.
+        dedup_core::thumbnail::set_cache_dir(dir.path().join("thumbs"));
         let mut group: DupeGroup = Vec::new();
         for i in 0..3u8 {
             let rel = format!("photo{i}.png");
@@ -3188,6 +3196,8 @@ mod ui_tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
+        // Dedicated cache so the test never writes into the user's real one.
+        dedup_core::thumbnail::set_cache_dir(dir.path().join("thumbs"));
         let clip = dir.path().join("clip.mp4");
         let ok = std::process::Command::new("ffmpeg")
             .args(["-v", "error", "-y", "-f", "lavfi", "-i"])

@@ -262,6 +262,32 @@ type MergeHead = Option<(u64, [u8; 32], Vec<String>)>;
 /// The cache of shared repo index handles, keyed by repo name.
 type RepoDbMap = HashMap<String, Arc<redb::Database>>;
 
+/// Shared repo handles plus the names currently frozen by an identity
+/// operation (remove/rename/duplicate). Opening a frozen name fails
+/// [`StoreError::Busy`]; the file work itself runs *outside* the mutex, so
+/// unrelated repos never block on another repo's file I/O.
+#[derive(Default)]
+struct RepoDbCache {
+    map: RepoDbMap,
+    frozen: std::collections::HashSet<String>,
+}
+
+/// Unfreezes its repo names on drop, so every exit path (including `?`) of an
+/// identity operation releases them.
+struct FreezeGuard<'a> {
+    store: &'a Store,
+    names: Vec<String>,
+}
+
+impl Drop for FreezeGuard<'_> {
+    fn drop(&mut self) {
+        let mut cache = self.store.repo_dbs();
+        for name in &self.names {
+            cache.frozen.remove(name);
+        }
+    }
+}
+
 pub struct Store {
     config_dir: PathBuf,
     registry: redb::Database,
@@ -271,7 +297,32 @@ pub struct Store {
     /// (MVCC) — so every user must share the cached handle instead of
     /// re-opening the file, or concurrent operations fail with
     /// "database already open".
-    repo_dbs: Mutex<RepoDbMap>,
+    repo_dbs: Mutex<RepoDbCache>,
+}
+
+/// Create (or open) a repo index file at `path` and ensure its tables exist.
+fn create_db_file(path: &std::path::Path) -> Result<redb::Database, StoreError> {
+    if let Some(parent) = path.parent()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let db = redb::Database::create(path)?;
+
+    // Ensure tables exist
+    let write_txn = db.begin_write()?;
+    {
+        let _files = write_txn.open_table(FILES)?;
+        let _by_size_hash = write_txn.open_multimap_table(BY_SIZE_HASH)?;
+        let _by_fprint = write_txn.open_multimap_table(BY_FPRINT)?;
+        let _meta = write_txn.open_table(META)?;
+        let _mime_stats = write_txn.open_table(MIME_STATS)?;
+        let _archive_members = write_txn.open_table(ARCHIVE_MEMBERS)?;
+        // Drop the pre-ImgHash fingerprint index if this repo predates it.
+        let _ = write_txn.delete_multimap_table(BY_FPRINT_LEGACY);
+    }
+    write_txn.commit()?;
+    Ok(db)
 }
 
 fn get_config_dir() -> PathBuf {
@@ -429,14 +480,15 @@ impl Store {
         Ok(Self {
             config_dir,
             registry,
-            repo_dbs: Mutex::new(HashMap::new()),
+            repo_dbs: Mutex::new(RepoDbCache::default()),
         })
     }
 
-    /// Lock the repo handle map. A poisoned lock only means another thread
-    /// panicked while holding it; the map itself (plain inserts/removes of
-    /// `Arc`s) is always consistent, so recover instead of propagating panics.
-    fn repo_dbs(&self) -> MutexGuard<'_, RepoDbMap> {
+    /// Lock the repo handle cache. A poisoned lock only means another thread
+    /// panicked while holding it; the cache itself (plain inserts/removes of
+    /// `Arc`s and names) is always consistent, so recover instead of
+    /// propagating panics.
+    fn repo_dbs(&self) -> MutexGuard<'_, RepoDbCache> {
         self.repo_dbs.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -453,64 +505,48 @@ impl Store {
     /// The shared handle for a repo's index database, creating the database
     /// (and its tables) on first use. All callers — scans, diff ops, views —
     /// get the same instance, so they can run concurrently under redb's MVCC
-    /// (readers never block; writers serialize per batch).
+    /// (readers never block; writers serialize per batch). Fails with
+    /// [`StoreError::Busy`] while an identity operation has the name frozen.
     pub fn open_repo_db(&self, name: &str) -> Result<Arc<redb::Database>, StoreError> {
-        let mut dbs = self.repo_dbs();
-        self.open_repo_db_in(&mut dbs, name)
-    }
-
-    /// [`Self::open_repo_db`] against an already-locked handle map, so callers
-    /// that must hold the lock across a file operation can open without
-    /// re-locking (the map mutex is not reentrant).
-    fn open_repo_db_in(
-        &self,
-        dbs: &mut RepoDbMap,
-        name: &str,
-    ) -> Result<Arc<redb::Database>, StoreError> {
-        if let Some(db) = dbs.get(name) {
+        let mut cache = self.repo_dbs();
+        if cache.frozen.contains(name) {
+            return Err(StoreError::Busy(name.to_string()));
+        }
+        if let Some(db) = cache.map.get(name) {
             return Ok(Arc::clone(db));
         }
 
-        let path = self.get_repo_db_path(name);
-        if let Some(parent) = path.parent()
-            && !parent.exists()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        let db = redb::Database::create(&path)?;
-
-        // Ensure tables exist
-        let write_txn = db.begin_write()?;
-        {
-            let _files = write_txn.open_table(FILES)?;
-            let _by_size_hash = write_txn.open_multimap_table(BY_SIZE_HASH)?;
-            let _by_fprint = write_txn.open_multimap_table(BY_FPRINT)?;
-            let _meta = write_txn.open_table(META)?;
-            let _mime_stats = write_txn.open_table(MIME_STATS)?;
-            let _archive_members = write_txn.open_table(ARCHIVE_MEMBERS)?;
-            // Drop the pre-ImgHash fingerprint index if this repo predates it.
-            let _ = write_txn.delete_multimap_table(BY_FPRINT_LEGACY);
-        }
-        write_txn.commit()?;
-
-        let db = Arc::new(db);
-        dbs.insert(name.to_string(), Arc::clone(&db));
+        let db = Arc::new(create_db_file(&self.get_repo_db_path(name))?);
+        cache.map.insert(name.to_string(), Arc::clone(&db));
         Ok(db)
     }
 
-    /// Remove `name`'s cached handle so its index file may be deleted, renamed
-    /// or copied. Fails with [`StoreError::Busy`] while any operation still
-    /// holds the handle (e.g. a running scan). The caller must keep holding
-    /// `dbs` across the following file operation so no thread re-opens the
-    /// index mid-change.
-    fn evict_repo_db(&self, dbs: &mut RepoDbMap, name: &str) -> Result<(), StoreError> {
-        if let Some(db) = dbs.get(name) {
-            if Arc::strong_count(db) > 1 {
-                return Err(StoreError::Busy(name.to_string()));
+    /// Freeze `names` for an identity operation (remove/rename/duplicate):
+    /// their cached handles are evicted — failing with [`StoreError::Busy`]
+    /// while any operation (e.g. a running scan) still holds one — and every
+    /// open attempt fails `Busy` until the returned guard drops. The guard
+    /// lets the registry/file work run *outside* the handle-map mutex, so a
+    /// long copy or delete never stalls access to unrelated repos.
+    fn freeze(&self, names: &[&str]) -> Result<FreezeGuard<'_>, StoreError> {
+        let mut cache = self.repo_dbs();
+        for name in names {
+            if cache.frozen.contains(*name) {
+                return Err(StoreError::Busy((*name).to_string()));
             }
-            dbs.remove(name);
+            if let Some(db) = cache.map.get(*name) {
+                if Arc::strong_count(db) > 1 {
+                    return Err(StoreError::Busy((*name).to_string()));
+                }
+                cache.map.remove(*name);
+            }
         }
-        Ok(())
+        for name in names {
+            cache.frozen.insert((*name).to_string());
+        }
+        Ok(FreezeGuard {
+            store: self,
+            names: names.iter().map(|n| (*n).to_string()).collect(),
+        })
     }
 
     pub fn create_repo(&self, name: &str, path: &str) -> Result<(), StoreError> {
@@ -660,10 +696,10 @@ impl Store {
     }
 
     pub fn remove_repo(&self, name: &str) -> Result<(), StoreError> {
-        // Held across the registry removal and the directory delete so no
-        // thread can re-open the index mid-removal.
-        let mut dbs = self.repo_dbs();
-        self.evict_repo_db(&mut dbs, name)?;
+        // Frozen across the registry removal and the directory delete so no
+        // thread can re-open the index mid-removal (without blocking access
+        // to other repos while the delete runs).
+        let _frozen = self.freeze(&[name])?;
 
         let reg_write_txn = self.registry.begin_write()?;
         {
@@ -683,10 +719,13 @@ impl Store {
     }
 
     pub fn rename_repo(&self, name: &str, new_name: &str) -> Result<(), StoreError> {
-        // Held across the registry update and the directory rename so no
-        // thread can re-open either index mid-rename.
-        let mut dbs = self.repo_dbs();
-        self.evict_repo_db(&mut dbs, name)?;
+        if name == new_name {
+            return Err(StoreError::AlreadyExists(new_name.to_string()));
+        }
+        // Both names frozen across the registry update and the directory
+        // rename: nobody may re-open the old index mid-rename, and nobody may
+        // create the new name's index before the rename lands on it.
+        let _frozen = self.freeze(&[name, new_name])?;
 
         let reg_write_txn = self.registry.begin_write()?;
         {
@@ -760,10 +799,10 @@ impl Store {
             return Err(StoreError::AlreadyExists(dest.to_string()));
         }
         // A byte-copy is only consistent while nothing can write the source
-        // index, so evict its handle (fails while e.g. a scan holds it) and
-        // keep the map locked until the copy is done.
-        let mut dbs = self.repo_dbs();
-        self.evict_repo_db(&mut dbs, source)?;
+        // index, so freeze it (fails while e.g. a scan holds it) — and the
+        // destination, so nobody opens a half-copied index — until the copy
+        // is done. The copy itself runs outside the handle-map mutex.
+        let _frozen = self.freeze(&[source, dest])?;
 
         let source_meta = self.get_repo(source)?;
 
@@ -797,8 +836,9 @@ impl Store {
             if src_db.exists() {
                 std::fs::copy(&src_db, &dst_db)?;
             } else {
-                // Source was never scanned: start the copy with empty tables.
-                self.open_repo_db_in(&mut dbs, dest)?;
+                // Source was never scanned: start the copy with empty tables
+                // (dest is frozen, so the file can be created directly).
+                create_db_file(&dst_db)?;
             }
             reg_table.insert(dest, serialized.as_slice())?;
         }

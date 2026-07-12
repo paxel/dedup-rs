@@ -126,7 +126,9 @@ impl ThumbCache {
     }
 
     /// Fetch video still `idx` (of `count`) for `hex`, requesting extraction if
-    /// not cached. `None` while pending or failed (e.g. no ffmpeg).
+    /// not cached. `None` while pending or failed (e.g. no ffmpeg). `count` is
+    /// part of the key: it decides where in the timeline still `idx` is
+    /// sampled, so the same `idx` under a different grid is a different frame.
     pub fn get_video(
         &mut self,
         hex: &str,
@@ -134,7 +136,7 @@ impl ThumbCache {
         idx: usize,
         count: usize,
     ) -> Option<TextureHandle> {
-        let key = format!("{hex}-v{idx}");
+        let key = format!("{hex}-v{idx}of{count}");
         self.get_keyed(key, hex, source, Job::VideoFrame { idx, count })
     }
 

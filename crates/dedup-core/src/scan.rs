@@ -56,7 +56,12 @@ pub fn scan_repos(store: &Store, repo_names: &[String]) -> Result<Vec<Flag>, Sto
             if entry.missing {
                 return Ok(());
             }
-            if let Some((category, reason)) = classify(rel_path, entry.size, &root.join(rel_path)) {
+            if let Some((category, reason)) = classify(
+                rel_path,
+                entry.size,
+                entry.mime.as_deref(),
+                &root.join(rel_path),
+            ) {
                 flags.push(Flag {
                     repo: name.clone(),
                     rel_path: rel_path.to_string(),
@@ -71,8 +76,14 @@ pub fn scan_repos(store: &Store, repo_names: &[String]) -> Result<Vec<Flag>, Sto
 }
 
 /// Classify one file. Filename/path rules run first (no I/O); content probes on
-/// small files strengthen or add flags. `abs_path` is the on-disk location.
-pub fn classify(rel_path: &str, size: u64, abs_path: &Path) -> Option<(Category, String)> {
+/// small files strengthen or add flags. `mime` is the indexed MIME type (used
+/// to skip probes that cannot apply); `abs_path` is the on-disk location.
+pub fn classify(
+    rel_path: &str,
+    size: u64,
+    mime: Option<&str>,
+    abs_path: &Path,
+) -> Option<(Category, String)> {
     let lower = rel_path.replace('\\', "/").to_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(&lower);
 
@@ -100,8 +111,16 @@ pub fn classify(rel_path: &str, size: u64, abs_path: &Path) -> Option<(Category,
             return Some((Category::Key, "SSH key material".into()));
         }
     }
-    for ext in [".pem", ".p12", ".pfx", ".gpg", ".asc", ".key"] {
+    // `.asc` is deliberately absent: armored *public* keys and detached
+    // signatures share it, so armored private keys are left to the content
+    // probe (their PEM-style header sits in the first bytes).
+    for ext in [".pem", ".p12", ".pfx", ".gpg", ".key"] {
         if name.ends_with(ext) {
+            // Apple Keynote presentations are zip containers named `.key`;
+            // real key files never are.
+            if ext == ".key" && mime == Some("application/zip") {
+                continue;
+            }
             return Some((Category::Key, format!("key/cert file ({ext})")));
         }
     }
@@ -110,7 +129,14 @@ pub fn classify(rel_path: &str, size: u64, abs_path: &Path) -> Option<(Category,
     }
 
     // --- Content probes (small files only) --------------------------------
-    if size <= PROBE_CAP
+    // Media files can't be wallets, keystores, key text, or seed phrases, so
+    // an indexed media MIME skips the read entirely (photo/music repos would
+    // otherwise re-read every small file on each scan/report).
+    let media = mime.is_some_and(|m| {
+        m.starts_with("image/") || m.starts_with("video/") || m.starts_with("audio/")
+    });
+    if !media
+        && size <= PROBE_CAP
         && let Ok(bytes) = std::fs::read(abs_path)
     {
         if is_berkeley_db(&bytes) {
@@ -256,7 +282,7 @@ mod tests {
     fn by_name(rel: &str) -> Option<(Category, String)> {
         // A nonexistent path → content probes are skipped, exercising the
         // filename rules in isolation.
-        classify(rel, 10, Path::new("/nonexistent-dedup-scan-test"))
+        classify(rel, 10, None, Path::new("/nonexistent-dedup-scan-test"))
     }
 
     #[test]
@@ -266,6 +292,7 @@ mod tests {
         assert_eq!(by_name("vault/passwords.kdbx").unwrap().0, Category::Vault);
         assert_eq!(by_name("home/.ssh/id_ed25519").unwrap().0, Category::Key);
         assert_eq!(by_name("certs/server.pem").unwrap().0, Category::Key);
+        assert_eq!(by_name("certs/server.key").unwrap().0, Category::Key);
         assert_eq!(
             by_name("docs/Steuer_2021.pdf").unwrap().0,
             Category::Financial
@@ -284,6 +311,68 @@ mod tests {
         );
     }
 
+    /// Known false-positive classes stay quiet: Keynote presentations (`.key`
+    /// zip containers) and armored `.asc` files that aren't private keys.
+    #[test]
+    fn keynote_and_armored_public_material_are_not_flagged() {
+        let nowhere = Path::new("/nonexistent-dedup-scan-test");
+        assert!(
+            classify("talks/deck.key", 10, Some("application/zip"), nowhere).is_none(),
+            "Keynote .key (zip) is not key material"
+        );
+        assert_eq!(
+            classify(
+                "certs/server.key",
+                10,
+                Some("application/octet-stream"),
+                nowhere
+            )
+            .unwrap()
+            .0,
+            Category::Key,
+            "non-zip .key still flags"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let sig = dir.path().join("release.tar.gz.asc");
+        std::fs::write(&sig, b"-----BEGIN PGP SIGNATURE-----\nabc\n").unwrap();
+        assert!(
+            classify("release.tar.gz.asc", 30, None, &sig).is_none(),
+            "detached signature .asc is not flagged"
+        );
+        let pubkey = dir.path().join("friend.asc");
+        std::fs::write(&pubkey, b"-----BEGIN PGP PUBLIC KEY BLOCK-----\nabc\n").unwrap();
+        assert!(
+            classify("friend.asc", 40, None, &pubkey).is_none(),
+            "armored public key .asc is not flagged"
+        );
+        // An armored *private* key is still caught — by content, not extension.
+        let privkey = dir.path().join("secret.asc");
+        std::fs::write(&privkey, b"-----BEGIN PGP PRIVATE KEY BLOCK-----\nabc\n").unwrap();
+        assert_eq!(
+            classify("secret.asc", 40, None, &privkey).unwrap().0,
+            Category::Key
+        );
+    }
+
+    /// An indexed media MIME skips the content probes entirely — even content
+    /// that would otherwise trip a probe is never read for a photo.
+    #[test]
+    fn media_mimes_skip_content_probes() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("holiday.jpg");
+        std::fs::write(&fake, b"-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n").unwrap();
+        assert!(
+            classify("holiday.jpg", 40, Some("image/jpeg"), &fake).is_none(),
+            "image MIME skips the probe"
+        );
+        assert_eq!(
+            classify("holiday.jpg", 40, None, &fake).unwrap().0,
+            Category::Key,
+            "without a MIME the probe still runs"
+        );
+    }
+
     #[test]
     fn content_probes_flag_secrets() {
         let dir = tempfile::tempdir().unwrap();
@@ -295,21 +384,24 @@ mod tests {
             br#"{"version":3,"crypto":{"cipher":"aes-128-ctr","kdfparams":{"n":8192}}}"#,
         )
         .unwrap();
-        let (cat, reason) = classify("UTC--2021--addr.json", 80, &ks).unwrap();
+        let (cat, reason) = classify("UTC--2021--addr.json", 80, None, &ks).unwrap();
         assert_eq!(cat, Category::Wallet);
         assert!(reason.contains("keystore"));
 
         // OpenSSH private key by header (name doesn't match any rule).
         let key = dir.path().join("backup_blob");
         std::fs::write(&key, b"-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n").unwrap();
-        assert_eq!(classify("backup_blob", 40, &key).unwrap().0, Category::Key);
+        assert_eq!(
+            classify("backup_blob", 40, None, &key).unwrap().0,
+            Category::Key
+        );
 
         // BIP-39 seed phrase in a small text file.
         let seed = dir.path().join("notes.txt");
         let phrase = "abandon ability able about above absent absorb abstract \
                       absurd abuse access accident";
         std::fs::write(&seed, phrase).unwrap();
-        let (cat, reason) = classify("notes.txt", phrase.len() as u64, &seed).unwrap();
+        let (cat, reason) = classify("notes.txt", phrase.len() as u64, None, &seed).unwrap();
         assert_eq!(cat, Category::Wallet);
         assert!(reason.contains("seed phrase"));
 
@@ -320,6 +412,6 @@ mod tests {
             b"today i went to the lake and had a lovely picnic with friends",
         )
         .unwrap();
-        assert!(classify("diary.txt", 60, &prose).is_none());
+        assert!(classify("diary.txt", 60, None, &prose).is_none());
     }
 }

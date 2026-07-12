@@ -6,12 +6,11 @@ use dedup_core::store::{FileEntry, Store};
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 fn entry(rel: &str, ms: i64) -> FileEntry {
-    let mut hash = [0u8; 32];
-    hash[0] = rel.len() as u8;
-    hash[1] = rel.bytes().next().unwrap_or(0);
+    // Size and hash match the file content the test writes (the file name),
+    // so export's already-present check sees the real identity.
     FileEntry {
-        size: 100,
-        hash,
+        size: rel.len() as u64,
+        hash: *blake3::hash(rel.as_bytes()).as_bytes(),
         modified_ms: ms,
         missing: false,
         mime: Some("image/jpeg".into()),
@@ -64,5 +63,30 @@ fn buckets_and_export_group_by_date() -> TestResult {
     assert!(out.join("2020").join("07").join("c.jpg").exists());
     assert!(out.join("2021").join("03").join("a.jpg").exists());
     assert!(out.join("2021").join("03").join("b.jpg").exists());
+
+    // Re-running the export is idempotent: identical destinations are skipped,
+    // nothing is copied again, and no " (2)" duplicates appear.
+    let again = dedup_core::organize::export_by_date(&store, &["r".to_string()], &out, None)?;
+    assert_eq!((again.copied, again.skipped, again.errors), (0, 3, 0));
+    assert!(
+        !out.join("2021").join("03").join("a (2).jpg").exists(),
+        "re-run must not duplicate exports"
+    );
+
+    // Same name, different content → the numeric suffix is used (never an
+    // overwrite, never a false skip).
+    std::fs::write(dir.join("a.jpg"), b"different pixels")?;
+    let mut changed = entry("a.jpg", ymd_to_ms(2021, 3, 10));
+    changed.size = 16;
+    changed.hash = *blake3::hash(b"different pixels").as_bytes();
+    store.update_file_entry("r", "a.jpg", &changed)?;
+    let third = dedup_core::organize::export_by_date(&store, &["r".to_string()], &out, None)?;
+    assert_eq!((third.copied, third.skipped), (1, 2));
+    assert!(out.join("2021").join("03").join("a (2).jpg").exists());
+    assert_eq!(
+        std::fs::read(out.join("2021").join("03").join("a.jpg"))?,
+        b"a.jpg",
+        "the original export is untouched"
+    );
     Ok(())
 }

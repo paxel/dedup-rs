@@ -182,30 +182,35 @@ fn open_repo(store: &Store, name: &str) -> Result<OpenRepo, StoreError> {
     Ok(OpenRepo { meta, db })
 }
 
-/// Open the primary reference (`references[0]`) and merge the content indexes of
-/// *all* references into one presence map. A content key is `present` if any
-/// reference has a live copy and `missing` if any reference marks it missing —
-/// so "unique" means unique against every reference, not just one.
+/// Open every reference repo once and merge their content indexes into one
+/// presence map. A content key is `present` if any reference has a live copy
+/// and `missing` if any reference marks it missing — so "unique" means unique
+/// against every reference, not just one.
 ///
-/// The primary is special: it is the repo whose index `diff_copy` writes copies
-/// back into, and whose paths `diff_print` reports for `Equal`. Callers must
-/// pass at least one reference.
-fn open_primary_and_index(
+/// The primary (`repos[0]`) is special: it is the repo whose index `diff_copy`
+/// writes copies back into, and whose paths `diff_print` prefers for `Equal`.
+/// Callers must pass at least one reference. The whole vec is returned so
+/// per-file lookups can reuse the open handles instead of reopening repos.
+fn open_references(
     store: &Store,
     references: &[&str],
-) -> Result<(OpenRepo, HashMap<ContentKey, ContentState>), DiffError> {
-    let (first, rest) = references.split_first().ok_or(DiffError::NoReference)?;
-    let primary = open_repo(store, first)?;
-    let mut merged = store::read_content_index(&primary.db)?;
-    for name in rest {
-        let extra = open_repo(store, name)?;
-        for (key, state) in store::read_content_index(&extra.db)? {
+) -> Result<(Vec<OpenRepo>, HashMap<ContentKey, ContentState>), DiffError> {
+    if references.is_empty() {
+        return Err(DiffError::NoReference);
+    }
+    let mut repos = Vec::with_capacity(references.len());
+    for name in references {
+        repos.push(open_repo(store, name)?);
+    }
+    let mut merged: HashMap<ContentKey, ContentState> = HashMap::new();
+    for repo in &repos {
+        for (key, state) in store::read_content_index(&repo.db)? {
             let slot = merged.entry(key).or_default();
             slot.present |= state.present;
             slot.missing |= state.missing;
         }
     }
-    Ok((primary, merged))
+    Ok((repos, merged))
 }
 
 /// Collect the source entries (rel path + entry) that pass the filter.
@@ -236,22 +241,22 @@ pub fn diff_print(
 ) -> Result<Vec<DiffItem>, DiffError> {
     let filter = FileFilter::parse(filter)?;
     let source = open_repo(store, source)?;
-    let (primary, ref_index) = open_primary_and_index(store, references)?;
+    let (refs, ref_index) = open_references(store, references)?;
 
     let mut items = Vec::new();
     for (rel_path, entry) in collect_source_entries(&source.db, &filter, false)? {
         match ref_index.get(&(entry.size, entry.hash)) {
             None => items.push(DiffItem::New { rel_path }),
             Some(state) if state.present => {
-                // Prefer a path from the primary; fall back to any reference.
+                // Prefer a path from the primary; fall back to any reference
+                // (all handles are already open — no per-file reopening).
                 let mut reference_path =
-                    store::get_paths_by_size_hash(&primary.db, entry.size, &entry.hash)?
+                    store::get_paths_by_size_hash(&refs[0].db, entry.size, &entry.hash)?
                         .into_iter()
                         .next()
                         .unwrap_or_default();
                 if reference_path.is_empty() {
-                    for name in &references[1..] {
-                        let extra = open_repo(store, name)?;
+                    for extra in &refs[1..] {
                         if let Some(p) =
                             store::get_paths_by_size_hash(&extra.db, entry.size, &entry.hash)?
                                 .into_iter()
@@ -299,7 +304,9 @@ pub fn diff_copy(
     let source = open_repo(store, source)?;
     // The primary reference is the copy-back target; the merged index is the
     // union of all references (a file is "new" only if no reference has it).
-    let (reference, ref_index) = open_primary_and_index(store, references)?;
+    let (mut refs, ref_index) = open_references(store, references)?;
+    let reference = refs.swap_remove(0);
+    drop(refs); // the extras were only needed to build the merged index
 
     let candidates: Vec<(String, FileEntry)> = collect_source_entries(&source.db, &filter, false)?
         .into_iter()
@@ -410,7 +417,7 @@ pub fn diff_delete(
 ) -> Result<DeleteStats, DiffError> {
     let filter = FileFilter::parse(filter)?;
     let source = open_repo(store, source)?;
-    let (_reference, ref_index) = open_primary_and_index(store, references)?;
+    let (_refs, ref_index) = open_references(store, references)?;
 
     let candidates: Vec<(String, FileEntry)> = collect_source_entries(&source.db, &filter, false)?
         .into_iter()

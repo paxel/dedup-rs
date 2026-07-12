@@ -6,9 +6,22 @@
 //! `image` dependency (and the ≤512 px / JPEG policy) stays in the domain crate.
 
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 /// Longest edge of a generated thumbnail, in pixels.
 pub const MAX_EDGE: u32 = 512;
+
+/// Process-wide override of the cache directory (see [`set_cache_dir`]).
+static CACHE_DIR_OVERRIDE: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+/// Redirect the thumbnail cache to `dir` for the rest of the process. Tests
+/// use this for a dedicated per-test cache — mutating `HOME` instead would be
+/// racy (and undefined behavior) in a multithreaded test binary.
+pub fn set_cache_dir(dir: impl Into<PathBuf>) {
+    *CACHE_DIR_OVERRIDE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dir.into());
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum ThumbError {
@@ -19,8 +32,16 @@ pub enum ThumbError {
     Image(String),
 }
 
-/// Directory holding the thumbnail cache (`~/.cache/dedup/thumbs`).
+/// Directory holding the thumbnail cache (`~/.cache/dedup/thumbs`, unless
+/// overridden via [`set_cache_dir`]).
 pub fn cache_dir() -> PathBuf {
+    if let Some(dir) = CACHE_DIR_OVERRIDE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+    {
+        return dir.clone();
+    }
     if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home)
             .join(".cache")
@@ -95,9 +116,12 @@ pub fn get_rgba(source: &Path, hash_hex: &str) -> Result<(u32, u32, Vec<u8>), Th
     load_rgba(&out)
 }
 
-/// Cache path for still `idx` of a video (`<hex>-v<idx>.jpg`).
-pub fn video_thumb_path(hash_hex: &str, idx: usize) -> PathBuf {
-    cache_dir().join(format!("{hash_hex}-v{idx}.jpg"))
+/// Cache path for still `idx` of `count` evenly spaced stills of a video
+/// (`<hex>-v<idx>of<count>.jpg`). `count` is part of the key because it decides
+/// *where* in the timeline still `idx` is sampled — the same `idx` under a
+/// different grid is a different frame.
+pub fn video_thumb_path(hash_hex: &str, idx: usize, count: usize) -> PathBuf {
+    cache_dir().join(format!("{hash_hex}-v{idx}of{count}.jpg"))
 }
 
 /// Ensure still `idx` (of `count` evenly spaced stills) for the video `source`
@@ -109,11 +133,11 @@ pub fn ensure_video_frame(
     idx: usize,
     count: usize,
 ) -> Result<PathBuf, ThumbError> {
-    let out = video_thumb_path(hash_hex, idx);
+    let count = count.max(1);
+    let out = video_thumb_path(hash_hex, idx, count);
     if out.exists() {
         return Ok(out);
     }
-    let count = count.max(1);
     let duration = crate::fingerprint::media_duration_secs(source).unwrap_or(0.0);
     let at = if duration > 0.0 {
         duration * (idx as f64 + 0.5) / count as f64
@@ -226,15 +250,18 @@ mod tests {
             return;
         }
 
-        // Redirect the cache into the tempdir so the test is hermetic.
-        // SAFETY: single-threaded test; no other thread reads HOME concurrently.
-        unsafe { std::env::set_var("HOME", dir.path()) };
+        // Dedicated per-test cache so the test is hermetic without touching
+        // the process environment (parallel tests read env concurrently).
+        set_cache_dir(dir.path().join("thumbs"));
 
         let hex = "deadbeef";
         let (w, h, rgba) = video_frame_rgba(&video, hex, 2, 10).expect("extract frame");
         assert!(w > 0 && h > 0);
         assert_eq!(rgba.len() as u32, w * h * 4);
         // The still is cached where the GUI worker expects it.
-        assert!(video_thumb_path(hex, 2).exists(), "still is cached on disk");
+        assert!(
+            video_thumb_path(hex, 2, 10).exists(),
+            "still is cached on disk"
+        );
     }
 }

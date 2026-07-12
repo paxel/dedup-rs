@@ -5,7 +5,7 @@ use dedup_core::diff::{
 use dedup_core::dupes::{DupeGroup, delete_duplicates, find_exact_duplicates, wasted_bytes};
 use dedup_core::similar::find_similar;
 use dedup_core::store::Store;
-use dedup_core::update::{CancellationToken, NoProgress, Progress, ProgressEvent, update_repo};
+use dedup_core::update::{CancellationToken, Progress, ProgressEvent, update_repo};
 
 #[derive(Parser)]
 #[command(name = "dedup")]
@@ -451,8 +451,8 @@ fn run_timeline(
                 filter.as_deref(),
             )?;
             println!(
-                "Exported {} file(s) into '{}' ({} error(s)).",
-                stats.copied, dir, stats.errors
+                "Exported {} file(s) into '{}' ({} already present, {} error(s)).",
+                stats.copied, dir, stats.skipped, stats.errors
             );
         }
         None => {
@@ -607,7 +607,11 @@ fn run_sanitize(
 
     if !no_scan {
         println!("Scanning '{source}'…");
-        update_repo(store, source, 0, &NoProgress, &cancel)?;
+        // Same live progress as `repo update` — a whole-disk scan can run for
+        // hours and must not look like a hang.
+        let progress = TerminalProgress::new();
+        update_repo(store, source, 0, &progress, &cancel)?;
+        progress.finish();
     }
 
     // The sanitized repo's directory receives the copies (and is a reference).

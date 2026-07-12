@@ -141,17 +141,10 @@ pub fn read_exif(path: &Path) -> Option<ExifInfo> {
 }
 
 /// Convert an EXIF `DateTime` (naive, no timezone) to epoch milliseconds,
-/// treated as if UTC. Uses Howard Hinnant's days-from-civil algorithm.
+/// treated as if UTC (via the shared civil-date math in [`crate::filter`]).
 fn exif_datetime_to_ms(dt: &exif::DateTime) -> i64 {
-    let (y, m, d) = (dt.year as i64, dt.month as i64, dt.day as i64);
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    let secs = days * 86400 + dt.hour as i64 * 3600 + dt.minute as i64 * 60 + dt.second as i64;
-    secs * 1000
+    crate::filter::ymd_to_ms(dt.year as i64, dt.month as i64, dt.day as i64)
+        + (dt.hour as i64 * 3600 + dt.minute as i64 * 60 + dt.second as i64) * 1000
 }
 
 // --- Images -----------------------------------------------------------------
@@ -523,19 +516,21 @@ pub fn eml_hash(path: &Path) -> Option<[u8; 32]> {
     text_hash(&basis)
 }
 
-/// Above this size a text file is hashed raw (no normalization) to bound cost.
+/// Above this size a text file gets no normalized hash, bounding both the read
+/// and the in-memory copy. A raw hash would add nothing: it equals the entry's
+/// BLAKE3 content hash, so exact-duplicate search already covers those files.
 const TEXT_NORMALIZE_CAP: u64 = 32 * 1024 * 1024;
 
 /// BLAKE3 of a normalized text/CSV file so exports and logs that differ only by
 /// BOM, line endings (CRLF vs LF) or trailing whitespace group together. Files
-/// larger than [`TEXT_NORMALIZE_CAP`] are hashed raw (bounded cost); a
-/// one-row/one-line difference still changes the hash.
+/// larger than [`TEXT_NORMALIZE_CAP`] get `None` (their raw identity is the
+/// content hash); a one-row/one-line difference still changes the hash.
 pub fn text_file_hash(path: &Path) -> Option<[u8; 32]> {
     let meta = std::fs::metadata(path).ok()?;
-    let bytes = std::fs::read(path).ok()?;
     if meta.len() > TEXT_NORMALIZE_CAP {
-        return Some(*blake3::hash(&bytes).as_bytes());
+        return None;
     }
+    let bytes = std::fs::read(path).ok()?;
     let text = String::from_utf8_lossy(&bytes);
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(&text); // strip BOM
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
