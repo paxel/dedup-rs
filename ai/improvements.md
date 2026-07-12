@@ -8,18 +8,6 @@ redundant backups. A caretaker must find the useful and important material — d
 photos, crypto wallets, keys — without eyeballing terabytes of duplicates. As the
 "no hardcopies" generation ages, this is a recurring, real problem.
 
-The product is a four-stage pipeline:
-
-```
- Stage 1: REDUCE     eliminate duplicates within each disk           (done)
- Stage 2: SANITIZE   copy unique content to a curated dir, then      (done)
-                     diff every next disk against it
- Stage 3: REFINE     drop media that exists elsewhere in better      (done)
-                     quality — needs fast human review
- Stage 4: ORDER      organize survivors by time/importance; flag     (done)
-                     wallets, keys, vital documents
-```
-
 Media strategy is **hybrid**: in-app image zoom, in-app audio playback, video as
 scrub-able frame strips; one click hands any file to the system's external app for full
 fidelity.
@@ -40,3 +28,36 @@ coverage, forensic layer) have shipped. What remains is cross-cutting debt.
   kittest geometric tests + an `--ignored` render snapshot; every core feature with
   temp-repo integration tests; store format changes must include a legacy-decode test
   (pattern: `store.rs::v1_entries_decode_and_flag_images_stale`).
+
+
+user demands changes:
+
+* The ETA calculation is waaay off. the last time it predicted about 2h and it took 6. even 1h before finish the eta was still like 8 minutes. there must be some better prediction algos. is there a lib that allows that? if not we should create something like that: a function where you put total items, concurrent lanes, and then duration per lane and ask for eta every 5s to have a less flickering display?
+* I dont understand the also REF selection. I find it not intuitive and there must be a better solution for whatever it tries to solve. create a plan with different options for the user to decide
+* The Files section should be renamed to transfer section. because its transfering  files from different repos together. the delete should be moved to the new fourth section: grooming
+* the move to and copy to commands are added, where unique files are copied or moved into a folder that the user can specify with a folder selector
+  * the move and copy to have also mode selector where duplicates and siliars can be selected and an inverter so that duplicates instead are cpied / moved
+* the grooming should have a top selector for the command and as it is the most complex one every command should have its own layout.
+* the delete has a source repo selector and a multi repo selector for the remaining repos. the source repo deletes all duplicates that are in any of the selected repos.
+* the organize command has a filter a path generator where the taret path can be generated with placeholders and alternatives to define the new reative path of files in a repo
+  * maybe multiple filters and paths
+  * the complete selection can be named, stored and reactivated by the user on other repos or in te future. for repeating or modifying the organisation
+  * no file should ever get lost or overwritten here.
+  * a preview similar to the copy move is required
+  * a progress when executed too
+* small tools like: 
+  * delete empty dirs
+  * delete ALL of a filter: mime, size name. the name filter should allow some kind of wildcards to ensure that you can say: ends with .db or starts with copy_of
+* the fith page will be browse where all the forensic tools will be added. allo the user to filter files, display them, mark them with annotations (trash, important, etc)
+* with annotations a new filter for annotations makes sense
+* binary / hex view of at least the header of files
+* strings on demand on unknown files
+* the transfer copy to with annotation filter can be an export of important or otherwise tagged stuff. similar the move to can be an removal and archival of unimportant stuff
+* face recognition of photos and image is a far future task
+* object recognition also
+* vla of files to specific topics
+* word clouds to documents
+* mp3 tags handling
+* meta data extraction of all known formats
+* plugin support for new formats
+* api for externalize features
