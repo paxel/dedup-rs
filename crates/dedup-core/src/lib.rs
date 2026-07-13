@@ -4,6 +4,7 @@
 pub mod archive;
 pub mod diff;
 pub mod dupes;
+pub mod eta;
 pub mod filter;
 pub mod fingerprint;
 pub mod organize;

@@ -46,6 +46,10 @@ pub enum ProgressEvent {
     Hashing {
         done: u64,
         total: u64,
+        /// Bytes processed so far (summed file sizes, whether hashed or errored).
+        done_bytes: u64,
+        /// Total bytes to process this run (summed sizes of all files to hash).
+        total_bytes: u64,
         current: String,
     },
     Error {
@@ -270,6 +274,7 @@ pub fn update_repo(
         .build()
         .map_err(|e| UpdateError::ThreadPool(e.to_string()))?;
     let total = to_hash.len() as u64;
+    let total_bytes: u64 = to_hash.iter().map(|f| f.size).sum();
     let (sender, receiver) = mpsc::channel::<(&WalkedFile, std::io::Result<HashedFile>)>();
 
     // Perceptual fingerprints (images/video/pdf/audio) are computed alongside
@@ -302,8 +307,12 @@ pub fn update_repo(
         });
 
         let mut batch: Vec<(&str, FileEntry)> = Vec::new();
+        let mut done_bytes: u64 = 0;
         for (index, (file, result)) in receiver.iter().enumerate() {
             let done = index as u64 + 1;
+            // Count every file's size toward progress, hashed or errored, so the
+            // byte counter reaches `total_bytes` exactly at completion.
+            done_bytes += file.size;
             match result {
                 Ok(hashed) => {
                     if existing.contains_key(&file.rel) {
@@ -346,6 +355,8 @@ pub fn update_repo(
             progress.on(ProgressEvent::Hashing {
                 done,
                 total,
+                done_bytes,
+                total_bytes,
                 current: file.rel.clone(),
             });
         }

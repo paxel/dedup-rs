@@ -100,26 +100,7 @@ layout** (unlike Transfer's shared form).
     (`filter.rs:127`); add prefix/suffix/glob matching so "ends with `.db`" or "starts
     with `copy_of`" work.
 
-### 5.3 Smarter ETA
-
-Today's scan ETA is a naive linear extrapolation by **file count**
-(`app.rs:942`: `elapsed * (total-done)/done`), which is wildly wrong — file sizes vary by
-orders of magnitude and hashing runs on several lanes, so it once predicted ~2h for a 6h
-run and still read "~8 min" an hour before finishing.
-
-- Estimate by **bytes**, not file count: track hashed bytes vs total bytes. `update.rs`
-  already sums `hashed_bytes` and every entry carries `.size`; carry byte progress on the
-  `Hashing` event.
-- Model **aggregate throughput** across the concurrent lanes and smooth it with an
-  **exponential moving average**, so a few very large/small files don't whipsaw the number.
-- **Recompute on a fixed cadence (~5 s)** and hold the shown value between ticks to stop
-  the flicker — exactly the "total items, lanes, duration-per-lane, ask every 5 s" shape
-  requested.
-- Ship as a small reusable `EtaEstimator` in `dedup-core` (`new(total_bytes)`,
-  `record(done_bytes, now)`, `eta()`), unit-tested against synthetic throughput curves.
-- Library note: no Rust crate does headless byte-throughput ETA well — `indicatif` bundles
-  an ETA but only inside its own progress bar. Recommend the small custom estimator
-  (mirroring indicatif's recent-sample weighting) over pulling a dependency.
+### 5.3 Smarter ETA  — ✅ done
 
 ---
 

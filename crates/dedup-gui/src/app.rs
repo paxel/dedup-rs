@@ -765,6 +765,7 @@ impl DedupApp {
                 r.queued_at.elapsed(),
                 r.started_at.map(|s| s.elapsed()),
                 r.event.clone(),
+                r.eta(),
             )
         });
         egui::Frame::new()
@@ -858,7 +859,7 @@ impl DedupApp {
                 });
 
                 match tracked {
-                    Some((kind, RepoStatus::Queued, waited, _, _)) => {
+                    Some((kind, RepoStatus::Queued, waited, _, _, _)) => {
                         let verb = if kind == JobKind::Check {
                             "check"
                         } else {
@@ -884,7 +885,7 @@ impl DedupApp {
                             }
                         });
                     }
-                    Some((kind, RepoStatus::Running, _, elapsed, event)) => {
+                    Some((kind, RepoStatus::Running, _, elapsed, event, eta)) => {
                         let elapsed = elapsed.unwrap_or_default();
                         let checking = kind == JobKind::Check;
                         ui.horizontal(|ui| {
@@ -935,17 +936,13 @@ impl DedupApp {
                             }
                         });
                         let verb = if checking { "checking" } else { "scanning" };
-                        let timing = match &event {
-                            ProgressEvent::Hashing { done, total, .. }
-                                if *total > 0 && *done > 0 && !checking =>
-                            {
-                                let eta = elapsed.mul_f64((*total - *done) as f64 / *done as f64);
-                                format!(
-                                    "scanning for {} · ETA {}",
-                                    format_elapsed(elapsed),
-                                    format_elapsed(eta)
-                                )
-                            }
+                        let hashing = !checking && matches!(&event, ProgressEvent::Hashing { total, .. } if *total > 0);
+                        let timing = match eta {
+                            Some(eta) if hashing => format!(
+                                "scanning for {} · ETA {}",
+                                format_elapsed(elapsed),
+                                format_elapsed(eta)
+                            ),
                             _ => format!("{verb} for {}", format_elapsed(elapsed)),
                         };
                         ui.label(RichText::new(timing).color(theme::TAN).size(12.0));
