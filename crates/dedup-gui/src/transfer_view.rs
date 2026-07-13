@@ -12,14 +12,15 @@ use crate::theme;
 use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::diff::{
-    CopyDest, DiffAction, DiffEvent, DiffItem, DiffProgress, DiffRun, diff_copy, diff_print,
+    CopyDest, DiffAction, DiffEvent, DiffItem, DiffProgress, DiffRun, FolderMode, diff_copy,
+    diff_print, export_to_folder, plan_folder_export,
 };
 use dedup_core::filter::{FileFilter, count_matches};
 use dedup_core::store::Store;
 use dedup_core::update::CancellationToken;
 use egui::{Id, RichText};
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -65,9 +66,52 @@ impl Command {
     }
 }
 
+/// Where a COPY/MOVE lands: into another repo, or into a plain folder.
+#[derive(PartialEq, Clone, Copy)]
+enum Destination {
+    /// Into the target repo (content compared against target + references).
+    Repo,
+    /// Into a user-picked folder (a deduplicated selection of the source).
+    Folder,
+}
+
+/// How a folder export groups the source to pick which copies to keep.
+#[derive(PartialEq, Clone, Copy)]
+enum SelectMode {
+    /// Exact-content duplicate groups.
+    Exact,
+    /// Perceptual-similarity groups (at the app's similarity threshold).
+    Similar,
+}
+
+impl SelectMode {
+    fn label(self) -> &'static str {
+        match self {
+            SelectMode::Exact => "EXACT",
+            SelectMode::Similar => "SIMILAR",
+        }
+    }
+}
+
 struct PreviewRow {
     from: String,
     to: String,
+}
+
+/// A snapshot of the destination captured when a run starts, so the worker
+/// thread owns everything it needs without borrowing the view.
+enum StartDest {
+    Repo {
+        references: Vec<String>,
+        target: String,
+        subdir: String,
+    },
+    Folder {
+        references: Vec<String>,
+        dir: PathBuf,
+        mode: FolderMode,
+        invert: bool,
+    },
 }
 
 /// The kind of a single filter condition. Maps one-to-one to the `mime:` /
@@ -268,9 +312,23 @@ pub struct TransferView {
     /// when neither the target nor any of these already has its content.
     extra_refs: Vec<String>,
     command: Command,
+    /// Whether COPY/MOVE goes into a repo or a picked folder.
+    destination: Destination,
+    /// Absolute path of the export folder (Destination::Folder).
+    folder: String,
+    /// Grouping basis for a folder export.
+    select_mode: SelectMode,
+    /// Export the redundant copies instead of the unique files.
+    invert: bool,
+    /// The app-wide similarity threshold, refreshed each frame from `show`;
+    /// used when a folder export groups by SIMILAR.
+    similar_threshold: f64,
     subdir: String,
     subdir_tx: Sender<Result<String, String>>,
     subdir_rx: Receiver<Result<String, String>>,
+    /// Absolute export folder picked by the native folder dialog thread.
+    folder_tx: Sender<Result<String, String>>,
+    folder_rx: Receiver<Result<String, String>>,
     filters: Vec<FilterCond>,
     /// Whether the `+` type picker is currently expanded.
     adding: bool,
@@ -325,6 +383,11 @@ enum Act {
     ToggleExtraRef(String),
     MarkSourceDone,
     SetCommand(Command),
+    SetDestination(Destination),
+    SetMode(SelectMode),
+    ToggleInvert,
+    FolderChanged,
+    BrowseFolder,
     SubdirChanged,
     FilterChanged,
     AddCond(FilterKind),
@@ -350,6 +413,7 @@ impl TransferView {
     pub fn new() -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
         let (subdir_tx, subdir_rx) = crossbeam_channel::unbounded();
+        let (folder_tx, folder_rx) = crossbeam_channel::unbounded();
         let (count_tx, count_rx) = crossbeam_channel::unbounded();
         let (io_tx, io_rx) = crossbeam_channel::unbounded();
         Self {
@@ -359,9 +423,16 @@ impl TransferView {
             target: None,
             extra_refs: Vec::new(),
             command: Command::Copy,
+            destination: Destination::Repo,
+            folder: String::new(),
+            select_mode: SelectMode::Exact,
+            invert: false,
+            similar_threshold: 90.0,
             subdir: String::new(),
             subdir_tx,
             subdir_rx,
+            folder_tx,
+            folder_rx,
             filters: Vec::new(),
             adding: false,
             history: FilterHistory::default(),
@@ -392,8 +463,15 @@ impl TransferView {
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, verbosity: TooltipVerbosity) {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        store: &Arc<Store>,
+        verbosity: TooltipVerbosity,
+        similar_threshold: f64,
+    ) {
         self.verbosity = verbosity;
+        self.similar_threshold = similar_threshold;
         self.drain(ui, store);
         if !self.loaded {
             self.reload(store);
@@ -403,7 +481,7 @@ impl TransferView {
         let mut acts: Vec<Act> = Vec::new();
         ui.add_space(6.0);
         ui.label(
-            RichText::new("FILE MANAGEMENT")
+            RichText::new("TRANSFER")
                 .color(theme::BLUE)
                 .size(18.0)
                 .strong(),
@@ -411,7 +489,14 @@ impl TransferView {
 
         self.repo_rows(ui, &mut acts);
         self.command_bar(ui, &mut acts);
-        self.subdir_bar(ui, &mut acts);
+        self.dest_bar(ui, &mut acts);
+        match self.destination {
+            Destination::Repo => self.subdir_bar(ui, &mut acts),
+            Destination::Folder => {
+                self.folder_bar(ui, &mut acts);
+                self.mode_bar(ui, &mut acts);
+            }
+        }
         self.filter_bar(ui, &mut acts);
         self.action_bar(ui, &mut acts);
 
@@ -490,7 +575,7 @@ impl TransferView {
                             self.verbosity,
                             "Pick as the source repo",
                             "Use this repository as the source: its files are compared \
-                             against the target (and any ALSO REF repos) to decide what's \
+                             against the target (and any DupePool repos) to decide what's \
                              new or already known.",
                         )
                         .clicked()
@@ -511,40 +596,68 @@ impl TransferView {
                     acts.push(Act::Reload);
                 }
             });
+            // The target repo is only chosen when copying/moving into a repo; a
+            // folder export has no target (the folder is the destination).
+            if self.destination == Destination::Repo {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("TARGET").color(theme::TEXT).size(12.0));
+                    for name in &self.repos {
+                        // The target is chosen from the repos that are not the source.
+                        if self.source.as_deref() == Some(name.as_str()) {
+                            continue;
+                        }
+                        let sel = self.target.as_deref() == Some(name.as_str());
+                        let fill = if sel { theme::BLUE } else { theme::PANEL };
+                        let col = if sel { theme::BLACK } else { theme::BLUE };
+                        if ui
+                            .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
+                            .explain(
+                                self.verbosity,
+                                "Pick as the target repo",
+                                "Use this repository as the target: it's where COPY/MOVE files \
+                                 land, and it always counts as a reference for deciding what's \
+                                 new.",
+                            )
+                            .clicked()
+                        {
+                            acts.push(Act::PickTarget(name.clone()));
+                        }
+                    }
+                });
+            }
+            // Reference repos: content any of them already holds is treated as
+            // "already known" and never re-copied. In REPO mode the target is
+            // always a reference and is shown as a locked chip.
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("TARGET").color(theme::TEXT).size(12.0));
+                ui.label(RichText::new("DUPEPOOL").color(theme::TEXT).size(12.0));
+                if self.destination == Destination::Repo
+                    && let Some(target) = self.target.clone()
+                {
+                    // A locked, non-toggleable chip: the target is always a
+                    // reference. Rendered filled (not disabled) so it reads
+                    // as "on"; clicks are intentionally ignored.
+                    ui.add(
+                        egui::Button::new(
+                            RichText::new(format!("{} {target}", icon::LOCK)).color(theme::BLACK),
+                        )
+                        .fill(theme::LILAC),
+                    )
+                    .explain(
+                        self.verbosity,
+                        "Always in the pool (it's the target)",
+                        "The target repo is always in the dupe pool — COPY/MOVE never \
+                         re-copies content the target already has — so it can't be \
+                         toggled off.",
+                    );
+                }
                 for name in &self.repos {
-                    // The target is chosen from the repos that are not the source.
+                    // Never a reference to itself; in REPO mode the target is
+                    // shown locked above, so skip it here.
                     if self.source.as_deref() == Some(name.as_str()) {
                         continue;
                     }
-                    let sel = self.target.as_deref() == Some(name.as_str());
-                    let fill = if sel { theme::BLUE } else { theme::PANEL };
-                    let col = if sel { theme::BLACK } else { theme::BLUE };
-                    if ui
-                        .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
-                        .explain(
-                            self.verbosity,
-                            "Pick as the target repo",
-                            "Use this repository as the target: it's where COPY/MOVE files \
-                             land, and it always counts as a reference for deciding what's \
-                             new.",
-                        )
-                        .clicked()
-                    {
-                        acts.push(Act::PickTarget(name.clone()));
-                    }
-                }
-            });
-            // Optional extra reference repos: content present in any of them is
-            // treated as "already known" (so it is not copied).
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("ALSO REF").color(theme::TEXT).size(12.0));
-                for name in &self.repos {
-                    // Extra refs exclude the source and target (target is always
-                    // a reference already).
-                    if self.source.as_deref() == Some(name.as_str())
-                        || self.target.as_deref() == Some(name.as_str())
+                    if self.destination == Destination::Repo
+                        && self.target.as_deref() == Some(name.as_str())
                     {
                         continue;
                     }
@@ -555,11 +668,8 @@ impl TransferView {
                         .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
                         .explain(
                             self.verbosity,
-                            "Toggle as an extra reference",
-                            "Also treat this repository's content as \"already known\", on \
-                             top of the target. A source file counts as new only when \
-                             *none* of the target or these extra references already has it \
-                             — this is what makes disk-triage correct across many disks.",
+                            "Add to the dupe pool",
+                            "Also check for dupes vs these repos in addition to the target repo.",
                         )
                         .clicked()
                     {
@@ -580,6 +690,39 @@ impl TransferView {
             }
         }
         refs
+    }
+
+    /// The DupePool repos to subtract from a folder export: the extra references
+    /// (there is no target in folder mode), minus the source.
+    fn folder_references(&self) -> Vec<String> {
+        self.extra_refs
+            .iter()
+            .filter(|r| self.source.as_deref() != Some(r.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    /// The [`FolderMode`] currently selected for a folder export.
+    fn folder_mode(&self) -> FolderMode {
+        match self.select_mode {
+            SelectMode::Exact => FolderMode::Exact,
+            SelectMode::Similar => FolderMode::Similar {
+                threshold: self.similar_threshold,
+            },
+        }
+    }
+
+    /// Whether PREVIEW/RUN can act: a source is picked, the destination is
+    /// resolved (a target repo, or a non-blank export folder), and nothing is
+    /// already running.
+    fn ready(&self) -> bool {
+        if self.running || self.source.is_none() {
+            return false;
+        }
+        match self.destination {
+            Destination::Repo => self.target.is_some(),
+            Destination::Folder => !self.folder.trim().is_empty(),
+        }
     }
 
     fn command_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
@@ -660,6 +803,144 @@ impl TransferView {
                 .color(theme::LILAC)
                 .size(11.0),
             );
+        });
+    }
+
+    /// Selector for where COPY/MOVE lands: into a repo or into a picked folder.
+    fn dest_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        theme::section(theme::BLUE).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("DEST").color(theme::TEXT).size(12.0));
+                for (dest, label, short, verbose) in [
+                    (
+                        Destination::Repo,
+                        "REPO",
+                        "Transfer into the target repo",
+                        "COPY/MOVE the source files the target (and DupePool) don't have \
+                         into the target repository.",
+                    ),
+                    (
+                        Destination::Folder,
+                        "FOLDER",
+                        "Export into a picked folder",
+                        "COPY/MOVE a deduplicated selection of the source into a plain \
+                         folder you pick, keeping each file's source-relative path.",
+                    ),
+                ] {
+                    let sel = self.destination == dest;
+                    let fill = if sel { theme::BLUE } else { theme::PANEL };
+                    let col = if sel { theme::BLACK } else { theme::BLUE };
+                    if ui
+                        .add(egui::Button::new(RichText::new(label).color(col)).fill(fill))
+                        .explain(self.verbosity, short, verbose)
+                        .clicked()
+                    {
+                        acts.push(Act::SetDestination(dest));
+                    }
+                }
+            });
+        });
+    }
+
+    /// The export-folder path input and its native folder picker (FOLDER mode).
+    fn folder_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        theme::section(theme::BLUE).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("FOLDER").color(theme::TEXT).size(12.0));
+                let changed = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.folder)
+                            .desired_width(320.0)
+                            .hint_text("/absolute/export/folder"),
+                    )
+                    .explain(
+                        self.verbosity,
+                        "Absolute export folder",
+                        "The folder the selected files are copied/moved into. Files keep \
+                         their source-relative path under it.",
+                    )
+                    .changed();
+                if changed {
+                    acts.push(Act::FolderChanged);
+                }
+                if ui
+                    .add(egui::Button::new(
+                        RichText::new(format!("{} BROWSE", icon::FOLDER_OPEN)).color(theme::BLACK),
+                    ))
+                    .explain(
+                        self.verbosity,
+                        "Pick or create the export folder",
+                        "Open a native folder picker to choose (or create) the folder the \
+                         selected files go into.",
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::BrowseFolder);
+                }
+            });
+        });
+    }
+
+    /// Grouping mode (exact/similar) and the invert toggle for a folder export.
+    fn mode_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        theme::section(theme::LILAC).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("MODE").color(theme::TEXT).size(12.0));
+                for mode in [SelectMode::Exact, SelectMode::Similar] {
+                    let sel = self.select_mode == mode;
+                    let fill = if sel { theme::LILAC } else { theme::PANEL };
+                    let col = if sel { theme::BLACK } else { theme::LILAC };
+                    let (short, verbose) = match mode {
+                        SelectMode::Exact => (
+                            "Group by exact content",
+                            "Treat only byte-identical files (same size + hash) as copies of \
+                             each other.",
+                        ),
+                        SelectMode::Similar => (
+                            "Group by perceptual similarity",
+                            "Treat perceptually similar media (at the Duplicates tab's \
+                             similarity threshold) as copies — e.g. one photo per burst.",
+                        ),
+                    };
+                    if ui
+                        .add(egui::Button::new(RichText::new(mode.label()).color(col)).fill(fill))
+                        .explain(self.verbosity, short, verbose)
+                        .clicked()
+                    {
+                        acts.push(Act::SetMode(mode));
+                    }
+                }
+                ui.separator();
+                let fill = if self.invert {
+                    theme::ORANGE
+                } else {
+                    theme::PANEL
+                };
+                let col = if self.invert {
+                    theme::BLACK
+                } else {
+                    theme::ORANGE
+                };
+                if ui
+                    .add(egui::Button::new(RichText::new("INVERT").color(col)).fill(fill))
+                    .explain(
+                        self.verbosity,
+                        "Export the redundant copies instead",
+                        "Off: export the unique files (one best copy per group plus every \
+                         singleton). On: export the redundant copies instead (every \
+                         non-best member of a group) — what a dedup would remove.",
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::ToggleInvert);
+                }
+            });
+            let hint = if self.invert {
+                "Exports the redundant copies (every non-best member of a group)."
+            } else {
+                "Exports the unique files (best copy of each group plus every singleton)."
+            };
+            ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
         });
     }
 
@@ -1053,7 +1334,7 @@ impl TransferView {
         theme::section(theme::AMBER).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("ACTION").color(theme::TEXT).size(12.0));
-                let ready = self.source.is_some() && self.target.is_some() && !self.running;
+                let ready = self.ready();
                 if ui
                     .add_enabled(
                         ready,
@@ -1288,6 +1569,20 @@ impl TransferView {
                 self.command = cmd;
                 self.clear_preview();
             }
+            Act::SetDestination(dest) => {
+                self.destination = dest;
+                self.clear_preview();
+            }
+            Act::SetMode(mode) => {
+                self.select_mode = mode;
+                self.clear_preview();
+            }
+            Act::ToggleInvert => {
+                self.invert = !self.invert;
+                self.clear_preview();
+            }
+            Act::FolderChanged => self.clear_preview(),
+            Act::BrowseFolder => self.browse_folder(ctx),
             Act::SubdirChanged => self.clear_preview(),
             Act::FilterChanged => {
                 self.clear_preview();
@@ -1580,6 +1875,25 @@ impl TransferView {
         });
     }
 
+    /// Open the native folder dialog and store the picked absolute path as the
+    /// export folder (Destination::Folder).
+    fn browse_folder(&mut self, ctx: &egui::Context) {
+        let tx = self.folder_tx.clone();
+        let repaint = ctx.clone();
+        // Start the dialog in the current folder if it is a real directory.
+        let start = Some(self.folder.clone()).filter(|f| Path::new(f).is_dir());
+        std::thread::spawn(move || {
+            let mut dialog = rfd::FileDialog::new().set_title("Choose the export folder");
+            if let Some(dir) = start {
+                dialog = dialog.set_directory(dir);
+            }
+            if let Some(dir) = dialog.pick_folder() {
+                let _ = tx.send(Ok(dir.to_string_lossy().into_owned()));
+                repaint.request_repaint();
+            }
+        });
+    }
+
     fn filter_string(&self) -> Option<String> {
         let mut parts = Vec::new();
         for cond in &self.filters {
@@ -1596,7 +1910,7 @@ impl TransferView {
     }
 
     fn run_preview(&mut self, store: &Store) {
-        let (Some(source), Some(target)) = (self.source.clone(), self.target.clone()) else {
+        let Some(source) = self.source.clone() else {
             return;
         };
         // PREVIEW and RUN are mutually exclusive: previewing drops any run log.
@@ -1614,10 +1928,20 @@ impl TransferView {
         if dirty {
             self.save_history(store);
         }
+        match self.destination {
+            Destination::Repo => self.run_preview_repo(store, &source),
+            Destination::Folder => self.run_preview_folder(store, &source),
+        }
+    }
+
+    fn run_preview_repo(&mut self, store: &Store, source: &str) {
+        let Some(target) = self.target.clone() else {
+            return;
+        };
         let filter = self.filter_string();
         let references = self.references(&target);
         let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
-        match diff_print(store, &source, &ref_slice, filter.as_deref()) {
+        match diff_print(store, source, &ref_slice, filter.as_deref()) {
             Ok(items) => {
                 // Copy/Move act on content the target lacks (New).
                 let matched: Vec<&DiffItem> = items
@@ -1628,10 +1952,48 @@ impl TransferView {
                 self.preview = matched
                     .into_iter()
                     .take(PREVIEW_LIMIT)
-                    .map(|item| self.preview_row(&source, &target, item))
+                    .map(|item| self.preview_row(source, &target, item))
                     .collect();
                 self.status = Some(format!(
                     "{} match the {}.",
+                    self.preview_total,
+                    self.command.label().to_lowercase()
+                ));
+                self.error = None;
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    fn run_preview_folder(&mut self, store: &Store, source: &str) {
+        let folder = self.folder.trim();
+        if folder.is_empty() {
+            return;
+        }
+        let filter = self.filter_string();
+        let references = self.folder_references();
+        let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
+        match plan_folder_export(
+            store,
+            source,
+            &ref_slice,
+            self.folder_mode(),
+            self.invert,
+            filter.as_deref(),
+        ) {
+            Ok(rels) => {
+                self.preview_total = rels.len();
+                self.preview = rels
+                    .iter()
+                    .take(PREVIEW_LIMIT)
+                    .map(|rel| PreviewRow {
+                        from: format!("{source}/{rel}"),
+                        to: format!("{folder}/{rel}"),
+                    })
+                    .collect();
+                let what = if self.invert { "redundant" } else { "unique" };
+                self.status = Some(format!(
+                    "{} {what} file(s) to {}.",
                     self.preview_total,
                     self.command.label().to_lowercase()
                 ));
@@ -1669,12 +2031,24 @@ impl TransferView {
     fn build_prompt(&mut self, store: &Store) -> Option<String> {
         // Refresh the count so the confirmation reflects the current filter.
         self.run_preview(store);
-        let (source, target) = (self.source.as_ref()?, self.target.as_ref()?);
-        let subdir = self.normalized_subdir();
-        let dest = if subdir.is_empty() {
-            target.to_string()
-        } else {
-            format!("{target}/{subdir}")
+        let source = self.source.as_ref()?;
+        let dest = match self.destination {
+            Destination::Repo => {
+                let target = self.target.as_ref()?;
+                let subdir = self.normalized_subdir();
+                if subdir.is_empty() {
+                    target.to_string()
+                } else {
+                    format!("{target}/{subdir}")
+                }
+            }
+            Destination::Folder => {
+                let folder = self.folder.trim();
+                if folder.is_empty() {
+                    return None;
+                }
+                folder.to_string()
+            }
         };
         Some(match self.command {
             Command::Copy => format!(
@@ -1689,13 +2063,38 @@ impl TransferView {
     }
 
     fn start(&mut self, store: &Arc<Store>) {
-        let (Some(source), Some(target)) = (self.source.clone(), self.target.clone()) else {
+        let Some(source) = self.source.clone() else {
             return;
         };
-        let references = self.references(&target);
+        // Snapshot everything the worker needs before spawning, branching on
+        // where the transfer lands.
+        let dest = match self.destination {
+            Destination::Repo => {
+                let Some(target) = self.target.clone() else {
+                    return;
+                };
+                StartDest::Repo {
+                    references: self.references(&target),
+                    target,
+                    subdir: self.normalized_subdir(),
+                }
+            }
+            Destination::Folder => {
+                let folder = self.folder.trim().to_string();
+                if folder.is_empty() {
+                    return;
+                }
+                StartDest::Folder {
+                    references: self.folder_references(),
+                    dir: PathBuf::from(&folder),
+                    mode: self.folder_mode(),
+                    invert: self.invert,
+                }
+            }
+        };
         let filter = self.filter_string();
-        let subdir = self.normalized_subdir();
         let command = self.command;
+        let move_files = command == Command::Move;
         let store = Arc::clone(store);
         let tx = self.tx.clone();
         self.cancel = CancellationToken::new();
@@ -1708,21 +2107,24 @@ impl TransferView {
         self.reset_run();
 
         std::thread::spawn(move || {
-            let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
             let progress = ChannelDiffProgress { tx: tx.clone() };
             let run = DiffRun::new(&progress, &cancel);
-            let result = match command {
-                Command::Copy | Command::Move => {
-                    let move_files = command == Command::Move;
-                    match store.get_repo(&target) {
+            let stats = match &dest {
+                StartDest::Repo {
+                    references,
+                    target,
+                    subdir,
+                } => {
+                    let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
+                    match store.get_repo(target) {
                         Ok(meta) => {
-                            let target_dir = std::path::PathBuf::from(meta.abs_path);
+                            let target_dir = PathBuf::from(meta.abs_path);
                             let subdir = if subdir.is_empty() {
                                 None
                             } else {
                                 Some(subdir.as_str())
                             };
-                            match diff_copy(
+                            diff_copy(
                                 &store,
                                 &source,
                                 &ref_slice,
@@ -1733,18 +2135,40 @@ impl TransferView {
                                 move_files,
                                 filter.as_deref(),
                                 &run,
-                            ) {
-                                Ok(s) => OpResult::Copied {
-                                    copied: s.copied,
-                                    cancelled: s.cancelled,
-                                    moved: move_files,
-                                },
-                                Err(e) => OpResult::Error(e.to_string()),
-                            }
+                            )
+                            .map_err(|e| e.to_string())
                         }
-                        Err(e) => OpResult::Error(e.to_string()),
+                        Err(e) => Err(e.to_string()),
                     }
                 }
+                StartDest::Folder {
+                    references,
+                    dir,
+                    mode,
+                    invert,
+                } => {
+                    let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
+                    export_to_folder(
+                        &store,
+                        &source,
+                        &ref_slice,
+                        dir,
+                        *mode,
+                        *invert,
+                        move_files,
+                        filter.as_deref(),
+                        &run,
+                    )
+                    .map_err(|e| e.to_string())
+                }
+            };
+            let result = match stats {
+                Ok(s) => OpResult::Copied {
+                    copied: s.copied,
+                    cancelled: s.cancelled,
+                    moved: move_files,
+                },
+                Err(e) => OpResult::Error(e),
             };
             let _ = tx.send(Msg::Done(result));
         });
@@ -1810,12 +2234,24 @@ impl TransferView {
                 HistoryIo::Failed(e) => self.error = Some(e),
             }
         }
-        // Apply any folder picked by the native subdir dialog thread.
+        // Apply any subfolder picked by the native subdir dialog thread.
         while let Ok(picked) = self.subdir_rx.try_recv() {
             got = true;
             match picked {
                 Ok(rel) => {
                     self.subdir = rel;
+                    self.error = None;
+                    self.clear_preview();
+                }
+                Err(e) => self.error = Some(e),
+            }
+        }
+        // Apply any export folder picked by the native folder dialog thread.
+        while let Ok(picked) = self.folder_rx.try_recv() {
+            got = true;
+            match picked {
+                Ok(abs) => {
+                    self.folder = abs;
                     self.error = None;
                     self.clear_preview();
                 }
@@ -1991,6 +2427,7 @@ mod tests {
 mod ui_tests {
     use super::*;
     use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
 
     /// A temp store with a `source` and `target` repo, `source` holding a
     /// couple of files so the filter builder and preview have something real
@@ -2011,6 +2448,96 @@ mod ui_tests {
             .create_repo("target", &dst_dir.to_string_lossy())
             .unwrap();
         (tmp, Arc::new(store))
+    }
+
+    /// Build a headless harness showing the Transfer view over `store`, driven
+    /// by the given `setup` (which runs once, before the first frame, to select
+    /// repos / destination / etc.).
+    fn transfer_harness(
+        store: Arc<Store>,
+        setup: impl FnOnce(&mut TransferView),
+    ) -> Harness<'static, TransferView> {
+        let mut view = TransferView::new();
+        view.loaded = true;
+        view.repos = vec!["source".to_string(), "target".to_string()];
+        view.source = Some("source".to_string());
+        setup(&mut view);
+
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 620.0))
+            .build_ui_state(
+                move |ui, view: &mut TransferView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), 90.0);
+                },
+                view,
+            );
+        harness.run();
+        harness
+    }
+
+    /// In FOLDER mode the folder/mode/invert controls appear and the repo-only
+    /// controls (TARGET row and INTO subdir bar) are hidden.
+    #[test]
+    fn folder_mode_shows_folder_controls_and_hides_repo_controls() {
+        let (_tmp, store) = sample_store();
+        let harness = transfer_harness(store, |view| {
+            view.destination = Destination::Folder;
+        });
+
+        // Folder-export controls are present (FOLDER appears twice: the DEST
+        // toggle button and the folder-path row label).
+        assert!(
+            harness.query_all_by_label("FOLDER").next().is_some(),
+            "FOLDER destination/label should be shown"
+        );
+        assert!(
+            harness.query_by_label("MODE").is_some(),
+            "MODE selector should be shown in folder mode"
+        );
+        assert!(
+            harness.query_by_label("INVERT").is_some(),
+            "INVERT toggle should be shown in folder mode"
+        );
+        // Repo-only controls are hidden.
+        assert!(
+            harness.query_by_label("TARGET").is_none(),
+            "the TARGET row must be hidden in folder mode"
+        );
+        assert!(
+            harness.query_by_label("INTO").is_none(),
+            "the INTO subdir bar must be hidden in folder mode"
+        );
+    }
+
+    /// In REPO mode the TARGET row and INTO subdir bar are shown, and the
+    /// folder-export controls are absent.
+    #[test]
+    fn repo_mode_shows_repo_controls_and_hides_folder_controls() {
+        let (_tmp, store) = sample_store();
+        let harness = transfer_harness(store, |view| {
+            view.destination = Destination::Repo;
+            view.target = Some("target".to_string());
+        });
+
+        assert!(
+            harness.query_by_label("TARGET").is_some(),
+            "the TARGET row should be shown in repo mode"
+        );
+        assert!(
+            harness.query_by_label("INTO").is_some(),
+            "the INTO subdir bar should be shown in repo mode"
+        );
+        assert!(
+            harness.query_by_label("MODE").is_none(),
+            "the MODE selector must be hidden in repo mode"
+        );
     }
 
     /// Doc screenshot: the Transfer tab with a source/target picked
@@ -2043,7 +2570,7 @@ mod ui_tests {
                         crate::theme::apply(ui.ctx());
                         init = true;
                     }
-                    view.show(ui, &store_ui, TooltipVerbosity::default());
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), 90.0);
                 },
                 view,
             );

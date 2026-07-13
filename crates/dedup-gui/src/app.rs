@@ -540,7 +540,12 @@ impl eframe::App for DedupApp {
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Repositories => self.repositories_view(ui, &mut actions),
             Tab::Duplicates => self.dupes.show(ui, &self.store, self.tooltip_verbosity),
-            Tab::Transfer => self.transfer.show(ui, &self.store, self.tooltip_verbosity),
+            Tab::Transfer => self.transfer.show(
+                ui,
+                &self.store,
+                self.tooltip_verbosity,
+                self.dupes.threshold(),
+            ),
             Tab::Grooming => Self::grooming_view(ui),
         });
         if self.show_settings {

@@ -38,31 +38,7 @@ Browse/forensic layer is Phase 6 and recognition/extensibility is Phase 7.
 
 ### 5.0 Tab restructure  — ✅ done
 
-### 5.1 Transfer section
-
-Commands: **COPY**, **MOVE**, plus two new folder-targeted variants:
-
-- **COPY TO / MOVE TO a folder**: the destination is an arbitrary directory chosen with a
-  folder picker (not a repo). Unique files are copied/moved there.
-  - **Mode selector**: choose the working set — *duplicates* or *similars* — with an
-    **invert** toggle, so the same command can act on the redundant copies instead of the
-    unique ones.
-- **Reference relabel** (decision 2026-07-13): keep today's target + extra-refs model but
-  rename **ALSO REF** to a plainer label (e.g. **"ALREADY HAVE IN"**) and make the
-  target's automatic inclusion visually obvious — a source file is "new" only when none of
-  the reference repos already holds its content.
-  - *Rejected alternatives (kept if relabel proves insufficient):* a single unified
-    reference multiselect with a separate destination picker; inverting the model so the
-    user picks the "keep set" and everything else is implicitly source.
-- Preview + background-run progress already exist in `files_view.rs` — reuse them.
-- Forward link: once annotations land (Phase 6), **COPY TO** with an annotation filter
-  becomes an *export of important/tagged* material, and **MOVE TO** an *archival of
-  unimportant* material.
-
-Core work: `diff_copy` currently lands files in a target **repo** (`diff.rs::CopyDest`).
-Add a plain-folder destination and a "unique / duplicate / similar" set selector (building
-on `dupes.rs` / `similar.rs`) so extraction to a directory reuses the same preview and
-progress path.
+### 5.1 Transfer section  — ✅ done
 
 ### 5.2 Grooming section
 
