@@ -4,6 +4,7 @@
 mod app;
 mod dupes_view;
 mod external;
+mod grooming_view;
 mod icon;
 mod lightbox;
 mod player;

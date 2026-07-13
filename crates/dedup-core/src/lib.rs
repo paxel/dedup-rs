@@ -7,6 +7,7 @@ pub mod dupes;
 pub mod eta;
 pub mod filter;
 pub mod fingerprint;
+pub mod groom;
 pub mod organize;
 pub mod report;
 pub mod scan;

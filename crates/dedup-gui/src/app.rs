@@ -5,6 +5,7 @@
 //! [`crate::transfer_view`].
 
 use crate::dupes_view::DupesView;
+use crate::grooming_view::GroomingView;
 use crate::icon;
 use crate::settings::TooltipVerbosity;
 use crate::status::{self, Location};
@@ -140,6 +141,7 @@ pub struct DedupApp {
     status_rx: Receiver<(String, Location)>,
     dupes: DupesView,
     transfer: TransferView,
+    grooming: GroomingView,
     /// Last settings written to disk, to avoid rewriting an unchanged file.
     saved_settings: crate::settings::Settings,
 }
@@ -175,6 +177,7 @@ impl DedupApp {
             status_rx,
             dupes: DupesView::new(),
             transfer: TransferView::new(),
+            grooming: GroomingView::new(),
             saved_settings: crate::settings::Settings::default(),
         };
         // Restore persisted settings (thread count, similarity threshold,
@@ -546,7 +549,7 @@ impl eframe::App for DedupApp {
                 self.tooltip_verbosity,
                 self.dupes.threshold(),
             ),
-            Tab::Grooming => Self::grooming_view(ui),
+            Tab::Grooming => self.grooming.show(ui, &self.store, self.tooltip_verbosity),
         });
         if self.show_settings {
             self.settings_modal(&ctx);
@@ -676,23 +679,6 @@ impl DedupApp {
                     });
                 });
             });
-    }
-
-    /// Placeholder for the Grooming tab. Its commands (delete, organize, small
-    /// tools) are built in Phase 5.2; for now the tab just announces itself.
-    fn grooming_view(ui: &mut egui::Ui) {
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new("GROOMING")
-                .color(theme::TAN)
-                .size(18.0)
-                .strong(),
-        );
-        ui.add_space(8.0);
-        ui.colored_label(
-            theme::TEXT,
-            "Pruning and reorganization commands are coming soon.",
-        );
     }
 
     fn repositories_view(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {

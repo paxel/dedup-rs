@@ -1,7 +1,13 @@
 //! File filters for diff and file operations, ported from the legacy
-//! `FilterFactory`: `mime:<substring>`, `name:<substring>`, and
+//! `FilterFactory`: `mime:<substring>`, `name:<pattern>`, and
 //! `size:<op><bytes>` with the operators `>=`, `<=`, `>`, `<`, `=`
 //! (a bare number means equality).
+//!
+//! `name:` is a plain substring over the relative path unless the value
+//! contains a `*`, in which case it is a glob (`*` matches any run of
+//! characters, including `/`) anchored to the whole relative path — so
+//! `name:*.db` matches paths ending in `.db` and `name:copy_of*` matches paths
+//! starting with `copy_of`.
 
 use crate::store::{FileEntry, StoreError, for_each_file_entry};
 
@@ -11,7 +17,8 @@ pub enum FileFilter {
     All,
     /// Matches entries whose MIME type contains the substring.
     Mime(String),
-    /// Matches entries whose relative path contains the substring.
+    /// Matches entries by relative path: a plain substring, or a `*`-glob when
+    /// the pattern contains a `*` (see [`glob_match`]).
     Name(String),
     /// Matches entries whose size satisfies the comparison.
     Size(SizeOp, u64),
@@ -242,7 +249,13 @@ impl FileFilter {
                 .mime
                 .as_ref()
                 .is_some_and(|mime| mime.contains(substring)),
-            Self::Name(substring) => rel_path.contains(substring),
+            Self::Name(pattern) => {
+                if pattern.contains('*') {
+                    glob_match(pattern, rel_path)
+                } else {
+                    rel_path.contains(pattern)
+                }
+            }
             Self::Origin(substring) => entry
                 .origin
                 .as_ref()
@@ -259,6 +272,46 @@ impl FileFilter {
             Self::And(filters) => filters.iter().all(|f| f.matches(rel_path, entry)),
         }
     }
+}
+
+/// Match `text` against a `*`-glob `pattern`, where `*` matches any run of
+/// characters (including `/`). The match is anchored to the whole string: the
+/// segments between `*`s must appear in order, the first anchored to the start
+/// (unless the pattern begins with `*`) and the last to the end (unless it ends
+/// with `*`). Case-sensitive, matching the plain-substring path.
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    // With no wildcard the pattern must match the whole string exactly.
+    if !pattern.contains('*') {
+        return pattern == text;
+    }
+    // Split on '*'. Consecutive '*'s and leading/trailing '*'s yield empty
+    // segments, which impose no constraint.
+    let mut segments = pattern.split('*');
+    let Some(first) = segments.next() else {
+        return true;
+    };
+    // The part before the first '*' must be a prefix.
+    let Some(mut rest) = text.strip_prefix(first) else {
+        return false;
+    };
+    // Collect the middle/last segments to know which one is last.
+    let tail: Vec<&str> = segments.collect();
+    for (i, seg) in tail.iter().enumerate() {
+        if seg.is_empty() {
+            continue;
+        }
+        if i + 1 == tail.len() {
+            // Last segment (pattern didn't end with '*'): must be a suffix.
+            return rest.ends_with(seg);
+        }
+        // A middle segment: find its next occurrence and advance past it.
+        match rest.find(seg) {
+            Some(pos) => rest = &rest[pos + seg.len()..],
+            None => return false,
+        }
+    }
+    // Pattern ended with '*' (or had only the prefix): the remainder is free.
+    true
 }
 
 /// Count the number of present (non-missing) entries in a repo database that
@@ -318,6 +371,42 @@ mod tests {
         assert!(filter.matches("sub/a.txt", &entry(1, None)));
         assert!(!filter.matches("other/a.txt", &entry(1, None)));
         Ok(())
+    }
+
+    #[test]
+    fn name_filter_supports_wildcards() -> Result<(), FilterError> {
+        // Suffix glob: "ends with .db".
+        let db = FileFilter::parse(Some("name:*.db"))?;
+        assert!(db.matches("data.db", &entry(1, None)));
+        assert!(db.matches("a/b/data.db", &entry(1, None)));
+        assert!(!db.matches("data.txt", &entry(1, None)));
+
+        // Prefix glob: "starts with copy_of".
+        let copy = FileFilter::parse(Some("name:copy_of*"))?;
+        assert!(copy.matches("copy_of_report.txt", &entry(1, None)));
+        assert!(!copy.matches("report.txt", &entry(1, None)));
+        // Anchored to the whole path, so a nested basename needs a leading '*'.
+        assert!(!copy.matches("dir/copy_of_x", &entry(1, None)));
+        assert!(
+            FileFilter::parse(Some("name:*copy_of*"))?.matches("dir/copy_of_x", &entry(1, None))
+        );
+
+        // A middle segment between two wildcards.
+        let mid = FileFilter::parse(Some("name:*IMG*.jpg"))?;
+        assert!(mid.matches("2021/IMG_1234.jpg", &entry(1, None)));
+        assert!(!mid.matches("2021/PIC_1234.jpg", &entry(1, None)));
+        Ok(())
+    }
+
+    #[test]
+    fn glob_match_edge_cases() {
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("*", ""));
+        assert!(glob_match("abc", "abc"));
+        assert!(!glob_match("abc", "abcd")); // no '*' → exact via prefix+suffix
+        assert!(glob_match("a*c", "ac"));
+        assert!(glob_match("a*c", "abbbc"));
+        assert!(!glob_match("a*c", "ab"));
     }
 
     #[test]
