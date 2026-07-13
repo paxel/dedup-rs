@@ -4,6 +4,7 @@
 mod app;
 mod dupes_view;
 mod external;
+mod filter_ui;
 mod grooming_view;
 mod icon;
 mod lightbox;
@@ -26,11 +27,15 @@ use std::sync::Arc;
 pub fn run(ui_scale: Option<f32>) -> Result<(), String> {
     let store = Arc::new(Store::open().map_err(|e| e.to_string())?);
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1100.0, 720.0])
+        .with_min_inner_size([760.0, 480.0])
+        .with_title("dedup");
+    if let Some(icon) = load_icon() {
+        viewport = viewport.with_icon(Arc::new(icon));
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 720.0])
-            .with_min_inner_size([760.0, 480.0])
-            .with_title("dedup"),
+        viewport,
         ..Default::default()
     };
 
@@ -47,4 +52,19 @@ pub fn run(ui_scale: Option<f32>) -> Result<(), String> {
         }),
     )
     .map_err(|e| e.to_string())
+}
+
+/// Decode the embedded app icon (two cat heads, one crossed through) into the
+/// RGBA form eframe wants for the window/taskbar icon. Returns `None` if the
+/// bundled PNG ever fails to decode, so a bad asset never blocks startup.
+fn load_icon() -> Option<egui::IconData> {
+    let image = image::load_from_memory(include_bytes!("../assets/icon.png"))
+        .ok()?
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    Some(egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    })
 }

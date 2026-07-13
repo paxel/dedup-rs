@@ -12,6 +12,7 @@
 //! All destructive runs go through a confirmation modal and execute on a
 //! background thread, reusing the same `DiffEvent` progress plumbing as Transfer.
 
+use crate::filter_ui::FilterBuilder;
 use crate::settings::TooltipVerbosity;
 use crate::theme;
 use crate::util::ExplainExt;
@@ -105,8 +106,8 @@ pub struct GroomingView {
     pool: Vec<String>,
     /// PURGE / EMPTY DIRS: the single repo the command acts on.
     repo: Option<String>,
-    /// PURGE / DEDUPE filter expression (mime / size / name with `*` wildcards).
-    filter: String,
+    /// The shared FILTER wizard (used by DEDUPE and PURGE).
+    filter: FilterBuilder,
     preview: Vec<PreviewRow>,
     preview_total: usize,
     status: Option<String>,
@@ -128,7 +129,6 @@ enum Act {
     PickSource(String),
     TogglePool(String),
     PickRepo(String),
-    FilterChanged,
     Reload,
     Preview,
     Ask,
@@ -147,7 +147,7 @@ impl GroomingView {
             source: None,
             pool: Vec::new(),
             repo: None,
-            filter: String::new(),
+            filter: FilterBuilder::new(),
             preview: Vec::new(),
             preview_total: 0,
             status: None,
@@ -186,6 +186,27 @@ impl GroomingView {
             Command::Dedupe => self.dedupe_layout(ui, &mut acts),
             Command::Purge => self.purge_layout(ui, &mut acts),
             Command::EmptyDirs => self.empty_dirs_layout(ui, &mut acts),
+        }
+        // The shared FILTER wizard for the commands that filter. Its MIME
+        // suggestions and live count are backed by the acted-on repo.
+        let count_repo = match self.command {
+            Command::Dedupe => self.source.clone(),
+            Command::Purge => self.repo.clone(),
+            Command::EmptyDirs => None,
+        };
+        if self.command != Command::EmptyDirs {
+            let outcome = self
+                .filter
+                .ui(ui, store, count_repo.as_deref(), self.verbosity);
+            if outcome.changed {
+                self.clear_preview();
+            }
+            if outcome.status.is_some() {
+                self.status = outcome.status;
+            }
+            if outcome.error.is_some() {
+                self.error = outcome.error;
+            }
         }
         self.action_bar(ui, &mut acts);
 
@@ -290,21 +311,10 @@ impl GroomingView {
                 }
             });
         });
-        self.filter_bar(
-            ui,
-            acts,
-            "Only delete duplicates that also match this filter.",
-        );
     }
 
     fn purge_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         self.single_repo_bar(ui, acts, "Delete matching files from this repo.");
-        self.filter_bar(
-            ui,
-            acts,
-            "Every non-missing file matching this filter is deleted. \
-             Leave blank to match everything.",
-        );
     }
 
     fn empty_dirs_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
@@ -334,32 +344,6 @@ impl GroomingView {
     }
 
     /// A single-line filter expression (mime / size / name with `*` wildcards).
-    fn filter_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>, hint: &str) {
-        theme::section(theme::BLUE).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("FILTER").color(theme::TEXT).size(12.0));
-                let changed = ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.filter)
-                            .desired_width(360.0)
-                            .hint_text("e.g. name:*.db size:>=1000 mime:image"),
-                    )
-                    .explain(
-                        self.verbosity,
-                        "Filter expression",
-                        "Space-separated conditions: `mime:<substr>`, `size:<op><bytes>`, \
-                         and `name:<pattern>` where a `*` in the name is a wildcard \
-                         (`*.db`, `copy_of*`).",
-                    )
-                    .changed();
-                if changed {
-                    acts.push(Act::FilterChanged);
-                }
-            });
-            ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
-        });
-    }
-
     fn action_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         theme::section(theme::AMBER).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -522,12 +506,7 @@ impl GroomingView {
     }
 
     fn filter_string(&self) -> Option<String> {
-        let f = self.filter.trim();
-        if f.is_empty() {
-            None
-        } else {
-            Some(f.to_string())
-        }
+        self.filter.filter_string()
     }
 
     fn apply(&mut self, store: &Arc<Store>, act: Act) {
@@ -553,7 +532,6 @@ impl GroomingView {
                 self.repo = Some(name);
                 self.clear_preview();
             }
-            Act::FilterChanged => self.clear_preview(),
             Act::Reload => self.reload(store),
             Act::Preview => self.run_preview(store),
             Act::Ask => {
