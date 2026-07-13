@@ -30,6 +30,120 @@ coverage, forensic layer) have shipped. What remains is cross-cutting debt.
   (pattern: `store.rs::v1_entries_decode_and_flag_images_stale`).
 
 
+## Phase 5 — Transfer, Grooming & smarter ETA  *(current branch: `feature/summer/transfer_and_grooming`)*
+
+This wave splits the old **Files** tab into two purpose-built sections and fixes the
+progress ETA. Scope confirmed 2026-07-13: Transfer + Grooming + ETA are near-term; the
+Browse/forensic layer is Phase 6 and recognition/extensibility is Phase 7.
+
+### 5.0 Tab restructure
+
+Grow `Tab` from `{ Repositories, Duplicates, Files }` to
+`{ Repositories, Duplicates, Transfer, Grooming, Browse }`:
+
+- Rename the **Files** tab (and `files_view.rs`) to **Transfer** — it moves files
+  *between* repos, so the name should say so.
+- The **DELETE** command leaves Transfer and becomes a Grooming command (see 5.2).
+- Add the **Grooming** tab now; reserve **Browse** for Phase 6.
+
+### 5.1 Transfer section
+
+Commands: **COPY**, **MOVE**, plus two new folder-targeted variants:
+
+- **COPY TO / MOVE TO a folder**: the destination is an arbitrary directory chosen with a
+  folder picker (not a repo). Unique files are copied/moved there.
+  - **Mode selector**: choose the working set — *duplicates* or *similars* — with an
+    **invert** toggle, so the same command can act on the redundant copies instead of the
+    unique ones.
+- **Reference relabel** (decision 2026-07-13): keep today's target + extra-refs model but
+  rename **ALSO REF** to a plainer label (e.g. **"ALREADY HAVE IN"**) and make the
+  target's automatic inclusion visually obvious — a source file is "new" only when none of
+  the reference repos already holds its content.
+  - *Rejected alternatives (kept if relabel proves insufficient):* a single unified
+    reference multiselect with a separate destination picker; inverting the model so the
+    user picks the "keep set" and everything else is implicitly source.
+- Preview + background-run progress already exist in `files_view.rs` — reuse them.
+- Forward link: once annotations land (Phase 6), **COPY TO** with an annotation filter
+  becomes an *export of important/tagged* material, and **MOVE TO** an *archival of
+  unimportant* material.
+
+Core work: `diff_copy` currently lands files in a target **repo** (`diff.rs::CopyDest`).
+Add a plain-folder destination and a "unique / duplicate / similar" set selector (building
+on `dupes.rs` / `similar.rs`) so extraction to a directory reuses the same preview and
+progress path.
+
+### 5.2 Grooming section
+
+A **top command selector**; because these commands differ a lot, **each gets its own
+layout** (unlike Transfer's shared form).
+
+- **DELETE** — a **source** repo selector plus a **multi-repo** selector for the rest.
+  Deletes every source file whose content exists in *any* selected repo. Generalises
+  today's single-target-plus-extra-refs `diff_delete` to an arbitrary reference set.
+- **ORGANIZE** — rewrites the *relative paths* of files within one repo:
+  - A **path generator**: target paths built from **placeholders** (date Y/M/D, mime,
+    extension, size bucket, original name, …) with **alternatives** (fallbacks used when a
+    placeholder is empty).
+  - One or **multiple filter → path** rules.
+  - **Named, saved, reusable selections**: a whole organize config can be named, stored,
+    and re-applied to other repos or re-run later (for repeating or tweaking an
+    organisation).
+  - **Safety invariant: no file is ever lost or overwritten** — collisions must resolve to
+    a new name or refuse, never clobber.
+  - **Preview** (like copy/move) and **progress** on execution.
+  - Core: a new path-template engine, extending beyond today's
+    `organize.rs::export_by_date`. Persist presets alongside the GUI settings.
+- **Small tools**:
+  - **Delete empty directories**.
+  - **Delete everything matching a filter** (mime / size / name). The **NAME** filter
+    needs **wildcards** — today `FileFilter::Name` is a plain substring
+    (`filter.rs:127`); add prefix/suffix/glob matching so "ends with `.db`" or "starts
+    with `copy_of`" work.
+
+### 5.3 Smarter ETA
+
+Today's scan ETA is a naive linear extrapolation by **file count**
+(`app.rs:942`: `elapsed * (total-done)/done`), which is wildly wrong — file sizes vary by
+orders of magnitude and hashing runs on several lanes, so it once predicted ~2h for a 6h
+run and still read "~8 min" an hour before finishing.
+
+- Estimate by **bytes**, not file count: track hashed bytes vs total bytes. `update.rs`
+  already sums `hashed_bytes` and every entry carries `.size`; carry byte progress on the
+  `Hashing` event.
+- Model **aggregate throughput** across the concurrent lanes and smooth it with an
+  **exponential moving average**, so a few very large/small files don't whipsaw the number.
+- **Recompute on a fixed cadence (~5 s)** and hold the shown value between ticks to stop
+  the flicker — exactly the "total items, lanes, duration-per-lane, ask every 5 s" shape
+  requested.
+- Ship as a small reusable `EtaEstimator` in `dedup-core` (`new(total_bytes)`,
+  `record(done_bytes, now)`, `eta()`), unit-tested against synthetic throughput curves.
+- Library note: no Rust crate does headless byte-throughput ETA well — `indicatif` bundles
+  an ETA but only inside its own progress bar. Recommend the small custom estimator
+  (mirroring indicatif's recent-sample weighting) over pulling a dependency.
+
+---
+
+## Phase 6 — Browse & forensic layer  *(deferred)*
+
+A fifth **Browse** tab hosting the forensic tools:
+
+- Filter, display, and **annotate** files (trash / important / …); a new **annotation
+  filter** follows naturally once annotations exist.
+- **Binary / hex view** of at least a file's header.
+- **Strings** on demand for unknown files.
+- Unlocks the annotation-driven Transfer exports noted in 5.1.
+
+## Phase 7 — Recognition & extensibility  *(far future)*
+
+- Face recognition and object recognition for photos/images.
+- VLA tagging of files to topics; word clouds for documents.
+- MP3 tag handling; metadata extraction for all known formats.
+- Plugin support for new formats; an API to externalise features.
+
+---
+
+### Source remarks (verbatim, kept as reference)
+
 user demands changes:
 
 * The ETA calculation is waaay off. the last time it predicted about 2h and it took 6. even 1h before finish the eta was still like 8 minutes. there must be some better prediction algos. is there a lib that allows that? if not we should create something like that: a function where you put total items, concurrent lanes, and then duration per lane and ask for eta every 5s to have a less flickering display?
