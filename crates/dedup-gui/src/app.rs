@@ -6,9 +6,10 @@
 use crate::dupes_view::DupesView;
 use crate::files_view::FilesView;
 use crate::icon;
+use crate::settings::TooltipVerbosity;
 use crate::status::{self, Location};
 use crate::theme;
-use crate::util::format_size;
+use crate::util::{ExplainExt, format_size};
 use crate::worker::{ChannelProgress, JobKind, JobOutcome, RepoStatus, WorkerMsg, WorkerState};
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::store::{RepoStats, Store};
@@ -124,6 +125,7 @@ pub struct DedupApp {
     /// Whether the one-time startup status probe has been kicked off.
     did_initial_status: bool,
     threads: usize,
+    tooltip_verbosity: TooltipVerbosity,
 
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
@@ -161,6 +163,7 @@ impl DedupApp {
             show_about: false,
             did_initial_status: false,
             threads: 0,
+            tooltip_verbosity: TooltipVerbosity::default(),
             tx,
             rx,
             worker: WorkerState::default(),
@@ -172,10 +175,12 @@ impl DedupApp {
             files: FilesView::new(),
             saved_settings: crate::settings::Settings::default(),
         };
-        // Restore persisted settings (thread count, similarity threshold).
+        // Restore persisted settings (thread count, similarity threshold,
+        // tooltip verbosity).
         let settings = crate::settings::Settings::load(app.store.config_dir());
         app.threads = settings.threads;
         app.dupes.set_threshold(settings.similarity_threshold);
+        app.tooltip_verbosity = settings.tooltip_verbosity;
         app.saved_settings = settings;
         app.reload_all();
         app
@@ -532,8 +537,8 @@ impl eframe::App for DedupApp {
         }
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Repositories => self.repositories_view(ui, &mut actions),
-            Tab::Duplicates => self.dupes.show(ui, &self.store),
-            Tab::Files => self.files.show(ui, &self.store),
+            Tab::Duplicates => self.dupes.show(ui, &self.store, self.tooltip_verbosity),
+            Tab::Files => self.files.show(ui, &self.store, self.tooltip_verbosity),
         });
         if self.show_settings {
             self.settings_modal(&ctx);
@@ -564,6 +569,7 @@ impl eframe::App for DedupApp {
         let current = crate::settings::Settings {
             threads: self.threads,
             similarity_threshold: self.dupes.threshold(),
+            tooltip_verbosity: self.tooltip_verbosity,
         };
         if current != self.saved_settings {
             current.save(self.store.config_dir());
@@ -598,6 +604,8 @@ impl DedupApp {
                         Tab::Repositories,
                         "REPOSITORIES",
                         theme::ORANGE,
+                        self.tooltip_verbosity,
+                        "Add, update, and manage repository links",
                     );
                     tab_button(
                         ui,
@@ -605,8 +613,18 @@ impl DedupApp {
                         Tab::Duplicates,
                         "DUPLICATES",
                         theme::LILAC,
+                        self.tooltip_verbosity,
+                        "Find and review exact or perceptually similar duplicates",
                     );
-                    tab_button(ui, &mut self.tab, Tab::Files, "FILES", theme::BLUE);
+                    tab_button(
+                        ui,
+                        &mut self.tab,
+                        Tab::Files,
+                        "FILES",
+                        theme::BLUE,
+                        self.tooltip_verbosity,
+                        "Copy, move, or delete files between repositories by content",
+                    );
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
@@ -614,6 +632,11 @@ impl DedupApp {
                                 RichText::new(format!("{} SETTINGS", icon::GEAR))
                                     .color(theme::BLACK),
                             ))
+                            .explain(
+                                self.tooltip_verbosity,
+                                "App settings",
+                                "Open app settings: hashing thread count and tooltip verbosity.",
+                            )
                             .clicked()
                         {
                             self.show_settings = true;
@@ -624,6 +647,11 @@ impl DedupApp {
                             .add(egui::Button::new(
                                 RichText::new("ABOUT").color(theme::BLACK),
                             ))
+                            .explain(
+                                self.tooltip_verbosity,
+                                "Version and license",
+                                "Show the app version, license, and contact info.",
+                            )
                             .clicked()
                         {
                             self.show_about = true;
@@ -655,7 +683,16 @@ impl DedupApp {
                 RichText::new(format!("{} ADD REPOSITORY", icon::PLUS)).color(theme::BLACK),
             )
             .fill(theme::BLUE);
-            if ui.add_enabled(!busy, add).clicked() {
+            if ui
+                .add_enabled(!busy, add)
+                .explain(
+                    self.tooltip_verbosity,
+                    "Register a new repository",
+                    "Register a new repository: pick a folder on disk to track and scan for \
+                     duplicates. Disabled while a scan is running elsewhere in the app.",
+                )
+                .clicked()
+            {
                 actions.push(Action::OpenAdd);
             }
             // Enqueues every repo; it only touches names (no db access), so it
@@ -664,7 +701,16 @@ impl DedupApp {
                 RichText::new(format!("{} UPDATE ALL", icon::REFRESH)).color(theme::BLACK),
             )
             .fill(theme::ORANGE);
-            if ui.add_enabled(!self.repos.is_empty(), update_all).clicked() {
+            if ui
+                .add_enabled(!self.repos.is_empty(), update_all)
+                .explain(
+                    self.tooltip_verbosity,
+                    "Scan every repository",
+                    "Queue an UPDATE / SCAN for every registered repository, one at a time. \
+                     Already up-to-date repos finish almost instantly.",
+                )
+                .clicked()
+            {
                 actions.push(Action::UpdateAll);
             }
             // Re-probe every repo's location/reachability (filesystem only, no
@@ -675,8 +721,11 @@ impl DedupApp {
             .fill(theme::LILAC);
             if ui
                 .add_enabled(!self.repos.is_empty(), refresh)
-                .on_hover_text(
-                    "Re-check every repository's location and scan for file changes since the last update",
+                .explain(
+                    self.tooltip_verbosity,
+                    "Re-check location and staleness",
+                    "Re-check every repository's location and reachability, and whether its \
+                     index is stale (dry-run — no hashing, no writes).",
                 )
                 .clicked()
             {
@@ -737,12 +786,16 @@ impl DedupApp {
                             .size(17.0)
                             .strong(),
                     );
-                    status_pills(ui, row);
+                    status_pills(ui, row, self.tooltip_verbosity);
                     ui.label(RichText::new(&row.path).color(theme::TEXT).size(12.0))
-                        .on_hover_text(&row.path);
+                        .explain(
+                            self.tooltip_verbosity,
+                            &row.path,
+                            &format!("On-disk folder this repository indexes: {}", row.path),
+                        );
                     // MIME breakdown, share-sorted, pinned to the top-right.
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        mime_tags(ui, row);
+                        mime_tags(ui, row, self.tooltip_verbosity);
                     });
                 });
                 ui.horizontal(|ui| {
@@ -752,6 +805,10 @@ impl DedupApp {
                         &row.stats.file_count.to_string(),
                         theme::ORANGE,
                         "Indexed files (missing files excluded)",
+                        "Number of files currently indexed for this repository. Files that \
+                         were indexed before but have since vanished from disk are excluded \
+                         from this count.",
+                        self.tooltip_verbosity,
                     );
                     stat(
                         ui,
@@ -759,6 +816,9 @@ impl DedupApp {
                         &format_size(row.stats.total_size),
                         theme::BLUE,
                         "Total size of indexed files",
+                        "Sum of the on-disk size of every indexed (non-missing) file in this \
+                         repository.",
+                        self.tooltip_verbosity,
                     );
                     stat(
                         ui,
@@ -766,6 +826,10 @@ impl DedupApp {
                         &row.stats.missing_count.to_string(),
                         theme::LILAC,
                         "Indexed before but no longer on disk",
+                        "Files that were indexed by a previous scan but are no longer found \
+                         on disk. They stay in the index as history but are excluded from \
+                         stats and duplicate search until a rescan confirms they're back.",
+                        self.tooltip_verbosity,
                     );
                     stat(
                         ui,
@@ -773,6 +837,9 @@ impl DedupApp {
                         &format_last_scan(row.stats.last_scan_ms),
                         theme::TAN,
                         "When this repository was last scanned",
+                        "Date and time of the most recent completed UPDATE / SCAN of this \
+                         repository. \"never\" means it hasn't been scanned yet.",
+                        self.tooltip_verbosity,
                     );
                     if row.stats.triage_done_ms > 0 {
                         stat(
@@ -781,6 +848,11 @@ impl DedupApp {
                             &format_last_scan(row.stats.triage_done_ms),
                             theme::BLUE,
                             "This repo's unique content was copied into a sanitized dir",
+                            "This repository was marked triage-done: its unique content was \
+                             already copied into a sanitized directory (via `dedup sanitize` \
+                             or MARK SOURCE DONE in Files management), so it's safe to \
+                             consider fully processed.",
+                            self.tooltip_verbosity,
                         );
                     }
                 });
@@ -800,7 +872,14 @@ impl DedupApp {
                                 ))
                                 .color(theme::TAN),
                             );
-                            if cancel_button(ui, "Remove from the queue").clicked() {
+                            if cancel_button(
+                                ui,
+                                "Remove from the queue",
+                                "Remove this repository from the queue before its scan/check starts.",
+                                self.tooltip_verbosity,
+                            )
+                            .clicked()
+                            {
                                 actions.push(Action::Cancel(row.name.clone()));
                             }
                         });
@@ -837,12 +916,21 @@ impl DedupApp {
                                     );
                                 }
                             }
-                            let hover = if checking {
-                                "Stop the check"
+                            let (hover, hover_verbose) = if checking {
+                                (
+                                    "Stop the check",
+                                    "Stop this dry-run check. No index changes have been made, \
+                                     so there's nothing to roll back.",
+                                )
                             } else {
-                                "Stop the scan (already-hashed files stay indexed)"
+                                (
+                                    "Stop the scan (already-hashed files stay indexed)",
+                                    "Stop this scan. Files already hashed before you cancelled \
+                                     stay committed to the index; only unhashed files are left \
+                                     for next time.",
+                                )
                             };
-                            if cancel_button(ui, hover).clicked() {
+                            if cancel_button(ui, hover, hover_verbose, self.tooltip_verbosity).clicked() {
                                 actions.push(Action::Cancel(row.name.clone()));
                             }
                         });
@@ -876,17 +964,29 @@ impl DedupApp {
         // Inline editors take over the row when active for this repo.
         match &mut self.edit {
             Some(Edit::Rename { name, buf }) if *name == row.name => {
+                let verbosity = self.tooltip_verbosity;
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("RENAME →").color(theme::LILAC));
-                    ui.text_edit_singleline(buf);
+                    ui.text_edit_singleline(buf).explain(
+                        verbosity,
+                        "New name",
+                        "The new name for this repository (its registry entry only — the \
+                         on-disk folder it points at is unchanged).",
+                    );
                     if ui
                         .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::BLACK))
+                        .explain(verbosity, "Confirm rename", "Apply the new name.")
                         .clicked()
                     {
                         actions.push(Action::CommitRename(name.clone(), buf.trim().to_string()));
                     }
                     if ui
                         .button(RichText::new(icon::X).color(theme::BLACK))
+                        .explain(
+                            verbosity,
+                            "Cancel",
+                            "Discard this rename and close the editor.",
+                        )
                         .clicked()
                     {
                         actions.push(Action::CancelEdit);
@@ -895,17 +995,29 @@ impl DedupApp {
                 return;
             }
             Some(Edit::Relocate { name, buf }) if *name == row.name => {
+                let verbosity = self.tooltip_verbosity;
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("RELOCATE →").color(theme::LILAC));
-                    ui.text_edit_singleline(buf);
+                    ui.text_edit_singleline(buf).explain(
+                        verbosity,
+                        "New folder path",
+                        "The new on-disk folder this repository should point at. The \
+                         existing index is kept — only the target path changes.",
+                    );
                     if ui
                         .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::BLACK))
+                        .explain(verbosity, "Confirm relocate", "Apply the new folder path.")
                         .clicked()
                     {
                         actions.push(Action::CommitRelocate(name.clone(), buf.trim().to_string()));
                     }
                     if ui
                         .button(RichText::new(icon::X).color(theme::BLACK))
+                        .explain(
+                            verbosity,
+                            "Cancel",
+                            "Discard this relocate and close the editor.",
+                        )
                         .clicked()
                     {
                         actions.push(Action::CancelEdit);
@@ -914,17 +1026,34 @@ impl DedupApp {
                 return;
             }
             Some(Edit::Duplicate { name, dest, path }) if *name == row.name => {
+                let verbosity = self.tooltip_verbosity;
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("COPY → NAME").color(theme::LILAC));
-                    ui.add(egui::TextEdit::singleline(dest).desired_width(140.0));
+                    ui.add(egui::TextEdit::singleline(dest).desired_width(140.0))
+                        .explain(
+                            verbosity,
+                            "New repository's name",
+                            "Name for the new repository the index is copied into.",
+                        );
                     ui.label(RichText::new("PATH").color(theme::LILAC));
                     ui.add(
                         egui::TextEdit::singleline(path)
                             .desired_width(240.0)
                             .hint_text("/new/repo/path"),
+                    )
+                    .explain(
+                        verbosity,
+                        "New repository's folder",
+                        "On-disk folder the new repository will point at. The source \
+                         repository is left completely unchanged.",
                     );
                     if ui
                         .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::BLACK))
+                        .explain(
+                            verbosity,
+                            "Confirm duplicate",
+                            "Copy this repository's index into the new one at the new path.",
+                        )
                         .clicked()
                     {
                         actions.push(Action::CommitDuplicate {
@@ -935,6 +1064,11 @@ impl DedupApp {
                     }
                     if ui
                         .button(RichText::new(icon::X).color(theme::BLACK))
+                        .explain(
+                            verbosity,
+                            "Cancel",
+                            "Discard this duplicate and close the editor.",
+                        )
                         .clicked()
                     {
                         actions.push(Action::CancelEdit);
@@ -943,6 +1077,7 @@ impl DedupApp {
                 return;
             }
             Some(Edit::ConfirmDelete { name }) if *name == row.name => {
+                let verbosity = self.tooltip_verbosity;
                 ui.horizontal(|ui| {
                     ui.colored_label(theme::RED, format!("Delete '{name}' and its index?"));
                     if ui
@@ -950,12 +1085,23 @@ impl DedupApp {
                             egui::Button::new(RichText::new("DELETE").color(theme::BLACK))
                                 .fill(theme::RED),
                         )
+                        .explain(
+                            verbosity,
+                            "Confirm delete",
+                            "Permanently remove this repository's registry entry and its \
+                             index database. The on-disk files it tracked are never touched.",
+                        )
                         .clicked()
                     {
                         actions.push(Action::CommitDelete(name.clone()));
                     }
                     if ui
                         .button(RichText::new("KEEP").color(theme::BLACK))
+                        .explain(
+                            verbosity,
+                            "Cancel",
+                            "Keep this repository; close the confirmation.",
+                        )
                         .clicked()
                     {
                         actions.push(Action::CancelEdit);
@@ -975,7 +1121,13 @@ impl DedupApp {
             );
             if ui
                 .add_enabled(reachable, update)
-                .on_hover_text("Scan the folder and index new or changed files")
+                .explain(
+                    self.tooltip_verbosity,
+                    "Scan the folder and index new or changed files",
+                    "Walk this repository's folder, hash any new or changed files, and \
+                     mark vanished files missing. Already-hashed unchanged files are \
+                     skipped, so a repeat scan is fast.",
+                )
                 .clicked()
             {
                 actions.push(Action::Update(row.name.clone()));
@@ -985,8 +1137,12 @@ impl DedupApp {
             );
             if ui
                 .add_enabled(reachable, check)
-                .on_hover_text(
+                .explain(
+                    self.tooltip_verbosity,
                     "Dry-run: report new, changed, and missing files without hashing or writing",
+                    "Dry-run a scan: report how many files are new, changed, or missing \
+                     compared to the index, without hashing anything or writing to the \
+                     index. Use this to see if UPDATE / SCAN has real work to do.",
                 )
                 .clicked()
             {
@@ -994,21 +1150,37 @@ impl DedupApp {
             }
             if ui
                 .button(RichText::new(format!("{} RENAME", icon::PENCIL)).color(theme::BLACK))
-                .on_hover_text("Rename this repository")
+                .explain(
+                    self.tooltip_verbosity,
+                    "Rename this repository",
+                    "Rename this repository's registry entry. The on-disk folder it \
+                     points at is not moved.",
+                )
                 .clicked()
             {
                 actions.push(Action::BeginRename(row.name.clone()));
             }
             if ui
                 .button(RichText::new(format!("{} RELOCATE", icon::RELOCATE)).color(theme::BLACK))
-                .on_hover_text("Point this repository at a different folder")
+                .explain(
+                    self.tooltip_verbosity,
+                    "Point this repository at a different folder",
+                    "Point this repository at a different on-disk folder while keeping its \
+                     existing index — use this after moving the data to a new location.",
+                )
                 .clicked()
             {
                 actions.push(Action::BeginRelocate(row.name.clone()));
             }
             if ui
                 .button(RichText::new(format!("{} DUPLICATE", icon::COPY)).color(theme::BLACK))
-                .on_hover_text("Copy this repository's index into a new one at a new path")
+                .explain(
+                    self.tooltip_verbosity,
+                    "Copy this repository's index into a new one at a new path",
+                    "Clone this repository's entire index into a brand-new repository at a \
+                     new path. The source repository is left completely unchanged — this is \
+                     for branching off a snapshot, not moving anything.",
+                )
                 .clicked()
             {
                 actions.push(Action::BeginDuplicate(row.name.clone()));
@@ -1020,7 +1192,13 @@ impl DedupApp {
                     )
                     .fill(theme::RED),
                 )
-                .on_hover_text("Remove this repository and delete its index")
+                .explain(
+                    self.tooltip_verbosity,
+                    "Remove this repository and delete its index",
+                    "Remove this repository's registry entry and delete its index database. \
+                     The on-disk files it tracked are never touched — only the tracking \
+                     record disappears.",
+                )
                 .clicked()
             {
                 actions.push(Action::BeginDelete(row.name.clone()));
@@ -1054,6 +1232,12 @@ impl DedupApp {
                     .button(
                         RichText::new(format!("{} CHOOSE…", icon::FOLDER_OPEN)).color(theme::BLACK),
                     )
+                    .explain(
+                        self.tooltip_verbosity,
+                        "Pick a folder",
+                        "Open a native folder picker to choose the folder this repository \
+                         should index.",
+                    )
                     .clicked()
                 {
                     actions.push(Action::ChooseFolder);
@@ -1062,6 +1246,12 @@ impl DedupApp {
                     egui::TextEdit::singleline(&mut self.new_path)
                         .desired_width(300.0)
                         .hint_text("/path/to/folder"),
+                )
+                .explain(
+                    self.tooltip_verbosity,
+                    "Folder to index",
+                    "Absolute or relative path to the folder this repository should index. \
+                     You can type it directly or use CHOOSE… above.",
                 );
             });
             ui.horizontal(|ui| {
@@ -1072,7 +1262,12 @@ impl DedupApp {
                 if clashes {
                     name_edit = name_edit.text_color(theme::RED);
                 }
-                ui.add(name_edit);
+                ui.add(name_edit).explain(
+                    self.tooltip_verbosity,
+                    "Repository name",
+                    "Display name for this repository in the registry. Leave blank to use \
+                     the folder's own name; must be unique among registered repositories.",
+                );
             });
 
             if clashes {
@@ -1089,11 +1284,25 @@ impl DedupApp {
             ui.horizontal(|ui| {
                 let add =
                     egui::Button::new(RichText::new("ADD").color(theme::BLACK)).fill(theme::BLUE);
-                if ui.add_enabled(can_add, add).clicked() {
+                if ui
+                    .add_enabled(can_add, add)
+                    .explain(
+                        self.tooltip_verbosity,
+                        "Register this repository",
+                        "Register the repository with this folder and name. It won't be \
+                         scanned automatically — use UPDATE / SCAN afterwards.",
+                    )
+                    .clicked()
+                {
                     actions.push(Action::Create);
                 }
                 if ui
                     .button(RichText::new("CANCEL").color(theme::BLACK))
+                    .explain(
+                        self.tooltip_verbosity,
+                        "Cancel",
+                        "Close this dialog without registering a repository.",
+                    )
                     .clicked()
                 {
                     actions.push(Action::CloseAdd);
@@ -1117,10 +1326,75 @@ impl DedupApp {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Hashing threads").color(theme::TEXT));
-                ui.add(egui::DragValue::new(&mut self.threads).range(0..=64));
+                ui.add(egui::DragValue::new(&mut self.threads).range(0..=64))
+                    .explain(
+                        self.tooltip_verbosity,
+                        "Parallel hashing threads for scans",
+                        "How many threads a repo scan uses to hash files in parallel. \
+                         Higher uses more CPU but finishes faster; 0 lets the hashing \
+                         library pick one thread per CPU core.",
+                    );
             });
             ui.label(
                 RichText::new("0 = one thread per CPU core")
+                    .color(theme::TAN)
+                    .size(12.0),
+            );
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Tooltips").color(theme::TEXT));
+                let short = self.tooltip_verbosity == TooltipVerbosity::Short;
+                egui::Frame::new()
+                    .stroke(egui::Stroke::new(1.0, theme::BLUE))
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::symmetric(4, 2))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (short_fill, short_text) = if short {
+                                (theme::BLUE, theme::BLACK)
+                            } else {
+                                (theme::PANEL, theme::BLUE)
+                            };
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new("SHORT").color(short_text))
+                                        .fill(short_fill),
+                                )
+                                .explain(
+                                    self.tooltip_verbosity,
+                                    "Terse one-line hints",
+                                    "Hover text stays a short one-liner naming what a \
+                                     control does.",
+                                )
+                                .clicked()
+                            {
+                                self.tooltip_verbosity = TooltipVerbosity::Short;
+                            }
+                            let (verbose_fill, verbose_text) = if short {
+                                (theme::PANEL, theme::LILAC)
+                            } else {
+                                (theme::LILAC, theme::BLACK)
+                            };
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new("VERBOSE").color(verbose_text))
+                                        .fill(verbose_fill),
+                                )
+                                .explain(
+                                    self.tooltip_verbosity,
+                                    "Fuller explanations",
+                                    "Hover text expands into a fuller explanation of what \
+                                     the control does and when to use it.",
+                                )
+                                .clicked()
+                            {
+                                self.tooltip_verbosity = TooltipVerbosity::Verbose;
+                            }
+                        });
+                    });
+            });
+            ui.label(
+                RichText::new("Controls how much detail hover tooltips show throughout the app")
                     .color(theme::TAN)
                     .size(12.0),
             );
@@ -1129,6 +1403,11 @@ impl DedupApp {
                 .add(egui::Button::new(
                     RichText::new("CLOSE").color(theme::BLACK),
                 ))
+                .explain(
+                    self.tooltip_verbosity,
+                    "Close this dialog",
+                    "Close the settings dialog; changes are saved automatically as you make them.",
+                )
                 .clicked()
             {
                 self.show_settings = false;
@@ -1176,6 +1455,11 @@ impl DedupApp {
                 .add(egui::Button::new(
                     RichText::new("CLOSE").color(theme::BLACK),
                 ))
+                .explain(
+                    self.tooltip_verbosity,
+                    "Close this dialog",
+                    "Close the about dialog.",
+                )
                 .clicked()
             {
                 self.show_about = false;
@@ -1201,67 +1485,116 @@ fn pill(ui: &mut egui::Ui, text: &str, fill: Color32) -> egui::Response {
 
 /// Render a repo's location + freshness as chips next to its name. Anything
 /// still `Unknown` (not yet probed/checked) draws nothing.
-fn status_pills(ui: &mut egui::Ui, row: &RepoRow) {
+fn status_pills(ui: &mut egui::Ui, row: &RepoRow, verbosity: TooltipVerbosity) {
     match row.location {
         Some(Location::Local) => {
-            pill(ui, "LOCAL", theme::BLUE);
+            pill(ui, "LOCAL", theme::BLUE).explain(
+                verbosity,
+                "On this machine",
+                "The repository's folder is on a local disk of this machine.",
+            );
         }
         Some(Location::Remote) => {
-            pill(ui, "REMOTE", theme::LILAC);
+            pill(ui, "REMOTE", theme::LILAC).explain(
+                verbosity,
+                "Network mount",
+                "The repository's folder is on a reachable network mount (e.g. NFS/SMB).",
+            );
         }
         Some(Location::Offline) => {
-            pill(ui, "OFFLINE", theme::AMBER)
-                .on_hover_text("Network mount is not reachable right now");
+            pill(ui, "OFFLINE", theme::AMBER).explain(
+                verbosity,
+                "Network mount is not reachable right now",
+                "This repository's network mount is not reachable right now — scans and \
+                 checks will fail until it's back online.",
+            );
         }
         Some(Location::Missing) => {
-            pill(ui, "MISSING", theme::RED).on_hover_text("Local folder is not accessible");
+            pill(ui, "MISSING", theme::RED).explain(
+                verbosity,
+                "Local folder is not accessible",
+                "This repository's local folder no longer exists or can't be read — RELOCATE \
+                 it, or restore the folder, before scanning.",
+            );
         }
         None => {}
     }
     match row.freshness {
         Freshness::Unknown => {}
         Freshness::UpToDate => {
-            pill(ui, "UP TO DATE", theme::TAN);
+            pill(ui, "UP TO DATE", theme::TAN).explain(
+                verbosity,
+                "No changes since the last scan",
+                "The last CHECK found no new, changed, or missing files since the last scan.",
+            );
         }
         Freshness::Stale { changed, missing } => {
-            pill(ui, "UPDATE REQUIRED", theme::ORANGE).on_hover_text(format!(
-                "{changed} new/changed, {missing} missing since the last scan"
-            ));
+            pill(ui, "UPDATE REQUIRED", theme::ORANGE).explain(
+                verbosity,
+                &format!("{changed} new/changed, {missing} missing since the last scan"),
+                &format!(
+                    "The last CHECK found {changed} new or changed file(s) and {missing} \
+                     missing file(s) since the last scan — run UPDATE / SCAN to bring the \
+                     index back in sync."
+                ),
+            );
         }
     }
 }
 
 /// The RED "CANCEL" button shared by queued and running repo cards.
-fn cancel_button(ui: &mut egui::Ui, hover: &str) -> egui::Response {
+fn cancel_button(
+    ui: &mut egui::Ui,
+    hover: &str,
+    hover_verbose: &str,
+    verbosity: TooltipVerbosity,
+) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(format!("{} CANCEL", icon::X)).color(theme::BLACK))
             .fill(theme::RED),
     )
-    .on_hover_text(hover)
+    .explain(verbosity, hover, hover_verbose)
 }
 
-fn tab_button(ui: &mut egui::Ui, current: &mut Tab, tab: Tab, label: &str, color: Color32) {
+fn tab_button(
+    ui: &mut egui::Ui,
+    current: &mut Tab,
+    tab: Tab,
+    label: &str,
+    color: Color32,
+    verbosity: TooltipVerbosity,
+    hover_verbose: &str,
+) {
     let selected = *current == tab;
     let fill = if selected { color } else { theme::PANEL };
     let text_color = if selected { theme::BLACK } else { color };
     if ui
         .add(egui::Button::new(RichText::new(label).color(text_color)).fill(fill))
+        .explain(verbosity, label, hover_verbose)
         .clicked()
     {
         *current = tab;
     }
 }
 
-fn stat(ui: &mut egui::Ui, label: &str, value: &str, color: Color32, tip: &str) {
+fn stat(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &str,
+    color: Color32,
+    tip: &str,
+    tip_verbose: &str,
+    verbosity: TooltipVerbosity,
+) {
     ui.add_space(2.0);
     ui.label(
         RichText::new(format!("{label} "))
             .color(theme::TEXT)
             .size(12.0),
     )
-    .on_hover_text(tip);
+    .explain(verbosity, tip, tip_verbose);
     ui.label(RichText::new(value).color(color).strong())
-        .on_hover_text(tip);
+        .explain(verbosity, tip, tip_verbose);
     ui.add_space(10.0);
 }
 
@@ -1280,7 +1613,7 @@ const MIME_TAG_LIMIT: usize = 5;
 /// Render the repo's MIME distribution as the top few share-sorted tags, each in
 /// a stable pastel color derived from the MIME name. Rendered inside a
 /// right-to-left layout, so the largest share sits in the top-right corner.
-fn mime_tags(ui: &mut egui::Ui, row: &RepoRow) {
+fn mime_tags(ui: &mut egui::Ui, row: &RepoRow, verbosity: TooltipVerbosity) {
     let total = row.stats.file_count;
     if total == 0 || row.mimes.is_empty() {
         return;
@@ -1292,7 +1625,14 @@ fn mime_tags(ui: &mut egui::Ui, row: &RepoRow) {
                 .color(theme::TEXT)
                 .size(11.0),
         )
-        .on_hover_text(format!("{extra} more MIME type(s)"));
+        .explain(
+            verbosity,
+            &format!("{extra} more MIME type(s)"),
+            &format!(
+                "{extra} more MIME type(s) present in this repository beyond the top \
+                 {MIME_TAG_LIMIT} shown here, each too small a share to list."
+            ),
+        );
     }
     for (mime, count) in row.mimes.iter().take(MIME_TAG_LIMIT) {
         egui::Frame::new()
@@ -1305,7 +1645,15 @@ fn mime_tags(ui: &mut egui::Ui, row: &RepoRow) {
                         .color(theme::BLACK)
                         .size(11.0),
                 )
-                .on_hover_text(format!("{count} file(s) · {mime}"));
+                .explain(
+                    verbosity,
+                    &format!("{count} file(s) · {mime}"),
+                    &format!(
+                        "{count} file(s) with MIME type {mime} — {} of this repository's \
+                         indexed files.",
+                        mime_pct(*count, total)
+                    ),
+                );
             });
     }
 }
@@ -1421,5 +1769,97 @@ mod tests {
         use super::mime_color;
         assert_eq!(mime_color("image/png"), mime_color("image/png"));
         assert_ne!(mime_color("image/png"), mime_color("application/pdf"));
+    }
+}
+
+/// Kittest UI tests: generate doc screenshots of the Repository Management
+/// tab and the Settings dialog by driving `DedupApp` directly (calling its
+/// private view methods, not the `eframe::App` trait — no `eframe::Frame` is
+/// needed that way).
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+    use dedup_core::update::{NoProgress, update_repo};
+    use egui_kittest::Harness;
+
+    /// A temp store with two scanned repos, so the Repository Management
+    /// cards show real stats instead of all-zero placeholders.
+    fn sample_app() -> (tempfile::TempDir, DedupApp) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        for (name, files) in [("Automatic Upload", 5), ("Videos", 2)] {
+            let dir = tmp.path().join(name.replace(' ', "_"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for i in 0..files {
+                std::fs::write(dir.join(format!("f{i}.bin")), format!("sample data {i}")).unwrap();
+            }
+            store.create_repo(name, &dir.to_string_lossy()).unwrap();
+            update_repo(&store, name, 1, &NoProgress, &CancellationToken::new()).unwrap();
+        }
+        (tmp, DedupApp::new(store))
+    }
+
+    fn doc_screenshot_path(name: &str) -> PathBuf {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    /// Doc screenshot: the Repository Management tab with two scanned repos,
+    /// to `docs/screenshots/repositories_tab.png`. Run with `--ignored`.
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_repositories_tab() {
+        let (_tmp, app) = sample_app();
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 620.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, app: &mut DedupApp| {
+                    if !init {
+                        icon::install(ui.ctx());
+                        theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let mut actions = Vec::new();
+                    app.repositories_view(ui, &mut actions);
+                },
+                app,
+            );
+        harness.run();
+        let img = harness.render().expect("wgpu render failed");
+        let out = doc_screenshot_path("repositories_tab.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Doc screenshot: the Settings dialog (hashing threads, tooltip
+    /// verbosity toggle) to `docs/screenshots/settings_modal.png`. `--ignored`.
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_settings_modal() {
+        let (_tmp, mut app) = sample_app();
+        app.show_settings = true;
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(420.0, 320.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, app: &mut DedupApp| {
+                    if !init {
+                        icon::install(ui.ctx());
+                        theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    app.settings_modal(&ui.ctx().clone());
+                },
+                app,
+            );
+        harness.run();
+        let img = harness.render().expect("wgpu render failed");
+        let out = doc_screenshot_path("settings_modal.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 }

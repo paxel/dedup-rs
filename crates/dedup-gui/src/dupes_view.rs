@@ -5,9 +5,10 @@
 use crate::icon;
 use crate::lightbox::{CompareState, FullResCache, LightboxState};
 use crate::player::Player;
+use crate::settings::TooltipVerbosity;
 use crate::theme;
 use crate::thumbs::ThumbCache;
-use crate::util::{format_mtime, format_size};
+use crate::util::{ExplainExt, format_mtime, format_size};
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::dupes::{
     DupeDeleteStats, DupeFile, DupeGroup, DupeGroupKey, delete_paths, load_groups,
@@ -211,6 +212,9 @@ pub struct DupesView {
     full_res: FullResCache,
     /// Global audio preview player (one file at a time).
     player: Player,
+    /// Tooltip wording for this frame, set at the top of [`Self::show`] from
+    /// the app-wide setting (not persisted here; `app.rs` owns that).
+    verbosity: TooltipVerbosity,
 }
 
 impl DupesView {
@@ -243,6 +247,7 @@ impl DupesView {
             lightbox: None,
             full_res: FullResCache::new(2),
             player: Player::new(),
+            verbosity: TooltipVerbosity::default(),
         }
     }
 
@@ -268,7 +273,8 @@ impl DupesView {
         self.results.as_ref().map_or(0, Results::len)
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, store: &Arc<Store>) {
+    pub fn show(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, verbosity: TooltipVerbosity) {
+        self.verbosity = verbosity;
         let ctx = ui.ctx().clone();
         if self.thumbs.poll(&ctx) {
             ctx.request_repaint();
@@ -452,19 +458,28 @@ impl DupesView {
                                         egui::Button::new(RichText::new(&repo.name).color(text))
                                             .fill(fill),
                                     )
-                                    .on_hover_text("Toggle whether this repo is searched")
+                                    .explain(
+                                        self.verbosity,
+                                        "Toggle whether this repo is searched",
+                                        "Include or exclude this repository from FIND results. \
+                                         Excluded repos are skipped entirely — their files \
+                                         won't appear as duplicates or as candidates.",
+                                    )
                                     .clicked()
                                 {
                                     acts.push(Act::ToggleInclude(i));
                                 }
                                 // Closed padlock = read-only (protected); open
                                 // padlock = deletable.
-                                let (glyph, ro_fill, ro_text, hover) = if repo.read_only {
+                                let (glyph, ro_fill, ro_text, hover, hover_verbose) = if repo.read_only {
                                     (
                                         icon::LOCK,
                                         theme::BLUE,
                                         theme::BLACK,
                                         "Locked: files here are protected from deletion — click to allow deleting",
+                                        "This repo is read-only: none of its files are ever \
+                                         preselected or deletable, even by auto-resolve. Click \
+                                         to unlock the whole repo for deletion.",
                                     )
                                 } else {
                                     (
@@ -472,6 +487,9 @@ impl DupesView {
                                         theme::PANEL,
                                         theme::BLUE,
                                         "Unlocked: files here can be deleted — click to protect",
+                                        "This repo is unlocked: its files can be marked and \
+                                         deleted like any other. Click to protect it (read-only) \
+                                         again.",
                                     )
                                 };
                                 if ui
@@ -479,7 +497,7 @@ impl DupesView {
                                         egui::Button::new(RichText::new(glyph).color(ro_text))
                                             .fill(ro_fill),
                                     )
-                                    .on_hover_text(hover)
+                                    .explain(self.verbosity, hover, hover_verbose)
                                     .clicked()
                                 {
                                     acts.push(Act::ToggleRo(i));
@@ -505,7 +523,13 @@ impl DupesView {
                         .fill(theme::LILAC);
                         if ui
                             .add(refresh)
-                            .on_hover_text("Reload the repository list")
+                            .explain(
+                                self.verbosity,
+                                "Reload the repository list",
+                                "Reload the list of registered repositories (e.g. after \
+                                 adding one in the Repositories tab). Include/read-only \
+                                 choices for repos that still exist are kept.",
+                            )
                             .clicked()
                         {
                             acts.push(Act::ReloadRepos);
@@ -542,7 +566,12 @@ impl DupesView {
                                     egui::Button::new(RichText::new("DUPLICATES").color(dup_text))
                                         .fill(dup_fill),
                                 )
-                                .on_hover_text("Exact byte-for-byte duplicates")
+                                .explain(
+                                    self.verbosity,
+                                    "Exact byte-for-byte duplicates",
+                                    "Find files whose content is byte-for-byte identical \
+                                     (same size and BLAKE3 hash). Fast, no false positives.",
+                                )
                                 .clicked()
                             {
                                 self.mode = Mode::Exact;
@@ -557,7 +586,13 @@ impl DupesView {
                                     egui::Button::new(RichText::new("SIMILAR").color(sim_text))
                                         .fill(sim_fill),
                                 )
-                                .on_hover_text("Perceptually similar images/videos")
+                                .explain(
+                                    self.verbosity,
+                                    "Perceptually similar images/videos",
+                                    "Find images and videos that look alike even when their \
+                                     bytes differ — re-saves, re-encodes, or crops — using a \
+                                     perceptual hash and the similarity threshold below.",
+                                )
                                 .clicked()
                             {
                                 self.mode = Mode::Similar;
@@ -568,7 +603,16 @@ impl DupesView {
                     RichText::new(format!("{} FIND", icon::SEARCH)).color(theme::BLACK),
                 )
                 .fill(theme::AMBER);
-                if ui.add_enabled(self.busy.is_none(), find).clicked() {
+                if ui
+                    .add_enabled(self.busy.is_none(), find)
+                    .explain(
+                        self.verbosity,
+                        "Search the included repos",
+                        "Search every included (checked) repository for duplicates or \
+                         similars per the selected mode. Excluded repos are skipped.",
+                    )
+                    .clicked()
+                {
                     acts.push(Act::Find);
                 }
                 // Progress while a background op runs.
@@ -602,6 +646,13 @@ impl DupesView {
                         egui::Slider::new(&mut self.threshold, 50.0..=100.0)
                             .suffix("%")
                             .max_decimals(1),
+                    )
+                    .explain(
+                        self.verbosity,
+                        "Minimum similarity to group as similar",
+                        "How alike two files' perceptual hashes must be to group as \
+                         similar: similarity % = (1 − hamming distance / bits) × 100. \
+                         Lower catches more (and riskier) matches; 100% is bit-identical.",
                     );
                     // 100% is bit-identical (512-bit hash); ≥99.5% is visually
                     // identical for practical purposes.
@@ -625,8 +676,12 @@ impl DupesView {
                 };
                 if ui
                     .add(qd)
-                    .on_hover_text(
+                    .explain(
+                        self.verbosity,
                         "Show a DELETE NOW button on each group that deletes its marked files immediately, no confirmation",
+                        "When on, every group gets a DELETE NOW button that deletes its \
+                         currently marked files immediately, skipping the usual \
+                         confirmation dialog. Turn off to go back to confirming every batch.",
                     )
                     .clicked()
                 {
@@ -650,7 +705,13 @@ impl DupesView {
                     egui::Button::new(RichText::new("AUTO-RESOLVE REST").color(theme::BLACK));
                 if ui
                     .add_enabled(idle, auto)
-                    .on_hover_text("Mark every non-best copy in a deletable repo")
+                    .explain(
+                        self.verbosity,
+                        "Mark every non-best copy in a deletable repo",
+                        "Across every result group, mark every copy except the best one for \
+                         deletion — but only in repos that aren't read-only. Review the \
+                         marks before deleting; nothing is deleted by this button alone.",
+                    )
                     .clicked()
                 {
                     acts.push(Act::AutoResolve);
@@ -659,7 +720,17 @@ impl DupesView {
                     RichText::new(format!("DELETE MARKED ({n})")).color(theme::BLACK),
                 )
                 .fill(theme::RED);
-                if ui.add_enabled(idle && n > 0, del).clicked() {
+                if ui
+                    .add_enabled(idle && n > 0, del)
+                    .explain(
+                        self.verbosity,
+                        "Delete every marked file, with confirmation",
+                        "Delete every currently marked file across all groups, batched per \
+                         repo in one transaction. Always asks for confirmation first — use \
+                         QUICK DELETE if you want per-group deletes without asking.",
+                    )
+                    .clicked()
+                {
                     acts.push(Act::AskDelete);
                 }
             });
@@ -684,6 +755,11 @@ impl DupesView {
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(page > 0, egui::Button::new(icon::CARET_LEFT))
+                .explain(
+                    self.verbosity,
+                    "Previous page",
+                    "Go to the previous page of groups.",
+                )
                 .clicked()
             {
                 acts.push(Act::SetPage(page - 1));
@@ -694,6 +770,11 @@ impl DupesView {
             );
             if ui
                 .add_enabled(page + 1 < pages, egui::Button::new(icon::CARET_RIGHT))
+                .explain(
+                    self.verbosity,
+                    "Next page",
+                    "Go to the next page of groups.",
+                )
                 .clicked()
             {
                 acts.push(Act::SetPage(page + 1));
@@ -854,7 +935,13 @@ impl DupesView {
                         .fill(theme::RED);
                         if ui
                             .add_enabled(idle, del)
-                            .on_hover_text("Delete this group's marked files now")
+                            .explain(
+                                self.verbosity,
+                                "Delete this group's marked files now",
+                                "Delete this group's marked files immediately, no \
+                                 confirmation — QUICK DELETE is on. Files still marked \
+                                 KEEP are untouched.",
+                            )
                             .clicked()
                         {
                             acts.push(Act::DeleteGroup(gi));
@@ -970,13 +1057,27 @@ impl DupesView {
                                         )
                                         .sense(egui::Sense::click()),
                                     )
-                                    .on_hover_text("Right-click or long-press to unlock this file");
+                                    .explain(
+                                        self.verbosity,
+                                        "Right-click or long-press to unlock this file",
+                                        "This file is protected by its repo's read-only lock \
+                                         and can't be marked for deletion. Right-click (or \
+                                         long-press) to unlock just this one file — a \
+                                         deliberately inconvenient escape hatch, never bulk-set.",
+                                    );
                                 if resp.long_touched() {
                                     acts.push(Act::Unlock(k.clone()));
                                 }
                                 resp.context_menu(|ui| {
                                     if ui
                                         .button(format!("{} UNLOCK for deletion", icon::LOCK_OPEN))
+                                        .explain(
+                                            self.verbosity,
+                                            "Unlock this file only",
+                                            "Unlock just this file for deletion, without \
+                                             unlocking the whole repo. Reset the next time \
+                                             you run FIND.",
+                                        )
                                         .clicked()
                                     {
                                         acts.push(Act::Unlock(k.clone()));
@@ -994,11 +1095,25 @@ impl DupesView {
                                     )
                                     .sense(egui::Sense::click()),
                                 )
-                                .on_hover_text(
+                                .explain(
+                                    self.verbosity,
                                     "Read-only override for this file — right-click to re-lock",
+                                    "This file was individually unlocked from its repo's \
+                                     read-only protection. Right-click to re-lock it (or FIND \
+                                     again, which resets all per-file unlocks).",
                                 );
                                     resp.context_menu(|ui| {
-                                        if ui.button(format!("{} RE-LOCK", icon::LOCK)).clicked() {
+                                        if ui
+                                            .button(format!("{} RE-LOCK", icon::LOCK))
+                                            .explain(
+                                                self.verbosity,
+                                                "Restore read-only protection",
+                                                "Re-lock this file, restoring its repo's \
+                                                 read-only protection and clearing any \
+                                                 pending mark.",
+                                            )
+                                            .clicked()
+                                        {
                                             acts.push(Act::Relock(k.clone()));
                                             ui.close();
                                         }
@@ -1015,6 +1130,13 @@ impl DupesView {
                                         egui::Button::new(RichText::new(label).color(color))
                                             .fill(fill),
                                     )
+                                    .explain(
+                                        self.verbosity,
+                                        "Toggle this copy's mark",
+                                        "Toggle whether this copy is marked for deletion. \
+                                         Nothing is deleted until you press DELETE MARKED (or \
+                                         DELETE NOW under Quick Delete).",
+                                    )
                                     .clicked()
                                 {
                                     acts.push(Act::ToggleMark(k.clone()));
@@ -1025,12 +1147,27 @@ impl DupesView {
                 // Full-fidelity escape hatch: hand the file to the system's
                 // default app.
                 card.response.context_menu(|ui| {
-                    if ui.button(format!("{} OPEN", icon::ARROW_RIGHT)).clicked() {
+                    if ui
+                        .button(format!("{} OPEN", icon::ARROW_RIGHT))
+                        .explain(
+                            self.verbosity,
+                            "Open with the system default app",
+                            "Hand this file to the operating system's default application \
+                             for its type — the full-fidelity escape hatch for anything the \
+                             in-app preview can't show.",
+                        )
+                        .clicked()
+                    {
                         acts.push(Act::Open(file.absolute_path()));
                         ui.close();
                     }
                     if ui
                         .button(format!("{} SHOW IN FOLDER", icon::FOLDER_OPEN))
+                        .explain(
+                            self.verbosity,
+                            "Reveal in the file manager",
+                            "Open this file's containing folder in the system file manager.",
+                        )
                         .clicked()
                     {
                         acts.push(Act::Reveal(file.absolute_path()));
@@ -1069,6 +1206,12 @@ impl DupesView {
             let col = if playing { theme::BLACK } else { theme::TEXT };
             if ui
                 .add(egui::Button::new(RichText::new(label).color(col)).fill(fill))
+                .explain(
+                    self.verbosity,
+                    "Play/pause this track",
+                    "Play this file in the built-in preview player. Only one file plays at \
+                     a time — starting another stops this one. Click again to pause/resume.",
+                )
                 .clicked()
             {
                 acts.push(Act::PlayAudio(hex.clone(), file.absolute_path(), total_ms));
@@ -1091,6 +1234,11 @@ impl DupesView {
             let mut frac = (snap.pos_ms as f32 / total as f32).clamp(0.0, 1.0);
             if ui
                 .add(egui::Slider::new(&mut frac, 0.0..=1.0).show_value(false))
+                .explain(
+                    self.verbosity,
+                    "Seek",
+                    "Drag to seek to a position in this track.",
+                )
                 .changed()
             {
                 acts.push(Act::SeekAudio(frac));
@@ -1138,7 +1286,13 @@ impl DupesView {
                                 .corner_radius(6)
                                 .sense(egui::Sense::click()),
                         )
-                        .on_hover_text("Click to open the lightbox");
+                        .explain(
+                            self.verbosity,
+                            "Click to open the lightbox",
+                            "Click to open the full-window lightbox: zoom, pan, step through \
+                             this group's copies, and (for images) A/B compare against the \
+                             best copy.",
+                        );
                     // Hairline so dark photos stand off the dark panel.
                     ui.painter().rect_stroke(
                         resp.rect,
@@ -1190,6 +1344,7 @@ impl DupesView {
     /// A/B compare against the best copy (`space` swaps in flicker mode), `Esc`
     /// close. Marking respects read-only exactly like the cards.
     fn lightbox_modal(&mut self, ctx: &egui::Context, acts: &mut Vec<Act>) {
+        let verbosity = self.verbosity;
         // Take the state so `full_res`/`thumbs` can be borrowed mutably below;
         // it is put back at the end unless the lightbox was closed.
         let Some(mut state) = self.lightbox.take() else {
@@ -1516,14 +1671,34 @@ impl DupesView {
                         .max_rect(top)
                         .layout(egui::Layout::left_to_right(egui::Align::Center)),
                     |ui| {
-                        let pill = |ui: &mut egui::Ui, text: &str, fill: egui::Color32, col: egui::Color32| {
+                        let pill = |ui: &mut egui::Ui,
+                                    text: &str,
+                                    fill: egui::Color32,
+                                    col: egui::Color32,
+                                    short: &str,
+                                    verbose: &str| {
                             ui.add(egui::Button::new(RichText::new(text).color(col)).fill(fill))
+                                .explain(verbosity, short, verbose)
                                 .clicked()
                         };
-                        if pill(ui, &format!("{} CLOSE", icon::CHECK), theme::AMBER, theme::BLACK) {
+                        if pill(
+                            ui,
+                            &format!("{} CLOSE", icon::CHECK),
+                            theme::AMBER,
+                            theme::BLACK,
+                            "Close the lightbox",
+                            "Close the lightbox and return to the group list (Esc does the same).",
+                        ) {
                             close = true;
                         }
-                        if pill(ui, icon::CARET_LEFT, theme::PANEL, theme::TEXT) {
+                        if pill(
+                            ui,
+                            icon::CARET_LEFT,
+                            theme::PANEL,
+                            theme::TEXT,
+                            "Previous copy",
+                            "Step to the previous copy in this group (← does the same).",
+                        ) {
                             new_idx = (idx + count - 1) % count;
                         }
                         ui.label(
@@ -1531,14 +1706,36 @@ impl DupesView {
                                 .color(theme::TAN)
                                 .strong(),
                         );
-                        if pill(ui, icon::CARET_RIGHT, theme::PANEL, theme::TEXT) {
+                        if pill(
+                            ui,
+                            icon::CARET_RIGHT,
+                            theme::PANEL,
+                            theme::TEXT,
+                            "Next copy",
+                            "Step to the next copy in this group (→ does the same).",
+                        ) {
                             new_idx = (idx + 1) % count;
                         }
                         if state.compare.is_none() {
-                            if pill(ui, "FIT", theme::PANEL, theme::TEXT) {
+                            if pill(
+                                ui,
+                                "FIT",
+                                theme::PANEL,
+                                theme::TEXT,
+                                "Fit to window",
+                                "Scale the image to fit the viewport (F does the same).",
+                            ) {
                                 do_fit = true;
                             }
-                            if pill(ui, "1:1", theme::PANEL, theme::TEXT) {
+                            if pill(
+                                ui,
+                                "1:1",
+                                theme::PANEL,
+                                theme::TEXT,
+                                "True pixels",
+                                "Show the image at 100% — one screen pixel per image pixel \
+                                 (1 does the same).",
+                            ) {
                                 do_one = true;
                             }
                             let (ml, mf) = if a_marked {
@@ -1547,21 +1744,74 @@ impl DupesView {
                                 ("MARK".to_string(), theme::PANEL)
                             };
                             let mc = if a_marked { theme::BLACK } else { theme::TEXT };
-                            if a_markable && pill(ui, &ml, mf, mc) {
+                            if a_markable
+                                && pill(
+                                    ui,
+                                    &ml,
+                                    mf,
+                                    mc,
+                                    "Toggle this copy's mark",
+                                    "Toggle whether the shown copy is marked for deletion \
+                                     (Del/K does the same). Nothing deletes until you confirm \
+                                     back in the group list.",
+                                )
+                            {
                                 acts.push(Act::ToggleMark(a_key.clone()));
                             }
-                            if count >= 2 && !a_is_video && pill(ui, "COMPARE", theme::PANEL, theme::BLUE) {
+                            if count >= 2
+                                && !a_is_video
+                                && pill(
+                                    ui,
+                                    "COMPARE",
+                                    theme::PANEL,
+                                    theme::BLUE,
+                                    "A/B compare with the best copy",
+                                    "Enter A/B compare against the group's best copy, with a \
+                                     shared zoom/pan (C does the same).",
+                                )
+                            {
                                 toggle_compare = true;
                             }
                         } else {
-                            if pill(ui, "EXIT COMPARE", theme::PANEL, theme::BLUE) {
+                            if pill(
+                                ui,
+                                "EXIT COMPARE",
+                                theme::PANEL,
+                                theme::BLUE,
+                                "Back to single view",
+                                "Leave A/B compare and return to the single-image view \
+                                 (C does the same).",
+                            ) {
                                 toggle_compare = true;
                             }
                             let mode = if flicker { "SIDE BY SIDE" } else { "FLICKER" };
-                            if pill(ui, mode, theme::PANEL, theme::TEXT) {
+                            let (mode_short, mode_verbose) = if flicker {
+                                (
+                                    "Switch to side-by-side",
+                                    "Show A and B in two panes side by side instead of \
+                                     overlaid.",
+                                )
+                            } else {
+                                (
+                                    "Switch to flicker mode",
+                                    "Overlay A and B full-window; space swaps between them in \
+                                     place — the fastest way to spot compression artifacts.",
+                                )
+                            };
+                            if pill(ui, mode, theme::PANEL, theme::TEXT, mode_short, mode_verbose) {
                                 toggle_flicker = true;
                             }
-                            if flicker && pill(ui, "SWAP", theme::PANEL, theme::TEXT) {
+                            if flicker
+                                && pill(
+                                    ui,
+                                    "SWAP",
+                                    theme::PANEL,
+                                    theme::TEXT,
+                                    "Swap A/B",
+                                    "Swap which of A or B is currently shown in flicker mode \
+                                     (space does the same).",
+                                )
+                            {
                                 swap = true;
                             }
                             // Mark A / Mark B.
@@ -1571,7 +1821,17 @@ impl DupesView {
                                 ("MARK A".to_string(), theme::PANEL)
                             };
                             let ac = if a_marked { theme::BLACK } else { theme::TEXT };
-                            if a_markable && pill(ui, &al, af, ac) {
+                            if a_markable
+                                && pill(
+                                    ui,
+                                    &al,
+                                    af,
+                                    ac,
+                                    "Toggle A's mark",
+                                    "Toggle whether copy A (the shown file) is marked for \
+                                     deletion.",
+                                )
+                            {
                                 acts.push(Act::ToggleMark(a_key.clone()));
                             }
                             if let Some(bk) = &b_key {
@@ -1581,7 +1841,18 @@ impl DupesView {
                                     ("MARK B".to_string(), theme::PANEL)
                                 };
                                 let bc = if b_marked { theme::BLACK } else { theme::TEXT };
-                                if b_markable && pill(ui, &bl, bf, bc) {
+                                if b_markable
+                                    && pill(
+                                        ui,
+                                        &bl,
+                                        bf,
+                                        bc,
+                                        "Toggle B's mark",
+                                        "Toggle whether copy B (the compare candidate) is \
+                                         marked for deletion (Del/K does the same while \
+                                         comparing).",
+                                    )
+                                {
                                     acts.push(Act::ToggleMark(bk.clone()));
                                 }
                             }
@@ -2023,7 +2294,7 @@ mod ui_tests {
                     crate::theme::apply(ui.ctx());
                     init = true;
                 }
-                view.show(ui, &store);
+                view.show(ui, &store, TooltipVerbosity::default());
             });
         harness.run();
         harness
@@ -2085,7 +2356,7 @@ mod ui_tests {
                     crate::theme::apply(ui.ctx());
                     init = true;
                 }
-                view.show(ui, &store);
+                view.show(ui, &store, TooltipVerbosity::default());
             });
         harness.run();
         harness.get_by_label("SIMILAR").click();
@@ -2154,7 +2425,7 @@ mod ui_tests {
                         crate::theme::apply(ui.ctx());
                         init = true;
                     }
-                    view.show(ui, &store);
+                    view.show(ui, &store, TooltipVerbosity::default());
                 },
                 view,
             );
@@ -2192,7 +2463,7 @@ mod ui_tests {
                         crate::theme::apply(ui.ctx());
                         init = true;
                     }
-                    view.show(ui, &store);
+                    view.show(ui, &store, TooltipVerbosity::default());
                 },
                 view,
             );
@@ -2279,7 +2550,7 @@ mod ui_tests {
                         crate::theme::apply(ui.ctx());
                         init = true;
                     }
-                    view.show(ui, &store_ui);
+                    view.show(ui, &store_ui, TooltipVerbosity::default());
                 },
                 view,
             );
@@ -2309,7 +2580,7 @@ mod ui_tests {
                         crate::theme::apply(ui.ctx());
                         init = true;
                     }
-                    view.show(ui, &store_ui);
+                    view.show(ui, &store_ui, TooltipVerbosity::default());
                 },
                 DupesView::new(),
             );
@@ -2377,7 +2648,7 @@ mod ui_tests {
                     }
                     // keep tmp alive for the store's lifetime
                     let _ = &tmp;
-                    view.show(ui, &store);
+                    view.show(ui, &store, TooltipVerbosity::default());
                 },
                 view,
             );
@@ -2454,7 +2725,7 @@ mod ui_tests {
                         init = true;
                     }
                     let _ = &tmp;
-                    view.show(ui, &store);
+                    view.show(ui, &store, TooltipVerbosity::default());
                 },
                 view,
             );
@@ -2523,7 +2794,7 @@ mod ui_tests {
                         init = true;
                     }
                     let _ = &tmp;
-                    view.show(ui, &store);
+                    view.show(ui, &store, TooltipVerbosity::default());
                 },
                 view,
             );
@@ -2568,7 +2839,7 @@ mod ui_tests {
                         init = true;
                     }
                     let _ = &tmp;
-                    view.show(ui, &store);
+                    view.show(ui, &store, TooltipVerbosity::default());
                 },
                 view,
             );
@@ -2615,7 +2886,7 @@ mod ui_tests {
                         init = true;
                     }
                     let _ = &tmp;
-                    view.show(ui, &store);
+                    view.show(ui, &store, TooltipVerbosity::default());
                 },
                 view,
             );
@@ -2718,7 +2989,7 @@ mod ui_tests {
                         init = true;
                     }
                     let _ = &tmp;
-                    view.show(ui, &store);
+                    view.show(ui, &store, TooltipVerbosity::default());
                 },
                 view,
             );
@@ -2766,7 +3037,7 @@ mod ui_tests {
                         init = true;
                     }
                     let _ = &tmp;
-                    view.show(ui, &store);
+                    view.show(ui, &store, TooltipVerbosity::default());
                 },
                 view,
             );
@@ -2951,7 +3222,7 @@ mod ui_tests {
                         crate::theme::apply(ui.ctx());
                         init = true;
                     }
-                    view.show(ui, &store_ui);
+                    view.show(ui, &store_ui, TooltipVerbosity::default());
                 },
                 view,
             );
@@ -3001,7 +3272,7 @@ mod ui_tests {
                     crate::theme::apply(ui.ctx());
                     init = true;
                 }
-                view.show(ui, &store);
+                view.show(ui, &store, TooltipVerbosity::default());
             });
         harness.run();
         harness.snapshot("dupes_view");
@@ -3025,7 +3296,7 @@ mod ui_tests {
                     crate::theme::apply(ui.ctx());
                     init = true;
                 }
-                view.show(ui, &store);
+                view.show(ui, &store, TooltipVerbosity::default());
             });
         harness.run();
         let img = harness.render().expect("wgpu render failed");
@@ -3052,7 +3323,7 @@ mod ui_tests {
                     crate::theme::apply(ui.ctx());
                     init = true;
                 }
-                view.show(ui, &store);
+                view.show(ui, &store, TooltipVerbosity::default());
             });
         harness.run();
         harness.get_by_label("SIMILAR").click();
@@ -3094,7 +3365,7 @@ mod ui_tests {
                         crate::theme::apply(ui.ctx());
                         init = true;
                     }
-                    view.show(ui, &store_ui);
+                    view.show(ui, &store_ui, TooltipVerbosity::default());
                 },
                 view,
             );
@@ -3169,7 +3440,7 @@ mod ui_tests {
                         init = true;
                     }
                     let _ = (&tmp, &dir);
-                    view.show(ui, &store);
+                    view.show(ui, &store, TooltipVerbosity::default());
                 },
                 view,
             );
@@ -3253,7 +3524,7 @@ mod ui_tests {
                         init = true;
                     }
                     let _ = (&tmp, &dir);
-                    view.show(ui, &store);
+                    view.show(ui, &store, TooltipVerbosity::default());
                 },
                 view,
             );
@@ -3265,6 +3536,133 @@ mod ui_tests {
         let img = harness.render().expect("wgpu render failed");
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/lightbox_video.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Absolute path to `docs/screenshots/<name>`, creating the directory if
+    /// needed. Kept separate from the `render_*`/snapshot tests above (which
+    /// are for manual inspection/regression) — these are the doc screenshots
+    /// referenced from `docs/gui/*.md`.
+    fn doc_screenshot_path(name: &str) -> PathBuf {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    /// Doc screenshot: the Duplicate Management tab with a populated result
+    /// set (worse copies pre-marked, Quick Delete on) to
+    /// `docs/screenshots/duplicates_tab.png`. Run with `--ignored`.
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_duplicates_tab() {
+        let (_tmp, store) = seeded_store(3);
+        let plan = plan_exact_duplicates(&store, &["repo".to_string()], |_| {}).unwrap();
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.repos = vec![RepoSel {
+            name: "repo".into(),
+            included: true,
+            read_only: false,
+        }];
+        view.result_names = vec!["repo".to_string()];
+        view.results = Some(Results::Exact(plan));
+        view.quick_delete = true;
+
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 620.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        let img = harness.render().expect("wgpu render failed");
+        let out = doc_screenshot_path("duplicates_tab.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Doc screenshot: the lightbox in A/B compare (side-by-side) mode to
+    /// `docs/screenshots/lightbox_compare.png`. Run with `--ignored`.
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_lightbox_compare() {
+        let dir = tempfile::tempdir().unwrap();
+        dedup_core::thumbnail::set_cache_dir(dir.path().join("thumbs"));
+        let mut group: DupeGroup = Vec::new();
+        for i in 0..3u8 {
+            let rel = format!("photo{i}.png");
+            let path = dir.path().join(&rel);
+            image::RgbImage::from_fn(640, 480, |x, y| {
+                image::Rgb([x as u8, y as u8, (i as u32 * 60) as u8])
+            })
+            .save(&path)
+            .unwrap();
+            let mut hash = [0u8; 32];
+            hash[0] = i;
+            group.push(DupeFile {
+                repo: "r".into(),
+                repo_root: dir.path().to_string_lossy().into_owned(),
+                rel_path: rel,
+                entry: dedup_core::store::FileEntry {
+                    size: 1000,
+                    hash,
+                    modified_ms: 0,
+                    missing: false,
+                    mime: Some("image/png".into()),
+                    img_fingerprint: None,
+                    video_hash: None,
+                    pdf_hash: None,
+                    audio: None,
+                    img_size: Some((640, 480)),
+                    origin: None,
+                    exif: None,
+                },
+            });
+        }
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+        let mut lb = LightboxState::new(0, 0);
+        lb.compare = Some(CompareState::new(1));
+        view.lightbox = Some(lb);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 720.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = (&tmp, &dir);
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        for _ in 0..12 {
+            harness.run();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        harness.run();
+        let img = harness.render().expect("wgpu render failed");
+        let out = doc_screenshot_path("lightbox_compare.png");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }

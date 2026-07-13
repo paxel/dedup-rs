@@ -8,7 +8,9 @@
 //! - **Delete** removes source files whose content the target already has.
 
 use crate::icon;
+use crate::settings::TooltipVerbosity;
 use crate::theme;
+use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::diff::{
     CopyDest, DiffAction, DiffEvent, DiffItem, DiffProgress, DiffRun, diff_copy, diff_delete,
@@ -47,6 +49,29 @@ impl Command {
     }
     fn destructive(self) -> bool {
         !matches!(self, Command::Copy)
+    }
+    /// (short, verbose) tooltip text for this command's selector button.
+    fn tooltip(self) -> (&'static str, &'static str) {
+        match self {
+            Command::Copy => (
+                "Copy files the target doesn't have",
+                "Copy source files whose content the target (and any ALSO REF repos) \
+                 doesn't already have into the target repo's directory. Source files are \
+                 left in place.",
+            ),
+            Command::Move => (
+                "Move files the target doesn't have",
+                "Move source files whose content the target (and any ALSO REF repos) \
+                 doesn't already have into the target repo's directory, marking the \
+                 source entries missing.",
+            ),
+            Command::Delete => (
+                "Delete files the target already has",
+                "Delete source files whose content the target (or any ALSO REF repo) \
+                 already has — the source copy is redundant. Nothing is written to the \
+                 target.",
+            ),
+        }
     }
 }
 
@@ -303,6 +328,9 @@ pub struct FilesView {
     run_current: String,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
+    /// Tooltip wording for this frame, set at the top of [`Self::show`] from
+    /// the app-wide setting (not persisted here; `app.rs` owns that).
+    verbosity: TooltipVerbosity,
 }
 
 enum Act {
@@ -374,10 +402,12 @@ impl FilesView {
             run_current: String::new(),
             tx,
             rx,
+            verbosity: TooltipVerbosity::default(),
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, store: &Arc<Store>) {
+    pub fn show(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, verbosity: TooltipVerbosity) {
+        self.verbosity = verbosity;
         self.drain(ui, store);
         if !self.loaded {
             self.reload(store);
@@ -470,6 +500,13 @@ impl FilesView {
                     let col = if sel { theme::BLACK } else { theme::TEXT };
                     if ui
                         .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
+                        .explain(
+                            self.verbosity,
+                            "Pick as the source repo",
+                            "Use this repository as the source: its files are compared \
+                             against the target (and any ALSO REF repos) to decide what's \
+                             new or already known.",
+                        )
                         .clicked()
                     {
                         acts.push(Act::PickSource(name.clone()));
@@ -477,6 +514,12 @@ impl FilesView {
                 }
                 if ui
                     .button(RichText::new(icon::REFRESH).color(theme::BLACK))
+                    .explain(
+                        self.verbosity,
+                        "Reload the repository list",
+                        "Reload the list of registered repositories, e.g. after adding one \
+                         in the Repositories tab.",
+                    )
                     .clicked()
                 {
                     acts.push(Act::Reload);
@@ -494,6 +537,13 @@ impl FilesView {
                     let col = if sel { theme::BLACK } else { theme::BLUE };
                     if ui
                         .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
+                        .explain(
+                            self.verbosity,
+                            "Pick as the target repo",
+                            "Use this repository as the target: for COPY/MOVE it's where \
+                             files land (and is always a reference); for DELETE it's the \
+                             reference whose known content makes source files deletable.",
+                        )
                         .clicked()
                     {
                         acts.push(Act::PickTarget(name.clone()));
@@ -517,6 +567,14 @@ impl FilesView {
                     let col = if sel { theme::BLACK } else { theme::LILAC };
                     if ui
                         .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
+                        .explain(
+                            self.verbosity,
+                            "Toggle as an extra reference",
+                            "Also treat this repository's content as \"already known\", on \
+                             top of the target. A source file counts as new only when \
+                             *none* of the target or these extra references already has it \
+                             — this is what makes disk-triage correct across many disks.",
+                        )
                         .clicked()
                     {
                         acts.push(Act::ToggleExtraRef(name.clone()));
@@ -553,8 +611,10 @@ impl FilesView {
                     // Unselected pills sit on the dark panel — black text would
                     // vanish there, so they carry their accent color instead.
                     let col = if sel { theme::BLACK } else { accent };
+                    let (short, verbose) = cmd.tooltip();
                     if ui
                         .add(egui::Button::new(RichText::new(cmd.label()).color(col)).fill(fill))
+                        .explain(self.verbosity, short, verbose)
                         .clicked()
                     {
                         acts.push(Act::SetCommand(cmd));
@@ -580,6 +640,14 @@ impl FilesView {
                             .desired_width(220.0)
                             .hint_text("relative/subdir (optional)"),
                     )
+                    .explain(
+                        self.verbosity,
+                        "Relative subfolder inside the target",
+                        "Place transferred files under this relative subfolder inside the \
+                         target repo, preserving each file's source-relative path. Leave \
+                         blank to place them at the target root. Paths escaping the target \
+                         (absolute or containing `..`) are rejected.",
+                    )
                     .changed();
                 if changed {
                     acts.push(Act::SubdirChanged);
@@ -592,6 +660,12 @@ impl FilesView {
                             RichText::new(format!("{} BROWSE", icon::FOLDER_OPEN))
                                 .color(theme::BLACK),
                         ),
+                    )
+                    .explain(
+                        self.verbosity,
+                        "Pick or create a subfolder",
+                        "Open a native folder picker rooted at the target repo to pick (or \
+                         create) the subfolder transferred files go into.",
                     )
                     .clicked()
                 {
@@ -653,12 +727,23 @@ impl FilesView {
                     };
                     if ui
                         .add(egui::Button::new(RichText::new(text).color(col)).fill(fill))
+                        .explain(
+                            self.verbosity,
+                            "Edit this condition",
+                            "Open this filter condition's inline editor to change its value.",
+                        )
                         .clicked()
                     {
                         acts.push(Act::EditCond(i));
                     }
                     if ui
                         .add(egui::Button::new(RichText::new("×").color(theme::RED)))
+                        .explain(
+                            self.verbosity,
+                            "Remove this condition",
+                            "Remove this filter condition. Remaining conditions still combine \
+                             with AND.",
+                        )
                         .clicked()
                     {
                         acts.push(Act::RemoveCond(i));
@@ -671,17 +756,41 @@ impl FilesView {
                         egui::Button::new(RichText::new("+").color(theme::BLACK))
                             .fill(theme::AMBER),
                     )
+                    .explain(
+                        self.verbosity,
+                        "Add a filter condition",
+                        "Show the MIME / NAME / SIZE condition-type picker to add another \
+                         filter condition. Multiple conditions combine with AND.",
+                    )
                     .clicked()
                 {
                     self.adding = !self.adding;
                 }
                 if self.adding {
                     for kind in [FilterKind::Mime, FilterKind::Name, FilterKind::Size] {
+                        let (short, verbose) = match kind {
+                            FilterKind::Mime => (
+                                "Filter by MIME type",
+                                "Match files whose detected MIME type contains this substring \
+                                 (e.g. \"image/\" matches every image type).",
+                            ),
+                            FilterKind::Name => (
+                                "Filter by path substring",
+                                "Match files whose relative path contains this substring \
+                                 (case-sensitive, verbatim — internal spaces are preserved).",
+                            ),
+                            FilterKind::Size => (
+                                "Filter by size",
+                                "Match files by size with an operator and byte count, e.g. \
+                                 \">=1000\" or \"<500000\".",
+                            ),
+                        };
                         if ui
                             .add(
                                 egui::Button::new(RichText::new(kind.label()).color(theme::BLUE))
                                     .fill(theme::PANEL),
                             )
+                            .explain(self.verbosity, short, verbose)
                             .clicked()
                         {
                             acts.push(Act::AddCond(kind));
@@ -694,6 +803,11 @@ impl FilesView {
                         .add(
                             egui::Button::new(RichText::new("CLEAR").color(theme::BLACK))
                                 .fill(theme::RED),
+                        )
+                        .explain(
+                            self.verbosity,
+                            "Remove every condition",
+                            "Remove every filter condition, going back to matching all files.",
                         )
                         .clicked()
                 {
@@ -730,12 +844,23 @@ impl FilesView {
                         egui::Button::new(RichText::new(&preset.name).color(theme::TAN))
                             .fill(theme::PANEL),
                     )
+                    .explain(
+                        self.verbosity,
+                        "Apply this preset",
+                        "Replace the current filter conditions with this saved preset.",
+                    )
                     .clicked()
                 {
                     acts.push(Act::ApplyPreset(i));
                 }
                 if ui
                     .add(egui::Button::new(RichText::new("×").color(theme::RED)))
+                    .explain(
+                        self.verbosity,
+                        "Forget this preset",
+                        "Permanently remove this saved preset. The active filter conditions \
+                         are unaffected.",
+                    )
                     .clicked()
                 {
                     acts.push(Act::RemovePreset(i));
@@ -748,6 +873,12 @@ impl FilesView {
                     egui::TextEdit::singleline(&mut self.preset_name)
                         .desired_width(120.0)
                         .hint_text("preset name"),
+                )
+                .explain(
+                    self.verbosity,
+                    "Name for the new preset",
+                    "Name under which to save the current set of filter conditions as a \
+                     reusable preset.",
                 );
                 let can_save = !self.preset_name.trim().is_empty();
                 if ui
@@ -755,6 +886,12 @@ impl FilesView {
                         can_save,
                         egui::Button::new(RichText::new("SAVE").color(theme::BLACK))
                             .fill(theme::AMBER),
+                    )
+                    .explain(
+                        self.verbosity,
+                        "Save as a preset",
+                        "Save the current condition set as a named preset for one-click \
+                         reuse later.",
                     )
                     .clicked()
                 {
@@ -766,6 +903,12 @@ impl FilesView {
                     egui::Button::new(RichText::new("EXPORT").color(theme::BLUE))
                         .fill(theme::PANEL),
                 )
+                .explain(
+                    self.verbosity,
+                    "Export history + presets",
+                    "Export remembered filter values and saved presets to a JSON file, to \
+                     back up or share with another machine.",
+                )
                 .clicked()
             {
                 acts.push(Act::ExportHistory);
@@ -774,6 +917,12 @@ impl FilesView {
                 .add(
                     egui::Button::new(RichText::new("IMPORT").color(theme::BLUE))
                         .fill(theme::PANEL),
+                )
+                .explain(
+                    self.verbosity,
+                    "Import history + presets",
+                    "Import remembered filter values and presets from a previously \
+                     exported JSON file, merging with what's already saved.",
                 )
                 .clicked()
             {
@@ -810,11 +959,23 @@ impl FilesView {
                             .desired_width(200.0)
                             .hint_text(kind.hint()),
                     )
+                    .explain(
+                        self.verbosity,
+                        "Condition value",
+                        "The value to match for this condition — its meaning depends on the \
+                         condition type (MIME/NAME substring, or a SIZE operator + byte count).",
+                    )
                     .changed();
             }
             if ui
                 .add(
                     egui::Button::new(RichText::new("DONE").color(theme::BLACK)).fill(theme::AMBER),
+                )
+                .explain(
+                    self.verbosity,
+                    "Finish editing",
+                    "Close this condition's inline editor. The value is already applied as \
+                     you type.",
                 )
                 .clicked()
             {
@@ -860,6 +1021,14 @@ impl FilesView {
                             )
                             .fill(theme::PANEL),
                         )
+                        .explain(
+                            self.verbosity,
+                            "Use this MIME value",
+                            &format!(
+                                "Set the condition value to \"{mime}\" — {count} file(s) in \
+                                 the source repo have this MIME type."
+                            ),
+                        )
                         .clicked()
                         && let Some(cond) = self.filters.get_mut(idx)
                     {
@@ -880,6 +1049,13 @@ impl FilesView {
                         .add(
                             egui::Button::new(RichText::new(value).color(theme::TAN))
                                 .fill(theme::PANEL),
+                        )
+                        .explain(
+                            self.verbosity,
+                            "Use this recent value",
+                            &format!(
+                                "Set the condition value to a previously used one: \"{value}\"."
+                            ),
                         )
                         .clicked()
                         && let Some(cond) = self.filters.get_mut(idx)
@@ -903,13 +1079,31 @@ impl FilesView {
                         ready,
                         egui::Button::new(RichText::new("PREVIEW").color(theme::BLACK)),
                     )
+                    .explain(
+                        self.verbosity,
+                        "Preview the first transfers",
+                        "Show the first matching `from → to` transfers (up to a preview \
+                         limit) and a total count, without changing anything on disk. \
+                         PREVIEW and RUN are mutually exclusive — starting a run clears the \
+                         preview.",
+                    )
                     .clicked()
                 {
                     acts.push(Act::Preview);
                 }
                 let run =
                     egui::Button::new(RichText::new("RUN").color(theme::BLACK)).fill(theme::AMBER);
-                if ui.add_enabled(ready, run).clicked() {
+                if ui
+                    .add_enabled(ready, run)
+                    .explain(
+                        self.verbosity,
+                        "Run the command",
+                        "Run the selected command (COPY/MOVE/DELETE) on a background thread, \
+                         after a confirmation dialog. Progress, the current file, and a \
+                         running count are shown live.",
+                    )
+                    .clicked()
+                {
                     acts.push(Act::Ask);
                 }
                 if self.running {
@@ -918,6 +1112,13 @@ impl FilesView {
                         .add(
                             egui::Button::new(RichText::new("CANCEL").color(theme::BLACK))
                                 .fill(theme::RED),
+                        )
+                        .explain(
+                            self.verbosity,
+                            "Stop the running operation",
+                            "Cancel the in-progress operation. Files already transferred or \
+                             deleted before cancelling stay as they are — this stops further \
+                             work, it doesn't roll back.",
                         )
                         .clicked()
                     {
@@ -932,7 +1133,14 @@ impl FilesView {
                             egui::Button::new(RichText::new("MARK SOURCE DONE").color(theme::BLUE))
                                 .fill(theme::PANEL),
                         )
-                        .on_hover_text("Flag the source repo as triaged (its uniques copied out)")
+                        .explain(
+                            self.verbosity,
+                            "Flag the source repo as triaged (its uniques copied out)",
+                            "Mark the source repository triage-done: its unique content has \
+                             already been copied out into a sanitized directory, so it shows \
+                             a TRIAGED stat in Repository management and can be treated as \
+                             fully processed.",
+                        )
                         .clicked()
                     {
                         acts.push(Act::MarkSourceDone);
@@ -1036,12 +1244,22 @@ impl FilesView {
                 };
                 if ui
                     .add(egui::Button::new(RichText::new("PROCEED").color(theme::BLACK)).fill(fill))
+                    .explain(
+                        self.verbosity,
+                        "Confirm and run",
+                        "Confirm and start the run on a background thread.",
+                    )
                     .clicked()
                 {
                     acts.push(Act::Confirm);
                 }
                 if ui
                     .button(RichText::new("CANCEL").color(theme::BLACK))
+                    .explain(
+                        self.verbosity,
+                        "Cancel",
+                        "Close this dialog without running anything.",
+                    )
                     .clicked()
                 {
                     acts.push(Act::CancelConfirm);
@@ -1806,5 +2024,78 @@ mod tests {
             Some("mime:image/ size:>=100")
         );
         Ok(())
+    }
+}
+
+/// Kittest UI tests, kept separate from the plain unit tests above (which
+/// don't need a rendered `egui::Ui`). Mirrors the harness pattern established
+/// in `dupes_view.rs`'s `ui_tests` module.
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+    use egui_kittest::Harness;
+
+    /// A temp store with a `source` and `target` repo, `source` holding a
+    /// couple of files so the filter builder and preview have something real
+    /// to show.
+    fn sample_store() -> (tempfile::TempDir, Arc<Store>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_at(tmp.path().join("cfg")).unwrap();
+        let src_dir = tmp.path().join("source");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("holiday.jpg"), b"fake jpeg bytes").unwrap();
+        std::fs::write(src_dir.join("notes.txt"), b"fake text bytes").unwrap();
+        store
+            .create_repo("source", &src_dir.to_string_lossy())
+            .unwrap();
+        let dst_dir = tmp.path().join("target");
+        std::fs::create_dir_all(&dst_dir).unwrap();
+        store
+            .create_repo("target", &dst_dir.to_string_lossy())
+            .unwrap();
+        (tmp, Arc::new(store))
+    }
+
+    /// Doc screenshot: the File Management tab with a source/target picked
+    /// and a MIME filter condition active, to
+    /// `docs/screenshots/files_tab.png`. Run with `--ignored`.
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_files_tab() {
+        let (_tmp, store) = sample_store();
+        let mut view = FilesView::new();
+        view.loaded = true;
+        view.repos = vec!["source".to_string(), "target".to_string()];
+        view.source = Some("source".to_string());
+        view.target = Some("target".to_string());
+        view.filters = vec![FilterCond {
+            kind: FilterKind::Mime,
+            value: "image/".to_string(),
+            editing: false,
+        }];
+
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 620.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut FilesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("files_tab.png");
+        let img = harness.render().expect("wgpu render failed");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 }

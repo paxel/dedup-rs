@@ -10,6 +10,15 @@ use std::path::{Path, PathBuf};
 
 const FILE: &str = "gui_settings.json";
 
+/// How much explanation a hover tooltip gives: a terse one-liner, or a fuller
+/// paragraph on what the control does and when to use it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TooltipVerbosity {
+    #[default]
+    Short,
+    Verbose,
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -17,6 +26,8 @@ pub struct Settings {
     pub threads: usize,
     /// Duplicate-similarity slider position (percent).
     pub similarity_threshold: f64,
+    /// Hover-tooltip wording: short one-liners or verbose explanations.
+    pub tooltip_verbosity: TooltipVerbosity,
 }
 
 impl Default for Settings {
@@ -24,6 +35,7 @@ impl Default for Settings {
         Self {
             threads: 0,
             similarity_threshold: 99.0,
+            tooltip_verbosity: TooltipVerbosity::default(),
         }
     }
 }
@@ -63,6 +75,7 @@ mod tests {
         let s = Settings {
             threads: 4,
             similarity_threshold: 97.5,
+            tooltip_verbosity: TooltipVerbosity::Verbose,
         };
         s.save(dir.path());
         assert_eq!(Settings::load(dir.path()), s);
@@ -70,5 +83,24 @@ mod tests {
         // Corrupt file → defaults, never a panic.
         std::fs::write(dir.path().join(FILE), b"not json").unwrap();
         assert_eq!(Settings::load(dir.path()), Settings::default());
+    }
+
+    /// The verbosity tag round-trips through JSON as a plain string, so a
+    /// hand-edited config file (`"tooltip_verbosity": "Verbose"`) keeps working.
+    #[test]
+    fn tooltip_verbosity_json_tag_is_stable() {
+        assert_eq!(
+            serde_json::to_string(&TooltipVerbosity::Short).unwrap(),
+            "\"Short\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TooltipVerbosity::Verbose).unwrap(),
+            "\"Verbose\""
+        );
+        assert_eq!(
+            serde_json::from_str::<TooltipVerbosity>("\"Verbose\"").unwrap(),
+            TooltipVerbosity::Verbose
+        );
+        assert_eq!(TooltipVerbosity::default(), TooltipVerbosity::Short);
     }
 }
