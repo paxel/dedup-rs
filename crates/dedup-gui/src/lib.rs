@@ -30,7 +30,11 @@ pub fn run(ui_scale: Option<f32>) -> Result<(), String> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1100.0, 720.0])
         .with_min_inner_size([760.0, 480.0])
-        .with_title("dedup");
+        .with_title("dedup")
+        // On Wayland the compositor ignores `with_icon` and instead matches the
+        // window's app_id to an installed `<app_id>.desktop` file for the
+        // taskbar/titlebar icon; keep this stable and matching `dedup.desktop`.
+        .with_app_id("dedup");
     if let Some(icon) = load_icon() {
         viewport = viewport.with_icon(Arc::new(icon));
     }

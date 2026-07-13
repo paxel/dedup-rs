@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=dedup
+GenericName=Deduplication Triage
+Comment=Forensic data-inheritance triage: find the useful material in heaps of redundant backups
+Exec=dedup
+Icon=dedup
+Terminal=false
+Categories=Utility;FileTools;
+# Wayland/KDE matches the running window's app_id (set via with_app_id("dedup"))
+# to this file for the taskbar/titlebar icon; keep both equal to "dedup".
+StartupWMClass=dedup
