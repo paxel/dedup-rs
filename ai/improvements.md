@@ -36,15 +36,7 @@ This wave splits the old **Files** tab into two purpose-built sections and fixes
 progress ETA. Scope confirmed 2026-07-13: Transfer + Grooming + ETA are near-term; the
 Browse/forensic layer is Phase 6 and recognition/extensibility is Phase 7.
 
-### 5.0 Tab restructure
-
-Grow `Tab` from `{ Repositories, Duplicates, Files }` to
-`{ Repositories, Duplicates, Transfer, Grooming, Browse }`:
-
-- Rename the **Files** tab (and `files_view.rs`) to **Transfer** — it moves files
-  *between* repos, so the name should say so.
-- The **DELETE** command leaves Transfer and becomes a Grooming command (see 5.2).
-- Add the **Grooming** tab now; reserve **Browse** for Phase 6.
+### 5.0 Tab restructure  — ✅ done
 
 ### 5.1 Transfer section
 

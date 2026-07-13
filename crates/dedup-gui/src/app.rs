@@ -1,14 +1,15 @@
-//! The eframe application: a tabbed LCARS shell (Repository / Duplicate / File
-//! management) wired to the core store and a background update worker. This
-//! module owns the Repository Management tab and delegates the other two to
-//! [`crate::dupes_view`] and [`crate::files_view`].
+//! The eframe application: a tabbed LCARS shell (Repositories / Duplicates /
+//! Transfer / Grooming) wired to the core store and a background update worker.
+//! This module owns the Repository Management tab and the (currently empty)
+//! Grooming tab, and delegates the others to [`crate::dupes_view`] and
+//! [`crate::transfer_view`].
 
 use crate::dupes_view::DupesView;
-use crate::files_view::FilesView;
 use crate::icon;
 use crate::settings::TooltipVerbosity;
 use crate::status::{self, Location};
 use crate::theme;
+use crate::transfer_view::TransferView;
 use crate::util::{ExplainExt, format_size};
 use crate::worker::{ChannelProgress, JobKind, JobOutcome, RepoStatus, WorkerMsg, WorkerState};
 use crossbeam_channel::{Receiver, Sender};
@@ -28,7 +29,8 @@ const MAX_CONCURRENT: usize = 1;
 enum Tab {
     Repositories,
     Duplicates,
-    Files,
+    Transfer,
+    Grooming,
 }
 
 /// Freshness of a repo's index relative to disk, from the last CHECK.
@@ -137,7 +139,7 @@ pub struct DedupApp {
     status_tx: Sender<(String, Location)>,
     status_rx: Receiver<(String, Location)>,
     dupes: DupesView,
-    files: FilesView,
+    transfer: TransferView,
     /// Last settings written to disk, to avoid rewriting an unchanged file.
     saved_settings: crate::settings::Settings,
 }
@@ -172,7 +174,7 @@ impl DedupApp {
             status_tx,
             status_rx,
             dupes: DupesView::new(),
-            files: FilesView::new(),
+            transfer: TransferView::new(),
             saved_settings: crate::settings::Settings::default(),
         };
         // Restore persisted settings (thread count, similarity threshold,
@@ -538,7 +540,8 @@ impl eframe::App for DedupApp {
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Repositories => self.repositories_view(ui, &mut actions),
             Tab::Duplicates => self.dupes.show(ui, &self.store, self.tooltip_verbosity),
-            Tab::Files => self.files.show(ui, &self.store, self.tooltip_verbosity),
+            Tab::Transfer => self.transfer.show(ui, &self.store, self.tooltip_verbosity),
+            Tab::Grooming => Self::grooming_view(ui),
         });
         if self.show_settings {
             self.settings_modal(&ctx);
@@ -619,11 +622,20 @@ impl DedupApp {
                     tab_button(
                         ui,
                         &mut self.tab,
-                        Tab::Files,
-                        "FILES",
+                        Tab::Transfer,
+                        "TRANSFER",
                         theme::BLUE,
                         self.tooltip_verbosity,
-                        "Copy, move, or delete files between repositories by content",
+                        "Copy or move files between repositories by content",
+                    );
+                    tab_button(
+                        ui,
+                        &mut self.tab,
+                        Tab::Grooming,
+                        "GROOMING",
+                        theme::TAN,
+                        self.tooltip_verbosity,
+                        "Prune and reorganize repositories (coming soon)",
                     );
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -659,6 +671,23 @@ impl DedupApp {
                     });
                 });
             });
+    }
+
+    /// Placeholder for the Grooming tab. Its commands (delete, organize, small
+    /// tools) are built in Phase 5.2; for now the tab just announces itself.
+    fn grooming_view(ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("GROOMING")
+                .color(theme::TAN)
+                .size(18.0)
+                .strong(),
+        );
+        ui.add_space(8.0);
+        ui.colored_label(
+            theme::TEXT,
+            "Pruning and reorganization commands are coming soon.",
+        );
     }
 
     fn repositories_view(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
@@ -851,7 +880,7 @@ impl DedupApp {
                             "This repo's unique content was copied into a sanitized dir",
                             "This repository was marked triage-done: its unique content was \
                              already copied into a sanitized directory (via `dedup sanitize` \
-                             or MARK SOURCE DONE in Files management), so it's safe to \
+                             or MARK SOURCE DONE in the Transfer tab), so it's safe to \
                              consider fully processed.",
                             self.tooltip_verbosity,
                         );

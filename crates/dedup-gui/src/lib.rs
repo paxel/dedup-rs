@@ -4,7 +4,6 @@
 mod app;
 mod dupes_view;
 mod external;
-mod files_view;
 mod icon;
 mod lightbox;
 mod player;
@@ -12,6 +11,7 @@ mod settings;
 mod status;
 mod theme;
 mod thumbs;
+mod transfer_view;
 mod util;
 mod worker;
 

@@ -1,11 +1,10 @@
-//! The File Management tab: pick a source repo and a target repo, choose a
-//! command (copy / move / delete), narrow with a filter, preview the first
-//! `from → to` transfers, then run it on a background thread with confirmation.
+//! The Transfer tab: pick a source repo and a target repo, choose a command
+//! (copy / move), narrow with a filter, preview the first `from → to` transfers,
+//! then run it on a background thread with confirmation.
 //!
 //! Semantics reuse the core diff operations (content compared by size + hash):
 //! - **Copy/Move** transfer source files whose content the target lacks into the
 //!   target repo's directory (move also marks the source entries missing).
-//! - **Delete** removes source files whose content the target already has.
 
 use crate::icon;
 use crate::settings::TooltipVerbosity;
@@ -13,8 +12,7 @@ use crate::theme;
 use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::diff::{
-    CopyDest, DiffAction, DiffEvent, DiffItem, DiffProgress, DiffRun, diff_copy, diff_delete,
-    diff_print,
+    CopyDest, DiffAction, DiffEvent, DiffItem, DiffProgress, DiffRun, diff_copy, diff_print,
 };
 use dedup_core::filter::{FileFilter, count_matches};
 use dedup_core::store::Store;
@@ -36,7 +34,6 @@ const RUN_LOG_LIMIT: usize = 10;
 enum Command {
     Copy,
     Move,
-    Delete,
 }
 
 impl Command {
@@ -44,7 +41,6 @@ impl Command {
         match self {
             Command::Copy => "COPY",
             Command::Move => "MOVE",
-            Command::Delete => "DELETE",
         }
     }
     fn destructive(self) -> bool {
@@ -64,12 +60,6 @@ impl Command {
                 "Move source files whose content the target (and any ALSO REF repos) \
                  doesn't already have into the target repo's directory, marking the \
                  source entries missing.",
-            ),
-            Command::Delete => (
-                "Delete files the target already has",
-                "Delete source files whose content the target (or any ALSO REF repo) \
-                 already has — the source copy is redundant. Nothing is written to the \
-                 target.",
             ),
         }
     }
@@ -247,10 +237,6 @@ enum OpResult {
         cancelled: bool,
         moved: bool,
     },
-    Deleted {
-        deleted: u64,
-        cancelled: bool,
-    },
     Error(String),
 }
 
@@ -261,7 +247,7 @@ enum Msg {
     Done(OpResult),
 }
 
-/// [`DiffProgress`] adapter that forwards every diff event onto the FilesView
+/// [`DiffProgress`] adapter that forwards every diff event onto the TransferView
 /// channel. Sends never block; a dropped receiver is fine.
 struct ChannelDiffProgress {
     tx: Sender<Msg>,
@@ -273,7 +259,7 @@ impl DiffProgress for ChannelDiffProgress {
     }
 }
 
-pub struct FilesView {
+pub struct TransferView {
     repos: Vec<String>,
     loaded: bool,
     source: Option<String>,
@@ -360,7 +346,7 @@ enum Act {
     CancelRun,
 }
 
-impl FilesView {
+impl TransferView {
     pub fn new() -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
         let (subdir_tx, subdir_rx) = crossbeam_channel::unbounded();
@@ -540,9 +526,9 @@ impl FilesView {
                         .explain(
                             self.verbosity,
                             "Pick as the target repo",
-                            "Use this repository as the target: for COPY/MOVE it's where \
-                             files land (and is always a reference); for DELETE it's the \
-                             reference whose known content makes source files deletable.",
+                            "Use this repository as the target: it's where COPY/MOVE files \
+                             land, and it always counts as a reference for deciding what's \
+                             new.",
                         )
                         .clicked()
                     {
@@ -551,7 +537,7 @@ impl FilesView {
                 }
             });
             // Optional extra reference repos: content present in any of them is
-            // treated as "already known" (so it is not copied / is deletable).
+            // treated as "already known" (so it is not copied).
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("ALSO REF").color(theme::TEXT).size(12.0));
                 for name in &self.repos {
@@ -600,7 +586,7 @@ impl FilesView {
         theme::section(theme::ORANGE).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("COMMAND").color(theme::TEXT).size(12.0));
-                for cmd in [Command::Copy, Command::Move, Command::Delete] {
+                for cmd in [Command::Copy, Command::Move] {
                     let sel = self.command == cmd;
                     let accent = if cmd.destructive() {
                         theme::RED
@@ -626,11 +612,6 @@ impl FilesView {
     }
 
     fn subdir_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        // The relative target subdirectory only applies to copy/move; delete
-        // never writes into the target, so the group is hidden there.
-        if self.command == Command::Delete {
-            return;
-        }
         theme::section(theme::BLUE).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("INTO").color(theme::TEXT).size(12.0));
@@ -689,7 +670,6 @@ impl FilesView {
                 "Move source files the target does not have into the target repo \
                  (they are removed from the source directory)."
             }
-            Command::Delete => "Delete source files whose content the target already has.",
         };
         ui.label(RichText::new(text).color(theme::LILAC).size(11.0));
     }
@@ -1098,7 +1078,7 @@ impl FilesView {
                     .explain(
                         self.verbosity,
                         "Run the command",
-                        "Run the selected command (COPY/MOVE/DELETE) on a background thread, \
+                        "Run the selected command (COPY/MOVE) on a background thread, \
                          after a confirmation dialog. Progress, the current file, and a \
                          running count are shown live.",
                     )
@@ -1116,8 +1096,8 @@ impl FilesView {
                         .explain(
                             self.verbosity,
                             "Stop the running operation",
-                            "Cancel the in-progress operation. Files already transferred or \
-                             deleted before cancelling stay as they are — this stops further \
+                            "Cancel the in-progress operation. Files already transferred \
+                             before cancelling stay as they are — this stops further \
                              work, it doesn't roll back.",
                         )
                         .clicked()
@@ -1225,7 +1205,7 @@ impl FilesView {
     }
 
     fn confirm_modal(&mut self, ui: &mut egui::Ui, prompt: &str, acts: &mut Vec<Act>) {
-        egui::Modal::new(Id::new("files-confirm")).show(&ui.ctx().clone(), |ui| {
+        egui::Modal::new(Id::new("transfer-confirm")).show(&ui.ctx().clone(), |ui| {
             ui.set_width(380.0);
             ui.label(
                 RichText::new(format!("CONFIRM {}", self.command.label()))
@@ -1639,15 +1619,10 @@ impl FilesView {
         let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
         match diff_print(store, &source, &ref_slice, filter.as_deref()) {
             Ok(items) => {
-                let deleting = self.command == Command::Delete;
+                // Copy/Move act on content the target lacks (New).
                 let matched: Vec<&DiffItem> = items
                     .iter()
-                    .filter(|item| match item {
-                        // Copy/Move act on content the target lacks (New).
-                        DiffItem::New { .. } => !deleting,
-                        // Delete acts on content the target already knows.
-                        DiffItem::Equal { .. } | DiffItem::DeletedInReference { .. } => deleting,
-                    })
+                    .filter(|item| matches!(item, DiffItem::New { .. }))
                     .collect();
                 self.preview_total = matched.len();
                 self.preview = matched
@@ -1680,10 +1655,12 @@ impl FilesView {
                     to,
                 }
             }
+            // Transfer only previews New items (see `run_preview`); content the
+            // target already has is never shown as a transfer.
             DiffItem::Equal { rel_path, .. } | DiffItem::DeletedInReference { rel_path } => {
                 PreviewRow {
                     from: format!("{source}/{rel_path}"),
-                    to: "✗ delete (already in target)".to_string(),
+                    to: String::new(),
                 }
             }
         }
@@ -1706,10 +1683,6 @@ impl FilesView {
             ),
             Command::Move => format!(
                 "Move {} file(s) from '{source}' into '{dest}'? They are removed from the source directory.",
-                self.preview_total
-            ),
-            Command::Delete => format!(
-                "Delete {} file(s) from '{source}' that already exist in '{target}'? This cannot be undone.",
                 self.preview_total
             ),
         })
@@ -1769,15 +1742,6 @@ impl FilesView {
                                 Err(e) => OpResult::Error(e.to_string()),
                             }
                         }
-                        Err(e) => OpResult::Error(e.to_string()),
-                    }
-                }
-                Command::Delete => {
-                    match diff_delete(&store, &source, &ref_slice, filter.as_deref(), &run) {
-                        Ok(s) => OpResult::Deleted {
-                            deleted: s.deleted,
-                            cancelled: s.cancelled,
-                        },
                         Err(e) => OpResult::Error(e.to_string()),
                     }
                 }
@@ -1885,13 +1849,6 @@ impl FilesView {
                             ));
                             self.error = None;
                         }
-                        OpResult::Deleted { deleted, cancelled } => {
-                            self.status = Some(format!(
-                                "Deleted {deleted} file(s){}.",
-                                if cancelled { " (cancelled)" } else { "" }
-                            ));
-                            self.error = None;
-                        }
                         OpResult::Error(e) => self.error = Some(e),
                     }
                 }
@@ -1918,7 +1875,7 @@ mod tests {
 
     #[test]
     fn conditions_map_to_expected_expression() {
-        let mut view = FilesView::new();
+        let mut view = TransferView::new();
         assert_eq!(view.filter_string(), None);
 
         view.filters = vec![
@@ -1934,7 +1891,7 @@ mod tests {
 
     #[test]
     fn blank_conditions_are_skipped() {
-        let mut view = FilesView::new();
+        let mut view = TransferView::new();
         view.filters = vec![cond(FilterKind::Mime, "  "), cond(FilterKind::Name, "foo")];
         assert_eq!(view.filter_string().as_deref(), Some("name:foo"));
     }
@@ -2001,7 +1958,7 @@ mod tests {
         let store = Arc::new(Store::open_at(dir.path().to_path_buf())?);
         let ctx = egui::Context::default();
 
-        let mut view = FilesView::new();
+        let mut view = TransferView::new();
         view.filters = vec![
             cond(FilterKind::Mime, "image/"),
             cond(FilterKind::Size, ">=100"),
@@ -2056,14 +2013,14 @@ mod ui_tests {
         (tmp, Arc::new(store))
     }
 
-    /// Doc screenshot: the File Management tab with a source/target picked
+    /// Doc screenshot: the Transfer tab with a source/target picked
     /// and a MIME filter condition active, to
     /// `docs/screenshots/files_tab.png`. Run with `--ignored`.
     #[test]
     #[ignore = "generates a doc screenshot (needs wgpu)"]
     fn doc_screenshot_files_tab() {
         let (_tmp, store) = sample_store();
-        let mut view = FilesView::new();
+        let mut view = TransferView::new();
         view.loaded = true;
         view.repos = vec!["source".to_string(), "target".to_string()];
         view.source = Some("source".to_string());
@@ -2080,7 +2037,7 @@ mod ui_tests {
             .with_size(egui::vec2(1120.0, 620.0))
             .wgpu()
             .build_ui_state(
-                move |ui, view: &mut FilesView| {
+                move |ui, view: &mut TransferView| {
                     if !init {
                         crate::icon::install(ui.ctx());
                         crate::theme::apply(ui.ctx());
