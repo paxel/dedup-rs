@@ -24,8 +24,10 @@ pub enum TooltipVerbosity {
 pub struct Settings {
     /// Hashing thread count used by scans (0 = rayon default).
     pub threads: usize,
-    /// Duplicate-similarity slider position (percent).
+    /// Duplicates-tab similarity slider position (percent).
     pub similarity_threshold: f64,
+    /// Transfer-tab SIMILAR folder-export similarity slider position (percent).
+    pub transfer_similarity_threshold: f64,
     /// Hover-tooltip wording: short one-liners or verbose explanations.
     pub tooltip_verbosity: TooltipVerbosity,
 }
@@ -35,6 +37,7 @@ impl Default for Settings {
         Self {
             threads: 0,
             similarity_threshold: 99.0,
+            transfer_similarity_threshold: 90.0,
             tooltip_verbosity: TooltipVerbosity::default(),
         }
     }
@@ -75,6 +78,7 @@ mod tests {
         let s = Settings {
             threads: 4,
             similarity_threshold: 97.5,
+            transfer_similarity_threshold: 88.0,
             tooltip_verbosity: TooltipVerbosity::Verbose,
         };
         s.save(dir.path());

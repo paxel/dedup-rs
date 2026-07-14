@@ -76,7 +76,7 @@ enum Destination {
 enum SelectMode {
     /// Exact-content duplicate groups.
     Exact,
-    /// Perceptual-similarity groups (at the app's similarity threshold).
+    /// Perceptual-similarity groups (at this tab's own similarity threshold).
     Similar,
 }
 
@@ -155,8 +155,8 @@ pub struct TransferView {
     select_mode: SelectMode,
     /// Export the redundant copies instead of the unique files.
     invert: bool,
-    /// The app-wide similarity threshold, refreshed each frame from `show`;
-    /// used when a folder export groups by SIMILAR.
+    /// This tab's own similarity threshold (%), shown as a slider in SIMILAR
+    /// mode; used when a folder export groups by perceptual similarity.
     similar_threshold: f64,
     subdir: String,
     subdir_tx: Sender<Result<String, String>>,
@@ -247,15 +247,19 @@ impl TransferView {
         }
     }
 
-    pub fn show(
-        &mut self,
-        ui: &mut egui::Ui,
-        store: &Arc<Store>,
-        verbosity: TooltipVerbosity,
-        similar_threshold: f64,
-    ) {
+    /// The SIMILAR folder-export similarity threshold (percent), persisted
+    /// across launches by `app.rs`.
+    pub fn threshold(&self) -> f64 {
+        self.similar_threshold
+    }
+
+    /// Restore the persisted SIMILAR similarity threshold.
+    pub fn set_threshold(&mut self, threshold: f64) {
+        self.similar_threshold = threshold.clamp(50.0, 100.0);
+    }
+
+    pub fn show(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, verbosity: TooltipVerbosity) {
         self.verbosity = verbosity;
-        self.similar_threshold = similar_threshold;
         self.drain(ui);
         if !self.loaded {
             self.reload(store);
@@ -678,8 +682,8 @@ impl TransferView {
                         ),
                         SelectMode::Similar => (
                             "Group by perceptual similarity",
-                            "Treat perceptually similar media (at the Duplicates tab's \
-                             similarity threshold) as copies — e.g. one photo per burst.",
+                            "Treat perceptually similar media (at the similarity threshold \
+                             below) as copies — e.g. one photo per burst.",
                         ),
                     };
                     if ui
@@ -715,6 +719,14 @@ impl TransferView {
                     acts.push(Act::ToggleInvert);
                 }
             });
+            // In SIMILAR mode the threshold is chosen right here (the same shared
+            // control as the Duplicates tab), not borrowed from another tab.
+            if self.select_mode == SelectMode::Similar {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    crate::util::similarity_slider(ui, &mut self.similar_threshold, self.verbosity);
+                });
+            }
             let hint = if self.invert {
                 "Exports the redundant copies (every non-best member of a group)."
             } else {
@@ -1473,7 +1485,7 @@ mod ui_tests {
                         crate::theme::apply(ui.ctx());
                         init = true;
                     }
-                    view.show(ui, &store_ui, TooltipVerbosity::default(), 90.0);
+                    view.show(ui, &store_ui, TooltipVerbosity::default());
                 },
                 view,
             );
@@ -1512,6 +1524,31 @@ mod ui_tests {
         assert!(
             harness.query_by_label("INTO").is_none(),
             "the INTO subdir bar must be hidden in folder mode"
+        );
+    }
+
+    /// SIMILAR mode reveals the shared similarity threshold slider inline (the
+    /// threshold is owned here, not borrowed from the Duplicates tab); EXACT
+    /// mode does not show it.
+    #[test]
+    fn similar_mode_shows_the_threshold_slider() {
+        let (_tmp, store) = sample_store();
+        let similar = transfer_harness(Arc::clone(&store), |view| {
+            view.destination = Destination::Folder;
+            view.select_mode = SelectMode::Similar;
+        });
+        assert!(
+            similar.query_by_label("similarity").is_some(),
+            "SIMILAR mode shows the similarity threshold control"
+        );
+
+        let exact = transfer_harness(store, |view| {
+            view.destination = Destination::Folder;
+            view.select_mode = SelectMode::Exact;
+        });
+        assert!(
+            exact.query_by_label("similarity").is_none(),
+            "EXACT mode has no similarity threshold control"
         );
     }
 
@@ -1564,7 +1601,7 @@ mod ui_tests {
                         crate::theme::apply(ui.ctx());
                         init = true;
                     }
-                    view.show(ui, &store_ui, TooltipVerbosity::default(), 90.0);
+                    view.show(ui, &store_ui, TooltipVerbosity::default());
                 },
                 view,
             );

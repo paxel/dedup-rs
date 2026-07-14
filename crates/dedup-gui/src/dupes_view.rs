@@ -635,30 +635,7 @@ impl DupesView {
             if self.mode == Mode::Similar {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("similarity").color(theme::TEXT).size(12.0));
-                    // The value box draws on the orange pill, where the theme's
-                    // global cream text is unreadable — use black there, and a
-                    // light backdrop while the value is being typed.
-                    let visuals = ui.visuals_mut();
-                    visuals.override_text_color = Some(theme::BLACK);
-                    visuals.extreme_bg_color = theme::TAN;
-                    ui.add(
-                        egui::Slider::new(&mut self.threshold, 50.0..=100.0)
-                            .suffix("%")
-                            .max_decimals(1),
-                    )
-                    .explain(
-                        self.verbosity,
-                        "Minimum similarity to group as similar",
-                        "How alike two files' perceptual hashes must be to group as \
-                         similar: similarity % = (1 − hamming distance / bits) × 100. \
-                         Lower catches more (and riskier) matches; 100% is bit-identical.",
-                    );
-                    // 100% is bit-identical (512-bit hash); ≥99.5% is visually
-                    // identical for practical purposes.
-                    if self.threshold >= 99.5 {
-                        ui.label(RichText::new("identical").color(theme::BLUE).size(11.0));
-                    }
+                    crate::util::similarity_slider(ui, &mut self.threshold, self.verbosity);
                 });
             }
 

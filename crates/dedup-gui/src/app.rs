@@ -185,6 +185,8 @@ impl DedupApp {
         let settings = crate::settings::Settings::load(app.store.config_dir());
         app.threads = settings.threads;
         app.dupes.set_threshold(settings.similarity_threshold);
+        app.transfer
+            .set_threshold(settings.transfer_similarity_threshold);
         app.tooltip_verbosity = settings.tooltip_verbosity;
         app.saved_settings = settings;
         app.reload_all();
@@ -543,12 +545,7 @@ impl eframe::App for DedupApp {
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Repositories => self.repositories_view(ui, &mut actions),
             Tab::Duplicates => self.dupes.show(ui, &self.store, self.tooltip_verbosity),
-            Tab::Transfer => self.transfer.show(
-                ui,
-                &self.store,
-                self.tooltip_verbosity,
-                self.dupes.threshold(),
-            ),
+            Tab::Transfer => self.transfer.show(ui, &self.store, self.tooltip_verbosity),
             Tab::Grooming => self.grooming.show(ui, &self.store, self.tooltip_verbosity),
         });
         if self.show_settings {
@@ -580,6 +577,7 @@ impl eframe::App for DedupApp {
         let current = crate::settings::Settings {
             threads: self.threads,
             similarity_threshold: self.dupes.threshold(),
+            transfer_similarity_threshold: self.transfer.threshold(),
             tooltip_verbosity: self.tooltip_verbosity,
         };
         if current != self.saved_settings {
