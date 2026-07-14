@@ -1346,8 +1346,9 @@ impl DupesView {
 
     /// Full-window image lightbox: wheel zoom (around cursor), drag pan, `F`
     /// fit / `1` 1:1, `←`/`→` step the group, `Del`/`K` toggle the mark, `C`
-    /// A/B compare against the best copy (`space` swaps in flicker mode), `Esc`
-    /// close. Marking respects read-only exactly like the cards.
+    /// A/B compare against the best copy (`space` enters flicker, then swaps
+    /// A/B). `Esc` steps back one level — flicker → side-by-side → single →
+    /// closed. Marking respects read-only exactly like the cards.
     fn lightbox_modal(&mut self, ctx: &egui::Context, acts: &mut Vec<Act>) {
         let verbosity = self.verbosity;
         // Take the state so `full_res`/`thumbs` can be borrowed mutably below;
@@ -1375,9 +1376,10 @@ impl DupesView {
         let mut new_idx = idx;
         let (mut do_fit, mut do_one, mut do_mark) = (false, false, false);
         let (mut toggle_compare, mut toggle_flicker, mut swap) = (false, false, false);
+        let (mut esc, mut space) = (false, false);
         ctx.input(|i| {
             if i.key_pressed(egui::Key::Escape) {
-                close = true;
+                esc = true;
             }
             if i.key_pressed(egui::Key::ArrowRight) {
                 new_idx = (idx + 1) % count;
@@ -1398,9 +1400,28 @@ impl DupesView {
                 toggle_compare = true;
             }
             if i.key_pressed(egui::Key::Space) {
-                swap = true;
+                space = true;
             }
         });
+        // Escape is a universal "back": it pops one view level instead of
+        // closing outright — flicker → side-by-side → single image → closed.
+        // Space drives the flicker interaction: it enters flicker from
+        // side-by-side, then swaps A/B once there. Both reuse the deferred
+        // toggle flags so they apply after drawing like the button paths.
+        if esc {
+            match state.compare.as_ref() {
+                Some(c) if c.flicker => toggle_flicker = true,
+                Some(_) => toggle_compare = true,
+                None => close = true,
+            }
+        }
+        if space {
+            match state.compare.as_ref() {
+                Some(c) if c.flicker => swap = true,
+                Some(_) => toggle_flicker = true,
+                None => {}
+            }
+        }
         if close {
             return; // dropped state = closed
         }
@@ -1472,6 +1493,11 @@ impl DupesView {
         };
         let b_meta = b.as_ref().map(lightbox_meta);
         let flicker = state.compare.as_ref().is_some_and(|c| c.flicker);
+        // Bottom strip height: compare stacks three lines (path A, path B, and
+        // the hint) where the single view needs only two, so it grows and the
+        // viewport shrinks to match — otherwise the hint line is pushed off the
+        // bottom of the screen (which is why it looked like it vanished).
+        let strip_h = if state.compare.is_some() { 74.0 } else { 50.0 };
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
 
         // Video preview: a scrubbable filmstrip instead of a zoomable image.
@@ -1526,7 +1552,7 @@ impl DupesView {
                 // Viewport = screen minus top control bar and bottom strip.
                 let viewport = egui::Rect::from_min_max(
                     egui::pos2(screen.min.x + 8.0, screen.min.y + 44.0),
-                    egui::pos2(screen.max.x - 8.0, screen.max.y - 62.0),
+                    egui::pos2(screen.max.x - 8.0, screen.max.y - strip_h - 12.0),
                 );
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);
                 let cursor = ctx.pointer_hover_pos();
@@ -1799,8 +1825,9 @@ impl DupesView {
                             } else {
                                 (
                                     "Switch to flicker mode",
-                                    "Overlay A and B full-window; space swaps between them in \
-                                     place — the fastest way to spot compression artifacts.",
+                                    "Overlay A and B full-window; space enters flicker and then \
+                                     swaps between them in place — the fastest way to spot \
+                                     compression artifacts.",
                                 )
                             };
                             if pill(ui, mode, theme::PANEL, theme::TEXT, mode_short, mode_verbose) {
@@ -1867,7 +1894,7 @@ impl DupesView {
 
                 // Bottom metadata + hint strip.
                 let bottom = egui::Rect::from_min_max(
-                    egui::pos2(screen.min.x + 8.0, screen.max.y - 56.0),
+                    egui::pos2(screen.min.x + 8.0, screen.max.y - strip_h - 6.0),
                     egui::pos2(screen.max.x - 8.0, screen.max.y - 6.0),
                 );
                 ui.scope_builder(
@@ -1903,11 +1930,12 @@ impl DupesView {
                                 row(ui, "B", bf, b_size_col, b_dim_col);
                             }
                             let _ = b_meta;
-                            ui.label(
-                                RichText::new("C exit · flicker: space swaps · Del/K marks B · Esc close")
-                                    .color(theme::LILAC)
-                                    .size(11.0),
-                            );
+                            let hint = if flicker {
+                                "wheel zoom · drag pan · space: swap A/B · Del/K mark B · Esc: back to side-by-side · C: exit compare"
+                            } else {
+                                "wheel zoom · drag pan · space: flicker · Del/K mark B · Esc/C: back to single"
+                            };
+                            ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
                         } else {
                             ui.label(RichText::new(&a_meta).color(theme::TEXT).size(13.0));
                             let hint = if a_is_video {
@@ -3067,6 +3095,20 @@ mod ui_tests {
             "compare exposes the FLICKER toggle"
         );
 
+        // Compare stacks three bottom lines (path A, path B, hint) where the
+        // single view needs only two. The strip must grow so the hint stays
+        // inside it (above the 6px bottom margin of the 700px window) rather
+        // than being pushed off the bottom edge — the reason it looked like the
+        // hint "vanished" on entering compare.
+        let hint_bottom = harness
+            .get_by_label_contains("space: flicker")
+            .rect()
+            .bottom();
+        assert!(
+            hint_bottom <= 694.0,
+            "compare hint stays inside the bottom strip, not off-screen: bottom {hint_bottom:.1}"
+        );
+
         // Clear preselected marks so B shows the unmarked MARK B control.
         harness.state_mut().marked.clear();
         harness.run();
@@ -3089,6 +3131,121 @@ mod ui_tests {
         assert!(
             harness.state().lightbox.as_ref().unwrap().compare.is_none(),
             "C exits compare mode"
+        );
+    }
+
+    /// Space enters flicker then swaps A/B; Escape is a hierarchical "back"
+    /// that pops one view level per press: flicker → side-by-side → single →
+    /// closed.
+    #[test]
+    fn lightbox_space_flicker_and_escape_back() {
+        let group: DupeGroup = (0..3).map(image_file).collect();
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.run();
+
+        // Enter compare — starts in side-by-side (not flicker).
+        harness.key_press(egui::Key::C);
+        harness.run();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .lightbox
+                .as_ref()
+                .unwrap()
+                .compare
+                .as_ref()
+                .is_some_and(|c| !c.flicker),
+            "C enters compare in side-by-side"
+        );
+
+        // Space enters flicker from side-by-side, showing A.
+        harness.key_press(egui::Key::Space);
+        harness.run();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .lightbox
+                .as_ref()
+                .unwrap()
+                .compare
+                .as_ref()
+                .is_some_and(|c| c.flicker && !c.show_b),
+            "space enters flicker showing A"
+        );
+
+        // Space again swaps A/B within flicker.
+        harness.key_press(egui::Key::Space);
+        harness.run();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .lightbox
+                .as_ref()
+                .unwrap()
+                .compare
+                .as_ref()
+                .is_some_and(|c| c.flicker && c.show_b),
+            "space swaps A/B within flicker"
+        );
+
+        // Escape steps back one level: flicker → side-by-side (still comparing).
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .lightbox
+                .as_ref()
+                .unwrap()
+                .compare
+                .as_ref()
+                .is_some_and(|c| !c.flicker),
+            "Escape leaves flicker back to side-by-side, staying in compare"
+        );
+
+        // Escape again: side-by-side → single image.
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        harness.run();
+        assert!(
+            harness.state().lightbox.as_ref().unwrap().compare.is_none(),
+            "Escape leaves compare back to the single image"
+        );
+
+        // Escape again: single image → closed.
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        harness.run();
+        assert!(
+            harness.state().lightbox.is_none(),
+            "Escape from the single image closes the lightbox"
         );
     }
 

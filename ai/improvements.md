@@ -12,8 +12,10 @@ Media strategy is **hybrid**: in-app image zoom, in-app audio playback, video as
 scrub-able frame strips; one click hands any file to the system's external app for full
 fidelity.
 
-All four phases planned in this document (review tooling, sanitize workflow, content
-coverage, forensic layer) have shipped. What remains is cross-cutting debt.
+All four phases originally planned in this document (review tooling, sanitize workflow,
+content coverage, forensic layer) have shipped. What remains is a near-term preview &
+lightbox polish wave (Phase 6), the deferred Browse (Phase 7) and Recognition (Phase 8)
+layers, and cross-cutting debt.
 
 ---
 
@@ -46,7 +48,80 @@ Browse/forensic layer is Phase 6 and recognition/extensibility is Phase 7.
 
 ---
 
-## Phase 6 — Browse & forensic layer  *(deferred)*
+## Phase 6 — Preview & Lightbox polish  *(near-term)*
+
+The Duplicates lightbox is where triage actually happens, and it has three gaps: audio is
+near-unusable (files render as the generic broken-image placeholder), the keyboard/​hint
+affordances are incomplete, and there is no way to fix or re-tag a file without leaving the
+app. This wave makes the lightbox a first-class comparison surface for **both** images and
+audio, with safe in-place edits. (Folded from the "Open issues" list, kept verbatim below.)
+
+### 6.1 Keyboard shortcuts & discoverable hints
+
+**Lightbox — ✅ done (2026-07-14).**
+- **Escape is a universal "back"**, not an immediate close: it pops one view level per press
+  — flicker → side-by-side → single image → closed. This is the intended principle for all
+  modals/future views (applied to the lightbox now; rolled out elsewhere with the cross-view
+  work below).
+- **`Space` drives flicker**: it enters flicker from side-by-side (previously button-only),
+  then swaps A/B once there.
+- **Hint "vanished on compare" was a real layout bug** (user was right): the hint string
+  existed, but compare stacks three bottom lines (path A, path B, hint) into a strip only
+  tall enough for two, so the hint rendered *below* the window bottom (measured at y≈709 in
+  a 700 px window). Fixed by growing the bottom strip (and shrinking the viewport to match)
+  in compare mode; a geometric test now asserts the hint stays on-screen.
+- The compare hint bar is now **mode-aware** (distinct side-by-side vs flicker strings) and
+  names every available shortcut.
+
+**Remaining (deferred 2026-07-14 — this pass is lightbox-only by decision):** extend a
+persistent, discoverable hint bar *and* actual keyboard shortcuts to the Transfer, Grooming,
+and Duplicates-grid views, which have none today. Audio play/pause + next-audio shortcuts
+land with the audio lightbox (6.3).
+
+### 6.2 Audio preview tile
+
+- **Bug:** audio files fall back to the generic broken-image thumbnail placeholder.
+- Card view: replace it with a meaningful audio tile — duration + basic metadata plus a
+  **deterministic fingerprint glyph** derived from `AudioFp.chunk_hashes` (identicon-style:
+  hash bits drive colour / mirror / line generators). Determinism means identical or similar
+  audio produces visibly similar glyphs. Fallback/simplest form: render the fingerprint as a
+  grayscale block.
+- Clicking the glyph opens the file in the audio lightbox (6.3).
+
+### 6.3 Audio lightbox & audible comparison
+
+- Give audio a lightbox that renders the fingerprint as an **audio graph** (waveform-style)
+  so differences between similar files are *visible* side-by-side — reuse the A/B compare and
+  flicker affordances where they map cleanly.
+- While in the lightbox, let the user switch between the group's audio copies **without
+  stopping playback**, preserving the playback offset, so differences are *audible*.
+- *(Flagged "maybe" by the user — confirm before building:)* carry the same "keep offset when
+  switching files" behaviour into the normal card view (`player` is a single global player,
+  so this is a small extension of existing state).
+
+### 6.4 Lightbox image editing (lossless)
+
+- Add an **Edit** control in the image lightbox for lossless flip / rotate (90° steps +
+  mirror).
+- Offer an option to **overwrite** the original file with the transformed image, lossless
+  where the format allows (e.g. jpegtran-style transforms for JPEG); document per-format
+  limits. Gated by the 6.6 confirmation.
+
+### 6.5 Audio id3 tags
+
+- Display **id3** tags in the audio lightbox.
+- Optional inline editor to change tags and write them back to the file. Gated by 6.6.
+
+### 6.6 Safe in-place saves  *(cross-cutting for 6.4 & 6.5)*
+
+- Every action that writes to a file from the lightbox (overwrite image, write id3) requires
+  an explicit confirmation ack — "you are about to change this file on disk."
+- Saving must **not** close the lightbox: the user stays in context to keep reviewing the
+  group.
+
+---
+
+## Phase 7 — Browse & forensic layer  *(deferred)*
 
 A fifth **Browse** tab hosting the forensic tools:
 
@@ -56,7 +131,7 @@ A fifth **Browse** tab hosting the forensic tools:
 - **Strings** on demand for unknown files.
 - Unlocks the annotation-driven Transfer exports noted in 5.1.
 
-## Phase 7 — Recognition & extensibility  *(far future)*
+## Phase 8 — Recognition & extensibility  *(far future)*
 
 - Face recognition and object recognition for photos/images.
 - VLA tagging of files to topics; word clouds for documents.
@@ -100,7 +175,8 @@ user demands changes:
 * api for externalize features
 
 
-# Open issues:
+### Open issues (verbatim, folded into Phase 6)
+
 * The lightbox has a shortcut description on the bottom. it goes away when you choose compare
 * I like the shortcut description and I want one in every view and also as much as possible shortcutable
   * in lightbox the flicker view and there especially the swap need a key, maybe space?
