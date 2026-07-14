@@ -98,3 +98,16 @@ user demands changes:
 * meta data extraction of all known formats
 * plugin support for new formats
 * api for externalize features
+
+
+# Open issues:
+* The lightbox has a shortcut description on the bottom. it goes away when you choose compare
+* I like the shortcut description and I want one in every view and also as much as possible shortcutable
+  * in lightbox the flicker view and there especially the swap need a key, maybe space?
+* the display of audio is quite awful. the icon looks like a broken image. maybe show some meta info and maybe display the fingerprint as a glyph? you know where some short seed generates some small image, by taking some bits as color some as mirror some as line generator. dunno. some small human recognicable visualisaton. or optionl just the fingerprint as a grayscale block.
+  * clicking the fingerprint image should bring you to the lightbox and the audio data is converted to nice audio graphs that can be compared against each other, so you can SEE the diffs?
+* playing audio in the lightbox should allow switching between different audios and continues to play so you can also hear the differences of similar files
+  * maybe this should also be possible in the normal view? when you play another play button, it keeps the offset?
+* the lightbox should have an edit button to flip and rotate images losless with the option to actually overwrite the image with the flipped rotated image
+* the audio lightbox should have a id3 display, and maybe an editor to change the id3 tag and save it
+* all save actions in the lightbox need a "sure, you change that, you know" kind of ack for the user. saving does not leave the lightbx
