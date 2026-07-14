@@ -75,6 +75,12 @@ pub struct LightboxState {
     fit: bool,
     /// Active A/B compare, if the user pressed `C`.
     pub compare: Option<CompareState>,
+    /// Audio lightbox only: the group index whose playback cursor is shown (the
+    /// copy the user last started). Needed because exact-duplicate copies share
+    /// a content hash, so the hash alone can't say which row is playing.
+    pub audio_active: Option<usize>,
+    /// Audio lightbox only: show spectrograms instead of amplitude waveforms.
+    pub spectrogram: bool,
 }
 
 impl LightboxState {
@@ -86,6 +92,8 @@ impl LightboxState {
             pan: Vec2::ZERO,
             fit: true,
             compare: None,
+            audio_active: None,
+            spectrogram: false,
         }
     }
 

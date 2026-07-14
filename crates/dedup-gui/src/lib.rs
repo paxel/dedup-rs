@@ -15,6 +15,7 @@ mod theme;
 mod thumbs;
 mod transfer_view;
 mod util;
+mod waveform;
 mod worker;
 
 use dedup_core::store::Store;

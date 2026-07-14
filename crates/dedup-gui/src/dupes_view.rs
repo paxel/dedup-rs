@@ -9,6 +9,7 @@ use crate::settings::TooltipVerbosity;
 use crate::theme;
 use crate::thumbs::ThumbCache;
 use crate::util::{ExplainExt, format_mtime, format_size};
+use crate::waveform::WaveCache;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::dupes::{
     DupeDeleteStats, DupeFile, DupeGroup, DupeGroupKey, delete_paths, load_groups,
@@ -18,7 +19,7 @@ use dedup_core::similar::find_similar;
 use dedup_core::store::Store;
 use dedup_core::thumbnail::hash_hex;
 use egui::{Color32, Id, RichText};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -192,6 +193,47 @@ fn paint_audio_glyph(painter: &egui::Painter, rect: egui::Rect, fp: &dedup_core:
     }
 }
 
+/// Magma-ish heat ramp (black → purple → orange → white) for spectrogram cells:
+/// `v` in 0..=1 maps to brightness, so louder frequencies read brighter.
+fn spec_color(v: f32) -> egui::Color32 {
+    const STOPS: [(f32, f32, f32, f32); 5] = [
+        (0.00, 0.0, 0.0, 4.0),
+        (0.25, 60.0, 15.0, 110.0),
+        (0.50, 165.0, 45.0, 110.0),
+        (0.75, 235.0, 105.0, 60.0),
+        (1.00, 252.0, 255.0, 200.0),
+    ];
+    let v = v.clamp(0.0, 1.0);
+    let mut i = 0;
+    while i + 1 < STOPS.len() && v > STOPS[i + 1].0 {
+        i += 1;
+    }
+    let (v0, r0, g0, b0) = STOPS[i];
+    let (v1, r1, g1, b1) = STOPS[(i + 1).min(STOPS.len() - 1)];
+    let t = if v1 > v0 { (v - v0) / (v1 - v0) } else { 0.0 };
+    let lerp = |a: f32, b: f32| (a + (b - a) * t) as u8;
+    egui::Color32::from_rgb(lerp(r0, r1), lerp(g0, g1), lerp(b0, b1))
+}
+
+/// Build a spectrogram image (time on x, frequency on y with bass at the
+/// bottom) from a decoded [`waveform::AudioViz`].
+fn spec_image(viz: &crate::waveform::AudioViz) -> egui::ColorImage {
+    let (w, h) = (viz.spec_w, viz.spec_h);
+    let mut rgba = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let bin = h - 1 - y; // row 0 (top) = highest freq
+        for x in 0..w {
+            let c = spec_color(viz.spec[bin * w + x]);
+            let i = (y * w + x) * 4;
+            rgba[i] = c.r();
+            rgba[i + 1] = c.g();
+            rgba[i + 2] = c.b();
+            rgba[i + 3] = 255;
+        }
+    }
+    egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba)
+}
+
 /// One-line `path · size · WxH · mtime` description used by the lightbox.
 fn lightbox_meta(file: &DupeFile) -> String {
     format!(
@@ -277,6 +319,11 @@ pub struct DupesView {
     full_res: FullResCache,
     /// Global audio preview player (one file at a time).
     player: Player,
+    /// Audio-visualization cache backing the audio lightbox's waveforms/spectra.
+    waves: WaveCache,
+    /// GPU textures for spectrograms, keyed by content hash (built lazily from
+    /// `waves`, cleared when the audio lightbox closes).
+    spec_tex: HashMap<String, egui::TextureHandle>,
     /// Tooltip wording for this frame, set at the top of [`Self::show`] from
     /// the app-wide setting (not persisted here; `app.rs` owns that).
     verbosity: TooltipVerbosity,
@@ -312,6 +359,8 @@ impl DupesView {
             lightbox: None,
             full_res: FullResCache::new(2),
             player: Player::new(),
+            waves: WaveCache::new(2),
+            spec_tex: HashMap::new(),
             verbosity: TooltipVerbosity::default(),
         }
     }
@@ -345,6 +394,9 @@ impl DupesView {
             ctx.request_repaint();
         }
         if self.full_res.poll(&ctx) {
+            ctx.request_repaint();
+        }
+        if self.waves.poll(&ctx) {
             ctx.request_repaint();
         }
         self.drain_messages(store, &ctx);
@@ -1352,27 +1404,39 @@ impl DupesView {
         }
         // Audio: a deterministic fingerprint glyph + duration, so cards read as
         // audio instead of a broken image and identical content shows the same
-        // glyph. (Clicking it to open an audio lightbox arrives with 6.3.)
+        // glyph. Clicking it opens the audio lightbox (waveform comparison).
         if is_audio && let Some(fp) = file.entry.audio.as_ref() {
-            egui::Frame::new()
-                .fill(theme::PANEL)
-                .stroke(egui::Stroke::new(1.0, theme::HAIRLINE))
-                .corner_radius(6)
-                .inner_margin(8.0)
-                .show(ui, |ui| {
-                    ui.set_width(160.0);
-                    ui.vertical_centered(|ui| {
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(144.0, 82.0), egui::Sense::hover());
-                        paint_audio_glyph(ui.painter(), rect, fp);
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new(fmt_ms(fp.duration_ms as u64))
-                                .color(theme::TAN)
-                                .size(12.0),
-                        );
-                    });
-                });
+            let (rect, resp) =
+                ui.allocate_exact_size(egui::vec2(160.0, 112.0), egui::Sense::click());
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 6.0, theme::PANEL);
+            painter.rect_stroke(
+                rect,
+                6.0,
+                egui::Stroke::new(1.0, theme::HAIRLINE),
+                egui::StrokeKind::Inside,
+            );
+            let glyph = egui::Rect::from_min_max(
+                rect.min + egui::vec2(8.0, 8.0),
+                egui::pos2(rect.max.x - 8.0, rect.max.y - 24.0),
+            );
+            paint_audio_glyph(&painter, glyph, fp);
+            painter.text(
+                egui::pos2(rect.center().x, rect.max.y - 13.0),
+                egui::Align2::CENTER_CENTER,
+                fmt_ms(fp.duration_ms as u64),
+                egui::FontId::proportional(12.0),
+                theme::TAN,
+            );
+            let resp = resp.explain(
+                self.verbosity,
+                "Open the audio lightbox",
+                "Open the full-window audio view: compare this group's copies as waveforms and \
+                 switch playback between them without losing your place in the track.",
+            );
+            if resp.clicked() {
+                acts.push(Act::OpenLightbox(gi, fi));
+            }
             return;
         }
 
@@ -1432,6 +1496,17 @@ impl DupesView {
         };
         let count = group.len();
         let mut idx = state.index.min(count - 1);
+
+        // Audio files get a dedicated waveform lightbox, not the image viewer.
+        if group[idx]
+            .entry
+            .mime
+            .as_deref()
+            .is_some_and(|m| m.starts_with("audio/"))
+        {
+            self.audio_lightbox(ctx, state, group, idx);
+            return;
+        }
 
         // Keyboard: navigation, view modes, mark, compare, close. Mode changes
         // are recorded as flags and applied after drawing (uniform one-frame
@@ -2062,6 +2137,601 @@ impl DupesView {
         }
     }
 
+    /// Full-window audio lightbox: each copy's decoded waveform, stacked for A/B
+    /// compare so differences stand out; `space` play/pause, `←`/`→` switch which
+    /// copy plays (keeping the offset, so you hear the same moment in each),
+    /// clicking a waveform plays that copy from there, `C` toggles compare, `Esc`
+    /// steps back (compare → single → closed).
+    /// Lazily upload (and cache) a spectrogram texture for `hex`.
+    fn spec_texture(
+        &mut self,
+        ctx: &egui::Context,
+        hex: &str,
+        viz: &crate::waveform::AudioViz,
+    ) -> egui::TextureHandle {
+        if let Some(t) = self.spec_tex.get(hex) {
+            return t.clone();
+        }
+        let tex = ctx.load_texture(
+            format!("spec-{hex}"),
+            spec_image(viz),
+            egui::TextureOptions::LINEAR,
+        );
+        self.spec_tex.insert(hex.to_string(), tex.clone());
+        tex
+    }
+
+    fn audio_lightbox(
+        &mut self,
+        ctx: &egui::Context,
+        mut state: LightboxState,
+        group: DupeGroup,
+        mut idx: usize,
+    ) {
+        let verbosity = self.verbosity;
+        let count = group.len();
+        let params = |f: &DupeFile| -> (String, PathBuf, u64) {
+            (
+                hash_hex(&f.entry.hash),
+                f.absolute_path(),
+                f.entry
+                    .audio
+                    .as_ref()
+                    .map_or(0, |a| u64::from(a.duration_ms)),
+            )
+        };
+
+        // A is the current copy; B (compare target) is another copy in the group.
+        let a = group[idx].clone();
+        let (a_hex, a_path, _a_total) = params(&a);
+        let a_viz = self.waves.get(&a_hex, &a_path);
+        let b_file = state
+            .compare
+            .as_ref()
+            .map(|c| group[c.other.min(count - 1)].clone());
+        let (b_hex, b_viz) = match &b_file {
+            Some(f) => {
+                let (h, p, _t) = params(f);
+                let v = self.waves.get(&h, &p);
+                (Some(h), v)
+            }
+            None => (None, None),
+        };
+        let comparing = b_file.is_some();
+        let flicker = state.compare.as_ref().is_some_and(|c| c.flicker);
+        let spectrogram = state.spectrogram;
+        // Build/fetch spectrogram textures (only needed in spectrogram view).
+        let a_tex = if spectrogram {
+            a_viz.clone().map(|v| self.spec_texture(ctx, &a_hex, &v))
+        } else {
+            None
+        };
+        let b_tex = match (spectrogram, b_hex.as_ref(), b_viz.clone()) {
+            (true, Some(h), Some(v)) => Some(self.spec_texture(ctx, h, &v)),
+            _ => None,
+        };
+
+        // Keyboard. `space` drives flicker (enter, then swap) exactly like the
+        // image lightbox; playback is `P`, and `S` toggles the spectrogram view.
+        let mut close = false;
+        let mut new_idx = idx;
+        let (mut toggle_play, mut toggle_compare, mut esc) = (false, false, false);
+        let (mut space, mut toggle_flicker, mut swap, mut toggle_spec) =
+            (false, false, false, false);
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::Escape) {
+                esc = true;
+            }
+            if i.key_pressed(egui::Key::ArrowRight) {
+                new_idx = (idx + 1) % count;
+            }
+            if i.key_pressed(egui::Key::ArrowLeft) {
+                new_idx = (idx + count - 1) % count;
+            }
+            if i.key_pressed(egui::Key::Space) {
+                space = true;
+            }
+            if i.key_pressed(egui::Key::P) {
+                toggle_play = true;
+            }
+            if i.key_pressed(egui::Key::S) {
+                toggle_spec = true;
+            }
+            if i.key_pressed(egui::Key::C) {
+                toggle_compare = true;
+            }
+        });
+
+        // Player snapshot for the playback cursor. The cursor shows on exactly
+        // one row — the copy the user last started (`audio_active`) — because
+        // exact-duplicate copies share a content hash, so the hash alone can't
+        // say which row is playing.
+        let snap = self.player.snapshot();
+        let b_idx = state.compare.as_ref().map(|c| c.other.min(count - 1));
+        // Adopt an already-playing copy (e.g. started from a card) on open.
+        if state.audio_active.is_none()
+            && snap.loaded
+            && snap.hex.as_deref() == Some(a_hex.as_str())
+        {
+            state.audio_active = Some(idx);
+        }
+        let active = state.audio_active;
+        let cursor_at = |group_idx: usize, hex: &str| -> Option<f32> {
+            (active == Some(group_idx)
+                && snap.loaded
+                && snap.hex.as_deref() == Some(hex)
+                && snap.total_ms > 0)
+                .then(|| (snap.pos_ms as f32 / snap.total_ms as f32).clamp(0.0, 1.0))
+        };
+        let a_cursor = cursor_at(idx, &a_hex);
+        let b_cursor = b_file
+            .as_ref()
+            .zip(b_idx)
+            .and_then(|(f, bi)| cursor_at(bi, &params(f).0));
+
+        // Click on a waveform → play that copy from there. (row_is_b, fraction)
+        let mut click_play: Option<(bool, f32)> = None;
+
+        egui::Area::new(Id::new("audio-lightbox"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                let screen = ctx.content_rect();
+                // Absorb stray clicks so the cards behind stay inert.
+                let _sink = ui.allocate_rect(screen, egui::Sense::click());
+                ui.painter()
+                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(238));
+
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                let draw_row = |ui: &egui::Ui,
+                                rect: egui::Rect,
+                                viz: Option<&Arc<crate::waveform::AudioViz>>,
+                                tex: Option<&egui::TextureHandle>,
+                                color: egui::Color32,
+                                tag: &str,
+                                cursor: Option<f32>| {
+                    let p = ui.painter_at(rect);
+                    p.rect_filled(rect, 4.0, theme::PANEL);
+                    let ready = if spectrogram {
+                        if let Some(tex) = tex {
+                            p.image(tex.id(), rect, uv, egui::Color32::WHITE);
+                            true
+                        } else {
+                            false
+                        }
+                    } else if let Some(env) = viz.map(|v| &v.envelope).filter(|e| !e.is_empty()) {
+                        let n = env.len();
+                        let mid = rect.center().y;
+                        let bw = rect.width() / n as f32;
+                        for (i, &amp) in env.iter().enumerate() {
+                            let h = amp * rect.height() * 0.46;
+                            let x = rect.left() + i as f32 * bw;
+                            p.rect_filled(
+                                egui::Rect::from_min_max(
+                                    egui::pos2(x, mid - h),
+                                    egui::pos2(x + bw.max(1.0), mid + h),
+                                ),
+                                0.0,
+                                color,
+                            );
+                        }
+                        true
+                    } else {
+                        false
+                    };
+                    if !ready {
+                        p.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "analyzing…",
+                            egui::FontId::proportional(16.0),
+                            theme::TAN,
+                        );
+                    }
+                    if let Some(f) = cursor {
+                        let x = rect.left() + f * rect.width();
+                        p.line_segment(
+                            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                            egui::Stroke::new(1.5, theme::AMBER),
+                        );
+                    }
+                    p.text(
+                        rect.min + egui::vec2(6.0, 4.0),
+                        egui::Align2::LEFT_TOP,
+                        tag,
+                        egui::FontId::proportional(16.0),
+                        theme::AMBER,
+                    );
+                };
+
+                // View area (between the top bar and the bottom strip).
+                let area = egui::Rect::from_min_max(
+                    egui::pos2(screen.min.x + 12.0, screen.min.y + 52.0),
+                    egui::pos2(screen.max.x - 12.0, screen.max.y - 64.0),
+                );
+                let frac_at = |rect: egui::Rect, resp: &egui::Response| {
+                    resp.interact_pointer_pos()
+                        .map(|p| ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0))
+                };
+                if comparing && flicker {
+                    // Overlay: show A or B full-area; space swaps between them.
+                    let show_b = state.compare.as_ref().is_some_and(|c| c.show_b);
+                    let ra = ui.allocate_rect(area, egui::Sense::click());
+                    if show_b {
+                        draw_row(ui, area, b_viz.as_ref(), b_tex.as_ref(), theme::TAN, "B", b_cursor);
+                    } else {
+                        draw_row(ui, area, a_viz.as_ref(), a_tex.as_ref(), theme::BLUE, "A", a_cursor);
+                    }
+                    if ra.clicked()
+                        && let Some(f) = frac_at(area, &ra)
+                    {
+                        click_play = Some((show_b, f));
+                    }
+                } else if comparing {
+                    let gap = 12.0;
+                    let half = (area.height() - gap) / 2.0;
+                    let top = egui::Rect::from_min_size(area.min, egui::vec2(area.width(), half));
+                    let bot = egui::Rect::from_min_size(
+                        egui::pos2(area.min.x, area.min.y + half + gap),
+                        egui::vec2(area.width(), half),
+                    );
+                    let ra = ui.allocate_rect(top, egui::Sense::click());
+                    draw_row(ui, top, a_viz.as_ref(), a_tex.as_ref(), theme::BLUE, "A", a_cursor);
+                    if ra.clicked()
+                        && let Some(f) = frac_at(top, &ra)
+                    {
+                        click_play = Some((false, f));
+                    }
+                    let rb = ui.allocate_rect(bot, egui::Sense::click());
+                    draw_row(ui, bot, b_viz.as_ref(), b_tex.as_ref(), theme::TAN, "B", b_cursor);
+                    if rb.clicked()
+                        && let Some(f) = frac_at(bot, &rb)
+                    {
+                        click_play = Some((true, f));
+                    }
+                } else {
+                    let ra = ui.allocate_rect(area, egui::Sense::click());
+                    draw_row(ui, area, a_viz.as_ref(), a_tex.as_ref(), theme::BLUE, "A", a_cursor);
+                    if ra.clicked()
+                        && let Some(f) = frac_at(area, &ra)
+                    {
+                        click_play = Some((false, f));
+                    }
+                }
+
+                // Top control bar.
+                let top_bar = egui::Rect::from_min_max(
+                    egui::pos2(screen.min.x + 8.0, screen.min.y + 6.0),
+                    egui::pos2(screen.max.x - 8.0, screen.min.y + 40.0),
+                );
+                let playing = a_cursor.is_some() && snap.playing;
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(top_bar)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    |ui| {
+                        let pill = |ui: &mut egui::Ui,
+                                    text: &str,
+                                    fill: egui::Color32,
+                                    col: egui::Color32,
+                                    short: &str,
+                                    verbose: &str| {
+                            ui.add(egui::Button::new(RichText::new(text).color(col)).fill(fill))
+                                .explain(verbosity, short, verbose)
+                                .clicked()
+                        };
+                        if pill(
+                            ui,
+                            &format!("{} CLOSE", icon::CHECK),
+                            theme::AMBER,
+                            theme::BLACK,
+                            "Close the audio lightbox",
+                            "Close and return to the group list (Esc steps back one level).",
+                        ) {
+                            close = true;
+                        }
+                        if pill(
+                            ui,
+                            icon::CARET_LEFT,
+                            theme::PANEL,
+                            theme::TEXT,
+                            "Previous copy",
+                            "Switch to the previous copy, keeping the playback offset (← does \
+                             the same).",
+                        ) {
+                            new_idx = (idx + count - 1) % count;
+                        }
+                        ui.label(
+                            RichText::new(format!("{} / {count}", idx + 1))
+                                .color(theme::TAN)
+                                .strong(),
+                        );
+                        if pill(
+                            ui,
+                            icon::CARET_RIGHT,
+                            theme::PANEL,
+                            theme::TEXT,
+                            "Next copy",
+                            "Switch to the next copy, keeping the playback offset (→ does the \
+                             same).",
+                        ) {
+                            new_idx = (idx + 1) % count;
+                        }
+                        let (pl, pf, pc) = if playing {
+                            ("PAUSE", theme::AMBER, theme::BLACK)
+                        } else {
+                            ("PLAY", theme::PANEL, theme::TEXT)
+                        };
+                        if pill(
+                            ui,
+                            pl,
+                            pf,
+                            pc,
+                            "Play/pause",
+                            "Play or pause the current copy (P does the same).",
+                        ) {
+                            toggle_play = true;
+                        }
+                        // Waveform ↔ spectrogram view toggle.
+                        let (vl, vshort, vverbose) = if spectrogram {
+                            (
+                                "WAVEFORM",
+                                "Show the amplitude waveform",
+                                "Switch back to the amplitude waveform (S toggles).",
+                            )
+                        } else {
+                            (
+                                "SPECTROGRAM",
+                                "Show the spectrogram",
+                                "Switch to a frequency-vs-time spectrogram: brightness is loudness \
+                                 per frequency band — far more telling than the flat waveform for \
+                                 loud music (S toggles).",
+                            )
+                        };
+                        if pill(ui, vl, theme::PANEL, theme::LILAC, vshort, vverbose) {
+                            toggle_spec = true;
+                        }
+                        if count >= 2 {
+                            let (cl, cshort, cverbose) = if comparing {
+                                (
+                                    "EXIT COMPARE",
+                                    "Back to a single copy",
+                                    "Hide the B view and show only the current copy.",
+                                )
+                            } else {
+                                (
+                                    "COMPARE",
+                                    "Compare against another copy",
+                                    "Stack a second copy below this one so differences are \
+                                     visible; click either to hear that spot.",
+                                )
+                            };
+                            if pill(ui, cl, theme::PANEL, theme::BLUE, cshort, cverbose) {
+                                toggle_compare = true;
+                            }
+                            if comparing {
+                                let (ml, mshort, mverbose) = if flicker {
+                                    (
+                                        "SIDE BY SIDE",
+                                        "Stack A and B",
+                                        "Show A and B stacked instead of overlaid.",
+                                    )
+                                } else {
+                                    (
+                                        "FLICKER",
+                                        "Overlay & flicker",
+                                        "Overlay A and B in one pane; space enters flicker and \
+                                         then swaps between them — flick A↔B to spot differences.",
+                                    )
+                                };
+                                if pill(ui, ml, theme::PANEL, theme::TEXT, mshort, mverbose) {
+                                    toggle_flicker = true;
+                                }
+                                if flicker
+                                    && pill(
+                                        ui,
+                                        "SWAP",
+                                        theme::PANEL,
+                                        theme::TEXT,
+                                        "Swap A/B",
+                                        "Swap which copy is shown in flicker (space does the same).",
+                                    )
+                                {
+                                    swap = true;
+                                }
+                            }
+                        }
+                    },
+                );
+
+                // Bottom metadata + hint strip.
+                let bottom = egui::Rect::from_min_max(
+                    egui::pos2(screen.min.x + 12.0, screen.max.y - 58.0),
+                    egui::pos2(screen.max.x - 12.0, screen.max.y - 6.0),
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(bottom)
+                        .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                    |ui| {
+                        let meta = |ui: &mut egui::Ui, tag: &str, f: &DupeFile| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{tag}  {}  ·  {}  ·  {}",
+                                    f.rel_path,
+                                    format_size(f.entry.size),
+                                    fmt_ms(
+                                        f.entry
+                                            .audio
+                                            .as_ref()
+                                            .map_or(0, |a| u64::from(a.duration_ms))
+                                    ),
+                                ))
+                                .color(theme::TEXT)
+                                .size(12.0),
+                            );
+                        };
+                        meta(ui, "A", &a);
+                        if let Some(bf) = &b_file {
+                            meta(ui, "B", bf);
+                        }
+                        let view = if spectrogram { "waveform" } else { "spectrogram" };
+                        let hint = if flicker {
+                            format!(
+                                "space: swap A/B · P play · {}/{} copy · S {view} · Esc back",
+                                icon::CARET_LEFT,
+                                icon::CARET_RIGHT,
+                            )
+                        } else if comparing {
+                            format!(
+                                "space: flicker · P play · click to play · {}/{} copy · S {view} · \
+                                 C exit · Esc back",
+                                icon::CARET_LEFT,
+                                icon::CARET_RIGHT,
+                            )
+                        } else {
+                            format!(
+                                "P play/pause · click to play · {}/{} switch copy (keeps offset) · \
+                                 C compare · S {view} · Esc back",
+                                icon::CARET_LEFT,
+                                icon::CARET_RIGHT,
+                            )
+                        };
+                        ui.label(
+                            RichText::new(hint)
+                            .color(theme::LILAC)
+                            .size(11.0),
+                        );
+                    },
+                );
+            });
+
+        // Apply deferred actions now that drawing is done. Esc and space mirror
+        // the image lightbox: Esc steps back one level (flicker → side-by-side →
+        // single → closed); space enters flicker from side-by-side, then swaps.
+        if esc {
+            match state.compare.as_ref() {
+                Some(c) if c.flicker => toggle_flicker = true,
+                Some(_) => toggle_compare = true,
+                None => close = true,
+            }
+        }
+        if space {
+            match state.compare.as_ref() {
+                Some(c) if c.flicker => swap = true,
+                Some(_) => toggle_flicker = true,
+                None => {}
+            }
+        }
+        if close {
+            self.player.stop();
+            self.spec_tex.clear();
+            return; // dropped state = closed
+        }
+        if toggle_spec {
+            state.spectrogram = !state.spectrogram;
+        }
+
+        let snap = self.player.snapshot();
+        let cur_ms = snap.pos_ms;
+        // Whether the player already holds exactly this (A, B) pair — if so, a
+        // flicker swap is just an instant, gap-free volume flip.
+        let paired_ab = comparing
+            && snap.paired
+            && snap.hex_a.as_deref() == Some(a_hex.as_str())
+            && snap.hex_b.as_deref() == b_hex.as_deref();
+
+        // Start (or re-target) playback at `offset`, making the chosen copy
+        // audible. In compare mode both copies load into a synced pair so
+        // flicker swaps are gap-free; otherwise a single file plays.
+        let start_play = |me: &DupesView, want_b: bool, offset: u64| {
+            if let (true, Some(bf)) = (comparing, b_file.as_ref()) {
+                let (bh, bp, _bt) = params(bf);
+                me.player
+                    .play_pair(&a_hex, &a_path, &bh, &bp, _a_total, offset, want_b);
+            } else {
+                me.player.play(&a_hex, &a_path, _a_total, offset);
+            }
+        };
+
+        // ←/→ : switch which copy is A, keeping the offset (single playback).
+        if new_idx != idx {
+            idx = new_idx;
+            state.index = idx;
+            if snap.loaded {
+                let (h, p, t) = params(&group[idx]);
+                self.player.play(&h, &p, t, cur_ms.min(t));
+                state.audio_active = Some(idx);
+            }
+        }
+        if toggle_compare {
+            if state.compare.is_some() {
+                state.compare = None;
+            } else if count >= 2 {
+                let other = if idx == 0 { 1 } else { 0 };
+                state.compare = Some(CompareState::new(other));
+            }
+        }
+        if toggle_flicker && let Some(c) = state.compare.as_mut() {
+            c.flicker = !c.flicker;
+            // Entering flicker: show the copy that is currently audible.
+            if c.flicker {
+                c.show_b = state.audio_active.is_some() && state.audio_active == b_idx;
+            }
+        }
+        // Entering flicker while a copy plays: load the synced pair now, so even
+        // the first swap is gap-free.
+        if toggle_flicker
+            && state.compare.as_ref().is_some_and(|c| c.flicker)
+            && snap.loaded
+            && !paired_ab
+        {
+            start_play(self, state.audio_active == b_idx, cur_ms);
+        }
+        // space in flicker → swap the shown copy AND the audio, gap-free when the
+        // pair is loaded (else load it), moving the cursor with it.
+        if swap
+            && let Some(c) = state.compare.as_mut()
+            && c.flicker
+        {
+            c.show_b = !c.show_b;
+        }
+        if swap && state.compare.as_ref().is_some_and(|c| c.flicker) && snap.loaded {
+            let show_b = state.compare.as_ref().is_some_and(|c| c.show_b);
+            if paired_ab {
+                self.player.flip();
+            } else {
+                start_play(self, show_b, cur_ms);
+            }
+            state.audio_active = if show_b { b_idx } else { Some(idx) };
+        }
+        if toggle_play {
+            if snap.loaded {
+                self.player.toggle_pause();
+            } else {
+                start_play(self, false, cur_ms.min(_a_total));
+                state.audio_active = Some(idx);
+            }
+        }
+        if let Some((is_b, frac)) = click_play {
+            let want_b = is_b && comparing;
+            let offset = (f64::from(frac) * _a_total as f64) as u64;
+            start_play(self, want_b, offset);
+            state.audio_active = if want_b { b_idx } else { Some(idx) };
+            if let Some(c) = state.compare.as_mut()
+                && c.flicker
+            {
+                c.show_b = want_b;
+            }
+        }
+
+        self.lightbox = Some(state);
+        // Keep repainting while a copy plays so the cursor advances smoothly.
+        if self.player.is_active() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
     fn confirm_modal(&mut self, ui: &mut egui::Ui, prompt: &str, verb: &str, acts: &mut Vec<Act>) {
         egui::Modal::new(Id::new("dupes-confirm")).show(&ui.ctx().clone(), |ui| {
             ui.set_width(360.0);
@@ -2144,7 +2814,11 @@ impl DupesView {
                 if snap.loaded && snap.hex.as_deref() == Some(hex.as_str()) {
                     self.player.toggle_pause();
                 } else {
-                    self.player.play(&hex, &path, total_ms);
+                    // Switching between a group's copies keeps the current
+                    // offset, so you hear the same moment in each — the openings
+                    // are byte-identical, so any difference is later in the track.
+                    let start_ms = if snap.loaded { snap.pos_ms } else { 0 };
+                    self.player.play(&hex, &path, total_ms, start_ms);
                 }
             }
             Act::SeekAudio(f) => self.player.seek_fraction(f),
@@ -3150,6 +3824,207 @@ mod ui_tests {
         );
     }
 
+    /// Switching to another copy in a group keeps the playback offset, so you
+    /// hear the same moment in each. Clicking the currently-playing file instead
+    /// toggles pause (offset untouched).
+    #[test]
+    fn switching_audio_copies_keeps_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let ctx = egui::Context::default();
+        let mut view = DupesView::new();
+
+        let f0 = audio_file(0);
+        let f1 = audio_file(1);
+        let hex0 = hash_hex(&f0.entry.hash);
+        let hex1 = hash_hex(&f1.entry.hash);
+        let total = f0.entry.audio.as_ref().unwrap().duration_ms as u64;
+
+        // Start copy 0 from the beginning, then seek into the middle.
+        view.apply(
+            &ctx,
+            &store,
+            Act::PlayAudio(hex0, f0.absolute_path(), total),
+        );
+        view.apply(&ctx, &store, Act::SeekAudio(0.5));
+        let mid = view.player.snapshot().pos_ms;
+        assert!(mid > 0, "seeking advanced the position");
+
+        // Switch to copy 1 → the offset carries over.
+        view.apply(
+            &ctx,
+            &store,
+            Act::PlayAudio(hex1.clone(), f1.absolute_path(), total),
+        );
+        let snap = view.player.snapshot();
+        assert_eq!(
+            snap.hex.as_deref(),
+            Some(hex1.as_str()),
+            "switched to the other copy"
+        );
+        assert_eq!(
+            snap.pos_ms, mid,
+            "playback offset carried over to the new copy"
+        );
+    }
+
+    /// Clicking an audio card opens the dedicated audio lightbox (not the image
+    /// viewer); `P` plays, `S` toggles the spectrogram, `C` compares, `space`
+    /// drives flicker (enter then swap), and `Esc` steps back one level at a time.
+    #[test]
+    fn audio_lightbox_opens_compares_plays_and_escapes() {
+        let group: DupeGroup = (0..2).map(audio_file).collect();
+        let a_hex = hash_hex(&group[0].entry.hash);
+        let b_hex = hash_hex(&group[1].entry.hash);
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.run();
+
+        // The audio lightbox shows its own controls (CLOSE + COMPARE are unique
+        // to it; the image viewer's FIT/1:1 must be absent). PLAY is ambiguous
+        // because the card behind the overlay also has one, so it isn't queried.
+        assert!(
+            harness
+                .query_by_label(&format!("{} CLOSE", icon::CHECK))
+                .is_some(),
+            "audio lightbox shows a CLOSE control"
+        );
+        assert!(
+            harness.query_by_label("COMPARE").is_some(),
+            "audio lightbox offers A/B compare"
+        );
+        assert!(
+            harness.query_by_label("FIT").is_none(),
+            "audio lightbox is not the image viewer"
+        );
+
+        // P plays the current copy (A). Playback keeps repainting, so step a
+        // fixed number of frames rather than running to a settled state.
+        harness.key_press(egui::Key::P);
+        harness.step();
+        harness.step();
+        assert_eq!(
+            harness.state().player.snapshot().hex.as_deref(),
+            Some(a_hex.as_str()),
+            "P plays the current copy"
+        );
+
+        // S toggles the spectrogram view.
+        harness.key_press(egui::Key::S);
+        harness.step();
+        harness.step();
+        assert!(
+            harness.state().lightbox.as_ref().unwrap().spectrogram,
+            "S switches to the spectrogram view"
+        );
+
+        // C enters compare; space then enters flicker and swaps A/B — mirroring
+        // the image lightbox.
+        harness.key_press(egui::Key::C);
+        harness.step();
+        harness.step();
+        assert!(
+            harness.state().lightbox.as_ref().unwrap().compare.is_some(),
+            "C enters compare"
+        );
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        harness.step();
+        assert!(
+            harness
+                .state()
+                .lightbox
+                .as_ref()
+                .unwrap()
+                .compare
+                .as_ref()
+                .is_some_and(|c| c.flicker && !c.show_b),
+            "space enters flicker showing A"
+        );
+        // Entering flicker while playing loads the synced A/B pair, still audible A.
+        let snap = harness.state().player.snapshot();
+        assert!(
+            snap.paired,
+            "flicker loads the A/B pair for gap-free swapping"
+        );
+        assert_eq!(
+            snap.hex.as_deref(),
+            Some(a_hex.as_str()),
+            "A is audible first"
+        );
+
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        harness.step();
+        assert!(
+            harness
+                .state()
+                .lightbox
+                .as_ref()
+                .unwrap()
+                .compare
+                .as_ref()
+                .is_some_and(|c| c.flicker && c.show_b),
+            "space swaps A/B within flicker"
+        );
+        // The swap flips the audio too (gap-free): B is now the audible channel.
+        assert_eq!(
+            harness.state().player.snapshot().hex.as_deref(),
+            Some(b_hex.as_str()),
+            "flicker swap makes B audible"
+        );
+
+        // Esc steps back: flicker → side-by-side → single → closed.
+        for expect in ["flicker-off", "compare-off", "closed"] {
+            harness.key_press(egui::Key::Escape);
+            harness.step();
+            harness.step();
+            match expect {
+                "flicker-off" => assert!(
+                    harness
+                        .state()
+                        .lightbox
+                        .as_ref()
+                        .unwrap()
+                        .compare
+                        .as_ref()
+                        .is_some_and(|c| !c.flicker),
+                    "Esc leaves flicker back to side-by-side"
+                ),
+                "compare-off" => assert!(
+                    harness.state().lightbox.as_ref().unwrap().compare.is_none(),
+                    "Esc leaves compare back to the single view"
+                ),
+                _ => assert!(
+                    harness.state().lightbox.is_none(),
+                    "Esc from the single view closes the lightbox"
+                ),
+            }
+        }
+    }
+
     /// `C` enters A/B compare, which exposes MARK B and a FLICKER toggle, marks
     /// the B candidate, and exits back to single view.
     #[test]
@@ -3622,6 +4497,107 @@ mod ui_tests {
         let img = harness.render().expect("wgpu render failed");
         let out =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/dupes_audio.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Renders the audio lightbox (two copies' waveforms, A/B compare) to
+    /// `target/dupes_audio_lightbox.png` for manual inspection. `--ignored`.
+    #[test]
+    #[ignore = "renders a PNG for manual inspection"]
+    fn render_audio_lightbox() {
+        use std::f32::consts::PI;
+        let tmp = tempfile::tempdir().unwrap();
+        // Two real WAVs with opposite frequency sweeps (chirps) → the
+        // spectrograms show diagonals running in opposite directions.
+        let wav = |i: usize, up: bool| -> DupeFile {
+            // Long enough (~45 s) that the STFT column-fold runs several times.
+            let (sr, secs) = (16000u32, 45usize);
+            let n = sr as usize * secs;
+            let (f0, f1) = if up {
+                (200.0f32, 1200.0)
+            } else {
+                (1200.0f32, 200.0)
+            };
+            let tt = secs as f32;
+            let samples: Vec<i16> = (0..n)
+                .map(|k| {
+                    let t = k as f32 / sr as f32;
+                    // Swept fundamental + two harmonics + a DC offset — enough
+                    // structure and DC to exercise the dB/DC-drop spectrogram fix.
+                    let phase = f0 * t + (f1 - f0) * t * t / (2.0 * tt);
+                    let s = (2.0 * PI * phase).sin()
+                        + 0.5 * (2.0 * PI * 2.0 * phase).sin()
+                        + 0.3 * (2.0 * PI * 3.0 * phase).sin();
+                    ((s * 0.3 + 0.2) * 24_000.0) as i16
+                })
+                .collect();
+            let rel = format!("track{i}.wav");
+            crate::waveform::write_wav(&tmp.path().join(&rel), sr, &samples);
+            let mut hash = [0u8; 32];
+            hash[0] = 0xB0 | i as u8;
+            DupeFile {
+                repo: "r".into(),
+                repo_root: tmp.path().to_string_lossy().into_owned(),
+                rel_path: rel,
+                entry: dedup_core::store::FileEntry {
+                    size: (n * 2) as u64,
+                    hash,
+                    modified_ms: 0,
+                    missing: false,
+                    mime: Some("audio/x-wav".into()),
+                    img_fingerprint: None,
+                    video_hash: None,
+                    pdf_hash: None,
+                    audio: Some(dedup_core::store::AudioFp {
+                        duration_ms: (secs as u32) * 1000,
+                        chunk_hashes: vec![hash],
+                    }),
+                    img_size: None,
+                    origin: None,
+                    exif: None,
+                },
+            }
+        };
+        let group: DupeGroup = vec![wav(0, true), wav(1, false)];
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 640.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.step();
+        {
+            let lb = harness.state_mut().lightbox.as_mut().unwrap();
+            lb.compare = Some(CompareState::new(1));
+            lb.spectrogram = true;
+        }
+        // Give the background workers time to decode both WAVs into spectrograms.
+        for _ in 0..60 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            harness.step();
+        }
+        let img = harness.render().expect("wgpu render failed");
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/dupes_audio_lightbox.png");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }

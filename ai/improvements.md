@@ -32,20 +32,7 @@ layers, and cross-cutting debt.
   (pattern: `store.rs::v1_entries_decode_and_flag_images_stale`).
 
 
-## Phase 5 — Transfer, Grooming & smarter ETA  *(current branch: `feature/summer/transfer_and_grooming`)*
-
-This wave splits the old **Files** tab into two purpose-built sections and fixes the
-progress ETA. Scope confirmed 2026-07-13: Transfer + Grooming + ETA are near-term; the
-Browse/forensic layer is Phase 6 and recognition/extensibility is Phase 7.
-
-### 5.0 Tab restructure  — ✅ done
-
-### 5.1 Transfer section  — ✅ done
-
-### 5.2 Grooming section  — ✅ done
-
-### 5.3 Smarter ETA  — ✅ done
-
+## Phase 5 — Transfer, Grooming & smarter ETA  - done
 ---
 
 ## Phase 6 — Preview & Lightbox polish  *(near-term)*
@@ -96,16 +83,53 @@ land with the audio lightbox (6.3).
   non-interactive for now — the existing PLAY controls handle playback). No audio lightbox
   exists yet, so wiring the click to the image lightbox would just show "decoding…" forever.
 
-### 6.3 Audio lightbox & audible comparison
+### 6.3 Audio lightbox & audible comparison — ✅ done (2026-07-14, scope "both")
 
-- Give audio a lightbox that renders the fingerprint as an **audio graph** (waveform-style)
-  so differences between similar files are *visible* side-by-side — reuse the A/B compare and
-  flicker affordances where they map cleanly.
-- While in the lightbox, let the user switch between the group's audio copies **without
-  stopping playback**, preserving the playback offset, so differences are *audible*.
-- *(Flagged "maybe" by the user — confirm before building:)* carry the same "keep offset when
-  switching files" behaviour into the normal card view (`player` is a single global player,
-  so this is a small extension of existing state).
+- **Real decoded waveforms, not the fingerprint.** The fingerprint glyph is identical for
+  every copy in a group (grouped on exact hash), so it can't show diffs — confirmed with the
+  user, who chose the full build. A new `waveform.rs` decodes each file to a normalized
+  amplitude envelope on a background pool (mirrors `FullResCache`), cached by content hash.
+  Extraction **streams** with a peak-fold that halves resolution when it fills, so it needs
+  no length estimate (the decoder's reported duration proved unreliable — a 2 s clip reported
+  6.3 s) and stays O(buckets) memory in one pass.
+- **Audio lightbox** (`audio_lightbox` in `dupes_view.rs`): clicking an audio tile opens a
+  full-window view with each copy stacked for A/B compare, a playback cursor, and a transport
+  bar. `P` play/pause, `←`/`→` switch copy, click to play that copy from that spot, `C`
+  compare, `Esc` steps back a level. Reuses `LightboxState`/`CompareState`.
+- **Spectrogram view + real flicker** (follow-up on user feedback): the amplitude waveform is
+  a flat block for loud/compressed music, so `S` toggles a **spectrogram** (frequency×time,
+  brightness = per-band loudness) built from a dependency-free radix-2 FFT/STFT in the same
+  streaming pass (`waveform.rs::AudioViz`; magma colormap; GPU texture cached by hash). And
+  `space` now drives **flicker exactly like the image lightbox** — enters flicker from
+  side-by-side, then swaps A/B — so you can flick A↔B (spectrogram or waveform) to spot
+  differences. (Play/pause moved off `space` to `P` to free it for flicker, per the user.)
+- **Spectrogram fix** (bug the user caught — "bright left edge, rest black; goes black after
+  1 min of a 6 min song"): the real culprit was the **column fold losing its time axis**. The
+  STFT halves resolution when the column buffer fills, but — unlike the envelope — it wasn't
+  increasing frames-per-column, so old columns pooled a max over ever-more frames (bright)
+  while newer ones covered a handful (black), collapsing the whole song into the first few
+  columns. Fixed with a `col_step` that doubles on each fold (mirrors the envelope), so
+  columns keep a uniform time span. My first pass only changed the intensity scale (dB with a
+  70 dB floor + DC-bin drop) — a real contrast improvement, but *not* the bug; the short (3 s)
+  render test never folded, so it hid the defect. New unit test decodes a long tone and
+  asserts its bin is lit at x=0, mid, **and the last column**.
+- **Gap-free flicker audio swap** (bug the user caught): swapping in flicker changed only the
+  picture, not the sound. `player.rs` now has a **paired mode** — two sinks play the same
+  offset in sync, one muted; entering flicker loads the pair and a swap is an instant volume
+  **flip** (no reload, no gap), with the playback cursor following to the audible copy.
+- **One cursor, not two** (bug fix): the cursor keyed off content hash, so exact-duplicate
+  copies (shared hash) both lit up. Now tracked by row via `LightboxState.audio_active`.
+- **Keep-offset switching, both places** (the flagged "maybe" — user said yes): switching
+  copies (in the lightbox *and* the card grid) keeps the current playback offset. Threaded
+  `start_ms` through `Player::play` (seek-on-start).
+- **Honest note:** within a group the opening bytes are identical, so views line up early and
+  real differences show later (or in a slightly different length).
+- **Deferred:** the *small pause* the user flagged is now gone for the flicker A/B swap (the
+  key case). Switching the *A* copy with `←`/`→` (or clicking a different copy) still reloads a
+  single sink, so that path keeps a small gap; extending the pair to those is a follow-up.
+- Tests: `waveform.rs` envelope+spectrogram unit tests (WAV generated in-test — no
+  audio-writer dep), `audio_lightbox_opens_compares_plays_and_escapes` (P/S/space-flicker/Esc),
+  `switching_audio_copies_keeps_offset`, and `--ignored` `render_audio_lightbox` (spectrogram).
 
 ### 6.4 Lightbox image editing (lossless)
 
