@@ -155,6 +155,43 @@ fn fmt_ms(ms: u64) -> String {
     }
 }
 
+/// Paint a deterministic "fingerprint" glyph for an audio file: a waveform whose
+/// bar heights and accent colour come from the audio chunk hash. Every bar is an
+/// independent hash byte (no forced mirror symmetry, which would make different
+/// files look alike to the eye). Identical content yields an identical glyph —
+/// BLAKE3's avalanche means it signals *identity*, not gradations of similarity.
+/// It replaces the generic broken-image placeholder so audio cards read as audio.
+fn paint_audio_glyph(painter: &egui::Painter, rect: egui::Rect, fp: &dedup_core::store::AudioFp) {
+    let seed = fp.chunk_hashes.first().copied().unwrap_or([0u8; 32]);
+    let palette = [
+        theme::AMBER,
+        theme::TAN,
+        theme::LILAC,
+        theme::BLUE,
+        theme::ORANGE,
+    ];
+    let accent = palette[seed[0] as usize % palette.len()];
+    let bars = 15usize;
+    let gap = 3.0;
+    let bar_w = ((rect.width() - gap * (bars as f32 - 1.0)) / bars as f32).max(1.0);
+    let mid_y = rect.center().y;
+    let max_amp = rect.height() * 0.45;
+    for i in 0..bars {
+        // Each bar is its own hash byte — no mirror — so distinct audio yields
+        // visibly distinct glyphs instead of similar symmetric ones.
+        let amp = (0.15 + (seed[i % seed.len()] as f32 / 255.0) * 0.85) * max_amp;
+        let x = rect.left() + i as f32 * (bar_w + gap);
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x, mid_y - amp),
+                egui::pos2(x + bar_w, mid_y + amp),
+            ),
+            1.0,
+            accent,
+        );
+    }
+}
+
 /// One-line `path · size · WxH · mtime` description used by the lightbox.
 fn lightbox_meta(file: &DupeFile) -> String {
     format!(
@@ -1262,6 +1299,7 @@ impl DupesView {
         let mime = file.entry.mime.as_deref();
         let is_image = mime.is_some_and(|m| m.starts_with("image/"));
         let is_video = mime.is_some_and(|m| m.starts_with("video/"));
+        let is_audio = mime.is_some_and(|m| m.starts_with("audio/"));
         if is_image || is_video {
             // Only fetch a texture for on-screen cards. The results list is not
             // virtualized, so a page can lay out far more thumbnails than the GPU
@@ -1312,6 +1350,32 @@ impl DupesView {
                 }
             }
         }
+        // Audio: a deterministic fingerprint glyph + duration, so cards read as
+        // audio instead of a broken image and identical content shows the same
+        // glyph. (Clicking it to open an audio lightbox arrives with 6.3.)
+        if is_audio && let Some(fp) = file.entry.audio.as_ref() {
+            egui::Frame::new()
+                .fill(theme::PANEL)
+                .stroke(egui::Stroke::new(1.0, theme::HAIRLINE))
+                .corner_radius(6)
+                .inner_margin(8.0)
+                .show(ui, |ui| {
+                    ui.set_width(160.0);
+                    ui.vertical_centered(|ui| {
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(144.0, 82.0), egui::Sense::hover());
+                        paint_audio_glyph(ui.painter(), rect, fp);
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(fmt_ms(fp.duration_ms as u64))
+                                .color(theme::TAN)
+                                .size(12.0),
+                        );
+                    });
+                });
+            return;
+        }
+
         // Placeholder for non-images or not-yet-ready thumbnails.
         let label = file.entry.mime.clone().unwrap_or_else(|| "file".into());
         egui::Frame::new()
@@ -3046,6 +3110,46 @@ mod ui_tests {
         assert!(snap.loaded, "player reports a loaded track");
     }
 
+    /// Audio cards render a fingerprint-glyph tile (with the duration) instead
+    /// of the generic broken-image placeholder, which used to show the raw mime
+    /// string in place of a thumbnail.
+    #[test]
+    fn audio_card_shows_fingerprint_tile_not_placeholder() {
+        let group: DupeGroup = (0..2).map(audio_file).collect();
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(900.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+
+        assert!(
+            harness.query_by_label("track0.mp3").is_some(),
+            "the audio card renders"
+        );
+        assert!(
+            harness.query_by_label("audio/mpeg").is_none(),
+            "the audio tile replaces the broken-image placeholder (which showed the raw mime)"
+        );
+    }
+
     /// `C` enters A/B compare, which exposes MARK B and a FLICKER toggle, marks
     /// the B candidate, and exits back to single view.
     #[test]
@@ -3464,6 +3568,60 @@ mod ui_tests {
         let img = harness.render().expect("wgpu render failed");
         let out =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/dupes_view.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Renders a group of audio cards (fingerprint-glyph tiles) to
+    /// `target/dupes_audio.png` for manual inspection. `--ignored`.
+    #[test]
+    #[ignore = "renders a PNG for manual inspection"]
+    fn render_audio_cards() {
+        let group: DupeGroup = (0..4u8)
+            .map(|i| {
+                let mut f = audio_file(i as usize);
+                // Jagged per-byte values (mimicking a real BLAKE3 hash) so the
+                // rendered glyphs look representative, not like smooth ramps.
+                let mut h = [0u8; 32];
+                for (j, b) in h.iter_mut().enumerate() {
+                    let v = (i as u32 + 1).wrapping_mul(2_654_435_761)
+                        ^ (j as u32).wrapping_mul(2_246_822_519);
+                    *b = (v >> ((j as u32 % 6) * 4 + 3)) as u8;
+                }
+                f.entry.audio = Some(dedup_core::store::AudioFp {
+                    duration_ms: 60_000 + i as u32 * 45_000,
+                    chunk_hashes: vec![h],
+                });
+                f
+            })
+            .collect();
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 700.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        let img = harness.render().expect("wgpu render failed");
+        let out =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/dupes_audio.png");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }

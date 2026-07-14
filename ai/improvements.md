@@ -78,15 +78,23 @@ persistent, discoverable hint bar *and* actual keyboard shortcuts to the Transfe
 and Duplicates-grid views, which have none today. Audio play/pause + next-audio shortcuts
 land with the audio lightbox (6.3).
 
-### 6.2 Audio preview tile
+### 6.2 Audio preview tile — ✅ done (2026-07-14)
 
-- **Bug:** audio files fall back to the generic broken-image thumbnail placeholder.
-- Card view: replace it with a meaningful audio tile — duration + basic metadata plus a
-  **deterministic fingerprint glyph** derived from `AudioFp.chunk_hashes` (identicon-style:
-  hash bits drive colour / mirror / line generators). Determinism means identical or similar
-  audio produces visibly similar glyphs. Fallback/simplest form: render the fingerprint as a
-  grayscale block.
-- Clicking the glyph opens the file in the audio lightbox (6.3).
+- **Fixed the "broken image" look:** audio cards used to fall back to the generic
+  placeholder (an image-square icon + the raw mime string). They now render a
+  **deterministic fingerprint glyph** — a waveform whose bar heights and accent colour come
+  from `AudioFp.chunk_hashes[0]` (each bar an independent hash byte, no mirror symmetry, so
+  distinct audio looks distinct) — with the duration centred below, bordered to match the
+  image thumbnails (`paint_audio_glyph` in `dupes_view.rs`).
+- **Honest scope correction:** the glyph signals *identity*, **not** similarity. The chunk
+  hash is BLAKE3 (full avalanche), and audio "similars" are grouped on **exact**
+  `chunk_hashes` equality (`similar.rs`), so within any displayed group every member's glyph
+  is identical by construction. Same content → same glyph; different content → different
+  glyph. It cannot show gradations of similarity (the earlier "similar audio → similar glyph"
+  claim was wrong).
+- **Deferred:** clicking the glyph to open an audio lightbox lands with 6.3 (the tile is
+  non-interactive for now — the existing PLAY controls handle playback). No audio lightbox
+  exists yet, so wiring the click to the image lightbox would just show "decoding…" forever.
 
 ### 6.3 Audio lightbox & audible comparison
 
