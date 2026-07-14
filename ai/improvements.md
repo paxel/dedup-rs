@@ -40,33 +40,7 @@ Browse/forensic layer is Phase 6 and recognition/extensibility is Phase 7.
 
 ### 5.1 Transfer section  — ✅ done
 
-### 5.2 Grooming section
-
-A **top command selector**; because these commands differ a lot, **each gets its own
-layout** (unlike Transfer's shared form).
-
-- **DELETE** — a **source** repo selector plus a **multi-repo** selector for the rest.
-  Deletes every source file whose content exists in *any* selected repo. Generalises
-  today's single-target-plus-extra-refs `diff_delete` to an arbitrary reference set.
-- **ORGANIZE** — rewrites the *relative paths* of files within one repo:
-  - A **path generator**: target paths built from **placeholders** (date Y/M/D, mime,
-    extension, size bucket, original name, …) with **alternatives** (fallbacks used when a
-    placeholder is empty).
-  - One or **multiple filter → path** rules.
-  - **Named, saved, reusable selections**: a whole organize config can be named, stored,
-    and re-applied to other repos or re-run later (for repeating or tweaking an
-    organisation).
-  - **Safety invariant: no file is ever lost or overwritten** — collisions must resolve to
-    a new name or refuse, never clobber.
-  - **Preview** (like copy/move) and **progress** on execution.
-  - Core: a new path-template engine, extending beyond today's
-    `organize.rs::export_by_date`. Persist presets alongside the GUI settings.
-- **Small tools**:
-  - **Delete empty directories**.
-  - **Delete everything matching a filter** (mime / size / name). The **NAME** filter
-    needs **wildcards** — today `FileFilter::Name` is a plain substring
-    (`filter.rs:127`); add prefix/suffix/glob matching so "ends with `.db`" or "starts
-    with `copy_of`" work.
+### 5.2 Grooming section  — ✅ done
 
 ### 5.3 Smarter ETA  — ✅ done
 

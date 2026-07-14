@@ -175,6 +175,48 @@ impl FilterHistory {
     }
 }
 
+/// Split a filter expression into wizard conditions, mirroring the way
+/// `filter_string` composes it: each `mime:`/`name:`/`size:` prefix at a
+/// whitespace boundary starts a new condition whose value runs to the next
+/// prefix. Text before the first prefix is ignored (the wizard only builds
+/// these three kinds).
+fn parse_conditions(expr: &str) -> Vec<FilterCond> {
+    const PREFIXES: [(&str, FilterKind); 3] = [
+        ("mime:", FilterKind::Mime),
+        ("name:", FilterKind::Name),
+        ("size:", FilterKind::Size),
+    ];
+    let bytes = expr.as_bytes();
+    let mut starts: Vec<(usize, FilterKind)> = Vec::new();
+    for i in 0..expr.len() {
+        if !expr.is_char_boundary(i) {
+            continue;
+        }
+        let at_boundary = i == 0 || bytes[i - 1].is_ascii_whitespace();
+        if at_boundary {
+            for (p, kind) in PREFIXES {
+                if expr[i..].starts_with(p) {
+                    starts.push((i, kind));
+                }
+            }
+        }
+    }
+    let mut conds = Vec::new();
+    for (idx, &(start, kind)) in starts.iter().enumerate() {
+        let end = starts.get(idx + 1).map(|(s, _)| *s).unwrap_or(expr.len());
+        // Every supported prefix is exactly "xxxx:" — five bytes.
+        let value = expr[start + 5..end].trim().to_string();
+        if !value.is_empty() {
+            conds.push(FilterCond {
+                kind,
+                value,
+                editing: false,
+            });
+        }
+    }
+    conds
+}
+
 /// Result of a background export/import file dialog, reported to the UI thread.
 enum HistoryIo {
     Imported(FilterHistory),
@@ -269,6 +311,14 @@ impl FilterBuilder {
             error: None,
             verbosity: TooltipVerbosity::default(),
         }
+    }
+
+    /// Replace the active conditions with those parsed from a filter expression
+    /// (the `mime:`/`name:`/`size:` groups produced by [`Self::filter_string`]).
+    /// Used to restore a saved rule/preset into the wizard.
+    pub fn set_expression(&mut self, expr: &str) {
+        self.filters = parse_conditions(expr);
+        self.adding = false;
     }
 
     /// The composed filter expression, or `None` when there are no non-blank
