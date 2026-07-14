@@ -109,6 +109,34 @@ struct RepoSel {
     read_only: bool,
 }
 
+/// How long a press must be held (mouse or touch) to count as a long-press.
+const LONG_PRESS_SECS: f64 = 0.5;
+
+/// Whether `resp` was long-pressed: a touchscreen long-touch, or the primary
+/// mouse button held down on it for [`LONG_PRESS_SECS`]. Fires once per press
+/// (tracked in egui memory by the widget id) rather than every frame while held.
+fn long_pressed(ui: &egui::Ui, resp: &egui::Response) -> bool {
+    if resp.long_touched() {
+        return true;
+    }
+    if !resp.is_pointer_button_down_on() {
+        return false;
+    }
+    let (start, now) = ui.input(|i| (i.pointer.press_start_time(), i.time));
+    let Some(start) = start else {
+        return false;
+    };
+    // Keep re-evaluating while the button is held so the threshold is noticed.
+    ui.ctx().request_repaint();
+    // `insert_temp(id, start)` marks this specific press handled.
+    let already = ui.data(|d| d.get_temp::<f64>(resp.id)) == Some(start);
+    if now - start >= LONG_PRESS_SECS && !already {
+        ui.data_mut(|d| d.insert_temp(resp.id, start));
+        return true;
+    }
+    false
+}
+
 /// Unique key for a file across repos.
 type FileKey = (String, String);
 
@@ -1022,9 +1050,9 @@ impl DupesView {
                                 );
                             }
                             if ro {
-                                // Escape hatch for the occasional worse copy inside a
-                                // protected repo: unlock this one file via context menu
-                                // or long press — deliberately never a plain click.
+                                // A worse copy inside a protected repo can still be
+                                // unlocked one file at a time, via its context menu
+                                // or a long press (never a plain click).
                                 let resp = ui
                                     .add(
                                         egui::Label::new(
@@ -1037,12 +1065,12 @@ impl DupesView {
                                     .explain(
                                         self.verbosity,
                                         "Right-click or long-press to unlock this file",
-                                        "This file is protected by its repo's read-only lock \
-                                         and can't be marked for deletion. Right-click (or \
-                                         long-press) to unlock just this one file — a \
-                                         deliberately inconvenient escape hatch, never bulk-set.",
+                                        "This file is protected by its repo's read-only lock, \
+                                         so it can't be marked for deletion. Right-click or \
+                                         long-press to unlock just this one file. Running FIND \
+                                         again re-locks it.",
                                     );
-                                if resp.long_touched() {
+                                if long_pressed(ui, &resp) {
                                     acts.push(Act::Unlock(k.clone()));
                                 }
                                 resp.context_menu(|ui| {
