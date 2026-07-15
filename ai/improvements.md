@@ -133,25 +133,32 @@ land with the audio lightbox (6.3).
   audio-writer dep), `audio_lightbox_opens_compares_plays_and_escapes` (P/S/space-flicker/Esc),
   `switching_audio_copies_keeps_offset`, and `--ignored` `render_audio_lightbox` (spectrogram).
 
-### 6.4 Lightbox image editing (lossless)
+### 6.4 Lightbox image editing (lossless) — ✅ done (2026-07-15)
 
-- Add an **Edit** control in the image lightbox for lossless flip / rotate (90° steps +
-  mirror).
-- Offer an option to **overwrite** the original file with the transformed image, lossless
-  where the format allows (e.g. jpegtran-style transforms for JPEG); document per-format
-  limits. Gated by the 6.6 confirmation.
+- **Edit controls** in the single-image lightbox: `ROT L` / `ROT R` (90° steps), `FLIP H` /
+  `FLIP V`, plus `RESET` and `SAVE` once edited. A live preview shows the rotated/flipped
+  image (zoom/pan track the new dimensions); `imgedit.rs::apply_ops` composes the ops.
+- **JPEG decision (user):** re-encode at quality 95 — no new dependency. PNG/BMP/etc. stay
+  bit-exact lossless; JPEG loses a little (labeled in the save modal). True lossless JPEG
+  would need a C library (libjpeg-turbo); declined.
+- **Caveat (not yet handled):** overwriting a file changes its bytes, so its stored
+  content-hash/dimensions in the index go stale until a re-scan. Acceptable for now; a
+  re-index-on-edit hook is a follow-up.
 
 ### 6.5 Audio id3 tags
 
 - Display **id3** tags in the audio lightbox.
 - Optional inline editor to change tags and write them back to the file. Gated by 6.6.
 
-### 6.6 Safe in-place saves  *(cross-cutting for 6.4 & 6.5)*
+### 6.6 Safe in-place saves — ✅ done (2026-07-15) *(cross-cutting for 6.4 & 6.5)*
 
-- Every action that writes to a file from the lightbox (overwrite image, write id3) requires
-  an explicit confirmation ack — "you are about to change this file on disk."
-- Saving must **not** close the lightbox: the user stays in context to keep reviewing the
-  group.
+- **Save decision (user): offer both each time.** The save modal presents `OVERWRITE
+  ORIGINAL` (red) vs `SAVE A COPY` (writes a non-colliding `_rot` sibling — never loses data)
+  vs `CANCEL`, with the ack "Overwriting changes the file on disk and cannot be undone."
+- Overwrite is **atomic** (temp file + rename, so a failed encode can't truncate the
+  original); a copy never overwrites an existing file.
+- Saving keeps the lightbox open and the preview showing (verified by test). Wired for images
+  now; 6.5's id3 writes will reuse the same modal.
 
 ---
 

@@ -7,6 +7,7 @@ mod external;
 mod filter_ui;
 mod grooming_view;
 mod icon;
+mod imgedit;
 mod lightbox;
 mod player;
 mod settings;

@@ -3,6 +3,7 @@
 //! delete the worse copies — batched per repo, never without a confirmation.
 
 use crate::icon;
+use crate::imgedit::{self, Orient};
 use crate::lightbox::{CompareState, FullResCache, LightboxState};
 use crate::player::Player;
 use crate::settings::TooltipVerbosity;
@@ -20,7 +21,7 @@ use dedup_core::store::Store;
 use dedup_core::thumbnail::hash_hex;
 use egui::{Color32, Id, RichText};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const PAGE_SIZE: usize = 50;
@@ -30,6 +31,8 @@ const AUTO_BATCH: usize = 128;
 /// the grid the card preview samples from (frame `VIDEO_STRIP / 2`), so the
 /// card's still is reused by the filmstrip instead of extracted twice.
 const VIDEO_STRIP: usize = 10;
+/// Longest edge for the lightbox edit preview (matches the full-res decoder).
+const EDIT_MAX_EDGE: u32 = 8192;
 
 /// The current result set: exact duplicates are a lightweight *plan* of
 /// descriptors (members loaded a page at a time), while similar results are the
@@ -324,9 +327,24 @@ pub struct DupesView {
     /// GPU textures for spectrograms, keyed by content hash (built lazily from
     /// `waves`, cleared when the audio lightbox closes).
     spec_tex: HashMap<String, egui::TextureHandle>,
+    /// In-progress lossless rotate/flip of the lightbox's current image, if any.
+    edit: Option<EditState>,
+    /// The save-confirmation modal (overwrite vs copy) is open.
+    edit_save: bool,
     /// Tooltip wording for this frame, set at the top of [`Self::show`] from
     /// the app-wide setting (not persisted here; `app.rs` owns that).
     verbosity: TooltipVerbosity,
+}
+
+/// A pending rotate/flip edit of the lightbox's current image. The `base` pixels
+/// are decoded once; `tex`/`dims` are the live preview with `ops` applied.
+struct EditState {
+    hex: String,
+    path: PathBuf,
+    base: image::RgbaImage,
+    ops: Vec<Orient>,
+    tex: egui::TextureHandle,
+    dims: egui::Vec2,
 }
 
 impl DupesView {
@@ -361,6 +379,8 @@ impl DupesView {
             player: Player::new(),
             waves: WaveCache::new(2),
             spec_tex: HashMap::new(),
+            edit: None,
+            edit_save: false,
             verbosity: TooltipVerbosity::default(),
         }
     }
@@ -1472,6 +1492,41 @@ impl DupesView {
         (tex, img)
     }
 
+    /// Apply a rotate/flip `op` to the lightbox's current image, decoding the
+    /// base pixels on first use, and refresh the live preview texture.
+    fn edit_apply(&mut self, ctx: &egui::Context, hex: &str, path: &Path, op: Orient) {
+        if self.edit.as_ref().map(|e| e.hex.as_str()) != Some(hex) {
+            let Ok((w, h, rgba)) = dedup_core::thumbnail::load_full_rgba(path, EDIT_MAX_EDGE)
+            else {
+                return;
+            };
+            let Some(base) = image::RgbaImage::from_raw(w, h, rgba) else {
+                return;
+            };
+            let img =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], base.as_raw());
+            let tex = ctx.load_texture(format!("edit-{hex}"), img, egui::TextureOptions::LINEAR);
+            self.edit = Some(EditState {
+                hex: hex.to_string(),
+                path: path.to_path_buf(),
+                base,
+                ops: Vec::new(),
+                tex,
+                dims: egui::vec2(w as f32, h as f32),
+            });
+        }
+        if let Some(e) = self.edit.as_mut() {
+            e.ops.push(op);
+            let rgba = imgedit::apply_ops(image::DynamicImage::ImageRgba8(e.base.clone()), &e.ops)
+                .to_rgba8();
+            let (w, h) = rgba.dimensions();
+            let img =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+            e.tex = ctx.load_texture(format!("edit-{hex}"), img, egui::TextureOptions::LINEAR);
+            e.dims = egui::vec2(w as f32, h as f32);
+        }
+    }
+
     /// Full-window image lightbox: wheel zoom (around cursor), drag pan, `F`
     /// fit / `1` 1:1, `←`/`→` step the group, `Del`/`K` toggle the mark, `C`
     /// A/B compare against the best copy (`space` enters flicker, then swaps
@@ -1516,6 +1571,7 @@ impl DupesView {
         let (mut do_fit, mut do_one, mut do_mark) = (false, false, false);
         let (mut toggle_compare, mut toggle_flicker, mut swap) = (false, false, false);
         let (mut esc, mut space) = (false, false);
+        let (mut edit_op, mut reset_edit, mut open_save) = (None::<Orient>, false, false);
         ctx.input(|i| {
             if i.key_pressed(egui::Key::Escape) {
                 esc = true;
@@ -1562,6 +1618,8 @@ impl DupesView {
             }
         }
         if close {
+            self.edit = None;
+            self.edit_save = false;
             return; // dropped state = closed
         }
         if new_idx != idx {
@@ -1647,6 +1705,27 @@ impl DupesView {
             .mime
             .as_deref()
             .is_some_and(|m| m.starts_with("video/"));
+
+        // Rotate/flip editing applies only to a single, non-video image. Drop a
+        // stale edit (and any open save modal) when we navigate to another image.
+        let a_hex = hash_hex(&a.entry.hash);
+        let a_is_image = a
+            .entry
+            .mime
+            .as_deref()
+            .is_some_and(|m| m.starts_with("image/"));
+        if self.edit.as_ref().is_some_and(|e| e.hex != a_hex) {
+            self.edit = None;
+            self.edit_save = false;
+        }
+        let editing = a_is_image && !a_is_video && state.compare.is_none();
+        let edited = editing && self.edit.as_ref().is_some_and(|e| !e.ops.is_empty());
+        // The single-image view draws the live edit preview when there are edits.
+        let (draw_tex, draw_img) = match &self.edit {
+            Some(e) if edited && e.hex == a_hex => (Some(e.tex.clone()), e.dims),
+            _ => (a_tex.clone(), a_img),
+        };
+
         let vp_screen = ctx.content_rect();
         let vp = egui::Rect::from_min_max(
             egui::pos2(vp_screen.min.x + 8.0, vp_screen.min.y + 44.0),
@@ -1819,16 +1898,16 @@ impl DupesView {
                 } else {
                     // Single image: wheel zoom around cursor, drag pan.
                     if bg.dragged() {
-                        state.pan_by(bg.drag_delta(), viewport, a_img);
+                        state.pan_by(bg.drag_delta(), viewport, draw_img);
                     }
                     if scroll != 0.0
                         && let Some(c) = cursor
                         && viewport.contains(c)
                     {
-                        state.zoom_at(c, (scroll * 0.005).exp(), viewport, a_img);
+                        state.zoom_at(c, (scroll * 0.005).exp(), viewport, draw_img);
                     }
-                    let rect = state.image_rect(viewport, a_img);
-                    draw(ui, rect, viewport, &a_tex);
+                    let rect = state.image_rect(viewport, draw_img);
+                    draw(ui, rect, viewport, &draw_tex);
                 }
 
                 // Top control bar.
@@ -1941,6 +2020,72 @@ impl DupesView {
                                 )
                             {
                                 toggle_compare = true;
+                            }
+                            if editing {
+                                if pill(
+                                    ui,
+                                    "ROT L",
+                                    theme::PANEL,
+                                    theme::TEXT,
+                                    "Rotate counter-clockwise",
+                                    "Rotate 90° counter-clockwise. Lossless for PNG etc.; JPEG is \
+                                     re-encoded at high quality when you save.",
+                                ) {
+                                    edit_op = Some(Orient::RotateCcw);
+                                }
+                                if pill(
+                                    ui,
+                                    "ROT R",
+                                    theme::PANEL,
+                                    theme::TEXT,
+                                    "Rotate clockwise",
+                                    "Rotate the image 90° clockwise.",
+                                ) {
+                                    edit_op = Some(Orient::RotateCw);
+                                }
+                                if pill(
+                                    ui,
+                                    "FLIP H",
+                                    theme::PANEL,
+                                    theme::TEXT,
+                                    "Flip horizontally",
+                                    "Mirror the image left-to-right.",
+                                ) {
+                                    edit_op = Some(Orient::FlipH);
+                                }
+                                if pill(
+                                    ui,
+                                    "FLIP V",
+                                    theme::PANEL,
+                                    theme::TEXT,
+                                    "Flip vertically",
+                                    "Mirror the image top-to-bottom.",
+                                ) {
+                                    edit_op = Some(Orient::FlipV);
+                                }
+                                if edited {
+                                    if pill(
+                                        ui,
+                                        "RESET",
+                                        theme::PANEL,
+                                        theme::TAN,
+                                        "Discard edits",
+                                        "Discard the rotate/flip edits and show the original.",
+                                    ) {
+                                        reset_edit = true;
+                                    }
+                                    if pill(
+                                        ui,
+                                        &format!("{} SAVE", icon::CHECK),
+                                        theme::AMBER,
+                                        theme::BLACK,
+                                        "Save the rotated image",
+                                        "Write the rotated/flipped image to disk. You'll choose \
+                                         overwrite or a new copy, and confirm first.",
+                                    ) {
+                                        open_save = true;
+                                    }
+                                }
                             }
                         } else {
                             if pill(
@@ -2125,9 +2270,106 @@ impl DupesView {
             state.index = new_idx;
             state.reset_view();
         }
+        // Rotate/flip edits (deferred like the other controls).
+        if let Some(op) = edit_op {
+            self.edit_apply(ctx, &a_hex, &a.absolute_path(), op);
+        }
+        if reset_edit {
+            self.edit = None;
+        }
+        if open_save {
+            self.edit_save = true;
+        }
+
+        // Save-confirmation modal (Phase 6.6): overwrite in place or a `_rot`
+        // copy, both explicitly confirmed. Saving does not close the lightbox.
+        if self.edit_save {
+            let (mut do_overwrite, mut do_copy, mut cancel) = (false, false, false);
+            let is_jpeg = image::ImageFormat::from_path(a.absolute_path())
+                .is_ok_and(|f| f == image::ImageFormat::Jpeg);
+            egui::Modal::new(Id::new("edit-save")).show(&ctx.clone(), |ui| {
+                ui.set_width(400.0);
+                ui.label(
+                    RichText::new("SAVE ROTATED IMAGE")
+                        .color(theme::AMBER)
+                        .size(16.0)
+                        .strong(),
+                );
+                ui.add_space(6.0);
+                ui.label(RichText::new(&a.rel_path).color(theme::TEXT).size(12.0));
+                if is_jpeg {
+                    ui.label(
+                        RichText::new(
+                            "JPEG will be re-encoded at high quality — a small, unavoidable loss.",
+                        )
+                        .color(theme::TAN)
+                        .size(11.0),
+                    );
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("OVERWRITE ORIGINAL").color(theme::BLACK),
+                            )
+                            .fill(theme::RED),
+                        )
+                        .clicked()
+                    {
+                        do_overwrite = true;
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("SAVE A COPY").color(theme::BLACK))
+                                .fill(theme::BLUE),
+                        )
+                        .clicked()
+                    {
+                        do_copy = true;
+                    }
+                    if ui
+                        .button(RichText::new("CANCEL").color(theme::TEXT))
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Overwriting changes the file on disk and cannot be undone.")
+                        .color(theme::LILAC)
+                        .size(11.0),
+                );
+            });
+            if cancel {
+                self.edit_save = false;
+            } else if do_overwrite || do_copy {
+                let ops = self
+                    .edit
+                    .as_ref()
+                    .map(|e| e.ops.clone())
+                    .unwrap_or_default();
+                let path = self.edit.as_ref().map(|e| e.path.clone());
+                if let Some(path) = path {
+                    match imgedit::save_edited(&path, &ops, do_overwrite) {
+                        Ok(out) => {
+                            self.status = Some(format!("Saved {}", out.display()));
+                            self.error = None;
+                        }
+                        Err(e) => self.error = Some(format!("Save failed: {e}")),
+                    }
+                }
+                self.edit_save = false;
+                // Stay in the lightbox (6.6); keep the edit preview showing.
+            }
+        }
 
         if !close {
             self.lightbox = Some(state);
+        } else {
+            self.edit = None;
+            self.edit_save = false;
         }
 
         // Keep polling while video stills are still being extracted so the
@@ -4257,6 +4499,104 @@ mod ui_tests {
         );
     }
 
+    /// The image lightbox's Edit controls rotate the live preview and can save a
+    /// `_rot` copy, leaving the original untouched and the lightbox open (6.4/6.6).
+    #[test]
+    fn lightbox_edit_rotates_and_saves_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let img_path = tmp.path().join("shot.png");
+        image::RgbImage::from_fn(40, 20, |x, _| image::Rgb([x as u8, 0, 0]))
+            .save(&img_path)
+            .unwrap();
+
+        let mut hash = [0u8; 32];
+        hash[0] = 0x7E;
+        let file = DupeFile {
+            repo: "r".into(),
+            repo_root: tmp.path().to_string_lossy().into_owned(),
+            rel_path: "shot.png".into(),
+            entry: dedup_core::store::FileEntry {
+                size: 100,
+                hash,
+                modified_ms: 0,
+                missing: false,
+                mime: Some("image/png".into()),
+                img_fingerprint: None,
+                video_hash: None,
+                pdf_hash: None,
+                audio: None,
+                img_size: Some((40, 20)),
+                origin: None,
+                exif: None,
+            },
+        };
+        let group: DupeGroup = vec![file];
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.run();
+
+        // Rotate clockwise → the preview's dimensions swap (40×20 → 20×40).
+        harness.get_by_label("ROT R").click();
+        harness.run();
+        harness.run();
+        let dims = harness.state().edit.as_ref().map(|e| e.dims);
+        assert_eq!(
+            dims,
+            Some(egui::vec2(20.0, 40.0)),
+            "rotate swaps preview dims"
+        );
+
+        // SAVE opens the confirm modal (does not write yet).
+        harness
+            .get_by_label(&format!("{} SAVE", icon::CHECK))
+            .click();
+        harness.run();
+        harness.run();
+        assert!(harness.state().edit_save, "SAVE opens the confirm modal");
+
+        // Save a copy → a rotated sibling is written, the original untouched, and
+        // the lightbox stays open.
+        harness.get_by_label("SAVE A COPY").click();
+        harness.run();
+        let copy = tmp.path().join("shot_rot.png");
+        assert!(copy.exists(), "a rotated copy is written");
+        assert_eq!(
+            image::image_dimensions(&copy).unwrap(),
+            (20, 40),
+            "the copy is rotated"
+        );
+        assert_eq!(
+            image::image_dimensions(&img_path).unwrap(),
+            (40, 20),
+            "the original is left untouched"
+        );
+        assert!(!harness.state().edit_save, "the modal closes after saving");
+        assert!(
+            harness.state().lightbox.is_some(),
+            "saving keeps the lightbox open (6.6)"
+        );
+    }
+
     /// Re-locking removes the override and any pending mark, and turning a
     /// repo read-only clears its per-file unlocks.
     #[test]
@@ -4446,6 +4786,77 @@ mod ui_tests {
             });
         harness.run();
         harness.snapshot("dupes_view");
+    }
+
+    /// Renders the image lightbox mid-edit (rotated preview + Edit controls +
+    /// the save-confirm modal) to `target/dupes_edit.png`. `--ignored`.
+    #[test]
+    #[ignore = "renders a PNG for manual inspection"]
+    fn render_lightbox_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let img_path = tmp.path().join("shot.png");
+        // A directional gradient so a rotation is obvious.
+        image::RgbImage::from_fn(400, 240, |x, y| image::Rgb([(x / 2) as u8, (y) as u8, 90]))
+            .save(&img_path)
+            .unwrap();
+        let mut hash = [0u8; 32];
+        hash[0] = 0x7E;
+        let file = DupeFile {
+            repo: "r".into(),
+            repo_root: tmp.path().to_string_lossy().into_owned(),
+            rel_path: "shot.png".into(),
+            entry: dedup_core::store::FileEntry {
+                size: 100,
+                hash,
+                modified_ms: 0,
+                missing: false,
+                mime: Some("image/png".into()),
+                img_fingerprint: None,
+                video_hash: None,
+                pdf_hash: None,
+                audio: None,
+                img_size: Some((400, 240)),
+                origin: None,
+                exif: None,
+            },
+        };
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![vec![file]]));
+
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 700.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.run();
+        harness.get_by_label("ROT R").click();
+        harness.run();
+        harness.run();
+        harness
+            .get_by_label(&format!("{} SAVE", icon::CHECK))
+            .click();
+        harness.run();
+        harness.run();
+        let img = harness.render().expect("wgpu render failed");
+        let out =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/dupes_edit.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 
     /// Not run by default: renders the view to `target/dupes_view.png` for a
