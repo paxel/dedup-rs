@@ -2800,7 +2800,10 @@ impl DupesView {
                     egui::pos2(screen.min.x + 8.0, screen.min.y + 6.0),
                     egui::pos2(screen.max.x - 8.0, screen.min.y + 40.0),
                 );
-                let playing = a_cursor.is_some() && snap.playing;
+                // PLAY/PAUSE reflects whether *any* copy is playing, not just A —
+                // in compare the audible copy switches, but the button must stay
+                // PAUSE the whole time something is playing.
+                let playing = snap.loaded && snap.playing;
                 ui.scope_builder(
                     egui::UiBuilder::new()
                         .max_rect(top_bar)
@@ -4773,6 +4776,10 @@ mod ui_tests {
             "→ flips audible to B"
         );
         assert!(snap.paired, "still paired — no reload, no gap");
+        assert!(
+            snap.loaded && snap.playing,
+            "still playing after the flip — so the transport button stays PAUSE (not PLAY)"
+        );
         assert_eq!(
             harness.state().lightbox.as_ref().unwrap().audio_active,
             Some(1),
