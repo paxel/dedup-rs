@@ -1206,6 +1206,24 @@ where
     Ok(())
 }
 
+/// Remove the given relative paths from an open repo database in one write
+/// transaction (a no-op for paths that aren't present). Mirrors [`apply_entries`]
+/// / [`mark_missing`] for callers that move or drop entries in batches.
+pub fn remove_entries<'a, I>(db: &redb::Database, rel_paths: I) -> Result<(), StoreError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let write_txn = db.begin_write()?;
+    {
+        let mut tables = RepoTables::open(&write_txn)?;
+        for rel_path in rel_paths {
+            tables.remove(rel_path)?;
+        }
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+
 /// Read one file entry from an open repo database.
 pub fn get_entry(db: &redb::Database, rel_path: &str) -> Result<Option<FileEntry>, StoreError> {
     let read_txn = db.begin_read()?;

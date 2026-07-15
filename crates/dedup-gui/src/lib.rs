@@ -4,15 +4,20 @@
 mod app;
 mod dupes_view;
 mod external;
-mod files_view;
+mod filter_ui;
+mod grooming_view;
 mod icon;
+mod id3tags;
+mod imgedit;
 mod lightbox;
 mod player;
 mod settings;
 mod status;
 mod theme;
 mod thumbs;
+mod transfer_view;
 mod util;
+mod waveform;
 mod worker;
 
 use dedup_core::store::Store;
@@ -25,11 +30,25 @@ use std::sync::Arc;
 pub fn run(ui_scale: Option<f32>) -> Result<(), String> {
     let store = Arc::new(Store::open().map_err(|e| e.to_string())?);
 
+    // Restore the last window size (clamped to something sane), so the app opens
+    // where it was left instead of a fixed default.
+    let size = settings::Settings::load(store.config_dir())
+        .window_size
+        .map(|[w, h]| [w.clamp(760.0, 10_000.0), h.clamp(480.0, 10_000.0)])
+        .unwrap_or([1100.0, 720.0]);
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size(size)
+        .with_min_inner_size([760.0, 480.0])
+        .with_title("dedup")
+        // On Wayland the compositor ignores `with_icon` and instead matches the
+        // window's app_id to an installed `<app_id>.desktop` file for the
+        // taskbar/titlebar icon; keep this stable and matching `dedup.desktop`.
+        .with_app_id("dedup");
+    if let Some(icon) = load_icon() {
+        viewport = viewport.with_icon(Arc::new(icon));
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 720.0])
-            .with_min_inner_size([760.0, 480.0])
-            .with_title("dedup"),
+        viewport,
         ..Default::default()
     };
 
@@ -46,4 +65,19 @@ pub fn run(ui_scale: Option<f32>) -> Result<(), String> {
         }),
     )
     .map_err(|e| e.to_string())
+}
+
+/// Decode the embedded app icon (two cat heads, one crossed through) into the
+/// RGBA form eframe wants for the window/taskbar icon. Returns `None` if the
+/// bundled PNG ever fails to decode, so a bad asset never blocks startup.
+fn load_icon() -> Option<egui::IconData> {
+    let image = image::load_from_memory(include_bytes!("../assets/icon.png"))
+        .ok()?
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    Some(egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    })
 }

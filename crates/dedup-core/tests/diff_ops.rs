@@ -4,8 +4,8 @@
 //! Java in-memory mock filesystem.
 
 use dedup_core::diff::{
-    CopyDest, DiffAction, DiffEvent, DiffItem, DiffProgress, DiffRun, NoDiffProgress, diff_copy,
-    diff_delete, diff_print, diff_sync,
+    CopyDest, DiffAction, DiffEvent, DiffItem, DiffProgress, DiffRun, FolderMode, NoDiffProgress,
+    diff_copy, diff_delete, diff_print, diff_sync, export_to_folder, plan_folder_export,
 };
 use dedup_core::store::{FileEntry, Store};
 use dedup_core::update::{CancellationToken, NoProgress, update_repo};
@@ -836,5 +836,152 @@ fn copy_records_origin_in_target_index() -> TestResult {
         Some("A"),
         "origin records source repo"
     );
+    Ok(())
+}
+
+/// Count how many of the given source-relative paths landed under `dest`.
+fn landed(dest: &Path, rels: &[&str]) -> u32 {
+    rels.iter().filter(|rel| dest.join(rel).exists()).count() as u32
+}
+
+#[test]
+fn folder_export_uniques_keeps_one_copy_per_content() -> TestResult {
+    let sb = Sandbox::new()?;
+    // Two byte-identical files (a duplicate group) plus one unique file.
+    Sandbox::write(&sb.a_root, "dup1.txt", b"same")?;
+    Sandbox::write(&sb.a_root, "sub/dup2.txt", b"same")?;
+    Sandbox::write(&sb.a_root, "solo.txt", b"unique")?;
+    sb.update("A")?;
+
+    let dest = sb._tempdir.path().join("export");
+    let cancel = CancellationToken::new();
+    let run = DiffRun::new(&NoDiffProgress, &cancel);
+    let stats = export_to_folder(
+        &sb.store,
+        "A",
+        &[],
+        &dest,
+        FolderMode::Exact,
+        false,
+        false,
+        None,
+        &run,
+    )?;
+
+    assert_eq!(
+        stats.copied, 2,
+        "one copy of the duplicated content plus the unique file"
+    );
+    assert_eq!(
+        landed(&dest, &["dup1.txt", "sub/dup2.txt"]),
+        1,
+        "exactly one of the two duplicate copies is exported"
+    );
+    assert!(
+        dest.join("solo.txt").exists(),
+        "the unique file is exported"
+    );
+    Ok(())
+}
+
+#[test]
+fn folder_export_inverted_keeps_only_redundant_copies() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "dup1.txt", b"same")?;
+    Sandbox::write(&sb.a_root, "sub/dup2.txt", b"same")?;
+    Sandbox::write(&sb.a_root, "solo.txt", b"unique")?;
+    sb.update("A")?;
+
+    let dest = sb._tempdir.path().join("export");
+    let cancel = CancellationToken::new();
+    let run = DiffRun::new(&NoDiffProgress, &cancel);
+    let stats = export_to_folder(
+        &sb.store,
+        "A",
+        &[],
+        &dest,
+        FolderMode::Exact,
+        true, // invert → redundant copies only
+        false,
+        None,
+        &run,
+    )?;
+
+    assert_eq!(stats.copied, 1, "only the redundant duplicate copy");
+    assert_eq!(
+        landed(&dest, &["dup1.txt", "sub/dup2.txt"]),
+        1,
+        "exactly one duplicate copy exported"
+    );
+    assert!(
+        !dest.join("solo.txt").exists(),
+        "a unique file is never redundant, so it is not exported"
+    );
+    Ok(())
+}
+
+#[test]
+fn folder_export_subtracts_reference_content() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "shared.txt", b"shared")?;
+    Sandbox::write(&sb.a_root, "onlyA.txt", b"onlyA")?;
+    Sandbox::write(&sb.b_root, "s.txt", b"shared")?; // B already holds "shared"
+    sb.update("A")?;
+    sb.update("B")?;
+
+    let dest = sb._tempdir.path().join("export");
+    let cancel = CancellationToken::new();
+    let run = DiffRun::new(&NoDiffProgress, &cancel);
+    let stats = export_to_folder(
+        &sb.store,
+        "A",
+        &["B"],
+        &dest,
+        FolderMode::Exact,
+        false,
+        false,
+        None,
+        &run,
+    )?;
+
+    assert_eq!(stats.copied, 1, "content B already has is excluded");
+    assert!(dest.join("onlyA.txt").exists());
+    assert!(
+        !dest.join("shared.txt").exists(),
+        "shared content is already in the reference"
+    );
+    Ok(())
+}
+
+#[test]
+fn folder_export_move_marks_source_missing() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "m.txt", b"movable")?;
+    sb.update("A")?;
+
+    let dest = sb._tempdir.path().join("export");
+    let cancel = CancellationToken::new();
+    let run = DiffRun::new(&NoDiffProgress, &cancel);
+    let stats = export_to_folder(
+        &sb.store,
+        "A",
+        &[],
+        &dest,
+        FolderMode::Exact,
+        false,
+        true, // move
+        None,
+        &run,
+    )?;
+
+    assert_eq!(stats.copied, 1);
+    assert!(dest.join("m.txt").exists(), "moved into the export folder");
+    assert!(
+        !sb.a_root.join("m.txt").exists(),
+        "removed from the source directory"
+    );
+    // The source entry is marked missing, so it is no longer a candidate.
+    let again = plan_folder_export(&sb.store, "A", &[], FolderMode::Exact, false, None)?;
+    assert!(again.is_empty(), "the moved file is no longer exportable");
     Ok(())
 }

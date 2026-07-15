@@ -1,14 +1,16 @@
-//! The eframe application: a tabbed LCARS shell (Repository / Duplicate / File
-//! management) wired to the core store and a background update worker. This
-//! module owns the Repository Management tab and delegates the other two to
-//! [`crate::dupes_view`] and [`crate::files_view`].
+//! The eframe application: a tabbed LCARS shell (Repositories / Duplicates /
+//! Transfer / Grooming) wired to the core store and a background update worker.
+//! This module owns the Repository Management tab and the (currently empty)
+//! Grooming tab, and delegates the others to [`crate::dupes_view`] and
+//! [`crate::transfer_view`].
 
 use crate::dupes_view::DupesView;
-use crate::files_view::FilesView;
+use crate::grooming_view::GroomingView;
 use crate::icon;
 use crate::settings::TooltipVerbosity;
 use crate::status::{self, Location};
 use crate::theme;
+use crate::transfer_view::TransferView;
 use crate::util::{ExplainExt, format_size};
 use crate::worker::{ChannelProgress, JobKind, JobOutcome, RepoStatus, WorkerMsg, WorkerState};
 use crossbeam_channel::{Receiver, Sender};
@@ -28,7 +30,8 @@ const MAX_CONCURRENT: usize = 1;
 enum Tab {
     Repositories,
     Duplicates,
-    Files,
+    Transfer,
+    Grooming,
 }
 
 /// Freshness of a repo's index relative to disk, from the last CHECK.
@@ -137,9 +140,13 @@ pub struct DedupApp {
     status_tx: Sender<(String, Location)>,
     status_rx: Receiver<(String, Location)>,
     dupes: DupesView,
-    files: FilesView,
+    transfer: TransferView,
+    grooming: GroomingView,
     /// Last settings written to disk, to avoid rewriting an unchanged file.
     saved_settings: crate::settings::Settings,
+    /// Current window inner size (logical points), captured each frame and
+    /// flushed on exit so the next launch reopens at the same size.
+    window_size: Option<[f32; 2]>,
 }
 
 impl DedupApp {
@@ -172,18 +179,33 @@ impl DedupApp {
             status_tx,
             status_rx,
             dupes: DupesView::new(),
-            files: FilesView::new(),
+            transfer: TransferView::new(),
+            grooming: GroomingView::new(),
             saved_settings: crate::settings::Settings::default(),
+            window_size: None,
         };
         // Restore persisted settings (thread count, similarity threshold,
         // tooltip verbosity).
         let settings = crate::settings::Settings::load(app.store.config_dir());
         app.threads = settings.threads;
         app.dupes.set_threshold(settings.similarity_threshold);
+        app.transfer
+            .set_threshold(settings.transfer_similarity_threshold);
         app.tooltip_verbosity = settings.tooltip_verbosity;
         app.saved_settings = settings;
         app.reload_all();
         app
+    }
+
+    /// The persistable settings snapshot for the current UI state.
+    fn current_settings(&self) -> crate::settings::Settings {
+        crate::settings::Settings {
+            threads: self.threads,
+            similarity_threshold: self.dupes.threshold(),
+            transfer_similarity_threshold: self.transfer.threshold(),
+            tooltip_verbosity: self.tooltip_verbosity,
+            window_size: self.window_size,
+        }
     }
 
     /// Kick off a background probe of every repo's location + reachability.
@@ -538,7 +560,8 @@ impl eframe::App for DedupApp {
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Repositories => self.repositories_view(ui, &mut actions),
             Tab::Duplicates => self.dupes.show(ui, &self.store, self.tooltip_verbosity),
-            Tab::Files => self.files.show(ui, &self.store, self.tooltip_verbosity),
+            Tab::Transfer => self.transfer.show(ui, &self.store, self.tooltip_verbosity),
+            Tab::Grooming => self.grooming.show(ui, &self.store, self.tooltip_verbosity),
         });
         if self.show_settings {
             self.settings_modal(&ctx);
@@ -563,18 +586,37 @@ impl eframe::App for DedupApp {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
-        // Persist settings the moment they change (eframe's own storage isn't
-        // enabled, so we own the file). Comparing first keeps this to one write
-        // per actual change, not one per frame.
-        let current = crate::settings::Settings {
-            threads: self.threads,
-            similarity_threshold: self.dupes.threshold(),
-            tooltip_verbosity: self.tooltip_verbosity,
-        };
-        if current != self.saved_settings {
+        // Track the window's logical size for persistence (flushed on exit).
+        // `screen_rect` works on Wayland, where winit can't report the window
+        // position so `viewport().inner_rect` is None; scaling by the zoom
+        // factor converts egui points to the logical points `with_inner_size`
+        // expects, independent of HiDPI or `--ui-scale`.
+        let sz = ctx.viewport_rect().size() * ctx.zoom_factor();
+        if sz.x >= 1.0 && sz.y >= 1.0 {
+            self.window_size = Some([sz.x, sz.y]);
+        }
+
+        // Persist settings the moment a *control* changes (eframe's own storage
+        // isn't enabled, so we own the file). Comparing first keeps this to one
+        // write per actual change. A window resize alone doesn't write here —
+        // that would thrash the file every frame of a drag — the final size is
+        // flushed in `on_exit`.
+        let current = self.current_settings();
+        let control_changed = current.threads != self.saved_settings.threads
+            || current.similarity_threshold != self.saved_settings.similarity_threshold
+            || current.transfer_similarity_threshold
+                != self.saved_settings.transfer_similarity_threshold
+            || current.tooltip_verbosity != self.saved_settings.tooltip_verbosity;
+        if control_changed {
             current.save(self.store.config_dir());
             self.saved_settings = current;
         }
+    }
+
+    fn on_exit(&mut self) {
+        // Flush the final window size (and any current control values) so the
+        // next launch reopens where the user left it.
+        self.current_settings().save(self.store.config_dir());
     }
 }
 
@@ -619,11 +661,20 @@ impl DedupApp {
                     tab_button(
                         ui,
                         &mut self.tab,
-                        Tab::Files,
-                        "FILES",
+                        Tab::Transfer,
+                        "TRANSFER",
                         theme::BLUE,
                         self.tooltip_verbosity,
-                        "Copy, move, or delete files between repositories by content",
+                        "Copy or move files between repositories by content",
+                    );
+                    tab_button(
+                        ui,
+                        &mut self.tab,
+                        Tab::Grooming,
+                        "GROOMING",
+                        theme::TAN,
+                        self.tooltip_verbosity,
+                        "Prune and reorganize repositories (coming soon)",
                     );
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -765,6 +816,7 @@ impl DedupApp {
                 r.queued_at.elapsed(),
                 r.started_at.map(|s| s.elapsed()),
                 r.event.clone(),
+                r.eta(),
             )
         });
         egui::Frame::new()
@@ -850,7 +902,7 @@ impl DedupApp {
                             "This repo's unique content was copied into a sanitized dir",
                             "This repository was marked triage-done: its unique content was \
                              already copied into a sanitized directory (via `dedup sanitize` \
-                             or MARK SOURCE DONE in Files management), so it's safe to \
+                             or MARK SOURCE DONE in the Transfer tab), so it's safe to \
                              consider fully processed.",
                             self.tooltip_verbosity,
                         );
@@ -858,7 +910,7 @@ impl DedupApp {
                 });
 
                 match tracked {
-                    Some((kind, RepoStatus::Queued, waited, _, _)) => {
+                    Some((kind, RepoStatus::Queued, waited, _, _, _)) => {
                         let verb = if kind == JobKind::Check {
                             "check"
                         } else {
@@ -884,7 +936,7 @@ impl DedupApp {
                             }
                         });
                     }
-                    Some((kind, RepoStatus::Running, _, elapsed, event)) => {
+                    Some((kind, RepoStatus::Running, _, elapsed, event, eta)) => {
                         let elapsed = elapsed.unwrap_or_default();
                         let checking = kind == JobKind::Check;
                         ui.horizontal(|ui| {
@@ -935,17 +987,13 @@ impl DedupApp {
                             }
                         });
                         let verb = if checking { "checking" } else { "scanning" };
-                        let timing = match &event {
-                            ProgressEvent::Hashing { done, total, .. }
-                                if *total > 0 && *done > 0 && !checking =>
-                            {
-                                let eta = elapsed.mul_f64((*total - *done) as f64 / *done as f64);
-                                format!(
-                                    "scanning for {} · ETA {}",
-                                    format_elapsed(elapsed),
-                                    format_elapsed(eta)
-                                )
-                            }
+                        let hashing = !checking && matches!(&event, ProgressEvent::Hashing { total, .. } if *total > 0);
+                        let timing = match eta {
+                            Some(eta) if hashing => format!(
+                                "scanning for {} · ETA {}",
+                                format_elapsed(elapsed),
+                                format_elapsed(eta)
+                            ),
                             _ => format!("{verb} for {}", format_elapsed(elapsed)),
                         };
                         ui.label(RichText::new(timing).color(theme::TAN).size(12.0));
@@ -1797,6 +1845,32 @@ mod ui_tests {
             update_repo(&store, name, 1, &NoProgress, &CancellationToken::new()).unwrap();
         }
         (tmp, DedupApp::new(store))
+    }
+
+    /// The window size is flushed on exit and restored (via `Settings`) on the
+    /// next launch, so the app reopens where the user left it.
+    #[test]
+    fn window_size_persists_on_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let config_dir = store.config_dir().to_path_buf();
+        let mut app = DedupApp::new(store);
+
+        // Nothing saved yet → the next `run()` would fall back to the default.
+        assert_eq!(
+            crate::settings::Settings::load(&config_dir).window_size,
+            None
+        );
+
+        // A resize (captured each frame from `viewport_rect`) then a close.
+        app.window_size = Some([912.0, 678.0]);
+        eframe::App::on_exit(&mut app);
+
+        assert_eq!(
+            crate::settings::Settings::load(&config_dir).window_size,
+            Some([912.0, 678.0]),
+            "the closed size is restored on the next launch"
+        );
     }
 
     fn doc_screenshot_path(name: &str) -> PathBuf {

@@ -12,8 +12,10 @@ Media strategy is **hybrid**: in-app image zoom, in-app audio playback, video as
 scrub-able frame strips; one click hands any file to the system's external app for full
 fidelity.
 
-All four phases planned in this document (review tooling, sanitize workflow, content
-coverage, forensic layer) have shipped. What remains is cross-cutting debt.
+All four phases originally planned in this document (review tooling, sanitize workflow,
+content coverage, forensic layer) have shipped. What remains is a near-term preview &
+lightbox polish wave (Phase 6), the deferred Browse (Phase 7) and Recognition (Phase 8)
+layers, and cross-cutting debt.
 
 ---
 
@@ -29,6 +31,202 @@ coverage, forensic layer) have shipped. What remains is cross-cutting debt.
   temp-repo integration tests; store format changes must include a legacy-decode test
   (pattern: `store.rs::v1_entries_decode_and_flag_images_stale`).
 
+
+## Phase 5 — Transfer, Grooming & smarter ETA  - done
+---
+
+## Phase 6 — Preview & Lightbox polish  *(near-term)*
+
+The Duplicates lightbox is where triage actually happens, and it has three gaps: audio is
+near-unusable (files render as the generic broken-image placeholder), the keyboard/​hint
+affordances are incomplete, and there is no way to fix or re-tag a file without leaving the
+app. This wave makes the lightbox a first-class comparison surface for **both** images and
+audio, with safe in-place edits. (Folded from the "Open issues" list, kept verbatim below.)
+
+### 6.1 Keyboard shortcuts & discoverable hints
+
+**Lightbox — ✅ done (2026-07-14).**
+- **Escape is a universal "back"**, not an immediate close: it pops one view level per press
+  — flicker → side-by-side → single image → closed. This is the intended principle for all
+  modals/future views (applied to the lightbox now; rolled out elsewhere with the cross-view
+  work below).
+- **`Space` drives flicker**: it enters flicker from side-by-side (previously button-only),
+  then swaps A/B once there.
+- **Hint "vanished on compare" was a real layout bug** (user was right): the hint string
+  existed, but compare stacks three bottom lines (path A, path B, hint) into a strip only
+  tall enough for two, so the hint rendered *below* the window bottom (measured at y≈709 in
+  a 700 px window). Fixed by growing the bottom strip (and shrinking the viewport to match)
+  in compare mode; a geometric test now asserts the hint stays on-screen.
+- The compare hint bar is now **mode-aware** (distinct side-by-side vs flicker strings) and
+  names every available shortcut.
+
+**Cross-view shortcuts — ✅ done (2026-07-15).** A shared `util::shortcut_bar` renders a
+persistent hint line (same LILAC style as the lightbox) at the top of each view, and each
+view now handles keyboard shortcuts (guarded by `egui_wants_keyboard_input()` so text fields
+still type, and — for Duplicates — skipped while a lightbox/confirm modal owns the keyboard):
+
+- **Duplicates grid:** `F` find · `←`/`→` page · `M` toggle match mode.
+- **Transfer:** `1` copy · `2` move · `P` preview · `R` run.
+- **Grooming:** `1`–`4` command (dedupe/purge/empty-dirs/organize) · `P` preview · `R` run.
+
+Tests: `grid_shortcut_toggles_match_mode` (dupes), `number_keys_select_command` (transfer &
+grooming).
+
+### 6.2 Audio preview tile — ✅ done (2026-07-14)
+
+- **Fixed the "broken image" look:** audio cards used to fall back to the generic
+  placeholder (an image-square icon + the raw mime string). They now render a
+  **deterministic fingerprint glyph** — a waveform whose bar heights and accent colour come
+  from `AudioFp.chunk_hashes[0]` (each bar an independent hash byte, no mirror symmetry, so
+  distinct audio looks distinct) — with the duration centred below, bordered to match the
+  image thumbnails (`paint_audio_glyph` in `dupes_view.rs`).
+- **Honest scope correction:** the glyph signals *identity*, **not** similarity. The chunk
+  hash is BLAKE3 (full avalanche), and audio "similars" are grouped on **exact**
+  `chunk_hashes` equality (`similar.rs`), so within any displayed group every member's glyph
+  is identical by construction. Same content → same glyph; different content → different
+  glyph. It cannot show gradations of similarity (the earlier "similar audio → similar glyph"
+  claim was wrong).
+- **Deferred:** clicking the glyph to open an audio lightbox lands with 6.3 (the tile is
+  non-interactive for now — the existing PLAY controls handle playback). No audio lightbox
+  exists yet, so wiring the click to the image lightbox would just show "decoding…" forever.
+
+### 6.3 Audio lightbox & audible comparison — ✅ done (2026-07-14, scope "both")
+
+- **Real decoded waveforms, not the fingerprint.** The fingerprint glyph is identical for
+  every copy in a group (grouped on exact hash), so it can't show diffs — confirmed with the
+  user, who chose the full build. A new `waveform.rs` decodes each file to a normalized
+  amplitude envelope on a background pool (mirrors `FullResCache`), cached by content hash.
+  Extraction **streams** with a peak-fold that halves resolution when it fills, so it needs
+  no length estimate (the decoder's reported duration proved unreliable — a 2 s clip reported
+  6.3 s) and stays O(buckets) memory in one pass.
+- **Audio lightbox** (`audio_lightbox` in `dupes_view.rs`): clicking an audio tile opens a
+  full-window view with each copy stacked for A/B compare, a playback cursor, and a transport
+  bar. `P` play/pause, `←`/`→` switch copy, click to play that copy from that spot, `C`
+  compare, `Esc` steps back a level. Reuses `LightboxState`/`CompareState`.
+- **Spectrogram view + real flicker** (follow-up on user feedback): the amplitude waveform is
+  a flat block for loud/compressed music, so `S` toggles a **spectrogram** (frequency×time,
+  brightness = per-band loudness) built from a dependency-free radix-2 FFT/STFT in the same
+  streaming pass (`waveform.rs::AudioViz`; magma colormap; GPU texture cached by hash). And
+  `space` now drives **flicker exactly like the image lightbox** — enters flicker from
+  side-by-side, then swaps A/B — so you can flick A↔B (spectrogram or waveform) to spot
+  differences. (Play/pause moved off `space` to `P` to free it for flicker, per the user.)
+- **Spectrogram fix** (bug the user caught — "bright left edge, rest black; goes black after
+  1 min of a 6 min song"): the real culprit was the **column fold losing its time axis**. The
+  STFT halves resolution when the column buffer fills, but — unlike the envelope — it wasn't
+  increasing frames-per-column, so old columns pooled a max over ever-more frames (bright)
+  while newer ones covered a handful (black), collapsing the whole song into the first few
+  columns. Fixed with a `col_step` that doubles on each fold (mirrors the envelope), so
+  columns keep a uniform time span. My first pass only changed the intensity scale (dB with a
+  70 dB floor + DC-bin drop) — a real contrast improvement, but *not* the bug; the short (3 s)
+  render test never folded, so it hid the defect. New unit test decodes a long tone and
+  asserts its bin is lit at x=0, mid, **and the last column**.
+- **Gap-free audio switching in compare** (bug the user caught, then extended): swapping in
+  flicker changed only the picture, not the sound. `player.rs` now has a **paired mode** — two
+  sinks play the same offset in sync, one muted. The pair is kept loaded whenever you're
+  comparing-and-playing, so **both** a flicker `space` swap **and** a side-by-side click on the
+  other copy are an instant volume **flip** (no reload, no gap); a click only seeks if it
+  actually moves the playhead. The playback cursor follows to the audible copy.
+- **One cursor, not two** (bug fix): the cursor keyed off content hash, so exact-duplicate
+  copies (shared hash) both lit up. Now tracked by row via `LightboxState.audio_active`.
+- **Keep-offset switching, both places** (the flagged "maybe" — user said yes): switching
+  copies (in the lightbox *and* the card grid) keeps the current playback offset. Threaded
+  `start_ms` through `Player::play` (seek-on-start).
+- **Honest note:** within a group the opening bytes are identical, so views line up early and
+  real differences show later (or in a slightly different length).
+- **Deferred:** the *small pause* the user flagged is gone for both the flicker swap and
+  side-by-side clicks. Only `←`/`→` (which changes *which* copy is A, a structural change) and
+  the very first play/click that loads the pair still reload — an acceptable one-off.
+- Tests: `waveform.rs` envelope+spectrogram unit tests (WAV generated in-test — no
+  audio-writer dep), `audio_lightbox_opens_compares_plays_and_escapes` (P/S/space-flicker/Esc),
+  `switching_audio_copies_keeps_offset`, and `--ignored` `render_audio_lightbox` (spectrogram).
+
+### 6.4 Lightbox image editing (lossless) — ✅ done (2026-07-15)
+
+- **Edit controls** in the single-image lightbox: `ROT L` / `ROT R` (90° steps), `FLIP H` /
+  `FLIP V`, plus `RESET` and `SAVE` once edited. A live preview shows the rotated/flipped
+  image (zoom/pan track the new dimensions); `imgedit.rs::apply_ops` composes the ops.
+- **JPEG decision (user):** re-encode at quality 95 — no new dependency. PNG/BMP/etc. stay
+  bit-exact lossless; JPEG loses a little (labeled in the save modal). True lossless JPEG
+  would need a C library (libjpeg-turbo); declined.
+- **Caveat (not yet handled):** overwriting a file changes its bytes, so its stored
+  content-hash/dimensions in the index go stale until a re-scan. Acceptable for now; a
+  re-index-on-edit hook is a follow-up.
+
+### 6.5 Audio id3 tags — ✅ done (2026-07-15)
+
+- **Display:** the audio lightbox shows an `Artist — Title` summary in the bottom strip
+  (single view), read via the new `id3` crate and cached per hash (`id3tags.rs`).
+- **Editor (user chose "add id3"):** a `✎ TAGS` button (or `T`) opens a modal with
+  Title / Artist / Album / Year / Track / Genre. `SAVE TAGS` writes **only the tags** back
+  (audio untouched, other frames like album art preserved); empty fields clear that frame.
+- **6.6 reuse:** the modal carries the "writes the tags to the file on disk" note and stays
+  open after saving. `Esc` closes the editor before it backs out the lightbox.
+- **Scope:** ID3v2 only (MP3/WAV/AIFF); FLAC/OGG show no tags (read returns `None`).
+- Tests: `id3tags.rs` round-trip + clear-field unit tests (real bare-MP3 in-test), and
+  `audio_lightbox_edits_and_saves_id3_tags` (T → edit → SAVE writes to disk, others
+  preserved, lightbox stays open); `--ignored` `render_audio_tags`.
+
+### 6.6 Safe in-place saves — ✅ done (2026-07-15) *(cross-cutting for 6.4 & 6.5)*
+
+- **Save decision (user): offer both each time.** The save modal presents `OVERWRITE
+  ORIGINAL` (red) vs `SAVE A COPY` (writes a non-colliding `_rot` sibling — never loses data)
+  vs `CANCEL`, with the ack "Overwriting changes the file on disk and cannot be undone."
+- Overwrite is **atomic** (temp file + rename, so a failed encode can't truncate the
+  original); a copy never overwrites an existing file.
+- Saving keeps the lightbox open and the preview showing (verified by test). Wired for images
+  now; 6.5's id3 writes will reuse the same modal.
+
+### 6.7 Audio compare polish & id3 in the diff view — ✅ done (2026-07-15, from user feedback)
+
+Follow-ups on the audio lightbox (6.3) and id3 editor (6.5):
+
+- **Fixed — arrow-switch paused and the cursor stuck on top.** `←`/`→` in compare used to
+  re-navigate the *A index*, reloading a single sink (gap) and, with 2 copies, colliding A
+  and B so the line stayed on top. Now arrows **flip which copy is audible** (gap-free via the
+  loaded pair) and move the cursor with it; they only step the index in single view.
+- **id3 tags in the diff view — one panel per row (symmetric).** A **read-only** tag panel
+  sits on the right of *each* waveform row: A's tags beside the A wave, B's beside the B wave
+  (not A/B columns in one box — the first cut put B off-screen and read as "no table"). Each
+  panel lists Title/Artist/Album/Year/Track/Genre with differing values highlighted, and
+  **flickers** with its row so tag diffs pop when flicking A↔B.
+- **Per-panel EDIT button** opens the editor modal for *that* copy (`open_tags` now carries a
+  group index); the panels stay read-only. Top-bar `TAGS`/`T` edits the current copy.
+- **Pick values from any copy.** The editor collects the distinct value of each field across
+  *all* the group's copies; each field has a menu to adopt any of them.
+- Tests: `audio_compare_arrow_flips_audible_copy`, `tag_editor_offers_values_from_all_copies`,
+  and the `--ignored` `render_audio_tags` now renders the A/B diff table.
+
+### 6.8 ID3v1 read fallback — ✅ done (2026-07-15)
+
+- **Read** falls back to ID3v1 (the 128-byte trailer on older/ripped MP3s) when there's no
+  ID3v2, so those files show tags in the diff panels instead of blank — `id3tags::read` uses
+  `id3::v1v2::read_from_path` (v2, then v1).
+- **Write stays ID3v2.4** and now **strips any ID3v1 trailer** so a stale v1 can't shadow the
+  edit (user's add) — via `id3::v1v2::write_to_path`, which removes v1 after writing v2.
+- Tests: `read_falls_back_to_id3v1`, `writing_v2_strips_the_v1_trailer`.
+
+---
+
+## Phase 7 — Browse & forensic layer  *(deferred)*
+
+A fifth **Browse** tab hosting the forensic tools:
+
+- Filter, display, and **annotate** files (trash / important / …); a new **annotation
+  filter** follows naturally once annotations exist.
+- **Binary / hex view** of at least a file's header.
+- **Strings** on demand for unknown files.
+- Unlocks the annotation-driven Transfer exports noted in 5.1.
+
+## Phase 8 — Recognition & extensibility  *(far future)*
+
+- Face recognition and object recognition for photos/images.
+- VLA tagging of files to topics; word clouds for documents.
+- MP3 tag handling; metadata extraction for all known formats.
+- Plugin support for new formats; an API to externalise features.
+
+---
+
+### Source remarks (verbatim, kept as reference)
 
 user demands changes:
 
@@ -61,3 +259,17 @@ user demands changes:
 * meta data extraction of all known formats
 * plugin support for new formats
 * api for externalize features
+
+
+### Open issues (verbatim, folded into Phase 6)
+
+* The lightbox has a shortcut description on the bottom. it goes away when you choose compare
+* I like the shortcut description and I want one in every view and also as much as possible shortcutable
+  * in lightbox the flicker view and there especially the swap need a key, maybe space?
+* the display of audio is quite awful. the icon looks like a broken image. maybe show some meta info and maybe display the fingerprint as a glyph? you know where some short seed generates some small image, by taking some bits as color some as mirror some as line generator. dunno. some small human recognicable visualisaton. or optionl just the fingerprint as a grayscale block.
+  * clicking the fingerprint image should bring you to the lightbox and the audio data is converted to nice audio graphs that can be compared against each other, so you can SEE the diffs?
+* playing audio in the lightbox should allow switching between different audios and continues to play so you can also hear the differences of similar files
+  * maybe this should also be possible in the normal view? when you play another play button, it keeps the offset?
+* the lightbox should have an edit button to flip and rotate images losless with the option to actually overwrite the image with the flipped rotated image
+* the audio lightbox should have a id3 display, and maybe an editor to change the id3 tag and save it
+* all save actions in the lightbox need a "sure, you change that, you know" kind of ack for the user. saving does not leave the lightbx

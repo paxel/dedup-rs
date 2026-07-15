@@ -11,11 +11,13 @@
 //! - [`diff_sync`]: sync source into target — copy new content (never
 //!   overwriting an occupied path), optionally delete target content the
 //!   source marks missing; best effort, errors are counted.
+//! - [`export_to_folder`]: copy (or move) a deduplicated selection of the
+//!   source into a plain folder (not a repo), keeping source-relative paths.
 
 use crate::filter::{FileFilter, FilterError};
 use crate::store::{self, ContentKey, ContentState, FileEntry, RepoMeta, Store, StoreError};
 use crate::update::CancellationToken;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(thiserror::Error, Debug)]
@@ -652,6 +654,152 @@ fn transfer_file(from: &Path, to: &Path, move_file: bool) -> Result<(), DiffErro
         }
     } else {
         std::fs::copy(from, to).map_err(|e| io_err("copy", e))?;
+    }
+    Ok(())
+}
+
+/// How a folder export groups the source to decide which copies are redundant.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FolderMode {
+    /// Group by exact content (size + BLAKE3 hash).
+    Exact,
+    /// Group by perceptual similarity at the given threshold percentage
+    /// (matching the Duplicates tab's similarity slider).
+    Similar { threshold: f64 },
+}
+
+/// Plan a folder export: the source-relative paths that would be copied/moved
+/// into an export folder, in deterministic (rel-path) order.
+///
+/// The candidate set is the source's non-missing files that pass `filter` and
+/// whose content none of the `references` already holds (present *or* missing,
+/// matching [`diff_copy`]'s notion of "already known"). Those candidates are
+/// then split by exact/similar grouping of the *source repo*: with
+/// `invert == false` the export keeps the **unique** files — each group's best
+/// copy plus every ungrouped singleton; with `invert == true` it keeps the
+/// **redundant** copies — every non-best member of a group.
+pub fn plan_folder_export(
+    store: &Store,
+    source: &str,
+    references: &[&str],
+    mode: FolderMode,
+    invert: bool,
+    filter: Option<&str>,
+) -> Result<Vec<String>, DiffError> {
+    let filter = FileFilter::parse(filter)?;
+    let source_open = open_repo(store, source)?;
+
+    // Content the reference repos already hold is excluded up front.
+    let ref_index = if references.is_empty() {
+        HashMap::new()
+    } else {
+        open_references(store, references)?.1
+    };
+    let mut candidates: Vec<String> = collect_source_entries(&source_open.db, &filter, false)?
+        .into_iter()
+        .filter(|(_, entry)| !ref_index.contains_key(&(entry.size, entry.hash)))
+        .map(|(rel_path, _)| rel_path)
+        .collect();
+
+    // The non-best members of each exact/similar group within the source repo
+    // are the "redundant" copies; every group is sorted best-copy-first.
+    let source_names = [source.to_string()];
+    let groups = match mode {
+        FolderMode::Exact => crate::dupes::find_exact_duplicates(store, &source_names)?,
+        FolderMode::Similar { threshold } => {
+            crate::similar::find_similar(store, &source_names, threshold)?
+        }
+    };
+    let redundant: HashSet<String> = groups
+        .iter()
+        .flat_map(|group| group.iter().skip(1))
+        .map(|file| file.rel_path.clone())
+        .collect();
+
+    // Uniques keep the candidates that are not a redundant copy; the inverted
+    // export keeps only the redundant copies.
+    candidates.retain(|rel_path| redundant.contains(rel_path) == invert);
+    Ok(candidates)
+}
+
+/// Copy (or move) the source's exported files (see [`plan_folder_export`]) into
+/// `dest_dir`, preserving each file's source-relative path. Nothing is indexed
+/// into a repo — the destination is a plain directory — but a move marks the
+/// exported source entries missing (batched, with a final flush applied even on
+/// cancel or failure). Per-file progress is reported through `run`.
+#[allow(clippy::too_many_arguments)]
+pub fn export_to_folder(
+    store: &Store,
+    source: &str,
+    references: &[&str],
+    dest_dir: &Path,
+    mode: FolderMode,
+    invert: bool,
+    move_files: bool,
+    filter: Option<&str>,
+    run: &DiffRun<'_>,
+) -> Result<CopyStats, DiffError> {
+    let exports = plan_folder_export(store, source, references, mode, invert, filter)?;
+    let source_open = open_repo(store, source)?;
+    let source_root = PathBuf::from(&source_open.meta.abs_path);
+    let total = exports.len() as u64;
+    let action = if move_files {
+        DiffAction::Move
+    } else {
+        DiffAction::Copy
+    };
+    let mut stats = CopyStats::default();
+    let mut moved: Vec<String> = Vec::new();
+    let mut since_flush = 0u64;
+    let mut failure: Option<DiffError> = None;
+
+    for rel_path in &exports {
+        if run.cancel.is_cancelled() {
+            stats.cancelled = true;
+            break;
+        }
+        let from = source_root.join(rel_path);
+        let to = dest_dir.join(rel_path);
+        if let Err(err) = transfer_file(&from, &to, move_files) {
+            run.progress.on(DiffEvent::Error {
+                path: from.to_string_lossy().into_owned(),
+                message: err.to_string(),
+            });
+            failure = Some(err);
+            break;
+        }
+        if move_files {
+            moved.push(rel_path.clone());
+        }
+        stats.copied += 1;
+        since_flush += 1;
+        run.progress.on(DiffEvent::Progress {
+            action,
+            done: stats.copied,
+            total,
+            rel_path: rel_path.clone(),
+        });
+        if since_flush >= INDEX_BATCH {
+            flush_moved(&source_open.db, &mut moved)?;
+            since_flush = 0;
+        }
+    }
+
+    // Reflect any moves already done on disk, even on cancel or failure.
+    flush_moved(&source_open.db, &mut moved)?;
+
+    match failure {
+        Some(err) => Err(err),
+        None => Ok(stats),
+    }
+}
+
+/// Mark the buffered moved source paths missing in one write transaction, then
+/// clear the buffer.
+fn flush_moved(source_db: &redb::Database, moved: &mut Vec<String>) -> Result<(), StoreError> {
+    if !moved.is_empty() {
+        store::mark_missing(source_db, moved.iter().map(String::as_str))?;
+        moved.clear();
     }
     Ok(())
 }

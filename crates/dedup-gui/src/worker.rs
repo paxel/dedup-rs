@@ -6,9 +6,10 @@
 //! never forces a repaint or backs up the channel.
 
 use crossbeam_channel::{Receiver, Sender};
+use dedup_core::eta::EtaEstimator;
 use dedup_core::update::{CheckStats, Progress, ProgressEvent, UpdateStats};
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// What a queued/running job does to a repo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +71,17 @@ pub struct RepoProgress {
     pub queued_at: Instant,
     pub started_at: Option<Instant>,
     pub event: ProgressEvent,
+    /// Byte-throughput ETA for the hashing phase, created lazily on the first
+    /// `Hashing` event (once the run's total byte count is known).
+    eta: Option<EtaEstimator>,
+}
+
+impl RepoProgress {
+    /// The current smoothed estimate of time remaining for this repo's scan, if
+    /// enough progress has been observed to make one.
+    pub fn eta(&self) -> Option<Duration> {
+        self.eta.as_ref().and_then(EtaEstimator::eta)
+    }
 }
 
 /// The UI's view of in-flight work: one [`RepoProgress`] per repo that is
@@ -91,6 +103,7 @@ impl WorkerState {
                 queued_at: Instant::now(),
                 started_at: None,
                 event: ProgressEvent::Scanning { files: 0, dirs: 0 },
+                eta: None,
             },
         );
     }
@@ -135,9 +148,21 @@ impl WorkerState {
     /// stats, drop the cancellation token, …).
     pub fn drain(&mut self, rx: &Receiver<WorkerMsg>) -> Vec<(String, JobOutcome)> {
         let mut completed = Vec::new();
+        // Latest `(done_bytes, total_bytes)` seen this drain per repo, so the ETA
+        // estimator gets exactly one throughput sample per frame (feeding every
+        // coalesced event would stamp them all at ~now and add no real interval).
+        let mut hashed: HashMap<String, (u64, u64)> = HashMap::new();
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 WorkerMsg::Progress { repo, event } => {
+                    if let ProgressEvent::Hashing {
+                        done_bytes,
+                        total_bytes,
+                        ..
+                    } = &event
+                    {
+                        hashed.insert(repo.clone(), (*done_bytes, *total_bytes));
+                    }
                     if let Some(record) = self.tracked.get_mut(&repo) {
                         record.event = event;
                     }
@@ -146,6 +171,17 @@ impl WorkerState {
                     self.tracked.remove(&repo);
                     completed.push((repo, outcome));
                 }
+            }
+        }
+        for (repo, (done_bytes, total_bytes)) in hashed {
+            if let Some(record) = self.tracked.get_mut(&repo)
+                && let Some(started) = record.started_at
+            {
+                let elapsed = started.elapsed().as_secs_f64();
+                record
+                    .eta
+                    .get_or_insert_with(|| EtaEstimator::new(total_bytes))
+                    .record(done_bytes, elapsed);
             }
         }
         completed
@@ -170,6 +206,8 @@ mod tests {
                 event: ProgressEvent::Hashing {
                     done,
                     total: 500,
+                    done_bytes: done * 1000,
+                    total_bytes: 500_000,
                     current: format!("f{done}"),
                 },
             })
@@ -239,6 +277,42 @@ mod tests {
             }
             None => panic!("expected a tracked record"),
         }
+    }
+
+    #[test]
+    fn hashing_progress_produces_an_eta() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = WorkerState::default();
+        state.mark_queued("a", JobKind::Update);
+        state.mark_running("a");
+
+        let hashing = |done: u64, done_bytes: u64| WorkerMsg::Progress {
+            repo: "a".into(),
+            event: ProgressEvent::Hashing {
+                done,
+                total: 10,
+                done_bytes,
+                total_bytes: 10_000_000,
+                current: format!("f{done}"),
+            },
+        };
+
+        // First drain seeds the estimator; one sample can't yet yield a rate.
+        tx.send(hashing(1, 1_000_000)).unwrap();
+        state.drain(&rx);
+        assert!(
+            state.get("a").unwrap().eta().is_none(),
+            "no rate from one sample"
+        );
+
+        // A second sample a real interval later gives a throughput and an ETA.
+        std::thread::sleep(Duration::from_millis(20));
+        tx.send(hashing(2, 2_000_000)).unwrap();
+        state.drain(&rx);
+        assert!(
+            state.get("a").unwrap().eta().is_some(),
+            "an ETA is available once throughput can be measured"
+        );
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! Small formatting helpers shared across views.
 
 use crate::settings::TooltipVerbosity;
+use crate::theme;
+use egui::RichText;
 
 /// Attaches a hover tooltip whose wording depends on the app's tooltip
 /// verbosity setting, so every callsite picks short/verbose text once instead
@@ -23,6 +25,43 @@ fn pick_tooltip<'a>(verbosity: TooltipVerbosity, short: &'a str, verbose: &'a st
     match verbosity {
         TooltipVerbosity::Short => short,
         TooltipVerbosity::Verbose => verbose,
+    }
+}
+
+/// A persistent one-line keyboard-shortcut hint, styled like the lightbox's, so
+/// every view advertises its shortcuts the same way. Middot-separated, e.g.
+/// `"F find · ←/→ page · M mode"`.
+pub fn shortcut_bar(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(2.0);
+    ui.label(RichText::new(text).color(theme::LILAC).size(11.0));
+}
+
+/// The shared "similarity" threshold control: a labelled `50–100 %` slider
+/// (with an "identical" hint at the top) used everywhere a SIMILAR grouping is
+/// chosen, so the Duplicates and Transfer tabs present it identically. Edits
+/// `threshold` in place. Meant to sit in its own `ui.horizontal` row.
+pub fn similarity_slider(ui: &mut egui::Ui, threshold: &mut f64, verbosity: TooltipVerbosity) {
+    ui.label(RichText::new("similarity").color(theme::TEXT).size(12.0));
+    // The value box draws on the orange pill, where the theme's global cream
+    // text is unreadable — use black there, and a light backdrop while typing.
+    let visuals = ui.visuals_mut();
+    visuals.override_text_color = Some(theme::BLACK);
+    visuals.extreme_bg_color = theme::TAN;
+    ui.add(
+        egui::Slider::new(threshold, 50.0..=100.0)
+            .suffix("%")
+            .max_decimals(1),
+    )
+    .explain(
+        verbosity,
+        "Minimum similarity to group as similar",
+        "How alike two files' perceptual hashes must be to group as similar: \
+         similarity % = (1 − hamming distance / bits) × 100. Lower catches more \
+         (and riskier) matches; 100% is bit-identical.",
+    );
+    // 100% is bit-identical (512-bit hash); ≥99.5% is visually identical.
+    if *threshold >= 99.5 {
+        ui.label(RichText::new("identical").color(theme::BLUE).size(11.0));
     }
 }
 

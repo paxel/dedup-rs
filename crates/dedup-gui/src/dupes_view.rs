@@ -3,12 +3,15 @@
 //! delete the worse copies — batched per repo, never without a confirmation.
 
 use crate::icon;
+use crate::id3tags::{self, Tags};
+use crate::imgedit::{self, Orient};
 use crate::lightbox::{CompareState, FullResCache, LightboxState};
 use crate::player::Player;
 use crate::settings::TooltipVerbosity;
 use crate::theme;
 use crate::thumbs::ThumbCache;
 use crate::util::{ExplainExt, format_mtime, format_size};
+use crate::waveform::WaveCache;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::dupes::{
     DupeDeleteStats, DupeFile, DupeGroup, DupeGroupKey, delete_paths, load_groups,
@@ -18,8 +21,8 @@ use dedup_core::similar::find_similar;
 use dedup_core::store::Store;
 use dedup_core::thumbnail::hash_hex;
 use egui::{Color32, Id, RichText};
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const PAGE_SIZE: usize = 50;
@@ -29,6 +32,8 @@ const AUTO_BATCH: usize = 128;
 /// the grid the card preview samples from (frame `VIDEO_STRIP / 2`), so the
 /// card's still is reused by the filmstrip instead of extracted twice.
 const VIDEO_STRIP: usize = 10;
+/// Longest edge for the lightbox edit preview (matches the full-res decoder).
+const EDIT_MAX_EDGE: u32 = 8192;
 
 /// The current result set: exact duplicates are a lightweight *plan* of
 /// descriptors (members loaded a page at a time), while similar results are the
@@ -109,6 +114,34 @@ struct RepoSel {
     read_only: bool,
 }
 
+/// How long a press must be held (mouse or touch) to count as a long-press.
+const LONG_PRESS_SECS: f64 = 0.5;
+
+/// Whether `resp` was long-pressed: a touchscreen long-touch, or the primary
+/// mouse button held down on it for [`LONG_PRESS_SECS`]. Fires once per press
+/// (tracked in egui memory by the widget id) rather than every frame while held.
+fn long_pressed(ui: &egui::Ui, resp: &egui::Response) -> bool {
+    if resp.long_touched() {
+        return true;
+    }
+    if !resp.is_pointer_button_down_on() {
+        return false;
+    }
+    let (start, now) = ui.input(|i| (i.pointer.press_start_time(), i.time));
+    let Some(start) = start else {
+        return false;
+    };
+    // Keep re-evaluating while the button is held so the threshold is noticed.
+    ui.ctx().request_repaint();
+    // `insert_temp(id, start)` marks this specific press handled.
+    let already = ui.data(|d| d.get_temp::<f64>(resp.id)) == Some(start);
+    if now - start >= LONG_PRESS_SECS && !already {
+        ui.data_mut(|d| d.insert_temp(resp.id, start));
+        return true;
+    }
+    false
+}
+
 /// Unique key for a file across repos.
 type FileKey = (String, String);
 
@@ -125,6 +158,84 @@ fn fmt_ms(ms: u64) -> String {
     } else {
         format!("{m}:{s:02}")
     }
+}
+
+/// Paint a deterministic "fingerprint" glyph for an audio file: a waveform whose
+/// bar heights and accent colour come from the audio chunk hash. Every bar is an
+/// independent hash byte (no forced mirror symmetry, which would make different
+/// files look alike to the eye). Identical content yields an identical glyph —
+/// BLAKE3's avalanche means it signals *identity*, not gradations of similarity.
+/// It replaces the generic broken-image placeholder so audio cards read as audio.
+fn paint_audio_glyph(painter: &egui::Painter, rect: egui::Rect, fp: &dedup_core::store::AudioFp) {
+    let seed = fp.chunk_hashes.first().copied().unwrap_or([0u8; 32]);
+    let palette = [
+        theme::AMBER,
+        theme::TAN,
+        theme::LILAC,
+        theme::BLUE,
+        theme::ORANGE,
+    ];
+    let accent = palette[seed[0] as usize % palette.len()];
+    let bars = 15usize;
+    let gap = 3.0;
+    let bar_w = ((rect.width() - gap * (bars as f32 - 1.0)) / bars as f32).max(1.0);
+    let mid_y = rect.center().y;
+    let max_amp = rect.height() * 0.45;
+    for i in 0..bars {
+        // Each bar is its own hash byte — no mirror — so distinct audio yields
+        // visibly distinct glyphs instead of similar symmetric ones.
+        let amp = (0.15 + (seed[i % seed.len()] as f32 / 255.0) * 0.85) * max_amp;
+        let x = rect.left() + i as f32 * (bar_w + gap);
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x, mid_y - amp),
+                egui::pos2(x + bar_w, mid_y + amp),
+            ),
+            1.0,
+            accent,
+        );
+    }
+}
+
+/// Magma-ish heat ramp (black → purple → orange → white) for spectrogram cells:
+/// `v` in 0..=1 maps to brightness, so louder frequencies read brighter.
+fn spec_color(v: f32) -> egui::Color32 {
+    const STOPS: [(f32, f32, f32, f32); 5] = [
+        (0.00, 0.0, 0.0, 4.0),
+        (0.25, 60.0, 15.0, 110.0),
+        (0.50, 165.0, 45.0, 110.0),
+        (0.75, 235.0, 105.0, 60.0),
+        (1.00, 252.0, 255.0, 200.0),
+    ];
+    let v = v.clamp(0.0, 1.0);
+    let mut i = 0;
+    while i + 1 < STOPS.len() && v > STOPS[i + 1].0 {
+        i += 1;
+    }
+    let (v0, r0, g0, b0) = STOPS[i];
+    let (v1, r1, g1, b1) = STOPS[(i + 1).min(STOPS.len() - 1)];
+    let t = if v1 > v0 { (v - v0) / (v1 - v0) } else { 0.0 };
+    let lerp = |a: f32, b: f32| (a + (b - a) * t) as u8;
+    egui::Color32::from_rgb(lerp(r0, r1), lerp(g0, g1), lerp(b0, b1))
+}
+
+/// Build a spectrogram image (time on x, frequency on y with bass at the
+/// bottom) from a decoded [`waveform::AudioViz`].
+fn spec_image(viz: &crate::waveform::AudioViz) -> egui::ColorImage {
+    let (w, h) = (viz.spec_w, viz.spec_h);
+    let mut rgba = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let bin = h - 1 - y; // row 0 (top) = highest freq
+        for x in 0..w {
+            let c = spec_color(viz.spec[bin * w + x]);
+            let i = (y * w + x) * 4;
+            rgba[i] = c.r();
+            rgba[i + 1] = c.g();
+            rgba[i + 2] = c.b();
+            rgba[i + 3] = 255;
+        }
+    }
+    egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba)
 }
 
 /// One-line `path · size · WxH · mtime` description used by the lightbox.
@@ -212,10 +323,48 @@ pub struct DupesView {
     full_res: FullResCache,
     /// Global audio preview player (one file at a time).
     player: Player,
+    /// Audio-visualization cache backing the audio lightbox's waveforms/spectra.
+    waves: WaveCache,
+    /// GPU textures for spectrograms, keyed by content hash (built lazily from
+    /// `waves`, cleared when the audio lightbox closes).
+    spec_tex: HashMap<String, egui::TextureHandle>,
+    /// In-progress lossless rotate/flip of the lightbox's current image, if any.
+    edit: Option<EditState>,
+    /// The save-confirmation modal (overwrite vs copy) is open.
+    edit_save: bool,
+    /// Cached ID3 tags per audio file (hex → tags, or `None` if none/unsupported).
+    tags_cache: HashMap<String, Option<Tags>>,
+    /// The ID3 tag editor (audio lightbox), if open.
+    tag_edit: Option<TagEdit>,
     /// Tooltip wording for this frame, set at the top of [`Self::show`] from
     /// the app-wide setting (not persisted here; `app.rs` owns that).
     verbosity: TooltipVerbosity,
 }
+
+/// A pending rotate/flip edit of the lightbox's current image. The `base` pixels
+/// are decoded once; `tex`/`dims` are the live preview with `ops` applied.
+struct EditState {
+    hex: String,
+    path: PathBuf,
+    base: image::RgbaImage,
+    ops: Vec<Orient>,
+    tex: egui::TextureHandle,
+    dims: egui::Vec2,
+}
+
+/// Open ID3 tag editor: the audio file being edited plus a working copy of its
+/// tags, bound to the modal's text fields. `options` holds the distinct values
+/// seen across every copy in the group, per field (Title/Artist/Album/Year/
+/// Track/Genre), so the user can adopt the best value from any similar file.
+struct TagEdit {
+    hex: String,
+    path: PathBuf,
+    tags: Tags,
+    options: [Vec<String>; 6],
+}
+
+/// A displayable ID3 field: its label and an accessor for its value.
+type TagField = (&'static str, fn(&Tags) -> &str);
 
 impl DupesView {
     pub fn new() -> Self {
@@ -247,6 +396,12 @@ impl DupesView {
             lightbox: None,
             full_res: FullResCache::new(2),
             player: Player::new(),
+            waves: WaveCache::new(2),
+            spec_tex: HashMap::new(),
+            edit: None,
+            edit_save: false,
+            tags_cache: HashMap::new(),
+            tag_edit: None,
             verbosity: TooltipVerbosity::default(),
         }
     }
@@ -282,12 +437,40 @@ impl DupesView {
         if self.full_res.poll(&ctx) {
             ctx.request_repaint();
         }
+        if self.waves.poll(&ctx) {
+            ctx.request_repaint();
+        }
         self.drain_messages(store, &ctx);
         if !self.repos_loaded {
             self.load_repos(store);
         }
 
         let mut acts: Vec<Act> = Vec::new();
+
+        // Grid keyboard shortcuts — skipped while a lightbox or confirm modal
+        // owns the keyboard, or a text field is focused.
+        if self.lightbox.is_none() && self.confirm.is_none() && !ctx.egui_wants_keyboard_input() {
+            let pages = self.total_groups().div_ceil(PAGE_SIZE);
+            let cur = self.page.min(pages.saturating_sub(1));
+            ctx.input(|i| {
+                if i.key_pressed(egui::Key::F) && self.busy.is_none() {
+                    acts.push(Act::Find);
+                }
+                if i.key_pressed(egui::Key::M) {
+                    self.mode = if self.mode == Mode::Exact {
+                        Mode::Similar
+                    } else {
+                        Mode::Exact
+                    };
+                }
+                if i.key_pressed(egui::Key::ArrowLeft) && cur > 0 {
+                    acts.push(Act::SetPage(cur - 1));
+                }
+                if i.key_pressed(egui::Key::ArrowRight) && cur + 1 < pages {
+                    acts.push(Act::SetPage(cur + 1));
+                }
+            });
+        }
 
         ui.add_space(6.0);
         ui.label(
@@ -298,6 +481,14 @@ impl DupesView {
         );
         self.repo_bar(ui, &mut acts);
         self.controls(ui, &mut acts);
+        crate::util::shortcut_bar(
+            ui,
+            &format!(
+                "F find · {}/{} page · M mode",
+                icon::CARET_LEFT,
+                icon::CARET_RIGHT
+            ),
+        );
         if let Some(err) = &self.error {
             ui.colored_label(theme::RED, err);
         }
@@ -635,30 +826,7 @@ impl DupesView {
             if self.mode == Mode::Similar {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("similarity").color(theme::TEXT).size(12.0));
-                    // The value box draws on the orange pill, where the theme's
-                    // global cream text is unreadable — use black there, and a
-                    // light backdrop while the value is being typed.
-                    let visuals = ui.visuals_mut();
-                    visuals.override_text_color = Some(theme::BLACK);
-                    visuals.extreme_bg_color = theme::TAN;
-                    ui.add(
-                        egui::Slider::new(&mut self.threshold, 50.0..=100.0)
-                            .suffix("%")
-                            .max_decimals(1),
-                    )
-                    .explain(
-                        self.verbosity,
-                        "Minimum similarity to group as similar",
-                        "How alike two files' perceptual hashes must be to group as \
-                         similar: similarity % = (1 − hamming distance / bits) × 100. \
-                         Lower catches more (and riskier) matches; 100% is bit-identical.",
-                    );
-                    // 100% is bit-identical (512-bit hash); ≥99.5% is visually
-                    // identical for practical purposes.
-                    if self.threshold >= 99.5 {
-                        ui.label(RichText::new("identical").color(theme::BLUE).size(11.0));
-                    }
+                    crate::util::similarity_slider(ui, &mut self.threshold, self.verbosity);
                 });
             }
 
@@ -1045,9 +1213,9 @@ impl DupesView {
                                 );
                             }
                             if ro {
-                                // Escape hatch for the occasional worse copy inside a
-                                // protected repo: unlock this one file via context menu
-                                // or long press — deliberately never a plain click.
+                                // A worse copy inside a protected repo can still be
+                                // unlocked one file at a time, via its context menu
+                                // or a long press (never a plain click).
                                 let resp = ui
                                     .add(
                                         egui::Label::new(
@@ -1060,12 +1228,12 @@ impl DupesView {
                                     .explain(
                                         self.verbosity,
                                         "Right-click or long-press to unlock this file",
-                                        "This file is protected by its repo's read-only lock \
-                                         and can't be marked for deletion. Right-click (or \
-                                         long-press) to unlock just this one file — a \
-                                         deliberately inconvenient escape hatch, never bulk-set.",
+                                        "This file is protected by its repo's read-only lock, \
+                                         so it can't be marked for deletion. Right-click or \
+                                         long-press to unlock just this one file. Running FIND \
+                                         again re-locks it.",
                                     );
-                                if resp.long_touched() {
+                                if long_pressed(ui, &resp) {
                                     acts.push(Act::Unlock(k.clone()));
                                 }
                                 resp.context_menu(|ui| {
@@ -1257,6 +1425,7 @@ impl DupesView {
         let mime = file.entry.mime.as_deref();
         let is_image = mime.is_some_and(|m| m.starts_with("image/"));
         let is_video = mime.is_some_and(|m| m.starts_with("video/"));
+        let is_audio = mime.is_some_and(|m| m.starts_with("audio/"));
         if is_image || is_video {
             // Only fetch a texture for on-screen cards. The results list is not
             // virtualized, so a page can lay out far more thumbnails than the GPU
@@ -1307,6 +1476,44 @@ impl DupesView {
                 }
             }
         }
+        // Audio: a deterministic fingerprint glyph + duration, so cards read as
+        // audio instead of a broken image and identical content shows the same
+        // glyph. Clicking it opens the audio lightbox (waveform comparison).
+        if is_audio && let Some(fp) = file.entry.audio.as_ref() {
+            let (rect, resp) =
+                ui.allocate_exact_size(egui::vec2(160.0, 112.0), egui::Sense::click());
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 6.0, theme::PANEL);
+            painter.rect_stroke(
+                rect,
+                6.0,
+                egui::Stroke::new(1.0, theme::HAIRLINE),
+                egui::StrokeKind::Inside,
+            );
+            let glyph = egui::Rect::from_min_max(
+                rect.min + egui::vec2(8.0, 8.0),
+                egui::pos2(rect.max.x - 8.0, rect.max.y - 24.0),
+            );
+            paint_audio_glyph(&painter, glyph, fp);
+            painter.text(
+                egui::pos2(rect.center().x, rect.max.y - 13.0),
+                egui::Align2::CENTER_CENTER,
+                fmt_ms(fp.duration_ms as u64),
+                egui::FontId::proportional(12.0),
+                theme::TAN,
+            );
+            let resp = resp.explain(
+                self.verbosity,
+                "Open the audio lightbox",
+                "Open the full-window audio view: compare this group's copies as waveforms and \
+                 switch playback between them without losing your place in the track.",
+            );
+            if resp.clicked() {
+                acts.push(Act::OpenLightbox(gi, fi));
+            }
+            return;
+        }
+
         // Placeholder for non-images or not-yet-ready thumbnails.
         let label = file.entry.mime.clone().unwrap_or_else(|| "file".into());
         egui::Frame::new()
@@ -1339,10 +1546,46 @@ impl DupesView {
         (tex, img)
     }
 
+    /// Apply a rotate/flip `op` to the lightbox's current image, decoding the
+    /// base pixels on first use, and refresh the live preview texture.
+    fn edit_apply(&mut self, ctx: &egui::Context, hex: &str, path: &Path, op: Orient) {
+        if self.edit.as_ref().map(|e| e.hex.as_str()) != Some(hex) {
+            let Ok((w, h, rgba)) = dedup_core::thumbnail::load_full_rgba(path, EDIT_MAX_EDGE)
+            else {
+                return;
+            };
+            let Some(base) = image::RgbaImage::from_raw(w, h, rgba) else {
+                return;
+            };
+            let img =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], base.as_raw());
+            let tex = ctx.load_texture(format!("edit-{hex}"), img, egui::TextureOptions::LINEAR);
+            self.edit = Some(EditState {
+                hex: hex.to_string(),
+                path: path.to_path_buf(),
+                base,
+                ops: Vec::new(),
+                tex,
+                dims: egui::vec2(w as f32, h as f32),
+            });
+        }
+        if let Some(e) = self.edit.as_mut() {
+            e.ops.push(op);
+            let rgba = imgedit::apply_ops(image::DynamicImage::ImageRgba8(e.base.clone()), &e.ops)
+                .to_rgba8();
+            let (w, h) = rgba.dimensions();
+            let img =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+            e.tex = ctx.load_texture(format!("edit-{hex}"), img, egui::TextureOptions::LINEAR);
+            e.dims = egui::vec2(w as f32, h as f32);
+        }
+    }
+
     /// Full-window image lightbox: wheel zoom (around cursor), drag pan, `F`
     /// fit / `1` 1:1, `←`/`→` step the group, `Del`/`K` toggle the mark, `C`
-    /// A/B compare against the best copy (`space` swaps in flicker mode), `Esc`
-    /// close. Marking respects read-only exactly like the cards.
+    /// A/B compare against the best copy (`space` enters flicker, then swaps
+    /// A/B). `Esc` steps back one level — flicker → side-by-side → single →
+    /// closed. Marking respects read-only exactly like the cards.
     fn lightbox_modal(&mut self, ctx: &egui::Context, acts: &mut Vec<Act>) {
         let verbosity = self.verbosity;
         // Take the state so `full_res`/`thumbs` can be borrowed mutably below;
@@ -1363,6 +1606,17 @@ impl DupesView {
         let count = group.len();
         let mut idx = state.index.min(count - 1);
 
+        // Audio files get a dedicated waveform lightbox, not the image viewer.
+        if group[idx]
+            .entry
+            .mime
+            .as_deref()
+            .is_some_and(|m| m.starts_with("audio/"))
+        {
+            self.audio_lightbox(ctx, state, group, idx);
+            return;
+        }
+
         // Keyboard: navigation, view modes, mark, compare, close. Mode changes
         // are recorded as flags and applied after drawing (uniform one-frame
         // latency), so this frame draws a consistent state.
@@ -1370,9 +1624,11 @@ impl DupesView {
         let mut new_idx = idx;
         let (mut do_fit, mut do_one, mut do_mark) = (false, false, false);
         let (mut toggle_compare, mut toggle_flicker, mut swap) = (false, false, false);
+        let (mut esc, mut space) = (false, false);
+        let (mut edit_op, mut reset_edit, mut open_save) = (None::<Orient>, false, false);
         ctx.input(|i| {
             if i.key_pressed(egui::Key::Escape) {
-                close = true;
+                esc = true;
             }
             if i.key_pressed(egui::Key::ArrowRight) {
                 new_idx = (idx + 1) % count;
@@ -1393,10 +1649,31 @@ impl DupesView {
                 toggle_compare = true;
             }
             if i.key_pressed(egui::Key::Space) {
-                swap = true;
+                space = true;
             }
         });
+        // Escape is a universal "back": it pops one view level instead of
+        // closing outright — flicker → side-by-side → single image → closed.
+        // Space drives the flicker interaction: it enters flicker from
+        // side-by-side, then swaps A/B once there. Both reuse the deferred
+        // toggle flags so they apply after drawing like the button paths.
+        if esc {
+            match state.compare.as_ref() {
+                Some(c) if c.flicker => toggle_flicker = true,
+                Some(_) => toggle_compare = true,
+                None => close = true,
+            }
+        }
+        if space {
+            match state.compare.as_ref() {
+                Some(c) if c.flicker => swap = true,
+                Some(_) => toggle_flicker = true,
+                None => {}
+            }
+        }
         if close {
+            self.edit = None;
+            self.edit_save = false;
             return; // dropped state = closed
         }
         if new_idx != idx {
@@ -1467,6 +1744,11 @@ impl DupesView {
         };
         let b_meta = b.as_ref().map(lightbox_meta);
         let flicker = state.compare.as_ref().is_some_and(|c| c.flicker);
+        // Bottom strip height: compare stacks three lines (path A, path B, and
+        // the hint) where the single view needs only two, so it grows and the
+        // viewport shrinks to match — otherwise the hint line is pushed off the
+        // bottom of the screen (which is why it looked like it vanished).
+        let strip_h = if state.compare.is_some() { 74.0 } else { 50.0 };
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
 
         // Video preview: a scrubbable filmstrip instead of a zoomable image.
@@ -1477,6 +1759,27 @@ impl DupesView {
             .mime
             .as_deref()
             .is_some_and(|m| m.starts_with("video/"));
+
+        // Rotate/flip editing applies only to a single, non-video image. Drop a
+        // stale edit (and any open save modal) when we navigate to another image.
+        let a_hex = hash_hex(&a.entry.hash);
+        let a_is_image = a
+            .entry
+            .mime
+            .as_deref()
+            .is_some_and(|m| m.starts_with("image/"));
+        if self.edit.as_ref().is_some_and(|e| e.hex != a_hex) {
+            self.edit = None;
+            self.edit_save = false;
+        }
+        let editing = a_is_image && !a_is_video && state.compare.is_none();
+        let edited = editing && self.edit.as_ref().is_some_and(|e| !e.ops.is_empty());
+        // The single-image view draws the live edit preview when there are edits.
+        let (draw_tex, draw_img) = match &self.edit {
+            Some(e) if edited && e.hex == a_hex => (Some(e.tex.clone()), e.dims),
+            _ => (a_tex.clone(), a_img),
+        };
+
         let vp_screen = ctx.content_rect();
         let vp = egui::Rect::from_min_max(
             egui::pos2(vp_screen.min.x + 8.0, vp_screen.min.y + 44.0),
@@ -1521,7 +1824,7 @@ impl DupesView {
                 // Viewport = screen minus top control bar and bottom strip.
                 let viewport = egui::Rect::from_min_max(
                     egui::pos2(screen.min.x + 8.0, screen.min.y + 44.0),
-                    egui::pos2(screen.max.x - 8.0, screen.max.y - 62.0),
+                    egui::pos2(screen.max.x - 8.0, screen.max.y - strip_h - 12.0),
                 );
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);
                 let cursor = ctx.pointer_hover_pos();
@@ -1649,16 +1952,16 @@ impl DupesView {
                 } else {
                     // Single image: wheel zoom around cursor, drag pan.
                     if bg.dragged() {
-                        state.pan_by(bg.drag_delta(), viewport, a_img);
+                        state.pan_by(bg.drag_delta(), viewport, draw_img);
                     }
                     if scroll != 0.0
                         && let Some(c) = cursor
                         && viewport.contains(c)
                     {
-                        state.zoom_at(c, (scroll * 0.005).exp(), viewport, a_img);
+                        state.zoom_at(c, (scroll * 0.005).exp(), viewport, draw_img);
                     }
-                    let rect = state.image_rect(viewport, a_img);
-                    draw(ui, rect, viewport, &a_tex);
+                    let rect = state.image_rect(viewport, draw_img);
+                    draw(ui, rect, viewport, &draw_tex);
                 }
 
                 // Top control bar.
@@ -1772,6 +2075,72 @@ impl DupesView {
                             {
                                 toggle_compare = true;
                             }
+                            if editing {
+                                if pill(
+                                    ui,
+                                    "ROT L",
+                                    theme::PANEL,
+                                    theme::TEXT,
+                                    "Rotate counter-clockwise",
+                                    "Rotate 90° counter-clockwise. Lossless for PNG etc.; JPEG is \
+                                     re-encoded at high quality when you save.",
+                                ) {
+                                    edit_op = Some(Orient::RotateCcw);
+                                }
+                                if pill(
+                                    ui,
+                                    "ROT R",
+                                    theme::PANEL,
+                                    theme::TEXT,
+                                    "Rotate clockwise",
+                                    "Rotate the image 90° clockwise.",
+                                ) {
+                                    edit_op = Some(Orient::RotateCw);
+                                }
+                                if pill(
+                                    ui,
+                                    "FLIP H",
+                                    theme::PANEL,
+                                    theme::TEXT,
+                                    "Flip horizontally",
+                                    "Mirror the image left-to-right.",
+                                ) {
+                                    edit_op = Some(Orient::FlipH);
+                                }
+                                if pill(
+                                    ui,
+                                    "FLIP V",
+                                    theme::PANEL,
+                                    theme::TEXT,
+                                    "Flip vertically",
+                                    "Mirror the image top-to-bottom.",
+                                ) {
+                                    edit_op = Some(Orient::FlipV);
+                                }
+                                if edited {
+                                    if pill(
+                                        ui,
+                                        "RESET",
+                                        theme::PANEL,
+                                        theme::TAN,
+                                        "Discard edits",
+                                        "Discard the rotate/flip edits and show the original.",
+                                    ) {
+                                        reset_edit = true;
+                                    }
+                                    if pill(
+                                        ui,
+                                        &format!("{} SAVE", icon::CHECK),
+                                        theme::AMBER,
+                                        theme::BLACK,
+                                        "Save the rotated image",
+                                        "Write the rotated/flipped image to disk. You'll choose \
+                                         overwrite or a new copy, and confirm first.",
+                                    ) {
+                                        open_save = true;
+                                    }
+                                }
+                            }
                         } else {
                             if pill(
                                 ui,
@@ -1794,8 +2163,9 @@ impl DupesView {
                             } else {
                                 (
                                     "Switch to flicker mode",
-                                    "Overlay A and B full-window; space swaps between them in \
-                                     place — the fastest way to spot compression artifacts.",
+                                    "Overlay A and B full-window; space enters flicker and then \
+                                     swaps between them in place — the fastest way to spot \
+                                     compression artifacts.",
                                 )
                             };
                             if pill(ui, mode, theme::PANEL, theme::TEXT, mode_short, mode_verbose) {
@@ -1862,7 +2232,7 @@ impl DupesView {
 
                 // Bottom metadata + hint strip.
                 let bottom = egui::Rect::from_min_max(
-                    egui::pos2(screen.min.x + 8.0, screen.max.y - 56.0),
+                    egui::pos2(screen.min.x + 8.0, screen.max.y - strip_h - 6.0),
                     egui::pos2(screen.max.x - 8.0, screen.max.y - 6.0),
                 );
                 ui.scope_builder(
@@ -1898,11 +2268,12 @@ impl DupesView {
                                 row(ui, "B", bf, b_size_col, b_dim_col);
                             }
                             let _ = b_meta;
-                            ui.label(
-                                RichText::new("C exit · flicker: space swaps · Del/K marks B · Esc close")
-                                    .color(theme::LILAC)
-                                    .size(11.0),
-                            );
+                            let hint = if flicker {
+                                "wheel zoom · drag pan · space: swap A/B · Del/K mark B · Esc: back to side-by-side · C: exit compare"
+                            } else {
+                                "wheel zoom · drag pan · space: flicker · Del/K mark B · Esc/C: back to single"
+                            };
+                            ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
                         } else {
                             ui.label(RichText::new(&a_meta).color(theme::TEXT).size(13.0));
                             let hint = if a_is_video {
@@ -1953,15 +2324,1032 @@ impl DupesView {
             state.index = new_idx;
             state.reset_view();
         }
+        // Rotate/flip edits (deferred like the other controls).
+        if let Some(op) = edit_op {
+            self.edit_apply(ctx, &a_hex, &a.absolute_path(), op);
+        }
+        if reset_edit {
+            self.edit = None;
+        }
+        if open_save {
+            self.edit_save = true;
+        }
+
+        // Save-confirmation modal (Phase 6.6): overwrite in place or a `_rot`
+        // copy, both explicitly confirmed. Saving does not close the lightbox.
+        if self.edit_save {
+            let (mut do_overwrite, mut do_copy, mut cancel) = (false, false, false);
+            let is_jpeg = image::ImageFormat::from_path(a.absolute_path())
+                .is_ok_and(|f| f == image::ImageFormat::Jpeg);
+            egui::Modal::new(Id::new("edit-save")).show(&ctx.clone(), |ui| {
+                ui.set_width(400.0);
+                ui.label(
+                    RichText::new("SAVE ROTATED IMAGE")
+                        .color(theme::AMBER)
+                        .size(16.0)
+                        .strong(),
+                );
+                ui.add_space(6.0);
+                ui.label(RichText::new(&a.rel_path).color(theme::TEXT).size(12.0));
+                if is_jpeg {
+                    ui.label(
+                        RichText::new(
+                            "JPEG will be re-encoded at high quality — a small, unavoidable loss.",
+                        )
+                        .color(theme::TAN)
+                        .size(11.0),
+                    );
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("OVERWRITE ORIGINAL").color(theme::BLACK),
+                            )
+                            .fill(theme::RED),
+                        )
+                        .clicked()
+                    {
+                        do_overwrite = true;
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("SAVE A COPY").color(theme::BLACK))
+                                .fill(theme::BLUE),
+                        )
+                        .clicked()
+                    {
+                        do_copy = true;
+                    }
+                    if ui
+                        .button(RichText::new("CANCEL").color(theme::TEXT))
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Overwriting changes the file on disk and cannot be undone.")
+                        .color(theme::LILAC)
+                        .size(11.0),
+                );
+            });
+            if cancel {
+                self.edit_save = false;
+            } else if do_overwrite || do_copy {
+                let ops = self
+                    .edit
+                    .as_ref()
+                    .map(|e| e.ops.clone())
+                    .unwrap_or_default();
+                let path = self.edit.as_ref().map(|e| e.path.clone());
+                if let Some(path) = path {
+                    match imgedit::save_edited(&path, &ops, do_overwrite) {
+                        Ok(out) => {
+                            self.status = Some(format!("Saved {}", out.display()));
+                            self.error = None;
+                        }
+                        Err(e) => self.error = Some(format!("Save failed: {e}")),
+                    }
+                }
+                self.edit_save = false;
+                // Stay in the lightbox (6.6); keep the edit preview showing.
+            }
+        }
 
         if !close {
             self.lightbox = Some(state);
+        } else {
+            self.edit = None;
+            self.edit_save = false;
         }
 
         // Keep polling while video stills are still being extracted so the
         // filmstrip fills in without needing mouse movement.
         if video_pending {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
+        }
+    }
+
+    /// Full-window audio lightbox: each copy's decoded waveform, stacked for A/B
+    /// compare so differences stand out; `space` play/pause, `←`/`→` switch which
+    /// copy plays (keeping the offset, so you hear the same moment in each),
+    /// clicking a waveform plays that copy from there, `C` toggles compare, `Esc`
+    /// steps back (compare → single → closed).
+    /// Lazily upload (and cache) a spectrogram texture for `hex`.
+    fn spec_texture(
+        &mut self,
+        ctx: &egui::Context,
+        hex: &str,
+        viz: &crate::waveform::AudioViz,
+    ) -> egui::TextureHandle {
+        if let Some(t) = self.spec_tex.get(hex) {
+            return t.clone();
+        }
+        let tex = ctx.load_texture(
+            format!("spec-{hex}"),
+            spec_image(viz),
+            egui::TextureOptions::LINEAR,
+        );
+        self.spec_tex.insert(hex.to_string(), tex.clone());
+        tex
+    }
+
+    fn audio_lightbox(
+        &mut self,
+        ctx: &egui::Context,
+        mut state: LightboxState,
+        group: DupeGroup,
+        mut idx: usize,
+    ) {
+        let verbosity = self.verbosity;
+        let count = group.len();
+        let params = |f: &DupeFile| -> (String, PathBuf, u64) {
+            (
+                hash_hex(&f.entry.hash),
+                f.absolute_path(),
+                f.entry
+                    .audio
+                    .as_ref()
+                    .map_or(0, |a| u64::from(a.duration_ms)),
+            )
+        };
+
+        // A is the current copy; B (compare target) is another copy in the group.
+        let a = group[idx].clone();
+        let (a_hex, a_path, _a_total) = params(&a);
+        let a_viz = self.waves.get(&a_hex, &a_path);
+        let b_file = state
+            .compare
+            .as_ref()
+            .map(|c| group[c.other.min(count - 1)].clone());
+        let (b_hex, b_viz) = match &b_file {
+            Some(f) => {
+                let (h, p, _t) = params(f);
+                let v = self.waves.get(&h, &p);
+                (Some(h), v)
+            }
+            None => (None, None),
+        };
+        let comparing = b_file.is_some();
+        let flicker = state.compare.as_ref().is_some_and(|c| c.flicker);
+        let spectrogram = state.spectrogram;
+        // Build/fetch spectrogram textures (only needed in spectrogram view).
+        let a_tex = if spectrogram {
+            a_viz.clone().map(|v| self.spec_texture(ctx, &a_hex, &v))
+        } else {
+            None
+        };
+        let b_tex = match (spectrogram, b_hex.as_ref(), b_viz.clone()) {
+            (true, Some(h), Some(v)) => Some(self.spec_texture(ctx, h, &v)),
+            _ => None,
+        };
+
+        // ID3 tags for A (and B, when comparing) — cached, read is file I/O.
+        let a_tags = self
+            .tags_cache
+            .entry(a_hex.clone())
+            .or_insert_with(|| id3tags::read(&a_path))
+            .clone();
+        let b_tags = b_file.as_ref().and_then(|f| {
+            let (h, p, _t) = params(f);
+            self.tags_cache
+                .entry(h)
+                .or_insert_with(|| id3tags::read(&p))
+                .clone()
+        });
+
+        // Keyboard. `space` drives flicker (enter, then swap) exactly like the
+        // image lightbox; playback is `P`, `S` toggles the spectrogram, `T` the
+        // tag editor.
+        let mut close = false;
+        let mut new_idx = idx;
+        let (mut toggle_play, mut toggle_compare, mut esc) = (false, false, false);
+        let (mut space, mut toggle_flicker, mut swap, mut toggle_spec) =
+            (false, false, false, false);
+        // Which copy's tag editor to open (its group index), if any.
+        let mut open_tags: Option<usize> = None;
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::Escape) {
+                esc = true;
+            }
+            if i.key_pressed(egui::Key::ArrowRight) {
+                new_idx = (idx + 1) % count;
+            }
+            if i.key_pressed(egui::Key::ArrowLeft) {
+                new_idx = (idx + count - 1) % count;
+            }
+            if i.key_pressed(egui::Key::Space) {
+                space = true;
+            }
+            if i.key_pressed(egui::Key::P) {
+                toggle_play = true;
+            }
+            if i.key_pressed(egui::Key::S) {
+                toggle_spec = true;
+            }
+            if i.key_pressed(egui::Key::T) {
+                open_tags = Some(idx);
+            }
+            if i.key_pressed(egui::Key::C) {
+                toggle_compare = true;
+            }
+        });
+
+        // Player snapshot for the playback cursor. The cursor shows on exactly
+        // one row — the copy the user last started (`audio_active`) — because
+        // exact-duplicate copies share a content hash, so the hash alone can't
+        // say which row is playing.
+        let snap = self.player.snapshot();
+        let b_idx = state.compare.as_ref().map(|c| c.other.min(count - 1));
+        // Adopt an already-playing copy (e.g. started from a card) on open.
+        if state.audio_active.is_none()
+            && snap.loaded
+            && snap.hex.as_deref() == Some(a_hex.as_str())
+        {
+            state.audio_active = Some(idx);
+        }
+        let active = state.audio_active;
+        let cursor_at = |group_idx: usize, hex: &str| -> Option<f32> {
+            (active == Some(group_idx)
+                && snap.loaded
+                && snap.hex.as_deref() == Some(hex)
+                && snap.total_ms > 0)
+                .then(|| (snap.pos_ms as f32 / snap.total_ms as f32).clamp(0.0, 1.0))
+        };
+        let a_cursor = cursor_at(idx, &a_hex);
+        let b_cursor = b_file
+            .as_ref()
+            .zip(b_idx)
+            .and_then(|(f, bi)| cursor_at(bi, &params(f).0));
+
+        // Click on a waveform → play that copy from there. (row_is_b, fraction)
+        let mut click_play: Option<(bool, f32)> = None;
+
+        egui::Area::new(Id::new("audio-lightbox"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                let screen = ctx.content_rect();
+                // Absorb stray clicks so the cards behind stay inert.
+                let _sink = ui.allocate_rect(screen, egui::Sense::click());
+                ui.painter()
+                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(238));
+
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                let draw_row = |ui: &egui::Ui,
+                                rect: egui::Rect,
+                                viz: Option<&Arc<crate::waveform::AudioViz>>,
+                                tex: Option<&egui::TextureHandle>,
+                                color: egui::Color32,
+                                tag: &str,
+                                cursor: Option<f32>| {
+                    let p = ui.painter_at(rect);
+                    p.rect_filled(rect, 4.0, theme::PANEL);
+                    let ready = if spectrogram {
+                        if let Some(tex) = tex {
+                            p.image(tex.id(), rect, uv, egui::Color32::WHITE);
+                            true
+                        } else {
+                            false
+                        }
+                    } else if let Some(env) = viz.map(|v| &v.envelope).filter(|e| !e.is_empty()) {
+                        let n = env.len();
+                        let mid = rect.center().y;
+                        let bw = rect.width() / n as f32;
+                        for (i, &amp) in env.iter().enumerate() {
+                            let h = amp * rect.height() * 0.46;
+                            let x = rect.left() + i as f32 * bw;
+                            p.rect_filled(
+                                egui::Rect::from_min_max(
+                                    egui::pos2(x, mid - h),
+                                    egui::pos2(x + bw.max(1.0), mid + h),
+                                ),
+                                0.0,
+                                color,
+                            );
+                        }
+                        true
+                    } else {
+                        false
+                    };
+                    if !ready {
+                        p.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "analyzing…",
+                            egui::FontId::proportional(16.0),
+                            theme::TAN,
+                        );
+                    }
+                    if let Some(f) = cursor {
+                        let x = rect.left() + f * rect.width();
+                        p.line_segment(
+                            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                            egui::Stroke::new(1.5, theme::AMBER),
+                        );
+                    }
+                    p.text(
+                        rect.min + egui::vec2(6.0, 4.0),
+                        egui::Align2::LEFT_TOP,
+                        tag,
+                        egui::FontId::proportional(16.0),
+                        theme::AMBER,
+                    );
+                };
+
+                // View area. A right column always carries the read-only id3
+                // tags, split to mirror the waveform rows — A's tags beside the A
+                // wave, B's beside the B wave (symmetric), and flicker-aware.
+                let area = egui::Rect::from_min_max(
+                    egui::pos2(screen.min.x + 12.0, screen.min.y + 52.0),
+                    egui::pos2(screen.max.x - 12.0, screen.max.y - 64.0),
+                );
+                let tags_w = (area.width() * 0.28).clamp(180.0, 270.0);
+                let wave_area = egui::Rect::from_min_max(
+                    area.min,
+                    egui::pos2(area.max.x - tags_w - 12.0, area.max.y),
+                );
+                let tags_col = egui::Rect::from_min_max(
+                    egui::pos2(area.max.x - tags_w, area.min.y),
+                    area.max,
+                );
+                let frac_at = |rect: egui::Rect, resp: &egui::Response| {
+                    resp.interact_pointer_pos()
+                        .map(|p| ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0))
+                };
+                let fields: [TagField; 6] = [
+                    ("Title", |t| &t.title),
+                    ("Artist", |t| &t.artist),
+                    ("Album", |t| &t.album),
+                    ("Year", |t| &t.year),
+                    ("Track", |t| &t.track),
+                    ("Genre", |t| &t.genre),
+                ];
+                // Draw one copy's read-only tags into `rect`; values differing
+                // from `other` (when comparing) are highlighted. Returns the
+                // group index to edit if its EDIT button was clicked.
+                let draw_tags = |ui: &mut egui::Ui,
+                                 rect: egui::Rect,
+                                 own: &Option<Tags>,
+                                 other: &Option<Tags>,
+                                 header: &str,
+                                 header_col: egui::Color32,
+                                 edit_idx: usize|
+                 -> Option<usize> {
+                    let mut edit = None;
+                    ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(rect.shrink(6.0))
+                            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("{header}  ID3"))
+                                        .color(header_col)
+                                        .size(12.0)
+                                        .strong(),
+                                );
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new(format!("{} EDIT", icon::PENCIL))
+                                                .color(theme::TEXT),
+                                        )
+                                        .fill(theme::PANEL),
+                                    )
+                                    .clicked()
+                                {
+                                    edit = Some(edit_idx);
+                                }
+                            });
+                            ui.add_space(2.0);
+                            for (name, get) in fields {
+                                let ov = own.as_ref().map(get).unwrap_or("");
+                                let tv = other.as_ref().map(get).unwrap_or("");
+                                let col = if own.is_some() && ov != tv {
+                                    theme::AMBER
+                                } else {
+                                    theme::TEXT
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.add_sized(
+                                        [46.0, 15.0],
+                                        egui::Label::new(
+                                            RichText::new(name).color(theme::LILAC).size(10.0),
+                                        ),
+                                    );
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(ov).color(col).size(11.0),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(ov);
+                                });
+                            }
+                        },
+                    );
+                    edit
+                };
+
+                if comparing && flicker {
+                    // Overlay: show A or B full-area (and its tags); space swaps.
+                    let show_b = state.compare.as_ref().is_some_and(|c| c.show_b);
+                    let ra = ui.allocate_rect(wave_area, egui::Sense::click());
+                    if show_b {
+                        draw_row(ui, wave_area, b_viz.as_ref(), b_tex.as_ref(), theme::TAN, "B", b_cursor);
+                    } else {
+                        draw_row(ui, wave_area, a_viz.as_ref(), a_tex.as_ref(), theme::BLUE, "A", a_cursor);
+                    }
+                    if ra.clicked()
+                        && let Some(f) = frac_at(wave_area, &ra)
+                    {
+                        click_play = Some((show_b, f));
+                    }
+                    let hit = if show_b {
+                        draw_tags(ui, tags_col, &b_tags, &a_tags, "B", theme::TAN, b_idx.unwrap_or(idx))
+                    } else {
+                        draw_tags(ui, tags_col, &a_tags, &b_tags, "A", theme::BLUE, idx)
+                    };
+                    open_tags = open_tags.or(hit);
+                } else if comparing {
+                    let gap = 12.0;
+                    let half = (wave_area.height() - gap) / 2.0;
+                    let top =
+                        egui::Rect::from_min_size(wave_area.min, egui::vec2(wave_area.width(), half));
+                    let bot = egui::Rect::from_min_size(
+                        egui::pos2(wave_area.min.x, wave_area.min.y + half + gap),
+                        egui::vec2(wave_area.width(), half),
+                    );
+                    let ttop =
+                        egui::Rect::from_min_size(tags_col.min, egui::vec2(tags_col.width(), half));
+                    let tbot = egui::Rect::from_min_size(
+                        egui::pos2(tags_col.min.x, tags_col.min.y + half + gap),
+                        egui::vec2(tags_col.width(), half),
+                    );
+                    let ra = ui.allocate_rect(top, egui::Sense::click());
+                    draw_row(ui, top, a_viz.as_ref(), a_tex.as_ref(), theme::BLUE, "A", a_cursor);
+                    if ra.clicked()
+                        && let Some(f) = frac_at(top, &ra)
+                    {
+                        click_play = Some((false, f));
+                    }
+                    let rb = ui.allocate_rect(bot, egui::Sense::click());
+                    draw_row(ui, bot, b_viz.as_ref(), b_tex.as_ref(), theme::TAN, "B", b_cursor);
+                    if rb.clicked()
+                        && let Some(f) = frac_at(bot, &rb)
+                    {
+                        click_play = Some((true, f));
+                    }
+                    // Symmetric tag panels: A beside the top row, B beside bottom.
+                    let ha = draw_tags(ui, ttop, &a_tags, &b_tags, "A", theme::BLUE, idx);
+                    let hb = draw_tags(
+                        ui,
+                        tbot,
+                        &b_tags,
+                        &a_tags,
+                        "B",
+                        theme::TAN,
+                        b_idx.unwrap_or(idx),
+                    );
+                    open_tags = open_tags.or(ha).or(hb);
+                } else {
+                    let ra = ui.allocate_rect(wave_area, egui::Sense::click());
+                    draw_row(ui, wave_area, a_viz.as_ref(), a_tex.as_ref(), theme::BLUE, "A", a_cursor);
+                    if ra.clicked()
+                        && let Some(f) = frac_at(wave_area, &ra)
+                    {
+                        click_play = Some((false, f));
+                    }
+                    let hit = draw_tags(ui, tags_col, &a_tags, &b_tags, "A", theme::BLUE, idx);
+                    open_tags = open_tags.or(hit);
+                }
+
+                // Top control bar.
+                let top_bar = egui::Rect::from_min_max(
+                    egui::pos2(screen.min.x + 8.0, screen.min.y + 6.0),
+                    egui::pos2(screen.max.x - 8.0, screen.min.y + 40.0),
+                );
+                // PLAY/PAUSE reflects whether *any* copy is playing, not just A —
+                // in compare the audible copy switches, but the button must stay
+                // PAUSE the whole time something is playing.
+                let playing = snap.loaded && snap.playing;
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(top_bar)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    |ui| {
+                        let pill = |ui: &mut egui::Ui,
+                                    text: &str,
+                                    fill: egui::Color32,
+                                    col: egui::Color32,
+                                    short: &str,
+                                    verbose: &str| {
+                            ui.add(egui::Button::new(RichText::new(text).color(col)).fill(fill))
+                                .explain(verbosity, short, verbose)
+                                .clicked()
+                        };
+                        if pill(
+                            ui,
+                            &format!("{} CLOSE", icon::CHECK),
+                            theme::AMBER,
+                            theme::BLACK,
+                            "Close the audio lightbox",
+                            "Close and return to the group list (Esc steps back one level).",
+                        ) {
+                            close = true;
+                        }
+                        if pill(
+                            ui,
+                            icon::CARET_LEFT,
+                            theme::PANEL,
+                            theme::TEXT,
+                            "Previous copy",
+                            "Switch to the previous copy, keeping the playback offset (← does \
+                             the same).",
+                        ) {
+                            new_idx = (idx + count - 1) % count;
+                        }
+                        ui.label(
+                            RichText::new(format!("{} / {count}", idx + 1))
+                                .color(theme::TAN)
+                                .strong(),
+                        );
+                        if pill(
+                            ui,
+                            icon::CARET_RIGHT,
+                            theme::PANEL,
+                            theme::TEXT,
+                            "Next copy",
+                            "Switch to the next copy, keeping the playback offset (→ does the \
+                             same).",
+                        ) {
+                            new_idx = (idx + 1) % count;
+                        }
+                        let (pl, pf, pc) = if playing {
+                            ("PAUSE", theme::AMBER, theme::BLACK)
+                        } else {
+                            ("PLAY", theme::PANEL, theme::TEXT)
+                        };
+                        if pill(
+                            ui,
+                            pl,
+                            pf,
+                            pc,
+                            "Play/pause",
+                            "Play or pause the current copy (P does the same).",
+                        ) {
+                            toggle_play = true;
+                        }
+                        // Waveform ↔ spectrogram view toggle.
+                        let (vl, vshort, vverbose) = if spectrogram {
+                            (
+                                "WAVEFORM",
+                                "Show the amplitude waveform",
+                                "Switch back to the amplitude waveform (S toggles).",
+                            )
+                        } else {
+                            (
+                                "SPECTROGRAM",
+                                "Show the spectrogram",
+                                "Switch to a frequency-vs-time spectrogram: brightness is loudness \
+                                 per frequency band — far more telling than the flat waveform for \
+                                 loud music (S toggles).",
+                            )
+                        };
+                        if pill(ui, vl, theme::PANEL, theme::LILAC, vshort, vverbose) {
+                            toggle_spec = true;
+                        }
+                        if pill(
+                            ui,
+                            &format!("{} TAGS", icon::PENCIL),
+                            theme::PANEL,
+                            theme::TEXT,
+                            "Edit ID3 tags",
+                            "Open the ID3 tag editor for the current copy — the panels on the \
+                             right show them read-only; saving writes only the tags, the audio \
+                             is untouched (T does the same).",
+                        ) {
+                            open_tags = Some(idx);
+                        }
+                        if count >= 2 {
+                            let (cl, cshort, cverbose) = if comparing {
+                                (
+                                    "EXIT COMPARE",
+                                    "Back to a single copy",
+                                    "Hide the B view and show only the current copy.",
+                                )
+                            } else {
+                                (
+                                    "COMPARE",
+                                    "Compare against another copy",
+                                    "Stack a second copy below this one so differences are \
+                                     visible; click either to hear that spot.",
+                                )
+                            };
+                            if pill(ui, cl, theme::PANEL, theme::BLUE, cshort, cverbose) {
+                                toggle_compare = true;
+                            }
+                            if comparing {
+                                let (ml, mshort, mverbose) = if flicker {
+                                    (
+                                        "SIDE BY SIDE",
+                                        "Stack A and B",
+                                        "Show A and B stacked instead of overlaid.",
+                                    )
+                                } else {
+                                    (
+                                        "FLICKER",
+                                        "Overlay & flicker",
+                                        "Overlay A and B in one pane; space enters flicker and \
+                                         then swaps between them — flick A↔B to spot differences.",
+                                    )
+                                };
+                                if pill(ui, ml, theme::PANEL, theme::TEXT, mshort, mverbose) {
+                                    toggle_flicker = true;
+                                }
+                                if flicker
+                                    && pill(
+                                        ui,
+                                        "SWAP",
+                                        theme::PANEL,
+                                        theme::TEXT,
+                                        "Swap A/B",
+                                        "Swap which copy is shown in flicker (space does the same).",
+                                    )
+                                {
+                                    swap = true;
+                                }
+                            }
+                        }
+                    },
+                );
+
+                // Bottom metadata + hint strip.
+                let bottom = egui::Rect::from_min_max(
+                    egui::pos2(screen.min.x + 12.0, screen.max.y - 58.0),
+                    egui::pos2(screen.max.x - 12.0, screen.max.y - 6.0),
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(bottom)
+                        .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                    |ui| {
+                        let meta = |ui: &mut egui::Ui, tag: &str, f: &DupeFile| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{tag}  {}  ·  {}  ·  {}",
+                                    f.rel_path,
+                                    format_size(f.entry.size),
+                                    fmt_ms(
+                                        f.entry
+                                            .audio
+                                            .as_ref()
+                                            .map_or(0, |a| u64::from(a.duration_ms))
+                                    ),
+                                ))
+                                .color(theme::TEXT)
+                                .size(12.0),
+                            );
+                        };
+                        meta(ui, "A", &a);
+                        if let Some(bf) = &b_file {
+                            meta(ui, "B", bf);
+                        }
+                        let view = if spectrogram { "waveform" } else { "spectrogram" };
+                        let hint = if flicker {
+                            format!(
+                                "space: swap A/B · P play · {}/{} copy · S {view} · Esc back",
+                                icon::CARET_LEFT,
+                                icon::CARET_RIGHT,
+                            )
+                        } else if comparing {
+                            format!(
+                                "space: flicker · P play · click to play · {}/{} copy · S {view} · \
+                                 C exit · Esc back",
+                                icon::CARET_LEFT,
+                                icon::CARET_RIGHT,
+                            )
+                        } else {
+                            format!(
+                                "P play/pause · click to play · {}/{} switch copy (keeps offset) · \
+                                 C compare · S {view} · Esc back",
+                                icon::CARET_LEFT,
+                                icon::CARET_RIGHT,
+                            )
+                        };
+                        ui.label(
+                            RichText::new(hint)
+                            .color(theme::LILAC)
+                            .size(11.0),
+                        );
+                    },
+                );
+            });
+
+        // Apply deferred actions now that drawing is done. Esc and space mirror
+        // the image lightbox: Esc steps back one level (flicker → side-by-side →
+        // single → closed); space enters flicker from side-by-side, then swaps.
+        // Esc closes the tag editor first (if open), else backs out a level.
+        if esc && self.tag_edit.is_some() {
+            self.tag_edit = None;
+            esc = false;
+        }
+        if esc {
+            match state.compare.as_ref() {
+                Some(c) if c.flicker => toggle_flicker = true,
+                Some(_) => toggle_compare = true,
+                None => close = true,
+            }
+        }
+        if space {
+            match state.compare.as_ref() {
+                Some(c) if c.flicker => swap = true,
+                Some(_) => toggle_flicker = true,
+                None => {}
+            }
+        }
+        if close {
+            self.player.stop();
+            self.spec_tex.clear();
+            self.tag_edit = None;
+            return; // dropped state = closed
+        }
+        // A tag EDIT button (or `T`) opens the editor for that copy; clicking it
+        // again for the copy already open closes it (a toggle).
+        if let Some(ei) = open_tags {
+            let f = group[ei.min(count - 1)].clone();
+            let (h, p, _t) = params(&f);
+            if self.tag_edit.as_ref().map(|t| t.hex.as_str()) == Some(h.as_str()) {
+                self.tag_edit = None;
+            } else {
+                let tags = self
+                    .tags_cache
+                    .entry(h.clone())
+                    .or_insert_with(|| id3tags::read(&p))
+                    .clone();
+                // Collect the distinct value seen for each field across every
+                // copy in the group, so the editor can offer them as options.
+                let mut options: [Vec<String>; 6] = std::array::from_fn(|_| Vec::new());
+                for gf in &group {
+                    let (gh, gp, _) = params(gf);
+                    if let Some(t) = self
+                        .tags_cache
+                        .entry(gh)
+                        .or_insert_with(|| id3tags::read(&gp))
+                        .clone()
+                    {
+                        let vals = [&t.title, &t.artist, &t.album, &t.year, &t.track, &t.genre];
+                        for (i, v) in vals.into_iter().enumerate() {
+                            if !v.is_empty() && !options[i].iter().any(|o| o == v) {
+                                options[i].push(v.clone());
+                            }
+                        }
+                    }
+                }
+                self.tag_edit = Some(TagEdit {
+                    hex: h,
+                    path: p,
+                    tags: tags.unwrap_or_default(),
+                    options,
+                });
+            }
+        }
+        if toggle_spec {
+            state.spectrogram = !state.spectrogram;
+        }
+
+        let snap = self.player.snapshot();
+        let cur_ms = snap.pos_ms;
+        // Whether the player already holds exactly this (A, B) pair — if so, a
+        // flicker swap is just an instant, gap-free volume flip.
+        let paired_ab = comparing
+            && snap.paired
+            && snap.hex_a.as_deref() == Some(a_hex.as_str())
+            && snap.hex_b.as_deref() == b_hex.as_deref();
+
+        // Start (or re-target) playback at `offset`, making the chosen copy
+        // audible. In compare mode both copies load into a synced pair so
+        // flicker swaps are gap-free; otherwise a single file plays.
+        let start_play = |me: &DupesView, want_b: bool, offset: u64| {
+            if let (true, Some(bf)) = (comparing, b_file.as_ref()) {
+                let (bh, bp, _bt) = params(bf);
+                me.player
+                    .play_pair(&a_hex, &a_path, &bh, &bp, _a_total, offset, want_b);
+            } else {
+                me.player.play(&a_hex, &a_path, _a_total, offset);
+            }
+        };
+
+        // ←/→ : in single view, step which copy is A (keeping the offset). In
+        // compare, *flip which copy is audible* instead — gap-free via the loaded
+        // pair — and move the cursor with it. Re-indexing A while comparing would
+        // collide it with B and force a reloading pause (the bug the user hit).
+        let nav = new_idx != idx;
+        if nav && comparing {
+            if let Some(bi) = b_idx {
+                let want_b = state.audio_active != Some(bi); // flip audible copy
+                if snap.loaded {
+                    let target = if want_b {
+                        b_hex.as_deref()
+                    } else {
+                        Some(a_hex.as_str())
+                    };
+                    if paired_ab {
+                        if snap.hex.as_deref() != target {
+                            self.player.flip();
+                        }
+                    } else {
+                        start_play(self, want_b, cur_ms);
+                    }
+                }
+                state.audio_active = Some(if want_b { bi } else { idx });
+                if let Some(c) = state.compare.as_mut()
+                    && c.flicker
+                {
+                    c.show_b = want_b;
+                }
+            }
+        } else if nav {
+            idx = new_idx;
+            state.index = idx;
+            self.tag_edit = None; // tags belong to the copy we just left
+            if snap.loaded {
+                let (h, p, t) = params(&group[idx]);
+                self.player.play(&h, &p, t, cur_ms.min(t));
+                state.audio_active = Some(idx);
+            }
+        }
+        if toggle_compare {
+            if state.compare.is_some() {
+                state.compare = None;
+            } else if count >= 2 {
+                let other = if idx == 0 { 1 } else { 0 };
+                state.compare = Some(CompareState::new(other));
+            }
+        }
+        if toggle_flicker && let Some(c) = state.compare.as_mut() {
+            c.flicker = !c.flicker;
+            // Entering flicker: show the copy that is currently audible.
+            if c.flicker {
+                c.show_b = state.audio_active.is_some() && state.audio_active == b_idx;
+            }
+        }
+        // Keep the synced A/B pair loaded whenever comparing and playing, so both
+        // flicker swaps *and* side-by-side clicks switch instantly (gap-free).
+        // Skipped when another action this frame already (re)starts playback.
+        let busy = nav || swap || toggle_play || click_play.is_some();
+        if comparing && snap.playing && !paired_ab && !busy {
+            start_play(self, state.audio_active == b_idx, cur_ms);
+        }
+        // space in flicker → swap the shown copy AND the audio, gap-free when the
+        // pair is loaded (else load it), moving the cursor with it.
+        if swap
+            && let Some(c) = state.compare.as_mut()
+            && c.flicker
+        {
+            c.show_b = !c.show_b;
+        }
+        if swap && state.compare.as_ref().is_some_and(|c| c.flicker) && snap.loaded {
+            let show_b = state.compare.as_ref().is_some_and(|c| c.show_b);
+            if paired_ab {
+                self.player.flip();
+            } else {
+                start_play(self, show_b, cur_ms);
+            }
+            state.audio_active = if show_b { b_idx } else { Some(idx) };
+        }
+        if toggle_play {
+            if snap.loaded {
+                self.player.toggle_pause();
+            } else {
+                start_play(self, false, cur_ms.min(_a_total));
+                state.audio_active = Some(idx);
+            }
+        }
+        if let Some((is_b, frac)) = click_play {
+            let want_b = is_b && comparing;
+            if paired_ab && snap.playing {
+                // Gap-free: flip to the clicked copy if it isn't already audible,
+                // and seek only if the click actually moves the playhead — so
+                // clicking the other copy at the same spot is an instant A/B swap.
+                let wanted = if want_b {
+                    b_hex.as_deref()
+                } else {
+                    Some(a_hex.as_str())
+                };
+                if snap.hex.as_deref() != wanted {
+                    self.player.flip();
+                }
+                let cur = if snap.total_ms > 0 {
+                    snap.pos_ms as f32 / snap.total_ms as f32
+                } else {
+                    0.0
+                };
+                if (cur - frac).abs() > 0.01 {
+                    self.player.seek_fraction(frac);
+                }
+            } else {
+                let offset = (f64::from(frac) * _a_total as f64) as u64;
+                start_play(self, want_b, offset);
+            }
+            state.audio_active = if want_b { b_idx } else { Some(idx) };
+            if let Some(c) = state.compare.as_mut()
+                && c.flicker
+            {
+                c.show_b = want_b;
+            }
+        }
+
+        // ID3 tag editor modal (Phase 6.5). Fields bind to the working copy;
+        // SAVE writes tags only (audio untouched) and keeps the lightbox open.
+        if self.tag_edit.is_some() {
+            let (mut save, mut cancel) = (false, false);
+            egui::Modal::new(Id::new("id3-edit")).show(&ctx.clone(), |ui| {
+                let te = self.tag_edit.as_mut().unwrap();
+                ui.set_width(440.0);
+                ui.label(
+                    RichText::new("EDIT ID3 TAGS")
+                        .color(theme::AMBER)
+                        .size(16.0)
+                        .strong(),
+                );
+                ui.add_space(8.0);
+                let field = |ui: &mut egui::Ui, label: &str, val: &mut String, opts: &[String]| {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [56.0, 18.0],
+                            egui::Label::new(RichText::new(label).color(theme::TAN).size(12.0)),
+                        );
+                        ui.add(egui::TextEdit::singleline(val).desired_width(300.0));
+                        // Adopt a value from another copy in the group.
+                        if !opts.is_empty() {
+                            ui.menu_button(icon::CARET_RIGHT, |ui| {
+                                for o in opts {
+                                    if ui.button(RichText::new(o).color(theme::TEXT)).clicked() {
+                                        *val = o.clone();
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text("Pick a value from another copy in this group");
+                        }
+                    });
+                };
+                field(ui, "Title", &mut te.tags.title, &te.options[0]);
+                field(ui, "Artist", &mut te.tags.artist, &te.options[1]);
+                field(ui, "Album", &mut te.tags.album, &te.options[2]);
+                field(ui, "Year", &mut te.tags.year, &te.options[3]);
+                field(ui, "Track", &mut te.tags.track, &te.options[4]);
+                field(ui, "Genre", &mut te.tags.genre, &te.options[5]);
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("SAVE TAGS").color(theme::BLACK))
+                                .fill(theme::AMBER),
+                        )
+                        .clicked()
+                    {
+                        save = true;
+                    }
+                    if ui
+                        .button(RichText::new("CANCEL").color(theme::TEXT))
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Saving writes the tags to the file on disk; the audio is unchanged.",
+                    )
+                    .color(theme::LILAC)
+                    .size(11.0),
+                );
+            });
+            if cancel {
+                self.tag_edit = None;
+            } else if save && let Some(te) = self.tag_edit.take() {
+                match id3tags::write(&te.path, &te.tags) {
+                    Ok(()) => {
+                        self.status = Some("Tags saved".into());
+                        self.error = None;
+                        self.tags_cache.insert(te.hex, Some(te.tags));
+                    }
+                    Err(e) => self.error = Some(format!("Tag save failed: {e}")),
+                }
+            }
+        }
+
+        self.lightbox = Some(state);
+        // Keep repainting while a copy plays so the cursor advances smoothly.
+        if self.player.is_active() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
 
@@ -2047,7 +3435,11 @@ impl DupesView {
                 if snap.loaded && snap.hex.as_deref() == Some(hex.as_str()) {
                     self.player.toggle_pause();
                 } else {
-                    self.player.play(&hex, &path, total_ms);
+                    // Switching between a group's copies keeps the current
+                    // offset, so you hear the same moment in each — the openings
+                    // are byte-identical, so any difference is later in the track.
+                    let start_ms = if snap.loaded { snap.pos_ms } else { 0 };
+                    self.player.play(&hex, &path, total_ms, start_ms);
                 }
             }
             Act::SeekAudio(f) => self.player.seek_fraction(f),
@@ -3013,6 +4405,602 @@ mod ui_tests {
         assert!(snap.loaded, "player reports a loaded track");
     }
 
+    /// Audio cards render a fingerprint-glyph tile (with the duration) instead
+    /// of the generic broken-image placeholder, which used to show the raw mime
+    /// string in place of a thumbnail.
+    #[test]
+    fn audio_card_shows_fingerprint_tile_not_placeholder() {
+        let group: DupeGroup = (0..2).map(audio_file).collect();
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(900.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+
+        assert!(
+            harness.query_by_label("track0.mp3").is_some(),
+            "the audio card renders"
+        );
+        assert!(
+            harness.query_by_label("audio/mpeg").is_none(),
+            "the audio tile replaces the broken-image placeholder (which showed the raw mime)"
+        );
+    }
+
+    /// Switching to another copy in a group keeps the playback offset, so you
+    /// hear the same moment in each. Clicking the currently-playing file instead
+    /// toggles pause (offset untouched).
+    #[test]
+    fn switching_audio_copies_keeps_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let ctx = egui::Context::default();
+        let mut view = DupesView::new();
+
+        let f0 = audio_file(0);
+        let f1 = audio_file(1);
+        let hex0 = hash_hex(&f0.entry.hash);
+        let hex1 = hash_hex(&f1.entry.hash);
+        let total = f0.entry.audio.as_ref().unwrap().duration_ms as u64;
+
+        // Start copy 0 from the beginning, then seek into the middle.
+        view.apply(
+            &ctx,
+            &store,
+            Act::PlayAudio(hex0, f0.absolute_path(), total),
+        );
+        view.apply(&ctx, &store, Act::SeekAudio(0.5));
+        let mid = view.player.snapshot().pos_ms;
+        assert!(mid > 0, "seeking advanced the position");
+
+        // Switch to copy 1 → the offset carries over.
+        view.apply(
+            &ctx,
+            &store,
+            Act::PlayAudio(hex1.clone(), f1.absolute_path(), total),
+        );
+        let snap = view.player.snapshot();
+        assert_eq!(
+            snap.hex.as_deref(),
+            Some(hex1.as_str()),
+            "switched to the other copy"
+        );
+        assert_eq!(
+            snap.pos_ms, mid,
+            "playback offset carried over to the new copy"
+        );
+    }
+
+    /// Clicking an audio card opens the dedicated audio lightbox (not the image
+    /// viewer); `P` plays, `S` toggles the spectrogram, `C` compares, `space`
+    /// drives flicker (enter then swap), and `Esc` steps back one level at a time.
+    #[test]
+    fn audio_lightbox_opens_compares_plays_and_escapes() {
+        let group: DupeGroup = (0..2).map(audio_file).collect();
+        let a_hex = hash_hex(&group[0].entry.hash);
+        let b_hex = hash_hex(&group[1].entry.hash);
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.run();
+
+        // The audio lightbox shows its own controls (CLOSE + COMPARE are unique
+        // to it; the image viewer's FIT/1:1 must be absent). PLAY is ambiguous
+        // because the card behind the overlay also has one, so it isn't queried.
+        assert!(
+            harness
+                .query_by_label(&format!("{} CLOSE", icon::CHECK))
+                .is_some(),
+            "audio lightbox shows a CLOSE control"
+        );
+        assert!(
+            harness.query_by_label("COMPARE").is_some(),
+            "audio lightbox offers A/B compare"
+        );
+        assert!(
+            harness.query_by_label("FIT").is_none(),
+            "audio lightbox is not the image viewer"
+        );
+
+        // P plays the current copy (A). Playback keeps repainting, so step a
+        // fixed number of frames rather than running to a settled state.
+        harness.key_press(egui::Key::P);
+        harness.step();
+        harness.step();
+        assert_eq!(
+            harness.state().player.snapshot().hex.as_deref(),
+            Some(a_hex.as_str()),
+            "P plays the current copy"
+        );
+
+        // S toggles the spectrogram view.
+        harness.key_press(egui::Key::S);
+        harness.step();
+        harness.step();
+        assert!(
+            harness.state().lightbox.as_ref().unwrap().spectrogram,
+            "S switches to the spectrogram view"
+        );
+
+        // C enters compare; space then enters flicker and swaps A/B — mirroring
+        // the image lightbox.
+        harness.key_press(egui::Key::C);
+        harness.step();
+        harness.step();
+        assert!(
+            harness.state().lightbox.as_ref().unwrap().compare.is_some(),
+            "C enters compare"
+        );
+        // Comparing while playing loads the synced A/B pair even in side-by-side
+        // (not just flicker), so a click on either copy switches gap-free.
+        harness.step();
+        assert!(
+            harness.state().player.snapshot().paired,
+            "side-by-side compare keeps the A/B pair loaded"
+        );
+
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        harness.step();
+        assert!(
+            harness
+                .state()
+                .lightbox
+                .as_ref()
+                .unwrap()
+                .compare
+                .as_ref()
+                .is_some_and(|c| c.flicker && !c.show_b),
+            "space enters flicker showing A"
+        );
+        // Entering flicker while playing loads the synced A/B pair, still audible A.
+        let snap = harness.state().player.snapshot();
+        assert!(
+            snap.paired,
+            "flicker loads the A/B pair for gap-free swapping"
+        );
+        assert_eq!(
+            snap.hex.as_deref(),
+            Some(a_hex.as_str()),
+            "A is audible first"
+        );
+
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        harness.step();
+        assert!(
+            harness
+                .state()
+                .lightbox
+                .as_ref()
+                .unwrap()
+                .compare
+                .as_ref()
+                .is_some_and(|c| c.flicker && c.show_b),
+            "space swaps A/B within flicker"
+        );
+        // The swap flips the audio too (gap-free): B is now the audible channel.
+        assert_eq!(
+            harness.state().player.snapshot().hex.as_deref(),
+            Some(b_hex.as_str()),
+            "flicker swap makes B audible"
+        );
+
+        // Esc steps back: flicker → side-by-side → single → closed.
+        for expect in ["flicker-off", "compare-off", "closed"] {
+            harness.key_press(egui::Key::Escape);
+            harness.step();
+            harness.step();
+            match expect {
+                "flicker-off" => assert!(
+                    harness
+                        .state()
+                        .lightbox
+                        .as_ref()
+                        .unwrap()
+                        .compare
+                        .as_ref()
+                        .is_some_and(|c| !c.flicker),
+                    "Esc leaves flicker back to side-by-side"
+                ),
+                "compare-off" => assert!(
+                    harness.state().lightbox.as_ref().unwrap().compare.is_none(),
+                    "Esc leaves compare back to the single view"
+                ),
+                _ => assert!(
+                    harness.state().lightbox.is_none(),
+                    "Esc from the single view closes the lightbox"
+                ),
+            }
+        }
+    }
+
+    /// `T` opens the audio lightbox's ID3 editor pre-filled with the file's
+    /// tags; editing a field and clicking SAVE TAGS writes only the tags to
+    /// disk, preserves the others, and keeps the lightbox open (6.5/6.6).
+    #[test]
+    fn audio_lightbox_edits_and_saves_id3_tags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mp3 = tmp.path().join("song.mp3");
+        crate::id3tags::write_bare_mp3(&mp3);
+        crate::id3tags::write(
+            &mp3,
+            &Tags {
+                title: "Old".into(),
+                artist: "Cohen".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut hash = [0u8; 32];
+        hash[0] = 0xC3;
+        let file = DupeFile {
+            repo: "r".into(),
+            repo_root: tmp.path().to_string_lossy().into_owned(),
+            rel_path: "song.mp3".into(),
+            entry: dedup_core::store::FileEntry {
+                size: 417,
+                hash,
+                modified_ms: 0,
+                missing: false,
+                mime: Some("audio/mpeg".into()),
+                img_fingerprint: None,
+                video_hash: None,
+                pdf_hash: None,
+                audio: Some(dedup_core::store::AudioFp {
+                    duration_ms: 1000,
+                    chunk_hashes: Vec::new(),
+                }),
+                img_size: None,
+                origin: None,
+                exif: None,
+            },
+        };
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![vec![file]]));
+
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.run();
+
+        // T opens the editor, pre-filled from the file.
+        harness.key_press(egui::Key::T);
+        harness.run();
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .tag_edit
+                .as_ref()
+                .map(|t| t.tags.title.as_str()),
+            Some("Old"),
+            "editor opens pre-filled with the current title"
+        );
+
+        // Type a new title, then SAVE TAGS.
+        harness.state_mut().tag_edit.as_mut().unwrap().tags.title = "New Title".into();
+        harness.run();
+        harness.get_by_label("SAVE TAGS").click();
+        harness.run();
+
+        let saved = crate::id3tags::read(&mp3).expect("tags still readable");
+        assert_eq!(saved.title, "New Title", "the new title is written to disk");
+        assert_eq!(saved.artist, "Cohen", "other tags are preserved");
+        assert!(
+            harness.state().tag_edit.is_none(),
+            "the editor closes on save"
+        );
+        assert!(
+            harness.state().lightbox.is_some(),
+            "saving keeps the lightbox open (6.6)"
+        );
+    }
+
+    /// In side-by-side compare, `←`/`→` flip which copy is audible (gap-free via
+    /// the loaded pair) and move the cursor — not re-index A (which used to
+    /// pause and strand the cursor on the top row).
+    #[test]
+    fn audio_compare_arrow_flips_audible_copy() {
+        let group: DupeGroup = (0..2).map(audio_file).collect();
+        let a_hex = hash_hex(&group[0].entry.hash);
+        let b_hex = hash_hex(&group[1].entry.hash);
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.run();
+
+        // Enter compare, then play → the synced pair loads (A audible).
+        harness.key_press(egui::Key::C);
+        harness.run();
+        harness.run();
+        harness.key_press(egui::Key::P);
+        harness.step();
+        harness.step();
+        let snap = harness.state().player.snapshot();
+        assert!(snap.paired, "compare + play loads the pair");
+        assert_eq!(snap.hex.as_deref(), Some(a_hex.as_str()), "A audible first");
+
+        // → flips audible to B, gap-free (still paired), cursor follows.
+        harness.key_press(egui::Key::ArrowRight);
+        harness.step();
+        harness.step();
+        let snap = harness.state().player.snapshot();
+        assert_eq!(
+            snap.hex.as_deref(),
+            Some(b_hex.as_str()),
+            "→ flips audible to B"
+        );
+        assert!(snap.paired, "still paired — no reload, no gap");
+        assert!(
+            snap.loaded && snap.playing,
+            "still playing after the flip — so the transport button stays PAUSE (not PLAY)"
+        );
+        assert_eq!(
+            harness.state().lightbox.as_ref().unwrap().audio_active,
+            Some(1),
+            "the playback cursor moves to B"
+        );
+
+        // → again flips back to A.
+        harness.key_press(egui::Key::ArrowRight);
+        harness.step();
+        harness.step();
+        assert_eq!(
+            harness.state().player.snapshot().hex.as_deref(),
+            Some(a_hex.as_str()),
+            "→ flips back to A"
+        );
+    }
+
+    /// Side-by-side compare shows a tag panel per row: A's tags beside the A
+    /// wave, B's beside the B wave (symmetric), each with its own EDIT button.
+    #[test]
+    fn audio_compare_shows_symmetric_tag_panels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |name: &str, artist: &str, i: u8| -> DupeFile {
+            let path = tmp.path().join(name);
+            crate::id3tags::write_bare_mp3(&path);
+            crate::id3tags::write(
+                &path,
+                &Tags {
+                    title: "Song".into(),
+                    artist: artist.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut hash = [0u8; 32];
+            hash[0] = 0xE0 | i;
+            DupeFile {
+                repo: "r".into(),
+                repo_root: tmp.path().to_string_lossy().into_owned(),
+                rel_path: name.into(),
+                entry: dedup_core::store::FileEntry {
+                    size: 417,
+                    hash,
+                    modified_ms: 0,
+                    missing: false,
+                    mime: Some("audio/mpeg".into()),
+                    img_fingerprint: None,
+                    video_hash: None,
+                    pdf_hash: None,
+                    audio: Some(dedup_core::store::AudioFp {
+                        duration_ms: 1000,
+                        chunk_hashes: Vec::new(),
+                    }),
+                    img_size: None,
+                    origin: None,
+                    exif: None,
+                },
+            }
+        };
+        let group: DupeGroup = vec![mk("a.mp3", "Alpha", 0), mk("b.mp3", "Beta", 1)];
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.run();
+        harness.key_press(egui::Key::C);
+        harness.run();
+        harness.run();
+
+        // A's value shows in the A row and B's value in the B row (not blank).
+        assert!(
+            harness.query_by_label("Alpha").is_some(),
+            "A's tags render in the top panel"
+        );
+        assert!(
+            harness.query_by_label("Beta").is_some(),
+            "B's tags render in the B row (the regression the user hit)"
+        );
+        // One EDIT button per panel.
+        let edits = harness
+            .get_all_by_label(&format!("{} EDIT", icon::PENCIL))
+            .count();
+        assert_eq!(edits, 2, "an EDIT button per copy");
+    }
+
+    /// Opening the tag editor gathers the distinct value of each field from
+    /// every copy in the group, so the user can adopt the best one.
+    #[test]
+    fn tag_editor_offers_values_from_all_copies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |name: &str, title: &str, i: u8| -> DupeFile {
+            let path = tmp.path().join(name);
+            crate::id3tags::write_bare_mp3(&path);
+            crate::id3tags::write(
+                &path,
+                &Tags {
+                    title: title.into(),
+                    artist: "The Band".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut hash = [0u8; 32];
+            hash[0] = 0xD0 | i;
+            DupeFile {
+                repo: "r".into(),
+                repo_root: tmp.path().to_string_lossy().into_owned(),
+                rel_path: name.into(),
+                entry: dedup_core::store::FileEntry {
+                    size: 417,
+                    hash,
+                    modified_ms: 0,
+                    missing: false,
+                    mime: Some("audio/mpeg".into()),
+                    img_fingerprint: None,
+                    video_hash: None,
+                    pdf_hash: None,
+                    audio: Some(dedup_core::store::AudioFp {
+                        duration_ms: 1000,
+                        chunk_hashes: Vec::new(),
+                    }),
+                    img_size: None,
+                    origin: None,
+                    exif: None,
+                },
+            }
+        };
+        let group: DupeGroup = vec![mk("one.mp3", "Take One", 0), mk("two.mp3", "Take Two", 1)];
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.run();
+        harness.key_press(egui::Key::T);
+        harness.run();
+        harness.run();
+
+        let te = harness.state();
+        let te = te.tag_edit.as_ref().expect("editor open");
+        assert!(
+            te.options[0].contains(&"Take One".to_string())
+                && te.options[0].contains(&"Take Two".to_string()),
+            "title options gather both copies' values: {:?}",
+            te.options[0]
+        );
+        assert_eq!(
+            te.options[1],
+            vec!["The Band".to_string()],
+            "the shared artist is deduplicated to one option"
+        );
+    }
+
     /// `C` enters A/B compare, which exposes MARK B and a FLICKER toggle, marks
     /// the B candidate, and exits back to single view.
     #[test]
@@ -3062,6 +5050,20 @@ mod ui_tests {
             "compare exposes the FLICKER toggle"
         );
 
+        // Compare stacks three bottom lines (path A, path B, hint) where the
+        // single view needs only two. The strip must grow so the hint stays
+        // inside it (above the 6px bottom margin of the 700px window) rather
+        // than being pushed off the bottom edge — the reason it looked like the
+        // hint "vanished" on entering compare.
+        let hint_bottom = harness
+            .get_by_label_contains("space: flicker")
+            .rect()
+            .bottom();
+        assert!(
+            hint_bottom <= 694.0,
+            "compare hint stays inside the bottom strip, not off-screen: bottom {hint_bottom:.1}"
+        );
+
         // Clear preselected marks so B shows the unmarked MARK B control.
         harness.state_mut().marked.clear();
         harness.run();
@@ -3085,6 +5087,261 @@ mod ui_tests {
             harness.state().lightbox.as_ref().unwrap().compare.is_none(),
             "C exits compare mode"
         );
+    }
+
+    /// Space enters flicker then swaps A/B; Escape is a hierarchical "back"
+    /// that pops one view level per press: flicker → side-by-side → single →
+    /// closed.
+    #[test]
+    fn lightbox_space_flicker_and_escape_back() {
+        let group: DupeGroup = (0..3).map(image_file).collect();
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.run();
+
+        // Enter compare — starts in side-by-side (not flicker).
+        harness.key_press(egui::Key::C);
+        harness.run();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .lightbox
+                .as_ref()
+                .unwrap()
+                .compare
+                .as_ref()
+                .is_some_and(|c| !c.flicker),
+            "C enters compare in side-by-side"
+        );
+
+        // Space enters flicker from side-by-side, showing A.
+        harness.key_press(egui::Key::Space);
+        harness.run();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .lightbox
+                .as_ref()
+                .unwrap()
+                .compare
+                .as_ref()
+                .is_some_and(|c| c.flicker && !c.show_b),
+            "space enters flicker showing A"
+        );
+
+        // Space again swaps A/B within flicker.
+        harness.key_press(egui::Key::Space);
+        harness.run();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .lightbox
+                .as_ref()
+                .unwrap()
+                .compare
+                .as_ref()
+                .is_some_and(|c| c.flicker && c.show_b),
+            "space swaps A/B within flicker"
+        );
+
+        // Escape steps back one level: flicker → side-by-side (still comparing).
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .lightbox
+                .as_ref()
+                .unwrap()
+                .compare
+                .as_ref()
+                .is_some_and(|c| !c.flicker),
+            "Escape leaves flicker back to side-by-side, staying in compare"
+        );
+
+        // Escape again: side-by-side → single image.
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        harness.run();
+        assert!(
+            harness.state().lightbox.as_ref().unwrap().compare.is_none(),
+            "Escape leaves compare back to the single image"
+        );
+
+        // Escape again: single image → closed.
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        harness.run();
+        assert!(
+            harness.state().lightbox.is_none(),
+            "Escape from the single image closes the lightbox"
+        );
+    }
+
+    /// The image lightbox's Edit controls rotate the live preview and can save a
+    /// `_rot` copy, leaving the original untouched and the lightbox open (6.4/6.6).
+    #[test]
+    fn lightbox_edit_rotates_and_saves_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let img_path = tmp.path().join("shot.png");
+        image::RgbImage::from_fn(40, 20, |x, _| image::Rgb([x as u8, 0, 0]))
+            .save(&img_path)
+            .unwrap();
+
+        let mut hash = [0u8; 32];
+        hash[0] = 0x7E;
+        let file = DupeFile {
+            repo: "r".into(),
+            repo_root: tmp.path().to_string_lossy().into_owned(),
+            rel_path: "shot.png".into(),
+            entry: dedup_core::store::FileEntry {
+                size: 100,
+                hash,
+                modified_ms: 0,
+                missing: false,
+                mime: Some("image/png".into()),
+                img_fingerprint: None,
+                video_hash: None,
+                pdf_hash: None,
+                audio: None,
+                img_size: Some((40, 20)),
+                origin: None,
+                exif: None,
+            },
+        };
+        let group: DupeGroup = vec![file];
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.run();
+
+        // Rotate clockwise → the preview's dimensions swap (40×20 → 20×40).
+        harness.get_by_label("ROT R").click();
+        harness.run();
+        harness.run();
+        let dims = harness.state().edit.as_ref().map(|e| e.dims);
+        assert_eq!(
+            dims,
+            Some(egui::vec2(20.0, 40.0)),
+            "rotate swaps preview dims"
+        );
+
+        // SAVE opens the confirm modal (does not write yet).
+        harness
+            .get_by_label(&format!("{} SAVE", icon::CHECK))
+            .click();
+        harness.run();
+        harness.run();
+        assert!(harness.state().edit_save, "SAVE opens the confirm modal");
+
+        // Save a copy → a rotated sibling is written, the original untouched, and
+        // the lightbox stays open.
+        harness.get_by_label("SAVE A COPY").click();
+        harness.run();
+        let copy = tmp.path().join("shot_rot.png");
+        assert!(copy.exists(), "a rotated copy is written");
+        assert_eq!(
+            image::image_dimensions(&copy).unwrap(),
+            (20, 40),
+            "the copy is rotated"
+        );
+        assert_eq!(
+            image::image_dimensions(&img_path).unwrap(),
+            (40, 20),
+            "the original is left untouched"
+        );
+        assert!(!harness.state().edit_save, "the modal closes after saving");
+        assert!(
+            harness.state().lightbox.is_some(),
+            "saving keeps the lightbox open (6.6)"
+        );
+    }
+
+    /// `M` toggles the match mode from the grid (no lightbox/modal open).
+    #[test]
+    fn grid_shortcut_toggles_match_mode() {
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(900.0, 600.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        assert!(
+            harness.state().mode == Mode::Exact,
+            "starts in exact/DUPLICATES"
+        );
+
+        harness.key_press(egui::Key::M);
+        harness.run();
+        harness.run();
+        assert!(
+            harness.state().mode == Mode::Similar,
+            "M switches to SIMILAR"
+        );
+        harness.key_press(egui::Key::M);
+        harness.run();
+        harness.run();
+        assert!(harness.state().mode == Mode::Exact, "M toggles back");
     }
 
     /// Re-locking removes the override and any pending mark, and turning a
@@ -3278,6 +5535,169 @@ mod ui_tests {
         harness.snapshot("dupes_view");
     }
 
+    /// Renders the audio lightbox's ID3 tag editor to `target/dupes_tags.png`.
+    #[test]
+    #[ignore = "renders a PNG for manual inspection"]
+    fn render_audio_tags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |name: &str, tags: Tags, i: u8| -> DupeFile {
+            let path = tmp.path().join(name);
+            crate::id3tags::write_bare_mp3(&path);
+            crate::id3tags::write(&path, &tags).unwrap();
+            let mut hash = [0u8; 32];
+            hash[0] = 0xC0 | i;
+            DupeFile {
+                repo: "r".into(),
+                repo_root: tmp.path().to_string_lossy().into_owned(),
+                rel_path: name.into(),
+                entry: dedup_core::store::FileEntry {
+                    size: 417,
+                    hash,
+                    modified_ms: 0,
+                    missing: false,
+                    mime: Some("audio/mpeg".into()),
+                    img_fingerprint: None,
+                    video_hash: None,
+                    pdf_hash: None,
+                    audio: Some(dedup_core::store::AudioFp {
+                        duration_ms: 1000,
+                        chunk_hashes: Vec::new(),
+                    }),
+                    img_size: None,
+                    origin: None,
+                    exif: None,
+                },
+            }
+        };
+        // Two copies that agree on most tags but differ on album/track.
+        let a = mk(
+            "a.mp3",
+            Tags {
+                title: "Chelsea Hotel #2".into(),
+                artist: "Leonard Cohen".into(),
+                album: "New Skin".into(),
+                year: "1974".into(),
+                track: "5".into(),
+                genre: "Folk".into(),
+            },
+            0,
+        );
+        let b = mk(
+            "b.mp3",
+            Tags {
+                title: "Chelsea Hotel #2".into(),
+                artist: "Leonard Cohen".into(),
+                album: "New Skin for the Old Ceremony".into(),
+                year: "1974".into(),
+                track: "05".into(),
+                genre: "Folk".into(),
+            },
+            1,
+        );
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![vec![a, b]]));
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 640.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.run();
+        // Side-by-side compare → the read-only id3 diff table on the right.
+        harness.key_press(egui::Key::C);
+        harness.run();
+        harness.run();
+        let img = harness.render().expect("wgpu render failed");
+        let out =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/dupes_tags.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Renders the image lightbox mid-edit (rotated preview + Edit controls +
+    /// the save-confirm modal) to `target/dupes_edit.png`. `--ignored`.
+    #[test]
+    #[ignore = "renders a PNG for manual inspection"]
+    fn render_lightbox_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let img_path = tmp.path().join("shot.png");
+        // A directional gradient so a rotation is obvious.
+        image::RgbImage::from_fn(400, 240, |x, y| image::Rgb([(x / 2) as u8, (y) as u8, 90]))
+            .save(&img_path)
+            .unwrap();
+        let mut hash = [0u8; 32];
+        hash[0] = 0x7E;
+        let file = DupeFile {
+            repo: "r".into(),
+            repo_root: tmp.path().to_string_lossy().into_owned(),
+            rel_path: "shot.png".into(),
+            entry: dedup_core::store::FileEntry {
+                size: 100,
+                hash,
+                modified_ms: 0,
+                missing: false,
+                mime: Some("image/png".into()),
+                img_fingerprint: None,
+                video_hash: None,
+                pdf_hash: None,
+                audio: None,
+                img_size: Some((400, 240)),
+                origin: None,
+                exif: None,
+            },
+        };
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![vec![file]]));
+
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 700.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.run();
+        harness.get_by_label("ROT R").click();
+        harness.run();
+        harness.run();
+        harness
+            .get_by_label(&format!("{} SAVE", icon::CHECK))
+            .click();
+        harness.run();
+        harness.run();
+        let img = harness.render().expect("wgpu render failed");
+        let out =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/dupes_edit.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
     /// Not run by default: renders the view to `target/dupes_view.png` for a
     /// human to eyeball. Needs a wgpu backend (lavapipe works headless):
     ///   cargo test -p dedup-gui render_dupes_view -- --ignored --nocapture
@@ -3302,6 +5722,161 @@ mod ui_tests {
         let img = harness.render().expect("wgpu render failed");
         let out =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/dupes_view.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Renders a group of audio cards (fingerprint-glyph tiles) to
+    /// `target/dupes_audio.png` for manual inspection. `--ignored`.
+    #[test]
+    #[ignore = "renders a PNG for manual inspection"]
+    fn render_audio_cards() {
+        let group: DupeGroup = (0..4u8)
+            .map(|i| {
+                let mut f = audio_file(i as usize);
+                // Jagged per-byte values (mimicking a real BLAKE3 hash) so the
+                // rendered glyphs look representative, not like smooth ramps.
+                let mut h = [0u8; 32];
+                for (j, b) in h.iter_mut().enumerate() {
+                    let v = (i as u32 + 1).wrapping_mul(2_654_435_761)
+                        ^ (j as u32).wrapping_mul(2_246_822_519);
+                    *b = (v >> ((j as u32 % 6) * 4 + 3)) as u8;
+                }
+                f.entry.audio = Some(dedup_core::store::AudioFp {
+                    duration_ms: 60_000 + i as u32 * 45_000,
+                    chunk_hashes: vec![h],
+                });
+                f
+            })
+            .collect();
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 700.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        let img = harness.render().expect("wgpu render failed");
+        let out =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/dupes_audio.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Renders the audio lightbox (two copies' waveforms, A/B compare) to
+    /// `target/dupes_audio_lightbox.png` for manual inspection. `--ignored`.
+    #[test]
+    #[ignore = "renders a PNG for manual inspection"]
+    fn render_audio_lightbox() {
+        use std::f32::consts::PI;
+        let tmp = tempfile::tempdir().unwrap();
+        // Two real WAVs with opposite frequency sweeps (chirps) → the
+        // spectrograms show diagonals running in opposite directions.
+        let wav = |i: usize, up: bool| -> DupeFile {
+            // Long enough (~45 s) that the STFT column-fold runs several times.
+            let (sr, secs) = (16000u32, 45usize);
+            let n = sr as usize * secs;
+            let (f0, f1) = if up {
+                (200.0f32, 1200.0)
+            } else {
+                (1200.0f32, 200.0)
+            };
+            let tt = secs as f32;
+            let samples: Vec<i16> = (0..n)
+                .map(|k| {
+                    let t = k as f32 / sr as f32;
+                    // Swept fundamental + two harmonics + a DC offset — enough
+                    // structure and DC to exercise the dB/DC-drop spectrogram fix.
+                    let phase = f0 * t + (f1 - f0) * t * t / (2.0 * tt);
+                    let s = (2.0 * PI * phase).sin()
+                        + 0.5 * (2.0 * PI * 2.0 * phase).sin()
+                        + 0.3 * (2.0 * PI * 3.0 * phase).sin();
+                    ((s * 0.3 + 0.2) * 24_000.0) as i16
+                })
+                .collect();
+            let rel = format!("track{i}.wav");
+            crate::waveform::write_wav(&tmp.path().join(&rel), sr, &samples);
+            let mut hash = [0u8; 32];
+            hash[0] = 0xB0 | i as u8;
+            DupeFile {
+                repo: "r".into(),
+                repo_root: tmp.path().to_string_lossy().into_owned(),
+                rel_path: rel,
+                entry: dedup_core::store::FileEntry {
+                    size: (n * 2) as u64,
+                    hash,
+                    modified_ms: 0,
+                    missing: false,
+                    mime: Some("audio/x-wav".into()),
+                    img_fingerprint: None,
+                    video_hash: None,
+                    pdf_hash: None,
+                    audio: Some(dedup_core::store::AudioFp {
+                        duration_ms: (secs as u32) * 1000,
+                        chunk_hashes: vec![hash],
+                    }),
+                    img_size: None,
+                    origin: None,
+                    exif: None,
+                },
+            }
+        };
+        let group: DupeGroup = vec![wav(0, true), wav(1, false)];
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 640.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.step();
+        {
+            let lb = harness.state_mut().lightbox.as_mut().unwrap();
+            lb.compare = Some(CompareState::new(1));
+            lb.spectrogram = true;
+        }
+        // Give the background workers time to decode both WAVs into spectrograms.
+        for _ in 0..60 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            harness.step();
+        }
+        let img = harness.render().expect("wgpu render failed");
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/dupes_audio_lightbox.png");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }

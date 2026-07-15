@@ -950,6 +950,7 @@ impl Progress for TerminalProgress {
                 done,
                 total,
                 current,
+                ..
             } => {
                 if self.bar.length() != Some(total) {
                     self.bar.set_style(
