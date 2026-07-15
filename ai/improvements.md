@@ -145,10 +145,19 @@ land with the audio lightbox (6.3).
   content-hash/dimensions in the index go stale until a re-scan. Acceptable for now; a
   re-index-on-edit hook is a follow-up.
 
-### 6.5 Audio id3 tags
+### 6.5 Audio id3 tags — ✅ done (2026-07-15)
 
-- Display **id3** tags in the audio lightbox.
-- Optional inline editor to change tags and write them back to the file. Gated by 6.6.
+- **Display:** the audio lightbox shows an `Artist — Title` summary in the bottom strip
+  (single view), read via the new `id3` crate and cached per hash (`id3tags.rs`).
+- **Editor (user chose "add id3"):** a `✎ TAGS` button (or `T`) opens a modal with
+  Title / Artist / Album / Year / Track / Genre. `SAVE TAGS` writes **only the tags** back
+  (audio untouched, other frames like album art preserved); empty fields clear that frame.
+- **6.6 reuse:** the modal carries the "writes the tags to the file on disk" note and stays
+  open after saving. `Esc` closes the editor before it backs out the lightbox.
+- **Scope:** ID3v2 only (MP3/WAV/AIFF); FLAC/OGG show no tags (read returns `None`).
+- Tests: `id3tags.rs` round-trip + clear-field unit tests (real bare-MP3 in-test), and
+  `audio_lightbox_edits_and_saves_id3_tags` (T → edit → SAVE writes to disk, others
+  preserved, lightbox stays open); `--ignored` `render_audio_tags`.
 
 ### 6.6 Safe in-place saves — ✅ done (2026-07-15) *(cross-cutting for 6.4 & 6.5)*
 
@@ -159,6 +168,35 @@ land with the audio lightbox (6.3).
   original); a copy never overwrites an existing file.
 - Saving keeps the lightbox open and the preview showing (verified by test). Wired for images
   now; 6.5's id3 writes will reuse the same modal.
+
+### 6.7 Audio compare polish & id3 in the diff view — ✅ done (2026-07-15, from user feedback)
+
+Follow-ups on the audio lightbox (6.3) and id3 editor (6.5):
+
+- **Fixed — arrow-switch paused and the cursor stuck on top.** `←`/`→` in compare used to
+  re-navigate the *A index*, reloading a single sink (gap) and, with 2 copies, colliding A
+  and B so the line stayed on top. Now arrows **flip which copy is audible** (gap-free via the
+  loaded pair) and move the cursor with it; they only step the index in single view.
+- **id3 tags in the diff view — one panel per row (symmetric).** A **read-only** tag panel
+  sits on the right of *each* waveform row: A's tags beside the A wave, B's beside the B wave
+  (not A/B columns in one box — the first cut put B off-screen and read as "no table"). Each
+  panel lists Title/Artist/Album/Year/Track/Genre with differing values highlighted, and
+  **flickers** with its row so tag diffs pop when flicking A↔B.
+- **Per-panel EDIT button** opens the editor modal for *that* copy (`open_tags` now carries a
+  group index); the panels stay read-only. Top-bar `TAGS`/`T` edits the current copy.
+- **Pick values from any copy.** The editor collects the distinct value of each field across
+  *all* the group's copies; each field has a menu to adopt any of them.
+- Tests: `audio_compare_arrow_flips_audible_copy`, `tag_editor_offers_values_from_all_copies`,
+  and the `--ignored` `render_audio_tags` now renders the A/B diff table.
+
+### 6.8 ID3v1 read fallback — ✅ done (2026-07-15)
+
+- **Read** falls back to ID3v1 (the 128-byte trailer on older/ripped MP3s) when there's no
+  ID3v2, so those files show tags in the diff panels instead of blank — `id3tags::read` uses
+  `id3::v1v2::read_from_path` (v2, then v1).
+- **Write stays ID3v2.4** and now **strips any ID3v1 trailer** so a stale v1 can't shadow the
+  edit (user's add) — via `id3::v1v2::write_to_path`, which removes v1 after writing v2.
+- Tests: `read_falls_back_to_id3v1`, `writing_v2_strips_the_v1_trailer`.
 
 ---
 

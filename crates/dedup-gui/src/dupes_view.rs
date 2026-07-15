@@ -3,6 +3,7 @@
 //! delete the worse copies — batched per repo, never without a confirmation.
 
 use crate::icon;
+use crate::id3tags::{self, Tags};
 use crate::imgedit::{self, Orient};
 use crate::lightbox::{CompareState, FullResCache, LightboxState};
 use crate::player::Player;
@@ -331,6 +332,10 @@ pub struct DupesView {
     edit: Option<EditState>,
     /// The save-confirmation modal (overwrite vs copy) is open.
     edit_save: bool,
+    /// Cached ID3 tags per audio file (hex → tags, or `None` if none/unsupported).
+    tags_cache: HashMap<String, Option<Tags>>,
+    /// The ID3 tag editor (audio lightbox), if open.
+    tag_edit: Option<TagEdit>,
     /// Tooltip wording for this frame, set at the top of [`Self::show`] from
     /// the app-wide setting (not persisted here; `app.rs` owns that).
     verbosity: TooltipVerbosity,
@@ -346,6 +351,20 @@ struct EditState {
     tex: egui::TextureHandle,
     dims: egui::Vec2,
 }
+
+/// Open ID3 tag editor: the audio file being edited plus a working copy of its
+/// tags, bound to the modal's text fields. `options` holds the distinct values
+/// seen across every copy in the group, per field (Title/Artist/Album/Year/
+/// Track/Genre), so the user can adopt the best value from any similar file.
+struct TagEdit {
+    hex: String,
+    path: PathBuf,
+    tags: Tags,
+    options: [Vec<String>; 6],
+}
+
+/// A displayable ID3 field: its label and an accessor for its value.
+type TagField = (&'static str, fn(&Tags) -> &str);
 
 impl DupesView {
     pub fn new() -> Self {
@@ -381,6 +400,8 @@ impl DupesView {
             spec_tex: HashMap::new(),
             edit: None,
             edit_save: false,
+            tags_cache: HashMap::new(),
+            tag_edit: None,
             verbosity: TooltipVerbosity::default(),
         }
     }
@@ -2453,13 +2474,30 @@ impl DupesView {
             _ => None,
         };
 
+        // ID3 tags for A (and B, when comparing) — cached, read is file I/O.
+        let a_tags = self
+            .tags_cache
+            .entry(a_hex.clone())
+            .or_insert_with(|| id3tags::read(&a_path))
+            .clone();
+        let b_tags = b_file.as_ref().and_then(|f| {
+            let (h, p, _t) = params(f);
+            self.tags_cache
+                .entry(h)
+                .or_insert_with(|| id3tags::read(&p))
+                .clone()
+        });
+
         // Keyboard. `space` drives flicker (enter, then swap) exactly like the
-        // image lightbox; playback is `P`, and `S` toggles the spectrogram view.
+        // image lightbox; playback is `P`, `S` toggles the spectrogram, `T` the
+        // tag editor.
         let mut close = false;
         let mut new_idx = idx;
         let (mut toggle_play, mut toggle_compare, mut esc) = (false, false, false);
         let (mut space, mut toggle_flicker, mut swap, mut toggle_spec) =
             (false, false, false, false);
+        // Which copy's tag editor to open (its group index), if any.
+        let mut open_tags: Option<usize> = None;
         ctx.input(|i| {
             if i.key_pressed(egui::Key::Escape) {
                 esc = true;
@@ -2478,6 +2516,9 @@ impl DupesView {
             }
             if i.key_pressed(egui::Key::S) {
                 toggle_spec = true;
+            }
+            if i.key_pressed(egui::Key::T) {
+                open_tags = Some(idx);
             }
             if i.key_pressed(egui::Key::C) {
                 toggle_compare = true;
@@ -2586,36 +2627,135 @@ impl DupesView {
                     );
                 };
 
-                // View area (between the top bar and the bottom strip).
+                // View area. A right column always carries the read-only id3
+                // tags, split to mirror the waveform rows — A's tags beside the A
+                // wave, B's beside the B wave (symmetric), and flicker-aware.
                 let area = egui::Rect::from_min_max(
                     egui::pos2(screen.min.x + 12.0, screen.min.y + 52.0),
                     egui::pos2(screen.max.x - 12.0, screen.max.y - 64.0),
+                );
+                let tags_w = (area.width() * 0.28).clamp(180.0, 270.0);
+                let wave_area = egui::Rect::from_min_max(
+                    area.min,
+                    egui::pos2(area.max.x - tags_w - 12.0, area.max.y),
+                );
+                let tags_col = egui::Rect::from_min_max(
+                    egui::pos2(area.max.x - tags_w, area.min.y),
+                    area.max,
                 );
                 let frac_at = |rect: egui::Rect, resp: &egui::Response| {
                     resp.interact_pointer_pos()
                         .map(|p| ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0))
                 };
+                let fields: [TagField; 6] = [
+                    ("Title", |t| &t.title),
+                    ("Artist", |t| &t.artist),
+                    ("Album", |t| &t.album),
+                    ("Year", |t| &t.year),
+                    ("Track", |t| &t.track),
+                    ("Genre", |t| &t.genre),
+                ];
+                // Draw one copy's read-only tags into `rect`; values differing
+                // from `other` (when comparing) are highlighted. Returns the
+                // group index to edit if its EDIT button was clicked.
+                let draw_tags = |ui: &mut egui::Ui,
+                                 rect: egui::Rect,
+                                 own: &Option<Tags>,
+                                 other: &Option<Tags>,
+                                 header: &str,
+                                 header_col: egui::Color32,
+                                 edit_idx: usize|
+                 -> Option<usize> {
+                    let mut edit = None;
+                    ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(rect.shrink(6.0))
+                            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("{header}  ID3"))
+                                        .color(header_col)
+                                        .size(12.0)
+                                        .strong(),
+                                );
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new(format!("{} EDIT", icon::PENCIL))
+                                                .color(theme::TEXT),
+                                        )
+                                        .fill(theme::PANEL),
+                                    )
+                                    .clicked()
+                                {
+                                    edit = Some(edit_idx);
+                                }
+                            });
+                            ui.add_space(2.0);
+                            for (name, get) in fields {
+                                let ov = own.as_ref().map(get).unwrap_or("");
+                                let tv = other.as_ref().map(get).unwrap_or("");
+                                let col = if own.is_some() && ov != tv {
+                                    theme::AMBER
+                                } else {
+                                    theme::TEXT
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.add_sized(
+                                        [46.0, 15.0],
+                                        egui::Label::new(
+                                            RichText::new(name).color(theme::LILAC).size(10.0),
+                                        ),
+                                    );
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(ov).color(col).size(11.0),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(ov);
+                                });
+                            }
+                        },
+                    );
+                    edit
+                };
+
                 if comparing && flicker {
-                    // Overlay: show A or B full-area; space swaps between them.
+                    // Overlay: show A or B full-area (and its tags); space swaps.
                     let show_b = state.compare.as_ref().is_some_and(|c| c.show_b);
-                    let ra = ui.allocate_rect(area, egui::Sense::click());
+                    let ra = ui.allocate_rect(wave_area, egui::Sense::click());
                     if show_b {
-                        draw_row(ui, area, b_viz.as_ref(), b_tex.as_ref(), theme::TAN, "B", b_cursor);
+                        draw_row(ui, wave_area, b_viz.as_ref(), b_tex.as_ref(), theme::TAN, "B", b_cursor);
                     } else {
-                        draw_row(ui, area, a_viz.as_ref(), a_tex.as_ref(), theme::BLUE, "A", a_cursor);
+                        draw_row(ui, wave_area, a_viz.as_ref(), a_tex.as_ref(), theme::BLUE, "A", a_cursor);
                     }
                     if ra.clicked()
-                        && let Some(f) = frac_at(area, &ra)
+                        && let Some(f) = frac_at(wave_area, &ra)
                     {
                         click_play = Some((show_b, f));
                     }
+                    let hit = if show_b {
+                        draw_tags(ui, tags_col, &b_tags, &a_tags, "B", theme::TAN, b_idx.unwrap_or(idx))
+                    } else {
+                        draw_tags(ui, tags_col, &a_tags, &b_tags, "A", theme::BLUE, idx)
+                    };
+                    open_tags = open_tags.or(hit);
                 } else if comparing {
                     let gap = 12.0;
-                    let half = (area.height() - gap) / 2.0;
-                    let top = egui::Rect::from_min_size(area.min, egui::vec2(area.width(), half));
+                    let half = (wave_area.height() - gap) / 2.0;
+                    let top =
+                        egui::Rect::from_min_size(wave_area.min, egui::vec2(wave_area.width(), half));
                     let bot = egui::Rect::from_min_size(
-                        egui::pos2(area.min.x, area.min.y + half + gap),
-                        egui::vec2(area.width(), half),
+                        egui::pos2(wave_area.min.x, wave_area.min.y + half + gap),
+                        egui::vec2(wave_area.width(), half),
+                    );
+                    let ttop =
+                        egui::Rect::from_min_size(tags_col.min, egui::vec2(tags_col.width(), half));
+                    let tbot = egui::Rect::from_min_size(
+                        egui::pos2(tags_col.min.x, tags_col.min.y + half + gap),
+                        egui::vec2(tags_col.width(), half),
                     );
                     let ra = ui.allocate_rect(top, egui::Sense::click());
                     draw_row(ui, top, a_viz.as_ref(), a_tex.as_ref(), theme::BLUE, "A", a_cursor);
@@ -2631,14 +2771,28 @@ impl DupesView {
                     {
                         click_play = Some((true, f));
                     }
+                    // Symmetric tag panels: A beside the top row, B beside bottom.
+                    let ha = draw_tags(ui, ttop, &a_tags, &b_tags, "A", theme::BLUE, idx);
+                    let hb = draw_tags(
+                        ui,
+                        tbot,
+                        &b_tags,
+                        &a_tags,
+                        "B",
+                        theme::TAN,
+                        b_idx.unwrap_or(idx),
+                    );
+                    open_tags = open_tags.or(ha).or(hb);
                 } else {
-                    let ra = ui.allocate_rect(area, egui::Sense::click());
-                    draw_row(ui, area, a_viz.as_ref(), a_tex.as_ref(), theme::BLUE, "A", a_cursor);
+                    let ra = ui.allocate_rect(wave_area, egui::Sense::click());
+                    draw_row(ui, wave_area, a_viz.as_ref(), a_tex.as_ref(), theme::BLUE, "A", a_cursor);
                     if ra.clicked()
-                        && let Some(f) = frac_at(area, &ra)
+                        && let Some(f) = frac_at(wave_area, &ra)
                     {
                         click_play = Some((false, f));
                     }
+                    let hit = draw_tags(ui, tags_col, &a_tags, &b_tags, "A", theme::BLUE, idx);
+                    open_tags = open_tags.or(hit);
                 }
 
                 // Top control bar.
@@ -2732,6 +2886,18 @@ impl DupesView {
                         };
                         if pill(ui, vl, theme::PANEL, theme::LILAC, vshort, vverbose) {
                             toggle_spec = true;
+                        }
+                        if pill(
+                            ui,
+                            &format!("{} TAGS", icon::PENCIL),
+                            theme::PANEL,
+                            theme::TEXT,
+                            "Edit ID3 tags",
+                            "Open the ID3 tag editor for the current copy — the panels on the \
+                             right show them read-only; saving writes only the tags, the audio \
+                             is untouched (T does the same).",
+                        ) {
+                            open_tags = Some(idx);
                         }
                         if count >= 2 {
                             let (cl, cshort, cverbose) = if comparing {
@@ -2851,6 +3017,11 @@ impl DupesView {
         // Apply deferred actions now that drawing is done. Esc and space mirror
         // the image lightbox: Esc steps back one level (flicker → side-by-side →
         // single → closed); space enters flicker from side-by-side, then swaps.
+        // Esc closes the tag editor first (if open), else backs out a level.
+        if esc && self.tag_edit.is_some() {
+            self.tag_edit = None;
+            esc = false;
+        }
         if esc {
             match state.compare.as_ref() {
                 Some(c) if c.flicker => toggle_flicker = true,
@@ -2868,7 +3039,48 @@ impl DupesView {
         if close {
             self.player.stop();
             self.spec_tex.clear();
+            self.tag_edit = None;
             return; // dropped state = closed
+        }
+        // A tag EDIT button (or `T`) opens the editor for that copy; clicking it
+        // again for the copy already open closes it (a toggle).
+        if let Some(ei) = open_tags {
+            let f = group[ei.min(count - 1)].clone();
+            let (h, p, _t) = params(&f);
+            if self.tag_edit.as_ref().map(|t| t.hex.as_str()) == Some(h.as_str()) {
+                self.tag_edit = None;
+            } else {
+                let tags = self
+                    .tags_cache
+                    .entry(h.clone())
+                    .or_insert_with(|| id3tags::read(&p))
+                    .clone();
+                // Collect the distinct value seen for each field across every
+                // copy in the group, so the editor can offer them as options.
+                let mut options: [Vec<String>; 6] = std::array::from_fn(|_| Vec::new());
+                for gf in &group {
+                    let (gh, gp, _) = params(gf);
+                    if let Some(t) = self
+                        .tags_cache
+                        .entry(gh)
+                        .or_insert_with(|| id3tags::read(&gp))
+                        .clone()
+                    {
+                        let vals = [&t.title, &t.artist, &t.album, &t.year, &t.track, &t.genre];
+                        for (i, v) in vals.into_iter().enumerate() {
+                            if !v.is_empty() && !options[i].iter().any(|o| o == v) {
+                                options[i].push(v.clone());
+                            }
+                        }
+                    }
+                }
+                self.tag_edit = Some(TagEdit {
+                    hex: h,
+                    path: p,
+                    tags: tags.unwrap_or_default(),
+                    options,
+                });
+            }
         }
         if toggle_spec {
             state.spectrogram = !state.spectrogram;
@@ -2896,11 +3108,39 @@ impl DupesView {
             }
         };
 
-        // ←/→ : switch which copy is A, keeping the offset (single playback).
+        // ←/→ : in single view, step which copy is A (keeping the offset). In
+        // compare, *flip which copy is audible* instead — gap-free via the loaded
+        // pair — and move the cursor with it. Re-indexing A while comparing would
+        // collide it with B and force a reloading pause (the bug the user hit).
         let nav = new_idx != idx;
-        if nav {
+        if nav && comparing {
+            if let Some(bi) = b_idx {
+                let want_b = state.audio_active != Some(bi); // flip audible copy
+                if snap.loaded {
+                    let target = if want_b {
+                        b_hex.as_deref()
+                    } else {
+                        Some(a_hex.as_str())
+                    };
+                    if paired_ab {
+                        if snap.hex.as_deref() != target {
+                            self.player.flip();
+                        }
+                    } else {
+                        start_play(self, want_b, cur_ms);
+                    }
+                }
+                state.audio_active = Some(if want_b { bi } else { idx });
+                if let Some(c) = state.compare.as_mut()
+                    && c.flicker
+                {
+                    c.show_b = want_b;
+                }
+            }
+        } else if nav {
             idx = new_idx;
             state.index = idx;
+            self.tag_edit = None; // tags belong to the copy we just left
             if snap.loaded {
                 let (h, p, t) = params(&group[idx]);
                 self.player.play(&h, &p, t, cur_ms.min(t));
@@ -2985,6 +3225,88 @@ impl DupesView {
                 && c.flicker
             {
                 c.show_b = want_b;
+            }
+        }
+
+        // ID3 tag editor modal (Phase 6.5). Fields bind to the working copy;
+        // SAVE writes tags only (audio untouched) and keeps the lightbox open.
+        if self.tag_edit.is_some() {
+            let (mut save, mut cancel) = (false, false);
+            egui::Modal::new(Id::new("id3-edit")).show(&ctx.clone(), |ui| {
+                let te = self.tag_edit.as_mut().unwrap();
+                ui.set_width(440.0);
+                ui.label(
+                    RichText::new("EDIT ID3 TAGS")
+                        .color(theme::AMBER)
+                        .size(16.0)
+                        .strong(),
+                );
+                ui.add_space(8.0);
+                let field = |ui: &mut egui::Ui, label: &str, val: &mut String, opts: &[String]| {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [56.0, 18.0],
+                            egui::Label::new(RichText::new(label).color(theme::TAN).size(12.0)),
+                        );
+                        ui.add(egui::TextEdit::singleline(val).desired_width(300.0));
+                        // Adopt a value from another copy in the group.
+                        if !opts.is_empty() {
+                            ui.menu_button(icon::CARET_RIGHT, |ui| {
+                                for o in opts {
+                                    if ui.button(RichText::new(o).color(theme::TEXT)).clicked() {
+                                        *val = o.clone();
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text("Pick a value from another copy in this group");
+                        }
+                    });
+                };
+                field(ui, "Title", &mut te.tags.title, &te.options[0]);
+                field(ui, "Artist", &mut te.tags.artist, &te.options[1]);
+                field(ui, "Album", &mut te.tags.album, &te.options[2]);
+                field(ui, "Year", &mut te.tags.year, &te.options[3]);
+                field(ui, "Track", &mut te.tags.track, &te.options[4]);
+                field(ui, "Genre", &mut te.tags.genre, &te.options[5]);
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("SAVE TAGS").color(theme::BLACK))
+                                .fill(theme::AMBER),
+                        )
+                        .clicked()
+                    {
+                        save = true;
+                    }
+                    if ui
+                        .button(RichText::new("CANCEL").color(theme::TEXT))
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Saving writes the tags to the file on disk; the audio is unchanged.",
+                    )
+                    .color(theme::LILAC)
+                    .size(11.0),
+                );
+            });
+            if cancel {
+                self.tag_edit = None;
+            } else if save && let Some(te) = self.tag_edit.take() {
+                match id3tags::write(&te.path, &te.tags) {
+                    Ok(()) => {
+                        self.status = Some("Tags saved".into());
+                        self.error = None;
+                        self.tags_cache.insert(te.hex, Some(te.tags));
+                    }
+                    Err(e) => self.error = Some(format!("Tag save failed: {e}")),
+                }
             }
         }
 
@@ -4296,6 +4618,349 @@ mod ui_tests {
         }
     }
 
+    /// `T` opens the audio lightbox's ID3 editor pre-filled with the file's
+    /// tags; editing a field and clicking SAVE TAGS writes only the tags to
+    /// disk, preserves the others, and keeps the lightbox open (6.5/6.6).
+    #[test]
+    fn audio_lightbox_edits_and_saves_id3_tags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mp3 = tmp.path().join("song.mp3");
+        crate::id3tags::write_bare_mp3(&mp3);
+        crate::id3tags::write(
+            &mp3,
+            &Tags {
+                title: "Old".into(),
+                artist: "Cohen".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut hash = [0u8; 32];
+        hash[0] = 0xC3;
+        let file = DupeFile {
+            repo: "r".into(),
+            repo_root: tmp.path().to_string_lossy().into_owned(),
+            rel_path: "song.mp3".into(),
+            entry: dedup_core::store::FileEntry {
+                size: 417,
+                hash,
+                modified_ms: 0,
+                missing: false,
+                mime: Some("audio/mpeg".into()),
+                img_fingerprint: None,
+                video_hash: None,
+                pdf_hash: None,
+                audio: Some(dedup_core::store::AudioFp {
+                    duration_ms: 1000,
+                    chunk_hashes: Vec::new(),
+                }),
+                img_size: None,
+                origin: None,
+                exif: None,
+            },
+        };
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![vec![file]]));
+
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.run();
+
+        // T opens the editor, pre-filled from the file.
+        harness.key_press(egui::Key::T);
+        harness.run();
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .tag_edit
+                .as_ref()
+                .map(|t| t.tags.title.as_str()),
+            Some("Old"),
+            "editor opens pre-filled with the current title"
+        );
+
+        // Type a new title, then SAVE TAGS.
+        harness.state_mut().tag_edit.as_mut().unwrap().tags.title = "New Title".into();
+        harness.run();
+        harness.get_by_label("SAVE TAGS").click();
+        harness.run();
+
+        let saved = crate::id3tags::read(&mp3).expect("tags still readable");
+        assert_eq!(saved.title, "New Title", "the new title is written to disk");
+        assert_eq!(saved.artist, "Cohen", "other tags are preserved");
+        assert!(
+            harness.state().tag_edit.is_none(),
+            "the editor closes on save"
+        );
+        assert!(
+            harness.state().lightbox.is_some(),
+            "saving keeps the lightbox open (6.6)"
+        );
+    }
+
+    /// In side-by-side compare, `←`/`→` flip which copy is audible (gap-free via
+    /// the loaded pair) and move the cursor — not re-index A (which used to
+    /// pause and strand the cursor on the top row).
+    #[test]
+    fn audio_compare_arrow_flips_audible_copy() {
+        let group: DupeGroup = (0..2).map(audio_file).collect();
+        let a_hex = hash_hex(&group[0].entry.hash);
+        let b_hex = hash_hex(&group[1].entry.hash);
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.run();
+
+        // Enter compare, then play → the synced pair loads (A audible).
+        harness.key_press(egui::Key::C);
+        harness.run();
+        harness.run();
+        harness.key_press(egui::Key::P);
+        harness.step();
+        harness.step();
+        let snap = harness.state().player.snapshot();
+        assert!(snap.paired, "compare + play loads the pair");
+        assert_eq!(snap.hex.as_deref(), Some(a_hex.as_str()), "A audible first");
+
+        // → flips audible to B, gap-free (still paired), cursor follows.
+        harness.key_press(egui::Key::ArrowRight);
+        harness.step();
+        harness.step();
+        let snap = harness.state().player.snapshot();
+        assert_eq!(
+            snap.hex.as_deref(),
+            Some(b_hex.as_str()),
+            "→ flips audible to B"
+        );
+        assert!(snap.paired, "still paired — no reload, no gap");
+        assert_eq!(
+            harness.state().lightbox.as_ref().unwrap().audio_active,
+            Some(1),
+            "the playback cursor moves to B"
+        );
+
+        // → again flips back to A.
+        harness.key_press(egui::Key::ArrowRight);
+        harness.step();
+        harness.step();
+        assert_eq!(
+            harness.state().player.snapshot().hex.as_deref(),
+            Some(a_hex.as_str()),
+            "→ flips back to A"
+        );
+    }
+
+    /// Side-by-side compare shows a tag panel per row: A's tags beside the A
+    /// wave, B's beside the B wave (symmetric), each with its own EDIT button.
+    #[test]
+    fn audio_compare_shows_symmetric_tag_panels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |name: &str, artist: &str, i: u8| -> DupeFile {
+            let path = tmp.path().join(name);
+            crate::id3tags::write_bare_mp3(&path);
+            crate::id3tags::write(
+                &path,
+                &Tags {
+                    title: "Song".into(),
+                    artist: artist.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut hash = [0u8; 32];
+            hash[0] = 0xE0 | i;
+            DupeFile {
+                repo: "r".into(),
+                repo_root: tmp.path().to_string_lossy().into_owned(),
+                rel_path: name.into(),
+                entry: dedup_core::store::FileEntry {
+                    size: 417,
+                    hash,
+                    modified_ms: 0,
+                    missing: false,
+                    mime: Some("audio/mpeg".into()),
+                    img_fingerprint: None,
+                    video_hash: None,
+                    pdf_hash: None,
+                    audio: Some(dedup_core::store::AudioFp {
+                        duration_ms: 1000,
+                        chunk_hashes: Vec::new(),
+                    }),
+                    img_size: None,
+                    origin: None,
+                    exif: None,
+                },
+            }
+        };
+        let group: DupeGroup = vec![mk("a.mp3", "Alpha", 0), mk("b.mp3", "Beta", 1)];
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.run();
+        harness.key_press(egui::Key::C);
+        harness.run();
+        harness.run();
+
+        // A's value shows in the A row and B's value in the B row (not blank).
+        assert!(
+            harness.query_by_label("Alpha").is_some(),
+            "A's tags render in the top panel"
+        );
+        assert!(
+            harness.query_by_label("Beta").is_some(),
+            "B's tags render in the B row (the regression the user hit)"
+        );
+        // One EDIT button per panel.
+        let edits = harness
+            .get_all_by_label(&format!("{} EDIT", icon::PENCIL))
+            .count();
+        assert_eq!(edits, 2, "an EDIT button per copy");
+    }
+
+    /// Opening the tag editor gathers the distinct value of each field from
+    /// every copy in the group, so the user can adopt the best one.
+    #[test]
+    fn tag_editor_offers_values_from_all_copies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |name: &str, title: &str, i: u8| -> DupeFile {
+            let path = tmp.path().join(name);
+            crate::id3tags::write_bare_mp3(&path);
+            crate::id3tags::write(
+                &path,
+                &Tags {
+                    title: title.into(),
+                    artist: "The Band".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut hash = [0u8; 32];
+            hash[0] = 0xD0 | i;
+            DupeFile {
+                repo: "r".into(),
+                repo_root: tmp.path().to_string_lossy().into_owned(),
+                rel_path: name.into(),
+                entry: dedup_core::store::FileEntry {
+                    size: 417,
+                    hash,
+                    modified_ms: 0,
+                    missing: false,
+                    mime: Some("audio/mpeg".into()),
+                    img_fingerprint: None,
+                    video_hash: None,
+                    pdf_hash: None,
+                    audio: Some(dedup_core::store::AudioFp {
+                        duration_ms: 1000,
+                        chunk_hashes: Vec::new(),
+                    }),
+                    img_size: None,
+                    origin: None,
+                    exif: None,
+                },
+            }
+        };
+        let group: DupeGroup = vec![mk("one.mp3", "Take One", 0), mk("two.mp3", "Take Two", 1)];
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.run();
+        harness.key_press(egui::Key::T);
+        harness.run();
+        harness.run();
+
+        let te = harness.state();
+        let te = te.tag_edit.as_ref().expect("editor open");
+        assert!(
+            te.options[0].contains(&"Take One".to_string())
+                && te.options[0].contains(&"Take Two".to_string()),
+            "title options gather both copies' values: {:?}",
+            te.options[0]
+        );
+        assert_eq!(
+            te.options[1],
+            vec!["The Band".to_string()],
+            "the shared artist is deduplicated to one option"
+        );
+    }
+
     /// `C` enters A/B compare, which exposes MARK B and a FLICKER toggle, marks
     /// the B candidate, and exits back to single view.
     #[test]
@@ -4786,6 +5451,98 @@ mod ui_tests {
             });
         harness.run();
         harness.snapshot("dupes_view");
+    }
+
+    /// Renders the audio lightbox's ID3 tag editor to `target/dupes_tags.png`.
+    #[test]
+    #[ignore = "renders a PNG for manual inspection"]
+    fn render_audio_tags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |name: &str, tags: Tags, i: u8| -> DupeFile {
+            let path = tmp.path().join(name);
+            crate::id3tags::write_bare_mp3(&path);
+            crate::id3tags::write(&path, &tags).unwrap();
+            let mut hash = [0u8; 32];
+            hash[0] = 0xC0 | i;
+            DupeFile {
+                repo: "r".into(),
+                repo_root: tmp.path().to_string_lossy().into_owned(),
+                rel_path: name.into(),
+                entry: dedup_core::store::FileEntry {
+                    size: 417,
+                    hash,
+                    modified_ms: 0,
+                    missing: false,
+                    mime: Some("audio/mpeg".into()),
+                    img_fingerprint: None,
+                    video_hash: None,
+                    pdf_hash: None,
+                    audio: Some(dedup_core::store::AudioFp {
+                        duration_ms: 1000,
+                        chunk_hashes: Vec::new(),
+                    }),
+                    img_size: None,
+                    origin: None,
+                    exif: None,
+                },
+            }
+        };
+        // Two copies that agree on most tags but differ on album/track.
+        let a = mk(
+            "a.mp3",
+            Tags {
+                title: "Chelsea Hotel #2".into(),
+                artist: "Leonard Cohen".into(),
+                album: "New Skin".into(),
+                year: "1974".into(),
+                track: "5".into(),
+                genre: "Folk".into(),
+            },
+            0,
+        );
+        let b = mk(
+            "b.mp3",
+            Tags {
+                title: "Chelsea Hotel #2".into(),
+                artist: "Leonard Cohen".into(),
+                album: "New Skin for the Old Ceremony".into(),
+                year: "1974".into(),
+                track: "05".into(),
+                genre: "Folk".into(),
+            },
+            1,
+        );
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![vec![a, b]]));
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 640.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.run();
+        // Side-by-side compare → the read-only id3 diff table on the right.
+        harness.key_press(egui::Key::C);
+        harness.run();
+        harness.run();
+        let img = harness.render().expect("wgpu render failed");
+        let out =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/dupes_tags.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 
     /// Renders the image lightbox mid-edit (rotated preview + Edit controls +
