@@ -2655,7 +2655,8 @@ impl DupesView {
         };
 
         // ←/→ : switch which copy is A, keeping the offset (single playback).
-        if new_idx != idx {
+        let nav = new_idx != idx;
+        if nav {
             idx = new_idx;
             state.index = idx;
             if snap.loaded {
@@ -2679,13 +2680,11 @@ impl DupesView {
                 c.show_b = state.audio_active.is_some() && state.audio_active == b_idx;
             }
         }
-        // Entering flicker while a copy plays: load the synced pair now, so even
-        // the first swap is gap-free.
-        if toggle_flicker
-            && state.compare.as_ref().is_some_and(|c| c.flicker)
-            && snap.loaded
-            && !paired_ab
-        {
+        // Keep the synced A/B pair loaded whenever comparing and playing, so both
+        // flicker swaps *and* side-by-side clicks switch instantly (gap-free).
+        // Skipped when another action this frame already (re)starts playback.
+        let busy = nav || swap || toggle_play || click_play.is_some();
+        if comparing && snap.playing && !paired_ab && !busy {
             start_play(self, state.audio_active == b_idx, cur_ms);
         }
         // space in flicker → swap the shown copy AND the audio, gap-free when the
@@ -2715,8 +2714,30 @@ impl DupesView {
         }
         if let Some((is_b, frac)) = click_play {
             let want_b = is_b && comparing;
-            let offset = (f64::from(frac) * _a_total as f64) as u64;
-            start_play(self, want_b, offset);
+            if paired_ab && snap.playing {
+                // Gap-free: flip to the clicked copy if it isn't already audible,
+                // and seek only if the click actually moves the playhead — so
+                // clicking the other copy at the same spot is an instant A/B swap.
+                let wanted = if want_b {
+                    b_hex.as_deref()
+                } else {
+                    Some(a_hex.as_str())
+                };
+                if snap.hex.as_deref() != wanted {
+                    self.player.flip();
+                }
+                let cur = if snap.total_ms > 0 {
+                    snap.pos_ms as f32 / snap.total_ms as f32
+                } else {
+                    0.0
+                };
+                if (cur - frac).abs() > 0.01 {
+                    self.player.seek_fraction(frac);
+                }
+            } else {
+                let offset = (f64::from(frac) * _a_total as f64) as u64;
+                start_play(self, want_b, offset);
+            }
             state.audio_active = if want_b { b_idx } else { Some(idx) };
             if let Some(c) = state.compare.as_mut()
                 && c.flicker
@@ -3949,6 +3970,14 @@ mod ui_tests {
             harness.state().lightbox.as_ref().unwrap().compare.is_some(),
             "C enters compare"
         );
+        // Comparing while playing loads the synced A/B pair even in side-by-side
+        // (not just flicker), so a click on either copy switches gap-free.
+        harness.step();
+        assert!(
+            harness.state().player.snapshot().paired,
+            "side-by-side compare keeps the A/B pair loaded"
+        );
+
         harness.key_press(egui::Key::Space);
         harness.step();
         harness.step();

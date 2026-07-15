@@ -113,10 +113,12 @@ land with the audio lightbox (6.3).
   70 dB floor + DC-bin drop) — a real contrast improvement, but *not* the bug; the short (3 s)
   render test never folded, so it hid the defect. New unit test decodes a long tone and
   asserts its bin is lit at x=0, mid, **and the last column**.
-- **Gap-free flicker audio swap** (bug the user caught): swapping in flicker changed only the
-  picture, not the sound. `player.rs` now has a **paired mode** — two sinks play the same
-  offset in sync, one muted; entering flicker loads the pair and a swap is an instant volume
-  **flip** (no reload, no gap), with the playback cursor following to the audible copy.
+- **Gap-free audio switching in compare** (bug the user caught, then extended): swapping in
+  flicker changed only the picture, not the sound. `player.rs` now has a **paired mode** — two
+  sinks play the same offset in sync, one muted. The pair is kept loaded whenever you're
+  comparing-and-playing, so **both** a flicker `space` swap **and** a side-by-side click on the
+  other copy are an instant volume **flip** (no reload, no gap); a click only seeks if it
+  actually moves the playhead. The playback cursor follows to the audible copy.
 - **One cursor, not two** (bug fix): the cursor keyed off content hash, so exact-duplicate
   copies (shared hash) both lit up. Now tracked by row via `LightboxState.audio_active`.
 - **Keep-offset switching, both places** (the flagged "maybe" — user said yes): switching
@@ -124,9 +126,9 @@ land with the audio lightbox (6.3).
   `start_ms` through `Player::play` (seek-on-start).
 - **Honest note:** within a group the opening bytes are identical, so views line up early and
   real differences show later (or in a slightly different length).
-- **Deferred:** the *small pause* the user flagged is now gone for the flicker A/B swap (the
-  key case). Switching the *A* copy with `←`/`→` (or clicking a different copy) still reloads a
-  single sink, so that path keeps a small gap; extending the pair to those is a follow-up.
+- **Deferred:** the *small pause* the user flagged is gone for both the flicker swap and
+  side-by-side clicks. Only `←`/`→` (which changes *which* copy is A, a structural change) and
+  the very first play/click that loads the pair still reload — an acceptable one-off.
 - Tests: `waveform.rs` envelope+spectrogram unit tests (WAV generated in-test — no
   audio-writer dep), `audio_lightbox_opens_compares_plays_and_escapes` (P/S/space-flicker/Esc),
   `switching_audio_copies_keeps_offset`, and `--ignored` `render_audio_lightbox` (spectrogram).
