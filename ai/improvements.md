@@ -60,10 +60,17 @@ audio, with safe in-place edits. (Folded from the "Open issues" list, kept verba
 - The compare hint bar is now **mode-aware** (distinct side-by-side vs flicker strings) and
   names every available shortcut.
 
-**Remaining (deferred 2026-07-14 — this pass is lightbox-only by decision):** extend a
-persistent, discoverable hint bar *and* actual keyboard shortcuts to the Transfer, Grooming,
-and Duplicates-grid views, which have none today. Audio play/pause + next-audio shortcuts
-land with the audio lightbox (6.3).
+**Cross-view shortcuts — ✅ done (2026-07-15).** A shared `util::shortcut_bar` renders a
+persistent hint line (same LILAC style as the lightbox) at the top of each view, and each
+view now handles keyboard shortcuts (guarded by `egui_wants_keyboard_input()` so text fields
+still type, and — for Duplicates — skipped while a lightbox/confirm modal owns the keyboard):
+
+- **Duplicates grid:** `F` find · `←`/`→` page · `M` toggle match mode.
+- **Transfer:** `1` copy · `2` move · `P` preview · `R` run.
+- **Grooming:** `1`–`4` command (dedupe/purge/empty-dirs/organize) · `P` preview · `R` run.
+
+Tests: `grid_shortcut_toggles_match_mode` (dupes), `number_keys_select_command` (transfer &
+grooming).
 
 ### 6.2 Audio preview tile — ✅ done (2026-07-14)
 

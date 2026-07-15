@@ -447,6 +447,31 @@ impl DupesView {
 
         let mut acts: Vec<Act> = Vec::new();
 
+        // Grid keyboard shortcuts — skipped while a lightbox or confirm modal
+        // owns the keyboard, or a text field is focused.
+        if self.lightbox.is_none() && self.confirm.is_none() && !ctx.egui_wants_keyboard_input() {
+            let pages = self.total_groups().div_ceil(PAGE_SIZE);
+            let cur = self.page.min(pages.saturating_sub(1));
+            ctx.input(|i| {
+                if i.key_pressed(egui::Key::F) && self.busy.is_none() {
+                    acts.push(Act::Find);
+                }
+                if i.key_pressed(egui::Key::M) {
+                    self.mode = if self.mode == Mode::Exact {
+                        Mode::Similar
+                    } else {
+                        Mode::Exact
+                    };
+                }
+                if i.key_pressed(egui::Key::ArrowLeft) && cur > 0 {
+                    acts.push(Act::SetPage(cur - 1));
+                }
+                if i.key_pressed(egui::Key::ArrowRight) && cur + 1 < pages {
+                    acts.push(Act::SetPage(cur + 1));
+                }
+            });
+        }
+
         ui.add_space(6.0);
         ui.label(
             RichText::new("DUPLICATE MANAGEMENT")
@@ -456,6 +481,14 @@ impl DupesView {
         );
         self.repo_bar(ui, &mut acts);
         self.controls(ui, &mut acts);
+        crate::util::shortcut_bar(
+            ui,
+            &format!(
+                "F find · {}/{} page · M mode",
+                icon::CARET_LEFT,
+                icon::CARET_RIGHT
+            ),
+        );
         if let Some(err) = &self.error {
             ui.colored_label(theme::RED, err);
         }
@@ -5267,6 +5300,48 @@ mod ui_tests {
             harness.state().lightbox.is_some(),
             "saving keeps the lightbox open (6.6)"
         );
+    }
+
+    /// `M` toggles the match mode from the grid (no lightbox/modal open).
+    #[test]
+    fn grid_shortcut_toggles_match_mode() {
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(900.0, 600.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        assert!(
+            harness.state().mode == Mode::Exact,
+            "starts in exact/DUPLICATES"
+        );
+
+        harness.key_press(egui::Key::M);
+        harness.run();
+        harness.run();
+        assert!(
+            harness.state().mode == Mode::Similar,
+            "M switches to SIMILAR"
+        );
+        harness.key_press(egui::Key::M);
+        harness.run();
+        harness.run();
+        assert!(harness.state().mode == Mode::Exact, "M toggles back");
     }
 
     /// Re-locking removes the override and any pending mark, and turning a

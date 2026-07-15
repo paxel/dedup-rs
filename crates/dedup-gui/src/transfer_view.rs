@@ -266,6 +266,26 @@ impl TransferView {
         }
 
         let mut acts: Vec<Act> = Vec::new();
+
+        // Keyboard shortcuts — skipped while the confirm modal is up, a run is
+        // active, or a text field is focused.
+        if self.confirm.is_none() && !self.running && !ui.ctx().egui_wants_keyboard_input() {
+            ui.input(|i| {
+                if i.key_pressed(egui::Key::Num1) {
+                    acts.push(Act::SetCommand(Command::Copy));
+                }
+                if i.key_pressed(egui::Key::Num2) {
+                    acts.push(Act::SetCommand(Command::Move));
+                }
+                if i.key_pressed(egui::Key::P) {
+                    acts.push(Act::Preview);
+                }
+                if i.key_pressed(egui::Key::R) {
+                    acts.push(Act::Ask);
+                }
+            });
+        }
+
         ui.add_space(6.0);
         ui.label(
             RichText::new("TRANSFER")
@@ -273,6 +293,7 @@ impl TransferView {
                 .size(18.0)
                 .strong(),
         );
+        crate::util::shortcut_bar(ui, "1 copy · 2 move · P preview · R run");
 
         self.repo_rows(ui, &mut acts);
         self.command_bar(ui, &mut acts);
@@ -1491,6 +1512,24 @@ mod ui_tests {
             );
         harness.run();
         harness
+    }
+
+    /// The number keys switch the COPY/MOVE command from the keyboard.
+    #[test]
+    fn number_keys_select_command() {
+        let (_tmp, store) = sample_store();
+        let mut h = transfer_harness(store, |_| {});
+        assert!(h.state().command == Command::Copy, "starts on COPY");
+
+        h.key_press(egui::Key::Num2);
+        h.run();
+        h.run();
+        assert!(h.state().command == Command::Move, "2 selects MOVE");
+
+        h.key_press(egui::Key::Num1);
+        h.run();
+        h.run();
+        assert!(h.state().command == Command::Copy, "1 selects COPY");
     }
 
     /// In FOLDER mode the folder/mode/invert controls appear and the repo-only

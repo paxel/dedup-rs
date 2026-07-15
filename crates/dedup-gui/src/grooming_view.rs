@@ -262,12 +262,40 @@ impl GroomingView {
         }
 
         let mut acts: Vec<Act> = Vec::new();
+
+        // Keyboard shortcuts — skipped while the confirm modal is up, a run is
+        // active, or a text field is focused.
+        if self.confirm.is_none() && !self.running && !ui.ctx().egui_wants_keyboard_input() {
+            ui.input(|i| {
+                for (key, cmd) in [
+                    (egui::Key::Num1, Command::Dedupe),
+                    (egui::Key::Num2, Command::Purge),
+                    (egui::Key::Num3, Command::EmptyDirs),
+                    (egui::Key::Num4, Command::Organize),
+                ] {
+                    if i.key_pressed(key) {
+                        acts.push(Act::SetCommand(cmd));
+                    }
+                }
+                if i.key_pressed(egui::Key::P) {
+                    acts.push(Act::Preview);
+                }
+                if i.key_pressed(egui::Key::R) {
+                    acts.push(Act::Ask);
+                }
+            });
+        }
+
         ui.add_space(6.0);
         ui.label(
             RichText::new("GROOMING")
                 .color(theme::TAN)
                 .size(18.0)
                 .strong(),
+        );
+        crate::util::shortcut_bar(
+            ui,
+            "1 dedupe · 2 purge · 3 empty-dirs · 4 organize · P preview · R run",
         );
 
         self.command_bar(ui, &mut acts);
@@ -1238,6 +1266,24 @@ mod ui_tests {
             );
         harness.run();
         harness
+    }
+
+    /// The number keys switch commands (mirroring the segmented selector).
+    #[test]
+    fn number_keys_select_command() {
+        let (_tmp, store) = sample_store();
+        let mut h = grooming_harness(Arc::clone(&store), Command::Dedupe);
+        assert!(h.state().command == Command::Dedupe);
+
+        h.key_press(egui::Key::Num2);
+        h.run();
+        h.run();
+        assert!(h.state().command == Command::Purge, "2 selects PURGE");
+
+        h.key_press(egui::Key::Num4);
+        h.run();
+        h.run();
+        assert!(h.state().command == Command::Organize, "4 selects ORGANIZE");
     }
 
     /// DEDUPE shows SOURCE + DUPEPOOL + FILTER; PURGE shows a single REPO +

@@ -28,6 +28,14 @@ fn pick_tooltip<'a>(verbosity: TooltipVerbosity, short: &'a str, verbose: &'a st
     }
 }
 
+/// A persistent one-line keyboard-shortcut hint, styled like the lightbox's, so
+/// every view advertises its shortcuts the same way. Middot-separated, e.g.
+/// `"F find · ←/→ page · M mode"`.
+pub fn shortcut_bar(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(2.0);
+    ui.label(RichText::new(text).color(theme::LILAC).size(11.0));
+}
+
 /// The shared "similarity" threshold control: a labelled `50–100 %` slider
 /// (with an "identical" hint at the top) used everywhere a SIMILAR grouping is
 /// chosen, so the Duplicates and Transfer tabs present it identically. Edits
