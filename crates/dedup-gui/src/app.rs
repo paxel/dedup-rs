@@ -144,6 +144,9 @@ pub struct DedupApp {
     grooming: GroomingView,
     /// Last settings written to disk, to avoid rewriting an unchanged file.
     saved_settings: crate::settings::Settings,
+    /// Current window inner size (logical points), captured each frame and
+    /// flushed on exit so the next launch reopens at the same size.
+    window_size: Option<[f32; 2]>,
 }
 
 impl DedupApp {
@@ -179,6 +182,7 @@ impl DedupApp {
             transfer: TransferView::new(),
             grooming: GroomingView::new(),
             saved_settings: crate::settings::Settings::default(),
+            window_size: None,
         };
         // Restore persisted settings (thread count, similarity threshold,
         // tooltip verbosity).
@@ -191,6 +195,17 @@ impl DedupApp {
         app.saved_settings = settings;
         app.reload_all();
         app
+    }
+
+    /// The persistable settings snapshot for the current UI state.
+    fn current_settings(&self) -> crate::settings::Settings {
+        crate::settings::Settings {
+            threads: self.threads,
+            similarity_threshold: self.dupes.threshold(),
+            transfer_similarity_threshold: self.transfer.threshold(),
+            tooltip_verbosity: self.tooltip_verbosity,
+            window_size: self.window_size,
+        }
     }
 
     /// Kick off a background probe of every repo's location + reachability.
@@ -571,19 +586,37 @@ impl eframe::App for DedupApp {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
-        // Persist settings the moment they change (eframe's own storage isn't
-        // enabled, so we own the file). Comparing first keeps this to one write
-        // per actual change, not one per frame.
-        let current = crate::settings::Settings {
-            threads: self.threads,
-            similarity_threshold: self.dupes.threshold(),
-            transfer_similarity_threshold: self.transfer.threshold(),
-            tooltip_verbosity: self.tooltip_verbosity,
-        };
-        if current != self.saved_settings {
+        // Track the window's logical size for persistence (flushed on exit).
+        // `screen_rect` works on Wayland, where winit can't report the window
+        // position so `viewport().inner_rect` is None; scaling by the zoom
+        // factor converts egui points to the logical points `with_inner_size`
+        // expects, independent of HiDPI or `--ui-scale`.
+        let sz = ctx.viewport_rect().size() * ctx.zoom_factor();
+        if sz.x >= 1.0 && sz.y >= 1.0 {
+            self.window_size = Some([sz.x, sz.y]);
+        }
+
+        // Persist settings the moment a *control* changes (eframe's own storage
+        // isn't enabled, so we own the file). Comparing first keeps this to one
+        // write per actual change. A window resize alone doesn't write here —
+        // that would thrash the file every frame of a drag — the final size is
+        // flushed in `on_exit`.
+        let current = self.current_settings();
+        let control_changed = current.threads != self.saved_settings.threads
+            || current.similarity_threshold != self.saved_settings.similarity_threshold
+            || current.transfer_similarity_threshold
+                != self.saved_settings.transfer_similarity_threshold
+            || current.tooltip_verbosity != self.saved_settings.tooltip_verbosity;
+        if control_changed {
             current.save(self.store.config_dir());
             self.saved_settings = current;
         }
+    }
+
+    fn on_exit(&mut self) {
+        // Flush the final window size (and any current control values) so the
+        // next launch reopens where the user left it.
+        self.current_settings().save(self.store.config_dir());
     }
 }
 
@@ -1812,6 +1845,32 @@ mod ui_tests {
             update_repo(&store, name, 1, &NoProgress, &CancellationToken::new()).unwrap();
         }
         (tmp, DedupApp::new(store))
+    }
+
+    /// The window size is flushed on exit and restored (via `Settings`) on the
+    /// next launch, so the app reopens where the user left it.
+    #[test]
+    fn window_size_persists_on_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let config_dir = store.config_dir().to_path_buf();
+        let mut app = DedupApp::new(store);
+
+        // Nothing saved yet → the next `run()` would fall back to the default.
+        assert_eq!(
+            crate::settings::Settings::load(&config_dir).window_size,
+            None
+        );
+
+        // A resize (captured each frame from `viewport_rect`) then a close.
+        app.window_size = Some([912.0, 678.0]);
+        eframe::App::on_exit(&mut app);
+
+        assert_eq!(
+            crate::settings::Settings::load(&config_dir).window_size,
+            Some([912.0, 678.0]),
+            "the closed size is restored on the next launch"
+        );
     }
 
     fn doc_screenshot_path(name: &str) -> PathBuf {

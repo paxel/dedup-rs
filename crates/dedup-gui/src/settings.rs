@@ -30,6 +30,9 @@ pub struct Settings {
     pub transfer_similarity_threshold: f64,
     /// Hover-tooltip wording: short one-liners or verbose explanations.
     pub tooltip_verbosity: TooltipVerbosity,
+    /// Last window inner size in logical points `[w, h]`, restored next launch
+    /// (`None` until the window has been sized once).
+    pub window_size: Option<[f32; 2]>,
 }
 
 impl Default for Settings {
@@ -39,6 +42,7 @@ impl Default for Settings {
             similarity_threshold: 99.0,
             transfer_similarity_threshold: 90.0,
             tooltip_verbosity: TooltipVerbosity::default(),
+            window_size: None,
         }
     }
 }
@@ -80,6 +84,7 @@ mod tests {
             similarity_threshold: 97.5,
             transfer_similarity_threshold: 88.0,
             tooltip_verbosity: TooltipVerbosity::Verbose,
+            window_size: Some([1280.0, 800.0]),
         };
         s.save(dir.path());
         assert_eq!(Settings::load(dir.path()), s);

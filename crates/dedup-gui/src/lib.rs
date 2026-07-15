@@ -30,8 +30,14 @@ use std::sync::Arc;
 pub fn run(ui_scale: Option<f32>) -> Result<(), String> {
     let store = Arc::new(Store::open().map_err(|e| e.to_string())?);
 
+    // Restore the last window size (clamped to something sane), so the app opens
+    // where it was left instead of a fixed default.
+    let size = settings::Settings::load(store.config_dir())
+        .window_size
+        .map(|[w, h]| [w.clamp(760.0, 10_000.0), h.clamp(480.0, 10_000.0)])
+        .unwrap_or([1100.0, 720.0]);
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1100.0, 720.0])
+        .with_inner_size(size)
         .with_min_inner_size([760.0, 480.0])
         .with_title("dedup")
         // On Wayland the compositor ignores `with_icon` and instead matches the
