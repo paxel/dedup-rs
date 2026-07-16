@@ -247,9 +247,13 @@ everywhere.
   every matching file under the current dir recursively, named by sub-path. Flatten +
   batch-tag unit-tested, render-verified. (Batch id3-field-set on selected audio is
   deferred — needs the id3 write path.)
-- ✅ **7.7 Forensic extras** — unknown file types auto-show a hex-header + printable
-  strings dump in the preview; a **Hex / strings** command toggle forces that byte view
-  for *any* file (inspect a JPEG's header, etc.). Unit-tested; render-verified.
+- ✅ **7.7 Forensic extras** — an **Inspect bytes** command toggle forces a byte view for
+  media/text files (hidden for unknown types, which already show the byte fallback); a
+  **Hex | Strings** switch in the preview picks which half to show (both at once was too
+  much). All Browse toggles/rows are now self-painted (`paint_chip`) so they stay legible
+  in every state — the theme's `override_text_color` made plain `selectable_label`s
+  cream-on-amber on hover (captured in the new `egui-desktop` skill). Unit-tested;
+  render-verified incl. hover.
 - **7.8 Annotation filter** — a new annotation facet in the FILTER; unlocks the
   annotation-driven Transfer exports noted in 5.1 (export important / archive
   unimportant).

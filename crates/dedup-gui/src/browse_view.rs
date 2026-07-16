@@ -60,6 +60,13 @@ enum SortCol {
     Tags,
 }
 
+/// Which half of a byte dump to show (they're too much together).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ByteMode {
+    Hex,
+    Strings,
+}
+
 /// Broad file categories that pick how the preview dock renders a file.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Cat {
@@ -168,9 +175,11 @@ pub struct BrowseView {
     /// Cached text/binary preview body, keyed by the rel-path it was built for.
     preview: Option<Preview>,
     preview_key: Option<String>,
-    /// When on, the preview shows a hex-header + strings dump for *any* file
+    /// When on, the preview shows a byte dump (hex or strings) for *any* file
     /// (a forensic "inspect the bytes" mode), not just unknown types.
     hex_view: bool,
+    /// Which half of a byte dump the preview shows (hex or strings).
+    byte_mode: ByteMode,
     /// The selected file's annotation tags, loaded (per rel-path) from the store.
     annos: Vec<String>,
     annos_key: Option<String>,
@@ -213,6 +222,7 @@ impl BrowseView {
             preview: None,
             preview_key: None,
             hex_view: false,
+            byte_mode: ByteMode::Hex,
             annos: Vec::new(),
             annos_key: None,
             anno_input: String::new(),
@@ -513,8 +523,7 @@ impl BrowseView {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .selectable_label(self.flatten, "Flatten")
+                if pill_toggle(ui, self.flatten, "Flatten")
                     .explain(
                         self.verbosity,
                         "List all matching files recursively (hides the folder pane)",
@@ -622,21 +631,21 @@ impl BrowseView {
     /// the pane wider (its width is set by the splitter, not by content). The
     /// selected dir stays marked even when the files pane has focus (only dimmer).
     fn draw_dirs(&mut self, ui: &mut egui::Ui, dirs: &[String]) {
-        list_visuals(ui, self.focus == Pane::Dirs);
+        let active = self.focus == Pane::Dirs;
         egui::ScrollArea::vertical()
             .id_salt("browse-dirs")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if !self.cur.is_empty() {
                     let up = format!("{}  ..", crate::icon::CARET_LEFT);
-                    if ui.selectable_label(false, up).clicked() {
+                    if list_row(ui, false, active, &up).clicked() {
                         self.go_parent();
                     }
                 }
                 for (i, d) in dirs.iter().enumerate() {
                     let selected = i == self.dir_sel;
                     let label = format!("{}  {}", icon_folder(), truncate(d, 30));
-                    let resp = ui.selectable_label(selected, label);
+                    let resp = list_row(ui, selected, active, &label);
                     if resp.clicked() {
                         self.focus = Pane::Dirs;
                         self.dir_sel = i;
@@ -941,9 +950,21 @@ impl BrowseView {
         }
     }
 
-    /// Render the cached text/binary body: text lines, or a hex-header + strings
-    /// dump, in a scroll area.
+    /// Render the cached text/binary body: text lines, or a byte dump showing
+    /// *either* the hex header *or* the strings (a switch picks which — both at
+    /// once is too much), in a scroll area.
     fn draw_preview_body(&mut self, ui: &mut egui::Ui) {
+        // For a byte dump, a Hex|Strings switch above the scroll area.
+        if matches!(self.preview, Some(Preview::Bytes { .. })) {
+            ui.horizontal(|ui| {
+                for (mode, label) in [(ByteMode::Hex, "Hex"), (ByteMode::Strings, "Strings")] {
+                    if pill_toggle(ui, self.byte_mode == mode, label).clicked() {
+                        self.byte_mode = mode;
+                    }
+                }
+            });
+        }
+        let mode = self.byte_mode;
         egui::ScrollArea::vertical()
             .id_salt("browse-preview")
             .auto_shrink([false, false])
@@ -953,19 +974,21 @@ impl BrowseView {
                         ui.label(RichText::new(l).monospace().size(12.0));
                     }
                 }
-                Some(Preview::Bytes { hex, strings }) => {
-                    ui.label(RichText::new("HEADER").color(theme::AMBER).size(11.0));
-                    for l in hex {
-                        ui.label(RichText::new(l).monospace().size(12.0).color(theme::TEXT));
+                Some(Preview::Bytes { hex, strings }) => match mode {
+                    ByteMode::Hex => {
+                        for l in hex {
+                            ui.label(RichText::new(l).monospace().size(12.0).color(theme::TEXT));
+                        }
                     }
-                    if !strings.is_empty() {
-                        ui.add_space(4.0);
-                        ui.label(RichText::new("STRINGS").color(theme::AMBER).size(11.0));
+                    ByteMode::Strings => {
+                        if strings.is_empty() {
+                            ui.colored_label(theme::HAIRLINE, "(no printable strings)");
+                        }
                         for s in strings {
                             ui.label(RichText::new(s).monospace().size(12.0).color(theme::LILAC));
                         }
                     }
-                }
+                },
                 Some(Preview::Error(e)) => {
                     ui.colored_label(theme::RED, e);
                 }
@@ -1001,11 +1024,11 @@ impl BrowseView {
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                     batch_submit = true;
                 }
-                if ui.button("Tag all").clicked() {
+                if dark_button(ui, "Tag all").clicked() {
                     batch_submit = true;
                 }
             });
-            if ui.button("Clear selection").clicked() {
+            if dark_button(ui, "Clear selection").clicked() {
                 self.selected.clear();
             }
             if batch_submit {
@@ -1061,26 +1084,28 @@ impl BrowseView {
         {
             self.error = Some(e.to_string());
         }
-        // Forensic hex/strings toggle: inspect the raw header bytes of any file
-        // (not just unknown types). Toggling rebuilds the preview body.
-        let label = if self.hex_view {
-            "Hex / strings: on"
-        } else {
-            "Hex / strings: off"
-        };
-        if ui
-            .selectable_label(self.hex_view, label)
-            .explain(
-                self.verbosity,
-                "Show the file's header bytes + printable strings",
-                "Force a hex dump of the file's header plus any printable strings, for \
-                 any file type — the forensic 'what's actually in here' view. Unknown \
-                 file types show this automatically.",
-            )
-            .clicked()
-        {
-            self.hex_view = !self.hex_view;
-            self.preview_key = None; // force the preview body to rebuild
+        // Byte-inspection toggle — only meaningful when the default preview is
+        // *not* already a byte dump. Unknown types (Cat::Other) always show the
+        // hex/strings fallback, so the toggle would be a no-op there; hide it.
+        if Cat::of(&sel.mime) != Cat::Other {
+            let label = if self.hex_view {
+                "Inspect bytes: on"
+            } else {
+                "Inspect bytes: off"
+            };
+            if pill_toggle(ui, self.hex_view, label)
+                .explain(
+                    self.verbosity,
+                    "Show the file's raw bytes (hex or strings)",
+                    "Force a byte dump of the file's header — switch between the hex view \
+                     and the printable strings in the preview. For images/audio/video this \
+                     replaces the thumbnail/waveform; unknown types show it automatically.",
+                )
+                .clicked()
+            {
+                self.hex_view = !self.hex_view;
+                self.preview_key = None; // force the preview body to rebuild
+            }
         }
 
         ui.add_space(10.0);
@@ -1116,7 +1141,7 @@ impl BrowseView {
             if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                 submit = true;
             }
-            if ui.button("Add").clicked() {
+            if dark_button(ui, "Add").clicked() {
                 submit = true;
             }
         });
@@ -1138,7 +1163,11 @@ impl BrowseView {
             );
             ui.horizontal_wrapped(|ui| {
                 for tag in &suggestions {
-                    if ui.small_button(tag).clicked() {
+                    // Explicit black text so the pill stays readable on hover.
+                    if ui
+                        .add(egui::Button::new(RichText::new(tag).color(theme::BLACK)).small())
+                        .clicked()
+                    {
                         add_existing = Some(tag.clone());
                     }
                 }
@@ -1277,15 +1306,69 @@ fn selection_colors(ui: &mut egui::Ui, active: bool) {
     sel.stroke.color = theme::TEXT;
 }
 
-/// Interaction colours for the **dirs** pane (interactive `selectable_label`s):
-/// cream text when idle, black text on the amber hover pill (the theme default
-/// would leave cream text on amber, unreadable).
-fn list_visuals(ui: &mut egui::Ui, active: bool) {
-    let w = &mut ui.visuals_mut().widgets;
-    w.inactive.fg_stroke.color = theme::TEXT;
-    w.hovered.fg_stroke.color = theme::BLACK;
-    w.active.fg_stroke.color = theme::BLACK;
-    selection_colors(ui, active);
+/// A self-painted clickable chip that stays legible in every state. The theme's
+/// `override_text_color` forces cream text on plain `selectable_label`s (see the
+/// egui-desktop skill), which is unreadable on the amber hover fill — so we pick
+/// the fill *and* the text colour per state ourselves and paint them directly.
+/// `selected` → `sel_fill`/`sel_fg`; hovered → dark slate + cream; idle → cream.
+fn paint_chip(
+    ui: &mut egui::Ui,
+    text: &str,
+    selected: bool,
+    sel_fill: Color32,
+    sel_fg: Color32,
+    full_width: bool,
+) -> egui::Response {
+    let font = egui::FontId::proportional(13.5);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font.clone(), theme::TEXT);
+    let pad = egui::vec2(8.0, 4.0);
+    let w = if full_width {
+        ui.available_width()
+    } else {
+        galley.size().x + pad.x * 2.0
+    };
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(w, galley.size().y + pad.y * 2.0),
+        egui::Sense::click(),
+    );
+    if ui.is_rect_visible(rect) {
+        let (fill, fg) = if selected {
+            (sel_fill, sel_fg)
+        } else if resp.hovered() {
+            (Color32::from_rgb(0x2C, 0x37, 0x4E), theme::TEXT)
+        } else {
+            (Color32::TRANSPARENT, theme::TEXT)
+        };
+        if fill.a() > 0 {
+            ui.painter().rect_filled(rect, 6.0, fill);
+        }
+        ui.painter()
+            .text(rect.min + pad, egui::Align2::LEFT_TOP, text, font, fg);
+    }
+    // Accessibility + testability: expose it as a labelled, selectable widget.
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, text)
+    });
+    resp
+}
+
+/// A pill on/off (or segmented) toggle: amber + black when on, dark + cream on
+/// hover, transparent + cream when off. Content-width. Readable in every state.
+fn pill_toggle(ui: &mut egui::Ui, on: bool, text: &str) -> egui::Response {
+    paint_chip(ui, text, on, theme::AMBER, theme::BLACK, false)
+}
+
+/// A full-width list row (dirs pane): blue selection (bright when the pane is
+/// focused, dim otherwise) with cream text; dark hover; readable in every state.
+fn list_row(ui: &mut egui::Ui, selected: bool, active: bool, text: &str) -> egui::Response {
+    let sel_fill = if active {
+        Color32::from_rgb(0x2E, 0x45, 0x80)
+    } else {
+        Color32::from_rgb(0x1A, 0x22, 0x30)
+    };
+    paint_chip(ui, text, selected, sel_fill, theme::TEXT, true)
 }
 
 /// Interaction colours for the **file table**, whose cells are non-interactive
@@ -1297,6 +1380,12 @@ fn table_visuals(ui: &mut egui::Ui, active: bool) {
     w.noninteractive.fg_stroke.color = theme::TEXT;
     w.hovered.bg_fill = Color32::from_rgb(0x2C, 0x37, 0x4E);
     selection_colors(ui, active);
+}
+
+/// A normal button with readable black text (the theme forces cream text via
+/// `override_text_color`, which is illegible on the button's amber/orange fill).
+fn dark_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.button(RichText::new(label).color(theme::BLACK))
 }
 
 /// A full-width command button with readable black text on the amber pill (the
@@ -1635,6 +1724,60 @@ mod tests {
         );
     }
 
+    /// Clicking the "Inspect bytes" toggle flips it on and rebuilds the preview
+    /// from a text body into a byte (hex/strings) body.
+    #[test]
+    fn inspect_bytes_toggle_switches_the_preview() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let repo_dir = tmp.path().join("R");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        store.create_repo("R", &repo_dir.to_string_lossy()).unwrap();
+        std::fs::write(repo_dir.join("note.txt"), b"Hello world stuff\n").unwrap();
+        let mut e = entry();
+        e.mime = Some("text/plain".into());
+        store.update_file_entry("R", "note.txt", &e).unwrap();
+
+        let mut view = BrowseView::new();
+        view.repo = Some("R".into());
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut BrowseView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    ui.allocate_ui(egui::vec2(ui.available_width(), 600.0), |ui| {
+                        view.show(ui, &store_ui, TooltipVerbosity::default());
+                    });
+                },
+                view,
+            );
+        h.run();
+        h.key_press(egui::Key::Tab);
+        h.run();
+        h.run();
+        assert_eq!(h.state().sel_rel.as_deref(), Some("note.txt"));
+        assert!(
+            matches!(h.state().preview, Some(Preview::Text(_))),
+            "a text file previews as text initially"
+        );
+
+        h.get_by_label("Inspect bytes: off").click_accesskit();
+        h.run();
+        h.run();
+        assert!(h.state().hex_view, "the toggle turned on");
+        assert!(
+            matches!(h.state().preview, Some(Preview::Bytes { .. })),
+            "the preview switched to a byte dump"
+        );
+    }
+
     /// The FILTER prunes the whole navigation: only files that match show, and
     /// only subdirs that lead to a match survive.
     #[test]
@@ -1897,9 +2040,8 @@ mod tests {
         h.key_press(egui::Key::Tab);
         h.run();
         h.run();
-        // Hover the non-selected row to prove the hover state is legible (dark
-        // highlight + cream text, not cream-on-amber). diary.txt sorts first, so
-        // notes.txt is the unselected row.
+        // Hover a dir row to prove hover legibility (dark highlight + cream text,
+        // not the theme's illegible cream-on-amber).
         h.get_by_label("notes.txt").hover();
         h.run();
         let img = h.render().expect("wgpu render failed");
