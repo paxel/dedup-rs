@@ -241,9 +241,12 @@ everywhere.
   keeps it reachable. Integration-tested (type → Add → persisted). The file table also
   gained two DB-backed columns: **INFO** (image `W×H` / audio `m:ss`) and
   **ANNOTATIONS** (the file's tags), both sortable.
-- **7.6 Multi-select + flatten** — multi-select in the files pane → batch commands
-  (add-tags-to-selected, set an id3 field on all selected audio, …); a flatten toggle
-  hides the dirs pane and lists all matching files flat.
+- ✅ **7.6 Multi-select + flatten** — files-pane multi-select (Ctrl/Cmd-click toggles,
+  Shift-click ranges; arrows/nav collapse it) with a batch dock ("N selected" → tag all
+  selected). A **Flatten** toggle (right of the breadcrumb) hides the dirs pane and lists
+  every matching file under the current dir recursively, named by sub-path. Flatten +
+  batch-tag unit-tested, render-verified. (Batch id3-field-set on selected audio is
+  deferred — needs the id3 write path.)
 - **7.7 Forensic extras** — **binary / hex view** of at least a file's header;
   **strings** on demand for unknown files.
 - **7.8 Annotation filter** — a new annotation facet in the FILTER; unlocks the

@@ -17,9 +17,14 @@
 //! whole navigation: only matching files show, and only subdirs that lead to a
 //! match survive.
 //!
+//! The files pane supports multi-select (Ctrl/Cmd-click toggles, Shift-click
+//! ranges) with batch commands (e.g. tag all selected), and a Flatten toggle
+//! that hides the dirs pane and lists every matching file under the current dir
+//! recursively.
+//!
 //! Keyboard: in the subdirs pane `←` goes to the parent, `→` enters the selected
 //! dir, `↑`/`↓` move the selection; `Tab` switches to the files pane. Mouse works
-//! everywhere. (Multi-select and the flatten toggle land in later increments.)
+//! everywhere. (Hex/strings extras and the annotation filter land later.)
 
 use crate::external;
 use crate::filter_ui::FilterBuilder;
@@ -137,6 +142,14 @@ pub struct BrowseView {
     /// survives re-sorting and refreshes (`file_sel` is just its index in the
     /// current display order, recomputed from this each frame).
     sel_rel: Option<String>,
+    /// Multi-selection: the rel-paths of every checked file (batch commands act on
+    /// these). Always contains the cursor file after a plain click.
+    selected: std::collections::HashSet<String>,
+    /// Flatten mode: hide the dirs pane and list every matching file under the
+    /// current directory recursively (with its sub-path as the name).
+    flatten: bool,
+    /// Batch "add tag to selected" input.
+    batch_input: String,
     focus: Pane,
     /// One-shot: scroll the file table to `file_sel` next draw (set by keyboard
     /// moves, so the table follows arrow-key navigation without repainting
@@ -182,6 +195,9 @@ impl BrowseView {
             dir_sel: 0,
             file_sel: 0,
             sel_rel: None,
+            selected: std::collections::HashSet::new(),
+            flatten: false,
+            batch_input: String::new(),
             focus: Pane::Dirs,
             scroll_file: false,
             sort_col: SortCol::Name,
@@ -279,21 +295,7 @@ impl BrowseView {
                 }
                 None => {
                     if filter.matches(rel, entry) {
-                        let tags = self
-                            .annos_map
-                            .get(rel)
-                            .map(|t| t.join(", "))
-                            .unwrap_or_default();
-                        files.push(FileRow {
-                            rel: rel.clone(),
-                            name: rest.to_string(),
-                            size: entry.size,
-                            mime: entry.mime.clone().unwrap_or_default(),
-                            modified_ms: entry.modified_ms,
-                            hash: entry.hash,
-                            info: entry_info(entry),
-                            tags,
-                        });
+                        files.push(self.file_row(rel, rest, entry));
                     }
                 }
             }
@@ -301,16 +303,66 @@ impl BrowseView {
         (dirs.into_iter().collect(), files)
     }
 
+    /// Flatten mode: every matching file under the current directory, recursively,
+    /// with its path *relative to* the current directory as the display name (so
+    /// nested files are distinguishable). No dirs.
+    fn flat_listing(&self, filter: &FileFilter) -> (Vec<String>, Vec<FileRow>) {
+        let prefix = if self.cur.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", self.cur.join("/"))
+        };
+        let mut files = Vec::new();
+        for (rel, entry) in &self.entries {
+            let Some(rest) = rel.strip_prefix(&prefix) else {
+                continue;
+            };
+            if !rest.is_empty() && filter.matches(rel, entry) {
+                files.push(self.file_row(rel, rest, entry));
+            }
+        }
+        (Vec::new(), files)
+    }
+
+    /// The listing for the current mode (tree or flattened).
+    fn current_listing(&self, filter: &FileFilter) -> (Vec<String>, Vec<FileRow>) {
+        if self.flatten {
+            self.flat_listing(filter)
+        } else {
+            self.listing(filter)
+        }
+    }
+
+    /// Build one file row from an entry, denormalizing its size/mime/info/tags.
+    fn file_row(&self, rel: &str, name: &str, entry: &FileEntry) -> FileRow {
+        FileRow {
+            rel: rel.to_string(),
+            name: name.to_string(),
+            size: entry.size,
+            mime: entry.mime.clone().unwrap_or_default(),
+            modified_ms: entry.modified_ms,
+            hash: entry.hash,
+            info: entry_info(entry),
+            tags: self
+                .annos_map
+                .get(rel)
+                .map(|t| t.join(", "))
+                .unwrap_or_default(),
+        }
+    }
+
     fn enter_dir(&mut self, seg: &str) {
         self.cur.push(seg.to_string());
         self.dir_sel = 0;
         self.file_sel = 0;
+        self.selected.clear();
     }
 
     fn go_parent(&mut self) {
         if self.cur.pop().is_some() {
             self.dir_sel = 0;
             self.file_sel = 0;
+            self.selected.clear();
         }
     }
 
@@ -353,13 +405,16 @@ impl BrowseView {
                     }
                 }
                 Pane::Files => {
+                    // Arrow-moving the cursor collapses the multi-selection.
                     if up {
                         self.file_sel = self.file_sel.saturating_sub(1);
                         self.scroll_file = true;
+                        self.selected.clear();
                     }
                     if down && files_len > 0 {
                         self.file_sel = (self.file_sel + 1).min(files_len - 1);
                         self.scroll_file = true;
+                        self.selected.clear();
                     }
                     if left {
                         self.focus = Pane::Dirs;
@@ -428,17 +483,19 @@ impl BrowseView {
             self.dir_sel = 0;
             self.file_sel = 0;
             self.sel_rel = None;
+            self.selected.clear();
         }
         let filter =
             FileFilter::parse(self.filter.filter_string().as_deref()).unwrap_or(FileFilter::All);
 
-        // Clickable breadcrumb.
+        // Clickable breadcrumb, with the Flatten toggle right-aligned.
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             if ui.link(RichText::new(&repo).color(theme::LILAC)).clicked() {
                 self.cur.clear();
                 self.dir_sel = 0;
                 self.file_sel = 0;
+                self.selected.clear();
             }
             let segs = self.cur.clone();
             for (i, seg) in segs.iter().enumerate() {
@@ -447,15 +504,35 @@ impl BrowseView {
                     self.cur.truncate(i + 1);
                     self.dir_sel = 0;
                     self.file_sel = 0;
+                    self.selected.clear();
                 }
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .selectable_label(self.flatten, "Flatten")
+                    .explain(
+                        self.verbosity,
+                        "List all matching files recursively (hides the folder pane)",
+                        "Flatten the current folder: hide the subdirs pane and list every \
+                         matching file beneath it, recursively, with its sub-path as the \
+                         name. Handy with a filter for repo-wide sweeps.",
+                    )
+                    .clicked()
+                {
+                    self.flatten = !self.flatten;
+                    self.focus = Pane::Files;
+                    self.file_sel = 0;
+                    self.sel_rel = None;
+                    self.selected.clear();
+                }
+            });
         });
 
         // Compute + sort the listing into display order, then relocate the
         // selection to the same file (by rel path) so re-sorting or refreshing
         // keeps it selected. Then run the keys (which may move within the list or
         // change directory).
-        let (dirs, mut files) = self.listing(&filter);
+        let (dirs, mut files) = self.current_listing(&filter);
         self.sort_files(&mut files);
         self.relocate_selection(&files);
         let cur_before = self.cur.clone();
@@ -464,7 +541,7 @@ impl BrowseView {
         let (dirs, files) = if self.cur == cur_before {
             (dirs, files)
         } else {
-            let (d, mut f) = self.listing(&filter);
+            let (d, mut f) = self.current_listing(&filter);
             self.sort_files(&mut f);
             (d, f)
         };
@@ -504,14 +581,17 @@ impl BrowseView {
                 self.preview_dock(ui, store, sel.as_ref());
             });
 
-        egui::Panel::left("browse_dirs")
-            .resizable(true)
-            .default_size(240.0)
-            .min_size(150.0)
-            .max_size(460.0)
-            .show(ui, |ui| {
-                self.draw_dirs(ui, &dirs);
-            });
+        // Flatten mode hides the subdirs pane and shows only the flat file table.
+        if !self.flatten {
+            egui::Panel::left("browse_dirs")
+                .resizable(true)
+                .default_size(240.0)
+                .min_size(150.0)
+                .max_size(460.0)
+                .show(ui, |ui| {
+                    self.draw_dirs(ui, &dirs);
+                });
+        }
 
         egui::CentralPanel::default().show(ui, |ui| {
             self.draw_files(ui, &files);
@@ -601,6 +681,8 @@ impl BrowseView {
             (SortCol::Tags, "ANNOTATIONS"),
         ];
         let (sort_col, sort_asc, file_sel) = (self.sort_col, self.sort_asc, self.file_sel);
+        let selected = self.selected.clone();
+        let mods = ui.input(|i| i.modifiers);
         let mut clicked_header: Option<SortCol> = None;
         let mut clicked_row: Option<usize> = None;
         // Only follow the selection when a keyboard move asked for it; a per-frame
@@ -645,7 +727,8 @@ impl BrowseView {
                 body.rows(20.0, files.len(), |mut row| {
                     let i = row.index();
                     let f = &files[i];
-                    row.set_selected(i == file_sel);
+                    // Highlight every multi-selected row, plus the cursor.
+                    row.set_selected(i == file_sel || selected.contains(&f.rel));
                     row.col(|ui| {
                         ui.add(egui::Label::new(&f.name).truncate());
                     });
@@ -682,6 +765,23 @@ impl BrowseView {
         }
         if let Some(i) = clicked_row {
             self.focus = Pane::Files;
+            let rel = files[i].rel.clone();
+            if mods.command {
+                // Ctrl/Cmd-click toggles one file in the selection.
+                if !self.selected.remove(&rel) {
+                    self.selected.insert(rel);
+                }
+            } else if mods.shift {
+                // Shift-click extends the selection over the range from the cursor.
+                let (a, b) = (self.file_sel.min(i), self.file_sel.max(i));
+                for f in &files[a..=b] {
+                    self.selected.insert(f.rel.clone());
+                }
+            } else {
+                // Plain click selects just this file.
+                self.selected.clear();
+                self.selected.insert(rel);
+            }
             self.file_sel = i;
         }
     }
@@ -852,6 +952,40 @@ impl BrowseView {
     ) {
         self.ensure_annotations(store, &sel.rel);
         self.ensure_all_tags(store);
+
+        // Batch commands when more than one file is selected.
+        if self.selected.len() > 1 {
+            let n = self.selected.len();
+            ui.label(
+                RichText::new(format!("{n} FILES SELECTED"))
+                    .color(theme::AMBER)
+                    .size(11.0),
+            );
+            let mut batch_submit = false;
+            ui.horizontal(|ui| {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.batch_input)
+                        .hint_text("tag all")
+                        .desired_width(120.0),
+                );
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    batch_submit = true;
+                }
+                if ui.button("Tag all").clicked() {
+                    batch_submit = true;
+                }
+            });
+            if ui.button("Clear selection").clicked() {
+                self.selected.clear();
+            }
+            if batch_submit {
+                let tag = self.batch_input.trim().to_string();
+                self.batch_input.clear();
+                self.batch_tag(store, &tag);
+            }
+            ui.separator();
+            ui.add_space(4.0);
+        }
 
         ui.label(
             RichText::new(truncate(&sel.name, 32))
@@ -1034,6 +1168,30 @@ impl BrowseView {
         }
         // A new tag may have appeared (or the last of one vanished): refresh.
         self.reload_all_tags(store);
+    }
+
+    /// Add `tag` to every multi-selected file (skipping ones that already carry
+    /// it), then refresh the tag map / suggestions and the open editor.
+    fn batch_tag(&mut self, store: &Store, tag: &str) {
+        let tag = tag.trim();
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        if tag.is_empty() {
+            return;
+        }
+        for rel in self.selected.clone() {
+            let mut tags = store.get_annotations(&repo, &rel).unwrap_or_default();
+            if !tags.iter().any(|t| t == tag) {
+                tags.push(tag.to_string());
+                if let Err(e) = store.set_annotations(&repo, &rel, &tags) {
+                    self.error = Some(e.to_string());
+                }
+            }
+        }
+        self.reload_all_tags(store);
+        // Force the cursor file's editor to reload in case it was in the batch.
+        self.annos_key = None;
     }
 }
 
@@ -1343,6 +1501,63 @@ mod tests {
         assert_eq!(row("a.txt").tags, "");
     }
 
+    /// Flatten mode lists every file under the current dir recursively, naming
+    /// each by its path relative to the current dir; no subdirs.
+    #[test]
+    fn flatten_lists_files_recursively() {
+        let mut v = BrowseView::new();
+        v.entries = vec![
+            ("2019/Trips/IMG_01.jpg".into(), entry()),
+            ("2019/notes.txt".into(), entry()),
+            ("2020/a.png".into(), entry()),
+            ("readme.md".into(), entry()),
+        ];
+        let sorted_names = |files: &[FileRow]| {
+            let mut n: Vec<_> = files.iter().map(|f| f.name.clone()).collect();
+            n.sort();
+            n
+        };
+
+        let (dirs, files) = v.flat_listing(&FileFilter::All);
+        assert!(dirs.is_empty(), "flatten shows no subdirs");
+        assert_eq!(
+            sorted_names(&files),
+            [
+                "2019/Trips/IMG_01.jpg",
+                "2019/notes.txt",
+                "2020/a.png",
+                "readme.md",
+            ]
+        );
+
+        // Inside 2019, names are relative to it.
+        v.cur = vec!["2019".into()];
+        let (_d, files) = v.flat_listing(&FileFilter::All);
+        assert_eq!(sorted_names(&files), ["Trips/IMG_01.jpg", "notes.txt"]);
+    }
+
+    /// A batch tag is written to every selected file (and only those).
+    #[test]
+    fn batch_tag_applies_to_all_selected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_at(tmp.path().join("cfg")).unwrap();
+        let repo_dir = tmp.path().join("R");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        store.create_repo("R", &repo_dir.to_string_lossy()).unwrap();
+        for rel in ["a.txt", "b.txt", "c.txt"] {
+            store.update_file_entry("R", rel, &entry()).unwrap();
+        }
+
+        let mut v = BrowseView::new();
+        v.repo = Some("R".into());
+        v.selected = std::collections::HashSet::from(["a.txt".to_string(), "c.txt".to_string()]);
+        v.batch_tag(&store, "reviewed");
+
+        assert_eq!(store.get_annotations("R", "a.txt").unwrap(), ["reviewed"]);
+        assert_eq!(store.get_annotations("R", "c.txt").unwrap(), ["reviewed"]);
+        assert!(store.get_annotations("R", "b.txt").unwrap().is_empty());
+    }
+
     /// The FILTER prunes the whole navigation: only files that match show, and
     /// only subdirs that lead to a match survive.
     #[test]
@@ -1613,6 +1828,76 @@ mod tests {
         let img = h.render().expect("wgpu render failed");
         let out =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/dupes_browse.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Renders Browse in flatten mode with two files multi-selected, to
+    /// `target/dupes_browse_flat.png`. `--ignored`.
+    #[test]
+    #[ignore = "renders a PNG for manual inspection"]
+    fn render_browse_flatten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let repo_dir = tmp.path().join("Photos");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        store
+            .create_repo("Photos", &repo_dir.to_string_lossy())
+            .unwrap();
+        for rel in [
+            "2019/Trips/IMG_01.jpg",
+            "2019/Trips/IMG_02.jpg",
+            "2019/notes.txt",
+            "2019/diary.txt",
+            "2020/a.png",
+            "readme.md",
+        ] {
+            let mut e = entry();
+            e.mime = Some(if rel.ends_with(".txt") || rel.ends_with(".md") {
+                "text/plain".into()
+            } else {
+                "image/jpeg".into()
+            });
+            std::fs::create_dir_all(repo_dir.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(repo_dir.join(rel), b"").unwrap();
+            store.update_file_entry("Photos", rel, &e).unwrap();
+        }
+        store
+            .set_annotations("Photos", "2019/notes.txt", &["trash".into()])
+            .unwrap();
+
+        let mut view = BrowseView::new();
+        view.repo = Some("Photos".into());
+        view.flatten = true;
+        view.focus = Pane::Files;
+        view.selected = std::collections::HashSet::from([
+            "2019/notes.txt".to_string(),
+            "2019/diary.txt".to_string(),
+        ]);
+        view.sel_rel = Some("2019/notes.txt".to_string());
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1100.0, 640.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut BrowseView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    ui.allocate_ui(egui::vec2(ui.available_width(), 600.0), |ui| {
+                        view.show(ui, &store_ui, TooltipVerbosity::default());
+                    });
+                },
+                view,
+            );
+        h.run();
+        h.run();
+        let img = h.render().expect("wgpu render failed");
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/dupes_browse_flat.png");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
