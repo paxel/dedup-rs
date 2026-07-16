@@ -4,11 +4,14 @@
 //!
 //! The selected file drives a bottom preview dock (image → thumbnail, audio →
 //! waveform, text → scrollable lines, else a hex-header + strings dump) with a
-//! command column (open with the default app, reveal in the file manager).
+//! command column: open with the default app, reveal in the file manager, and a
+//! free-form annotations editor (removable tag pills, an add field, and a
+//! suggestion list of tags already used in the repo).
 //!
-//! The file table (egui_extras) has drag-resizable columns and click-to-sort
-//! headers; both panes keep their selection marked (bright when focused, dim
-//! otherwise) so the preview always matches a visible row.
+//! The file table (egui_extras) has drag-resizable, click-to-sort columns —
+//! NAME, SIZE, TYPE, INFO (image `W×H` / audio `m:ss`), MODIFIED, ANNOTATIONS
+//! (the file's tags). Both panes keep their selection marked (bright when
+//! focused, dim otherwise) so the preview always matches a visible row.
 //!
 //! The shared FILTER wizard (between the repo picker and breadcrumb) prunes the
 //! whole navigation: only matching files show, and only subdirs that lead to a
@@ -16,8 +19,7 @@
 //!
 //! Keyboard: in the subdirs pane `←` goes to the parent, `→` enters the selected
 //! dir, `↑`/`↓` move the selection; `Tab` switches to the files pane. Mouse works
-//! everywhere. (Annotations, multi-select and the flatten toggle land in later
-//! increments.)
+//! everywhere. (Multi-select and the flatten toggle land in later increments.)
 
 use crate::external;
 use crate::filter_ui::FilterBuilder;
@@ -47,7 +49,9 @@ enum SortCol {
     Name,
     Size,
     Type,
+    Info,
     Modified,
+    Tags,
 }
 
 /// Broad file categories that pick how the preview dock renders a file.
@@ -108,6 +112,11 @@ struct FileRow {
     mime: String,
     modified_ms: i64,
     hash: [u8; 32],
+    /// Adaptive detail from the entry: `W×H` for images, `m:ss` for audio, else
+    /// empty.
+    info: String,
+    /// This file's annotation tags, comma-joined for the table cell.
+    tags: String,
 }
 
 pub struct BrowseView {
@@ -145,6 +154,18 @@ pub struct BrowseView {
     /// Cached text/binary preview body, keyed by the rel-path it was built for.
     preview: Option<Preview>,
     preview_key: Option<String>,
+    /// The selected file's annotation tags, loaded (per rel-path) from the store.
+    annos: Vec<String>,
+    annos_key: Option<String>,
+    /// Text buffer for the "add tag" field.
+    anno_input: String,
+    /// Every tag used anywhere in the repo, for the suggestion list; reloaded when
+    /// the repo changes or an edit is made.
+    all_tags: Vec<String>,
+    all_tags_repo: Option<String>,
+    /// Per-file annotations for the whole repo (rel-path → tags), so the file
+    /// table can show a tags column. Reloaded alongside `all_tags`.
+    annos_map: HashMap<String, Vec<String>>,
     verbosity: TooltipVerbosity,
 }
 
@@ -171,6 +192,12 @@ impl BrowseView {
             waves: WaveCache::new(1),
             preview: None,
             preview_key: None,
+            annos: Vec::new(),
+            annos_key: None,
+            anno_input: String::new(),
+            all_tags: Vec::new(),
+            all_tags_repo: None,
+            annos_map: HashMap::new(),
             verbosity: TooltipVerbosity::default(),
         }
     }
@@ -252,6 +279,11 @@ impl BrowseView {
                 }
                 None => {
                     if filter.matches(rel, entry) {
+                        let tags = self
+                            .annos_map
+                            .get(rel)
+                            .map(|t| t.join(", "))
+                            .unwrap_or_default();
                         files.push(FileRow {
                             rel: rel.clone(),
                             name: rest.to_string(),
@@ -259,6 +291,8 @@ impl BrowseView {
                             mime: entry.mime.clone().unwrap_or_default(),
                             modified_ms: entry.modified_ms,
                             hash: entry.hash,
+                            info: entry_info(entry),
+                            tags,
                         });
                     }
                 }
@@ -379,6 +413,9 @@ impl BrowseView {
         if self.entries_repo.as_deref() != Some(repo.as_str()) {
             self.load_entries(store, &repo);
         }
+        // Load the repo's annotations up front so the file table's tags column and
+        // the suggestion list are populated before `listing()` runs.
+        self.ensure_all_tags(store);
 
         // Shared FILTER wizard: it prunes the whole navigation to matches. The
         // repo backs its MIME suggestions and live match count.
@@ -460,11 +497,11 @@ impl BrowseView {
 
         egui::Panel::bottom("browse_preview")
             .resizable(true)
-            .default_size(210.0)
+            .default_size(270.0)
             .min_size(120.0)
-            .max_size(480.0)
+            .max_size(520.0)
             .show(ui, |ui| {
-                self.preview_dock(ui, sel.as_ref());
+                self.preview_dock(ui, store, sel.as_ref());
             });
 
         egui::Panel::left("browse_dirs")
@@ -536,7 +573,15 @@ impl BrowseView {
                 SortCol::Name => by_name(),
                 SortCol::Size => a.size.cmp(&b.size).then_with(by_name),
                 SortCol::Type => a.mime.cmp(&b.mime).then_with(by_name),
+                SortCol::Info => a.info.cmp(&b.info).then_with(by_name),
                 SortCol::Modified => a.modified_ms.cmp(&b.modified_ms).then_with(by_name),
+                // Files with no tags sort last (empty string first otherwise).
+                SortCol::Tags => a
+                    .tags
+                    .is_empty()
+                    .cmp(&b.tags.is_empty())
+                    .then_with(|| a.tags.cmp(&b.tags))
+                    .then_with(by_name),
             };
             if self.sort_asc { ord } else { ord.reverse() }
         });
@@ -551,7 +596,9 @@ impl BrowseView {
             (SortCol::Name, "NAME"),
             (SortCol::Size, "SIZE"),
             (SortCol::Type, "TYPE"),
+            (SortCol::Info, "INFO"),
             (SortCol::Modified, "MODIFIED"),
+            (SortCol::Tags, "ANNOTATIONS"),
         ];
         let (sort_col, sort_asc, file_sel) = (self.sort_col, self.sort_asc, self.file_sel);
         let mut clicked_header: Option<SortCol> = None;
@@ -571,14 +618,16 @@ impl BrowseView {
                     .clip(true)
                     .resizable(true),
             )
-            .column(Column::initial(90.0).at_least(60.0).resizable(true))
+            .column(Column::initial(80.0).at_least(56.0).resizable(true))
             .column(
-                Column::initial(150.0)
-                    .at_least(80.0)
+                Column::initial(130.0)
+                    .at_least(70.0)
                     .clip(true)
                     .resizable(true),
             )
-            .column(Column::remainder().at_least(120.0));
+            .column(Column::initial(90.0).at_least(60.0).resizable(true))
+            .column(Column::initial(140.0).at_least(80.0).resizable(true))
+            .column(Column::remainder().at_least(100.0).clip(true));
         if let Some(row) = scroll_to {
             table = table.scroll_to_row(row, Some(egui::Align::Center));
         }
@@ -607,7 +656,15 @@ impl BrowseView {
                         ui.add(egui::Label::new(&f.mime).truncate());
                     });
                     row.col(|ui| {
+                        ui.monospace(&f.info);
+                    });
+                    row.col(|ui| {
                         ui.monospace(format_mtime(f.modified_ms));
+                    });
+                    row.col(|ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(&f.tags).color(theme::LILAC)).truncate(),
+                        );
                     });
                     if row.response().clicked() {
                         clicked_row = Some(i);
@@ -632,7 +689,7 @@ impl BrowseView {
     /// The bottom preview dock: a per-type preview on the left, a command column
     /// on the right. The on-disk file is only touched here (never during
     /// navigation), and text/binary bodies are cached per rel-path.
-    fn preview_dock(&mut self, ui: &mut egui::Ui, sel: Option<&FileRow>) {
+    fn preview_dock(&mut self, ui: &mut egui::Ui, store: &Store, sel: Option<&FileRow>) {
         let Some(sel) = sel.cloned() else {
             ui.centered_and_justified(|ui| {
                 ui.colored_label(theme::HAIRLINE, "Select a file to preview it.");
@@ -645,9 +702,16 @@ impl BrowseView {
 
         egui::Panel::right("browse_cmds")
             .resizable(false)
-            .exact_size(220.0)
+            .exact_size(240.0)
             .show(ui, |ui| {
-                self.draw_commands(ui, &sel, abs.as_deref());
+                // Scrollable: the command list (with annotations) can be taller
+                // than a short preview dock.
+                egui::ScrollArea::vertical()
+                    .id_salt("browse-cmds")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.draw_commands(ui, store, &sel, abs.as_deref());
+                    });
             });
         egui::CentralPanel::default().show(ui, |ui| {
             let height = ui.available_height();
@@ -779,53 +843,197 @@ impl BrowseView {
         }
     }
 
-    fn draw_commands(&mut self, ui: &mut egui::Ui, sel: &FileRow, abs: Option<&Path>) {
-        ui.vertical(|ui| {
-            ui.label(
-                RichText::new(truncate(&sel.name, 30))
-                    .color(theme::TEXT)
-                    .strong(),
-            );
-            ui.label(
-                RichText::new(format!("{} · {}", format_size(sel.size), sel.mime))
-                    .color(theme::HAIRLINE)
-                    .size(11.0),
-            );
-            ui.label(
-                RichText::new(format_mtime(sel.modified_ms))
-                    .color(theme::HAIRLINE)
-                    .size(11.0),
-            );
-            ui.add_space(8.0);
+    fn draw_commands(
+        &mut self,
+        ui: &mut egui::Ui,
+        store: &Store,
+        sel: &FileRow,
+        abs: Option<&Path>,
+    ) {
+        self.ensure_annotations(store, &sel.rel);
+        self.ensure_all_tags(store);
 
-            let enabled = abs.is_some();
-            if amber_button(ui, enabled, "Open with default app")
-                .explain(
-                    self.verbosity,
-                    "Open in the system's default application",
-                    "Hand the file to the OS default app — the full-fidelity escape hatch \
-                     for any type the in-app preview can't fully render.",
-                )
-                .clicked()
-                && let Some(abs) = abs
-                && let Err(e) = external::open(abs)
-            {
-                self.error = Some(e.to_string());
+        ui.label(
+            RichText::new(truncate(&sel.name, 32))
+                .color(theme::TEXT)
+                .strong(),
+        );
+        ui.label(
+            RichText::new(format!("{} · {}", format_size(sel.size), sel.mime))
+                .color(theme::HAIRLINE)
+                .size(11.0),
+        );
+        ui.label(
+            RichText::new(format_mtime(sel.modified_ms))
+                .color(theme::HAIRLINE)
+                .size(11.0),
+        );
+        ui.add_space(8.0);
+
+        let enabled = abs.is_some();
+        if amber_button(ui, enabled, "Open with default app")
+            .explain(
+                self.verbosity,
+                "Open in the system's default application",
+                "Hand the file to the OS default app — the full-fidelity escape hatch \
+                 for any type the in-app preview can't fully render.",
+            )
+            .clicked()
+            && let Some(abs) = abs
+            && let Err(e) = external::open(abs)
+        {
+            self.error = Some(e.to_string());
+        }
+        if amber_button(ui, enabled, "Reveal in file manager")
+            .explain(
+                self.verbosity,
+                "Show the file's folder in the file manager",
+                "Open the containing folder in the system file manager (portable \
+                 lowest-common-denominator: it reveals the parent directory).",
+            )
+            .clicked()
+            && let Some(abs) = abs
+            && let Err(e) = external::reveal(abs)
+        {
+            self.error = Some(e.to_string());
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.label(RichText::new("ANNOTATIONS").color(theme::AMBER).size(11.0));
+
+        // Current tags as removable pills (click the × to drop one).
+        let mut remove: Option<usize> = None;
+        ui.horizontal_wrapped(|ui| {
+            if self.annos.is_empty() {
+                ui.label(RichText::new("none yet").color(theme::HAIRLINE).size(11.0));
             }
-            if amber_button(ui, enabled, "Reveal in file manager")
-                .explain(
-                    self.verbosity,
-                    "Show the file's folder in the file manager",
-                    "Open the containing folder in the system file manager (portable \
-                     lowest-common-denominator: it reveals the parent directory).",
-                )
-                .clicked()
-                && let Some(abs) = abs
-                && let Err(e) = external::reveal(abs)
-            {
-                self.error = Some(e.to_string());
+            for (i, tag) in self.annos.iter().enumerate() {
+                let label = RichText::new(format!("{tag}  {}", crate::icon::X)).color(theme::BLACK);
+                if ui
+                    .add(egui::Button::new(label).fill(theme::TAN))
+                    .on_hover_text("Remove tag")
+                    .clicked()
+                {
+                    remove = Some(i);
+                }
             }
         });
+
+        // Add a new tag: free text (Enter or the button), full-featured.
+        let mut submit = false;
+        ui.horizontal(|ui| {
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.anno_input)
+                    .hint_text("add tag")
+                    .desired_width(150.0),
+            );
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                submit = true;
+            }
+            if ui.button("Add").clicked() {
+                submit = true;
+            }
+        });
+
+        // Suggestions: tags already used elsewhere in the repo, not on this file.
+        let suggestions: Vec<String> = self
+            .all_tags
+            .iter()
+            .filter(|t| !self.annos.iter().any(|a| a == *t))
+            .cloned()
+            .collect();
+        let mut add_existing: Option<String> = None;
+        if !suggestions.is_empty() {
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new("used in this repo")
+                    .color(theme::HAIRLINE)
+                    .size(10.0),
+            );
+            ui.horizontal_wrapped(|ui| {
+                for tag in &suggestions {
+                    if ui.small_button(tag).clicked() {
+                        add_existing = Some(tag.clone());
+                    }
+                }
+            });
+        }
+
+        // Apply edits after drawing (one store write per change).
+        if let Some(i) = remove
+            && i < self.annos.len()
+        {
+            self.annos.remove(i);
+            self.save_annotations(store, &sel.rel);
+        }
+        if submit {
+            let tag = self.anno_input.trim().to_string();
+            self.anno_input.clear();
+            self.add_tag(store, &sel.rel, &tag);
+        }
+        if let Some(tag) = add_existing {
+            self.add_tag(store, &sel.rel, &tag);
+        }
+    }
+
+    /// Load the selected file's annotation tags once per rel-path.
+    fn ensure_annotations(&mut self, store: &Store, rel: &str) {
+        if self.annos_key.as_deref() == Some(rel) {
+            return;
+        }
+        self.annos_key = Some(rel.to_string());
+        self.annos = match &self.repo {
+            Some(repo) => store.get_annotations(repo, rel).unwrap_or_default(),
+            None => Vec::new(),
+        };
+    }
+
+    /// Load the repo's distinct used tags (for suggestions) when the repo changes.
+    fn ensure_all_tags(&mut self, store: &Store) {
+        if self.all_tags_repo == self.repo {
+            return;
+        }
+        self.reload_all_tags(store);
+    }
+
+    fn reload_all_tags(&mut self, store: &Store) {
+        self.all_tags_repo = self.repo.clone();
+        let map = match &self.repo {
+            Some(repo) => store.all_annotations(repo).unwrap_or_default(),
+            None => HashMap::new(),
+        };
+        let mut set = std::collections::BTreeSet::new();
+        for tags in map.values() {
+            for t in tags {
+                set.insert(t.clone());
+            }
+        }
+        self.all_tags = set.into_iter().collect();
+        self.annos_map = map;
+    }
+
+    /// Add `tag` to the selected file (no-op if blank or already present), then
+    /// persist and refresh the repo-wide suggestion list.
+    fn add_tag(&mut self, store: &Store, rel: &str, tag: &str) {
+        let tag = tag.trim();
+        if tag.is_empty() || self.annos.iter().any(|a| a == tag) {
+            return;
+        }
+        self.annos.push(tag.to_string());
+        self.save_annotations(store, rel);
+    }
+
+    fn save_annotations(&mut self, store: &Store, rel: &str) {
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        if let Err(e) = store.set_annotations(&repo, rel, &self.annos) {
+            self.error = Some(e.to_string());
+            return;
+        }
+        // A new tag may have appeared (or the last of one vanished): refresh.
+        self.reload_all_tags(store);
     }
 }
 
@@ -971,6 +1179,19 @@ fn icon_folder() -> &'static str {
     crate::icon::FOLDER_OPEN
 }
 
+/// The adaptive "Info" cell for a file: image dimensions (`W×H`), audio duration
+/// (`m:ss`), or empty when the entry carries neither.
+fn entry_info(entry: &FileEntry) -> String {
+    if let Some((w, h)) = entry.img_size {
+        format!("{w}×{h}")
+    } else if let Some(a) = &entry.audio {
+        let secs = a.duration_ms / 1000;
+        format!("{}:{:02}", secs / 60, secs % 60)
+    } else {
+        String::new()
+    }
+}
+
 /// Truncate to `n` chars with an ellipsis, for the fixed-width file columns.
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
@@ -1013,6 +1234,8 @@ mod tests {
             mime: mime.into(),
             modified_ms,
             hash: [0u8; 32],
+            info: String::new(),
+            tags: String::new(),
         }
     }
 
@@ -1083,6 +1306,43 @@ mod tests {
         assert_eq!(v.file_sel, 0, "b.txt is now the first row");
     }
 
+    /// The file table derives the INFO cell (image `W×H` / audio `m:ss`) from the
+    /// entry, and the ANNOTATIONS cell (comma-joined tags) from `annos_map`.
+    #[test]
+    fn table_derives_info_and_tags_cells() {
+        let img = {
+            let mut e = entry();
+            e.img_size = Some((800, 600));
+            e
+        };
+        let aud = {
+            let mut e = entry();
+            e.audio = Some(dedup_core::store::AudioFp {
+                duration_ms: 65_000,
+                chunk_hashes: Vec::new(),
+            });
+            e
+        };
+        let mut v = BrowseView::new();
+        v.entries = vec![
+            ("photo.jpg".into(), img),
+            ("song.mp3".into(), aud),
+            ("a.txt".into(), entry()),
+        ];
+        v.annos_map = HashMap::from([(
+            "photo.jpg".to_string(),
+            vec!["keeper".to_string(), "wide".to_string()],
+        )]);
+
+        let (_d, files) = v.listing(&FileFilter::All);
+        let row = |name: &str| files.iter().find(|f| f.name == name).unwrap();
+        assert_eq!(row("photo.jpg").info, "800×600");
+        assert_eq!(row("photo.jpg").tags, "keeper, wide");
+        assert_eq!(row("song.mp3").info, "1:05");
+        assert_eq!(row("a.txt").info, "");
+        assert_eq!(row("a.txt").tags, "");
+    }
+
     /// The FILTER prunes the whole navigation: only files that match show, and
     /// only subdirs that lead to a match survive.
     #[test]
@@ -1120,6 +1380,60 @@ mod tests {
         let (dirs, files) = v.listing(&f);
         assert_eq!(dirs, ["Trips"]);
         assert!(files.is_empty());
+    }
+
+    /// Typing a tag and pressing Add persists it to the store's annotations table
+    /// for the selected file.
+    #[test]
+    fn adding_an_annotation_persists_to_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let repo_dir = tmp.path().join("R");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        store.create_repo("R", &repo_dir.to_string_lossy()).unwrap();
+        store.update_file_entry("R", "a.txt", &entry()).unwrap();
+        store.update_file_entry("R", "b.txt", &entry()).unwrap();
+
+        let mut view = BrowseView::new();
+        view.repo = Some("R".into());
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut BrowseView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    ui.allocate_ui(egui::vec2(ui.available_width(), 600.0), |ui| {
+                        view.show(ui, &store_ui, TooltipVerbosity::default());
+                    });
+                },
+                view,
+            );
+        h.run();
+        // Focus the files pane so a.txt (first row) is the selected file.
+        h.key_press(egui::Key::Tab);
+        h.run();
+        h.run();
+        assert_eq!(h.state().sel_rel.as_deref(), Some("a.txt"));
+
+        // Type a tag and click Add.
+        h.state_mut().anno_input = "keeper".into();
+        h.run();
+        // Accesskit click works even if the button is scrolled off in the dock.
+        h.get_by_label("Add").click_accesskit();
+        h.run();
+        h.run();
+
+        assert_eq!(
+            store.get_annotations("R", "a.txt").unwrap(),
+            vec!["keeper".to_string()],
+            "the tag is persisted for the selected file"
+        );
+        assert!(h.state().annos.contains(&"keeper".to_string()));
     }
 
     /// The subdir/file panes and `←`/`→` navigation are built entirely from the
@@ -1226,6 +1540,39 @@ mod tests {
         mk("2019/diary.txt", 2048, "text/plain", b"Dear diary...\n");
         mk("2020/a.png", 500_000, "image/png", b"");
         mk("readme.md", 1024, "text/markdown", b"# Photos\n");
+        // An image and an audio file so the INFO column shows W×H and m:ss.
+        {
+            let mut img = entry();
+            img.mime = Some("image/jpeg".into());
+            img.size = 2_100_000;
+            img.img_size = Some((4032, 3024));
+            std::fs::write(repo_dir.join("2019/photo.jpg"), b"").unwrap();
+            store
+                .update_file_entry("Photos", "2019/photo.jpg", &img)
+                .unwrap();
+            let mut aud = entry();
+            aud.mime = Some("audio/mpeg".into());
+            aud.size = 5_000_000;
+            aud.audio = Some(dedup_core::store::AudioFp {
+                duration_ms: 225_000,
+                chunk_hashes: Vec::new(),
+            });
+            std::fs::write(repo_dir.join("2019/song.mp3"), b"").unwrap();
+            store
+                .update_file_entry("Photos", "2019/song.mp3", &aud)
+                .unwrap();
+        }
+        // Seed annotations so the command dock shows tags + a suggestion.
+        store
+            .set_annotations(
+                "Photos",
+                "2019/diary.txt",
+                &["keeper".into(), "important".into()],
+            )
+            .unwrap();
+        store
+            .set_annotations("Photos", "2019/notes.txt", &["trash".into()])
+            .unwrap();
 
         let mut view = BrowseView::new();
         view.repo = Some("Photos".into());

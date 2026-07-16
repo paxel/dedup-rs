@@ -235,8 +235,12 @@ everywhere.
   (bright/dim by focus). On-disk files touched only here; text/binary bodies cached per
   rel-path. Functional + sort + render tests. (Still to reuse: the full image/audio
   lightboxes and the id3 editor as command buttons — folded into 7.5/7.6.)
-- **7.5 Annotations UI** — free-form multi-tags per file (add/remove/modify), with an
-  existing-tags helper list; wired to `set_annotations` / `all_annotations`.
+- ✅ **7.5 Annotations UI** — in the command dock: free-form multi-tags per file as
+  removable pills, an add-tag field (Enter or button), and a suggestion list of tags
+  already used in the repo. Wired to `get`/`set`/`all_annotations`; the scrollable dock
+  keeps it reachable. Integration-tested (type → Add → persisted). The file table also
+  gained two DB-backed columns: **INFO** (image `W×H` / audio `m:ss`) and
+  **ANNOTATIONS** (the file's tags), both sortable.
 - **7.6 Multi-select + flatten** — multi-select in the files pane → batch commands
   (add-tags-to-selected, set an id3 field on all selected audio, …); a flatten toggle
   hides the dirs pane and lists all matching files flat.
