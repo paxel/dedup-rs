@@ -225,10 +225,15 @@ everywhere.
 - **7.3 Filter pruning** — the shared FILTER wizard on top prunes the whole navigation:
   only subdirs/breadcrumb leading to matches show; files pane shows matches in the
   current dir.
-- **7.4 Preview + command dock** — select a file → preview by type (image → lightbox,
-  audio → waveform/spectrogram, text → scrollable preview, else hex header + strings);
-  commands to the right (Open with default app, Reveal, annotations, hex/strings
-  toggle). Reuse the image/audio lightboxes and the id3 editor.
+- ✅ **7.4 Preview + command dock** — hard, splitter-resizable panel layout (left
+  subdirs pane · centre file table · bottom preview dock · right command column) that
+  never reflows on navigation. File table via **egui_extras** (drag-resizable columns,
+  click-to-sort headers with a caret indicator). Preview by type (image/video →
+  thumbnail, audio → waveform, text → scrollable lines, else hex header + strings) and
+  commands (Open with default app, Reveal). Both panes keep their selection marked
+  (bright/dim by focus). On-disk files touched only here; text/binary bodies cached per
+  rel-path. Functional + sort + render tests. (Still to reuse: the full image/audio
+  lightboxes and the id3 editor as command buttons — folded into 7.5/7.6.)
 - **7.5 Annotations UI** — free-form multi-tags per file (add/remove/modify), with an
   existing-tags helper list; wired to `set_annotations` / `all_annotations`.
 - **7.6 Multi-select + flatten** — multi-select in the files pane → batch commands
