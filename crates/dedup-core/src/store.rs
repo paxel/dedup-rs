@@ -37,6 +37,10 @@ const MIME_STATS: redb::TableDefinition<&str, u64> = redb::TableDefinition::new(
 /// Archive rel-path → postcard-encoded `Vec<ArchiveMember>` (opt-in index).
 const ARCHIVE_MEMBERS: redb::TableDefinition<&str, &[u8]> =
     redb::TableDefinition::new("archive_members");
+/// File rel-path → encoded `Vec<String>` of free-form user annotation tags
+/// (Browse tab). Kept out of `FileEntry` since it's mutable user metadata, not
+/// content identity; a file with no tags has no row.
+const ANNOTATIONS: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("annotations");
 
 #[derive(thiserror::Error, Debug)]
 pub enum StoreError {
@@ -877,6 +881,78 @@ impl Store {
         Ok(())
     }
 
+    /// The free-form annotation tags on one file (empty if none). Browse tab.
+    pub fn get_annotations(
+        &self,
+        repo_name: &str,
+        rel_path: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let db = self.open_repo_db(repo_name)?;
+        let read_txn = db.begin_read()?;
+        let table = match read_txn.open_table(ANNOTATIONS) {
+            Ok(t) => t,
+            // The table is created lazily on first write; absent → no tags.
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        match table.get(rel_path)? {
+            Some(guard) => deserialize_value(SCHEMA_VERSION, guard.value()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Replace one file's annotation tags (deduped, order preserved). An empty
+    /// list removes the row entirely.
+    pub fn set_annotations(
+        &self,
+        repo_name: &str,
+        rel_path: &str,
+        tags: &[String],
+    ) -> Result<(), StoreError> {
+        let mut clean: Vec<String> = Vec::new();
+        for t in tags {
+            let t = t.trim();
+            if !t.is_empty() && !clean.iter().any(|c| c == t) {
+                clean.push(t.to_string());
+            }
+        }
+        let db = self.open_repo_db(repo_name)?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(ANNOTATIONS)?;
+            if clean.is_empty() {
+                table.remove(rel_path)?;
+            } else {
+                let bytes = serialize_value(SCHEMA_VERSION, &clean)?;
+                table.insert(rel_path, bytes.as_slice())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Every annotated file's tags, keyed by rel-path (for the Browse tab to
+    /// load a repo's annotations in one pass and derive the used-tag list).
+    pub fn all_annotations(
+        &self,
+        repo_name: &str,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>, StoreError> {
+        let db = self.open_repo_db(repo_name)?;
+        let read_txn = db.begin_read()?;
+        let mut out = std::collections::HashMap::new();
+        let table = match read_txn.open_table(ANNOTATIONS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(out),
+            Err(e) => return Err(e.into()),
+        };
+        for item in table.iter()? {
+            let (key, val) = item?;
+            let tags: Vec<String> = deserialize_value(SCHEMA_VERSION, val.value())?;
+            out.insert(key.value().to_string(), tags);
+        }
+        Ok(out)
+    }
+
     pub fn get_duplicate_groups(&self, repo_name: &str) -> Result<Vec<DuplicateGroup>, StoreError> {
         let db = self.open_repo_db(repo_name)?;
         let read_txn = db.begin_read()?;
@@ -1342,6 +1418,48 @@ pub fn read_scan_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn annotations_round_trip_dedup_and_clear() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let store = Store::open_at(tmp.path().to_path_buf())?;
+        let repo_dir = tmp.path().join("r");
+        std::fs::create_dir_all(&repo_dir)?;
+        store.create_repo("r", &repo_dir.to_string_lossy())?;
+
+        // No annotations yet (table not even created).
+        assert!(store.get_annotations("r", "a.jpg")?.is_empty());
+        assert!(store.all_annotations("r")?.is_empty());
+
+        // Set tags (with a blank + a duplicate that get cleaned out).
+        store.set_annotations(
+            "r",
+            "a.jpg",
+            &[
+                "important".into(),
+                " ".into(),
+                "keep".into(),
+                "important".into(),
+            ],
+        )?;
+        assert_eq!(
+            store.get_annotations("r", "a.jpg")?,
+            vec!["important", "keep"]
+        );
+
+        store.set_annotations("r", "b.png", &["trash".into()])?;
+        let all = store.all_annotations("r")?;
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.get("b.png"), Some(&vec!["trash".to_string()]));
+
+        // Modify, then clear.
+        store.set_annotations("r", "a.jpg", &["review".into()])?;
+        assert_eq!(store.get_annotations("r", "a.jpg")?, vec!["review"]);
+        store.set_annotations("r", "a.jpg", &[])?;
+        assert!(store.get_annotations("r", "a.jpg")?.is_empty());
+        assert_eq!(store.all_annotations("r")?.len(), 1, "only b.png remains");
+        Ok(())
+    }
 
     #[test]
     fn test_store_invariants() -> Result<(), Box<dyn std::error::Error>> {

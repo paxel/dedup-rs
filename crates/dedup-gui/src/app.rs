@@ -32,6 +32,7 @@ enum Tab {
     Duplicates,
     Transfer,
     Grooming,
+    Browse,
 }
 
 /// Freshness of a repo's index relative to disk, from the last CHECK.
@@ -142,6 +143,7 @@ pub struct DedupApp {
     dupes: DupesView,
     transfer: TransferView,
     grooming: GroomingView,
+    browse: crate::browse_view::BrowseView,
     /// Last settings written to disk, to avoid rewriting an unchanged file.
     saved_settings: crate::settings::Settings,
     /// Current window inner size (logical points), captured each frame and
@@ -181,6 +183,7 @@ impl DedupApp {
             dupes: DupesView::new(),
             transfer: TransferView::new(),
             grooming: GroomingView::new(),
+            browse: crate::browse_view::BrowseView::new(),
             saved_settings: crate::settings::Settings::default(),
             window_size: None,
         };
@@ -562,6 +565,7 @@ impl eframe::App for DedupApp {
             Tab::Duplicates => self.dupes.show(ui, &self.store, self.tooltip_verbosity),
             Tab::Transfer => self.transfer.show(ui, &self.store, self.tooltip_verbosity),
             Tab::Grooming => self.grooming.show(ui, &self.store, self.tooltip_verbosity),
+            Tab::Browse => self.browse.show(ui, &self.store, self.tooltip_verbosity),
         });
         if self.show_settings {
             self.settings_modal(&ctx);
@@ -675,6 +679,15 @@ impl DedupApp {
                         theme::TAN,
                         self.tooltip_verbosity,
                         "Prune and reorganize repositories (coming soon)",
+                    );
+                    tab_button(
+                        ui,
+                        &mut self.tab,
+                        Tab::Browse,
+                        "BROWSE",
+                        theme::AMBER,
+                        self.tooltip_verbosity,
+                        "Browse a repo's files by directory, from the index",
                     );
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

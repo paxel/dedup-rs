@@ -2,6 +2,7 @@
 //! LCARS-themed eframe/egui desktop shell for dedup.
 
 mod app;
+mod browse_view;
 mod dupes_view;
 mod external;
 mod filter_ui;

@@ -207,15 +207,38 @@ Follow-ups on the audio lightbox (6.3) and id3 editor (6.5):
 
 ---
 
-## Phase 7 — Browse & forensic layer  *(deferred)*
+## Phase 7 — Browse & forensic layer
 
-A fifth **Browse** tab hosting the forensic tools:
+A fifth **Browse** tab: a superfile/lazygit-style, DB-driven, directory-based file
+browser for one repo, hosting the forensic tools. Layout top→bottom: repo picker →
+shared FILTER wizard → clickable breadcrumb → two columns (subdirs | files) → preview
+dock (per file type) with a command-button dock on its right. Keyboard: in the dirs
+pane `←` parent / `→` enter / `↑↓` move; `Tab` switches to the files pane; mouse works
+everywhere.
 
-- Filter, display, and **annotate** files (trash / important / …); a new **annotation
-  filter** follows naturally once annotations exist.
-- **Binary / hex view** of at least a file's header.
-- **Strings** on demand for unknown files.
-- Unlocks the annotation-driven Transfer exports noted in 5.1.
+- ✅ **7.1 Store foundation** — separate `annotations` redb table keyed per repo+rel
+  (`get_annotations` / `set_annotations` / `all_annotations`), trims+dedups, empty
+  clears the row. No `FileEntry` format bump. Round-trip test.
+- ✅ **7.2 Browse shell** — `Tab::Browse` + `browse_view.rs`: single-repo picker,
+  breadcrumb, two-column subdirs|files derived from `for_each_file_entry` (no FS
+  access), keyboard nav (← parent / → enter / Tab switch). Functional + render tests.
+- **7.3 Filter pruning** — the shared FILTER wizard on top prunes the whole navigation:
+  only subdirs/breadcrumb leading to matches show; files pane shows matches in the
+  current dir.
+- **7.4 Preview + command dock** — select a file → preview by type (image → lightbox,
+  audio → waveform/spectrogram, text → scrollable preview, else hex header + strings);
+  commands to the right (Open with default app, Reveal, annotations, hex/strings
+  toggle). Reuse the image/audio lightboxes and the id3 editor.
+- **7.5 Annotations UI** — free-form multi-tags per file (add/remove/modify), with an
+  existing-tags helper list; wired to `set_annotations` / `all_annotations`.
+- **7.6 Multi-select + flatten** — multi-select in the files pane → batch commands
+  (add-tags-to-selected, set an id3 field on all selected audio, …); a flatten toggle
+  hides the dirs pane and lists all matching files flat.
+- **7.7 Forensic extras** — **binary / hex view** of at least a file's header;
+  **strings** on demand for unknown files.
+- **7.8 Annotation filter** — a new annotation facet in the FILTER; unlocks the
+  annotation-driven Transfer exports noted in 5.1 (export important / archive
+  unimportant).
 
 ## Phase 8 — Recognition & extensibility  *(far future)*
 
