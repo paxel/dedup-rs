@@ -222,9 +222,10 @@ everywhere.
 - ✅ **7.2 Browse shell** — `Tab::Browse` + `browse_view.rs`: single-repo picker,
   breadcrumb, two-column subdirs|files derived from `for_each_file_entry` (no FS
   access), keyboard nav (← parent / → enter / Tab switch). Functional + render tests.
-- **7.3 Filter pruning** — the shared FILTER wizard on top prunes the whole navigation:
-  only subdirs/breadcrumb leading to matches show; files pane shows matches in the
-  current dir.
+- ✅ **7.3 Filter pruning** — the shared `filter_ui::FilterBuilder` (between repo picker
+  and breadcrumb) prunes the whole navigation via `FileFilter`: a file shows only if it
+  matches, and a subdir shows only if a file beneath it matches (so the tree only leads
+  to matches). Filter changes reset the selection. Unit-tested.
 - ✅ **7.4 Preview + command dock** — hard, splitter-resizable panel layout (left
   subdirs pane · centre file table · bottom preview dock · right command column) that
   never reflows on navigation. File table via **egui_extras** (drag-resizable columns,

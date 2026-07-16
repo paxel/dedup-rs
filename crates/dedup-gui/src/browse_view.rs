@@ -10,23 +10,30 @@
 //! headers; both panes keep their selection marked (bright when focused, dim
 //! otherwise) so the preview always matches a visible row.
 //!
+//! The shared FILTER wizard (between the repo picker and breadcrumb) prunes the
+//! whole navigation: only matching files show, and only subdirs that lead to a
+//! match survive.
+//!
 //! Keyboard: in the subdirs pane `←` goes to the parent, `→` enters the selected
 //! dir, `↑`/`↓` move the selection; `Tab` switches to the files pane. Mouse works
-//! everywhere. (Filter pruning, annotations, multi-select and the flatten toggle
-//! land in later increments.)
+//! everywhere. (Annotations, multi-select and the flatten toggle land in later
+//! increments.)
 
 use crate::external;
+use crate::filter_ui::FilterBuilder;
 use crate::settings::TooltipVerbosity;
 use crate::theme;
 use crate::thumbs::ThumbCache;
 use crate::util::{ExplainExt, format_mtime, format_size, shortcut_bar};
 use crate::waveform::WaveCache;
+use dedup_core::filter::FileFilter;
 use dedup_core::store::{FileEntry, Store, for_each_file_entry};
 use dedup_core::thumbnail::hash_hex;
 use egui::{Color32, Key, Modifiers, RichText};
 use egui_extras::{Column, TableBuilder};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
@@ -128,6 +135,9 @@ pub struct BrowseView {
     scroll_file: bool,
     sort_col: SortCol,
     sort_asc: bool,
+    /// The shared FILTER wizard; when non-empty it prunes the whole navigation to
+    /// the matching files (and the dirs that lead to them).
+    filter: FilterBuilder,
     error: Option<String>,
     /// Thumbnails / audio-viz for the preview dock (background decode pools).
     thumbs: ThumbCache,
@@ -155,6 +165,7 @@ impl BrowseView {
             scroll_file: false,
             sort_col: SortCol::Name,
             sort_asc: true,
+            filter: FilterBuilder::new(),
             error: None,
             thumbs: ThumbCache::new(2),
             waves: WaveCache::new(1),
@@ -212,8 +223,11 @@ impl BrowseView {
     }
 
     /// The immediate subdirectories and files of the current directory, derived
-    /// from the indexed rel-paths (no filesystem access).
-    fn listing(&self) -> (Vec<String>, Vec<FileRow>) {
+    /// from the indexed rel-paths (no filesystem access). `filter` prunes the
+    /// navigation to matches: a file shows only if it matches, and a subdir shows
+    /// only if at least one file beneath it matches (so the tree only leads to
+    /// matches). A match-all filter yields the full listing.
+    fn listing(&self, filter: &FileFilter) -> (Vec<String>, Vec<FileRow>) {
         let prefix = if self.cur.is_empty() {
             String::new()
         } else {
@@ -229,17 +243,25 @@ impl BrowseView {
                 continue;
             }
             match rest.split_once('/') {
+                // A subdir is shown only if this descendant matches, so a subdir
+                // survives iff at least one file beneath it matches.
                 Some((seg, _)) => {
-                    dirs.insert(seg.to_string());
+                    if filter.matches(rel, entry) {
+                        dirs.insert(seg.to_string());
+                    }
                 }
-                None => files.push(FileRow {
-                    rel: rel.clone(),
-                    name: rest.to_string(),
-                    size: entry.size,
-                    mime: entry.mime.clone().unwrap_or_default(),
-                    modified_ms: entry.modified_ms,
-                    hash: entry.hash,
-                }),
+                None => {
+                    if filter.matches(rel, entry) {
+                        files.push(FileRow {
+                            rel: rel.clone(),
+                            name: rest.to_string(),
+                            size: entry.size,
+                            mime: entry.mime.clone().unwrap_or_default(),
+                            modified_ms: entry.modified_ms,
+                            hash: entry.hash,
+                        });
+                    }
+                }
             }
         }
         (dirs.into_iter().collect(), files)
@@ -313,7 +335,7 @@ impl BrowseView {
         });
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, store: &Store, verbosity: TooltipVerbosity) {
+    pub fn show(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, verbosity: TooltipVerbosity) {
         self.verbosity = verbosity;
         if !self.loaded {
             self.reload(store);
@@ -358,6 +380,21 @@ impl BrowseView {
             self.load_entries(store, &repo);
         }
 
+        // Shared FILTER wizard: it prunes the whole navigation to matches. The
+        // repo backs its MIME suggestions and live match count.
+        let outcome = self.filter.ui(ui, store, Some(&repo), self.verbosity);
+        if outcome.error.is_some() {
+            self.error = outcome.error;
+        }
+        if outcome.changed {
+            // The active selection may no longer match; start fresh.
+            self.dir_sel = 0;
+            self.file_sel = 0;
+            self.sel_rel = None;
+        }
+        let filter =
+            FileFilter::parse(self.filter.filter_string().as_deref()).unwrap_or(FileFilter::All);
+
         // Clickable breadcrumb.
         ui.add_space(2.0);
         ui.horizontal(|ui| {
@@ -381,7 +418,7 @@ impl BrowseView {
         // selection to the same file (by rel path) so re-sorting or refreshing
         // keeps it selected. Then run the keys (which may move within the list or
         // change directory).
-        let (dirs, mut files) = self.listing();
+        let (dirs, mut files) = self.listing(&filter);
         self.sort_files(&mut files);
         self.relocate_selection(&files);
         let cur_before = self.cur.clone();
@@ -390,7 +427,7 @@ impl BrowseView {
         let (dirs, files) = if self.cur == cur_before {
             (dirs, files)
         } else {
-            let (d, mut f) = self.listing();
+            let (d, mut f) = self.listing(&filter);
             self.sort_files(&mut f);
             (d, f)
         };
@@ -1027,7 +1064,7 @@ mod tests {
         ];
 
         // Sorted by name asc (a, b, c); select b.txt.
-        let (_d, mut files) = v.listing();
+        let (_d, mut files) = v.listing(&FileFilter::All);
         v.sort_files(&mut files);
         v.file_sel = 1;
         v.sel_rel = Some(files[v.file_sel].rel.clone());
@@ -1036,7 +1073,7 @@ mod tests {
         // Now sort by size asc (b=10, c=20, a=30): b.txt moves to index 0, and the
         // selection must follow it there.
         v.sort_col = SortCol::Size;
-        let (_d, mut files) = v.listing();
+        let (_d, mut files) = v.listing(&FileFilter::All);
         v.sort_files(&mut files);
         v.relocate_selection(&files);
         assert_eq!(
@@ -1044,6 +1081,45 @@ mod tests {
             "selection stays on the same file across a re-sort"
         );
         assert_eq!(v.file_sel, 0, "b.txt is now the first row");
+    }
+
+    /// The FILTER prunes the whole navigation: only files that match show, and
+    /// only subdirs that lead to a match survive.
+    #[test]
+    fn filter_prunes_navigation_to_matches() {
+        let emime = |mime: &str| {
+            let mut e = entry();
+            e.mime = Some(mime.into());
+            e
+        };
+        let mut v = BrowseView::new();
+        v.entries = vec![
+            ("2019/Trips/IMG_01.jpg".into(), emime("image/jpeg")),
+            ("2019/notes.txt".into(), emime("text/plain")),
+            ("2020/a.png".into(), emime("image/png")),
+            ("readme.md".into(), emime("text/markdown")),
+        ];
+        let names = |files: &[FileRow]| files.iter().map(|f| f.name.clone()).collect::<Vec<_>>();
+
+        // At the root, `mime:image` keeps both dated dirs (each has an image) but
+        // no root files (readme.md is text).
+        let f = FileFilter::parse(Some("mime:image")).unwrap();
+        let (dirs, files) = v.listing(&f);
+        assert_eq!(dirs, ["2019", "2020"]);
+        assert!(files.is_empty());
+
+        // `mime:text` keeps only 2019 (notes.txt) and the root readme.md.
+        let f = FileFilter::parse(Some("mime:text")).unwrap();
+        let (dirs, files) = v.listing(&f);
+        assert_eq!(dirs, ["2019"]);
+        assert_eq!(names(&files), ["readme.md"]);
+
+        // Inside 2019, `mime:image` leads only to Trips, with no direct files.
+        v.cur = vec!["2019".into()];
+        let f = FileFilter::parse(Some("mime:image")).unwrap();
+        let (dirs, files) = v.listing(&f);
+        assert_eq!(dirs, ["Trips"]);
+        assert!(files.is_empty());
     }
 
     /// The subdir/file panes and `←`/`→` navigation are built entirely from the
