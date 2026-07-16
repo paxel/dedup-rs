@@ -4,7 +4,8 @@
 //!
 //! The selected file drives a bottom preview dock (image → thumbnail, audio →
 //! waveform, text → scrollable lines, else a hex-header + strings dump) with a
-//! command column: open with the default app, reveal in the file manager, and a
+//! command column: open with the default app, reveal in the file manager, a
+//! forensic hex/strings toggle (force the byte dump for any file), and a
 //! free-form annotations editor (removable tag pills, an add field, and a
 //! suggestion list of tags already used in the repo).
 //!
@@ -167,6 +168,9 @@ pub struct BrowseView {
     /// Cached text/binary preview body, keyed by the rel-path it was built for.
     preview: Option<Preview>,
     preview_key: Option<String>,
+    /// When on, the preview shows a hex-header + strings dump for *any* file
+    /// (a forensic "inspect the bytes" mode), not just unknown types.
+    hex_view: bool,
     /// The selected file's annotation tags, loaded (per rel-path) from the store.
     annos: Vec<String>,
     annos_key: Option<String>,
@@ -208,6 +212,7 @@ impl BrowseView {
             waves: WaveCache::new(1),
             preview: None,
             preview_key: None,
+            hex_view: false,
             annos: Vec::new(),
             annos_key: None,
             anno_input: String::new(),
@@ -798,7 +803,7 @@ impl BrowseView {
         };
         let cat = Cat::of(&sel.mime);
         let abs = self.repo_root().map(|r| Path::new(r).join(&sel.rel));
-        self.ensure_preview(&sel.rel, abs.as_deref(), cat);
+        self.ensure_preview(&sel.rel, abs.as_deref(), cat, self.hex_view);
 
         egui::Panel::right("browse_cmds")
             .resizable(false)
@@ -813,19 +818,37 @@ impl BrowseView {
                         self.draw_commands(ui, store, &sel, abs.as_deref());
                     });
             });
+        let hex_view = self.hex_view;
         egui::CentralPanel::default().show(ui, |ui| {
             let height = ui.available_height();
-            self.draw_preview(ui, &sel, cat, abs.as_deref(), height);
+            self.draw_preview(ui, &sel, cat, abs.as_deref(), height, hex_view);
         });
     }
 
     /// Lazily build (and cache) the text/binary preview body for `rel`. Images,
-    /// video and audio stream straight from their caches, so they store `Media`.
-    fn ensure_preview(&mut self, rel: &str, abs: Option<&Path>, cat: Cat) {
-        if self.preview_key.as_deref() == Some(rel) {
+    /// video and audio stream straight from their caches, so they store `Media` —
+    /// unless `hex_view` forces a hex-header + strings dump for any file.
+    fn ensure_preview(&mut self, rel: &str, abs: Option<&Path>, cat: Cat, hex_view: bool) {
+        // `hex_view` is part of the cache key so toggling it rebuilds the body.
+        let key = if hex_view {
+            format!("\u{0}hex\u{0}{rel}")
+        } else {
+            rel.to_string()
+        };
+        if self.preview_key.as_deref() == Some(&key) {
             return;
         }
-        self.preview_key = Some(rel.to_string());
+        self.preview_key = Some(key);
+        if hex_view {
+            self.preview = Some(match abs {
+                Some(abs) => match read_head(abs, 4096) {
+                    Ok(bytes) => build_bytes(&bytes),
+                    Err(e) => Preview::Error(e.to_string()),
+                },
+                None => Preview::Error("repository root unknown".into()),
+            });
+            return;
+        }
         self.preview = Some(match (cat, abs) {
             (Cat::Image | Cat::Video | Cat::Audio, _) => Preview::Media,
             (_, None) => Preview::Error("repository root unknown".into()),
@@ -847,7 +870,14 @@ impl BrowseView {
         cat: Cat,
         abs: Option<&Path>,
         height: f32,
+        hex_view: bool,
     ) {
+        // Forced hex/strings mode (or an inherently text/unknown file) renders the
+        // cached body; media renders straight from its background cache.
+        if hex_view {
+            self.draw_preview_body(ui);
+            return;
+        }
         match cat {
             Cat::Image | Cat::Video => {
                 let tex = abs.and_then(|abs| {
@@ -907,40 +937,40 @@ impl BrowseView {
                     }
                 }
             }
-            Cat::Text | Cat::Other => {
-                egui::ScrollArea::vertical()
-                    .id_salt("browse-preview")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| match self.preview.as_ref() {
-                        Some(Preview::Text(lines)) => {
-                            for l in lines {
-                                ui.label(RichText::new(l).monospace().size(12.0));
-                            }
-                        }
-                        Some(Preview::Bytes { hex, strings }) => {
-                            ui.label(RichText::new("HEADER").color(theme::AMBER).size(11.0));
-                            for l in hex {
-                                ui.label(
-                                    RichText::new(l).monospace().size(12.0).color(theme::TEXT),
-                                );
-                            }
-                            if !strings.is_empty() {
-                                ui.add_space(4.0);
-                                ui.label(RichText::new("STRINGS").color(theme::AMBER).size(11.0));
-                                for s in strings {
-                                    ui.label(
-                                        RichText::new(s).monospace().size(12.0).color(theme::LILAC),
-                                    );
-                                }
-                            }
-                        }
-                        Some(Preview::Error(e)) => {
-                            ui.colored_label(theme::RED, e);
-                        }
-                        _ => {}
-                    });
-            }
+            Cat::Text | Cat::Other => self.draw_preview_body(ui),
         }
+    }
+
+    /// Render the cached text/binary body: text lines, or a hex-header + strings
+    /// dump, in a scroll area.
+    fn draw_preview_body(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("browse-preview")
+            .auto_shrink([false, false])
+            .show(ui, |ui| match self.preview.as_ref() {
+                Some(Preview::Text(lines)) => {
+                    for l in lines {
+                        ui.label(RichText::new(l).monospace().size(12.0));
+                    }
+                }
+                Some(Preview::Bytes { hex, strings }) => {
+                    ui.label(RichText::new("HEADER").color(theme::AMBER).size(11.0));
+                    for l in hex {
+                        ui.label(RichText::new(l).monospace().size(12.0).color(theme::TEXT));
+                    }
+                    if !strings.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("STRINGS").color(theme::AMBER).size(11.0));
+                        for s in strings {
+                            ui.label(RichText::new(s).monospace().size(12.0).color(theme::LILAC));
+                        }
+                    }
+                }
+                Some(Preview::Error(e)) => {
+                    ui.colored_label(theme::RED, e);
+                }
+                _ => {}
+            });
     }
 
     fn draw_commands(
@@ -1030,6 +1060,27 @@ impl BrowseView {
             && let Err(e) = external::reveal(abs)
         {
             self.error = Some(e.to_string());
+        }
+        // Forensic hex/strings toggle: inspect the raw header bytes of any file
+        // (not just unknown types). Toggling rebuilds the preview body.
+        let label = if self.hex_view {
+            "Hex / strings: on"
+        } else {
+            "Hex / strings: off"
+        };
+        if ui
+            .selectable_label(self.hex_view, label)
+            .explain(
+                self.verbosity,
+                "Show the file's header bytes + printable strings",
+                "Force a hex dump of the file's header plus any printable strings, for \
+                 any file type — the forensic 'what's actually in here' view. Unknown \
+                 file types show this automatically.",
+            )
+            .clicked()
+        {
+            self.hex_view = !self.hex_view;
+            self.preview_key = None; // force the preview body to rebuild
         }
 
         ui.add_space(10.0);
@@ -1556,6 +1607,32 @@ mod tests {
         assert_eq!(store.get_annotations("R", "a.txt").unwrap(), ["reviewed"]);
         assert_eq!(store.get_annotations("R", "c.txt").unwrap(), ["reviewed"]);
         assert!(store.get_annotations("R", "b.txt").unwrap().is_empty());
+    }
+
+    /// `hex_view` forces a hex-header + strings body for any file type; without
+    /// it, media files carry no body (`Media`).
+    #[test]
+    fn hex_view_dumps_any_file_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("x.jpg");
+        std::fs::write(&f, b"Hello\xff\x00World").unwrap();
+        let mut v = BrowseView::new();
+
+        v.ensure_preview("x.jpg", Some(&f), Cat::Image, true);
+        match &v.preview {
+            Some(Preview::Bytes { hex, strings }) => {
+                assert!(hex[0].contains("48 65 6c 6c 6f"), "hex dumps 'Hello'");
+                assert!(strings.iter().any(|s| s == "Hello"));
+                assert!(strings.iter().any(|s| s == "World"));
+            }
+            _ => panic!("hex_view should yield a Bytes body for an image"),
+        }
+
+        v.ensure_preview("x.jpg", Some(&f), Cat::Image, false);
+        assert!(
+            matches!(v.preview, Some(Preview::Media)),
+            "without hex_view an image carries no body"
+        );
     }
 
     /// The FILTER prunes the whole navigation: only files that match show, and

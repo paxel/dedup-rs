@@ -247,8 +247,9 @@ everywhere.
   every matching file under the current dir recursively, named by sub-path. Flatten +
   batch-tag unit-tested, render-verified. (Batch id3-field-set on selected audio is
   deferred — needs the id3 write path.)
-- **7.7 Forensic extras** — **binary / hex view** of at least a file's header;
-  **strings** on demand for unknown files.
+- ✅ **7.7 Forensic extras** — unknown file types auto-show a hex-header + printable
+  strings dump in the preview; a **Hex / strings** command toggle forces that byte view
+  for *any* file (inspect a JPEG's header, etc.). Unit-tested; render-verified.
 - **7.8 Annotation filter** — a new annotation facet in the FILTER; unlocks the
   annotation-driven Transfer exports noted in 5.1 (export important / archive
   unimportant).
