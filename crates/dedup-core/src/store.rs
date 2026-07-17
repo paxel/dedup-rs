@@ -938,19 +938,7 @@ impl Store {
         repo_name: &str,
     ) -> Result<std::collections::HashMap<String, Vec<String>>, StoreError> {
         let db = self.open_repo_db(repo_name)?;
-        let read_txn = db.begin_read()?;
-        let mut out = std::collections::HashMap::new();
-        let table = match read_txn.open_table(ANNOTATIONS) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(out),
-            Err(e) => return Err(e.into()),
-        };
-        for item in table.iter()? {
-            let (key, val) = item?;
-            let tags: Vec<String> = deserialize_value(SCHEMA_VERSION, val.value())?;
-            out.insert(key.value().to_string(), tags);
-        }
-        Ok(out)
+        annotations_of_db(&db)
     }
 
     pub fn get_duplicate_groups(&self, repo_name: &str) -> Result<Vec<DuplicateGroup>, StoreError> {
@@ -1324,6 +1312,28 @@ where
         f(key_guard.value(), entry)?;
     }
     Ok(())
+}
+
+/// Every annotated file's tags in a repo database, keyed by rel-path (files
+/// with no tags have no entry). Shared by [`Store::all_annotations`] and by
+/// filter matching that needs to resolve `tag:` conditions.
+pub fn annotations_of_db(
+    db: &redb::Database,
+) -> Result<std::collections::HashMap<String, Vec<String>>, StoreError> {
+    let read_txn = db.begin_read()?;
+    let mut out = std::collections::HashMap::new();
+    let table = match read_txn.open_table(ANNOTATIONS) {
+        Ok(t) => t,
+        // The table is created lazily on first write; absent → no annotations.
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(out),
+        Err(e) => return Err(e.into()),
+    };
+    for item in table.iter()? {
+        let (key, val) = item?;
+        let tags: Vec<String> = deserialize_value(SCHEMA_VERSION, val.value())?;
+        out.insert(key.value().to_string(), tags);
+    }
+    Ok(out)
 }
 
 /// Presence state of one content key (size, hash) in a repo.

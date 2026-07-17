@@ -10,13 +10,14 @@
 //! suggestion list of tags already used in the repo).
 //!
 //! The file table (egui_extras) has drag-resizable, click-to-sort columns —
-//! NAME, SIZE, TYPE, INFO (image `W×H` / audio `m:ss`), MODIFIED, ANNOTATIONS
+//! NAME, SIZE, TYPE, INFO (image `W×H` / audio `m:ss`), MODIFIED, TAGS
 //! (the file's tags). Both panes keep their selection marked (bright when
 //! focused, dim otherwise) so the preview always matches a visible row.
 //!
 //! The shared FILTER wizard (between the repo picker and breadcrumb) prunes the
 //! whole navigation: only matching files show, and only subdirs that lead to a
-//! match survive.
+//! match survive. Annotation filtering is just a `tag:` condition in that same
+//! wizard (no bespoke facet here).
 //!
 //! The files pane supports multi-select (Ctrl/Cmd-click toggles, Shift-click
 //! ranges) with batch commands (e.g. tag all selected), and a Flatten toggle
@@ -65,6 +66,17 @@ enum SortCol {
 enum ByteMode {
     Hex,
     Strings,
+}
+
+/// How an annotation chip behaves / is coloured.
+#[derive(Clone, Copy)]
+enum ChipMode {
+    /// Read-only badge (file table cell).
+    Display,
+    /// Clickable badge that adds the tag (suggestion list).
+    Add,
+    /// Removable badge — click removes (the current-tags editor).
+    Removable,
 }
 
 /// Broad file categories that pick how the preview dock renders a file.
@@ -128,8 +140,10 @@ struct FileRow {
     /// Adaptive detail from the entry: `W×H` for images, `m:ss` for audio, else
     /// empty.
     info: String,
-    /// This file's annotation tags, comma-joined for the table cell.
+    /// This file's annotation tags, comma-joined (used for sorting the column).
     tags: String,
+    /// The same tags as a list, for rendering per-tag badges in the cell.
+    tag_list: Vec<String>,
 }
 
 pub struct BrowseView {
@@ -190,7 +204,8 @@ pub struct BrowseView {
     all_tags: Vec<String>,
     all_tags_repo: Option<String>,
     /// Per-file annotations for the whole repo (rel-path → tags), so the file
-    /// table can show a tags column. Reloaded alongside `all_tags`.
+    /// table can show a tags column and the shared filter's `tag:` condition can
+    /// be evaluated. Reloaded alongside `all_tags`.
     annos_map: HashMap<String, Vec<String>>,
     verbosity: TooltipVerbosity,
 }
@@ -304,12 +319,12 @@ impl BrowseView {
                 // A subdir is shown only if this descendant matches, so a subdir
                 // survives iff at least one file beneath it matches.
                 Some((seg, _)) => {
-                    if filter.matches(rel, entry) {
+                    if self.matches_filter(filter, rel, entry) {
                         dirs.insert(seg.to_string());
                     }
                 }
                 None => {
-                    if filter.matches(rel, entry) {
+                    if self.matches_filter(filter, rel, entry) {
                         files.push(self.file_row(rel, rest, entry));
                     }
                 }
@@ -332,7 +347,7 @@ impl BrowseView {
             let Some(rest) = rel.strip_prefix(&prefix) else {
                 continue;
             };
-            if !rest.is_empty() && filter.matches(rel, entry) {
+            if !rest.is_empty() && self.matches_filter(filter, rel, entry) {
                 files.push(self.file_row(rel, rest, entry));
             }
         }
@@ -348,8 +363,16 @@ impl BrowseView {
         }
     }
 
+    /// Whether `rel`/`entry` matches `filter`, resolving any `tag:` condition
+    /// against the repo's in-memory annotation map.
+    fn matches_filter(&self, filter: &FileFilter, rel: &str, entry: &FileEntry) -> bool {
+        let tags = self.annos_map.get(rel).map(Vec::as_slice).unwrap_or(&[]);
+        filter.matches_tagged(rel, entry, tags)
+    }
+
     /// Build one file row from an entry, denormalizing its size/mime/info/tags.
     fn file_row(&self, rel: &str, name: &str, entry: &FileEntry) -> FileRow {
+        let tag_list = self.annos_map.get(rel).cloned().unwrap_or_default();
         FileRow {
             rel: rel.to_string(),
             name: name.to_string(),
@@ -358,11 +381,8 @@ impl BrowseView {
             modified_ms: entry.modified_ms,
             hash: entry.hash,
             info: entry_info(entry),
-            tags: self
-                .annos_map
-                .get(rel)
-                .map(|t| t.join(", "))
-                .unwrap_or_default(),
+            tags: tag_list.join(", "),
+            tag_list,
         }
     }
 
@@ -692,7 +712,7 @@ impl BrowseView {
             (SortCol::Type, "TYPE"),
             (SortCol::Info, "INFO"),
             (SortCol::Modified, "MODIFIED"),
-            (SortCol::Tags, "ANNOTATIONS"),
+            (SortCol::Tags, "TAGS"),
         ];
         let (sort_col, sort_asc, file_sel) = (self.sort_col, self.sort_asc, self.file_sel);
         let selected = self.selected.clone();
@@ -759,9 +779,10 @@ impl BrowseView {
                         ui.monospace(format_mtime(f.modified_ms));
                     });
                     row.col(|ui| {
-                        ui.add(
-                            egui::Label::new(RichText::new(&f.tags).color(theme::LILAC)).truncate(),
-                        );
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        for tag in &f.tag_list {
+                            annotation_chip(ui, tag, ChipMode::Display);
+                        }
                     });
                     if row.response().clicked() {
                         clicked_row = Some(i);
@@ -1057,6 +1078,91 @@ impl BrowseView {
         );
         ui.add_space(8.0);
 
+        // Annotations first — the primary reason to inspect a file here, so the
+        // tag editor and the existing-tag picker are visible without scrolling.
+        ui.label(RichText::new("TAGS").color(theme::AMBER).size(11.0));
+
+        // Current tags as removable badges (click to drop).
+        let mut remove: Option<usize> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if self.annos.is_empty() {
+                ui.label(RichText::new("none yet").color(theme::HAIRLINE).size(11.0));
+            }
+            for (i, tag) in self.annos.clone().iter().enumerate() {
+                if annotation_chip(ui, tag, ChipMode::Removable)
+                    .on_hover_text("Remove tag")
+                    .clicked()
+                {
+                    remove = Some(i);
+                }
+            }
+        });
+
+        // Add a new tag: free text (Enter or the button), full-featured.
+        let mut submit = false;
+        ui.horizontal(|ui| {
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.anno_input)
+                    .hint_text("add tag")
+                    .desired_width(150.0),
+            );
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                submit = true;
+            }
+            if dark_button(ui, "Add").clicked() {
+                submit = true;
+            }
+        });
+
+        // Existing tags to pick from — filtered by what you type (autocomplete),
+        // so you never have to retype a tag you've used before.
+        let typed = self.anno_input.trim().to_lowercase();
+        let existing: Vec<String> = self
+            .all_tags
+            .iter()
+            .filter(|t| !self.annos.iter().any(|a| a == *t))
+            .filter(|t| typed.is_empty() || t.to_lowercase().contains(&typed))
+            .cloned()
+            .collect();
+        let mut add_existing: Option<String> = None;
+        if !existing.is_empty() {
+            ui.label(
+                RichText::new("existing — click to add")
+                    .color(theme::HAIRLINE)
+                    .size(10.0),
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for tag in &existing {
+                    if annotation_chip(ui, tag, ChipMode::Add).clicked() {
+                        add_existing = Some(tag.clone());
+                    }
+                }
+            });
+        }
+
+        // Apply edits after drawing (one store write per change).
+        if let Some(i) = remove
+            && i < self.annos.len()
+        {
+            self.annos.remove(i);
+            self.save_annotations(store, &sel.rel);
+        }
+        if submit {
+            let tag = self.anno_input.trim().to_string();
+            self.anno_input.clear();
+            self.add_tag(store, &sel.rel, &tag);
+        }
+        if let Some(tag) = add_existing {
+            self.anno_input.clear();
+            self.add_tag(store, &sel.rel, &tag);
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+
+        // File commands.
         let enabled = abs.is_some();
         if amber_button(ui, enabled, "Open with default app")
             .explain(
@@ -1106,88 +1212,6 @@ impl BrowseView {
                 self.hex_view = !self.hex_view;
                 self.preview_key = None; // force the preview body to rebuild
             }
-        }
-
-        ui.add_space(10.0);
-        ui.separator();
-        ui.label(RichText::new("ANNOTATIONS").color(theme::AMBER).size(11.0));
-
-        // Current tags as removable pills (click the × to drop one).
-        let mut remove: Option<usize> = None;
-        ui.horizontal_wrapped(|ui| {
-            if self.annos.is_empty() {
-                ui.label(RichText::new("none yet").color(theme::HAIRLINE).size(11.0));
-            }
-            for (i, tag) in self.annos.iter().enumerate() {
-                let label = RichText::new(format!("{tag}  {}", crate::icon::X)).color(theme::BLACK);
-                if ui
-                    .add(egui::Button::new(label).fill(theme::TAN))
-                    .on_hover_text("Remove tag")
-                    .clicked()
-                {
-                    remove = Some(i);
-                }
-            }
-        });
-
-        // Add a new tag: free text (Enter or the button), full-featured.
-        let mut submit = false;
-        ui.horizontal(|ui| {
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.anno_input)
-                    .hint_text("add tag")
-                    .desired_width(150.0),
-            );
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                submit = true;
-            }
-            if dark_button(ui, "Add").clicked() {
-                submit = true;
-            }
-        });
-
-        // Suggestions: tags already used elsewhere in the repo, not on this file.
-        let suggestions: Vec<String> = self
-            .all_tags
-            .iter()
-            .filter(|t| !self.annos.iter().any(|a| a == *t))
-            .cloned()
-            .collect();
-        let mut add_existing: Option<String> = None;
-        if !suggestions.is_empty() {
-            ui.add_space(2.0);
-            ui.label(
-                RichText::new("used in this repo")
-                    .color(theme::HAIRLINE)
-                    .size(10.0),
-            );
-            ui.horizontal_wrapped(|ui| {
-                for tag in &suggestions {
-                    // Explicit black text so the pill stays readable on hover.
-                    if ui
-                        .add(egui::Button::new(RichText::new(tag).color(theme::BLACK)).small())
-                        .clicked()
-                    {
-                        add_existing = Some(tag.clone());
-                    }
-                }
-            });
-        }
-
-        // Apply edits after drawing (one store write per change).
-        if let Some(i) = remove
-            && i < self.annos.len()
-        {
-            self.annos.remove(i);
-            self.save_annotations(store, &sel.rel);
-        }
-        if submit {
-            let tag = self.anno_input.trim().to_string();
-            self.anno_input.clear();
-            self.add_tag(store, &sel.rel, &tag);
-        }
-        if let Some(tag) = add_existing {
-            self.add_tag(store, &sel.rel, &tag);
         }
     }
 
@@ -1273,6 +1297,93 @@ impl BrowseView {
         // Force the cursor file's editor to reload in case it was in the batch.
         self.annos_key = None;
     }
+}
+
+/// Draw a small outline "tag" glyph (a label shape with a hole) in `rect` — the
+/// vendored Phosphor subset has no tag icon, so we paint one so annotations read
+/// as tags everywhere.
+fn tag_glyph(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
+    let s = |x: f32, y: f32| rect.min + egui::vec2(rect.width() * x, rect.height() * y);
+    let pts = vec![
+        s(0.08, 0.5),
+        s(0.44, 0.14),
+        s(0.92, 0.14),
+        s(0.92, 0.86),
+        s(0.44, 0.86),
+    ];
+    let stroke = egui::Stroke::new(1.3, color);
+    painter.add(egui::Shape::closed_line(pts, stroke));
+    painter.circle_stroke(
+        s(0.31, 0.5),
+        rect.width() * 0.06,
+        egui::Stroke::new(1.2, color),
+    );
+}
+
+/// A self-painted annotation badge: a tag glyph + label on a pill, styled by
+/// `mode`. Reads as a tag everywhere and stays legible in every state. Returns
+/// the click response (for `Add`/`Removable`/`Toggle` modes).
+fn annotation_chip(ui: &mut egui::Ui, text: &str, mode: ChipMode) -> egui::Response {
+    let violet = Color32::from_rgb(0x33, 0x2A, 0x59);
+    let font = egui::FontId::proportional(12.0);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font.clone(), theme::TEXT);
+    let (icon, gap) = (12.0, 4.0);
+    let show_x = matches!(mode, ChipMode::Removable);
+    let x_w = if show_x { 14.0 } else { 0.0 };
+    let pad = egui::vec2(7.0, 3.0);
+    let h = galley.size().y + pad.y * 2.0;
+    let w = pad.x * 2.0 + icon + gap + galley.size().x + x_w;
+    let sense = if matches!(mode, ChipMode::Display) {
+        egui::Sense::hover()
+    } else {
+        egui::Sense::click()
+    };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), sense);
+    if ui.is_rect_visible(rect) {
+        let hov = resp.hovered();
+        let (fill, fg) = match mode {
+            ChipMode::Display => (violet, theme::LILAC),
+            ChipMode::Add => (
+                if hov {
+                    Color32::from_rgb(0x45, 0x39, 0x74)
+                } else {
+                    violet
+                },
+                theme::LILAC,
+            ),
+            ChipMode::Removable => (if hov { theme::AMBER } else { theme::TAN }, theme::BLACK),
+        };
+        let p = ui.painter();
+        if fill.a() > 0 {
+            p.rect_filled(rect, h * 0.5, fill);
+        }
+        let iy = rect.center().y - icon / 2.0;
+        tag_glyph(
+            p,
+            egui::Rect::from_min_size(egui::pos2(rect.min.x + pad.x, iy), egui::vec2(icon, icon)),
+            fg,
+        );
+        p.text(
+            egui::pos2(rect.min.x + pad.x + icon + gap, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            text,
+            font,
+            fg,
+        );
+        if show_x {
+            p.text(
+                egui::pos2(rect.max.x - pad.x, rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                "×",
+                egui::FontId::proportional(13.0),
+                fg,
+            );
+        }
+    }
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, text));
+    resp
 }
 
 /// A clickable file-table column header: the title, plus an up/down caret when
@@ -1534,6 +1645,7 @@ mod tests {
             hash: [0u8; 32],
             info: String::new(),
             tags: String::new(),
+            tag_list: Vec::new(),
         }
     }
 
@@ -1605,7 +1717,7 @@ mod tests {
     }
 
     /// The file table derives the INFO cell (image `W×H` / audio `m:ss`) from the
-    /// entry, and the ANNOTATIONS cell (comma-joined tags) from `annos_map`.
+    /// entry, and the TAGS cell (comma-joined tags) from `annos_map`.
     #[test]
     fn table_derives_info_and_tags_cells() {
         let img = {
@@ -1639,6 +1751,42 @@ mod tests {
         assert_eq!(row("song.mp3").info, "1:05");
         assert_eq!(row("a.txt").info, "");
         assert_eq!(row("a.txt").tags, "");
+    }
+
+    /// A `tag:` condition from the shared FILTER wizard prunes the listing to
+    /// files carrying a matching annotation, resolved from the in-memory map.
+    #[test]
+    fn tag_filter_prunes_to_annotated_files() {
+        let mut v = BrowseView::new();
+        v.entries = vec![
+            ("a.txt".into(), entry()),
+            ("b.txt".into(), entry()),
+            ("c.txt".into(), entry()),
+        ];
+        v.annos_map = HashMap::from([
+            ("a.txt".to_string(), vec!["keeper".to_string()]),
+            ("b.txt".to_string(), vec!["trash".to_string()]),
+        ]);
+        let names = |files: &[FileRow]| {
+            let mut n: Vec<_> = files.iter().map(|f| f.name.clone()).collect();
+            n.sort();
+            n
+        };
+
+        // No filter → everything.
+        assert_eq!(v.listing(&FileFilter::All).1.len(), 3);
+
+        // tag:keep matches the "keeper" tag (substring), nothing else.
+        let keep = FileFilter::parse(Some("tag:keep")).unwrap();
+        assert_eq!(names(&v.listing(&keep).1), ["a.txt"]);
+
+        // tag:trash matches only b.txt.
+        let trash = FileFilter::parse(Some("tag:trash")).unwrap();
+        assert_eq!(names(&v.listing(&trash).1), ["b.txt"]);
+
+        // A tag with no match prunes everything.
+        let none = FileFilter::parse(Some("tag:missing")).unwrap();
+        assert!(v.listing(&none).1.is_empty());
     }
 
     /// Flatten mode lists every file under the current dir recursively, naming

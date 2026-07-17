@@ -33,9 +33,10 @@ pub fn delete_by_filter(
     let root = PathBuf::from(&meta.abs_path);
 
     // Collect first so the read transaction isn't held during file I/O.
+    let annotated = crate::filter::AnnotatedFilter::new(&db, &filter)?;
     let mut candidates: Vec<String> = Vec::new();
     store::for_each_file_entry(&db, |rel_path, entry: FileEntry| {
-        if !entry.missing && filter.matches(rel_path, &entry) {
+        if !entry.missing && annotated.matches(rel_path, &entry) {
             candidates.push(rel_path.to_string());
         }
         Ok(())
@@ -109,10 +110,11 @@ pub fn preview_by_filter(
 ) -> Result<(Vec<String>, usize), DiffError> {
     let filter = FileFilter::parse(filter)?;
     let db = store.open_repo_db(repo)?;
+    let annotated = crate::filter::AnnotatedFilter::new(&db, &filter)?;
     let mut sample: Vec<String> = Vec::new();
     let mut total = 0usize;
     store::for_each_file_entry(&db, |rel_path, entry: FileEntry| {
-        if !entry.missing && filter.matches(rel_path, &entry) {
+        if !entry.missing && annotated.matches(rel_path, &entry) {
             total += 1;
             if sample.len() < limit {
                 sample.push(rel_path.to_string());

@@ -235,12 +235,13 @@ everywhere.
   (bright/dim by focus). On-disk files touched only here; text/binary bodies cached per
   rel-path. Functional + sort + render tests. (Still to reuse: the full image/audio
   lightboxes and the id3 editor as command buttons — folded into 7.5/7.6.)
-- ✅ **7.5 Annotations UI** — in the command dock: free-form multi-tags per file as
-  removable pills, an add-tag field (Enter or button), and a suggestion list of tags
-  already used in the repo. Wired to `get`/`set`/`all_annotations`; the scrollable dock
-  keeps it reachable. Integration-tested (type → Add → persisted). The file table also
-  gained two DB-backed columns: **INFO** (image `W×H` / audio `m:ss`) and
-  **ANNOTATIONS** (the file's tags), both sortable.
+- ✅ **7.5 Annotations UI** — in the command dock (shown *first*, so it's visible without
+  scrolling): free-form multi-tags as removable tag-badges, an add-tag field (Enter or
+  button), and an existing-tag picker that **filters as you type** (autocomplete) so you
+  never retype a tag. Wired to `get`/`set`/`all_annotations`. Integration-tested. The file
+  table also gained two sortable DB-backed columns: **INFO** (image `W×H` / audio `m:ss`)
+  and **ANNOTATIONS**. Annotations render everywhere as **tag-glyph badges** (the vendored
+  Phosphor subset has no tag icon, so the glyph is hand-painted).
 - ✅ **7.6 Multi-select + flatten** — files-pane multi-select (Ctrl/Cmd-click toggles,
   Shift-click ranges; arrows/nav collapse it) with a batch dock ("N selected" → tag all
   selected). A **Flatten** toggle (right of the breadcrumb) hides the dirs pane and lists
@@ -254,9 +255,17 @@ everywhere.
   in every state — the theme's `override_text_color` made plain `selectable_label`s
   cream-on-amber on hover (captured in the new `egui-desktop` skill). Unit-tested;
   render-verified incl. hover.
-- **7.8 Annotation filter** — a new annotation facet in the FILTER; unlocks the
-  annotation-driven Transfer exports noted in 5.1 (export important / archive
-  unimportant).
+- ✅ **7.8 Annotation filter** — a **`tag:`** condition in the shared FILTER wizard, so
+  annotation filtering works the same way everywhere the wizard is used (Browse, Transfer,
+  Grooming) rather than as a Browse-local widget. Core's `FileFilter` gained an `Anno`
+  variant; because tags live in a separate table `FileFilter::matches` can't see, an
+  `AnnotatedFilter` loads the repo's annotation map once and every streaming filter path
+  (`count_matches`, diff, groom, date-export) matches through it (`matches_tagged`). The
+  wizard's TAG editor suggests the repo's existing tags. This also **unlocks the
+  annotation-driven Transfer exports** (export important / archive unimportant, per 5.1),
+  since Transfer/Grooming now filter on tags. Unit-tested end-to-end (parse → count →
+  listing). *(Organize auto-rules match on identity only, so `tag:` in a rule is a no-op —
+  a deliberate boundary, they're separate from the wizard.)*
 
 ## Phase 8 — Recognition & extensibility  *(far future)*
 
@@ -264,6 +273,50 @@ everywhere.
 - VLA tagging of files to topics; word clouds for documents.
 - MP3 tag handling; metadata extraction for all known formats.
 - Plugin support for new formats; an API to externalise features.
+
+---
+
+## Open issues & requests — 2026-07-17
+
+### Bugs
+
+- **Duplicate "best" pick ignores writability** — when searching duplicates, the keeper
+  heuristic should prefer a **read-only** copy over a read-write one as the "best" (a
+  read-only original is the safer canonical).
+- **`.m3u` treated as audio** — `.m3u` is a *playlist*, not an audio format. Playlists must
+  not get the audio treatment (waveform tile / audio lightbox / id3). Exclude playlist
+  types from the audio category.
+- **Video lightbox scrubs on mouse-move** — the displayed frame changes as the mouse moves
+  across the lightbox, so it's unusable. Frame selection is (wrongly) bound to cursor
+  position; needs an explicit scrubber/keys instead.
+
+### Features
+
+- **Shared FILTER on the Duplicates tab** — the common filter wizard (used by
+  Transfer/Grooming/Browse) would make sense on the duplicates view too.
+- **Transfer `sync` command** — like `copy`, but also **deletes files in the target that
+  are not in the source** (mirror the source into the target).
+- **Confirm/preview step for copy / move / sync** — before executing any of these, show the
+  numbers ("copy X files to …, delete Y files") with an OK / Cancel gate.
+- **Repo relocate: folder picker** — relocating a repo must offer a native folder picker
+  (not a raw path field).
+- **Drag-and-drop add repositories** — drop one or more folders onto the app to add them as
+  repos in one gesture; derive valid repo names from the folder names, unifying/de-duping
+  names where needed.
+- **`prune` command (from the old Java tool)** — remove deleted (missing) files from the DB
+  and clean up / compact the index files. *Open question:* still needed with redb, or does
+  compaction/`mark_missing` already cover it? Verify before building.
+
+### Design questions (filter ↔ repo)
+
+- **Filter with no repo selected** — the FILTER wizard's MIME/TAG pick-lists are repo-backed,
+  so they're empty until a repo is chosen (you can still type raw conditions). Decide whether
+  the filter should be **disabled/hidden until a repo is selected** or stay usable-but-
+  unassisted. *(Confirmed direction: keep the editor-based, repo-backed pick-list — "A".)*
+- **Repo change can make an active filter moot** — conditions are kept verbatim across a repo
+  switch, so a `mime:`/`tag:` value that doesn't exist in the new repo silently matches
+  nothing. Decide: keep as-is (transparent 0-match), surface a warning, or clear conditions
+  on repo change. Suggestions already refresh to the new repo.
 
 ---
 

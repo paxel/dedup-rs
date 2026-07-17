@@ -29,8 +29,9 @@ pub fn timeline_buckets(
     let mut map: BTreeMap<(i64, u32), (u64, u64)> = BTreeMap::new();
     for name in repo_names {
         let db = store.open_repo_db(name)?;
+        let annotated = filter::AnnotatedFilter::new(&db, &filter)?;
         store::for_each_file_entry(&db, |rel_path, entry| {
-            if entry.missing || !filter.matches(rel_path, &entry) {
+            if entry.missing || !annotated.matches(rel_path, &entry) {
                 return Ok(());
             }
             let (y, m, _) = filter::ms_to_ymd(filter::best_date_ms(&entry));
@@ -75,10 +76,11 @@ pub fn export_by_date(
     for name in repo_names {
         let root = PathBuf::from(&store.get_repo(name)?.abs_path);
         let db = store.open_repo_db(name)?;
+        let annotated = filter::AnnotatedFilter::new(&db, &filter)?;
         // Collect first so the read transaction isn't held during file I/O.
         let mut files: Vec<(String, i64, u64, [u8; 32])> = Vec::new();
         store::for_each_file_entry(&db, |rel_path, entry| {
-            if !entry.missing && filter.matches(rel_path, &entry) {
+            if !entry.missing && annotated.matches(rel_path, &entry) {
                 files.push((
                     rel_path.to_string(),
                     filter::best_date_ms(&entry),
@@ -351,6 +353,10 @@ fn compile_rules(rules: &[OrganizeRule]) -> Result<Vec<CompiledRule>, DiffError>
 
 /// The target relative path a file would organize to, or `None` if no rule
 /// matches, the template renders to nothing, or it already sits there.
+///
+/// Rules match on file identity only (no annotation lookup), so a `tag:`
+/// condition in a rule filter never matches here — organize rules are a
+/// separate feature from the annotation-aware tab wizard.
 fn planned_target(rules: &[CompiledRule], rel_path: &str, entry: &FileEntry) -> Option<String> {
     let rule = rules.iter().find(|r| r.filter.matches(rel_path, entry))?;
     let target = normalize_rel(&render_template(&rule.template, entry, rel_path))?;

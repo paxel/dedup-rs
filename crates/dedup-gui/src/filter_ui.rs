@@ -34,7 +34,16 @@ enum FilterKind {
     Mime,
     Name,
     Size,
+    Tag,
 }
+
+/// Every condition kind, in the order they appear in the type picker.
+const FILTER_KINDS: [FilterKind; 4] = [
+    FilterKind::Mime,
+    FilterKind::Name,
+    FilterKind::Size,
+    FilterKind::Tag,
+];
 
 impl FilterKind {
     fn label(self) -> &'static str {
@@ -42,6 +51,7 @@ impl FilterKind {
             FilterKind::Mime => "MIME",
             FilterKind::Name => "NAME",
             FilterKind::Size => "SIZE",
+            FilterKind::Tag => "TAG",
         }
     }
 
@@ -52,6 +62,7 @@ impl FilterKind {
             FilterKind::Mime => "mime",
             FilterKind::Name => "name",
             FilterKind::Size => "size",
+            FilterKind::Tag => "tag",
         }
     }
 
@@ -61,6 +72,7 @@ impl FilterKind {
             "mime" => Some(FilterKind::Mime),
             "name" => Some(FilterKind::Name),
             "size" => Some(FilterKind::Size),
+            "tag" => Some(FilterKind::Tag),
             _ => None,
         }
     }
@@ -70,6 +82,7 @@ impl FilterKind {
             FilterKind::Mime => "image/",
             FilterKind::Name => "*.db or copy_of*",
             FilterKind::Size => ">=1000",
+            FilterKind::Tag => "keeper",
         }
     }
 }
@@ -105,6 +118,7 @@ struct FilterHistory {
     mime: Vec<String>,
     name: Vec<String>,
     size: Vec<String>,
+    tag: Vec<String>,
     presets: Vec<FilterPreset>,
 }
 
@@ -114,6 +128,7 @@ impl FilterHistory {
             FilterKind::Mime => &self.mime,
             FilterKind::Name => &self.name,
             FilterKind::Size => &self.size,
+            FilterKind::Tag => &self.tag,
         }
     }
 
@@ -122,6 +137,7 @@ impl FilterHistory {
             FilterKind::Mime => &mut self.mime,
             FilterKind::Name => &mut self.name,
             FilterKind::Size => &mut self.size,
+            FilterKind::Tag => &mut self.tag,
         }
     }
 
@@ -161,7 +177,7 @@ impl FilterHistory {
     /// (keeping their order at the front) and imported presets replace
     /// same-named local presets or are appended.
     fn merge(&mut self, other: FilterHistory) {
-        for kind in [FilterKind::Mime, FilterKind::Name, FilterKind::Size] {
+        for kind in FILTER_KINDS {
             for value in other.for_kind(kind).iter().rev() {
                 self.record_value(kind, value);
             }
@@ -176,16 +192,15 @@ impl FilterHistory {
 }
 
 /// Split a filter expression into wizard conditions, mirroring the way
-/// `filter_string` composes it: each `mime:`/`name:`/`size:` prefix at a
+/// `filter_string` composes it: each `mime:`/`name:`/`size:`/`tag:` prefix at a
 /// whitespace boundary starts a new condition whose value runs to the next
 /// prefix. Text before the first prefix is ignored (the wizard only builds
-/// these three kinds).
+/// these kinds).
 fn parse_conditions(expr: &str) -> Vec<FilterCond> {
-    const PREFIXES: [(&str, FilterKind); 3] = [
-        ("mime:", FilterKind::Mime),
-        ("name:", FilterKind::Name),
-        ("size:", FilterKind::Size),
-    ];
+    let prefixes: Vec<(String, FilterKind)> = FILTER_KINDS
+        .iter()
+        .map(|&k| (format!("{}:", k.prefix()), k))
+        .collect();
     let bytes = expr.as_bytes();
     let mut starts: Vec<(usize, FilterKind)> = Vec::new();
     for i in 0..expr.len() {
@@ -194,9 +209,9 @@ fn parse_conditions(expr: &str) -> Vec<FilterCond> {
         }
         let at_boundary = i == 0 || bytes[i - 1].is_ascii_whitespace();
         if at_boundary {
-            for (p, kind) in PREFIXES {
-                if expr[i..].starts_with(p) {
-                    starts.push((i, kind));
+            for (p, kind) in &prefixes {
+                if expr[i..].starts_with(p.as_str()) {
+                    starts.push((i, *kind));
                 }
             }
         }
@@ -204,8 +219,10 @@ fn parse_conditions(expr: &str) -> Vec<FilterCond> {
     let mut conds = Vec::new();
     for (idx, &(start, kind)) in starts.iter().enumerate() {
         let end = starts.get(idx + 1).map(|(s, _)| *s).unwrap_or(expr.len());
-        // Every supported prefix is exactly "xxxx:" — five bytes.
-        let value = expr[start + 5..end].trim().to_string();
+        // Skip past the "<prefix>:" that starts this group (prefix + colon).
+        let value = expr[start + kind.prefix().len() + 1..end]
+            .trim()
+            .to_string();
         if !value.is_empty() {
             conds.push(FilterCond {
                 kind,
@@ -265,6 +282,9 @@ pub struct FilterBuilder {
     repo: Option<String>,
     /// The `repo`'s MIME stats, cached for the MIME editor's suggestions.
     mime_stats: Vec<(String, u64)>,
+    /// The `repo`'s existing annotation tags (sorted, deduped), cached for the
+    /// TAG editor's suggestions so a tag can be picked instead of retyped.
+    tags: Vec<String>,
     // Background export/import file-dialog results.
     io_tx: Sender<HistoryIo>,
     io_rx: Receiver<HistoryIo>,
@@ -299,6 +319,7 @@ impl FilterBuilder {
             preset_name: String::new(),
             repo: None,
             mime_stats: Vec::new(),
+            tags: Vec::new(),
             io_tx,
             io_rx,
             count_tx,
@@ -360,7 +381,15 @@ impl FilterBuilder {
                 Some(r) => store.get_mime_stats(r).unwrap_or_default(),
                 None => Vec::new(),
             };
+            self.reload_tags(store);
             self.schedule_count();
+        }
+        // The tag list grows as files are annotated (in Browse), and the repo
+        // doesn't change while that happens — so reload it whenever a TAG
+        // condition's editor is open, keeping the pick-list current. Cheap: the
+        // annotations table only holds annotated files.
+        if self.filters.iter().any(|c| c.kind == FilterKind::Tag && c.editing) {
+            self.reload_tags(store);
         }
 
         self.drain(store);
@@ -380,6 +409,21 @@ impl FilterBuilder {
             status: self.status.take(),
             error: self.error.take(),
         }
+    }
+
+    /// Reload the current repo's distinct annotation tags (sorted) for the TAG
+    /// editor's pick-list. Empty when no repo is selected.
+    fn reload_tags(&mut self, store: &Store) {
+        self.tags = match self.repo.as_deref() {
+            Some(r) => {
+                let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+                for tags in store.all_annotations(r).unwrap_or_default().into_values() {
+                    set.extend(tags);
+                }
+                set.into_iter().collect()
+            }
+            None => Vec::new(),
+        };
     }
 
     fn filter_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
@@ -452,7 +496,7 @@ impl FilterBuilder {
                     self.adding = !self.adding;
                 }
                 if self.adding {
-                    for kind in [FilterKind::Mime, FilterKind::Name, FilterKind::Size] {
+                    for kind in FILTER_KINDS {
                         let (short, verbose) = match kind {
                             FilterKind::Mime => (
                                 "Filter by MIME type",
@@ -469,6 +513,11 @@ impl FilterBuilder {
                                 "Filter by size",
                                 "Match files by size with an operator and byte count, e.g. \
                                  \">=1000\" or \"<500000\".",
+                            ),
+                            FilterKind::Tag => (
+                                "Filter by tag",
+                                "Match files carrying a tag that contains this text. Add \
+                                 tags to files in the Browse tab.",
                             ),
                         };
                         if ui
@@ -717,6 +766,37 @@ impl FilterBuilder {
                         && let Some(cond) = self.filters.get_mut(idx)
                     {
                         cond.value = mime.clone();
+                        changed = true;
+                    }
+                }
+            });
+        }
+
+        // TAG suggestions: the repo's existing annotation tags, filtered by the
+        // typed substring, so a tag is picked rather than retyped. Empty (and
+        // hidden) when the repo has no tags yet.
+        if kind == FilterKind::Tag && !self.tags.is_empty() {
+            let tags = self.tags.clone();
+            let query = current.trim().to_lowercase();
+            ui.horizontal_wrapped(|ui| {
+                for tag in &tags {
+                    if !query.is_empty() && !tag.to_lowercase().contains(&query) {
+                        continue;
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new(tag).color(theme::BLUE))
+                                .fill(theme::PANEL),
+                        )
+                        .explain(
+                            self.verbosity,
+                            "Use this tag value",
+                            &format!("Set the condition value to the existing tag \"{tag}\"."),
+                        )
+                        .clicked()
+                        && let Some(cond) = self.filters.get_mut(idx)
+                    {
+                        cond.value = tag.clone();
                         changed = true;
                     }
                 }

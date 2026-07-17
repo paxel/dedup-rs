@@ -222,9 +222,10 @@ fn collect_source_entries(
     filter: &FileFilter,
     include_missing: bool,
 ) -> Result<Vec<(String, FileEntry)>, StoreError> {
+    let annotated = crate::filter::AnnotatedFilter::new(db, filter)?;
     let mut entries = Vec::new();
     store::for_each_file_entry(db, |rel_path, entry| {
-        if (include_missing || !entry.missing) && filter.matches(rel_path, &entry) {
+        if (include_missing || !entry.missing) && annotated.matches(rel_path, &entry) {
             entries.push((rel_path.to_string(), entry));
         }
         Ok(())
