@@ -62,6 +62,16 @@ struct RepoRow {
     freshness: Freshness,
 }
 
+/// Where a native folder-picker result should be routed, since the pick is
+/// resolved on a background thread after the invoking widget is gone.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FolderTarget {
+    /// The "add repository" form's path field.
+    Add,
+    /// The inline relocate editor's path buffer.
+    Relocate,
+}
+
 /// In-progress inline edit for a repo row.
 enum Edit {
     Rename {
@@ -105,7 +115,7 @@ enum Action {
     CancelEdit,
     OpenAdd,
     CloseAdd,
-    ChooseFolder,
+    ChooseFolder(FolderTarget),
     Create,
 }
 
@@ -122,6 +132,8 @@ pub struct DedupApp {
     /// Native folder-picker results delivered from a background thread.
     folder_tx: Sender<PathBuf>,
     folder_rx: Receiver<PathBuf>,
+    /// Where the next folder-picker result should land (add form vs relocate).
+    folder_target: FolderTarget,
     edit: Option<Edit>,
 
     show_settings: bool,
@@ -167,6 +179,7 @@ impl DedupApp {
             form_error: None,
             folder_tx,
             folder_rx,
+            folder_target: FolderTarget::Add,
             edit: None,
             show_settings: false,
             show_about: false,
@@ -408,12 +421,23 @@ impl DedupApp {
             }
             Action::CommitRelocate(name, new_path) => {
                 self.edit = None;
-                if !new_path.is_empty()
-                    && let Err(e) = self.store.relocate_repo(&name, &new_path)
-                {
-                    self.load_error = Some(e.to_string());
+                let mut relocated = false;
+                if !new_path.is_empty() {
+                    match self.store.relocate_repo(&name, &new_path) {
+                        Ok(()) => relocated = true,
+                        Err(e) => self.load_error = Some(e.to_string()),
+                    }
                 }
                 self.reload_all();
+                if relocated {
+                    // A moved repo's stale "missing" status must not linger:
+                    // clear it and re-probe location/reachability against the new
+                    // path (so it reads Local/Remote if the folder is now there).
+                    if let Some(row) = self.repos.iter_mut().find(|r| r.name == name) {
+                        row.location = None;
+                    }
+                    self.refresh_status(ctx);
+                }
             }
             Action::CommitDuplicate { source, dest, path } => {
                 self.edit = None;
@@ -443,7 +467,8 @@ impl DedupApp {
                 self.show_add = false;
                 self.form_error = None;
             }
-            Action::ChooseFolder => {
+            Action::ChooseFolder(target) => {
+                self.folder_target = target;
                 let tx = self.folder_tx.clone();
                 let repaint = ctx.clone();
                 std::thread::spawn(move || {
@@ -542,15 +567,27 @@ impl eframe::App for DedupApp {
             }
         }
 
-        // Folder-picker results: fill the path and auto-name from the last path
-        // component unless the user already typed a name.
+        // Folder-picker results land in whichever field asked for them.
         while let Ok(dir) = self.folder_rx.try_recv() {
-            if self.new_name.trim().is_empty()
-                && let Some(base) = dir.file_name()
-            {
-                self.new_name = base.to_string_lossy().into_owned();
+            let picked = dir.to_string_lossy().into_owned();
+            match self.folder_target {
+                // Add form: fill the path and auto-name from the last path
+                // component unless the user already typed a name.
+                FolderTarget::Add => {
+                    if self.new_name.trim().is_empty()
+                        && let Some(base) = dir.file_name()
+                    {
+                        self.new_name = base.to_string_lossy().into_owned();
+                    }
+                    self.new_path = picked;
+                }
+                // Relocate editor: fill its path buffer (if still open).
+                FolderTarget::Relocate => {
+                    if let Some(Edit::Relocate { buf, .. }) = &mut self.edit {
+                        *buf = picked;
+                    }
+                }
             }
-            self.new_path = dir.to_string_lossy().into_owned();
             ctx.request_repaint();
         }
 
@@ -1059,6 +1096,21 @@ impl DedupApp {
                 let verbosity = self.tooltip_verbosity;
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("RELOCATE →").color(theme::LILAC));
+                    if ui
+                        .button(
+                            RichText::new(format!("{} CHOOSE…", icon::FOLDER_OPEN))
+                                .color(theme::BLACK),
+                        )
+                        .explain(
+                            verbosity,
+                            "Pick a folder",
+                            "Open a native folder picker to choose the new folder this \
+                             repository should point at.",
+                        )
+                        .clicked()
+                    {
+                        actions.push(Action::ChooseFolder(FolderTarget::Relocate));
+                    }
                     ui.text_edit_singleline(buf).explain(
                         verbosity,
                         "New folder path",
@@ -1301,7 +1353,7 @@ impl DedupApp {
                     )
                     .clicked()
                 {
-                    actions.push(Action::ChooseFolder);
+                    actions.push(Action::ChooseFolder(FolderTarget::Add));
                 }
                 ui.add(
                     egui::TextEdit::singleline(&mut self.new_path)

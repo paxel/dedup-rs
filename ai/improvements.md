@@ -307,14 +307,26 @@ everywhere.
   are not in the source** (mirror the source into the target).
 - **Confirm/preview step for copy / move / sync** — before executing any of these, show the
   numbers ("copy X files to …, delete Y files") with an OK / Cancel gate.
-- **Repo relocate: folder picker** — relocating a repo must offer a native folder picker
-  (not a raw path field).
+- ✅ **Repo relocate: folder picker** — resolved 2026-07-17. The inline relocate editor now
+  has a **CHOOSE…** button opening the native folder picker (reusing the add-form's threaded
+  `rfd` flow, routed by a new `FolderTarget` so the result lands in the relocate buffer). The
+  path field remains for typing. Relocate also now **clears the stale "missing" repo status**:
+  after a successful relocate it drops the row's carried-over `Location` and re-probes
+  location/reachability against the new path (→ Local/Remote if the folder is now reachable,
+  or back to Missing if the new path is also bad). *(Repo-level status, not per-file flags.)*
 - **Drag-and-drop add repositories** — drop one or more folders onto the app to add them as
   repos in one gesture; derive valid repo names from the folder names, unifying/de-duping
   names where needed.
 - **`prune` command (from the old Java tool)** — remove deleted (missing) files from the DB
   and clean up / compact the index files. *Open question:* still needed with redb, or does
   compaction/`mark_missing` already cover it? Verify before building.
+- **Wrap single-line group rows** — some group rows (e.g. the repo chips) lay out on one
+  horizontal line and scroll out of the frame when there are many items in a small window.
+  They should **line-break / wrap** to multiple rows instead. Applies to almost every group
+  *except* the compare groups (whose side-by-side layout is intentional).
+- **Compare-group action buttons** — give each compare group its own group-level buttons:
+  **mark all**, **mark none**, and **hide group** (hidden until the next FIND). Quicker bulk
+  handling of a group without touching each file.
 
 ### Design questions (filter ↔ repo)
 
