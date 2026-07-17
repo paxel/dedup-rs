@@ -292,9 +292,12 @@ everywhere.
   category, dupes audio controls / thumbnails / lightbox). Playlists now fall to the generic
   byte/strings preview rather than a waveform. *(Already-indexed `.m3u` files keep their stale
   audio fingerprint until a re-scan; the GUI no longer treats them as audio regardless.)*
-- **Video lightbox scrubs on mouse-move** — the displayed frame changes as the mouse moves
-  across the lightbox, so it's unusable. Frame selection is (wrongly) bound to cursor
-  position; needs an explicit scrubber/keys instead.
+- ✅ **Video lightbox scrubbed on mouse-move** — resolved 2026-07-17. The shown frame was
+  bound to the cursor's x over the *whole* viewport, so any mouse movement changed it. Now
+  the filmstrip stills are **click-to-pin** (per user's choice): clicking a still shows that
+  frame enlarged and it stays put; mouse movement never changes it. Pinned frame lives in
+  `LightboxState::video_frame` (defaults to the middle still, resets when navigating to
+  another copy). Cells show a pointing-hand cursor + hover outline.
 
 ### Features
 

@@ -81,6 +81,10 @@ pub struct LightboxState {
     pub audio_active: Option<usize>,
     /// Audio lightbox only: show spectrograms instead of amplitude waveforms.
     pub spectrogram: bool,
+    /// Video lightbox only: the filmstrip still the user pinned (clicked) to show
+    /// enlarged. `None` until they click one — then the middle frame is shown.
+    /// Reset when navigating to another copy.
+    pub video_frame: Option<usize>,
 }
 
 impl LightboxState {
@@ -94,6 +98,7 @@ impl LightboxState {
             compare: None,
             audio_active: None,
             spectrogram: false,
+            video_frame: None,
         }
     }
 

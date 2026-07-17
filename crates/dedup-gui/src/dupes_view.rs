@@ -1686,6 +1686,7 @@ impl DupesView {
             idx = new_idx;
             state.index = idx;
             state.reset_view();
+            state.video_frame = None; // a new copy starts on its middle still
         }
 
         // The A file (always the current index) and its texture/metadata.
@@ -1796,14 +1797,13 @@ impl DupesView {
             let big =
                 egui::Rect::from_min_max(vp.min, egui::pos2(vp.max.x, vp.max.y - strip_h - 6.0));
             let strip = egui::Rect::from_min_max(egui::pos2(vp.min.x, vp.max.y - strip_h), vp.max);
-            let scrub = ctx
-                .pointer_hover_pos()
-                .filter(|c| vp.contains(*c))
-                .map(|c| {
-                    ((((c.x - vp.left()) / vp.width()) * VIDEO_STRIP as f32).floor() as i64)
-                        .clamp(0, VIDEO_STRIP as i64 - 1) as usize
-                })
-                .unwrap_or(VIDEO_STRIP / 2);
+            // The shown frame is the still the user clicked (pinned), defaulting
+            // to the middle frame — not a hover, so mouse movement never changes
+            // it. Clamp in case VIDEO_STRIP ever shrinks below a stale pin.
+            let scrub = state
+                .video_frame
+                .unwrap_or(VIDEO_STRIP / 2)
+                .min(VIDEO_STRIP - 1);
             let hexa = hash_hex(&a.entry.hash);
             let srca = a.absolute_path();
             let big_tex = self.thumbs.get_video(&hexa, &srca, scrub, VIDEO_STRIP);
@@ -1871,11 +1871,12 @@ impl DupesView {
                     ui.painter().text(
                         big.min + egui::vec2(6.0, 6.0),
                         egui::Align2::LEFT_TOP,
-                        "VIDEO — hover to scrub",
+                        "VIDEO — click a still to view",
                         egui::FontId::proportional(14.0),
                         theme::AMBER,
                     );
-                    // Filmstrip of stills; the current one is outlined.
+                    // Filmstrip of stills; the pinned one is outlined. Each cell
+                    // is a click target that pins that frame in the big view.
                     let n = frames.len().max(1);
                     let cell_w = strip.width() / n as f32;
                     for (i, f) in frames.iter().enumerate() {
@@ -1883,12 +1884,20 @@ impl DupesView {
                             egui::pos2(strip.left() + i as f32 * cell_w + 1.0, strip.top()),
                             egui::vec2(cell_w - 2.0, strip.height()),
                         );
+                        let cell_resp = ui
+                            .allocate_rect(cell, egui::Sense::click())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if cell_resp.clicked() {
+                            state.video_frame = Some(i);
+                        }
                         if let Some(t) = f {
                             let r = fit(cell, t.size_vec2());
                             ui.painter_at(cell).image(t.id(), r, uv, egui::Color32::WHITE);
                         }
                         let (col, w) = if i == *scrub {
                             (theme::AMBER, 2.0)
+                        } else if cell_resp.hovered() {
+                            (theme::TAN, 1.5)
                         } else {
                             (theme::HAIRLINE, 1.0)
                         };
@@ -2284,7 +2293,7 @@ impl DupesView {
                             ui.label(RichText::new(&a_meta).color(theme::TEXT).size(13.0));
                             let hint = if a_is_video {
                                 format!(
-                                    "hover: scrub · {}/{} step · Del/K mark · Esc close",
+                                    "click a still to view · {}/{} copy · Del/K mark · Esc close",
                                     icon::CARET_LEFT,
                                     icon::CARET_RIGHT,
                                 )
