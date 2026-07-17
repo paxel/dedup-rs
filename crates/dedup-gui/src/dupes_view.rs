@@ -1010,11 +1010,17 @@ impl DupesView {
         }
         self.cached_page = Some(page);
 
+        // Promote protected (read-only repo) copies to best within each group,
+        // so a protected original is the kept copy and its writable duplicate
+        // falls to the deletable tail (the default mark below then targets the
+        // writable copy, not the protected one).
+        let ro = self.read_only_names();
+        dedup_core::dupes::promote_protected_first(&mut self.page_groups, |f| ro.contains(&f.repo));
+
         // Default-mark this page's worse (non-best) copies once, so the extras
         // show DELETE by default. Read-only repos are never marked, and a page
         // is only preselected once so manual KEEP choices survive a revisit.
         if self.preselected_pages.insert(page) {
-            let ro = self.read_only_names();
             let keys: Vec<FileKey> = self
                 .page_groups
                 .iter()
@@ -1353,7 +1359,7 @@ impl DupesView {
             .entry
             .mime
             .as_deref()
-            .is_some_and(|m| m.starts_with("audio/"));
+            .is_some_and(dedup_core::fingerprint::is_audio_mime);
         if !is_audio {
             return;
         }
@@ -1425,7 +1431,7 @@ impl DupesView {
         let mime = file.entry.mime.as_deref();
         let is_image = mime.is_some_and(|m| m.starts_with("image/"));
         let is_video = mime.is_some_and(|m| m.starts_with("video/"));
-        let is_audio = mime.is_some_and(|m| m.starts_with("audio/"));
+        let is_audio = mime.is_some_and(dedup_core::fingerprint::is_audio_mime);
         if is_image || is_video {
             // Only fetch a texture for on-screen cards. The results list is not
             // virtualized, so a page can lay out far more thumbnails than the GPU
@@ -1611,7 +1617,7 @@ impl DupesView {
             .entry
             .mime
             .as_deref()
-            .is_some_and(|m| m.starts_with("audio/"))
+            .is_some_and(dedup_core::fingerprint::is_audio_mime)
         {
             self.audio_lightbox(ctx, state, group, idx);
             return;

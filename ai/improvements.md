@@ -280,12 +280,18 @@ everywhere.
 
 ### Bugs
 
-- **Duplicate "best" pick ignores writability** — when searching duplicates, the keeper
-  heuristic should prefer a **read-only** copy over a read-write one as the "best" (a
-  read-only original is the safer canonical).
-- **`.m3u` treated as audio** — `.m3u` is a *playlist*, not an audio format. Playlists must
-  not get the audio treatment (waveform tile / audio lightbox / id3). Exclude playlist
-  types from the audio category.
+- ✅ **Duplicate "best" pick ignores writability** — resolved 2026-07-17. Within each dupe
+  group, copies in a **read-only (protected) repo** are now promoted to "best"
+  (`dupes::promote_protected_first`, stable so content order still breaks ties among equally-
+  protected copies), so the writable duplicate falls to the deletable tail and is the one
+  marked by default. No-op when all repos are read-only (the default). *(Repo-level read-only,
+  per the user; the filesystem permission bit is not tracked.)*
+- ✅ **`.m3u` treated as audio** — resolved 2026-07-17. A shared `fingerprint::is_audio_mime`
+  excludes playlist MIME types (`audio/x-mpegurl`, `audio/mpegurl`, `audio/x-scpls`, …) from
+  the audio treatment, wired into core fingerprinting and every GUI audio check (Browse
+  category, dupes audio controls / thumbnails / lightbox). Playlists now fall to the generic
+  byte/strings preview rather than a waveform. *(Already-indexed `.m3u` files keep their stale
+  audio fingerprint until a re-scan; the GUI no longer treats them as audio regardless.)*
 - **Video lightbox scrubs on mouse-move** — the displayed frame changes as the mouse moves
   across the lightbox, so it's unusable. Frame selection is (wrongly) bound to cursor
   position; needs an explicit scrubber/keys instead.

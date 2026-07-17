@@ -40,6 +40,27 @@ pub fn detect_mime(path: &Path) -> Option<String> {
     mime_guess::from_path(path).first().map(|m| m.to_string())
 }
 
+/// Playlist MIME types that `mime_guess` reports under `audio/` (`.m3u`, `.pls`,
+/// …) even though they're text playlists, not audio media. They must not get the
+/// audio treatment (fingerprint, waveform, id3).
+pub fn is_playlist_mime(mime: &str) -> bool {
+    matches!(
+        mime,
+        "audio/x-mpegurl"
+            | "audio/mpegurl"
+            | "application/x-mpegurl"
+            | "application/vnd.apple.mpegurl"
+            | "audio/x-scpls"
+    )
+}
+
+/// Whether `mime` denotes an actual audio media file (so it gets the audio
+/// treatment). True for `audio/*` except playlist formats — see
+/// [`is_playlist_mime`].
+pub fn is_audio_mime(mime: &str) -> bool {
+    mime.starts_with("audio/") && !is_playlist_mime(mime)
+}
+
 /// Compute all applicable fingerprints for `path`, dispatching on MIME.
 ///
 /// `ffmpeg_available` gates the (external) video path; when false, video files
@@ -78,7 +99,7 @@ pub fn compute(path: &Path, ffmpeg_available: bool) -> Fingerprints {
         // Plain text / CSV: group exports and logs that differ only by BOM,
         // line endings or trailing whitespace.
         fp.pdf_hash = text_file_hash(path);
-    } else if mime.starts_with("audio/") {
+    } else if is_audio_mime(&mime) {
         fp.audio = audio_fingerprint(path);
     }
 
@@ -646,6 +667,21 @@ fn probe_audio_duration_ms(path: &Path) -> Option<u32> {
 mod tests {
     use super::*;
     use image::{DynamicImage, Rgb, RgbImage};
+
+    #[test]
+    fn playlists_are_not_audio_media() {
+        // Real audio media gets the audio treatment.
+        assert!(is_audio_mime("audio/mpeg"));
+        assert!(is_audio_mime("audio/x-wav"));
+        assert!(is_audio_mime("audio/flac"));
+        // Playlists that mime_guess files under audio/ do not.
+        assert!(!is_audio_mime("audio/x-mpegurl")); // .m3u
+        assert!(!is_audio_mime("audio/mpegurl"));
+        assert!(!is_audio_mime("audio/x-scpls")); // .pls
+        assert!(is_playlist_mime("audio/x-mpegurl"));
+        // .m3u8 isn't audio/* at all, so it was never treated as audio.
+        assert!(!is_audio_mime("application/vnd.apple.mpegurl"));
+    }
 
     /// An asymmetric "L" shape, echoing the Java invariance fixture.
     fn l_shape() -> DynamicImage {

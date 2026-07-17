@@ -95,7 +95,7 @@ impl Cat {
             Cat::Image
         } else if mime.starts_with("video/") {
             Cat::Video
-        } else if mime.starts_with("audio/") {
+        } else if dedup_core::fingerprint::is_audio_mime(mime) {
             Cat::Audio
         } else if mime.starts_with("text/")
             || matches!(

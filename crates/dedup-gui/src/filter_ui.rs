@@ -388,7 +388,11 @@ impl FilterBuilder {
         // doesn't change while that happens — so reload it whenever a TAG
         // condition's editor is open, keeping the pick-list current. Cheap: the
         // annotations table only holds annotated files.
-        if self.filters.iter().any(|c| c.kind == FilterKind::Tag && c.editing) {
+        if self
+            .filters
+            .iter()
+            .any(|c| c.kind == FilterKind::Tag && c.editing)
+        {
             self.reload_tags(store);
         }
 
