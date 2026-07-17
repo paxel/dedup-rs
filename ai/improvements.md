@@ -303,10 +303,26 @@ everywhere.
 
 - **Shared FILTER on the Duplicates tab** — the common filter wizard (used by
   Transfer/Grooming/Browse) would make sense on the duplicates view too.
-- **Transfer `sync` command** — like `copy`, but also **deletes files in the target that
-  are not in the source** (mirror the source into the target).
-- **Confirm/preview step for copy / move / sync** — before executing any of these, show the
-  numbers ("copy X files to …, delete Y files") with an OK / Cancel gate.
+- ✅ **Transfer `sync` command** — resolved 2026-07-17. The Transfer tab gained a third
+  **SYNC** command (`3` from the keyboard) that mirrors the source into the target repo at
+  the same relative path: it copies content the target lacks and, with an opt-in **DELETE
+  MISSING** toggle, deletes target files whose content the source has since lost. The core
+  `diff_sync` (already CLI-wired) was reused as-is — the GUI does **not** delete arbitrary
+  target files absent from the source; "delete" means *propagate the source's own
+  deletions*, matching the CLI's `--delete-missing`. *(Scope decided with the user: reuse
+  core semantics rather than build a true rsync-style mirror; DELETE MISSING defaults off so
+  SYNC is additive unless asked.)* SYNC is repo→repo only, so it hides the DEST/subdir/
+  folder/DUPEPOOL controls and shows its own OPTIONS bar. To match COPY/MOVE's live run
+  panel, `diff_sync` now emits per-file `DiffEvent` progress via `DiffRun` (one step per
+  acting entry; `done ≤ total`); a new `plan_sync` backs the preview/confirm counts without
+  touching disk. Tests: core `plan_sync_lists_copies_and_deletes` +
+  `sync_emits_progress_for_copies_and_deletes`, GUI
+  `sync_mode_shows_delete_toggle_and_hides_transfer_controls` (+ extended `number_keys`),
+  and `--ignored` `render_transfer_sync`.
+- ✅ **Confirm/preview step for copy / move / sync** — resolved 2026-07-17. All three
+  commands share the PREVIEW grid (first `from → to` rows; SYNC also lists red `path →
+  deleted` rows) and a CONFIRM modal that states the counts before running ("copy X … / copy
+  X and delete Y …"); the SYNC modal's PROCEED turns red only when DELETE MISSING is on.
 - ✅ **Repo relocate: folder picker** — resolved 2026-07-17. The inline relocate editor now
   has a **CHOOSE…** button opening the native folder picker (reusing the add-form's threaded
   `rfd` flow, routed by a new `FolderTarget` so the result lands in the relocate buffer). The

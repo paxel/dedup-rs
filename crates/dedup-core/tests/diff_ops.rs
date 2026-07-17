@@ -5,7 +5,7 @@
 
 use dedup_core::diff::{
     CopyDest, DiffAction, DiffEvent, DiffItem, DiffProgress, DiffRun, FolderMode, NoDiffProgress,
-    diff_copy, diff_delete, diff_print, diff_sync, export_to_folder, plan_folder_export,
+    diff_copy, diff_delete, diff_print, diff_sync, export_to_folder, plan_folder_export, plan_sync,
 };
 use dedup_core::store::{FileEntry, Store};
 use dedup_core::update::{CancellationToken, NoProgress, update_repo};
@@ -89,7 +89,7 @@ fn sync_does_not_copy_when_content_already_present_in_b() -> TestResult {
         true,
         false,
         None,
-        &CancellationToken::new(),
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
     )?;
     assert_eq!(stats.copied, 0);
     assert_eq!(stats.equal, 1);
@@ -110,7 +110,7 @@ fn sync_copies_when_missing_in_b_and_updates_index() -> TestResult {
         true,
         false,
         None,
-        &CancellationToken::new(),
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
     )?;
     assert_eq!(stats.copied, 1);
     assert_eq!(std::fs::read(sb.b_root.join("dir/a.txt"))?, b"hello");
@@ -150,7 +150,7 @@ fn sync_deletes_when_marked_missing_in_a_and_updates_index() -> TestResult {
         false,
         true,
         None,
-        &CancellationToken::new(),
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
     )?;
     assert_eq!(stats.deleted, 1);
     assert!(!sb.b_root.join("del.txt").exists());
@@ -179,7 +179,7 @@ fn sync_skips_copy_when_target_path_already_occupied_by_different_content() -> T
         true,
         false,
         None,
-        &CancellationToken::new(),
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
     )?;
     assert_eq!(stats.copied, 0);
     assert_eq!(stats.skipped, 1);
@@ -210,7 +210,7 @@ fn sync_obeys_mime_filter() -> TestResult {
         true,
         false,
         Some("mime:image"),
-        &CancellationToken::new(),
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
     )?;
     assert_eq!(stats.copied, 1);
     assert!(sb.b_root.join("img.png").exists());
@@ -242,7 +242,7 @@ fn sync_obeys_mime_filter_for_delete() -> TestResult {
         false,
         true,
         Some("mime:image"),
-        &CancellationToken::new(),
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
     )?;
     assert_eq!(stats.deleted, 1);
     assert!(!sb.b_root.join("img.png").exists());
@@ -275,11 +275,69 @@ fn sync_obeys_size_filter() -> TestResult {
         true,
         false,
         Some("size:5"),
-        &CancellationToken::new(),
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
     )?;
     assert_eq!(stats.copied, 1);
     assert!(sb.b_root.join("small.txt").exists());
     assert!(!sb.b_root.join("large.txt").exists());
+    Ok(())
+}
+
+#[test]
+fn plan_sync_lists_copies_and_deletes() -> TestResult {
+    let sb = Sandbox::new()?;
+    // A: "new" is unknown to B; "gone" was indexed then removed (missing in A).
+    Sandbox::write(&sb.a_root, "new.txt", b"new")?;
+    Sandbox::write(&sb.a_root, "gone.txt", b"gone")?;
+    sb.update("A")?;
+    std::fs::remove_file(sb.a_root.join("gone.txt"))?;
+    sb.update("A")?;
+    // B still holds the "gone" content (at another path).
+    Sandbox::write(&sb.b_root, "kept.txt", b"gone")?;
+    sb.update("B")?;
+
+    let plan = plan_sync(&sb.store, "A", "B", true, true, None)?;
+    assert_eq!(plan.copies, vec!["new.txt".to_string()]);
+    assert_eq!(plan.deletes, vec!["kept.txt".to_string()]);
+
+    // With delete_missing off, only copies are planned.
+    let copy_only = plan_sync(&sb.store, "A", "B", true, false, None)?;
+    assert_eq!(copy_only.copies, vec!["new.txt".to_string()]);
+    assert!(copy_only.deletes.is_empty());
+
+    // Nothing on disk changed (plan is read-only).
+    assert!(sb.b_root.join("kept.txt").exists());
+    assert!(!sb.b_root.join("new.txt").exists());
+    Ok(())
+}
+
+#[test]
+fn sync_emits_progress_for_copies_and_deletes() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "new.txt", b"new")?;
+    Sandbox::write(&sb.a_root, "gone.txt", b"gone")?;
+    sb.update("A")?;
+    std::fs::remove_file(sb.a_root.join("gone.txt"))?;
+    sb.update("A")?;
+    Sandbox::write(&sb.b_root, "kept.txt", b"gone")?;
+    sb.update("B")?;
+
+    let progress = RecordingProgress::default();
+    let stats = diff_sync(
+        &sb.store,
+        "A",
+        "B",
+        true,
+        true,
+        None,
+        &DiffRun::new(&progress, &CancellationToken::new()),
+    )?;
+    assert_eq!(stats.copied, 1);
+    assert_eq!(stats.deleted, 1);
+    // One progress step per acting entry (one copy + one delete), and `done`
+    // never overshoots `total`.
+    assert_eq!(progress.progress_count(), 2);
+    assert_eq!(progress.last_progress(), Some((2, 2)));
     Ok(())
 }
 

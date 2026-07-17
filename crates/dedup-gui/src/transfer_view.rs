@@ -1,10 +1,13 @@
 //! The Transfer tab: pick a source repo and a target repo, choose a command
-//! (copy / move), narrow with a filter, preview the first `from → to` transfers,
-//! then run it on a background thread with confirmation.
+//! (copy / move / sync), narrow with a filter, preview the first `from → to`
+//! transfers, then run it on a background thread with confirmation.
 //!
 //! Semantics reuse the core diff operations (content compared by size + hash):
 //! - **Copy/Move** transfer source files whose content the target lacks into the
 //!   target repo's directory (move also marks the source entries missing).
+//! - **Sync** mirrors the source into the target at the same relative path:
+//!   copy content the target lacks, and (with DELETE MISSING on) delete target
+//!   files whose content the source has lost. The source is never changed.
 
 use crate::filter_ui::FilterBuilder;
 use crate::icon;
@@ -14,7 +17,7 @@ use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::diff::{
     CopyDest, DiffAction, DiffEvent, DiffItem, DiffProgress, DiffRun, FolderMode, diff_copy,
-    diff_print, export_to_folder, plan_folder_export,
+    diff_print, diff_sync, export_to_folder, plan_folder_export, plan_sync,
 };
 use dedup_core::store::Store;
 use dedup_core::update::CancellationToken;
@@ -31,6 +34,7 @@ const RUN_LOG_LIMIT: usize = 10;
 enum Command {
     Copy,
     Move,
+    Sync,
 }
 
 impl Command {
@@ -38,10 +42,15 @@ impl Command {
         match self {
             Command::Copy => "COPY",
             Command::Move => "MOVE",
+            Command::Sync => "SYNC",
         }
     }
+    /// Whether the command is inherently destructive to on-disk data by itself.
+    /// SYNC is additive by default (it only *copies* into the target); its
+    /// optional DELETE MISSING toggle makes a given run destructive — see
+    /// [`TransferView::destructive_run`].
     fn destructive(self) -> bool {
-        !matches!(self, Command::Copy)
+        matches!(self, Command::Move)
     }
     /// (short, verbose) tooltip text for this command's selector button.
     fn tooltip(self) -> (&'static str, &'static str) {
@@ -57,6 +66,12 @@ impl Command {
                 "Move source files whose content the target (and any ALSO REF repos) \
                  doesn't already have into the target repo's directory, marking the \
                  source entries missing.",
+            ),
+            Command::Sync => (
+                "Make the target mirror the source",
+                "Copy source content the target lacks into the target at the same \
+                 relative path. Turn on DELETE MISSING to also delete target files \
+                 whose content the source has since lost. The source is never changed.",
             ),
         }
     }
@@ -92,6 +107,9 @@ impl SelectMode {
 struct PreviewRow {
     from: String,
     to: String,
+    /// A SYNC deletion (rendered in red as `path → deleted`) rather than a
+    /// `from → to` transfer.
+    del: bool,
 }
 
 /// A snapshot of the destination captured when a run starts, so the worker
@@ -108,6 +126,10 @@ enum StartDest {
         mode: FolderMode,
         invert: bool,
     },
+    Sync {
+        target: String,
+        delete_missing: bool,
+    },
 }
 
 enum OpResult {
@@ -115,6 +137,13 @@ enum OpResult {
         copied: u64,
         cancelled: bool,
         moved: bool,
+    },
+    Synced {
+        copied: u64,
+        deleted: u64,
+        skipped: u64,
+        errors: u64,
+        cancelled: bool,
     },
     Error(String),
 }
@@ -155,6 +184,12 @@ pub struct TransferView {
     select_mode: SelectMode,
     /// Export the redundant copies instead of the unique files.
     invert: bool,
+    /// SYNC only: also delete target files whose content the source marks
+    /// missing (off by default — SYNC is additive unless this is on).
+    sync_delete_missing: bool,
+    /// SYNC preview: how many target files a run would delete (companion to
+    /// `preview_total`, which counts the copies).
+    sync_delete_total: usize,
     /// This tab's own similarity threshold (%), shown as a slider in SIMILAR
     /// mode; used when a folder export groups by perceptual similarity.
     similar_threshold: f64,
@@ -195,6 +230,7 @@ enum Act {
     SetDestination(Destination),
     SetMode(SelectMode),
     ToggleInvert,
+    ToggleSyncDelete,
     FolderChanged,
     BrowseFolder,
     SubdirChanged,
@@ -223,6 +259,8 @@ impl TransferView {
             folder: String::new(),
             select_mode: SelectMode::Exact,
             invert: false,
+            sync_delete_missing: false,
+            sync_delete_total: 0,
             similar_threshold: 90.0,
             subdir: String::new(),
             subdir_tx,
@@ -277,6 +315,9 @@ impl TransferView {
                 if i.key_pressed(egui::Key::Num2) {
                     acts.push(Act::SetCommand(Command::Move));
                 }
+                if i.key_pressed(egui::Key::Num3) {
+                    acts.push(Act::SetCommand(Command::Sync));
+                }
                 if i.key_pressed(egui::Key::P) {
                     acts.push(Act::Preview);
                 }
@@ -293,16 +334,22 @@ impl TransferView {
                 .size(18.0)
                 .strong(),
         );
-        crate::util::shortcut_bar(ui, "1 copy · 2 move · P preview · R run");
+        crate::util::shortcut_bar(ui, "1 copy · 2 move · 3 sync · P preview · R run");
 
         self.repo_rows(ui, &mut acts);
         self.command_bar(ui, &mut acts);
-        self.dest_bar(ui, &mut acts);
-        match self.destination {
-            Destination::Repo => self.subdir_bar(ui, &mut acts),
-            Destination::Folder => {
-                self.folder_bar(ui, &mut acts);
-                self.mode_bar(ui, &mut acts);
+        // SYNC is always repo→repo at the same relative path, so it hides the
+        // DEST/subdir/folder controls and shows its own DELETE MISSING toggle.
+        if self.command == Command::Sync {
+            self.sync_bar(ui, &mut acts);
+        } else {
+            self.dest_bar(ui, &mut acts);
+            match self.destination {
+                Destination::Repo => self.subdir_bar(ui, &mut acts),
+                Destination::Folder => {
+                    self.folder_bar(ui, &mut acts);
+                    self.mode_bar(ui, &mut acts);
+                }
             }
         }
         // The shared FILTER wizard; the source repo backs its MIME suggestions
@@ -432,44 +479,47 @@ impl TransferView {
             }
             // Reference repos: content any of them already holds is treated as
             // "already known" and never re-copied. In REPO mode the target is
-            // always a reference and is shown as a locked chip.
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("DUPEPOOL").color(theme::TEXT).size(12.0));
-                if self.destination == Destination::Repo
-                    && let Some(target) = self.target.clone()
-                {
-                    // A locked, non-toggleable chip: the target is always a
-                    // reference. Rendered filled (not disabled) so it reads
-                    // as "on"; clicks are intentionally ignored.
-                    ui.add(
-                        egui::Button::new(
-                            RichText::new(format!("{} {target}", icon::LOCK)).color(theme::BLACK),
+            // always a reference and is shown as a locked chip. SYNC compares
+            // source against the single target only, so it has no dupe pool.
+            if self.command != Command::Sync {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("DUPEPOOL").color(theme::TEXT).size(12.0));
+                    if self.destination == Destination::Repo
+                        && let Some(target) = self.target.clone()
+                    {
+                        // A locked, non-toggleable chip: the target is always a
+                        // reference. Rendered filled (not disabled) so it reads
+                        // as "on"; clicks are intentionally ignored.
+                        ui.add(
+                            egui::Button::new(
+                                RichText::new(format!("{} {target}", icon::LOCK))
+                                    .color(theme::BLACK),
+                            )
+                            .fill(theme::LILAC),
                         )
-                        .fill(theme::LILAC),
-                    )
-                    .explain(
-                        self.verbosity,
-                        "Always in the pool (it's the target)",
-                        "The target repo is always in the dupe pool — COPY/MOVE never \
+                        .explain(
+                            self.verbosity,
+                            "Always in the pool (it's the target)",
+                            "The target repo is always in the dupe pool — COPY/MOVE never \
                          re-copies content the target already has — so it can't be \
                          toggled off.",
-                    );
-                }
-                for name in &self.repos {
-                    // Never a reference to itself; in REPO mode the target is
-                    // shown locked above, so skip it here.
-                    if self.source.as_deref() == Some(name.as_str()) {
-                        continue;
+                        );
                     }
-                    if self.destination == Destination::Repo
-                        && self.target.as_deref() == Some(name.as_str())
-                    {
-                        continue;
-                    }
-                    let sel = self.extra_refs.iter().any(|r| r == name);
-                    let fill = if sel { theme::LILAC } else { theme::PANEL };
-                    let col = if sel { theme::BLACK } else { theme::LILAC };
-                    if ui
+                    for name in &self.repos {
+                        // Never a reference to itself; in REPO mode the target is
+                        // shown locked above, so skip it here.
+                        if self.source.as_deref() == Some(name.as_str()) {
+                            continue;
+                        }
+                        if self.destination == Destination::Repo
+                            && self.target.as_deref() == Some(name.as_str())
+                        {
+                            continue;
+                        }
+                        let sel = self.extra_refs.iter().any(|r| r == name);
+                        let fill = if sel { theme::LILAC } else { theme::PANEL };
+                        let col = if sel { theme::BLACK } else { theme::LILAC };
+                        if ui
                         .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
                         .explain(
                             self.verbosity,
@@ -480,8 +530,9 @@ impl TransferView {
                     {
                         acts.push(Act::ToggleExtraRef(name.clone()));
                     }
-                }
-            });
+                    }
+                });
+            }
         });
     }
 
@@ -534,7 +585,7 @@ impl TransferView {
         theme::section(theme::ORANGE).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("COMMAND").color(theme::TEXT).size(12.0));
-                for cmd in [Command::Copy, Command::Move] {
+                for cmd in [Command::Copy, Command::Move, Command::Sync] {
                     let sel = self.command == cmd;
                     let accent = if cmd.destructive() {
                         theme::RED
@@ -764,8 +815,60 @@ impl TransferView {
                 "Move source files the target does not have into the target repo \
                  (they are removed from the source directory)."
             }
+            Command::Sync => {
+                "Make the target mirror the source: copy content it lacks (same relative \
+                 path); optionally delete target files the source has lost."
+            }
         };
         ui.label(RichText::new(text).color(theme::LILAC).size(11.0));
+    }
+
+    /// SYNC's option bar: the DELETE MISSING toggle (off by default). SYNC has
+    /// no subdir/folder/mode controls — it always mirrors source→target at the
+    /// same relative path.
+    fn sync_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        theme::section(theme::BLUE).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("OPTIONS").color(theme::TEXT).size(12.0));
+                let fill = if self.sync_delete_missing {
+                    theme::RED
+                } else {
+                    theme::PANEL
+                };
+                let col = if self.sync_delete_missing {
+                    theme::BLACK
+                } else {
+                    theme::RED
+                };
+                if ui
+                    .add(egui::Button::new(RichText::new("DELETE MISSING").color(col)).fill(fill))
+                    .explain(
+                        self.verbosity,
+                        "Also delete target files the source has lost",
+                        "Off: SYNC only copies content the target lacks (the source is \
+                         mirrored into the target, nothing is deleted). On: also delete \
+                         target files whose content the source once had and has since \
+                         lost — deletions cannot be undone.",
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::ToggleSyncDelete);
+                }
+            });
+            let hint = if self.sync_delete_missing {
+                "Copies content the target lacks AND deletes target files the source has lost."
+            } else {
+                "Copies content the target lacks. Nothing in the target is deleted."
+            };
+            ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
+        });
+    }
+
+    /// Whether the *current* run would delete on-disk data: MOVE always does,
+    /// and SYNC does only when DELETE MISSING is on. Drives the red accent on
+    /// the confirm dialog.
+    fn destructive_run(&self) -> bool {
+        self.command.destructive() || (self.command == Command::Sync && self.sync_delete_missing)
     }
 
     fn action_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
@@ -858,15 +961,21 @@ impl TransferView {
             );
             return;
         }
-        ui.label(
-            RichText::new(format!(
+        let header = if self.command == Command::Sync && self.sync_delete_missing {
+            format!(
+                "{} to copy · {} to delete · showing first {}",
+                self.preview_total,
+                self.sync_delete_total,
+                self.preview.len()
+            )
+        } else {
+            format!(
                 "{} file(s) match · showing first {}",
                 self.preview_total,
                 self.preview.len()
-            ))
-            .color(theme::AMBER)
-            .strong(),
-        );
+            )
+        };
+        ui.label(RichText::new(header).color(theme::AMBER).strong());
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -876,9 +985,16 @@ impl TransferView {
                     .spacing(egui::vec2(12.0, 4.0))
                     .show(ui, |ui| {
                         for row in &self.preview {
-                            ui.label(RichText::new(&row.from).color(theme::TEXT).size(12.0));
-                            ui.label(RichText::new(icon::ARROW_RIGHT).color(theme::ORANGE));
-                            ui.label(RichText::new(&row.to).color(theme::BLUE).size(12.0));
+                            if row.del {
+                                // A SYNC deletion: `target/path → deleted`, in red.
+                                ui.label(RichText::new(&row.from).color(theme::RED).size(12.0));
+                                ui.label(RichText::new(icon::ARROW_RIGHT).color(theme::RED));
+                                ui.label(RichText::new("deleted").color(theme::RED).size(12.0));
+                            } else {
+                                ui.label(RichText::new(&row.from).color(theme::TEXT).size(12.0));
+                                ui.label(RichText::new(icon::ARROW_RIGHT).color(theme::ORANGE));
+                                ui.label(RichText::new(&row.to).color(theme::BLUE).size(12.0));
+                            }
                             ui.end_row();
                         }
                     });
@@ -936,7 +1052,7 @@ impl TransferView {
             ui.colored_label(theme::TEXT, prompt);
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                let fill = if self.command.destructive() {
+                let fill = if self.destructive_run() {
                     theme::RED
                 } else {
                     theme::AMBER
@@ -1003,6 +1119,11 @@ impl TransferView {
             }
             Act::SetCommand(cmd) => {
                 self.command = cmd;
+                // SYNC is repo→repo only; snap the destination back to a repo so
+                // the target row is available (the DEST toggle is hidden).
+                if cmd == Command::Sync {
+                    self.destination = Destination::Repo;
+                }
                 self.clear_preview();
             }
             Act::SetDestination(dest) => {
@@ -1015,6 +1136,10 @@ impl TransferView {
             }
             Act::ToggleInvert => {
                 self.invert = !self.invert;
+                self.clear_preview();
+            }
+            Act::ToggleSyncDelete => {
+                self.sync_delete_missing = !self.sync_delete_missing;
                 self.clear_preview();
             }
             Act::FolderChanged => self.clear_preview(),
@@ -1040,6 +1165,7 @@ impl TransferView {
     fn clear_preview(&mut self) {
         self.preview.clear();
         self.preview_total = 0;
+        self.sync_delete_total = 0;
     }
 
     /// The subdir trimmed of surrounding whitespace and slashes; empty means
@@ -1109,9 +1235,67 @@ impl TransferView {
         };
         // PREVIEW and RUN are mutually exclusive: previewing drops any run log.
         self.reset_run();
+        if self.command == Command::Sync {
+            self.run_preview_sync(store, &source);
+            return;
+        }
         match self.destination {
             Destination::Repo => self.run_preview_repo(store, &source),
             Destination::Folder => self.run_preview_folder(store, &source),
+        }
+    }
+
+    fn run_preview_sync(&mut self, store: &Store, source: &str) {
+        let Some(target) = self.target.clone() else {
+            return;
+        };
+        let filter = self.filter_string();
+        match plan_sync(
+            store,
+            source,
+            &target,
+            true,
+            self.sync_delete_missing,
+            filter.as_deref(),
+        ) {
+            Ok(plan) => {
+                self.preview_total = plan.copies.len();
+                self.sync_delete_total = plan.deletes.len();
+                // Copies first (green-ish `from → to`), then any deletions
+                // (red `path → deleted`), up to the shared preview limit.
+                let mut rows: Vec<PreviewRow> = plan
+                    .copies
+                    .iter()
+                    .take(PREVIEW_LIMIT)
+                    .map(|rel| PreviewRow {
+                        from: format!("{source}/{rel}"),
+                        to: format!("{target}/{rel}"),
+                        del: false,
+                    })
+                    .collect();
+                for rel in plan
+                    .deletes
+                    .iter()
+                    .take(PREVIEW_LIMIT.saturating_sub(rows.len()))
+                {
+                    rows.push(PreviewRow {
+                        from: format!("{target}/{rel}"),
+                        to: String::new(),
+                        del: true,
+                    });
+                }
+                self.preview = rows;
+                self.status = Some(if self.sync_delete_missing {
+                    format!(
+                        "Sync: {} to copy, {} to delete.",
+                        self.preview_total, self.sync_delete_total
+                    )
+                } else {
+                    format!("Sync: {} to copy.", self.preview_total)
+                });
+                self.error = None;
+            }
+            Err(e) => self.error = Some(e.to_string()),
         }
     }
 
@@ -1170,6 +1354,7 @@ impl TransferView {
                     .map(|rel| PreviewRow {
                         from: format!("{source}/{rel}"),
                         to: format!("{folder}/{rel}"),
+                        del: false,
                     })
                     .collect();
                 let what = if self.invert { "redundant" } else { "unique" };
@@ -1196,6 +1381,7 @@ impl TransferView {
                 PreviewRow {
                     from: format!("{source}/{rel_path}"),
                     to,
+                    del: false,
                 }
             }
             // Transfer only previews New items (see `run_preview`); content the
@@ -1204,6 +1390,7 @@ impl TransferView {
                 PreviewRow {
                     from: format!("{source}/{rel_path}"),
                     to: String::new(),
+                    del: false,
                 }
             }
         }
@@ -1240,6 +1427,16 @@ impl TransferView {
                 "Move {} file(s) from '{source}' into '{dest}'? They are removed from the source directory.",
                 self.preview_total
             ),
+            Command::Sync if self.sync_delete_missing => format!(
+                "Sync '{source}' → '{dest}': copy {} file(s) into the target and delete {} \
+                 file(s) from the target. Deletions cannot be undone. The source is not changed.",
+                self.preview_total, self.sync_delete_total
+            ),
+            Command::Sync => format!(
+                "Sync '{source}' → '{dest}': copy {} file(s) into the target. Nothing is \
+                 deleted and the source is not changed.",
+                self.preview_total
+            ),
         })
     }
 
@@ -1248,28 +1445,39 @@ impl TransferView {
             return;
         };
         // Snapshot everything the worker needs before spawning, branching on
-        // where the transfer lands.
-        let dest = match self.destination {
-            Destination::Repo => {
-                let Some(target) = self.target.clone() else {
-                    return;
-                };
-                StartDest::Repo {
-                    references: self.references(&target),
-                    target,
-                    subdir: self.normalized_subdir(),
-                }
+        // where the transfer lands. SYNC is its own destination (repo→repo at
+        // the same relative path), independent of the REPO/FOLDER toggle.
+        let dest = if self.command == Command::Sync {
+            let Some(target) = self.target.clone() else {
+                return;
+            };
+            StartDest::Sync {
+                target,
+                delete_missing: self.sync_delete_missing,
             }
-            Destination::Folder => {
-                let folder = self.folder.trim().to_string();
-                if folder.is_empty() {
-                    return;
+        } else {
+            match self.destination {
+                Destination::Repo => {
+                    let Some(target) = self.target.clone() else {
+                        return;
+                    };
+                    StartDest::Repo {
+                        references: self.references(&target),
+                        target,
+                        subdir: self.normalized_subdir(),
+                    }
                 }
-                StartDest::Folder {
-                    references: self.folder_references(),
-                    dir: PathBuf::from(&folder),
-                    mode: self.folder_mode(),
-                    invert: self.invert,
+                Destination::Folder => {
+                    let folder = self.folder.trim().to_string();
+                    if folder.is_empty() {
+                        return;
+                    }
+                    StartDest::Folder {
+                        references: self.folder_references(),
+                        dir: PathBuf::from(&folder),
+                        mode: self.folder_mode(),
+                        invert: self.invert,
+                    }
                 }
             }
         };
@@ -1290,14 +1498,24 @@ impl TransferView {
         std::thread::spawn(move || {
             let progress = ChannelDiffProgress { tx: tx.clone() };
             let run = DiffRun::new(&progress, &cancel);
-            let stats = match &dest {
+            // Copy/Move (repo or folder) both yield CopyStats → Copied; Sync
+            // yields SyncStats → Synced. Map each to its OpResult in place.
+            let copied_result = |stats: Result<dedup_core::diff::CopyStats, String>| match stats {
+                Ok(s) => OpResult::Copied {
+                    copied: s.copied,
+                    cancelled: s.cancelled,
+                    moved: move_files,
+                },
+                Err(e) => OpResult::Error(e),
+            };
+            let result = match &dest {
                 StartDest::Repo {
                     references,
                     target,
                     subdir,
                 } => {
                     let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
-                    match store.get_repo(target) {
+                    let stats = match store.get_repo(target) {
                         Ok(meta) => {
                             let target_dir = PathBuf::from(meta.abs_path);
                             let subdir = if subdir.is_empty() {
@@ -1320,7 +1538,8 @@ impl TransferView {
                             .map_err(|e| e.to_string())
                         }
                         Err(e) => Err(e.to_string()),
-                    }
+                    };
+                    copied_result(stats)
                 }
                 StartDest::Folder {
                     references,
@@ -1329,7 +1548,7 @@ impl TransferView {
                     invert,
                 } => {
                     let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
-                    export_to_folder(
+                    let stats = export_to_folder(
                         &store,
                         &source,
                         &ref_slice,
@@ -1340,16 +1559,30 @@ impl TransferView {
                         filter.as_deref(),
                         &run,
                     )
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| e.to_string());
+                    copied_result(stats)
                 }
-            };
-            let result = match stats {
-                Ok(s) => OpResult::Copied {
-                    copied: s.copied,
-                    cancelled: s.cancelled,
-                    moved: move_files,
+                StartDest::Sync {
+                    target,
+                    delete_missing,
+                } => match diff_sync(
+                    &store,
+                    &source,
+                    target,
+                    true,
+                    *delete_missing,
+                    filter.as_deref(),
+                    &run,
+                ) {
+                    Ok(s) => OpResult::Synced {
+                        copied: s.copied,
+                        deleted: s.deleted,
+                        skipped: s.skipped,
+                        errors: s.errors,
+                        cancelled: s.cancelled,
+                    },
+                    Err(e) => OpResult::Error(e.to_string()),
                 },
-                Err(e) => OpResult::Error(e),
             };
             let _ = tx.send(Msg::Done(result));
         });
@@ -1441,6 +1674,30 @@ impl TransferView {
                             ));
                             self.error = None;
                         }
+                        OpResult::Synced {
+                            copied,
+                            deleted,
+                            skipped,
+                            errors,
+                            cancelled,
+                        } => {
+                            let mut parts = vec![format!("copied {copied}")];
+                            if deleted > 0 {
+                                parts.push(format!("deleted {deleted}"));
+                            }
+                            if skipped > 0 {
+                                parts.push(format!("skipped {skipped}"));
+                            }
+                            if errors > 0 {
+                                parts.push(format!("errors {errors}"));
+                            }
+                            self.status = Some(format!(
+                                "Sync done: {}{}.",
+                                parts.join(", "),
+                                if cancelled { " (cancelled)" } else { "" }
+                            ));
+                            self.error = None;
+                        }
                         OpResult::Error(e) => self.error = Some(e),
                     }
                 }
@@ -1526,10 +1783,48 @@ mod ui_tests {
         h.run();
         assert!(h.state().command == Command::Move, "2 selects MOVE");
 
+        h.key_press(egui::Key::Num3);
+        h.run();
+        h.run();
+        assert!(h.state().command == Command::Sync, "3 selects SYNC");
+
         h.key_press(egui::Key::Num1);
         h.run();
         h.run();
         assert!(h.state().command == Command::Copy, "1 selects COPY");
+    }
+
+    /// In SYNC mode the DELETE MISSING toggle appears and the copy/move-only
+    /// controls (DEST toggle, INTO subdir, DUPEPOOL) are hidden; the TARGET row
+    /// stays (SYNC is repo→repo).
+    #[test]
+    fn sync_mode_shows_delete_toggle_and_hides_transfer_controls() {
+        let (_tmp, store) = sample_store();
+        let harness = transfer_harness(store, |view| {
+            view.command = Command::Sync;
+            view.target = Some("target".to_string());
+        });
+
+        assert!(
+            harness.query_by_label("DELETE MISSING").is_some(),
+            "SYNC shows the DELETE MISSING toggle"
+        );
+        assert!(
+            harness.query_by_label("TARGET").is_some(),
+            "SYNC still picks a target repo"
+        );
+        assert!(
+            harness.query_by_label("DEST").is_none(),
+            "the REPO/FOLDER destination toggle must be hidden in SYNC mode"
+        );
+        assert!(
+            harness.query_by_label("INTO").is_none(),
+            "the INTO subdir bar must be hidden in SYNC mode"
+        );
+        assert!(
+            harness.query_by_label("DUPEPOOL").is_none(),
+            "SYNC compares source vs the single target, so no DUPEPOOL row"
+        );
     }
 
     /// In FOLDER mode the folder/mode/invert controls appear and the repo-only
@@ -1648,6 +1943,46 @@ mod ui_tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("files_tab.png");
+        let img = harness.render().expect("wgpu render failed");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Render snapshot of the SYNC command (with DELETE MISSING on) to
+    /// `docs/screenshots/transfer_sync.png`, to eyeball the sync bar and hidden
+    /// transfer controls. Run with `--ignored`.
+    #[test]
+    #[ignore = "generates a render snapshot (needs wgpu)"]
+    fn render_transfer_sync() {
+        let (_tmp, store) = sample_store();
+        let mut view = TransferView::new();
+        view.loaded = true;
+        view.repos = vec!["source".to_string(), "target".to_string()];
+        view.source = Some("source".to_string());
+        view.target = Some("target".to_string());
+        view.command = Command::Sync;
+        view.sync_delete_missing = true;
+
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 620.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut TransferView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("transfer_sync.png");
         let img = harness.render().expect("wgpu render failed");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());

@@ -781,7 +781,7 @@ fn run_diff(store: &Store, command: DiffCommands) -> anyhow::Result<()> {
                 copy_new,
                 delete_missing,
                 filter.as_deref(),
-                &cancel,
+                &DiffRun::new(&NoDiffProgress, &cancel),
             )?;
             println!(
                 "copied: {}, equal: {}, skipped: {}, deleted: {}, errors: {}",
