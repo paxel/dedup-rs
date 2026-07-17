@@ -17,7 +17,7 @@ use crossbeam_channel::{Receiver, Sender};
 use dedup_core::store::{RepoStats, Store};
 use dedup_core::update::{CancellationToken, ProgressEvent, check_repo, update_repo};
 use egui::{Align, Color32, Id, Layout, RichText};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -124,6 +124,8 @@ pub struct DedupApp {
     tab: Tab,
     repos: Vec<RepoRow>,
     load_error: Option<String>,
+    /// Transient non-error notice (e.g. a drag-and-drop add summary).
+    notice: Option<String>,
 
     show_add: bool,
     new_name: String,
@@ -173,6 +175,7 @@ impl DedupApp {
             tab: Tab::Repositories,
             repos: Vec::new(),
             load_error: None,
+            notice: None,
             show_add: false,
             new_name: String::new(),
             new_path: String::new(),
@@ -270,8 +273,75 @@ impl DedupApp {
                 }
                 self.repos = rows;
                 self.load_error = None;
+                self.notice = None;
             }
             Err(e) => self.load_error = Some(e.to_string()),
+        }
+    }
+
+    /// Add any folders dropped onto the window as repositories. Non-directory
+    /// drops are ignored; each repo's name is derived from the folder's basename
+    /// and made unique against existing repos and others in the same drop. No-op
+    /// while an update runs (the registry is locked then, like the ADD button).
+    fn handle_dropped_folders(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if dropped.is_empty() {
+            return;
+        }
+        if self.worker.active_count() > 0 {
+            self.load_error = Some(
+                "Can't add repositories while an update is running — try again once it finishes."
+                    .into(),
+            );
+            return;
+        }
+
+        let mut taken: HashSet<String> = self.repos.iter().map(|r| r.name.clone()).collect();
+        let mut added: Vec<String> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut non_dirs = 0usize;
+        for path in dropped {
+            if !path.is_dir() {
+                non_dirs += 1;
+                continue;
+            }
+            let name = unique_repo_name(&sanitize_repo_name(&path), &taken);
+            match self.store.create_repo(&name, &path.to_string_lossy()) {
+                Ok(()) => {
+                    taken.insert(name.clone());
+                    added.push(name);
+                }
+                Err(e) => errors.push(format!("{}: {e}", path.display())),
+            }
+        }
+
+        if !added.is_empty() {
+            self.reload_all();
+            self.refresh_status(ctx);
+            self.tab = Tab::Repositories; // show the result of the drop
+            self.load_error = None;
+            self.notice = Some(format!(
+                "Added {} repositor{}: {}",
+                added.len(),
+                if added.len() == 1 { "y" } else { "ies" },
+                added.join(", "),
+            ));
+        }
+        let mut problems: Vec<String> = Vec::new();
+        if non_dirs > 0 {
+            problems.push(format!(
+                "ignored {non_dirs} dropped item(s) that weren't folders"
+            ));
+        }
+        problems.extend(errors);
+        if !problems.is_empty() {
+            self.load_error = Some(problems.join("; "));
         }
     }
 
@@ -591,6 +661,25 @@ impl eframe::App for DedupApp {
             ctx.request_repaint();
         }
 
+        // Folders dropped onto the window are added as repositories.
+        self.handle_dropped_folders(&ctx);
+        // While folders hover the window, show a full-window drop affordance.
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let screen = ctx.content_rect();
+            let p = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("dnd-hint"),
+            ));
+            p.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(190));
+            p.text(
+                screen.center(),
+                egui::Align2::CENTER_CENTER,
+                "Drop folders to add them as repositories",
+                egui::FontId::proportional(22.0),
+                theme::AMBER,
+            );
+        }
+
         let mut actions: Vec<Action> = Vec::new();
         self.top_bar(ui);
         // Audio preview belongs to the Duplicates tab; stop it elsewhere.
@@ -774,6 +863,9 @@ impl DedupApp {
 
         if let Some(err) = &self.load_error {
             ui.colored_label(theme::RED, err);
+        }
+        if let Some(notice) = &self.notice {
+            ui.colored_label(theme::AMBER, notice);
         }
 
         // The registry is locked while any repo is updating, so adding a repo
@@ -1824,6 +1916,45 @@ fn effective_name(name: &str, path: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Derive a filesystem-safe repository name from a folder path's basename (the
+/// name becomes a directory under the config dir). Path separators and control
+/// characters are replaced with `_`; an empty result falls back to `repo`.
+fn sanitize_repo_name(path: &std::path::Path) -> String {
+    let base = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let cleaned: String = base
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '/' | '\\') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim().to_string();
+    if cleaned.is_empty() {
+        "repo".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Return `base` if it isn't already `taken`, else the first `base-2`, `base-3`,
+/// … that is free — so a batch of dropped folders with clashing names (or names
+/// clashing with existing repos) all get distinct repositories.
+fn unique_repo_name(base: &str, taken: &HashSet<String>) -> String {
+    if !taken.contains(base) {
+        return base.to_string();
+    }
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|c| !taken.contains(c))
+        .expect("an unbounded range always yields a free name")
+}
+
 /// Format a duration compactly: `"45s"`, `"3m 12s"`, or `"1h 04m"`.
 fn format_elapsed(d: Duration) -> String {
     let secs = d.as_secs();
@@ -1849,7 +1980,32 @@ fn progress_line(event: &ProgressEvent) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::effective_name;
+    use super::{effective_name, sanitize_repo_name, unique_repo_name};
+    use std::collections::HashSet;
+    use std::path::Path;
+
+    #[test]
+    fn sanitize_repo_name_from_folder_basename() {
+        assert_eq!(
+            sanitize_repo_name(Path::new("/data/Holiday 2019")),
+            "Holiday 2019"
+        );
+        // Hidden folders keep their leading dot (a valid dir name).
+        assert_eq!(sanitize_repo_name(Path::new("/home/x/.config")), ".config");
+        // A path with no basename falls back.
+        assert_eq!(sanitize_repo_name(Path::new("/")), "repo");
+    }
+
+    #[test]
+    fn unique_repo_name_suffixes_on_clash() {
+        let taken: HashSet<String> = ["photos".to_string(), "photos-2".to_string()]
+            .into_iter()
+            .collect();
+        // Free name is used as-is.
+        assert_eq!(unique_repo_name("docs", &taken), "docs");
+        // Clash skips past every taken suffix.
+        assert_eq!(unique_repo_name("photos", &taken), "photos-3");
+    }
 
     #[test]
     fn effective_name_prefers_typed_name() {

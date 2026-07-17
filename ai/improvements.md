@@ -314,9 +314,14 @@ everywhere.
   after a successful relocate it drops the row's carried-over `Location` and re-probes
   location/reachability against the new path (→ Local/Remote if the folder is now reachable,
   or back to Missing if the new path is also bad). *(Repo-level status, not per-file flags.)*
-- **Drag-and-drop add repositories** — drop one or more folders onto the app to add them as
-  repos in one gesture; derive valid repo names from the folder names, unifying/de-duping
-  names where needed.
+- ✅ **Drag-and-drop add repositories** — resolved 2026-07-17. Dropping one or more folders
+  onto the window adds each as a repo in one gesture: names are derived from the folder
+  basename (`sanitize_repo_name`, filesystem-safe) and made unique against existing repos +
+  others in the same drop (`unique_repo_name` → `name-2`, `name-3`, …). Non-folder drops are
+  ignored; the view switches to Repositories with an "Added N repositories: …" notice (errors
+  surfaced too). A full-window "Drop folders to add them as repositories" hint appears while
+  folders hover. Blocked during an active update (registry locked, like the ADD button).
+  Unit-tested (name sanitizing + de-dupe).
 - **`prune` command (from the old Java tool)** — remove deleted (missing) files from the DB
   and clean up / compact the index files. *Open question:* still needed with redb, or does
   compaction/`mark_missing` already cover it? Verify before building.
