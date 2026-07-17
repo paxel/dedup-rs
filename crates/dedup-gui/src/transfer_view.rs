@@ -16,8 +16,8 @@ use crate::theme;
 use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::diff::{
-    CopyDest, DiffAction, DiffEvent, DiffItem, DiffProgress, DiffRun, FolderMode, diff_copy,
-    diff_print, diff_sync, export_to_folder, plan_folder_export, plan_sync,
+    CopyDest, DiffAction, DiffEvent, DiffItem, DiffProgress, DiffRun, FolderMode, SyncDelete,
+    diff_copy, diff_print, diff_sync, export_to_folder, plan_folder_export, plan_sync,
 };
 use dedup_core::store::Store;
 use dedup_core::update::CancellationToken;
@@ -35,6 +35,7 @@ enum Command {
     Copy,
     Move,
     Sync,
+    Mirror,
 }
 
 impl Command {
@@ -43,14 +44,20 @@ impl Command {
             Command::Copy => "COPY",
             Command::Move => "MOVE",
             Command::Sync => "SYNC",
+            Command::Mirror => "MIRROR",
         }
     }
     /// Whether the command is inherently destructive to on-disk data by itself.
     /// SYNC is additive by default (it only *copies* into the target); its
     /// optional DELETE MISSING toggle makes a given run destructive — see
-    /// [`TransferView::destructive_run`].
+    /// [`TransferView::destructive_run`]. MIRROR always deletes.
     fn destructive(self) -> bool {
-        matches!(self, Command::Move)
+        matches!(self, Command::Move | Command::Mirror)
+    }
+    /// Whether the command runs repo→repo at the same relative path (SYNC /
+    /// MIRROR), which hides the DEST / subdir / folder / dupe-pool controls.
+    fn repo_to_repo(self) -> bool {
+        matches!(self, Command::Sync | Command::Mirror)
     }
     /// (short, verbose) tooltip text for this command's selector button.
     fn tooltip(self) -> (&'static str, &'static str) {
@@ -68,10 +75,16 @@ impl Command {
                  source entries missing.",
             ),
             Command::Sync => (
-                "Make the target mirror the source",
+                "Copy the source into the target",
                 "Copy source content the target lacks into the target at the same \
                  relative path. Turn on DELETE MISSING to also delete target files \
                  whose content the source has since lost. The source is never changed.",
+            ),
+            Command::Mirror => (
+                "Make the target an exact copy of the source",
+                "Copy source content the target lacks AND delete everything in the target \
+                 the source does not have, so the target ends up holding exactly the \
+                 source's content. Deletions cannot be undone. The source is never changed.",
             ),
         }
     }
@@ -128,7 +141,8 @@ enum StartDest {
     },
     Sync {
         target: String,
-        delete_missing: bool,
+        delete: SyncDelete,
+        mirror: bool,
     },
 }
 
@@ -144,6 +158,8 @@ enum OpResult {
         skipped: u64,
         errors: u64,
         cancelled: bool,
+        /// True for a MIRROR run (labels the status line), false for SYNC.
+        mirror: bool,
     },
     Error(String),
 }
@@ -318,6 +334,9 @@ impl TransferView {
                 if i.key_pressed(egui::Key::Num3) {
                     acts.push(Act::SetCommand(Command::Sync));
                 }
+                if i.key_pressed(egui::Key::Num4) {
+                    acts.push(Act::SetCommand(Command::Mirror));
+                }
                 if i.key_pressed(egui::Key::P) {
                     acts.push(Act::Preview);
                 }
@@ -334,21 +353,27 @@ impl TransferView {
                 .size(18.0)
                 .strong(),
         );
-        crate::util::shortcut_bar(ui, "1 copy · 2 move · 3 sync · P preview · R run");
+        crate::util::shortcut_bar(
+            ui,
+            "1 copy · 2 move · 3 sync · 4 mirror · P preview · R run",
+        );
 
         self.repo_rows(ui, &mut acts);
         self.command_bar(ui, &mut acts);
-        // SYNC is always repo→repo at the same relative path, so it hides the
-        // DEST/subdir/folder controls and shows its own DELETE MISSING toggle.
-        if self.command == Command::Sync {
-            self.sync_bar(ui, &mut acts);
-        } else {
-            self.dest_bar(ui, &mut acts);
-            match self.destination {
-                Destination::Repo => self.subdir_bar(ui, &mut acts),
-                Destination::Folder => {
-                    self.folder_bar(ui, &mut acts);
-                    self.mode_bar(ui, &mut acts);
+        // SYNC/MIRROR are always repo→repo at the same relative path, so they
+        // hide the DEST/subdir/folder controls: SYNC shows its DELETE MISSING
+        // toggle; MIRROR shows a warning (it always deletes).
+        match self.command {
+            Command::Sync => self.sync_bar(ui, &mut acts),
+            Command::Mirror => self.mirror_bar(ui),
+            _ => {
+                self.dest_bar(ui, &mut acts);
+                match self.destination {
+                    Destination::Repo => self.subdir_bar(ui, &mut acts),
+                    Destination::Folder => {
+                        self.folder_bar(ui, &mut acts);
+                        self.mode_bar(ui, &mut acts);
+                    }
                 }
             }
         }
@@ -481,7 +506,7 @@ impl TransferView {
             // "already known" and never re-copied. In REPO mode the target is
             // always a reference and is shown as a locked chip. SYNC compares
             // source against the single target only, so it has no dupe pool.
-            if self.command != Command::Sync {
+            if !self.command.repo_to_repo() {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("DUPEPOOL").color(theme::TEXT).size(12.0));
                     if self.destination == Destination::Repo
@@ -585,7 +610,7 @@ impl TransferView {
         theme::section(theme::ORANGE).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("COMMAND").color(theme::TEXT).size(12.0));
-                for cmd in [Command::Copy, Command::Move, Command::Sync] {
+                for cmd in [Command::Copy, Command::Move, Command::Sync, Command::Mirror] {
                     let sel = self.command == cmd;
                     let accent = if cmd.destructive() {
                         theme::RED
@@ -816,11 +841,51 @@ impl TransferView {
                  (they are removed from the source directory)."
             }
             Command::Sync => {
-                "Make the target mirror the source: copy content it lacks (same relative \
+                "Copy the source into the target: copy content it lacks (same relative \
                  path); optionally delete target files the source has lost."
+            }
+            Command::Mirror => {
+                "Make the target an exact copy of the source: copy what it lacks and delete \
+                 everything the source does not have."
             }
         };
         ui.label(RichText::new(text).color(theme::LILAC).size(11.0));
+    }
+
+    /// MIRROR's info bar: no toggle (it always deletes), just a red warning that
+    /// it removes everything in the target the source lacks.
+    fn mirror_bar(&self, ui: &mut egui::Ui) {
+        theme::section(theme::RED).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(icon::TRASH).color(theme::RED).size(12.0));
+                ui.label(
+                    RichText::new("DELETES EXTRAS")
+                        .color(theme::RED)
+                        .size(12.0)
+                        .strong(),
+                );
+            });
+            ui.label(
+                RichText::new(
+                    "Everything in the target whose content the source does not have is \
+                     deleted, so the target ends up holding exactly the source's content. \
+                     Deletions cannot be undone.",
+                )
+                .color(theme::LILAC)
+                .size(11.0),
+            );
+        });
+    }
+
+    /// The delete policy the current command runs with: MIRROR always deletes
+    /// everything the source lacks; SYNC deletes the source's own lost content
+    /// only when DELETE MISSING is on; COPY/MOVE never reach here.
+    fn sync_delete_mode(&self) -> SyncDelete {
+        match self.command {
+            Command::Mirror => SyncDelete::Absent,
+            Command::Sync if self.sync_delete_missing => SyncDelete::Missing,
+            _ => SyncDelete::None,
+        }
     }
 
     /// SYNC's option bar: the DELETE MISSING toggle (off by default). SYNC has
@@ -864,9 +929,9 @@ impl TransferView {
         });
     }
 
-    /// Whether the *current* run would delete on-disk data: MOVE always does,
-    /// and SYNC does only when DELETE MISSING is on. Drives the red accent on
-    /// the confirm dialog.
+    /// Whether the *current* run would delete on-disk data: MOVE and MIRROR
+    /// always do, and SYNC does only when DELETE MISSING is on. Drives the red
+    /// accent on the confirm dialog.
     fn destructive_run(&self) -> bool {
         self.command.destructive() || (self.command == Command::Sync && self.sync_delete_missing)
     }
@@ -961,7 +1026,7 @@ impl TransferView {
             );
             return;
         }
-        let header = if self.command == Command::Sync && self.sync_delete_missing {
+        let header = if self.command.repo_to_repo() && self.sync_delete_mode() != SyncDelete::None {
             format!(
                 "{} to copy · {} to delete · showing first {}",
                 self.preview_total,
@@ -1119,9 +1184,9 @@ impl TransferView {
             }
             Act::SetCommand(cmd) => {
                 self.command = cmd;
-                // SYNC is repo→repo only; snap the destination back to a repo so
-                // the target row is available (the DEST toggle is hidden).
-                if cmd == Command::Sync {
+                // SYNC/MIRROR are repo→repo only; snap the destination back to a
+                // repo so the target row is available (the DEST toggle is hidden).
+                if cmd.repo_to_repo() {
                     self.destination = Destination::Repo;
                 }
                 self.clear_preview();
@@ -1235,7 +1300,7 @@ impl TransferView {
         };
         // PREVIEW and RUN are mutually exclusive: previewing drops any run log.
         self.reset_run();
-        if self.command == Command::Sync {
+        if self.command.repo_to_repo() {
             self.run_preview_sync(store, &source);
             return;
         }
@@ -1250,14 +1315,8 @@ impl TransferView {
             return;
         };
         let filter = self.filter_string();
-        match plan_sync(
-            store,
-            source,
-            &target,
-            true,
-            self.sync_delete_missing,
-            filter.as_deref(),
-        ) {
+        let delete = self.sync_delete_mode();
+        match plan_sync(store, source, &target, true, delete, filter.as_deref()) {
             Ok(plan) => {
                 self.preview_total = plan.copies.len();
                 self.sync_delete_total = plan.deletes.len();
@@ -1285,13 +1344,14 @@ impl TransferView {
                     });
                 }
                 self.preview = rows;
-                self.status = Some(if self.sync_delete_missing {
+                let verb = self.command.label();
+                self.status = Some(if delete == SyncDelete::None {
+                    format!("{verb}: {} to copy.", self.preview_total)
+                } else {
                     format!(
-                        "Sync: {} to copy, {} to delete.",
+                        "{verb}: {} to copy, {} to delete.",
                         self.preview_total, self.sync_delete_total
                     )
-                } else {
-                    format!("Sync: {} to copy.", self.preview_total)
                 });
                 self.error = None;
             }
@@ -1437,6 +1497,12 @@ impl TransferView {
                  deleted and the source is not changed.",
                 self.preview_total
             ),
+            Command::Mirror => format!(
+                "Mirror '{source}' → '{dest}': copy {} file(s) into the target and DELETE {} \
+                 file(s) the source does not have, so the target ends up holding exactly the \
+                 source's content. Deletions cannot be undone. The source is not changed.",
+                self.preview_total, self.sync_delete_total
+            ),
         })
     }
 
@@ -1445,15 +1511,16 @@ impl TransferView {
             return;
         };
         // Snapshot everything the worker needs before spawning, branching on
-        // where the transfer lands. SYNC is its own destination (repo→repo at
-        // the same relative path), independent of the REPO/FOLDER toggle.
-        let dest = if self.command == Command::Sync {
+        // where the transfer lands. SYNC/MIRROR are their own destination
+        // (repo→repo at the same relative path), independent of REPO/FOLDER.
+        let dest = if self.command.repo_to_repo() {
             let Some(target) = self.target.clone() else {
                 return;
             };
             StartDest::Sync {
                 target,
-                delete_missing: self.sync_delete_missing,
+                delete: self.sync_delete_mode(),
+                mirror: self.command == Command::Mirror,
             }
         } else {
             match self.destination {
@@ -1564,13 +1631,14 @@ impl TransferView {
                 }
                 StartDest::Sync {
                     target,
-                    delete_missing,
+                    delete,
+                    mirror,
                 } => match diff_sync(
                     &store,
                     &source,
                     target,
                     true,
-                    *delete_missing,
+                    *delete,
                     filter.as_deref(),
                     &run,
                 ) {
@@ -1580,6 +1648,7 @@ impl TransferView {
                         skipped: s.skipped,
                         errors: s.errors,
                         cancelled: s.cancelled,
+                        mirror: *mirror,
                     },
                     Err(e) => OpResult::Error(e.to_string()),
                 },
@@ -1680,6 +1749,7 @@ impl TransferView {
                             skipped,
                             errors,
                             cancelled,
+                            mirror,
                         } => {
                             let mut parts = vec![format!("copied {copied}")];
                             if deleted > 0 {
@@ -1691,8 +1761,9 @@ impl TransferView {
                             if errors > 0 {
                                 parts.push(format!("errors {errors}"));
                             }
+                            let verb = if mirror { "Mirror" } else { "Sync" };
                             self.status = Some(format!(
-                                "Sync done: {}{}.",
+                                "{verb} done: {}{}.",
                                 parts.join(", "),
                                 if cancelled { " (cancelled)" } else { "" }
                             ));
@@ -1788,10 +1859,48 @@ mod ui_tests {
         h.run();
         assert!(h.state().command == Command::Sync, "3 selects SYNC");
 
+        h.key_press(egui::Key::Num4);
+        h.run();
+        h.run();
+        assert!(h.state().command == Command::Mirror, "4 selects MIRROR");
+
         h.key_press(egui::Key::Num1);
         h.run();
         h.run();
         assert!(h.state().command == Command::Copy, "1 selects COPY");
+    }
+
+    /// MIRROR hides the DELETE MISSING toggle (it always deletes) and the
+    /// copy/move-only controls, keeps the TARGET row, and warns via DELETES
+    /// EXTRAS.
+    #[test]
+    fn mirror_mode_shows_warning_and_hides_toggles() {
+        let (_tmp, store) = sample_store();
+        let harness = transfer_harness(store, |view| {
+            view.command = Command::Mirror;
+            view.target = Some("target".to_string());
+        });
+
+        assert!(
+            harness.query_by_label("DELETES EXTRAS").is_some(),
+            "MIRROR shows the DELETES EXTRAS warning"
+        );
+        assert!(
+            harness.query_by_label("DELETE MISSING").is_none(),
+            "MIRROR has no DELETE MISSING toggle (it always deletes)"
+        );
+        assert!(
+            harness.query_by_label("TARGET").is_some(),
+            "MIRROR still picks a target repo"
+        );
+        assert!(
+            harness.query_by_label("DEST").is_none(),
+            "the REPO/FOLDER toggle must be hidden in MIRROR mode"
+        );
+        assert!(
+            harness.query_by_label("DUPEPOOL").is_none(),
+            "MIRROR compares source vs the single target, so no DUPEPOOL row"
+        );
     }
 
     /// In SYNC mode the DELETE MISSING toggle appears and the copy/move-only
@@ -1983,6 +2092,45 @@ mod ui_tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("transfer_sync.png");
+        let img = harness.render().expect("wgpu render failed");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Render snapshot of the MIRROR command to
+    /// `docs/screenshots/transfer_mirror.png`, to eyeball the red DELETES
+    /// EXTRAS warning and hidden toggles. Run with `--ignored`.
+    #[test]
+    #[ignore = "generates a render snapshot (needs wgpu)"]
+    fn render_transfer_mirror() {
+        let (_tmp, store) = sample_store();
+        let mut view = TransferView::new();
+        view.loaded = true;
+        view.repos = vec!["source".to_string(), "target".to_string()];
+        view.source = Some("source".to_string());
+        view.target = Some("target".to_string());
+        view.command = Command::Mirror;
+
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 620.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut TransferView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("transfer_mirror.png");
         let img = harness.render().expect("wgpu render failed");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());

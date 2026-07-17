@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use dedup_core::diff::{
-    CopyDest, DiffItem, DiffRun, NoDiffProgress, diff_copy, diff_delete, diff_print, diff_sync,
+    CopyDest, DiffItem, DiffRun, NoDiffProgress, SyncDelete, diff_copy, diff_delete, diff_print,
+    diff_sync,
 };
 use dedup_core::dupes::{DupeGroup, delete_duplicates, find_exact_duplicates, wasted_bytes};
 use dedup_core::similar::find_similar;
@@ -166,10 +167,11 @@ enum DiffCommands {
         /// Copy contents that exist in A but not in B
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         copy_new: bool,
-        /// Delete in B contents that A marks as missing
+        /// Delete in B contents that A marks as missing (propagate A's deletions)
         #[arg(long)]
         delete_missing: bool,
-        /// Equivalent to --copy-new true --delete-missing
+        /// Make B a content-mirror of A: also delete B contents A does not have
+        /// (implies --copy-new; overrides --delete-missing)
         #[arg(long)]
         mirror: bool,
         /// Filter: mime:<substring>, name:<substring>, or size:<expr>
@@ -769,17 +771,22 @@ fn run_diff(store: &Store, command: DiffCommands) -> anyhow::Result<()> {
             mirror,
             filter,
         } => {
-            let (copy_new, delete_missing) = if mirror {
-                (true, true)
+            // --mirror is a true content-mirror (delete anything B has that A
+            // lacks) and forces the copy on; otherwise --delete-missing only
+            // propagates A's own deletions.
+            let (copy_new, delete) = if mirror {
+                (true, SyncDelete::Absent)
+            } else if delete_missing {
+                (copy_new, SyncDelete::Missing)
             } else {
-                (copy_new, delete_missing)
+                (copy_new, SyncDelete::None)
             };
             let stats = diff_sync(
                 store,
                 &source,
                 &target,
                 copy_new,
-                delete_missing,
+                delete,
                 filter.as_deref(),
                 &DiffRun::new(&NoDiffProgress, &cancel),
             )?;

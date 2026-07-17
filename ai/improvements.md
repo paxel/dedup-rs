@@ -307,22 +307,38 @@ everywhere.
   **SYNC** command (`3` from the keyboard) that mirrors the source into the target repo at
   the same relative path: it copies content the target lacks and, with an opt-in **DELETE
   MISSING** toggle, deletes target files whose content the source has since lost. The core
-  `diff_sync` (already CLI-wired) was reused as-is — the GUI does **not** delete arbitrary
-  target files absent from the source; "delete" means *propagate the source's own
-  deletions*, matching the CLI's `--delete-missing`. *(Scope decided with the user: reuse
-  core semantics rather than build a true rsync-style mirror; DELETE MISSING defaults off so
-  SYNC is additive unless asked.)* SYNC is repo→repo only, so it hides the DEST/subdir/
-  folder/DUPEPOOL controls and shows its own OPTIONS bar. To match COPY/MOVE's live run
-  panel, `diff_sync` now emits per-file `DiffEvent` progress via `DiffRun` (one step per
-  acting entry; `done ≤ total`); a new `plan_sync` backs the preview/confirm counts without
-  touching disk. Tests: core `plan_sync_lists_copies_and_deletes` +
+  `diff_sync` (already CLI-wired) was reused as-is — SYNC itself does **not** delete arbitrary
+  target files absent from the source; its "delete" means *propagate the source's own
+  deletions*, matching the CLI's `--delete-missing`. *(Scope decided with the user: SYNC
+  reuses core semantics; DELETE MISSING defaults off so SYNC is additive unless asked. A true
+  content-mirror shipped separately as the **MIRROR** command below.)* SYNC is repo→repo only,
+  so it hides the DEST/subdir/folder/DUPEPOOL controls and shows its own OPTIONS bar. To match
+  COPY/MOVE's live run panel, `diff_sync` now emits per-file `DiffEvent` progress via `DiffRun`
+  (one step per acting entry; `done ≤ total`); a new `plan_sync` backs the preview/confirm
+  counts without touching disk. Tests: core `plan_sync_lists_copies_and_deletes` +
   `sync_emits_progress_for_copies_and_deletes`, GUI
   `sync_mode_shows_delete_toggle_and_hides_transfer_controls` (+ extended `number_keys`),
   and `--ignored` `render_transfer_sync`.
-- ✅ **Confirm/preview step for copy / move / sync** — resolved 2026-07-17. All three
-  commands share the PREVIEW grid (first `from → to` rows; SYNC also lists red `path →
+- ✅ **Transfer `mirror` command** — resolved 2026-07-17. A fourth **MIRROR** command (`4`)
+  makes the target an exact **content-mirror** of the source: it copies content the target
+  lacks and **deletes everything in the target the source does not have**, so the target ends
+  up holding exactly the source's content. Implemented by generalising `diff_sync`'s delete
+  bool into a `SyncDelete` enum `{ None, Missing, Absent }`; MIRROR uses `Absent`. The mirror
+  **deletes first, then copies**, so a copy can reclaim a path a delete frees (target holds
+  *different* content at a source path → the path ends up with the source's content). It is a
+  mirror by **content**: identical content already in the target at a *different* path is kept,
+  not relocated (consistent with the app's content-based model — paths never matter for
+  existence). MIRROR is always destructive (red pill, no toggle, a red "DELETES EXTRAS"
+  warning bar) and repo→repo like SYNC. The CLI `--mirror` flag now means this true mirror
+  (was copy + delete-missing). Tests: core `mirror_deletes_target_content_absent_from_source`,
+  `mirror_deletes_first_so_a_copy_reclaims_the_freed_path`, `plan_sync_absent_lists_mirror_deletes`;
+  GUI `mirror_mode_shows_warning_and_hides_toggles` (+ extended `number_keys`) and `--ignored`
+  `render_transfer_mirror`.
+- ✅ **Confirm/preview step for copy / move / sync / mirror** — resolved 2026-07-17. All
+  commands share the PREVIEW grid (first `from → to` rows; SYNC/MIRROR also list red `path →
   deleted` rows) and a CONFIRM modal that states the counts before running ("copy X … / copy
-  X and delete Y …"); the SYNC modal's PROCEED turns red only when DELETE MISSING is on.
+  X and delete Y …"); PROCEED turns red whenever the run would delete (MOVE, MIRROR, or SYNC
+  with DELETE MISSING on).
 - ✅ **Repo relocate: folder picker** — resolved 2026-07-17. The inline relocate editor now
   has a **CHOOSE…** button opening the native folder picker (reusing the add-form's threaded
   `rfd` flow, routed by a new `FolderTarget` so the result lands in the relocate buffer). The
