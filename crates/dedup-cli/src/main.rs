@@ -825,7 +825,7 @@ fn dupes(
     let groups: Vec<DupeGroup> = match threshold {
         Some(t) if t > 0 => {
             println!("Similarity search (threshold: {}%)", t);
-            find_similar(store, &names, f64::from(t))?
+            find_similar(store, &names, f64::from(t), None)?
         }
         _ => find_exact_duplicates(store, &names)?,
     };

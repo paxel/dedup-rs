@@ -301,8 +301,21 @@ everywhere.
 
 ### Features
 
-- **Shared FILTER on the Duplicates tab** — the common filter wizard (used by
-  Transfer/Grooming/Browse) would make sense on the duplicates view too.
+- ✅ **Shared FILTER on the Duplicates tab** — resolved 2026-07-18. The Duplicates view now
+  hosts the shared `filter_ui::FilterBuilder` (same widget as Transfer/Grooming/Browse),
+  sitting between the REPOS bar and the MODE/FIND controls; the first included repo backs its
+  MIME/TAG pick-lists. *(Semantics decided with the user: **keep whole groups that contain a
+  match** — FIND finds all duplicate groups, then keeps any group with ≥1 member matching the
+  filter and shows **all** its copies. So `tag:important` surfaces the dupes involving tagged
+  files, other copies included.)* Core: `find_similar` gained a `filter: Option<&FileFilter>`
+  (retains matching groups in memory); a new `dupes::retain_matching_keys` filters the exact
+  **plan keys** by streaming each key's members (short-circuit on first match), so the
+  memory-light paged exact path is preserved — no filtering is done when the expression is
+  empty. `find_exact_duplicates` is unchanged (its CLI/folder-export callers don't filter).
+  The GUI parses the expression once up front (surfacing a bad filter immediately) and threads
+  it into the background FIND. Tests: core `retain_matching_keys_keeps_whole_group_when_any_member_matches`
+  and the `find_similar` filter assertions in `similar_repo`; GUI `filter_wizard_is_present`
+  and `find_applies_the_filter` (drives FIND with `name:g0_`, 5 groups → 1).
 - ✅ **Transfer `sync` command** — resolved 2026-07-17. The Transfer tab gained a third
   **SYNC** command (`3` from the keyboard) that mirrors the source into the target repo at
   the same relative path: it copies content the target lacks and, with an opt-in **DELETE

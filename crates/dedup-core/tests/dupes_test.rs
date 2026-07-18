@@ -2,7 +2,11 @@
 //! scenarios from the legacy `DuplicateRepoProcessTest` (sorting, deletion,
 //! cross-repo grouping). Similarity search is Phase 4 and not covered here.
 
-use dedup_core::dupes::{delete_duplicates, find_exact_duplicates, wasted_bytes};
+use dedup_core::dupes::{
+    delete_duplicates, find_exact_duplicates, load_groups, plan_exact_duplicates,
+    retain_matching_keys, wasted_bytes,
+};
+use dedup_core::filter::FileFilter;
 use dedup_core::store::{FileEntry, Store};
 use dedup_core::update::{CancellationToken, NoProgress, update_repo};
 use std::path::Path;
@@ -62,6 +66,47 @@ fn sorts_groups_by_wasted_bytes_and_files_by_area_time_path() -> TestResult {
 
     let paths: Vec<&str> = groups[1].iter().map(|f| f.rel_path.as_str()).collect();
     assert_eq!(paths, ["g1_f1.jpg", "g1_f2.jpg"]);
+    Ok(())
+}
+
+#[test]
+fn retain_matching_keys_keeps_whole_group_when_any_member_matches() -> TestResult {
+    let tempdir = tempfile::tempdir()?;
+    let store = Store::open_at(tempdir.path().join("config"))?;
+    setup_repo(&store, tempdir.path(), "repo")?;
+
+    // Group A (hash 1): one copy's path contains "2020", one does not.
+    store.update_file_entry("repo", "photos/2020/a.jpg", &entry(100, 1, 1000, None))?;
+    store.update_file_entry("repo", "misc/a-copy.jpg", &entry(100, 1, 2000, None))?;
+    // Group B (hash 2): no copy matches "2020".
+    store.update_file_entry("repo", "docs/b.txt", &entry(50, 2, 1000, None))?;
+    store.update_file_entry("repo", "docs/b-copy.txt", &entry(50, 2, 2000, None))?;
+
+    let names = vec!["repo".to_string()];
+    let plan = plan_exact_duplicates(&store, &names, |_| {})?;
+    assert_eq!(plan.len(), 2, "two exact-duplicate groups before filtering");
+
+    // Option B: a group is kept if ANY member matches, and ALL its copies show.
+    let filter = FileFilter::parse(Some("name:2020")).unwrap();
+    let kept = retain_matching_keys(&store, &names, plan, Some(&filter), |_| {})?;
+    let groups = load_groups(&store, &names, &kept)?;
+    assert_eq!(
+        groups.len(),
+        1,
+        "only the group with a matching member is kept"
+    );
+    let mut paths: Vec<&str> = groups[0].iter().map(|f| f.rel_path.as_str()).collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        ["misc/a-copy.jpg", "photos/2020/a.jpg"],
+        "the whole group is shown, including the non-matching copy"
+    );
+
+    // No filter → the plan is returned unchanged.
+    let plan2 = plan_exact_duplicates(&store, &names, |_| {})?;
+    let all = retain_matching_keys(&store, &names, plan2, None, |_| {})?;
+    assert_eq!(all.len(), 2, "None returns every group key");
     Ok(())
 }
 

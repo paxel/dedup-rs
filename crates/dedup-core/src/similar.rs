@@ -13,6 +13,7 @@
 //! Video/audio/PDF populations are small, so those group by direct scan.
 
 use crate::dupes::{DupeFile, DupeGroup, sort_groups};
+use crate::filter::{AnnotatedFilter, FileFilter};
 use crate::store::{self, FileEntry, ImgHash, Store, StoreError};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -242,6 +243,7 @@ pub fn find_similar(
     store: &Store,
     repo_names: &[String],
     threshold: f64,
+    filter: Option<&FileFilter>,
 ) -> Result<Vec<DupeGroup>, StoreError> {
     let staged = stage(store, repo_names)?;
 
@@ -269,6 +271,23 @@ pub fn find_similar(
         a.key.1 == b.key.1 && a.key.0.abs_diff(b.key.0) <= AUDIO_DURATION_TOLERANCE_MS
     });
     groups.extend(materialize(&dbs, &staged, &staged.audios, audio_groups)?);
+
+    // Keep only groups with at least one member matching the filter (a whole
+    // group is shown when any copy matches). Annotations are per repo, so build
+    // one matcher per repo and route each member to its repo's matcher.
+    if let Some(filter) = filter {
+        let mut matchers: HashMap<&str, AnnotatedFilter> = HashMap::with_capacity(dbs.len());
+        for (name, db) in staged.names.iter().zip(dbs.iter()) {
+            matchers.insert(name.as_str(), AnnotatedFilter::new(db, filter)?);
+        }
+        groups.retain(|group| {
+            group.iter().any(|f| {
+                matchers
+                    .get(f.repo.as_str())
+                    .is_some_and(|m| m.matches(&f.rel_path, &f.entry))
+            })
+        });
+    }
 
     sort_groups(&mut groups);
     Ok(groups)

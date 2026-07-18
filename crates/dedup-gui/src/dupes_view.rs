@@ -2,6 +2,7 @@
 //! duplicates or perceptual similars, review paged groups with thumbnails, and
 //! delete the worse copies — batched per repo, never without a confirmation.
 
+use crate::filter_ui::FilterBuilder;
 use crate::icon;
 use crate::id3tags::{self, Tags};
 use crate::imgedit::{self, Orient};
@@ -15,8 +16,9 @@ use crate::waveform::WaveCache;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::dupes::{
     DupeDeleteStats, DupeFile, DupeGroup, DupeGroupKey, delete_paths, load_groups,
-    plan_exact_duplicates, wasted_bytes,
+    plan_exact_duplicates, retain_matching_keys, wasted_bytes,
 };
+use dedup_core::filter::FileFilter;
 use dedup_core::similar::find_similar;
 use dedup_core::store::Store;
 use dedup_core::thumbnail::hash_hex;
@@ -339,6 +341,9 @@ pub struct DupesView {
     /// Tooltip wording for this frame, set at the top of [`Self::show`] from
     /// the app-wide setting (not persisted here; `app.rs` owns that).
     verbosity: TooltipVerbosity,
+    /// The shared FILTER wizard: FIND keeps only groups with at least one member
+    /// matching this (the same widget used by Transfer/Grooming/Browse).
+    filter: FilterBuilder,
 }
 
 /// A pending rotate/flip edit of the lightbox's current image. The `base` pixels
@@ -403,6 +408,7 @@ impl DupesView {
             tags_cache: HashMap::new(),
             tag_edit: None,
             verbosity: TooltipVerbosity::default(),
+            filter: FilterBuilder::new(),
         }
     }
 
@@ -480,6 +486,16 @@ impl DupesView {
                 .strong(),
         );
         self.repo_bar(ui, &mut acts);
+        // Shared FILTER wizard: FIND keeps only groups with ≥1 member matching
+        // it. The first included repo backs the MIME/TAG pick-lists.
+        let sugg = self.suggestion_repo();
+        let outcome = self.filter.ui(ui, store, sugg.as_deref(), self.verbosity);
+        if outcome.status.is_some() {
+            self.status = outcome.status;
+        }
+        if outcome.error.is_some() {
+            self.error = outcome.error;
+        }
         self.controls(ui, &mut acts);
         crate::util::shortcut_bar(
             ui,
@@ -3525,6 +3541,12 @@ impl DupesView {
             .collect()
     }
 
+    /// The repo whose MIME/tag pick-lists back the FILTER wizard: the first
+    /// included repo (the wizard stays usable-but-unassisted when none is).
+    fn suggestion_repo(&self) -> Option<String> {
+        self.included_names().into_iter().next()
+    }
+
     fn read_only_names(&self) -> HashSet<String> {
         self.repos
             .iter()
@@ -3543,6 +3565,18 @@ impl DupesView {
             self.error = Some("Select at least one repo.".into());
             return;
         }
+        // Parse the FILTER once, up front, so a bad expression is reported here
+        // rather than on the worker thread. `None` (no conditions) skips the
+        // per-member matching entirely.
+        let filter_str = self.filter.filter_string();
+        let has_filter = filter_str.is_some();
+        let filter = match FileFilter::parse(filter_str.as_deref()) {
+            Ok(f) => f,
+            Err(e) => {
+                self.error = Some(e.to_string());
+                return;
+            }
+        };
         self.result_names = names.clone();
         self.busy = Some(Op::Find(0));
         self.status = None;
@@ -3553,6 +3587,7 @@ impl DupesView {
         let threshold = self.threshold;
         let repaint = ctx.clone();
         std::thread::spawn(move || {
+            let fref = has_filter.then_some(&filter);
             let result = match mode {
                 Mode::Exact => {
                     let tx2 = tx.clone();
@@ -3561,10 +3596,20 @@ impl DupesView {
                         let _ = tx2.send(Msg::FindProgress(n));
                         r.request_repaint();
                     })
+                    .and_then(|plan| {
+                        // Keep only groups with ≥1 matching member (streams each
+                        // key's members; reports keys examined as progress).
+                        let tx2 = tx.clone();
+                        let r = repaint.clone();
+                        retain_matching_keys(&store, &names, plan, fref, move |n| {
+                            let _ = tx2.send(Msg::FindProgress(n));
+                            r.request_repaint();
+                        })
+                    })
                     .map(Results::Exact)
                     .map_err(|e| e.to_string())
                 }
-                Mode::Similar => find_similar(&store, &names, threshold)
+                Mode::Similar => find_similar(&store, &names, threshold, fref)
                     .map(Results::Similar)
                     .map_err(|e| e.to_string()),
             };
@@ -3739,12 +3784,30 @@ mod ui_tests {
     fn sections_stay_compact() {
         let (_tmp, store) = sample_store(&SAMPLE_REPOS);
         let harness = dupes_harness(store);
-        // Exact label (the help text also contains "FIND").
-        let find_label = format!("{} FIND", icon::SEARCH);
-        let find_top = harness.get_by_label(&find_label).rect().top();
+        // The FILTER wizard sits directly below the REPOS section, so its top
+        // reflects the REPOS height — a good guard against an expanded repos bar
+        // (the FIND button now sits below FILTER, so it's no longer a tight
+        // proxy for the repos height).
+        let filter_top = harness.get_by_label("FILTER").rect().top();
         assert!(
-            find_top < 160.0,
-            "FIND button at y={find_top}; the REPOS section is too tall (expanded?)"
+            filter_top < 160.0,
+            "FILTER section at y={filter_top}; the REPOS section is too tall (expanded?)"
+        );
+    }
+
+    /// The shared FILTER wizard is present on the Duplicates tab (its FILTER
+    /// label and the `+` add-condition button), so FIND can be narrowed.
+    #[test]
+    fn filter_wizard_is_present() {
+        let (_tmp, store) = sample_store(&SAMPLE_REPOS);
+        let harness = dupes_harness(store);
+        assert!(
+            harness.query_by_label("FILTER").is_some(),
+            "the shared FILTER wizard should render on the Duplicates tab"
+        );
+        assert!(
+            harness.query_by_label("+").is_some(),
+            "the FILTER wizard's add-condition button should be present"
         );
     }
 
@@ -4015,6 +4078,58 @@ mod ui_tests {
         );
         assert_eq!(harness.state().total_groups(), 5);
         assert!(harness.state().busy.is_none(), "op should have settled");
+    }
+
+    /// FIND respects the FILTER: with `name:g0_` set, only group 0 survives.
+    #[test]
+    fn find_applies_the_filter() {
+        let (_tmp, store) = seeded_store(5);
+        let store_ui = Arc::clone(&store);
+        let mut view = DupesView::new();
+        // seed_groups names copies g{g}_c{c}.bin, so this matches only group 0.
+        view.filter.set_expression("name:g0_");
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(700.0, 400.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default());
+                },
+                view,
+            );
+        // The FILTER's live match-count keeps requesting repaints, so `run`
+        // (step-capped) would overflow — step manually to load repos.
+        for _ in 0..5 {
+            harness.step();
+        }
+
+        harness
+            .get_by_label(&format!("{} FIND", icon::SEARCH))
+            .click();
+        let mut done = false;
+        for _ in 0..200 {
+            harness.step();
+            if harness.state().results.is_some() {
+                done = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            done,
+            "async FIND never populated (error={:?})",
+            harness.state().error
+        );
+        assert_eq!(
+            harness.state().total_groups(),
+            1,
+            "the filter should keep only group 0 (down from 5)"
+        );
     }
 
     /// A duplicate file in `repo` with rel path `rel` (metadata only).

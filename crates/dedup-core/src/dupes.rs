@@ -8,6 +8,7 @@
 //!
 //! The first file of each sorted group is the "best" copy — deletion keeps it.
 
+use crate::filter::{AnnotatedFilter, FileFilter};
 use crate::store::{self, FileEntry, Store, StoreError};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -143,6 +144,57 @@ pub fn find_exact_duplicates(
 ) -> Result<Vec<DupeGroup>, StoreError> {
     let plan = plan_exact_duplicates(store, repo_names, |_| {})?;
     load_groups(store, repo_names, &plan)
+}
+
+/// Keep only the group keys whose group has at least one member matching
+/// `filter` — the Duplicates tab's "keep a whole group when any copy matches"
+/// (a group is shown with *all* its copies, filtered only at the group level).
+/// `None` returns the plan unchanged.
+///
+/// Members are streamed per key (like [`load_groups`]) so the memory-light paged
+/// plan is preserved; each repo's annotations are loaded once up front. The
+/// scan short-circuits on the first matching member of a group. `progress`
+/// receives the running count of keys examined.
+pub fn retain_matching_keys(
+    store: &Store,
+    repo_names: &[String],
+    keys: Vec<DupeGroupKey>,
+    filter: Option<&FileFilter>,
+    mut progress: impl FnMut(usize),
+) -> Result<Vec<DupeGroupKey>, StoreError> {
+    let Some(filter) = filter else {
+        return Ok(keys);
+    };
+
+    let mut dbs: Vec<std::sync::Arc<redb::Database>> = Vec::with_capacity(repo_names.len());
+    for name in repo_names {
+        dbs.push(store.open_repo_db(name)?);
+    }
+    // One annotated matcher per repo (tags are per repo+path); built once.
+    let mut matchers: Vec<AnnotatedFilter> = Vec::with_capacity(dbs.len());
+    for db in &dbs {
+        matchers.push(AnnotatedFilter::new(db, filter)?);
+    }
+
+    let mut kept = Vec::with_capacity(keys.len());
+    for (i, key) in keys.into_iter().enumerate() {
+        let mut matched = false;
+        'members: for j in 0..dbs.len() {
+            for rel in store::get_paths_by_size_hash(&dbs[j], key.size, &key.hash)? {
+                if let Some(entry) = store::get_entry(&dbs[j], &rel)?
+                    && matchers[j].matches(&rel, &entry)
+                {
+                    matched = true;
+                    break 'members;
+                }
+            }
+        }
+        if matched {
+            kept.push(key);
+        }
+        progress(i + 1);
+    }
+    Ok(kept)
 }
 
 /// Sort files within each group (best copy first) and order the groups by

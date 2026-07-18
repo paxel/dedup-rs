@@ -77,11 +77,25 @@ fn update_computes_fingerprints_and_find_similar_groups_them() {
     // (The 512-bit hash is sparse for synthetic flat-background images, which
     // inflates their similarity to the all-zero hash of a solid color; realistic
     // thresholds sit well above that floor.)
-    let groups = dedup_core::similar::find_similar(&store, &["pics".to_string()], 95.0)
+    let groups = dedup_core::similar::find_similar(&store, &["pics".to_string()], 95.0, None)
         .expect("find similar");
     assert_eq!(groups.len(), 1, "exactly one similar group");
     let paths: Vec<&str> = groups[0].iter().map(|f| f.rel_path.as_str()).collect();
     assert_eq!(groups[0].len(), 2, "group holds both L-shapes");
     assert!(paths.contains(&"a.png") && paths.contains(&"b.png"));
     assert!(!paths.contains(&"c.png"), "the solid image is not similar");
+
+    // A FILTER matching one member keeps the WHOLE group (both L-shapes).
+    let f_a = dedup_core::filter::FileFilter::parse(Some("name:a.png")).unwrap();
+    let kept = dedup_core::similar::find_similar(&store, &["pics".to_string()], 95.0, Some(&f_a))
+        .expect("find similar (filtered)");
+    assert_eq!(kept.len(), 1, "group with a matching member is kept");
+    assert_eq!(kept[0].len(), 2, "both copies shown, not just the match");
+
+    // A FILTER matching no member drops the group entirely.
+    let f_none = dedup_core::filter::FileFilter::parse(Some("name:zzz")).unwrap();
+    let dropped =
+        dedup_core::similar::find_similar(&store, &["pics".to_string()], 95.0, Some(&f_none))
+            .expect("find similar (filtered)");
+    assert!(dropped.is_empty(), "no member matches → group dropped");
 }

@@ -983,7 +983,7 @@ pub fn plan_folder_export(
     let groups = match mode {
         FolderMode::Exact => crate::dupes::find_exact_duplicates(store, &source_names)?,
         FolderMode::Similar { threshold } => {
-            crate::similar::find_similar(store, &source_names, threshold)?
+            crate::similar::find_similar(store, &source_names, threshold, None)?
         }
     };
     let redundant: HashSet<String> = groups
