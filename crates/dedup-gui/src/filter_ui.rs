@@ -431,11 +431,9 @@ impl FilterBuilder {
     }
 
     fn filter_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::LILAC).show(ui, |ui| {
+        crate::lcars::section_lcars(ui, "FILTER", theme::LILAC, |ui| {
             let mut editing_idx = None;
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("FILTER").color(theme::TEXT).size(12.0));
-
                 // One pill per active condition: a clickable label opening its
                 // editor, followed by a small remove button.
                 for (i, cond) in self.filters.iter().enumerate() {

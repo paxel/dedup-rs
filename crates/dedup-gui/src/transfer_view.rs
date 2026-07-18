@@ -442,7 +442,7 @@ impl TransferView {
     }
 
     fn repo_rows(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::LILAC).show(ui, |ui| {
+        crate::lcars::section_lcars(ui, "REPOS", theme::LILAC, |ui| {
             // SOURCE: every repo, orange when picked.
             let src = self.repos.clone();
             crate::repo_chip::chip_row(ui, "xfer_source", "SOURCE", src.len(), |ui, i| {
@@ -601,9 +601,8 @@ impl TransferView {
     }
 
     fn command_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::ORANGE).show(ui, |ui| {
+        crate::lcars::section_lcars(ui, "COMMAND", theme::ORANGE, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("COMMAND").color(theme::TEXT).size(12.0));
                 for cmd in [Command::Copy, Command::Move, Command::Sync, Command::Mirror] {
                     let sel = self.command == cmd;
                     let accent = if cmd.destructive() {
@@ -630,9 +629,8 @@ impl TransferView {
     }
 
     fn subdir_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::BLUE).show(ui, |ui| {
+        crate::lcars::section_lcars(ui, "INTO", theme::BLUE, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("INTO").color(theme::TEXT).size(12.0));
                 let changed = ui
                     .add(
                         egui::TextEdit::singleline(&mut self.subdir)
@@ -683,9 +681,8 @@ impl TransferView {
 
     /// Selector for where COPY/MOVE lands: into a repo or into a picked folder.
     fn dest_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::BLUE).show(ui, |ui| {
+        crate::lcars::section_lcars(ui, "DEST", theme::BLUE, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("DEST").color(theme::TEXT).size(12.0));
                 for (dest, label, short, verbose) in [
                     (
                         Destination::Repo,
@@ -719,9 +716,8 @@ impl TransferView {
 
     /// The export-folder path input and its native folder picker (FOLDER mode).
     fn folder_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::BLUE).show(ui, |ui| {
+        crate::lcars::section_lcars(ui, "FOLDER", theme::BLUE, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("FOLDER").color(theme::TEXT).size(12.0));
                 let changed = ui
                     .add(
                         egui::TextEdit::singleline(&mut self.folder)
@@ -758,9 +754,8 @@ impl TransferView {
 
     /// Grouping mode (exact/similar) and the invert toggle for a folder export.
     fn mode_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::LILAC).show(ui, |ui| {
+        crate::lcars::section_lcars(ui, "MODE", theme::LILAC, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("MODE").color(theme::TEXT).size(12.0));
                 for mode in [SelectMode::Exact, SelectMode::Similar] {
                     let sel = self.select_mode == mode;
                     let fill = if sel { theme::LILAC } else { theme::PANEL };
@@ -849,26 +844,22 @@ impl TransferView {
     /// MIRROR's info bar: no toggle (it always deletes), just a red warning that
     /// it removes everything in the target the source lacks.
     fn mirror_bar(&self, ui: &mut egui::Ui) {
-        theme::section(theme::RED).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(icon::TRASH).color(theme::RED).size(12.0));
+        crate::lcars::section_lcars(
+            ui,
+            &format!("{} DELETES EXTRAS", icon::TRASH),
+            theme::RED,
+            |ui| {
                 ui.label(
-                    RichText::new("DELETES EXTRAS")
-                        .color(theme::RED)
-                        .size(12.0)
-                        .strong(),
-                );
-            });
-            ui.label(
-                RichText::new(
-                    "Everything in the target whose content the source does not have is \
+                    RichText::new(
+                        "Everything in the target whose content the source does not have is \
                      deleted, so the target ends up holding exactly the source's content. \
                      Deletions cannot be undone.",
-                )
-                .color(theme::LILAC)
-                .size(11.0),
-            );
-        });
+                    )
+                    .color(theme::LILAC)
+                    .size(11.0),
+                );
+            },
+        );
     }
 
     /// The delete policy the current command runs with: MIRROR always deletes
@@ -886,9 +877,8 @@ impl TransferView {
     /// no subdir/folder/mode controls — it always mirrors source→target at the
     /// same relative path.
     fn sync_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::BLUE).show(ui, |ui| {
+        crate::lcars::section_lcars(ui, "OPTIONS", theme::BLUE, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("OPTIONS").color(theme::TEXT).size(12.0));
                 let fill = if self.sync_delete_missing {
                     theme::RED
                 } else {
@@ -931,9 +921,8 @@ impl TransferView {
     }
 
     fn action_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::AMBER).show(ui, |ui| {
+        crate::lcars::section_lcars(ui, "ACTION", theme::AMBER, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("ACTION").color(theme::TEXT).size(12.0));
                 let ready = self.ready();
                 if ui
                     .add_enabled(
@@ -1875,7 +1864,7 @@ mod ui_tests {
         });
 
         assert!(
-            harness.query_by_label("DELETES EXTRAS").is_some(),
+            harness.query_by_label_contains("DELETES EXTRAS").is_some(),
             "MIRROR shows the DELETES EXTRAS warning"
         );
         assert!(

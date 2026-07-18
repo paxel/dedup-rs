@@ -29,7 +29,10 @@ pub fn identicon(painter: &egui::Painter, rect: Rect, name: &str) {
     // no cell sits flush against the tile edge (which clipped the last column thin).
     let cell = (side * 0.8 / 5.0).round().max(1.0);
     let grid = cell * 5.0;
-    let origin = tile.center() - Vec2::splat(grid / 2.0);
+    // Snap the grid origin to whole pixels. Otherwise the columns land on
+    // fractional coordinates and anti-aliasing renders the left and right
+    // (mirrored) columns with slightly different coverage — visibly asymmetric.
+    let origin = (tile.center() - Vec2::splat(grid / 2.0)).round();
     // Bits above the hue byte choose which cells are on: 3 free columns (the
     // other two mirror them) × 5 rows = 15 bits.
     let mut bits = hash >> 9;

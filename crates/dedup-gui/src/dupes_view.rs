@@ -22,7 +22,7 @@ use dedup_core::filter::FileFilter;
 use dedup_core::similar::find_similar;
 use dedup_core::store::Store;
 use dedup_core::thumbnail::hash_hex;
-use egui::{Color32, Id, RichText};
+use egui::{Id, RichText};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -84,22 +84,6 @@ enum DeleteFollow {
 enum ConfirmAction {
     EnableQuickDelete,
     DeleteAll,
-}
-
-/// A bold-bordered LCARS section container in the given accent color, used to
-/// group a row of related controls.
-fn section(color: Color32) -> egui::Frame {
-    egui::Frame::new()
-        .fill(theme::PANEL)
-        .corner_radius(theme::PILL)
-        .stroke(egui::Stroke::new(2.0, color))
-        .inner_margin(8.0)
-        .outer_margin(egui::Margin {
-            left: 0,
-            right: 0,
-            top: 0,
-            bottom: 8,
-        })
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -643,12 +627,11 @@ impl DupesView {
     }
 
     fn repo_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        section(theme::LILAC).show(ui, |ui| {
-            // Header: label + bulk MARK ALL / NONE (repos start excluded, so this
-            // is the quick way to include/clear all of them at once).
+        crate::lcars::section_lcars(ui, "REPOS", theme::LILAC, |ui| {
+            // Bulk MARK ALL / NONE (repos start excluded, so this is the quick way
+            // to include/clear all of them at once).
             ui.horizontal(|ui| {
-                ui.label(RichText::new("REPOS").color(theme::TEXT).size(12.0));
-                if crate::repo_chip::small_button(ui, "ALL", theme::ORANGE)
+                if crate::lcars::toggle_button(ui, "ALL", false, theme::ORANGE)
                     .explain(
                         self.verbosity,
                         "Include every repo in the search",
@@ -658,7 +641,7 @@ impl DupesView {
                 {
                     self.repos.iter_mut().for_each(|r| r.included = true);
                 }
-                if crate::repo_chip::small_button(ui, "NONE", theme::ORANGE)
+                if crate::lcars::toggle_button(ui, "NONE", false, theme::ORANGE)
                     .explain(
                         self.verbosity,
                         "Exclude every repo",
@@ -726,76 +709,46 @@ impl DupesView {
     }
 
     fn controls(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        section(theme::AMBER).show(ui, |ui| {
+        crate::lcars::section_lcars(ui, "MODE", theme::AMBER, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("MODE").color(theme::TEXT).size(12.0));
                 let exact = self.mode == Mode::Exact;
-                // The two match modes form one segmented toggle.
-                egui::Frame::new()
-                    .stroke(egui::Stroke::new(1.0, theme::BLUE))
-                    .corner_radius(6)
-                    .inner_margin(egui::Margin::symmetric(4, 2))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            // Selected = filled accent + black text; unselected =
-                            // panel fill with accent-colored text (an outline),
-                            // so both stay readable instead of black-on-black.
-                            let (dup_fill, dup_text) = if exact {
-                                (theme::ORANGE, theme::BLACK)
-                            } else {
-                                (theme::PANEL, theme::ORANGE)
-                            };
-                            if ui
-                                .add(
-                                    egui::Button::new(RichText::new("DUPLICATES").color(dup_text))
-                                        .fill(dup_fill),
-                                )
-                                .explain(
-                                    self.verbosity,
-                                    "Exact byte-for-byte duplicates",
-                                    "Find files whose content is byte-for-byte identical \
-                                     (same size and BLAKE3 hash). Fast, no false positives.",
-                                )
-                                .clicked()
-                            {
-                                self.mode = Mode::Exact;
-                            }
-                            let (sim_fill, sim_text) = if exact {
-                                (theme::PANEL, theme::LILAC)
-                            } else {
-                                (theme::LILAC, theme::BLACK)
-                            };
-                            if ui
-                                .add(
-                                    egui::Button::new(RichText::new("SIMILAR").color(sim_text))
-                                        .fill(sim_fill),
-                                )
-                                .explain(
-                                    self.verbosity,
-                                    "Perceptually similar images/videos",
-                                    "Find images and videos that look alike even when their \
-                                     bytes differ — re-saves, re-encodes, or crops — using a \
-                                     perceptual hash and the similarity threshold below.",
-                                )
-                                .clicked()
-                            {
-                                self.mode = Mode::Similar;
-                            }
-                        });
-                    });
-                let find = egui::Button::new(
-                    RichText::new(format!("{} FIND", icon::SEARCH)).color(theme::BLACK),
-                )
-                .fill(theme::AMBER);
-                if ui
-                    .add_enabled(self.busy.is_none(), find)
+                // The two match modes: DUPLICATES (orange) / SIMILAR (lilac).
+                if crate::lcars::toggle_button(ui, "DUPLICATES", exact, theme::ORANGE)
                     .explain(
                         self.verbosity,
-                        "Search the included repos",
-                        "Search every included (checked) repository for duplicates or \
-                         similars per the selected mode. Excluded repos are skipped.",
+                        "Exact byte-for-byte duplicates",
+                        "Find files whose content is byte-for-byte identical \
+                         (same size and BLAKE3 hash). Fast, no false positives.",
                     )
                     .clicked()
+                {
+                    self.mode = Mode::Exact;
+                }
+                if crate::lcars::toggle_button(ui, "SIMILAR", !exact, theme::LILAC)
+                    .explain(
+                        self.verbosity,
+                        "Perceptually similar images/videos",
+                        "Find images and videos that look alike even when their \
+                         bytes differ — re-saves, re-encodes, or crops — using a \
+                         perceptual hash and the similarity threshold below.",
+                    )
+                    .clicked()
+                {
+                    self.mode = Mode::Similar;
+                }
+                if crate::lcars::action_button(
+                    ui,
+                    &format!("{} FIND", icon::SEARCH),
+                    self.busy.is_none(),
+                    theme::AMBER,
+                )
+                .explain(
+                    self.verbosity,
+                    "Search the included repos",
+                    "Search every included (checked) repository for duplicates or \
+                     similars per the selected mode. Excluded repos are skipped.",
+                )
+                .clicked()
                 {
                     acts.push(Act::Find);
                 }
@@ -827,16 +780,10 @@ impl DupesView {
             // its marked files instantly (no per-group confirmation).
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                // Filled pill when on, text-only (frameless) when off — matches
-                // the other LCARS toggles.
+                // A proper bordered toggle now (filled red when on), so it's
+                // clearly a clickable control even when off.
                 let label = format!("{} QUICK DELETE", icon::LIGHTNING);
-                let qd = if self.quick_delete {
-                    egui::Button::new(RichText::new(label).color(theme::BLACK)).fill(theme::RED)
-                } else {
-                    egui::Button::new(RichText::new(label).color(theme::RED)).frame(false)
-                };
-                if ui
-                    .add(qd)
+                if crate::lcars::toggle_button(ui, &label, self.quick_delete, theme::RED)
                     .explain(
                         self.verbosity,
                         "Show a DELETE NOW button on each group that deletes its marked files immediately, no confirmation",
@@ -862,10 +809,7 @@ impl DupesView {
             ui.horizontal(|ui| {
                 let n = self.marked.len();
                 let idle = self.busy.is_none();
-                let auto =
-                    egui::Button::new(RichText::new("AUTO-RESOLVE REST").color(theme::BLACK));
-                if ui
-                    .add_enabled(idle, auto)
+                if crate::lcars::action_button(ui, "AUTO-RESOLVE REST", idle, theme::ORANGE)
                     .explain(
                         self.verbosity,
                         "Mark every non-best copy in a deletable repo",
@@ -877,20 +821,20 @@ impl DupesView {
                 {
                     acts.push(Act::AutoResolve);
                 }
-                let del = egui::Button::new(
-                    RichText::new(format!("DELETE MARKED ({n})")).color(theme::BLACK),
+                if crate::lcars::action_button(
+                    ui,
+                    &format!("DELETE MARKED ({n})"),
+                    idle && n > 0,
+                    theme::RED,
                 )
-                .fill(theme::RED);
-                if ui
-                    .add_enabled(idle && n > 0, del)
-                    .explain(
-                        self.verbosity,
-                        "Delete every marked file, with confirmation",
-                        "Delete every currently marked file across all groups, batched per \
-                         repo in one transaction. Always asks for confirmation first — use \
-                         QUICK DELETE if you want per-group deletes without asking.",
-                    )
-                    .clicked()
+                .explain(
+                    self.verbosity,
+                    "Delete every marked file, with confirmation",
+                    "Delete every currently marked file across all groups, batched per \
+                     repo in one transaction. Always asks for confirmation first — use \
+                     QUICK DELETE if you want per-group deletes without asking.",
+                )
+                .clicked()
                 {
                     acts.push(Act::AskDelete);
                 }
@@ -4067,7 +4011,7 @@ mod ui_tests {
 
         let mut init = false;
         let mut harness = Harness::builder()
-            .with_size(egui::vec2(600.0, 400.0))
+            .with_size(egui::vec2(600.0, 520.0))
             .build_ui_state(
                 move |ui, view: &mut DupesView| {
                     if !init {
@@ -4105,7 +4049,7 @@ mod ui_tests {
 
         let mut init = false;
         let mut harness = Harness::builder()
-            .with_size(egui::vec2(600.0, 400.0))
+            .with_size(egui::vec2(600.0, 520.0))
             .build_ui_state(
                 move |ui, view: &mut DupesView| {
                     if !init {
@@ -4192,7 +4136,7 @@ mod ui_tests {
         let store_ui = Arc::clone(&store);
         let mut init = false;
         let mut harness = Harness::builder()
-            .with_size(egui::vec2(600.0, 400.0))
+            .with_size(egui::vec2(600.0, 520.0))
             .build_ui_state(
                 move |ui, view: &mut DupesView| {
                     if !init {
@@ -4430,7 +4374,26 @@ mod ui_tests {
             dfile("w", "b"),
             dfile("ro", "c"),
         ]]));
-        let mut harness = similar_harness(view);
+        // Taller than `similar_harness` so the group header buttons clear the
+        // (now taller) LCARS section chrome and are clickable.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(700.0, 760.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
 
         harness.get_by_label("MARK NONE").click();
         harness.run();
@@ -4751,7 +4714,7 @@ mod ui_tests {
         let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
         let mut init = false;
         let mut harness = Harness::builder()
-            .with_size(egui::vec2(900.0, 700.0))
+            .with_size(egui::vec2(900.0, 820.0))
             .build_ui_state(
                 move |ui, view: &mut DupesView| {
                     if !init {

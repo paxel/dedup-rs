@@ -1,14 +1,20 @@
-//! Phosphor icon glyphs. The `egui-phosphor` crate targets an older egui, so we
-//! vendor the regular Phosphor font (MIT licensed, © Phosphor Icons) and the
-//! handful of codepoints we use, and register it against egui 0.35 directly.
+//! Fonts: the condensed LCARS-style body face plus the Phosphor icon glyphs.
 //!
-//! Icons live in the Unicode private-use area, so they never collide with real
-//! text glyphs; the font is appended as a fallback in the proportional family.
+//! The `egui-phosphor` crate targets an older egui, so we vendor the regular
+//! Phosphor font (MIT licensed, © Phosphor Icons) and register it against egui
+//! 0.35 directly. Icons live in the Unicode private-use area, so they never
+//! collide with real text glyphs; the font is appended as a fallback in the
+//! proportional family.
+//!
+//! Body text uses **DejaVu Sans Condensed** (Bitstream Vera license — see
+//! `assets/fonts/DejaVu-LICENSE.txt`), a narrow face that gives the UI its
+//! technical LCARS character. It's installed as the *primary* proportional font.
 
 use egui::{FontData, FontDefinitions, FontFamily};
 use std::sync::Arc;
 
 const PHOSPHOR: &[u8] = include_bytes!("../assets/Phosphor.ttf");
+const CONDENSED: &[u8] = include_bytes!("../assets/fonts/DejaVuSansCondensed.ttf");
 
 pub const PLUS: &str = "\u{E3D4}";
 pub const FOLDER_OPEN: &str = "\u{E256}";
@@ -32,14 +38,21 @@ pub const X: &str = "\u{E4F6}";
 pub const ARROW_RIGHT: &str = "\u{E06C}";
 pub const CHECK: &str = "\u{E182}";
 
-/// Register the Phosphor font on the context so the glyph constants render.
+/// Register the condensed body font and the Phosphor icon font on the context.
 pub fn install(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        "condensed".to_owned(),
+        Arc::new(FontData::from_static(CONDENSED)),
+    );
     fonts.font_data.insert(
         "phosphor".to_owned(),
         Arc::new(FontData::from_static(PHOSPHOR)),
     );
     if let Some(family) = fonts.families.get_mut(&FontFamily::Proportional) {
+        // Condensed body face first (primary), then the platform default fonts,
+        // then Phosphor as the fallback that supplies our PUA icon glyphs.
+        family.insert(0, "condensed".to_owned());
         family.push("phosphor".to_owned());
     }
     ctx.set_fonts(fonts);

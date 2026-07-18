@@ -363,9 +363,8 @@ impl GroomingView {
     }
 
     fn command_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::ORANGE).show(ui, |ui| {
+        crate::lcars::section_lcars(ui, "COMMAND", theme::ORANGE, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("COMMAND").color(theme::TEXT).size(12.0));
                 for cmd in [
                     Command::Dedupe,
                     Command::Purge,
@@ -390,7 +389,7 @@ impl GroomingView {
     }
 
     fn dedupe_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::LILAC).show(ui, |ui| {
+        crate::lcars::section_lcars(ui, "REPOS", theme::LILAC, |ui| {
             // SOURCE: the repo duplicates are deleted from, orange when picked.
             let src = self.repos.clone();
             crate::repo_chip::chip_row(ui, "groom_source", "SOURCE", src.len(), |ui, i| {
@@ -501,13 +500,8 @@ impl GroomingView {
 
         let rule_count = self.rules.len();
         for i in 0..rule_count {
-            theme::section(theme::BLUE).show(ui, |ui| {
+            crate::lcars::section_lcars(ui, &format!("RULE {}", i + 1), theme::BLUE, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("RULE {}", i + 1))
-                            .color(theme::TEXT)
-                            .size(12.0),
-                    );
                     // A rule can always be removed (a repo may need zero rules).
                     if ui
                         .add(egui::Button::new(RichText::new("× rule").color(theme::RED)))
@@ -574,7 +568,7 @@ impl GroomingView {
             });
         }
 
-        theme::section(theme::LILAC).show(ui, |ui| {
+        crate::lcars::section_lcars(ui, "RULES", theme::LILAC, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .add(
@@ -651,9 +645,9 @@ impl GroomingView {
 
     /// A single-repo picker used by PURGE and EMPTY DIRS (they act on one repo).
     fn single_repo_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>, hint: &str) {
-        theme::section(theme::LILAC).show(ui, |ui| {
+        crate::lcars::section_lcars(ui, "REPO", theme::LILAC, |ui| {
             let repos = self.repos.clone();
-            crate::repo_chip::chip_row(ui, "groom_repo", "REPO", repos.len(), |ui, i| {
+            crate::repo_chip::chip_row(ui, "groom_repo", "", repos.len(), |ui, i| {
                 let name = &repos[i];
                 let sel = self.repo.as_deref() == Some(name.as_str());
                 let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::ORANGE, None);
@@ -672,9 +666,8 @@ impl GroomingView {
 
     /// A single-line filter expression (mime / size / name with `*` wildcards).
     fn action_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::AMBER).show(ui, |ui| {
+        crate::lcars::section_lcars(ui, "ACTION", theme::AMBER, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("ACTION").color(theme::TEXT).size(12.0));
                 let ready = self.ready();
                 // EMPTY DIRS has no meaningful file preview (its count is only
                 // known after walking), so PREVIEW is offered for the other two.

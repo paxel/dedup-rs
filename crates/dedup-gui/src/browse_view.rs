@@ -482,22 +482,24 @@ impl BrowseView {
         // Repo picker (single repo), amber when selected.
         let repos = self.repos.clone();
         let mut picked: Option<String> = None;
-        crate::repo_chip::chip_row(ui, "browse_repo", "REPO", repos.len(), |ui, i| {
-            let name = &repos[i];
-            let sel = self.repo.as_deref() == Some(name.as_str());
-            let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::AMBER, None);
-            if chip
-                .name
-                .explain(
-                    self.verbosity,
-                    "Browse this repository",
-                    "Load this repository's index and browse its files by directory.",
-                )
-                .clicked()
-            {
-                picked = Some(name.clone());
-            }
-            chip.outer
+        crate::lcars::section_lcars(ui, "REPO", theme::AMBER, |ui| {
+            crate::repo_chip::chip_row(ui, "browse_repo", "", repos.len(), |ui, i| {
+                let name = &repos[i];
+                let sel = self.repo.as_deref() == Some(name.as_str());
+                let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::AMBER, None);
+                if chip
+                    .name
+                    .explain(
+                        self.verbosity,
+                        "Browse this repository",
+                        "Load this repository's index and browse its files by directory.",
+                    )
+                    .clicked()
+                {
+                    picked = Some(name.clone());
+                }
+                chip.outer
+            });
         });
         if let Some(name) = picked {
             self.repo = Some(name);

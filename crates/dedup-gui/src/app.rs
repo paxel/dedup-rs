@@ -800,26 +800,24 @@ impl DedupApp {
                     // horizontally when cramped (auto-hiding scrollbar) instead of
                     // letting the last tab slide behind ABOUT.
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(egui::Button::new(
-                                RichText::new(format!("{} SETTINGS", icon::GEAR))
-                                    .color(theme::BLACK),
-                            ))
-                            .explain(
-                                self.tooltip_verbosity,
-                                "App settings",
-                                "Open app settings: hashing thread count and tooltip verbosity.",
-                            )
-                            .clicked()
+                        if crate::lcars::action_button(
+                            ui,
+                            &format!("{} SETTINGS", icon::GEAR),
+                            true,
+                            theme::TAN,
+                        )
+                        .explain(
+                            self.tooltip_verbosity,
+                            "App settings",
+                            "Open app settings: hashing thread count and tooltip verbosity.",
+                        )
+                        .clicked()
                         {
                             self.show_settings = true;
                         }
                         // Added after SETTINGS so it renders immediately to its
                         // left in this right-to-left layout.
-                        if ui
-                            .add(egui::Button::new(
-                                RichText::new("ABOUT").color(theme::BLACK),
-                            ))
+                        if crate::lcars::action_button(ui, "ABOUT", true, theme::TAN)
                             .explain(
                                 self.tooltip_verbosity,
                                 "Version and license",
@@ -907,66 +905,68 @@ impl DedupApp {
         // The registry is locked while any repo is updating, so adding a repo
         // (which reads every repo's stats) must wait until scans finish.
         let busy = self.worker.active_count() > 0;
-        ui.horizontal(|ui| {
-            let add = egui::Button::new(
-                RichText::new(format!("{} ADD REPOSITORY", icon::PLUS)).color(theme::BLACK),
-            )
-            .fill(theme::BLUE);
-            if ui
-                .add_enabled(!busy, add)
-                .explain(
-                    self.tooltip_verbosity,
-                    "Register a new repository",
-                    "Register a new repository: pick a folder on disk to track and scan for \
+        crate::lcars::section_lcars(ui, "MANAGE", theme::BLUE, |ui| {
+            ui.horizontal(|ui| {
+                let add = egui::Button::new(
+                    RichText::new(format!("{} ADD REPOSITORY", icon::PLUS)).color(theme::BLACK),
+                )
+                .fill(theme::BLUE);
+                if ui
+                    .add_enabled(!busy, add)
+                    .explain(
+                        self.tooltip_verbosity,
+                        "Register a new repository",
+                        "Register a new repository: pick a folder on disk to track and scan for \
                      duplicates. Disabled while a scan is running elsewhere in the app.",
+                    )
+                    .clicked()
+                {
+                    actions.push(Action::OpenAdd);
+                }
+                // Enqueues every repo; it only touches names (no db access), so it
+                // stays enabled even while a batch is running.
+                let update_all = egui::Button::new(
+                    RichText::new(format!("{} UPDATE ALL", icon::REFRESH)).color(theme::BLACK),
                 )
-                .clicked()
-            {
-                actions.push(Action::OpenAdd);
-            }
-            // Enqueues every repo; it only touches names (no db access), so it
-            // stays enabled even while a batch is running.
-            let update_all = egui::Button::new(
-                RichText::new(format!("{} UPDATE ALL", icon::REFRESH)).color(theme::BLACK),
-            )
-            .fill(theme::ORANGE);
-            if ui
-                .add_enabled(!self.repos.is_empty(), update_all)
-                .explain(
-                    self.tooltip_verbosity,
-                    "Scan every repository",
-                    "Queue an UPDATE / SCAN for every registered repository, one at a time. \
+                .fill(theme::ORANGE);
+                if ui
+                    .add_enabled(!self.repos.is_empty(), update_all)
+                    .explain(
+                        self.tooltip_verbosity,
+                        "Scan every repository",
+                        "Queue an UPDATE / SCAN for every registered repository, one at a time. \
                      Already up-to-date repos finish almost instantly.",
+                    )
+                    .clicked()
+                {
+                    actions.push(Action::UpdateAll);
+                }
+                // Re-probe every repo's location/reachability (filesystem only, no
+                // db access), so it is fine to run any time.
+                let refresh = egui::Button::new(
+                    RichText::new(format!("{} REFRESH STATUS", icon::REFRESH)).color(theme::BLACK),
                 )
-                .clicked()
-            {
-                actions.push(Action::UpdateAll);
-            }
-            // Re-probe every repo's location/reachability (filesystem only, no
-            // db access), so it is fine to run any time.
-            let refresh = egui::Button::new(
-                RichText::new(format!("{} REFRESH STATUS", icon::REFRESH)).color(theme::BLACK),
-            )
-            .fill(theme::LILAC);
-            if ui
-                .add_enabled(!self.repos.is_empty(), refresh)
-                .explain(
-                    self.tooltip_verbosity,
-                    "Re-check location and staleness",
-                    "Re-check every repository's location and reachability, and whether its \
+                .fill(theme::LILAC);
+                if ui
+                    .add_enabled(!self.repos.is_empty(), refresh)
+                    .explain(
+                        self.tooltip_verbosity,
+                        "Re-check location and staleness",
+                        "Re-check every repository's location and reachability, and whether its \
                      index is stale (dry-run — no hashing, no writes).",
-                )
-                .clicked()
-            {
-                actions.push(Action::RefreshStatus);
-            }
-            if busy {
-                ui.label(
-                    RichText::new("· busy: a scan is running")
-                        .color(theme::TAN)
-                        .size(12.0),
-                );
-            }
+                    )
+                    .clicked()
+                {
+                    actions.push(Action::RefreshStatus);
+                }
+                if busy {
+                    ui.label(
+                        RichText::new("· busy: a scan is running")
+                            .color(theme::TAN)
+                            .size(12.0),
+                    );
+                }
+            });
         });
         ui.add_space(4.0);
 
@@ -1818,10 +1818,7 @@ fn tab_button(
     hover_verbose: &str,
 ) {
     let selected = *current == tab;
-    let fill = if selected { color } else { theme::PANEL };
-    let text_color = if selected { theme::BLACK } else { color };
-    if ui
-        .add(egui::Button::new(RichText::new(label).color(text_color)).fill(fill))
+    if crate::lcars::toggle_button(ui, label, selected, color)
         .explain(verbosity, label, hover_verbose)
         .clicked()
     {

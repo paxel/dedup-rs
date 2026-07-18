@@ -19,22 +19,6 @@ pub const HAIRLINE: Color32 = Color32::from_rgb(0x5C, 0x4E, 0x40);
 /// Large corner radius gives widgets the rounded LCARS block look.
 pub const PILL: CornerRadius = CornerRadius::same(12);
 
-/// A bold-bordered LCARS section container in the given accent color, used to
-/// group a row of related controls.
-pub fn section(color: Color32) -> egui::Frame {
-    egui::Frame::new()
-        .fill(PANEL)
-        .corner_radius(PILL)
-        .stroke(Stroke::new(2.0, color))
-        .inner_margin(8.0)
-        .outer_margin(egui::Margin {
-            left: 0,
-            right: 0,
-            top: 0,
-            bottom: 8,
-        })
-}
-
 /// FNV-1a hash of a string, used to derive stable per-name colors/patterns.
 pub fn name_hash(s: &str) -> u32 {
     let mut hash: u32 = 2166136261;
@@ -63,11 +47,15 @@ pub fn hsl(h: f32, s: f32, l: f32) -> Color32 {
     Color32::from_rgb(to(r), to(g), to(b))
 }
 
+/// A warm outline used on every button so an unselected (panel-filled) pill still
+/// reads as clickable — the LCARS look leans on outlined bars.
+const BUTTON_EDGE: Color32 = Color32::from_rgb(0x8A, 0x72, 0x4E);
+
 fn pill(bg: Color32, fg: Color32) -> WidgetVisuals {
     WidgetVisuals {
         bg_fill: bg,
         weak_bg_fill: bg,
-        bg_stroke: Stroke::NONE,
+        bg_stroke: Stroke::new(1.0, BUTTON_EDGE),
         corner_radius: PILL,
         fg_stroke: Stroke::new(1.5, fg),
         expansion: 0.0,
