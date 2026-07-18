@@ -495,66 +495,61 @@ impl TransferView {
             }
 
             // DUPEPOOL: content any of these repos already holds is treated as
-            // "already known" and never re-copied. In REPO mode the target is
-            // always a reference, shown as a pinned (always-on) chip. SYNC
+            // "already known" and never re-copied. The target is *always* a
+            // reference (handled in `references`), so — like the source — it's
+            // simply left out of this row rather than shown as a locked chip. SYNC
             // compares source against the single target only, so it has no pool.
             if !self.command.repo_to_repo() {
-                // Pinned target first (if any), then the toggleable pool repos.
-                enum Pool {
-                    Pinned(String),
-                    Toggle(String),
-                }
-                let mut items: Vec<Pool> = Vec::new();
-                if self.destination == Destination::Repo
-                    && let Some(target) = self.target.clone()
-                {
-                    items.push(Pool::Pinned(target));
-                }
-                for name in &self.repos {
-                    if self.source.as_deref() == Some(name.as_str()) {
-                        continue;
-                    }
-                    if self.destination == Destination::Repo
-                        && self.target.as_deref() == Some(name.as_str())
+                // The toggleable pool repos: everything except the source and target.
+                let eligible: Vec<String> = self
+                    .repos
+                    .iter()
+                    .filter(|n| {
+                        self.source.as_deref() != Some(n.as_str())
+                            && !(self.destination == Destination::Repo
+                                && self.target.as_deref() == Some(n.as_str()))
+                    })
+                    .cloned()
+                    .collect();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("DUPEPOOL").color(theme::TEXT).size(12.0));
+                    if crate::repo_chip::small_button(ui, "ALL", theme::LILAC)
+                        .explain(
+                            self.verbosity,
+                            "Add every eligible repo to the pool",
+                            "Treat content held by any other repo as already known.",
+                        )
+                        .clicked()
                     {
-                        continue;
+                        self.extra_refs = eligible.clone();
                     }
-                    items.push(Pool::Toggle(name.clone()));
-                }
-                crate::repo_chip::chip_row(ui, "xfer_pool", "DUPEPOOL", items.len(), |ui, i| {
-                    match &items[i] {
-                        // Always on and non-toggleable: the target is always in the pool.
-                        Pool::Pinned(target) => {
-                            let chip =
-                                crate::repo_chip::repo_chip(ui, target, true, theme::LILAC, None);
-                            chip.name.explain(
-                                self.verbosity,
-                                "Always in the pool (it's the target)",
-                                "The target repo is always in the dupe pool — COPY/MOVE never \
-                                 re-copies content the target already has — so it can't be \
-                                 toggled off.",
-                            );
-                            chip.outer
-                        }
-                        Pool::Toggle(name) => {
-                            let sel = self.extra_refs.iter().any(|r| r == name);
-                            let chip =
-                                crate::repo_chip::repo_chip(ui, name, sel, theme::LILAC, None);
-                            if chip
-                                .name
-                                .explain(
-                                    self.verbosity,
-                                    "Add to the dupe pool",
-                                    "Also check for dupes vs these repos in addition to the \
-                                     target repo.",
-                                )
-                                .clicked()
-                            {
-                                acts.push(Act::ToggleExtraRef(name.clone()));
-                            }
-                            chip.outer
-                        }
+                    if crate::repo_chip::small_button(ui, "NONE", theme::LILAC)
+                        .explain(
+                            self.verbosity,
+                            "Clear the dupe pool",
+                            "Compare against the target only (plus SYNC's single target).",
+                        )
+                        .clicked()
+                    {
+                        self.extra_refs.clear();
                     }
+                });
+                crate::repo_chip::chip_row(ui, "xfer_pool", "", eligible.len(), |ui, i| {
+                    let name = &eligible[i];
+                    let sel = self.extra_refs.iter().any(|r| r == name);
+                    let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::LILAC, None);
+                    if chip
+                        .name
+                        .explain(
+                            self.verbosity,
+                            "Add to the dupe pool",
+                            "Also check for dupes vs these repos in addition to the target repo.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::ToggleExtraRef(name.clone()));
+                    }
+                    chip.outer
                 });
             }
         });

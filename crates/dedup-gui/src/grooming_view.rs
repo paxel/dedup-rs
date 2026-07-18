@@ -418,7 +418,30 @@ impl GroomingView {
                 .filter(|n| self.source.as_deref() != Some(n.as_str()))
                 .cloned()
                 .collect();
-            crate::repo_chip::chip_row(ui, "groom_pool", "DUPEPOOL", pool.len(), |ui, i| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("DUPEPOOL").color(theme::TEXT).size(12.0));
+                if crate::repo_chip::small_button(ui, "ALL", theme::LILAC)
+                    .explain(
+                        self.verbosity,
+                        "Add every eligible repo to the pool",
+                        "A source file is deleted when its content exists in any pool repo.",
+                    )
+                    .clicked()
+                {
+                    self.pool = pool.clone();
+                }
+                if crate::repo_chip::small_button(ui, "NONE", theme::LILAC)
+                    .explain(
+                        self.verbosity,
+                        "Clear the dupe pool",
+                        "No pool repos selected.",
+                    )
+                    .clicked()
+                {
+                    self.pool.clear();
+                }
+            });
+            crate::repo_chip::chip_row(ui, "groom_pool", "", pool.len(), |ui, i| {
                 let name = &pool[i];
                 let sel = self.pool.iter().any(|r| r == name);
                 let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::LILAC, None);

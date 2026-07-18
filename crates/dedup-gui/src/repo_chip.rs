@@ -18,13 +18,18 @@ const GLYPH: f32 = 18.0;
 pub fn identicon(painter: &egui::Painter, rect: Rect, name: &str) {
     // Square the rect from its center so the grid stays regular.
     let side = rect.width().min(rect.height());
-    let rect = Rect::from_center_size(rect.center(), Vec2::splat(side));
+    let tile = Rect::from_center_size(rect.center(), Vec2::splat(side));
     // A dark tile makes the pastel cells legible on any chip fill.
-    painter.rect_filled(rect, 3.0, theme::BLACK);
+    painter.rect_filled(tile, 3.0, theme::BLACK);
 
     let hash = theme::name_hash(name);
     let color = theme::hsl((hash % 360) as f32, 0.55, 0.70);
-    let cell = side / 5.0;
+    // Equal, integer-sized cells centered in the tile with a margin, so every
+    // column is the same width and the grid is exactly left-right symmetric — and
+    // no cell sits flush against the tile edge (which clipped the last column thin).
+    let cell = (side * 0.8 / 5.0).round().max(1.0);
+    let grid = cell * 5.0;
+    let origin = tile.center() - Vec2::splat(grid / 2.0);
     // Bits above the hue byte choose which cells are on: 3 free columns (the
     // other two mirror them) × 5 rows = 15 bits.
     let mut bits = hash >> 9;
@@ -36,7 +41,7 @@ pub fn identicon(painter: &egui::Painter, rect: Rect, name: &str) {
                 continue;
             }
             for c in [col, 4 - col] {
-                let min = rect.min + Vec2::new(c as f32 * cell, row as f32 * cell);
+                let min = origin + Vec2::new(c as f32 * cell, row as f32 * cell);
                 painter.rect_filled(Rect::from_min_size(min, Vec2::splat(cell)), 0.0, color);
             }
         }
@@ -135,16 +140,19 @@ pub fn chip_row(
 
     let avail = ui.available_width();
     let spacing = ui.spacing().item_spacing.x;
-    // The label leads the first row; measure it for packing only.
-    let label_w = ui
-        .painter()
-        .layout_no_wrap(
-            label.to_owned(),
-            egui::FontId::proportional(12.0),
-            theme::TEXT,
-        )
-        .size()
-        .x;
+    // The label (if any) leads the first row; measure it for packing only.
+    let label_w = if label.is_empty() {
+        0.0
+    } else {
+        ui.painter()
+            .layout_no_wrap(
+                label.to_owned(),
+                egui::FontId::proportional(12.0),
+                theme::TEXT,
+            )
+            .size()
+            .x
+    };
 
     // Greedy packing: a chip's footprint is its measured width plus the trailing
     // add_space(8); every chip also carries a leading item_spacing. Row 0 begins
@@ -165,7 +173,7 @@ pub fn chip_row(
     ui.vertical(|ui| {
         for (r, row) in rows.iter().enumerate() {
             ui.horizontal_top(|ui| {
-                if r == 0 {
+                if r == 0 && !label.is_empty() {
                     ui.label(RichText::new(label).color(theme::TEXT).size(12.0));
                 }
                 for &i in row {
@@ -185,6 +193,16 @@ pub fn chip_row(
     if changed {
         ui.ctx().request_repaint();
     }
+}
+
+/// A compact accent-outlined button (used for the MARK ALL / NONE controls that
+/// bulk-toggle a multi-select repo row).
+pub fn small_button(ui: &mut egui::Ui, label: &str, accent: Color32) -> egui::Response {
+    ui.add(
+        egui::Button::new(RichText::new(label).color(accent).size(11.0))
+            .fill(theme::PANEL)
+            .stroke(egui::Stroke::new(1.0, accent)),
+    )
 }
 
 /// The padlock toggle inside a Duplicates chip. Closed blue padlock = read-only

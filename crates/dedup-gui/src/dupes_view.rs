@@ -605,9 +605,10 @@ impl DupesView {
 
     /// Sync the repo list with the store, non-destructively: existing repos keep
     /// their include + read-only state, newly-registered repos default to
-    /// included + read-only (the safe default — deleting is a deliberate unlock),
-    /// and removed repos drop out. Called on first show and whenever the tab is
-    /// re-shown, so the list stays fresh without a manual refresh button.
+    /// *excluded* + read-only (you opt in the repos to search via the chips or
+    /// MARK ALL; read-only stays the safe default — deleting is a deliberate
+    /// unlock), and removed repos drop out. Called on first show and whenever the
+    /// tab is re-shown, so the list stays fresh without a manual refresh button.
     pub fn sync_repos(&mut self, store: &Store) {
         match store.list_repos() {
             Ok(list) => {
@@ -617,7 +618,7 @@ impl DupesView {
                     .map(|(name, _, _)| {
                         let old = prev.iter().find(|r| r.name == name);
                         RepoSel {
-                            included: old.map(|r| r.included).unwrap_or(true),
+                            included: old.map(|r| r.included).unwrap_or(false),
                             read_only: old.map(|r| r.read_only).unwrap_or(true),
                             name,
                         }
@@ -632,9 +633,34 @@ impl DupesView {
 
     fn repo_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         section(theme::LILAC).show(ui, |ui| {
+            // Header: label + bulk MARK ALL / NONE (repos start excluded, so this
+            // is the quick way to include/clear all of them at once).
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("REPOS").color(theme::TEXT).size(12.0));
+                if crate::repo_chip::small_button(ui, "ALL", theme::ORANGE)
+                    .explain(
+                        self.verbosity,
+                        "Include every repo in the search",
+                        "Include (check) every repository so FIND searches them all.",
+                    )
+                    .clicked()
+                {
+                    self.repos.iter_mut().for_each(|r| r.included = true);
+                }
+                if crate::repo_chip::small_button(ui, "NONE", theme::ORANGE)
+                    .explain(
+                        self.verbosity,
+                        "Exclude every repo",
+                        "Exclude (uncheck) every repository. FIND needs at least one included.",
+                    )
+                    .clicked()
+                {
+                    self.repos.iter_mut().for_each(|r| r.included = false);
+                }
+            });
             // The shared wrapping chip row (see `repo_chip::chip_row`) breaks onto
             // multiple lines when the window is narrow.
-            crate::repo_chip::chip_row(ui, "dupes_repos", "REPOS", self.repos.len(), |ui, i| {
+            crate::repo_chip::chip_row(ui, "dupes_repos", "", self.repos.len(), |ui, i| {
                 self.repo_chip(ui, i, acts)
             });
         });
@@ -3712,8 +3738,8 @@ mod ui_tests {
     }
 
     /// Auto-refresh: re-syncing the repo list keeps existing repos' include and
-    /// read-only state, adds newly-registered repos (included + locked), so a
-    /// repo added elsewhere shows up without resetting the user's choices.
+    /// read-only state, adds newly-registered repos with the default (excluded +
+    /// locked), so a repo added elsewhere shows up without resetting choices.
     #[test]
     fn sync_repos_preserves_state_and_adds_new() {
         let (tmp, store) = sample_store(&["A", "B"]);
@@ -3727,12 +3753,12 @@ mod ui_tests {
             ["A", "B"]
         );
         assert!(
-            view.repos.iter().all(|r| r.included && r.read_only),
-            "repos default to included + read-only"
+            view.repos.iter().all(|r| !r.included && r.read_only),
+            "repos default to excluded + read-only"
         );
-        // The user excludes A and unlocks it.
+        // The user includes A and unlocks it (a non-default state to preserve).
         let a = view.repos.iter_mut().find(|r| r.name == "A").unwrap();
-        a.included = false;
+        a.included = true;
         a.read_only = false;
         // A new repo C is registered, then the tab is re-synced.
         let dir = tmp.path().join("C");
@@ -3745,14 +3771,53 @@ mod ui_tests {
         };
         assert_eq!(
             get("A"),
-            (false, false),
-            "A's exclude + unlock survive the re-sync"
+            (true, false),
+            "A's include + unlock survive the re-sync"
         );
-        assert_eq!(get("B"), (true, true), "B is unchanged");
+        assert_eq!(get("B"), (false, true), "B keeps the default");
         assert_eq!(
             get("C"),
-            (true, true),
-            "the new repo C appears with the safe default (included + locked)"
+            (false, true),
+            "the new repo C appears with the default (excluded + locked)"
+        );
+    }
+
+    /// MARK ALL / MARK NONE bulk-toggle every repo's include state (repos start
+    /// excluded by default).
+    #[test]
+    fn mark_all_none_toggles_include() {
+        let (_tmp, store) = sample_store(&SAMPLE_REPOS);
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 360.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default());
+                },
+                DupesView::new(),
+            );
+        harness.run();
+        assert!(
+            harness.state().repos.iter().all(|r| !r.included),
+            "repos start excluded by default"
+        );
+        harness.get_by_label("ALL").click();
+        harness.run();
+        assert!(
+            harness.state().repos.iter().all(|r| r.included),
+            "MARK ALL includes every repo"
+        );
+        harness.get_by_label("NONE").click();
+        harness.run();
+        assert!(
+            harness.state().repos.iter().all(|r| !r.included),
+            "MARK NONE excludes every repo"
         );
     }
 
@@ -3815,10 +3880,12 @@ mod ui_tests {
         // The FILTER wizard sits directly below the REPOS section, so its top
         // reflects the REPOS height — a good guard against an expanded repos bar
         // (the FIND button now sits below FILTER, so it's no longer a tight
-        // proxy for the repos height).
+        // proxy for the repos height). The REPOS section is the MARK ALL/NONE
+        // header line plus one chip row here; an over-expansion regression pushed
+        // it hundreds of px down, so a ~200px ceiling still catches that.
         let filter_top = harness.get_by_label("FILTER").rect().top();
         assert!(
-            filter_top < 160.0,
+            filter_top < 200.0,
             "FILTER section at y={filter_top}; the REPOS section is too tall (expanded?)"
         );
     }
@@ -4082,7 +4149,13 @@ mod ui_tests {
                 },
                 DupesView::new(),
             );
-        harness.run(); // load_repos (all included), initial render
+        harness.run(); // sync_repos (all excluded by default), initial render
+        // Repos start excluded; opt them all in before searching.
+        harness
+            .state_mut()
+            .repos
+            .iter_mut()
+            .for_each(|r| r.included = true);
 
         harness
             .get_by_label(&format!("{} FIND", icon::SEARCH))
@@ -4135,6 +4208,12 @@ mod ui_tests {
         for _ in 0..5 {
             harness.step();
         }
+        // Repos start excluded; opt them all in before searching.
+        harness
+            .state_mut()
+            .repos
+            .iter_mut()
+            .for_each(|r| r.included = true);
 
         harness
             .get_by_label(&format!("{} FIND", icon::SEARCH))

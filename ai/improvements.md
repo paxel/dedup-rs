@@ -27,14 +27,19 @@
 ## Open issues & requests — 2026-07-17
 
 ### Features
-- **Wrap single-line group rows — ✅ done (2026-07-18, REPOS bar).** The Duplicates REPOS
-  chip row now line-breaks onto multiple rows instead of running off the right edge in a
-  narrow window. egui can't wrap the composite `Frame` chips itself (it only wraps items
-  whose size it knows before layout, and any wrapping layout also grabs the full panel
-  height), so `repo_bar` packs the chips into `horizontal_top` rows by hand using each
-  chip's size measured the previous frame (`repo_chip_sizes`); one row reproduces the old
+- **Wrap single-line group rows — ✅ done (2026-07-18, REPOS bar).** Repo chip rows now
+  line-break onto multiple rows instead of running off the right edge in a narrow window.
+  egui can't wrap the composite `Frame` chips itself (it only wraps items whose size it
+  knows before layout, and any wrapping layout also grabs the full panel height), so
+  `repo_chip::chip_row` packs the chips into `horizontal_top` rows by hand using each chip's
+  size measured the previous frame (cached in egui temp memory); one row reproduces the old
   bar exactly, and `repo_chips_wrap_when_narrow` asserts the wrap + per-row top-alignment.
   The compare (file-card) group rows keep their intentional horizontal scroll.
+- **Unified repo selectors — ✅ done (2026-07-18).** Every repo selector (Duplicates,
+  Transfer, Grooming, Browse) renders repos with one shared chip (`repo_chip.rs`): a
+  generated per-repo identicon + name, accent-filled when selected, with a padlock as a 3rd
+  item on Duplicates. All manual REFRESH/RELOAD buttons removed — each view now
+  `sync_repos`es non-destructively when its tab is shown (`app.rs` tracks `synced_tab`).
 - **Compare-group action buttons** — give each compare group its own group-level buttons:
   **mark all**, **mark none**, and **hide group** (hidden until the next FIND). Quicker bulk
   handling of a group without touching each file.
@@ -49,6 +54,35 @@
   switch, so a `mime:`/`tag:` value that doesn't exist in the new repo silently matches
   nothing. Decide: keep as-is (transparent 0-match), surface a warning, or clear conditions
   on repo change. Suggestions already refresh to the new repo.
+
+---
+
+## Open issues & requests — 2026-07-18
+
+### Immediate
+- **Repo selection: mark all / mark none — ✅ done (2026-07-18).** Every multi-select repo
+  row (Duplicates *include*; Transfer & Grooming *dupe pools*) now has MARK ALL / NONE
+  buttons in a header line (`repo_chip::small_button`). Duplicates repos now **default to
+  excluded** — no wall of highlighted chips on open; FIND already says "Select at least one
+  repo" when none are picked. Read-only lock still defaults on (safety).
+
+### Sync groups & remote backup  *(future)*
+- Backing up to a remote is currently manual: DUPLICATE a repo, RELOCATE the copy to the
+  remote path, then UPDATE it. Make it a native feature. Mark repos as a **sync group**:
+  one **main** repo plus one or more remote **sinks**. In the normal repo lists the sinks
+  are **collapsed** (shown only when expanded) and otherwise treated as sinks of their main
+  repo. A dedicated **Sync Groups** tab maintains the groups: run a sync (push main →
+  sinks), detect **external changes in a sink** that may need migrating back to the main,
+  resolve divergence, etc.
+
+### Preview panel → review board  *(near-term; grows into sync compare)*
+- Rework the transfer/grooming preview into a **source ⇄ target table**: unchanged = grey,
+  added = greenish, deleted = red — each with a redundant colorblind-safe cue (`+ / − / =`,
+  emoji, or similar) so color is never the only signal. Give each row **reject** and
+  **apply** buttons per side, turning the preview into a **review board**: the user rejects
+  individual actions and can execute a single action immediately. The same panel later
+  powers **sync-group compare** (deleted / different / new files across group repos; equal
+  files optional — usually too noisy) and **manual per-file sync** between repos.
 
 ---
 
