@@ -40,9 +40,10 @@
   generated per-repo identicon + name, accent-filled when selected, with a padlock as a 3rd
   item on Duplicates. All manual REFRESH/RELOAD buttons removed — each view now
   `sync_repos`es non-destructively when its tab is shown (`app.rs` tracks `synced_tab`).
-- **Compare-group action buttons** — give each compare group its own group-level buttons:
-  **mark all**, **mark none**, and **hide group** (hidden until the next FIND). Quicker bulk
-  handling of a group without touching each file.
+- **Compare-group action buttons — ✅ done (2026-07-18).** Each Duplicates group header now
+  has **MARK ALL** (mark every writable copy for deletion — protected copies skipped),
+  **MARK NONE** (clear the group's marks), and **HIDE** (dismiss the group from the list
+  until the next FIND; `hidden` set, reset on FIND). Buttons use `repo_chip::small_button`.
 
 ### Design questions (filter ↔ repo)
 

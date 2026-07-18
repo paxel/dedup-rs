@@ -273,6 +273,12 @@ enum Act {
     ToggleQuickDelete,
     AutoResolve,
     DeleteGroup(usize),
+    /// Mark every markable (non-protected) file in group `gi` for deletion.
+    MarkGroup(usize),
+    /// Clear the marks on every file in group `gi` (keep them all).
+    UnmarkGroup(usize),
+    /// Dismiss group `gi` from the list until the next FIND.
+    HideGroup(usize),
     AskDelete,
     ConfirmDelete,
     CancelDelete,
@@ -305,6 +311,9 @@ pub struct DupesView {
     preselected_pages: HashSet<usize>,
     /// Group indices deleted this session (rendered collapsed). Reset on FIND.
     resolved: HashSet<usize>,
+    /// Group indices the user dismissed with HIDE GROUP; skipped from the list
+    /// until the next FIND (a triage aid, not a delete). Reset on FIND.
+    hidden: HashSet<usize>,
     /// When on, per-group DELETE NOW buttons appear and delete immediately.
     quick_delete: bool,
     /// Keys handed to the in-flight delete, applied to `marked` on completion.
@@ -387,6 +396,7 @@ impl DupesView {
             unlocked: HashSet::new(),
             preselected_pages: HashSet::new(),
             resolved: HashSet::new(),
+            hidden: HashSet::new(),
             quick_delete: false,
             delete_batch: Vec::new(),
             page: 0,
@@ -552,6 +562,7 @@ impl DupesView {
                             self.unlocked.clear();
                             self.preselected_pages.clear();
                             self.resolved.clear();
+                            self.hidden.clear();
                             self.page = 0;
                             self.cached_page = None;
                             self.error = None;
@@ -944,6 +955,11 @@ impl DupesView {
                 let avail_w = ui.available_width();
                 let spacing = ui.spacing().item_spacing.y;
                 for gi in start..end {
+                    // HIDE GROUP dismisses a group from the list until the next
+                    // FIND — skip it entirely (no card, no reserved space).
+                    if self.hidden.contains(&gi) {
+                        continue;
+                    }
                     // Virtualize: a group we've measured before and that lies
                     // outside the viewport just reserves its known height — we
                     // skip building (and cloning) its widgets entirely. Unmeasured
@@ -1082,6 +1098,41 @@ impl DupesView {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(header).color(theme::AMBER).strong());
+                    // Group-level bulk actions: mark every copy, keep every copy,
+                    // or dismiss the whole group — no need to touch each card.
+                    if crate::repo_chip::small_button(ui, "MARK ALL", theme::RED)
+                        .explain(
+                            self.verbosity,
+                            "Mark every copy in this group for deletion",
+                            "Mark all deletable copies in this group for deletion. \
+                             Protected (locked) copies are left untouched, and nothing is \
+                             removed until you run DELETE.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::MarkGroup(gi));
+                    }
+                    if crate::repo_chip::small_button(ui, "MARK NONE", theme::TAN)
+                        .explain(
+                            self.verbosity,
+                            "Keep every copy in this group",
+                            "Clear all deletion marks in this group, so every copy is kept.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::UnmarkGroup(gi));
+                    }
+                    if crate::repo_chip::small_button(ui, "HIDE", theme::BLUE)
+                        .explain(
+                            self.verbosity,
+                            "Hide this group until the next search",
+                            "Dismiss this group from the list until the next FIND. It isn't \
+                             deleted or changed — just hidden to keep your review focused.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::HideGroup(gi));
+                    }
                     // Quick Delete: one-click removal of this group's marked files.
                     if quick && has_marked {
                         let del = egui::Button::new(
@@ -3453,6 +3504,11 @@ impl DupesView {
             }
             Act::AutoResolve => self.start_auto_resolve(store, ctx),
             Act::DeleteGroup(gi) => self.delete_group(store, ctx, gi),
+            Act::MarkGroup(gi) => self.set_group_mark(gi, true),
+            Act::UnmarkGroup(gi) => self.set_group_mark(gi, false),
+            Act::HideGroup(gi) => {
+                self.hidden.insert(gi);
+            }
             Act::SetPage(p) => self.page = p,
             Act::AskDelete => {
                 let n = self.marked.len();
@@ -3496,6 +3552,35 @@ impl DupesView {
                 .collect()
         };
         self.start_delete(store, ctx, keys, DeleteFollow::Resolve(gi));
+    }
+
+    /// MARK ALL / MARK NONE for a group: set (`mark`) or clear the deletion mark
+    /// on its files. MARK ALL only touches *markable* copies — protected
+    /// (read-only, not individually unlocked) copies are never marked.
+    fn set_group_mark(&mut self, gi: usize, mark: bool) {
+        let keys: Vec<FileKey> = {
+            let Some(page) = self.cached_page else { return };
+            let page_start = page * PAGE_SIZE;
+            let Some(group) = self.page_groups.get(gi.wrapping_sub(page_start)) else {
+                return;
+            };
+            if mark {
+                group
+                    .iter()
+                    .filter(|f| !self.repo_is_ro(&f.repo) || self.unlocked.contains(&key(f)))
+                    .map(key)
+                    .collect()
+            } else {
+                group.iter().map(key).collect()
+            }
+        };
+        for k in keys {
+            if mark {
+                self.marked.insert(k);
+            } else {
+                self.marked.remove(&k);
+            }
+        }
     }
 
     fn included_names(&self) -> Vec<String> {
@@ -4319,6 +4404,63 @@ mod ui_tests {
             "read-only copy is never marked"
         );
         assert!(!m.contains(&("w".into(), "a".into())), "best copy is kept");
+    }
+
+    /// The group-level bulk buttons: MARK NONE clears the group, MARK ALL marks
+    /// every *writable* copy (never the read-only one), and HIDE dismisses the
+    /// whole group from the list.
+    #[test]
+    fn group_bulk_buttons_mark_and_hide() {
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.repos = vec![
+            RepoSel {
+                name: "w".into(),
+                included: true,
+                read_only: false,
+            },
+            RepoSel {
+                name: "ro".into(),
+                included: true,
+                read_only: true,
+            },
+        ];
+        view.results = Some(Results::Similar(vec![vec![
+            dfile("w", "a"),
+            dfile("w", "b"),
+            dfile("ro", "c"),
+        ]]));
+        let mut harness = similar_harness(view);
+
+        harness.get_by_label("MARK NONE").click();
+        harness.run();
+        assert!(
+            harness.state().marked.is_empty(),
+            "MARK NONE clears every mark in the group"
+        );
+
+        harness.get_by_label("MARK ALL").click();
+        harness.run();
+        let m = &harness.state().marked;
+        assert!(
+            m.contains(&("w".into(), "a".into())) && m.contains(&("w".into(), "b".into())),
+            "MARK ALL marks every writable copy (including the best)"
+        );
+        assert!(
+            !m.contains(&("ro".into(), "c".into())),
+            "MARK ALL never marks a protected read-only copy"
+        );
+
+        harness.get_by_label("HIDE").click();
+        harness.run();
+        assert!(
+            harness.state().hidden.contains(&0),
+            "HIDE dismisses the group"
+        );
+        assert!(
+            harness.query_by_label("MARK ALL").is_none(),
+            "a hidden group renders no card (and no buttons)"
+        );
     }
 
     /// A per-file unlock lets one read-only copy be marked: the locked card

@@ -195,8 +195,8 @@ pub fn chip_row(
     }
 }
 
-/// A compact accent-outlined button (used for the MARK ALL / NONE controls that
-/// bulk-toggle a multi-select repo row).
+/// A compact accent-outlined button, shared by the bulk controls (MARK ALL /
+/// NONE on multi-select repo rows, and the per-group MARK/HIDE actions).
 pub fn small_button(ui: &mut egui::Ui, label: &str, accent: Color32) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(label).color(accent).size(11.0))
