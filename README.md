@@ -99,6 +99,9 @@ cargo test
 
 ---
 
+## Packaging & Releases
+Build a Debian package locally with [`packaging/mkdeb.sh`](packaging/mkdeb.sh) (`--snapshot` by default, `--release` for a clean version; runtime `Depends` are auto-derived from the binary). Releases are automatic: pushing a **git tag** makes the [`.builds/`](.builds) sr.ht manifests build and test on native **amd64** and **arm64**, then upload each `.deb` straight to a self-hosted Raspberry Pi (WebDAV/`dufs`, authenticated by a **token** held as an encrypted CI secret), which rebuilds and re-signs its apt repository automatically. [`packaging/release.sh`](packaging/release.sh) does the same build-and-upload from your laptop as a fallback. See [**Releasing & hosting**](docs/hosting.md) for the full one-time setup and the per-release workflow.
+
 ## Documentation & Guidelines
 - [**CLI Reference**](docs/cli.md) — every command, in depth, with examples (multi-ref diff, filter syntax, the sanitize workflow).
 - [**GUI Guide**](docs/gui/index.md) — a walkthrough of every tab and control, with screenshots: [Repositories](docs/gui/repositories.md), [Duplicates](docs/gui/duplicates.md) (lightbox, A/B compare, audio/video preview), [Files](docs/gui/files.md).
