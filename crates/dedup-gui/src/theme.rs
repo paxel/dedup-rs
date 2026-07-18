@@ -35,6 +35,34 @@ pub fn section(color: Color32) -> egui::Frame {
         })
 }
 
+/// FNV-1a hash of a string, used to derive stable per-name colors/patterns.
+pub fn name_hash(s: &str) -> u32 {
+    let mut hash: u32 = 2166136261;
+    for b in s.bytes() {
+        hash ^= u32::from(b);
+        hash = hash.wrapping_mul(16777619);
+    }
+    hash
+}
+
+/// HSL → sRGB. Hue in degrees [0,360), saturation/lightness in [0,1].
+pub fn hsl(h: f32, s: f32, l: f32) -> Color32 {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = h / 60.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r, g, b) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    let to = |v: f32| (((v + m) * 255.0).round()).clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(to(r), to(g), to(b))
+}
+
 fn pill(bg: Color32, fg: Color32) -> WidgetVisuals {
     WidgetVisuals {
         bg_fill: bg,

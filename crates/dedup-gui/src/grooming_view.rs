@@ -235,7 +235,6 @@ enum Act {
     SavePreset,
     ApplyPreset(usize),
     RemovePreset(usize),
-    Reload,
     Preview,
     Ask,
     Confirm,
@@ -279,7 +278,7 @@ impl GroomingView {
         self.verbosity = verbosity;
         self.drain();
         if !self.loaded {
-            self.reload(store);
+            self.sync_repos(store);
         }
 
         let mut acts: Vec<Act> = Vec::new();
@@ -386,66 +385,56 @@ impl GroomingView {
                         acts.push(Act::SetCommand(cmd));
                     }
                 }
-                if ui
-                    .button(RichText::new("RELOAD").color(theme::BLACK))
-                    .explain(
-                        self.verbosity,
-                        "Reload the repository list",
-                        "Reload the list of registered repositories, e.g. after adding one \
-                         in the Repositories tab.",
-                    )
-                    .clicked()
-                {
-                    acts.push(Act::Reload);
-                }
             });
         });
     }
 
     fn dedupe_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         theme::section(theme::LILAC).show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("SOURCE").color(theme::TEXT).size(12.0));
-                for name in &self.repos {
-                    let sel = self.source.as_deref() == Some(name.as_str());
-                    let fill = if sel { theme::ORANGE } else { theme::PANEL };
-                    let col = if sel { theme::BLACK } else { theme::TEXT };
-                    if ui
-                        .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
-                        .explain(
-                            self.verbosity,
-                            "Pick the repo to delete duplicates from",
-                            "Files in this repo whose content is also in any dupe-pool repo \
-                             are deleted from here.",
-                        )
-                        .clicked()
-                    {
-                        acts.push(Act::PickSource(name.clone()));
-                    }
+            // SOURCE: the repo duplicates are deleted from, orange when picked.
+            let src = self.repos.clone();
+            crate::repo_chip::chip_row(ui, "groom_source", "SOURCE", src.len(), |ui, i| {
+                let name = &src[i];
+                let sel = self.source.as_deref() == Some(name.as_str());
+                let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::ORANGE, None);
+                if chip
+                    .name
+                    .explain(
+                        self.verbosity,
+                        "Pick the repo to delete duplicates from",
+                        "Files in this repo whose content is also in any dupe-pool repo are \
+                         deleted from here.",
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::PickSource(name.clone()));
                 }
+                chip.outer
             });
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("DUPEPOOL").color(theme::TEXT).size(12.0));
-                for name in &self.repos {
-                    if self.source.as_deref() == Some(name.as_str()) {
-                        continue;
-                    }
-                    let sel = self.pool.iter().any(|r| r == name);
-                    let fill = if sel { theme::LILAC } else { theme::PANEL };
-                    let col = if sel { theme::BLACK } else { theme::LILAC };
-                    if ui
-                        .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
-                        .explain(
-                            self.verbosity,
-                            "Add to the dupe pool",
-                            "A source file is deleted when its content exists in any of these \
-                             repos. The pool repos themselves are never modified.",
-                        )
-                        .clicked()
-                    {
-                        acts.push(Act::TogglePool(name.clone()));
-                    }
+            // DUPEPOOL: the repos to check the source against, lilac when on.
+            let pool: Vec<String> = self
+                .repos
+                .iter()
+                .filter(|n| self.source.as_deref() != Some(n.as_str()))
+                .cloned()
+                .collect();
+            crate::repo_chip::chip_row(ui, "groom_pool", "DUPEPOOL", pool.len(), |ui, i| {
+                let name = &pool[i];
+                let sel = self.pool.iter().any(|r| r == name);
+                let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::LILAC, None);
+                if chip
+                    .name
+                    .explain(
+                        self.verbosity,
+                        "Add to the dupe pool",
+                        "A source file is deleted when its content exists in any of these repos. \
+                         The pool repos themselves are never modified.",
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::TogglePool(name.clone()));
                 }
+                chip.outer
             });
         });
     }
@@ -640,20 +629,19 @@ impl GroomingView {
     /// A single-repo picker used by PURGE and EMPTY DIRS (they act on one repo).
     fn single_repo_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>, hint: &str) {
         theme::section(theme::LILAC).show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("REPO").color(theme::TEXT).size(12.0));
-                for name in &self.repos {
-                    let sel = self.repo.as_deref() == Some(name.as_str());
-                    let fill = if sel { theme::ORANGE } else { theme::PANEL };
-                    let col = if sel { theme::BLACK } else { theme::TEXT };
-                    if ui
-                        .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
-                        .explain(self.verbosity, "Pick the repo to act on", hint)
-                        .clicked()
-                    {
-                        acts.push(Act::PickRepo(name.clone()));
-                    }
+            let repos = self.repos.clone();
+            crate::repo_chip::chip_row(ui, "groom_repo", "REPO", repos.len(), |ui, i| {
+                let name = &repos[i];
+                let sel = self.repo.as_deref() == Some(name.as_str());
+                let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::ORANGE, None);
+                if chip
+                    .name
+                    .explain(self.verbosity, "Pick the repo to act on", hint)
+                    .clicked()
+                {
+                    acts.push(Act::PickRepo(name.clone()));
                 }
+                chip.outer
             });
             ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
         });
@@ -949,7 +937,6 @@ impl GroomingView {
                     self.save_presets(store);
                 }
             }
-            Act::Reload => self.reload(store),
             Act::Preview => self.run_preview(store),
             Act::Ask => {
                 if let Some(prompt) = self.build_prompt(store) {
@@ -1275,7 +1262,10 @@ impl GroomingView {
         }
     }
 
-    fn reload(&mut self, store: &Store) {
+    /// Sync the repo list with the store, keeping the current source/repo/pool
+    /// picks and dropping any that no longer exist. Called on first show and
+    /// whenever the tab is re-shown, so no manual reload button is needed.
+    pub fn sync_repos(&mut self, store: &Store) {
         if !self.presets_loaded {
             self.load_presets(store);
         }

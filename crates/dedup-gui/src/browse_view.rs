@@ -248,7 +248,10 @@ impl BrowseView {
         }
     }
 
-    fn reload(&mut self, store: &Store) {
+    /// Sync the repo list with the store, keeping the currently browsed repo if
+    /// it still exists. Called on first show and whenever the tab is re-shown, so
+    /// the picker stays fresh without a manual refresh button.
+    pub fn sync_repos(&mut self, store: &Store) {
         match store.list_repos() {
             Ok(list) => {
                 self.repos = list.iter().map(|(n, _, _)| n.clone()).collect();
@@ -462,7 +465,7 @@ impl BrowseView {
     pub fn show(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, verbosity: TooltipVerbosity) {
         self.verbosity = verbosity;
         if !self.loaded {
-            self.reload(store);
+            self.sync_repos(store);
         }
 
         ui.add_space(6.0);
@@ -476,24 +479,29 @@ impl BrowseView {
             ui.colored_label(theme::RED, err);
         }
 
-        // Repo picker (single repo).
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("REPO").color(theme::TEXT).size(12.0));
-            for name in self.repos.clone() {
-                let sel = self.repo.as_deref() == Some(name.as_str());
-                let (fill, col) = if sel {
-                    (theme::AMBER, theme::BLACK)
-                } else {
-                    (theme::PANEL, theme::TEXT)
-                };
-                if ui
-                    .add(egui::Button::new(RichText::new(&name).color(col)).fill(fill))
-                    .clicked()
-                {
-                    self.repo = Some(name);
-                }
+        // Repo picker (single repo), amber when selected.
+        let repos = self.repos.clone();
+        let mut picked: Option<String> = None;
+        crate::repo_chip::chip_row(ui, "browse_repo", "REPO", repos.len(), |ui, i| {
+            let name = &repos[i];
+            let sel = self.repo.as_deref() == Some(name.as_str());
+            let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::AMBER, None);
+            if chip
+                .name
+                .explain(
+                    self.verbosity,
+                    "Browse this repository",
+                    "Load this repository's index and browse its files by directory.",
+                )
+                .clicked()
+            {
+                picked = Some(name.clone());
             }
+            chip.outer
         });
+        if let Some(name) = picked {
+            self.repo = Some(name);
+        }
 
         let Some(repo) = self.repo.clone() else {
             ui.add_space(8.0);

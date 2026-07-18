@@ -122,6 +122,10 @@ enum Action {
 pub struct DedupApp {
     store: Arc<Store>,
     tab: Tab,
+    /// The tab shown last frame; when it changes we re-sync the newly-shown
+    /// view's repo list from the store (so a repo added in the Repositories tab
+    /// appears immediately — no manual refresh button needed).
+    synced_tab: Option<Tab>,
     repos: Vec<RepoRow>,
     load_error: Option<String>,
     /// Transient non-error notice (e.g. a drag-and-drop add summary).
@@ -173,6 +177,7 @@ impl DedupApp {
         let mut app = Self {
             store,
             tab: Tab::Repositories,
+            synced_tab: None,
             repos: Vec::new(),
             load_error: None,
             notice: None,
@@ -274,6 +279,9 @@ impl DedupApp {
                 self.repos = rows;
                 self.load_error = None;
                 self.notice = None;
+                // The repo set may have changed (add/remove/rename/relocate);
+                // force the selector tabs to re-sync when next shown.
+                self.synced_tab = None;
             }
             Err(e) => self.load_error = Some(e.to_string()),
         }
@@ -685,6 +693,21 @@ impl eframe::App for DedupApp {
         // Audio preview belongs to the Duplicates tab; stop it elsewhere.
         if self.tab != Tab::Duplicates {
             self.dupes.stop_audio();
+        }
+        // On each tab switch, re-sync the newly-shown view's repo list from the
+        // store, so repos added/removed elsewhere appear without a refresh
+        // button. (The Repositories tab refreshes its own cards separately.)
+        if self.synced_tab != Some(self.tab) {
+            match self.tab {
+                // The Repositories tab manages its own cards (refreshed after
+                // add/scan operations), so it isn't re-synced here.
+                Tab::Repositories => {}
+                Tab::Duplicates => self.dupes.sync_repos(&self.store),
+                Tab::Transfer => self.transfer.sync_repos(&self.store),
+                Tab::Grooming => self.grooming.sync_repos(&self.store),
+                Tab::Browse => self.browse.sync_repos(&self.store),
+            }
+            self.synced_tab = Some(self.tab);
         }
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Repositories => self.repositories_view(ui, &mut actions),
@@ -1902,29 +1925,7 @@ fn mime_pct(count: u64, total: u64) -> String {
 /// A stable pastel color for a MIME type: the name is hashed to a hue, with
 /// fixed saturation/lightness so every tag shares one cohesive palette.
 fn mime_color(mime: &str) -> Color32 {
-    let mut hash: u32 = 2166136261; // FNV-1a
-    for b in mime.bytes() {
-        hash ^= u32::from(b);
-        hash = hash.wrapping_mul(16777619);
-    }
-    hsl_to_color((hash % 360) as f32, 0.50, 0.74)
-}
-
-fn hsl_to_color(h: f32, s: f32, l: f32) -> Color32 {
-    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
-    let hp = h / 60.0;
-    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
-    let (r, g, b) = match hp as u32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    let m = l - c / 2.0;
-    let to = |v: f32| (((v + m) * 255.0).round()).clamp(0.0, 255.0) as u8;
-    Color32::from_rgb(to(r), to(g), to(b))
+    theme::hsl((theme::name_hash(mime) % 360) as f32, 0.50, 0.74)
 }
 
 /// The repo name Create will use: the typed name, or the chosen folder's own

@@ -12,6 +12,7 @@ mod id3tags;
 mod imgedit;
 mod lightbox;
 mod player;
+mod repo_chip;
 mod settings;
 mod status;
 mod theme;

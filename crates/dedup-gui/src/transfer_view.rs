@@ -251,7 +251,6 @@ enum Act {
     BrowseFolder,
     SubdirChanged,
     BrowseSubdir,
-    Reload,
     Preview,
     Ask,
     Confirm,
@@ -316,7 +315,7 @@ impl TransferView {
         self.verbosity = verbosity;
         self.drain(ui);
         if !self.loaded {
-            self.reload(store);
+            self.sync_repos(store);
         }
 
         let mut acts: Vec<Act> = Vec::new();
@@ -417,7 +416,10 @@ impl TransferView {
         }
     }
 
-    fn reload(&mut self, store: &Store) {
+    /// Sync the repo list with the store, keeping the current source/target/pool
+    /// picks and dropping any that no longer exist. Called on first show and
+    /// whenever the tab is re-shown, so no manual refresh button is needed.
+    pub fn sync_repos(&mut self, store: &Store) {
         match store.list_repos() {
             Ok(list) => {
                 self.repos = list.into_iter().map(|(n, _, _)| n).collect();
@@ -431,6 +433,7 @@ impl TransferView {
                 {
                     self.target = None;
                 }
+                self.extra_refs.retain(|r| self.repos.contains(r));
                 self.loaded = true;
                 self.error = None;
             }
@@ -440,121 +443,117 @@ impl TransferView {
 
     fn repo_rows(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         theme::section(theme::LILAC).show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("SOURCE").color(theme::TEXT).size(12.0));
-                for name in &self.repos {
-                    let sel = self.source.as_deref() == Some(name.as_str());
-                    let fill = if sel { theme::ORANGE } else { theme::PANEL };
-                    let col = if sel { theme::BLACK } else { theme::TEXT };
-                    if ui
-                        .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
-                        .explain(
-                            self.verbosity,
-                            "Pick as the source repo",
-                            "Use this repository as the source: its files are compared \
-                             against the target (and any DupePool repos) to decide what's \
-                             new or already known.",
-                        )
-                        .clicked()
-                    {
-                        acts.push(Act::PickSource(name.clone()));
-                    }
-                }
-                if ui
-                    .button(RichText::new(icon::REFRESH).color(theme::BLACK))
+            // SOURCE: every repo, orange when picked.
+            let src = self.repos.clone();
+            crate::repo_chip::chip_row(ui, "xfer_source", "SOURCE", src.len(), |ui, i| {
+                let name = &src[i];
+                let sel = self.source.as_deref() == Some(name.as_str());
+                let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::ORANGE, None);
+                if chip
+                    .name
                     .explain(
                         self.verbosity,
-                        "Reload the repository list",
-                        "Reload the list of registered repositories, e.g. after adding one \
-                         in the Repositories tab.",
+                        "Pick as the source repo",
+                        "Use this repository as the source: its files are compared against \
+                         the target (and any DupePool repos) to decide what's new or already \
+                         known.",
                     )
                     .clicked()
                 {
-                    acts.push(Act::Reload);
+                    acts.push(Act::PickSource(name.clone()));
                 }
+                chip.outer
             });
-            // The target repo is only chosen when copying/moving into a repo; a
-            // folder export has no target (the folder is the destination).
+
+            // TARGET (only when copying/moving into a repo — a folder export has
+            // no target): the repos that aren't the source, blue when picked.
             if self.destination == Destination::Repo {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("TARGET").color(theme::TEXT).size(12.0));
-                    for name in &self.repos {
-                        // The target is chosen from the repos that are not the source.
-                        if self.source.as_deref() == Some(name.as_str()) {
-                            continue;
-                        }
-                        let sel = self.target.as_deref() == Some(name.as_str());
-                        let fill = if sel { theme::BLUE } else { theme::PANEL };
-                        let col = if sel { theme::BLACK } else { theme::BLUE };
-                        if ui
-                            .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
-                            .explain(
-                                self.verbosity,
-                                "Pick as the target repo",
-                                "Use this repository as the target: it's where COPY/MOVE files \
-                                 land, and it always counts as a reference for deciding what's \
-                                 new.",
-                            )
-                            .clicked()
-                        {
-                            acts.push(Act::PickTarget(name.clone()));
-                        }
-                    }
-                });
-            }
-            // Reference repos: content any of them already holds is treated as
-            // "already known" and never re-copied. In REPO mode the target is
-            // always a reference and is shown as a locked chip. SYNC compares
-            // source against the single target only, so it has no dupe pool.
-            if !self.command.repo_to_repo() {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("DUPEPOOL").color(theme::TEXT).size(12.0));
-                    if self.destination == Destination::Repo
-                        && let Some(target) = self.target.clone()
-                    {
-                        // A locked, non-toggleable chip: the target is always a
-                        // reference. Rendered filled (not disabled) so it reads
-                        // as "on"; clicks are intentionally ignored.
-                        ui.add(
-                            egui::Button::new(
-                                RichText::new(format!("{} {target}", icon::LOCK))
-                                    .color(theme::BLACK),
-                            )
-                            .fill(theme::LILAC),
-                        )
+                let tgt: Vec<String> = self
+                    .repos
+                    .iter()
+                    .filter(|n| self.source.as_deref() != Some(n.as_str()))
+                    .cloned()
+                    .collect();
+                crate::repo_chip::chip_row(ui, "xfer_target", "TARGET", tgt.len(), |ui, i| {
+                    let name = &tgt[i];
+                    let sel = self.target.as_deref() == Some(name.as_str());
+                    let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::BLUE, None);
+                    if chip
+                        .name
                         .explain(
                             self.verbosity,
-                            "Always in the pool (it's the target)",
-                            "The target repo is always in the dupe pool — COPY/MOVE never \
-                         re-copies content the target already has — so it can't be \
-                         toggled off.",
-                        );
-                    }
-                    for name in &self.repos {
-                        // Never a reference to itself; in REPO mode the target is
-                        // shown locked above, so skip it here.
-                        if self.source.as_deref() == Some(name.as_str()) {
-                            continue;
-                        }
-                        if self.destination == Destination::Repo
-                            && self.target.as_deref() == Some(name.as_str())
-                        {
-                            continue;
-                        }
-                        let sel = self.extra_refs.iter().any(|r| r == name);
-                        let fill = if sel { theme::LILAC } else { theme::PANEL };
-                        let col = if sel { theme::BLACK } else { theme::LILAC };
-                        if ui
-                        .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
-                        .explain(
-                            self.verbosity,
-                            "Add to the dupe pool",
-                            "Also check for dupes vs these repos in addition to the target repo.",
+                            "Pick as the target repo",
+                            "Use this repository as the target: it's where COPY/MOVE files land, \
+                             and it always counts as a reference for deciding what's new.",
                         )
                         .clicked()
                     {
-                        acts.push(Act::ToggleExtraRef(name.clone()));
+                        acts.push(Act::PickTarget(name.clone()));
                     }
+                    chip.outer
+                });
+            }
+
+            // DUPEPOOL: content any of these repos already holds is treated as
+            // "already known" and never re-copied. In REPO mode the target is
+            // always a reference, shown as a pinned (always-on) chip. SYNC
+            // compares source against the single target only, so it has no pool.
+            if !self.command.repo_to_repo() {
+                // Pinned target first (if any), then the toggleable pool repos.
+                enum Pool {
+                    Pinned(String),
+                    Toggle(String),
+                }
+                let mut items: Vec<Pool> = Vec::new();
+                if self.destination == Destination::Repo
+                    && let Some(target) = self.target.clone()
+                {
+                    items.push(Pool::Pinned(target));
+                }
+                for name in &self.repos {
+                    if self.source.as_deref() == Some(name.as_str()) {
+                        continue;
+                    }
+                    if self.destination == Destination::Repo
+                        && self.target.as_deref() == Some(name.as_str())
+                    {
+                        continue;
+                    }
+                    items.push(Pool::Toggle(name.clone()));
+                }
+                crate::repo_chip::chip_row(ui, "xfer_pool", "DUPEPOOL", items.len(), |ui, i| {
+                    match &items[i] {
+                        // Always on and non-toggleable: the target is always in the pool.
+                        Pool::Pinned(target) => {
+                            let chip =
+                                crate::repo_chip::repo_chip(ui, target, true, theme::LILAC, None);
+                            chip.name.explain(
+                                self.verbosity,
+                                "Always in the pool (it's the target)",
+                                "The target repo is always in the dupe pool — COPY/MOVE never \
+                                 re-copies content the target already has — so it can't be \
+                                 toggled off.",
+                            );
+                            chip.outer
+                        }
+                        Pool::Toggle(name) => {
+                            let sel = self.extra_refs.iter().any(|r| r == name);
+                            let chip =
+                                crate::repo_chip::repo_chip(ui, name, sel, theme::LILAC, None);
+                            if chip
+                                .name
+                                .explain(
+                                    self.verbosity,
+                                    "Add to the dupe pool",
+                                    "Also check for dupes vs these repos in addition to the \
+                                     target repo.",
+                                )
+                                .clicked()
+                            {
+                                acts.push(Act::ToggleExtraRef(name.clone()));
+                            }
+                            chip.outer
+                        }
                     }
                 });
             }
@@ -1211,7 +1210,6 @@ impl TransferView {
             Act::BrowseFolder => self.browse_folder(ctx),
             Act::SubdirChanged => self.clear_preview(),
             Act::BrowseSubdir => self.browse_subdir(store, ctx),
-            Act::Reload => self.reload(store),
             Act::Preview => self.run_preview(store),
             Act::Ask => {
                 if let Some(prompt) = self.build_prompt(store) {
