@@ -367,9 +367,20 @@ everywhere.
   surfaced too). A full-window "Drop folders to add them as repositories" hint appears while
   folders hover. Blocked during an active update (registry locked, like the ADD button).
   Unit-tested (name sanitizing + de-dupe).
-- **`prune` command (from the old Java tool)** — remove deleted (missing) files from the DB
-  and clean up / compact the index files. *Open question:* still needed with redb, or does
-  compaction/`mark_missing` already cover it? Verify before building.
+- ✅ **`prune` command (from the old Java tool)** — resolved 2026-07-18. *Verified the open
+  question first:* it is **not** covered by `mark_missing` or redb compaction. `mark_missing`
+  keeps a `missing=true` *tombstone* row in `FILES` (unindexed, dropped from the counts,
+  added to `missing_count`) and nothing ever removes it; redb's `compact()` only reclaims
+  free pages, never logical tombstone rows, and wasn't called anywhere. Those tombstones also
+  carry the "content was here, now gone" signal the mirror/diff planner reads, so pruning is
+  deliberately destructive of that history and gated behind a confirm. Shipped as a 5th
+  **PRUNE** grooming command (per-repo, single REPO picker, `5` shortcut, PREVIEW lists the
+  missing records) that drops every `missing` record via `store::remove_entries` **then**
+  compacts the index file. Compaction needs exclusive `&mut` access, so the new
+  `Store::compact_repo` `freeze`s the repo (evicting the shared handle, `Busy` if in use) and
+  reopens the file privately for the rewrite. Tests: core `prune_drops_missing_records_and_keeps_live_ones`
+  (tombstones gone, live entry + `file_count` intact, `missing_count`→0, second prune a
+  no-op), GUI `prune_layout_shows_repo_only` and extended `number_keys_select_command` (`5`).
 - **Wrap single-line group rows** — some group rows (e.g. the repo chips) lay out on one
   horizontal line and scroll out of the frame when there are many items in a small window.
   They should **line-break / wrap** to multiple rows instead. Applies to almost every group

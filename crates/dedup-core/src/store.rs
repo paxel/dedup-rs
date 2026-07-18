@@ -62,6 +62,9 @@ pub enum StoreError {
     #[error("Commit error: {0}")]
     Commit(Box<redb::CommitError>),
 
+    #[error("Compaction error: {0}")]
+    Compaction(Box<redb::CompactionError>),
+
     #[error("Storage I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -117,6 +120,12 @@ impl From<redb::StorageError> for StoreError {
 impl From<redb::CommitError> for StoreError {
     fn from(err: redb::CommitError) -> Self {
         StoreError::Commit(Box::new(err))
+    }
+}
+
+impl From<redb::CompactionError> for StoreError {
+    fn from(err: redb::CompactionError) -> Self {
+        StoreError::Compaction(Box::new(err))
     }
 }
 
@@ -551,6 +560,25 @@ impl Store {
             store: self,
             names: names.iter().map(|n| (*n).to_string()).collect(),
         })
+    }
+
+    /// Rewrite a repo's index file to reclaim the disk space freed by removed
+    /// entries (e.g. by [`remove_entries`] pruning missing tombstones). redb's
+    /// [`compact`](redb::Database::compact) needs exclusive `&mut` access, so the
+    /// name is [`freeze`](Self::freeze)d first — evicting the shared handle and
+    /// failing [`StoreError::Busy`] while any operation still holds one — and the
+    /// file is reopened privately for the rewrite. Returns whether compaction
+    /// actually moved data (redb reports `false` when nothing could be reclaimed).
+    /// The guard drops on return, so the next [`open_repo_db`](Self::open_repo_db)
+    /// reopens the compacted file.
+    pub fn compact_repo(&self, name: &str) -> Result<bool, StoreError> {
+        let _frozen = self.freeze(&[name])?;
+        let path = self.get_repo_db_path(name);
+        if !path.exists() {
+            return Ok(false);
+        }
+        let mut db = redb::Database::open(&path)?;
+        Ok(db.compact()?)
     }
 
     pub fn create_repo(&self, name: &str, path: &str) -> Result<(), StoreError> {

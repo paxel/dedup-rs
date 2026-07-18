@@ -8,6 +8,10 @@
 //!   (wraps `dedup_core::groom::delete_by_filter`).
 //! - **EMPTY DIRS** — remove empty directories under a repo's root
 //!   (wraps `dedup_core::groom::delete_empty_dirs`).
+//! - **ORGANIZE** — move a repo's files into new rule-based paths in place
+//!   (wraps `dedup_core::organize::organize_apply`).
+//! - **PRUNE** — drop missing (deleted-from-disk) records and compact the index
+//!   (wraps `dedup_core::groom::prune`).
 //!
 //! All destructive runs go through a confirmation modal and execute on a
 //! background thread, reusing the same `DiffEvent` progress plumbing as Transfer.
@@ -18,7 +22,9 @@ use crate::theme;
 use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::diff::{DiffAction, DiffEvent, DiffProgress, DiffRun, diff_delete};
-use dedup_core::groom::{delete_by_filter, delete_empty_dirs, preview_by_filter};
+use dedup_core::groom::{
+    delete_by_filter, delete_empty_dirs, preview_by_filter, preview_prune, prune,
+};
 use dedup_core::organize::{DEFAULT_TEMPLATE, OrganizeRule, organize_apply, plan_organize};
 use dedup_core::store::Store;
 use dedup_core::update::CancellationToken;
@@ -59,6 +65,8 @@ enum Command {
     EmptyDirs,
     /// Reorganize a repo's files in place by rule-based path templates.
     Organize,
+    /// Drop missing (deleted-from-disk) records and compact the index.
+    Prune,
 }
 
 impl Command {
@@ -68,6 +76,7 @@ impl Command {
             Command::Purge => "PURGE",
             Command::EmptyDirs => "EMPTY DIRS",
             Command::Organize => "ORGANIZE",
+            Command::Prune => "PRUNE",
         }
     }
     /// (short, verbose) selector-button tooltip.
@@ -96,6 +105,13 @@ impl Command {
                  mime, camera, original name, …). Files matching no rule stay put; nothing \
                  is ever overwritten.",
             ),
+            Command::Prune => (
+                "Forget deleted files and shrink the index",
+                "Permanently remove this repo's records of files that no longer exist on \
+                 disk (its 'missing' entries), then rewrite the index file to reclaim their \
+                 space. The repo's existing files are untouched — only the leftover records \
+                 of already-deleted files are dropped.",
+            ),
         }
     }
 }
@@ -118,6 +134,11 @@ enum OpResult {
         moved: u64,
         skipped: u64,
         errors: u64,
+        cancelled: bool,
+    },
+    Pruned {
+        pruned: u64,
+        compacted: bool,
         cancelled: bool,
     },
     Error(String),
@@ -272,6 +293,7 @@ impl GroomingView {
                     (egui::Key::Num2, Command::Purge),
                     (egui::Key::Num3, Command::EmptyDirs),
                     (egui::Key::Num4, Command::Organize),
+                    (egui::Key::Num5, Command::Prune),
                 ] {
                     if i.key_pressed(key) {
                         acts.push(Act::SetCommand(cmd));
@@ -295,7 +317,7 @@ impl GroomingView {
         );
         crate::util::shortcut_bar(
             ui,
-            "1 dedupe · 2 purge · 3 empty-dirs · 4 organize · P preview · R run",
+            "1 dedupe · 2 purge · 3 empty-dirs · 4 organize · 5 prune · P preview · R run",
         );
 
         self.command_bar(ui, &mut acts);
@@ -315,6 +337,7 @@ impl GroomingView {
             }
             Command::EmptyDirs => self.empty_dirs_layout(ui, &mut acts),
             Command::Organize => self.organize_layout(ui, store, &mut acts),
+            Command::Prune => self.prune_layout(ui, &mut acts),
         }
         self.action_bar(ui, &mut acts);
 
@@ -349,6 +372,7 @@ impl GroomingView {
                     Command::Purge,
                     Command::EmptyDirs,
                     Command::Organize,
+                    Command::Prune,
                 ] {
                     let sel = self.command == cmd;
                     let fill = if sel { theme::RED } else { theme::PANEL };
@@ -432,6 +456,14 @@ impl GroomingView {
 
     fn empty_dirs_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         self.single_repo_bar(ui, acts, "Remove empty directories under this repo's root.");
+    }
+
+    fn prune_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        self.single_repo_bar(
+            ui,
+            acts,
+            "Drop records of files already deleted from this repo, then shrink its index.",
+        );
     }
 
     /// Draw the shared single FILTER wizard (DEDUPE/PURGE) backed by `count_repo`
@@ -797,7 +829,7 @@ impl GroomingView {
         }
         match self.command {
             Command::Dedupe => self.source.is_some() && !self.pool.is_empty(),
-            Command::Purge | Command::EmptyDirs => self.repo.is_some(),
+            Command::Purge | Command::EmptyDirs | Command::Prune => self.repo.is_some(),
             Command::Organize => self.repo.is_some() && !self.rules.is_empty(),
         }
     }
@@ -979,6 +1011,12 @@ impl GroomingView {
                 preview_by_filter(store, &repo, filter.as_deref(), PREVIEW_LIMIT)
                     .map_err(|e| e.to_string())
             }
+            Command::Prune => {
+                let Some(repo) = self.repo.clone() else {
+                    return;
+                };
+                preview_prune(store, &repo, PREVIEW_LIMIT).map_err(|e| e.to_string())
+            }
             Command::Organize => {
                 self.run_preview_organize(store);
                 return;
@@ -1056,6 +1094,15 @@ impl GroomingView {
                 let repo = self.repo.as_ref()?;
                 Some(format!("Remove all empty directories under '{repo}'?"))
             }
+            Command::Prune => {
+                self.run_preview(store);
+                let repo = self.repo.as_ref()?;
+                Some(format!(
+                    "Permanently drop {} record(s) of deleted files from '{repo}' and \
+                     compact its index? This cannot be undone.",
+                    self.preview_total
+                ))
+            }
             Command::Organize => {
                 self.run_preview(store);
                 let repo = self.repo.as_ref()?;
@@ -1128,6 +1175,17 @@ impl GroomingView {
                         Err(e) => OpResult::Error(e.to_string()),
                     }
                 }
+                Command::Prune => {
+                    let Some(repo) = repo else { return };
+                    match prune(&store, &repo, &run) {
+                        Ok(s) => OpResult::Pruned {
+                            pruned: s.pruned,
+                            compacted: s.compacted,
+                            cancelled: s.cancelled,
+                        },
+                        Err(e) => OpResult::Error(e.to_string()),
+                    }
+                }
             };
             let _ = tx.send(Msg::Done(result));
         });
@@ -1190,6 +1248,23 @@ impl GroomingView {
                             self.status = Some(format!(
                                 "Moved {moved}, skipped {skipped}, {errors} error(s){}.",
                                 if cancelled { " (cancelled)" } else { "" }
+                            ));
+                            self.error = None;
+                        }
+                        OpResult::Pruned {
+                            pruned,
+                            compacted,
+                            cancelled,
+                        } => {
+                            self.status = Some(format!(
+                                "Pruned {pruned} record(s){}.",
+                                if cancelled {
+                                    " (cancelled, index not compacted)"
+                                } else if compacted {
+                                    "; index compacted"
+                                } else {
+                                    "; index already compact"
+                                }
                             ));
                             self.error = None;
                         }
@@ -1284,6 +1359,28 @@ mod ui_tests {
         h.run();
         h.run();
         assert!(h.state().command == Command::Organize, "4 selects ORGANIZE");
+
+        h.key_press(egui::Key::Num5);
+        h.run();
+        h.run();
+        assert!(h.state().command == Command::Prune, "5 selects PRUNE");
+    }
+
+    /// PRUNE shows just the single REPO picker — no FILTER and no dupe pool
+    /// (its target is the repo's own missing records).
+    #[test]
+    fn prune_layout_shows_repo_only() {
+        let (_tmp, store) = sample_store();
+        let prune = grooming_harness(store, Command::Prune);
+        assert!(prune.query_by_label("REPO").is_some(), "PRUNE has REPO");
+        assert!(
+            prune.query_by_label("FILTER").is_none(),
+            "PRUNE has no filter"
+        );
+        assert!(
+            prune.query_by_label("DUPEPOOL").is_none(),
+            "PRUNE has no dupe pool"
+        );
     }
 
     /// DEDUPE shows SOURCE + DUPEPOOL + FILTER; PURGE shows a single REPO +

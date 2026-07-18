@@ -125,6 +125,95 @@ pub fn preview_by_filter(
     Ok((sample, total))
 }
 
+/// Outcome of a [`prune`] run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PruneStats {
+    /// Missing (deleted-from-disk) index records dropped from the database.
+    pub pruned: u64,
+    /// Whether the follow-up compaction actually reclaimed disk space (redb
+    /// reports `false` when there was nothing to reclaim).
+    pub compacted: bool,
+    /// The run was cancelled before every tombstone was removed.
+    pub cancelled: bool,
+}
+
+/// The first `limit` missing (deleted-from-disk) record paths in `repo`, plus
+/// the total count of them — the records [`prune`] would drop. Streams the index
+/// without changing anything.
+pub fn preview_prune(
+    store: &Store,
+    repo: &str,
+    limit: usize,
+) -> Result<(Vec<String>, usize), DiffError> {
+    let db = store.open_repo_db(repo)?;
+    let mut sample: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    store::for_each_file_entry(&db, |rel_path, entry: FileEntry| {
+        if entry.missing {
+            total += 1;
+            if sample.len() < limit {
+                sample.push(rel_path.to_string());
+            }
+        }
+        Ok(())
+    })?;
+    Ok((sample, total))
+}
+
+/// Drop every *missing* index record (a tombstone left by [`delete_by_filter`],
+/// a diff delete, or a scan that saw the file vanish) from `repo`'s database,
+/// then compact the file to reclaim the freed space. Missing records carry the
+/// "content was here, now gone" signal the mirror/diff planner reads, so this is
+/// destructive of that history and callers must confirm first. Removals are
+/// batched and cancellable (with a final flush applied even on cancel);
+/// compaction runs only on a full, uncancelled pass. Per-record progress is
+/// reported through `run`.
+pub fn prune(store: &Store, repo: &str, run: &DiffRun<'_>) -> Result<PruneStats, DiffError> {
+    let db = store.open_repo_db(repo)?;
+
+    // Collect first so the read transaction isn't held during the removals.
+    let mut tombstones: Vec<String> = Vec::new();
+    store::for_each_file_entry(&db, |rel_path, entry: FileEntry| {
+        if entry.missing {
+            tombstones.push(rel_path.to_string());
+        }
+        Ok(())
+    })?;
+
+    let total = tombstones.len() as u64;
+    let mut stats = PruneStats::default();
+    let mut batch: Vec<String> = Vec::new();
+
+    for rel_path in &tombstones {
+        if run.cancel.is_cancelled() {
+            stats.cancelled = true;
+            break;
+        }
+        batch.push(rel_path.clone());
+        stats.pruned += 1;
+        run.progress.on(DiffEvent::Progress {
+            action: DiffAction::Delete,
+            done: stats.pruned,
+            total,
+            rel_path: rel_path.clone(),
+        });
+        if batch.len() as u64 >= INDEX_BATCH {
+            store::remove_entries(&db, batch.iter().map(String::as_str))?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        store::remove_entries(&db, batch.iter().map(String::as_str))?;
+    }
+
+    // Release the shared handle before compaction, which needs exclusive access.
+    drop(db);
+    if !stats.cancelled {
+        stats.compacted = store.compact_repo(repo)?;
+    }
+    Ok(stats)
+}
+
 /// Remove every empty directory under `repo`'s root (bottom-up, so a directory
 /// left empty only after its empty children are removed is also pruned). The
 /// repo root itself is never removed. Returns the number of directories

@@ -2,7 +2,7 @@
 //! empty-directory pruning against a real repo in a tempdir.
 
 use dedup_core::diff::{DiffRun, NoDiffProgress};
-use dedup_core::groom::{delete_by_filter, delete_empty_dirs};
+use dedup_core::groom::{delete_by_filter, delete_empty_dirs, preview_prune, prune};
 use dedup_core::update::{CancellationToken, NoProgress, update_repo};
 use std::path::PathBuf;
 
@@ -95,6 +95,55 @@ fn delete_empty_dirs_prunes_bottom_up_but_keeps_root() -> TestResult {
     assert!(!sb.root.join("solo").exists());
     assert!(sb.root.join("full").exists(), "dir with a file is kept");
     assert!(sb.root.exists(), "the repo root itself is never removed");
+    Ok(())
+}
+
+#[test]
+fn prune_drops_missing_records_and_keeps_live_ones() -> TestResult {
+    let sb = Sandbox::new()?;
+    sb.write("keep.txt", b"keep")?;
+    sb.write("cache/a.db", b"db-a")?;
+    sb.write("cache/b.db", b"db-b")?;
+    sb.update()?;
+
+    // Delete the .db files, leaving two missing tombstones behind.
+    let cancel = CancellationToken::new();
+    let run = DiffRun::new(&NoDiffProgress, &cancel);
+    delete_by_filter(&sb.store, "R", Some("name:*.db"), &run)?;
+    assert_eq!(sb.store.get_repo_stats("R")?.missing_count, 2);
+
+    // Preview lists exactly the missing records, without changing anything.
+    let (sample, total) = preview_prune(&sb.store, "R", 10)?;
+    assert_eq!(total, 2);
+    assert_eq!(sample.len(), 2);
+    assert_eq!(
+        sb.store.get_repo_stats("R")?.missing_count,
+        2,
+        "preview is read-only"
+    );
+
+    // Prune removes the tombstones and compacts; the live entry survives.
+    let stats = prune(&sb.store, "R", &run)?;
+    assert_eq!(stats.pruned, 2);
+    assert!(!stats.cancelled);
+    assert_eq!(sb.store.get_repo_stats("R")?.missing_count, 0);
+    assert!(
+        sb.store.get_file_entry("R", "cache/a.db")?.is_none(),
+        "tombstone dropped"
+    );
+    assert!(
+        sb.store.get_file_entry("R", "cache/b.db")?.is_none(),
+        "tombstone dropped"
+    );
+    assert!(
+        !sb.store.get_file_entry("R", "keep.txt")?.unwrap().missing,
+        "live entry untouched"
+    );
+    assert_eq!(sb.store.get_repo_stats("R")?.file_count, 1);
+
+    // A second prune is a no-op (nothing left to drop).
+    let again = prune(&sb.store, "R", &run)?;
+    assert_eq!(again.pruned, 0);
     Ok(())
 }
 
