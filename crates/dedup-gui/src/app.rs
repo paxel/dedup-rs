@@ -70,6 +70,8 @@ enum FolderTarget {
     Add,
     /// The inline relocate editor's path buffer.
     Relocate,
+    /// The inline duplicate editor's path buffer.
+    Duplicate,
 }
 
 /// In-progress inline edit for a repo row.
@@ -135,11 +137,6 @@ pub struct DedupApp {
     new_name: String,
     new_path: String,
     form_error: Option<String>,
-    /// Native folder-picker results delivered from a background thread.
-    folder_tx: Sender<PathBuf>,
-    folder_rx: Receiver<PathBuf>,
-    /// Where the next folder-picker result should land (add form vs relocate).
-    folder_target: FolderTarget,
     edit: Option<Edit>,
 
     show_settings: bool,
@@ -172,7 +169,6 @@ pub struct DedupApp {
 impl DedupApp {
     pub fn new(store: Arc<Store>) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let (folder_tx, folder_rx) = crossbeam_channel::unbounded();
         let (status_tx, status_rx) = crossbeam_channel::unbounded();
         let mut app = Self {
             store,
@@ -185,9 +181,6 @@ impl DedupApp {
             new_name: String::new(),
             new_path: String::new(),
             form_error: None,
-            folder_tx,
-            folder_rx,
-            folder_target: FolderTarget::Add,
             edit: None,
             show_settings: false,
             show_about: false,
@@ -417,7 +410,43 @@ impl DedupApp {
         }
     }
 
-    fn apply(&mut self, ctx: &egui::Context, action: Action) {
+    /// Route a folder chosen from the native picker into whichever field asked
+    /// for it (add form, relocate editor, or duplicate editor).
+    fn route_picked_folder(&mut self, target: FolderTarget, dir: PathBuf) {
+        let picked = dir.to_string_lossy().into_owned();
+        match target {
+            // Add form: fill the path and auto-name from the last path component
+            // unless the user already typed a name.
+            FolderTarget::Add => {
+                if self.new_name.trim().is_empty()
+                    && let Some(base) = dir.file_name()
+                {
+                    self.new_name = base.to_string_lossy().into_owned();
+                }
+                self.new_path = picked;
+            }
+            // Relocate editor: fill its path buffer (if still open).
+            FolderTarget::Relocate => {
+                if let Some(Edit::Relocate { buf, .. }) = &mut self.edit {
+                    *buf = picked;
+                }
+            }
+            // Duplicate editor: fill the path, and auto-name the copy from the
+            // folder's basename unless a name was already typed.
+            FolderTarget::Duplicate => {
+                if let Some(Edit::Duplicate { dest, path, .. }) = &mut self.edit {
+                    if dest.trim().is_empty()
+                        && let Some(base) = dir.file_name()
+                    {
+                        *dest = base.to_string_lossy().into_owned();
+                    }
+                    *path = picked;
+                }
+            }
+        }
+    }
+
+    fn apply(&mut self, ctx: &egui::Context, frame: &eframe::Frame, action: Action) {
         match action {
             Action::Update(name) => self.enqueue(name, JobKind::Update),
             Action::UpdateAll => {
@@ -546,18 +575,16 @@ impl DedupApp {
                 self.form_error = None;
             }
             Action::ChooseFolder(target) => {
-                self.folder_target = target;
-                let tx = self.folder_tx.clone();
-                let repaint = ctx.clone();
-                std::thread::spawn(move || {
-                    if let Some(dir) = rfd::FileDialog::new()
-                        .set_title("Choose a folder")
-                        .pick_folder()
-                    {
-                        let _ = tx.send(dir);
-                        repaint.request_repaint();
-                    }
-                });
+                // Run the native picker modally, parented to our window: it grabs
+                // focus and the app can't spawn a second one while it's open.
+                // This blocks the UI thread until the user picks or cancels.
+                if let Some(dir) = rfd::FileDialog::new()
+                    .set_title("Choose a folder")
+                    .set_parent(frame)
+                    .pick_folder()
+                {
+                    self.route_picked_folder(target, dir);
+                }
             }
             Action::Create => {
                 let path = self.new_path.trim().to_string();
@@ -580,7 +607,7 @@ impl DedupApp {
 }
 
 impl eframe::App for DedupApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         // One-time startup probe of every repo's location/reachability.
         if !self.did_initial_status {
@@ -645,30 +672,6 @@ impl eframe::App for DedupApp {
             }
         }
 
-        // Folder-picker results land in whichever field asked for them.
-        while let Ok(dir) = self.folder_rx.try_recv() {
-            let picked = dir.to_string_lossy().into_owned();
-            match self.folder_target {
-                // Add form: fill the path and auto-name from the last path
-                // component unless the user already typed a name.
-                FolderTarget::Add => {
-                    if self.new_name.trim().is_empty()
-                        && let Some(base) = dir.file_name()
-                    {
-                        self.new_name = base.to_string_lossy().into_owned();
-                    }
-                    self.new_path = picked;
-                }
-                // Relocate editor: fill its path buffer (if still open).
-                FolderTarget::Relocate => {
-                    if let Some(Edit::Relocate { buf, .. }) = &mut self.edit {
-                        *buf = picked;
-                    }
-                }
-            }
-            ctx.request_repaint();
-        }
-
         // Folders dropped onto the window are added as repositories.
         self.handle_dropped_folders(&ctx);
         // While folders hover the window, show a full-window drop affordance.
@@ -712,7 +715,10 @@ impl eframe::App for DedupApp {
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Repositories => self.repositories_view(ui, &mut actions),
             Tab::Duplicates => self.dupes.show(ui, &self.store, self.tooltip_verbosity),
-            Tab::Transfer => self.transfer.show(ui, &self.store, self.tooltip_verbosity),
+            Tab::Transfer => {
+                self.transfer
+                    .show(ui, &self.store, self.tooltip_verbosity, Some(frame))
+            }
             Tab::Grooming => self.grooming.show(ui, &self.store, self.tooltip_verbosity),
             Tab::Browse => self.browse.show(ui, &self.store, self.tooltip_verbosity),
         });
@@ -726,7 +732,7 @@ impl eframe::App for DedupApp {
             self.add_modal(&ctx, &mut actions);
         }
         for action in actions {
-            self.apply(&ctx, action);
+            self.apply(&ctx, frame, action);
         }
 
         // Completions (drained above) free the running slot; the actions loop
@@ -1288,6 +1294,21 @@ impl DedupApp {
                             "Name for the new repository the index is copied into.",
                         );
                     ui.label(RichText::new("PATH").color(theme::LILAC));
+                    if ui
+                        .button(
+                            RichText::new(format!("{} CHOOSE…", icon::FOLDER_OPEN))
+                                .color(theme::BLACK),
+                        )
+                        .explain(
+                            verbosity,
+                            "Pick a folder",
+                            "Open a native folder picker to choose the on-disk folder the \
+                             new repository will point at.",
+                        )
+                        .clicked()
+                    {
+                        actions.push(Action::ChooseFolder(FolderTarget::Duplicate));
+                    }
                     ui.add(
                         egui::TextEdit::singleline(path)
                             .desired_width(240.0)
@@ -2088,6 +2109,39 @@ mod ui_tests {
             update_repo(&store, name, 1, &NoProgress, &CancellationToken::new()).unwrap();
         }
         (tmp, DedupApp::new(store))
+    }
+
+    /// The DUPLICATE editor offers a folder picker (CHOOSE…), like RELOCATE and
+    /// ADD — so the new repo's path can be browsed, not just typed.
+    #[test]
+    fn duplicate_editor_has_a_browse_button() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, mut app) = sample_app();
+        app.edit = Some(Edit::Duplicate {
+            name: "Automatic Upload".into(),
+            dest: String::new(),
+            path: String::new(),
+        });
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 400.0))
+            .build_ui_state(
+                move |ui, app: &mut DedupApp| {
+                    if !init {
+                        icon::install(ui.ctx());
+                        theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let mut actions = Vec::new();
+                    app.repositories_view(ui, &mut actions);
+                },
+                app,
+            );
+        harness.run();
+        assert!(
+            harness.query_by_label_contains("CHOOSE").is_some(),
+            "the DUPLICATE editor should offer a folder-picker button"
+        );
     }
 
     /// A temp store with one scanned repo whose on-disk path is very long, to

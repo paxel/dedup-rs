@@ -210,11 +210,6 @@ pub struct TransferView {
     /// mode; used when a folder export groups by perceptual similarity.
     similar_threshold: f64,
     subdir: String,
-    subdir_tx: Sender<Result<String, String>>,
-    subdir_rx: Receiver<Result<String, String>>,
-    /// Absolute export folder picked by the native folder dialog thread.
-    folder_tx: Sender<Result<String, String>>,
-    folder_rx: Receiver<Result<String, String>>,
     /// The shared FILTER wizard (conditions, presets, suggestions, live count).
     filter: FilterBuilder,
     preview: Vec<PreviewRow>,
@@ -261,8 +256,6 @@ enum Act {
 impl TransferView {
     pub fn new() -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let (subdir_tx, subdir_rx) = crossbeam_channel::unbounded();
-        let (folder_tx, folder_rx) = crossbeam_channel::unbounded();
         Self {
             repos: Vec::new(),
             loaded: false,
@@ -278,10 +271,6 @@ impl TransferView {
             sync_delete_total: 0,
             similar_threshold: 90.0,
             subdir: String::new(),
-            subdir_tx,
-            subdir_rx,
-            folder_tx,
-            folder_rx,
             filter: FilterBuilder::new(),
             preview: Vec::new(),
             preview_total: 0,
@@ -311,7 +300,13 @@ impl TransferView {
         self.similar_threshold = threshold.clamp(50.0, 100.0);
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, verbosity: TooltipVerbosity) {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        store: &Arc<Store>,
+        verbosity: TooltipVerbosity,
+        frame: Option<&eframe::Frame>,
+    ) {
         self.verbosity = verbosity;
         self.drain(ui);
         if !self.loaded {
@@ -410,9 +405,8 @@ impl TransferView {
             self.confirm_modal(ui, &prompt, &mut acts);
         }
 
-        let ctx = ui.ctx().clone();
         for act in acts {
-            self.apply(store, &ctx, act);
+            self.apply(store, frame, act);
         }
     }
 
@@ -1131,7 +1125,7 @@ impl TransferView {
         });
     }
 
-    fn apply(&mut self, store: &Arc<Store>, ctx: &egui::Context, act: Act) {
+    fn apply(&mut self, store: &Arc<Store>, frame: Option<&eframe::Frame>, act: Act) {
         match act {
             Act::PickSource(name) => {
                 if self.target.as_deref() == Some(name.as_str()) {
@@ -1191,9 +1185,17 @@ impl TransferView {
                 self.clear_preview();
             }
             Act::FolderChanged => self.clear_preview(),
-            Act::BrowseFolder => self.browse_folder(ctx),
+            Act::BrowseFolder => {
+                if let Some(frame) = frame {
+                    self.browse_folder(frame);
+                }
+            }
             Act::SubdirChanged => self.clear_preview(),
-            Act::BrowseSubdir => self.browse_subdir(store, ctx),
+            Act::BrowseSubdir => {
+                if let Some(frame) = frame {
+                    self.browse_subdir(store, frame);
+                }
+            }
             Act::Preview => self.run_preview(store),
             Act::Ask => {
                 if let Some(prompt) = self.build_prompt(store) {
@@ -1223,7 +1225,7 @@ impl TransferView {
 
     /// Open the native folder dialog rooted at the target repo and, on a pick,
     /// store the chosen folder as a path relative to the target root.
-    fn browse_subdir(&mut self, store: &Arc<Store>, ctx: &egui::Context) {
+    fn browse_subdir(&mut self, store: &Arc<Store>, frame: &eframe::Frame) {
         let Some(target) = self.target.clone() else {
             return;
         };
@@ -1234,41 +1236,45 @@ impl TransferView {
                 return;
             }
         };
-        let tx = self.subdir_tx.clone();
-        let repaint = ctx.clone();
-        std::thread::spawn(move || {
-            if let Some(dir) = rfd::FileDialog::new()
-                .set_title("Choose a subdirectory inside the target")
-                .set_directory(&target_root)
-                .pick_folder()
-            {
-                let msg = match dir.strip_prefix(&target_root) {
-                    Ok(rel) => Ok(rel.to_string_lossy().replace('\\', "/")),
-                    Err(_) => Err("The chosen folder is outside the target repo.".to_string()),
-                };
-                let _ = tx.send(msg);
-                repaint.request_repaint();
+        // Run the native picker modally, parented to our window, so it grabs
+        // focus and a second one can't be opened while it's up.
+        if let Some(dir) = rfd::FileDialog::new()
+            .set_title("Choose a subdirectory inside the target")
+            .set_directory(&target_root)
+            .set_parent(frame)
+            .pick_folder()
+        {
+            match dir.strip_prefix(&target_root) {
+                Ok(rel) => {
+                    self.subdir = rel.to_string_lossy().replace('\\', "/");
+                    self.error = None;
+                    self.clear_preview();
+                }
+                Err(_) => {
+                    self.error = Some("The chosen folder is outside the target repo.".to_string());
+                }
             }
-        });
+        }
     }
 
     /// Open the native folder dialog and store the picked absolute path as the
     /// export folder (Destination::Folder).
-    fn browse_folder(&mut self, ctx: &egui::Context) {
-        let tx = self.folder_tx.clone();
-        let repaint = ctx.clone();
+    fn browse_folder(&mut self, frame: &eframe::Frame) {
         // Start the dialog in the current folder if it is a real directory.
         let start = Some(self.folder.clone()).filter(|f| Path::new(f).is_dir());
-        std::thread::spawn(move || {
-            let mut dialog = rfd::FileDialog::new().set_title("Choose the export folder");
-            if let Some(dir) = start {
-                dialog = dialog.set_directory(dir);
-            }
-            if let Some(dir) = dialog.pick_folder() {
-                let _ = tx.send(Ok(dir.to_string_lossy().into_owned()));
-                repaint.request_repaint();
-            }
-        });
+        // Run the native picker modally, parented to our window, so it grabs
+        // focus and a second one can't be opened while it's up.
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Choose the export folder")
+            .set_parent(frame);
+        if let Some(dir) = start {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(dir) = dialog.pick_folder() {
+            self.folder = dir.to_string_lossy().into_owned();
+            self.error = None;
+            self.clear_preview();
+        }
     }
 
     /// The current filter expression composed by the shared wizard.
@@ -1682,30 +1688,6 @@ impl TransferView {
 
     fn drain(&mut self, ui: &egui::Ui) {
         let mut got = false;
-        // Apply any subfolder picked by the native subdir dialog thread.
-        while let Ok(picked) = self.subdir_rx.try_recv() {
-            got = true;
-            match picked {
-                Ok(rel) => {
-                    self.subdir = rel;
-                    self.error = None;
-                    self.clear_preview();
-                }
-                Err(e) => self.error = Some(e),
-            }
-        }
-        // Apply any export folder picked by the native folder dialog thread.
-        while let Ok(picked) = self.folder_rx.try_recv() {
-            got = true;
-            match picked {
-                Ok(abs) => {
-                    self.folder = abs;
-                    self.error = None;
-                    self.clear_preview();
-                }
-                Err(e) => self.error = Some(e),
-            }
-        }
         while let Ok(msg) = self.rx.try_recv() {
             got = true;
             match msg {
@@ -1816,7 +1798,7 @@ mod ui_tests {
                         crate::theme::apply(ui.ctx());
                         init = true;
                     }
-                    view.show(ui, &store_ui, TooltipVerbosity::default());
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), None);
                 },
                 view,
             );
@@ -2026,7 +2008,7 @@ mod ui_tests {
                         crate::theme::apply(ui.ctx());
                         init = true;
                     }
-                    view.show(ui, &store_ui, TooltipVerbosity::default());
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), None);
                 },
                 view,
             );
@@ -2066,7 +2048,7 @@ mod ui_tests {
                         crate::theme::apply(ui.ctx());
                         init = true;
                     }
-                    view.show(ui, &store_ui, TooltipVerbosity::default());
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), None);
                 },
                 view,
             );
@@ -2105,7 +2087,7 @@ mod ui_tests {
                         crate::theme::apply(ui.ctx());
                         init = true;
                     }
-                    view.show(ui, &store_ui, TooltipVerbosity::default());
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), None);
                 },
                 view,
             );
