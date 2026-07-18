@@ -523,25 +523,14 @@ impl BrowseView {
         let filter =
             FileFilter::parse(self.filter.filter_string().as_deref()).unwrap_or(FileFilter::All);
 
-        // Clickable breadcrumb, with the Flatten toggle right-aligned.
+        // Clickable breadcrumb, with the Flatten toggle right-aligned. The
+        // toggle is reserved first (right-to-left); the breadcrumb then fills the
+        // gap in a horizontal scroll area, so a deep path scrolls (clipped) rather
+        // than running under the toggle on a narrow window. `stick_to_right` keeps
+        // the current (deepest) segment in view, while the user can still scroll
+        // back toward the repo root; every segment stays individually clickable.
         ui.add_space(2.0);
         ui.horizontal(|ui| {
-            if ui.link(RichText::new(&repo).color(theme::LILAC)).clicked() {
-                self.cur.clear();
-                self.dir_sel = 0;
-                self.file_sel = 0;
-                self.selected.clear();
-            }
-            let segs = self.cur.clone();
-            for (i, seg) in segs.iter().enumerate() {
-                ui.label(RichText::new("›").color(theme::HAIRLINE));
-                if ui.link(RichText::new(seg).color(theme::LILAC)).clicked() {
-                    self.cur.truncate(i + 1);
-                    self.dir_sel = 0;
-                    self.file_sel = 0;
-                    self.selected.clear();
-                }
-            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if pill_toggle(ui, self.flatten, "Flatten")
                     .explain(
@@ -559,6 +548,33 @@ impl BrowseView {
                     self.sel_rel = None;
                     self.selected.clear();
                 }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    egui::ScrollArea::horizontal()
+                        .auto_shrink([false, true])
+                        .stick_to_right(true)
+                        .show(ui, |ui| {
+                            // A ScrollArea lays its content out top-down by
+                            // default; the breadcrumb must stay on one line.
+                            ui.horizontal(|ui| {
+                                if ui.link(RichText::new(&repo).color(theme::LILAC)).clicked() {
+                                    self.cur.clear();
+                                    self.dir_sel = 0;
+                                    self.file_sel = 0;
+                                    self.selected.clear();
+                                }
+                                let segs = self.cur.clone();
+                                for (i, seg) in segs.iter().enumerate() {
+                                    ui.label(RichText::new("›").color(theme::HAIRLINE));
+                                    if ui.link(RichText::new(seg).color(theme::LILAC)).clicked() {
+                                        self.cur.truncate(i + 1);
+                                        self.dir_sel = 0;
+                                        self.file_sel = 0;
+                                        self.selected.clear();
+                                    }
+                                }
+                            });
+                        });
+                });
             });
         });
 
@@ -1923,6 +1939,73 @@ mod tests {
         assert!(
             matches!(h.state().preview, Some(Preview::Bytes { .. })),
             "the preview switched to a byte dump"
+        );
+    }
+
+    /// A temp store with repo "R" holding one indexed file at the given deep
+    /// nested sub-path, so those directories are navigable in Browse.
+    fn store_with_deep_file(segs: &[String]) -> (tempfile::TempDir, Arc<Store>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let repo_dir = tmp.path().join("R");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        store.create_repo("R", &repo_dir.to_string_lossy()).unwrap();
+        let rel = format!("{}/f.bin", segs.join("/"));
+        let mut e = entry();
+        e.mime = Some("application/octet-stream".into());
+        store.update_file_entry("R", &rel, &e).unwrap();
+        (tmp, store)
+    }
+
+    /// A deep breadcrumb in a narrow window must not push the Flatten toggle off
+    /// the edge or run under it: the toggle stays pinned right and fully visible
+    /// while the breadcrumb scrolls (clipped) in the gap.
+    #[test]
+    fn deep_breadcrumb_does_not_overlap_flatten_toggle() {
+        let segs: Vec<String> = (0..8).map(|i| format!("deep-segment-{i}")).collect();
+        let (_tmp, store) = store_with_deep_file(&segs);
+        let mut view = BrowseView::new();
+        view.repo = Some("R".into());
+        let store_ui = Arc::clone(&store);
+        let cur = segs.clone();
+        let width = 520.0;
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(width, 600.0))
+            .build_ui_state(
+                move |ui, view: &mut BrowseView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default());
+                },
+                view,
+            );
+        h.run(); // first frame loads entries and resets `cur`
+        h.state_mut().cur = cur;
+        h.run();
+
+        let flatten = h.get_by_label("Flatten").rect();
+        assert!(
+            flatten.right() <= width + 0.5,
+            "Flatten toggle spilled off the right edge (right={} > {width})",
+            flatten.right()
+        );
+        // Pinned to the right: it wasn't pushed left/hidden by the long path.
+        assert!(
+            flatten.left() >= width - 120.0,
+            "Flatten toggle is not pinned to the right edge (left={})",
+            flatten.left()
+        );
+        // The breadcrumb really overflowed: its deepest segment (kept in view by
+        // `stick_to_right`) sits fully to the left of the toggle — clipped in the
+        // gap, never drawn under it.
+        let tail = h.get_by_label(segs.last().unwrap().as_str()).rect();
+        assert!(
+            tail.right() <= flatten.left() + 0.5,
+            "breadcrumb tail ({tail:?}) overlaps the Flatten toggle ({flatten:?})"
         );
     }
 

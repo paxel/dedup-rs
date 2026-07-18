@@ -295,6 +295,11 @@ pub struct DupesView {
     cached_page: Option<usize>,
     /// Cached rendered height per group index (absolute); `0.0` = not measured.
     group_heights: Vec<f32>,
+    /// Cached rendered size per repo chip, so the wrapping layout can reserve
+    /// each chip's space *before* rendering it (egui only wraps items whose size
+    /// it knows up front — composite `Frame` chips otherwise overflow the row).
+    /// Measured last frame; `ZERO` = not yet measured. See `repo_bar`.
+    repo_chip_sizes: Vec<egui::Vec2>,
     marked: HashSet<FileKey>,
     /// Per-file read-only overrides: files explicitly unlocked (via the
     /// read-only badge's context menu / long press) so a single worse copy in
@@ -377,6 +382,7 @@ impl DupesView {
         Self {
             repos: Vec::new(),
             repos_loaded: false,
+            repo_chip_sizes: Vec::new(),
             mode: Mode::Exact,
             threshold: 99.0,
             results: None,
@@ -632,120 +638,186 @@ impl DupesView {
 
     fn repo_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         section(theme::LILAC).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("REPOS").color(theme::TEXT).size(12.0));
-                // Top-align the chips. A centered row (`horizontal`/
-                // `horizontal_wrapped`) places earlier items progressively higher
-                // as the row height converges, leaving the first repo a few px
-                // above the rest (see the `repo_row_is_aligned` test). Top-align
-                // pins every chip to one line. It stays bounded because it's
-                // nested inside this outer `horizontal`. A horizontal scroll
-                // area keeps many repos on one line instead of overflowing the
-                // window (solid scrollbar from the theme).
-                egui::ScrollArea::horizontal()
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
-                    for (i, repo) in self.repos.iter().enumerate() {
-                    // Name + lock read as one bordered unit per repo, with room
-                    // between the border and the buttons.
-                    egui::Frame::new()
-                        .stroke(egui::Stroke::new(1.0, theme::BLUE))
-                        .corner_radius(8)
-                        .inner_margin(egui::Margin::symmetric(10, 6))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                let (fill, text) = if repo.included {
-                                    (theme::ORANGE, theme::BLACK)
-                                } else {
-                                    (theme::PANEL, theme::TEXT)
-                                };
-                                if ui
-                                    .add(
-                                        egui::Button::new(RichText::new(&repo.name).color(text))
-                                            .fill(fill),
-                                    )
-                                    .explain(
-                                        self.verbosity,
-                                        "Toggle whether this repo is searched",
-                                        "Include or exclude this repository from FIND results. \
-                                         Excluded repos are skipped entirely — their files \
-                                         won't appear as duplicates or as candidates.",
-                                    )
-                                    .clicked()
-                                {
-                                    acts.push(Act::ToggleInclude(i));
-                                }
-                                // Closed padlock = read-only (protected); open
-                                // padlock = deletable.
-                                let (glyph, ro_fill, ro_text, hover, hover_verbose) = if repo.read_only {
-                                    (
-                                        icon::LOCK,
-                                        theme::BLUE,
-                                        theme::BLACK,
-                                        "Locked: files here are protected from deletion — click to allow deleting",
-                                        "This repo is read-only: none of its files are ever \
-                                         preselected or deletable, even by auto-resolve. Click \
-                                         to unlock the whole repo for deletion.",
-                                    )
-                                } else {
-                                    (
-                                        icon::LOCK_OPEN,
-                                        theme::PANEL,
-                                        theme::BLUE,
-                                        "Unlocked: files here can be deleted — click to protect",
-                                        "This repo is unlocked: its files can be marked and \
-                                         deleted like any other. Click to protect it (read-only) \
-                                         again.",
-                                    )
-                                };
-                                if ui
-                                    .add(
-                                        egui::Button::new(RichText::new(glyph).color(ro_text))
-                                            .fill(ro_fill),
-                                    )
-                                    .explain(self.verbosity, hover, hover_verbose)
-                                    .clicked()
-                                {
-                                    acts.push(Act::ToggleRo(i));
-                                }
-                            });
-                        });
-                    ui.add_space(8.0);
+            // Wrap the REPOS label + chips onto multiple rows instead of letting
+            // them run off the right edge when the window is narrow. egui's own
+            // wrap (`horizontal_wrapped`) can't help here for two reasons: it only
+            // breaks between items whose size it knows *before* layout — our chips
+            // are composite `Frame`s sized only after their closure runs, so it
+            // never breaks — and any wrapping layout claims the full panel height
+            // (bloating the section) when there's vertical room below.
+            //
+            // So we pack the chips into rows ourselves, using each chip's size as
+            // measured last frame (`repo_chip_sizes`; the first frame lays them on
+            // one long row, then re-measures and repaints). Plain top-aligned
+            // rows (`horizontal_top`, matching `repo_row_is_aligned`) size to
+            // their content, so the section stays exactly as tall as the rows.
+            let n = self.repos.len();
+            let mut sizes = std::mem::take(&mut self.repo_chip_sizes);
+            sizes.resize(n + 1, egui::Vec2::ZERO); // [0, n) = chips, [n] = REFRESH
+            let avail = ui.available_width();
+            let spacing = ui.spacing().item_spacing.x;
+            // "REPOS" leads the first row; measure it for packing only.
+            let label_w = ui
+                .painter()
+                .layout_no_wrap(
+                    "REPOS".to_owned(),
+                    egui::FontId::proportional(12.0),
+                    theme::TEXT,
+                )
+                .size()
+                .x;
+
+            // Greedy row packing. A chip's footprint is its measured width plus
+            // the trailing `add_space(8)`; every item also carries a leading
+            // `item_spacing`. Row 0 begins already occupied by the label.
+            #[derive(Clone, Copy)]
+            enum Cell {
+                Chip(usize),
+                Refresh,
+            }
+            let footprint = |c: Cell| match c {
+                Cell::Chip(i) => sizes[i].x + 8.0,
+                Cell::Refresh => sizes[n].x,
+            };
+            let mut rows: Vec<Vec<Cell>> = vec![Vec::new()];
+            let mut used = label_w;
+            for c in (0..n).map(Cell::Chip).chain(std::iter::once(Cell::Refresh)) {
+                let w = spacing + footprint(c);
+                if !rows.last().unwrap().is_empty() && used + w > avail {
+                    rows.push(Vec::new());
+                    used = 0.0;
                 }
-                // Inset the refresh button by the chips' frame margin so its top
-                // lines up with the (inset) repo name buttons, not the chip tops.
-                egui::Frame::new()
-                    .inner_margin(egui::Margin {
-                        left: 0,
-                        right: 0,
-                        top: 7,
-                        bottom: 7,
-                    })
-                    .show(ui, |ui| {
-                        let refresh = egui::Button::new(
-                            RichText::new(format!("{} REFRESH", icon::REFRESH))
-                                .color(theme::BLACK),
-                        )
-                        .fill(theme::LILAC);
-                        if ui
-                            .add(refresh)
-                            .explain(
-                                self.verbosity,
-                                "Reload the repository list",
-                                "Reload the list of registered repositories (e.g. after \
-                                 adding one in the Repositories tab). Include/read-only \
-                                 choices for repos that still exist are kept.",
-                            )
-                            .clicked()
-                        {
-                            acts.push(Act::ReloadRepos);
+                used += w;
+                rows.last_mut().unwrap().push(c);
+            }
+
+            let mut changed = false;
+            ui.vertical(|ui| {
+                for (r, row) in rows.iter().enumerate() {
+                    ui.horizontal_top(|ui| {
+                        if r == 0 {
+                            ui.label(RichText::new("REPOS").color(theme::TEXT).size(12.0));
+                        }
+                        for &c in row {
+                            let (idx, resp) = match c {
+                                Cell::Chip(i) => (i, self.repo_chip(ui, i, acts)),
+                                Cell::Refresh => (n, self.refresh_button(ui, acts)),
+                            };
+                            if (resp.rect.size() - sizes[idx]).length() > 0.5 {
+                                sizes[idx] = resp.rect.size();
+                                changed = true;
+                            }
+                            if !matches!(c, Cell::Refresh) {
+                                ui.add_space(8.0);
+                            }
                         }
                     });
-                });
-                    });
+                }
             });
+
+            self.repo_chip_sizes = sizes;
+            // A chip's size changed under us: re-pack the rows with it this frame.
+            if changed {
+                ui.ctx().request_repaint();
+            }
         });
+    }
+
+    /// One repo chip — the name include-toggle plus the read-only padlock, read
+    /// as a single bordered unit. Returns the frame response (its rect feeds the
+    /// wrap packing in [`Self::repo_bar`]).
+    fn repo_chip(&self, ui: &mut egui::Ui, i: usize, acts: &mut Vec<Act>) -> egui::Response {
+        let repo = &self.repos[i];
+        egui::Frame::new()
+            .stroke(egui::Stroke::new(1.0, theme::BLUE))
+            .corner_radius(8)
+            // Name + lock read as one bordered unit per repo, with room between
+            // the border and the buttons.
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (fill, text) = if repo.included {
+                        (theme::ORANGE, theme::BLACK)
+                    } else {
+                        (theme::PANEL, theme::TEXT)
+                    };
+                    if ui
+                        .add(egui::Button::new(RichText::new(&repo.name).color(text)).fill(fill))
+                        .explain(
+                            self.verbosity,
+                            "Toggle whether this repo is searched",
+                            "Include or exclude this repository from FIND results. \
+                             Excluded repos are skipped entirely — their files \
+                             won't appear as duplicates or as candidates.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::ToggleInclude(i));
+                    }
+                    // Closed padlock = read-only (protected); open padlock = deletable.
+                    let (glyph, ro_fill, ro_text, hover, hover_verbose) = if repo.read_only {
+                        (
+                            icon::LOCK,
+                            theme::BLUE,
+                            theme::BLACK,
+                            "Locked: files here are protected from deletion — click to allow deleting",
+                            "This repo is read-only: none of its files are ever \
+                             preselected or deletable, even by auto-resolve. Click \
+                             to unlock the whole repo for deletion.",
+                        )
+                    } else {
+                        (
+                            icon::LOCK_OPEN,
+                            theme::PANEL,
+                            theme::BLUE,
+                            "Unlocked: files here can be deleted — click to protect",
+                            "This repo is unlocked: its files can be marked and \
+                             deleted like any other. Click to protect it (read-only) \
+                             again.",
+                        )
+                    };
+                    if ui
+                        .add(egui::Button::new(RichText::new(glyph).color(ro_text)).fill(ro_fill))
+                        .explain(self.verbosity, hover, hover_verbose)
+                        .clicked()
+                    {
+                        acts.push(Act::ToggleRo(i));
+                    }
+                });
+            })
+            .response
+    }
+
+    /// The REFRESH button, inset so its top lines up with the (inset) repo name
+    /// buttons rather than the chip tops. Returns the frame response.
+    fn refresh_button(&self, ui: &mut egui::Ui, acts: &mut Vec<Act>) -> egui::Response {
+        egui::Frame::new()
+            .inner_margin(egui::Margin {
+                left: 0,
+                right: 0,
+                top: 7,
+                bottom: 7,
+            })
+            .show(ui, |ui| {
+                let refresh = egui::Button::new(
+                    RichText::new(format!("{} REFRESH", icon::REFRESH)).color(theme::BLACK),
+                )
+                .fill(theme::LILAC);
+                if ui
+                    .add(refresh)
+                    .explain(
+                        self.verbosity,
+                        "Reload the repository list",
+                        "Reload the list of registered repositories (e.g. after \
+                         adding one in the Repositories tab). Include/read-only \
+                         choices for repos that still exist are kept.",
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::ReloadRepos);
+                }
+            })
+            .response
     }
 
     fn controls(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
@@ -3774,6 +3846,55 @@ mod ui_tests {
         assert!(
             (refresh_top - base).abs() < 0.75,
             "REFRESH top {refresh_top} != repo name-button top {base}"
+        );
+    }
+
+    /// Many repos in a narrow window must **wrap** onto several rows (rather
+    /// than scroll off-screen), and each wrapped row must stay top-aligned.
+    #[test]
+    fn repo_chips_wrap_when_narrow() {
+        let names: Vec<String> = (0..12).map(|i| format!("repo{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (_tmp, store) = sample_store(&refs);
+
+        let mut view = DupesView::new();
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(420.0, 500.0))
+            .build_ui(move |ui| {
+                if !init {
+                    crate::icon::install(ui.ctx());
+                    crate::theme::apply(ui.ctx());
+                    init = true;
+                }
+                view.show(ui, &store, TooltipVerbosity::default());
+            });
+        harness.run();
+
+        let tops: Vec<f32> = names
+            .iter()
+            .map(|n| harness.get_by_label(n).rect().top())
+            .collect();
+
+        // Cluster tops into rows (0.75 px tolerance, matching the alignment
+        // test). Wrapping means more than one row; top-alignment means the
+        // first row holds several chips that share a top edge.
+        let mut rows: Vec<f32> = Vec::new();
+        for &t in &tops {
+            if !rows.iter().any(|&r| (r - t).abs() < 0.75) {
+                rows.push(t);
+            }
+        }
+        assert!(
+            rows.len() >= 2,
+            "repo chips did not wrap: all {} chips share one row (tops: {tops:?})",
+            tops.len()
+        );
+        let first = tops.iter().cloned().fold(f32::INFINITY, f32::min);
+        let first_row = tops.iter().filter(|&&t| (t - first).abs() < 0.75).count();
+        assert!(
+            first_row >= 2,
+            "first wrapped row is not top-aligned: only {first_row} chip(s) at top {first} (tops: {tops:?})"
         );
     }
 

@@ -770,52 +770,12 @@ impl DedupApp {
                             .size(13.0),
                     );
                     ui.add_space(16.0);
-                    tab_button(
-                        ui,
-                        &mut self.tab,
-                        Tab::Repositories,
-                        "REPOSITORIES",
-                        theme::ORANGE,
-                        self.tooltip_verbosity,
-                        "Add, update, and manage repository links",
-                    );
-                    tab_button(
-                        ui,
-                        &mut self.tab,
-                        Tab::Duplicates,
-                        "DUPLICATES",
-                        theme::LILAC,
-                        self.tooltip_verbosity,
-                        "Find and review exact or perceptually similar duplicates",
-                    );
-                    tab_button(
-                        ui,
-                        &mut self.tab,
-                        Tab::Transfer,
-                        "TRANSFER",
-                        theme::BLUE,
-                        self.tooltip_verbosity,
-                        "Copy or move files between repositories by content",
-                    );
-                    tab_button(
-                        ui,
-                        &mut self.tab,
-                        Tab::Grooming,
-                        "GROOMING",
-                        theme::TAN,
-                        self.tooltip_verbosity,
-                        "Prune and reorganize repositories (coming soon)",
-                    );
-                    tab_button(
-                        ui,
-                        &mut self.tab,
-                        Tab::Browse,
-                        "BROWSE",
-                        theme::AMBER,
-                        self.tooltip_verbosity,
-                        "Browse a repo's files by directory, from the index",
-                    );
-
+                    // SETTINGS/ABOUT are pinned to the right (reserved first, in a
+                    // right-to-left layout); the tab strip fills the space between
+                    // the version and those buttons. The minimum window width can't
+                    // fit all five tabs plus these buttons, so the strip scrolls
+                    // horizontally when cramped (auto-hiding scrollbar) instead of
+                    // letting the last tab slide behind ABOUT.
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
                             .add(egui::Button::new(
@@ -846,6 +806,59 @@ impl DedupApp {
                         {
                             self.show_about = true;
                         }
+                        // The remaining width (left of ABOUT) holds the scrollable
+                        // tab strip, laid out left-to-right in its natural order.
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            egui::ScrollArea::horizontal()
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    tab_button(
+                                        ui,
+                                        &mut self.tab,
+                                        Tab::Repositories,
+                                        "REPOSITORIES",
+                                        theme::ORANGE,
+                                        self.tooltip_verbosity,
+                                        "Add, update, and manage repository links",
+                                    );
+                                    tab_button(
+                                        ui,
+                                        &mut self.tab,
+                                        Tab::Duplicates,
+                                        "DUPLICATES",
+                                        theme::LILAC,
+                                        self.tooltip_verbosity,
+                                        "Find and review exact or perceptually similar duplicates",
+                                    );
+                                    tab_button(
+                                        ui,
+                                        &mut self.tab,
+                                        Tab::Transfer,
+                                        "TRANSFER",
+                                        theme::BLUE,
+                                        self.tooltip_verbosity,
+                                        "Copy or move files between repositories by content",
+                                    );
+                                    tab_button(
+                                        ui,
+                                        &mut self.tab,
+                                        Tab::Grooming,
+                                        "GROOMING",
+                                        theme::TAN,
+                                        self.tooltip_verbosity,
+                                        "Prune and reorganize repositories (coming soon)",
+                                    );
+                                    tab_button(
+                                        ui,
+                                        &mut self.tab,
+                                        Tab::Browse,
+                                        "BROWSE",
+                                        theme::AMBER,
+                                        self.tooltip_verbosity,
+                                        "Browse a repo's files by directory, from the index",
+                                    );
+                                });
+                        });
                     });
                 });
             });
@@ -981,15 +994,26 @@ impl DedupApp {
                             .strong(),
                     );
                     status_pills(ui, row, self.tooltip_verbosity);
-                    ui.label(RichText::new(&row.path).color(theme::TEXT).size(12.0))
-                        .explain(
-                            self.tooltip_verbosity,
-                            &row.path,
-                            &format!("On-disk folder this repository indexes: {}", row.path),
-                        );
-                    // MIME breakdown, share-sorted, pinned to the top-right.
+                    // MIME breakdown, share-sorted, pinned to the top-right. It is
+                    // reserved first (right-to-left) so the path — added inside,
+                    // filling the gap between the status pills and the tags — can
+                    // truncate to fit instead of running under the tags on a narrow
+                    // window (the full path stays on hover). Both share one row.
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         mime_tags(ui, row, self.tooltip_verbosity);
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&row.path).color(theme::TEXT).size(12.0),
+                                )
+                                .truncate(),
+                            )
+                            .explain(
+                                self.tooltip_verbosity,
+                                &row.path,
+                                &format!("On-disk folder this repository indexes: {}", row.path),
+                            );
+                        });
                     });
                 });
                 ui.horizontal(|ui| {
@@ -2066,6 +2090,137 @@ mod ui_tests {
             update_repo(&store, name, 1, &NoProgress, &CancellationToken::new()).unwrap();
         }
         (tmp, DedupApp::new(store))
+    }
+
+    /// A temp store with one scanned repo whose on-disk path is very long, to
+    /// exercise the narrow-window path/MIME overlap.
+    fn app_with_long_path() -> (tempfile::TempDir, DedupApp, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let dir = tmp
+            .path()
+            .join("a/very/deeply/nested/photos/library/originals/2024/imports/raw");
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..4 {
+            std::fs::write(dir.join(format!("f{i}.bin")), format!("data {i}")).unwrap();
+        }
+        store.create_repo("Photos", &dir.to_string_lossy()).unwrap();
+        update_repo(&store, "Photos", 1, &NoProgress, &CancellationToken::new()).unwrap();
+        let path = dir.to_string_lossy().into_owned();
+        (tmp, DedupApp::new(store), path)
+    }
+
+    fn topbar_harness<'a>(app: DedupApp, width: f32) -> Harness<'a, DedupApp> {
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(width, 200.0))
+            .build_ui_state(
+                move |ui, app: &mut DedupApp| {
+                    if !init {
+                        icon::install(ui.ctx());
+                        theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    app.top_bar(ui);
+                },
+                app,
+            );
+        harness.run();
+        harness
+    }
+
+    /// At the minimum window width the five tabs no longer fit beside
+    /// SETTINGS/ABOUT. Those two buttons must stay fully on-screen and pinned to
+    /// the right (the tab strip scrolls, clipped, instead of a tab sliding behind
+    /// ABOUT or SETTINGS spilling off the edge — the reported regression).
+    #[test]
+    fn top_bar_pins_settings_about_when_narrow() {
+        use egui_kittest::kittest::Queryable;
+        let width = 760.0;
+        let (_tmp, app) = sample_app();
+        let harness = topbar_harness(app, width);
+        let settings = harness.get_by_label_contains("SETTINGS").rect();
+        let about = harness.get_by_label("ABOUT").rect();
+        let repos = harness.get_by_label("REPOSITORIES").rect();
+        assert!(
+            settings.right() <= width + 0.5,
+            "SETTINGS spills off the right edge (right={} > {width})",
+            settings.right()
+        );
+        assert!(
+            about.right() <= settings.left() + 0.5,
+            "ABOUT ({about:?}) overlaps SETTINGS ({settings:?})"
+        );
+        // The tab strip lives entirely to the left of ABOUT (it scrolls/clips
+        // there), so no tab is drawn behind ABOUT.
+        assert!(
+            repos.left() < about.left(),
+            "tab strip starts at/after ABOUT — it is not clipped to the left of it"
+        );
+    }
+
+    /// Wide enough for every tab: all five are laid out (none clipped) and
+    /// SETTINGS/ABOUT still sit to their right.
+    #[test]
+    fn top_bar_shows_all_tabs_when_wide() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, app) = sample_app();
+        let harness = topbar_harness(app, 1100.0);
+        for tab in [
+            "REPOSITORIES",
+            "DUPLICATES",
+            "TRANSFER",
+            "GROOMING",
+            "BROWSE",
+        ] {
+            assert!(
+                harness.query_by_label(tab).is_some(),
+                "tab {tab} missing at wide width"
+            );
+        }
+        let browse = harness.get_by_label("BROWSE").rect();
+        let about = harness.get_by_label("ABOUT").rect();
+        assert!(
+            browse.right() <= about.left() + 0.5,
+            "BROWSE ({browse:?}) overlaps ABOUT ({about:?}) even when wide"
+        );
+    }
+
+    /// A long repo path must truncate to the gap between the status pills and the
+    /// MIME tags instead of running under the (right-pinned) MIME tags.
+    #[test]
+    fn repo_card_path_does_not_overlap_mime_tags() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, app, _path) = app_with_long_path();
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(760.0, 300.0))
+            .build_ui_state(
+                move |ui, app: &mut DedupApp| {
+                    if !init {
+                        icon::install(ui.ctx());
+                        theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let mut actions = Vec::new();
+                    app.repositories_view(ui, &mut actions);
+                },
+                app,
+            );
+        harness.run();
+        // The lone repo is all one MIME type, so exactly one MIME pill renders.
+        let mime = harness.get_by_label_contains("100%").rect();
+        assert!(
+            mime.right() <= 760.0 + 0.5,
+            "MIME tag spills off the right edge (right={})",
+            mime.right()
+        );
+        // The path label (truncated) must end at or before the MIME tag begins.
+        let path = harness.get_by_label_contains("nested/photos").rect();
+        assert!(
+            path.right() <= mime.left() + 1.0,
+            "path ({path:?}) runs under the MIME tag ({mime:?})"
+        );
     }
 
     /// The window size is flushed on exit and restored (via `Settings`) on the
