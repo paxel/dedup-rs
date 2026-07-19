@@ -9,7 +9,8 @@
 //! `name:*.db` matches paths ending in `.db` and `name:copy_of*` matches paths
 //! starting with `copy_of`.
 
-use crate::store::{FileEntry, StoreError, for_each_file_entry};
+use crate::store::{FileEntry, StoreError, annotations_of_db, for_each_file_entry};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileFilter {
@@ -24,6 +25,11 @@ pub enum FileFilter {
     Size(SizeOp, u64),
     /// Matches entries whose provenance (`origin`) contains the substring.
     Origin(String),
+    /// Matches entries carrying an annotation tag containing the substring.
+    /// Unlike the other facets this reads the separate annotations table, so
+    /// callers must match through [`AnnotatedFilter`] (or [`FileFilter::matches_tagged`]);
+    /// the bare [`FileFilter::matches`] treats every file as untagged.
+    Anno(String),
     /// Matches entries whose best-known date is >= this epoch-ms.
     TakenAfter(i64),
     /// Matches entries whose best-known date is < this epoch-ms.
@@ -110,7 +116,7 @@ pub enum SizeOp {
 #[derive(thiserror::Error, Debug)]
 pub enum FilterError {
     #[error(
-        "Unknown filter '{0}': expected mime:<substring>, name:<substring>, size:<expr>, or origin:<substring>"
+        "Unknown filter '{0}': expected mime:<substring>, name:<substring>, size:<expr>, origin:<substring>, or tag:<substring>"
     )]
     UnknownFilter(String),
 
@@ -158,8 +164,8 @@ impl FileFilter {
     /// leading text before the first prefix is kept as its own group so
     /// genuinely unknown input is still rejected by `parse_single`.
     fn split_groups(filter: &str) -> Vec<&str> {
-        const PREFIXES: [&str; 7] = [
-            "mime:", "name:", "size:", "origin:", "date:", "before:", "after:",
+        const PREFIXES: [&str; 8] = [
+            "mime:", "name:", "size:", "origin:", "tag:", "date:", "before:", "after:",
         ];
         let bytes = filter.as_bytes();
         let mut starts: Vec<usize> = Vec::new();
@@ -199,6 +205,9 @@ impl FileFilter {
         }
         if let Some(rest) = filter.strip_prefix("origin:") {
             return Ok(Self::Origin(rest.trim().to_string()));
+        }
+        if let Some(rest) = filter.strip_prefix("tag:") {
+            return Ok(Self::Anno(rest.trim().to_string()));
         }
         if let Some(rest) = filter.strip_prefix("date:") {
             let (start, end) = parse_date_span(rest.trim())
@@ -242,7 +251,16 @@ impl FileFilter {
         Ok(Self::Size(op, value))
     }
 
+    /// Whether the file matches, treating it as having no annotation tags. Use
+    /// [`Self::matches_tagged`] (or [`AnnotatedFilter`]) when the filter may
+    /// contain a `tag:` condition and the file's tags are available.
     pub fn matches(&self, rel_path: &str, entry: &FileEntry) -> bool {
+        self.matches_tagged(rel_path, entry, &[])
+    }
+
+    /// Whether the file matches, given its annotation `tags`. Identical to
+    /// [`Self::matches`] for filters without a `tag:` condition.
+    pub fn matches_tagged(&self, rel_path: &str, entry: &FileEntry, tags: &[String]) -> bool {
         match self {
             Self::All => true,
             Self::Mime(substring) => entry
@@ -260,6 +278,7 @@ impl FileFilter {
                 .origin
                 .as_ref()
                 .is_some_and(|origin| origin.contains(substring)),
+            Self::Anno(substring) => tags.iter().any(|t| t.contains(substring)),
             Self::TakenAfter(ms) => best_date_ms(entry) >= *ms,
             Self::TakenBefore(ms) => best_date_ms(entry) < *ms,
             Self::Size(op, value) => match op {
@@ -269,8 +288,55 @@ impl FileFilter {
                 SizeOp::Ge => entry.size >= *value,
                 SizeOp::Eq => entry.size == *value,
             },
-            Self::And(filters) => filters.iter().all(|f| f.matches(rel_path, entry)),
+            Self::And(filters) => filters
+                .iter()
+                .all(|f| f.matches_tagged(rel_path, entry, tags)),
         }
+    }
+
+    /// Whether evaluating this filter needs the annotations table (i.e. it has a
+    /// `tag:` condition anywhere). Lets callers skip loading annotations when the
+    /// filter can't reference them.
+    pub fn uses_annotations(&self) -> bool {
+        match self {
+            Self::Anno(_) => true,
+            Self::And(filters) => filters.iter().any(FileFilter::uses_annotations),
+            _ => false,
+        }
+    }
+}
+
+/// A parsed filter paired with the repo's annotation map, so a streaming caller
+/// can evaluate `tag:` conditions without reopening the annotations table for
+/// every file. The map is loaded once, and only when the filter actually
+/// references annotations.
+pub struct AnnotatedFilter<'a> {
+    filter: &'a FileFilter,
+    annotations: HashMap<String, Vec<String>>,
+}
+
+impl<'a> AnnotatedFilter<'a> {
+    /// Build the matcher for `filter` against `db`'s annotations table.
+    pub fn new(db: &redb::Database, filter: &'a FileFilter) -> Result<Self, StoreError> {
+        let annotations = if filter.uses_annotations() {
+            annotations_of_db(db)?
+        } else {
+            HashMap::new()
+        };
+        Ok(Self {
+            filter,
+            annotations,
+        })
+    }
+
+    /// Whether `rel_path`/`entry` matches, resolving its tags from the loaded map.
+    pub fn matches(&self, rel_path: &str, entry: &FileEntry) -> bool {
+        let tags = self
+            .annotations
+            .get(rel_path)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        self.filter.matches_tagged(rel_path, entry, tags)
     }
 }
 
@@ -317,9 +383,10 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 /// Count the number of present (non-missing) entries in a repo database that
 /// satisfy the given filter. Streams the index without materializing it.
 pub fn count_matches(db: &redb::Database, filter: &FileFilter) -> Result<usize, StoreError> {
+    let annotated = AnnotatedFilter::new(db, filter)?;
     let mut count = 0usize;
     for_each_file_entry(db, |rel_path, entry| {
-        if !entry.missing && filter.matches(rel_path, &entry) {
+        if !entry.missing && annotated.matches(rel_path, &entry) {
             count += 1;
         }
         Ok(())
@@ -460,6 +527,95 @@ mod tests {
     fn invalid_filters_are_rejected() {
         assert!(FileFilter::parse(Some("bogus:x")).is_err());
         assert!(FileFilter::parse(Some("size:abc")).is_err());
+    }
+
+    #[test]
+    fn tag_filter_matches_annotation_substring() -> Result<(), FilterError> {
+        let filter = FileFilter::parse(Some("tag:keep"))?;
+        assert_eq!(filter, FileFilter::Anno("keep".to_string()));
+        assert!(filter.uses_annotations());
+
+        let e = entry(1, None);
+        // The bare `matches` treats every file as untagged.
+        assert!(!filter.matches("a.txt", &e));
+        // `matches_tagged` resolves against the supplied tags (substring).
+        assert!(filter.matches_tagged("a.txt", &e, &["keeper".to_string()]));
+        assert!(!filter.matches_tagged("a.txt", &e, &["trash".to_string()]));
+        assert!(!filter.matches_tagged("a.txt", &e, &[]));
+        Ok(())
+    }
+
+    #[test]
+    fn tag_combines_with_other_facets_via_and() -> Result<(), FilterError> {
+        let filter = FileFilter::parse(Some("mime:image tag:keep"))?;
+        assert_eq!(
+            filter,
+            FileFilter::And(vec![
+                FileFilter::Mime("image".to_string()),
+                FileFilter::Anno("keep".to_string()),
+            ])
+        );
+        assert!(filter.uses_annotations());
+        let img = entry(1, Some("image/png"));
+        assert!(filter.matches_tagged("a.png", &img, &["keeper".to_string()]));
+        // MIME matches but the tag doesn't.
+        assert!(!filter.matches_tagged("a.png", &img, &["trash".to_string()]));
+        // Tag matches but the MIME doesn't.
+        assert!(!filter.matches_tagged(
+            "a.txt",
+            &entry(1, Some("text/plain")),
+            &["keeper".to_string()]
+        ));
+        // A tag-free filter never needs the annotations table.
+        assert!(!FileFilter::parse(Some("mime:image"))?.uses_annotations());
+        Ok(())
+    }
+
+    #[test]
+    fn count_matches_resolves_tag_conditions() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::store::Store;
+
+        let temp_dir = tempfile::tempdir()?;
+        let store = Store::open_at(temp_dir.path().to_path_buf())?;
+        let repo_dir = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&repo_dir)?;
+        store.create_repo("r", &repo_dir.to_string_lossy())?;
+
+        let make = |mime: Option<&str>| FileEntry {
+            size: 1,
+            hash: [0; 32],
+            modified_ms: 0,
+            missing: false,
+            mime: mime.map(str::to_string),
+            img_fingerprint: None,
+            video_hash: None,
+            pdf_hash: None,
+            audio: None,
+            img_size: None,
+            origin: None,
+            exif: None,
+        };
+        store.update_file_entry("r", "a.png", &make(Some("image/png")))?;
+        store.update_file_entry("r", "b.png", &make(Some("image/png")))?;
+        store.update_file_entry("r", "c.txt", &make(Some("text/plain")))?;
+        store.set_annotations("r", "a.png", &["keeper".into()])?;
+        store.set_annotations("r", "c.txt", &["keeper".into()])?;
+
+        let db = store.open_repo_db("r")?;
+        assert_eq!(
+            count_matches(&db, &FileFilter::parse(Some("tag:keep"))?)?,
+            2
+        );
+        assert_eq!(
+            count_matches(&db, &FileFilter::parse(Some("tag:missing"))?)?,
+            0
+        );
+        // Combined with a MIME facet: only the tagged image survives.
+        assert_eq!(
+            count_matches(&db, &FileFilter::parse(Some("mime:image tag:keep"))?)?,
+            1
+        );
+        Ok(())
     }
 
     #[test]

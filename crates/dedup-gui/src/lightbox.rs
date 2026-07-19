@@ -8,6 +8,10 @@
 //! resident). While a decode is in flight the caller draws the 512-px thumbnail
 //! scaled up.
 
+use crate::icon;
+use crate::settings::TooltipVerbosity;
+use crate::theme;
+use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
 use egui::{ColorImage, Context, Rect, TextureHandle, TextureOptions, Vec2};
 use std::collections::{HashMap, HashSet};
@@ -81,6 +85,10 @@ pub struct LightboxState {
     pub audio_active: Option<usize>,
     /// Audio lightbox only: show spectrograms instead of amplitude waveforms.
     pub spectrogram: bool,
+    /// Video lightbox only: the filmstrip still the user pinned (clicked) to show
+    /// enlarged. `None` until they click one — then the middle frame is shown.
+    /// Reset when navigating to another copy.
+    pub video_frame: Option<usize>,
 }
 
 impl LightboxState {
@@ -94,6 +102,7 @@ impl LightboxState {
             compare: None,
             audio_active: None,
             spectrogram: false,
+            video_frame: None,
         }
     }
 
@@ -163,6 +172,163 @@ impl LightboxState {
             self.fit = false;
         }
     }
+}
+
+/// Draw `tex` stretched to `rect`, clipped to `pane` — or a "decoding…" note
+/// while the texture is still being produced.
+pub fn draw_in_pane(ui: &egui::Ui, pane: Rect, rect: Rect, tex: &Option<TextureHandle>) {
+    let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    match tex {
+        Some(tex) => {
+            ui.painter_at(pane)
+                .image(tex.id(), rect, uv, egui::Color32::WHITE);
+        }
+        None => {
+            ui.painter().text(
+                pane.center(),
+                egui::Align2::CENTER_CENTER,
+                "decoding…",
+                egui::FontId::proportional(16.0),
+                theme::TAN,
+            );
+        }
+    }
+}
+
+/// `size` fitted into `target`, centred.
+pub fn fit_rect(target: Rect, size: Vec2) -> Rect {
+    let s = (target.width() / size.x).min(target.height() / size.y);
+    Rect::from_center_size(target.center(), size * s)
+}
+
+/// The shared full-window viewer for one image: wheel zoom around the cursor,
+/// drag pan, FIT / 1:1, Esc or CLOSE to leave. Browse uses it as-is; the
+/// Duplicates lightbox layers compare/mark/edit on the same [`LightboxState`].
+/// Returns `true` when the viewer was closed this frame.
+pub fn single_view(
+    ctx: &Context,
+    state: &mut LightboxState,
+    tex: Option<TextureHandle>,
+    img: Vec2,
+    meta: &str,
+    verbosity: TooltipVerbosity,
+) -> bool {
+    let mut close = false;
+    let (mut do_fit, mut do_one) = (false, false);
+    ctx.input(|i| {
+        if i.key_pressed(egui::Key::Escape) {
+            close = true;
+        }
+        if i.key_pressed(egui::Key::F) {
+            do_fit = true;
+        }
+        if i.key_pressed(egui::Key::Num1) {
+            do_one = true;
+        }
+    });
+    egui::Area::new(egui::Id::new("single_lightbox"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let screen = ctx.content_rect();
+            let bg = ui.allocate_rect(screen, egui::Sense::click_and_drag());
+            ui.painter()
+                .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(238));
+            // Viewport = screen minus the top control bar and bottom meta strip.
+            let viewport = Rect::from_min_max(
+                egui::pos2(screen.min.x + 8.0, screen.min.y + 44.0),
+                egui::pos2(screen.max.x - 8.0, screen.max.y - 50.0),
+            );
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if bg.dragged() {
+                state.pan_by(bg.drag_delta(), viewport, img);
+            }
+            if scroll != 0.0
+                && let Some(c) = ctx.pointer_hover_pos()
+                && viewport.contains(c)
+            {
+                state.zoom_at(c, (scroll * 0.005).exp(), viewport, img);
+            }
+            draw_in_pane(ui, viewport, state.image_rect(viewport, img), &tex);
+
+            // Top control bar: CLOSE / FIT / 1:1.
+            let top = Rect::from_min_max(
+                egui::pos2(screen.min.x + 8.0, screen.min.y + 6.0),
+                egui::pos2(screen.max.x - 8.0, screen.min.y + 40.0),
+            );
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(top)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                |ui| {
+                    let pill = |ui: &mut egui::Ui,
+                                text: &str,
+                                fill: egui::Color32,
+                                col: egui::Color32,
+                                short: &str,
+                                verbose: &str| {
+                        ui.add(egui::Button::new(egui::RichText::new(text).color(col)).fill(fill))
+                            .explain(verbosity, short, verbose)
+                            .clicked()
+                    };
+                    if pill(
+                        ui,
+                        &format!("{} CLOSE", icon::CHECK),
+                        theme::AMBER,
+                        theme::BLACK,
+                        "Close the viewer",
+                        "Close the image viewer (Esc does the same).",
+                    ) {
+                        close = true;
+                    }
+                    if pill(
+                        ui,
+                        "FIT",
+                        theme::PANEL,
+                        theme::TEXT,
+                        "Fit to window",
+                        "Scale the image to fit the viewport (F does the same).",
+                    ) {
+                        do_fit = true;
+                    }
+                    if pill(
+                        ui,
+                        "1:1",
+                        theme::PANEL,
+                        theme::TEXT,
+                        "True pixels",
+                        "Show the image at 100% — one screen pixel per image pixel \
+                         (1 does the same).",
+                    ) {
+                        do_one = true;
+                    }
+                },
+            );
+
+            // Bottom strip: file metadata plus the interaction hint.
+            let p = ui.painter();
+            p.text(
+                egui::pos2(screen.min.x + 10.0, screen.max.y - 28.0),
+                egui::Align2::LEFT_BOTTOM,
+                meta,
+                egui::FontId::proportional(13.0),
+                theme::TAN,
+            );
+            p.text(
+                egui::pos2(screen.min.x + 10.0, screen.max.y - 10.0),
+                egui::Align2::LEFT_BOTTOM,
+                "wheel: zoom · drag: pan · F fit · 1 100% · Esc close",
+                egui::FontId::proportional(12.0),
+                theme::HAIRLINE,
+            );
+        });
+    if do_fit {
+        state.fit();
+    }
+    if do_one {
+        state.one_to_one();
+    }
+    close
 }
 
 struct Request {

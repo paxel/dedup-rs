@@ -14,7 +14,6 @@ use crossbeam_channel::{Receiver, Sender};
 use dedup_core::filter::{FileFilter, count_matches};
 use dedup_core::store::Store;
 use egui::RichText;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -34,7 +33,16 @@ enum FilterKind {
     Mime,
     Name,
     Size,
+    Tag,
 }
+
+/// Every condition kind, in the order they appear in the type picker.
+const FILTER_KINDS: [FilterKind; 4] = [
+    FilterKind::Mime,
+    FilterKind::Name,
+    FilterKind::Size,
+    FilterKind::Tag,
+];
 
 impl FilterKind {
     fn label(self) -> &'static str {
@@ -42,6 +50,7 @@ impl FilterKind {
             FilterKind::Mime => "MIME",
             FilterKind::Name => "NAME",
             FilterKind::Size => "SIZE",
+            FilterKind::Tag => "TAG",
         }
     }
 
@@ -52,6 +61,7 @@ impl FilterKind {
             FilterKind::Mime => "mime",
             FilterKind::Name => "name",
             FilterKind::Size => "size",
+            FilterKind::Tag => "tag",
         }
     }
 
@@ -61,6 +71,7 @@ impl FilterKind {
             "mime" => Some(FilterKind::Mime),
             "name" => Some(FilterKind::Name),
             "size" => Some(FilterKind::Size),
+            "tag" => Some(FilterKind::Tag),
             _ => None,
         }
     }
@@ -70,6 +81,7 @@ impl FilterKind {
             FilterKind::Mime => "image/",
             FilterKind::Name => "*.db or copy_of*",
             FilterKind::Size => ">=1000",
+            FilterKind::Tag => "keeper",
         }
     }
 }
@@ -105,6 +117,7 @@ struct FilterHistory {
     mime: Vec<String>,
     name: Vec<String>,
     size: Vec<String>,
+    tag: Vec<String>,
     presets: Vec<FilterPreset>,
 }
 
@@ -114,6 +127,7 @@ impl FilterHistory {
             FilterKind::Mime => &self.mime,
             FilterKind::Name => &self.name,
             FilterKind::Size => &self.size,
+            FilterKind::Tag => &self.tag,
         }
     }
 
@@ -122,6 +136,7 @@ impl FilterHistory {
             FilterKind::Mime => &mut self.mime,
             FilterKind::Name => &mut self.name,
             FilterKind::Size => &mut self.size,
+            FilterKind::Tag => &mut self.tag,
         }
     }
 
@@ -156,36 +171,18 @@ impl FilterHistory {
         let json = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
         std::fs::write(path, json).map_err(|e| e.to_string())
     }
-
-    /// Merge an imported history into this one: imported values are recorded
-    /// (keeping their order at the front) and imported presets replace
-    /// same-named local presets or are appended.
-    fn merge(&mut self, other: FilterHistory) {
-        for kind in [FilterKind::Mime, FilterKind::Name, FilterKind::Size] {
-            for value in other.for_kind(kind).iter().rev() {
-                self.record_value(kind, value);
-            }
-        }
-        for preset in other.presets {
-            match self.presets.iter_mut().find(|p| p.name == preset.name) {
-                Some(existing) => *existing = preset,
-                None => self.presets.push(preset),
-            }
-        }
-    }
 }
 
 /// Split a filter expression into wizard conditions, mirroring the way
-/// `filter_string` composes it: each `mime:`/`name:`/`size:` prefix at a
+/// `filter_string` composes it: each `mime:`/`name:`/`size:`/`tag:` prefix at a
 /// whitespace boundary starts a new condition whose value runs to the next
 /// prefix. Text before the first prefix is ignored (the wizard only builds
-/// these three kinds).
+/// these kinds).
 fn parse_conditions(expr: &str) -> Vec<FilterCond> {
-    const PREFIXES: [(&str, FilterKind); 3] = [
-        ("mime:", FilterKind::Mime),
-        ("name:", FilterKind::Name),
-        ("size:", FilterKind::Size),
-    ];
+    let prefixes: Vec<(String, FilterKind)> = FILTER_KINDS
+        .iter()
+        .map(|&k| (format!("{}:", k.prefix()), k))
+        .collect();
     let bytes = expr.as_bytes();
     let mut starts: Vec<(usize, FilterKind)> = Vec::new();
     for i in 0..expr.len() {
@@ -194,9 +191,9 @@ fn parse_conditions(expr: &str) -> Vec<FilterCond> {
         }
         let at_boundary = i == 0 || bytes[i - 1].is_ascii_whitespace();
         if at_boundary {
-            for (p, kind) in PREFIXES {
-                if expr[i..].starts_with(p) {
-                    starts.push((i, kind));
+            for (p, kind) in &prefixes {
+                if expr[i..].starts_with(p.as_str()) {
+                    starts.push((i, *kind));
                 }
             }
         }
@@ -204,8 +201,10 @@ fn parse_conditions(expr: &str) -> Vec<FilterCond> {
     let mut conds = Vec::new();
     for (idx, &(start, kind)) in starts.iter().enumerate() {
         let end = starts.get(idx + 1).map(|(s, _)| *s).unwrap_or(expr.len());
-        // Every supported prefix is exactly "xxxx:" — five bytes.
-        let value = expr[start + 5..end].trim().to_string();
+        // Skip past the "<prefix>:" that starts this group (prefix + colon).
+        let value = expr[start + kind.prefix().len() + 1..end]
+            .trim()
+            .to_string();
         if !value.is_empty() {
             conds.push(FilterCond {
                 kind,
@@ -217,13 +216,6 @@ fn parse_conditions(expr: &str) -> Vec<FilterCond> {
     conds
 }
 
-/// Result of a background export/import file dialog, reported to the UI thread.
-enum HistoryIo {
-    Imported(FilterHistory),
-    Exported(PathBuf),
-    Failed(String),
-}
-
 /// Deferred UI action, collected during a frame and applied after the render
 /// closures release their borrow of the builder.
 enum Act {
@@ -232,11 +224,10 @@ enum Act {
     EditCond(usize),
     CommitCond,
     ClearConds,
-    SavePreset,
+    StorePreset,
     ApplyPreset(usize),
     RemovePreset(usize),
-    ExportHistory,
-    ImportHistory,
+    CommitRenamePreset(usize),
     FilterChanged,
 }
 
@@ -258,16 +249,21 @@ pub struct FilterBuilder {
     adding: bool,
     history: FilterHistory,
     history_loaded: bool,
-    /// Name typed for the preset about to be saved.
-    preset_name: String,
+    /// Index of the preset currently being renamed inline, if any.
+    renaming_preset: Option<usize>,
+    /// Text buffer for the in-progress preset rename.
+    rename_buf: String,
+    /// Set for one frame when a rename just started, so its text field can
+    /// grab keyboard focus.
+    focus_rename_pending: bool,
     /// The repo whose MIME stats / match count the wizard reflects, updated when
     /// the host passes a different repo to [`Self::ui`].
     repo: Option<String>,
     /// The `repo`'s MIME stats, cached for the MIME editor's suggestions.
     mime_stats: Vec<(String, u64)>,
-    // Background export/import file-dialog results.
-    io_tx: Sender<HistoryIo>,
-    io_rx: Receiver<HistoryIo>,
+    /// The `repo`'s existing annotation tags (sorted, deduped), cached for the
+    /// TAG editor's suggestions so a tag can be picked instead of retyped.
+    tags: Vec<String>,
     // Debounced background NAME match count against the repo index. A `None`
     // count means the count failed (unparsable filter or unreadable index).
     count_tx: Sender<(u64, Option<usize>)>,
@@ -289,18 +285,18 @@ pub struct FilterBuilder {
 
 impl FilterBuilder {
     pub fn new() -> Self {
-        let (io_tx, io_rx) = crossbeam_channel::unbounded();
         let (count_tx, count_rx) = crossbeam_channel::unbounded();
         Self {
             filters: Vec::new(),
             adding: false,
             history: FilterHistory::default(),
             history_loaded: false,
-            preset_name: String::new(),
+            renaming_preset: None,
+            rename_buf: String::new(),
+            focus_rename_pending: false,
             repo: None,
             mime_stats: Vec::new(),
-            io_tx,
-            io_rx,
+            tags: Vec::new(),
             count_tx,
             count_rx,
             count_token: 0,
@@ -360,10 +356,22 @@ impl FilterBuilder {
                 Some(r) => store.get_mime_stats(r).unwrap_or_default(),
                 None => Vec::new(),
             };
+            self.reload_tags(store);
             self.schedule_count();
         }
+        // The tag list grows as files are annotated (in Browse), and the repo
+        // doesn't change while that happens — so reload it whenever a TAG
+        // condition's editor is open, keeping the pick-list current. Cheap: the
+        // annotations table only holds annotated files.
+        if self
+            .filters
+            .iter()
+            .any(|c| c.kind == FilterKind::Tag && c.editing)
+        {
+            self.reload_tags(store);
+        }
 
-        self.drain(store);
+        self.drain();
 
         let mut acts: Vec<Act> = Vec::new();
         self.filter_bar(ui, &mut acts);
@@ -382,137 +390,162 @@ impl FilterBuilder {
         }
     }
 
-    fn filter_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::LILAC).show(ui, |ui| {
-            let mut editing_idx = None;
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("FILTER").color(theme::TEXT).size(12.0));
-
-                // One pill per active condition: a clickable label opening its
-                // editor, followed by a small remove button.
-                for (i, cond) in self.filters.iter().enumerate() {
-                    if cond.editing {
-                        editing_idx = Some(i);
-                    }
-                    let shown = cond.value.trim();
-                    let text = if shown.is_empty() {
-                        format!("{}: …", cond.kind.label())
-                    } else {
-                        format!("{}: {}", cond.kind.label(), shown)
-                    };
-                    let fill = if cond.editing {
-                        theme::ORANGE
-                    } else {
-                        theme::PANEL
-                    };
-                    let col = if cond.editing {
-                        theme::BLACK
-                    } else {
-                        theme::TEXT
-                    };
-                    if ui
-                        .add(egui::Button::new(RichText::new(text).color(col)).fill(fill))
-                        .explain(
-                            self.verbosity,
-                            "Edit this condition",
-                            "Open this filter condition's inline editor to change its value.",
-                        )
-                        .clicked()
-                    {
-                        acts.push(Act::EditCond(i));
-                    }
-                    if ui
-                        .add(egui::Button::new(RichText::new("×").color(theme::RED)))
-                        .explain(
-                            self.verbosity,
-                            "Remove this condition",
-                            "Remove this filter condition. Remaining conditions still combine \
-                             with AND.",
-                        )
-                        .clicked()
-                    {
-                        acts.push(Act::RemoveCond(i));
-                    }
+    /// Reload the current repo's distinct annotation tags (sorted) for the TAG
+    /// editor's pick-list. Empty when no repo is selected.
+    fn reload_tags(&mut self, store: &Store) {
+        self.tags = match self.repo.as_deref() {
+            Some(r) => {
+                let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+                for tags in store.all_annotations(r).unwrap_or_default().into_values() {
+                    set.extend(tags);
                 }
-
-                // The trailing `+` pill toggles the type picker.
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("+").color(theme::BLACK))
-                            .fill(theme::AMBER),
-                    )
-                    .explain(
-                        self.verbosity,
-                        "Add a filter condition",
-                        "Show the MIME / NAME / SIZE condition-type picker to add another \
-                         filter condition. Multiple conditions combine with AND.",
-                    )
-                    .clicked()
-                {
-                    self.adding = !self.adding;
-                }
-                if self.adding {
-                    for kind in [FilterKind::Mime, FilterKind::Name, FilterKind::Size] {
-                        let (short, verbose) = match kind {
-                            FilterKind::Mime => (
-                                "Filter by MIME type",
-                                "Match files whose detected MIME type contains this substring \
-                                 (e.g. \"image/\" matches every image type).",
-                            ),
-                            FilterKind::Name => (
-                                "Filter by path (with wildcards)",
-                                "Match files by relative path: a plain substring, or a `*` \
-                                 wildcard glob like \"*.db\" (ends with) or \"copy_of*\" \
-                                 (starts with).",
-                            ),
-                            FilterKind::Size => (
-                                "Filter by size",
-                                "Match files by size with an operator and byte count, e.g. \
-                                 \">=1000\" or \"<500000\".",
-                            ),
-                        };
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new(kind.label()).color(theme::BLUE))
-                                    .fill(theme::PANEL),
-                            )
-                            .explain(self.verbosity, short, verbose)
-                            .clicked()
-                        {
-                            acts.push(Act::AddCond(kind));
-                        }
-                    }
-                }
-
-                if !self.filters.is_empty()
-                    && ui
-                        .add(
-                            egui::Button::new(RichText::new("CLEAR").color(theme::BLACK))
-                                .fill(theme::RED),
-                        )
-                        .explain(
-                            self.verbosity,
-                            "Remove every condition",
-                            "Remove every filter condition, going back to matching all files.",
-                        )
-                        .clicked()
-                {
-                    acts.push(Act::ClearConds);
-                }
-            });
-
-            // Inline editor panel for the condition currently being edited.
-            if let Some(idx) = editing_idx {
-                self.cond_editor(ui, idx, acts);
+                set.into_iter().collect()
             }
-
-            self.preset_row(ui, acts);
-        });
+            None => Vec::new(),
+        };
     }
 
-    /// The saved-preset row: one pill per preset (click to apply, `×` to
-    /// forget), a name field + SAVE for the current condition set, and
-    /// EXPORT / IMPORT of the whole history as a JSON file.
+    fn filter_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        crate::lcars::section_lcars(
+            ui,
+            "FILTER — NARROW WHICH FILES COUNT",
+            theme::LILAC,
+            |ui| {
+                let mut editing_idx = None;
+                ui.horizontal_wrapped(|ui| {
+                    // One pill per active condition: a clickable label opening its
+                    // editor, followed by a small remove button.
+                    for (i, cond) in self.filters.iter().enumerate() {
+                        if cond.editing {
+                            editing_idx = Some(i);
+                        }
+                        let shown = cond.value.trim();
+                        let text = if shown.is_empty() {
+                            format!("{}: …", cond.kind.label())
+                        } else {
+                            format!("{}: {}", cond.kind.label(), shown)
+                        };
+                        let fill = if cond.editing {
+                            theme::ORANGE
+                        } else {
+                            theme::PANEL
+                        };
+                        let col = if cond.editing {
+                            theme::BLACK
+                        } else {
+                            theme::TEXT
+                        };
+                        if ui
+                            .add(egui::Button::new(RichText::new(text).color(col)).fill(fill))
+                            .explain(
+                                self.verbosity,
+                                "Edit this condition",
+                                "Open this filter condition's inline editor to change its value.",
+                            )
+                            .clicked()
+                        {
+                            acts.push(Act::EditCond(i));
+                        }
+                        if ui
+                            .add(egui::Button::new(RichText::new("×").color(theme::RED)))
+                            .explain(
+                                self.verbosity,
+                                "Remove this condition",
+                                "Remove this filter condition. Remaining conditions still combine \
+                             with AND.",
+                            )
+                            .clicked()
+                        {
+                            acts.push(Act::RemoveCond(i));
+                        }
+                    }
+
+                    // The trailing `+` pill toggles the type picker.
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("+").color(theme::BLACK))
+                                .fill(theme::AMBER),
+                        )
+                        .explain(
+                            self.verbosity,
+                            "Add a filter condition",
+                            "Show the MIME / NAME / SIZE condition-type picker to add another \
+                         filter condition. Multiple conditions combine with AND.",
+                        )
+                        .clicked()
+                    {
+                        self.adding = !self.adding;
+                    }
+                    if self.adding {
+                        for kind in FILTER_KINDS {
+                            let (short, verbose) = match kind {
+                                FilterKind::Mime => (
+                                    "Filter by MIME type",
+                                    "Match files whose detected MIME type contains this substring \
+                                 (e.g. \"image/\" matches every image type).",
+                                ),
+                                FilterKind::Name => (
+                                    "Filter by path (with wildcards)",
+                                    "Match files by relative path: a plain substring, or a `*` \
+                                 wildcard glob like \"*.db\" (ends with) or \"copy_of*\" \
+                                 (starts with).",
+                                ),
+                                FilterKind::Size => (
+                                    "Filter by size",
+                                    "Match files by size with an operator and byte count, e.g. \
+                                 \">=1000\" or \"<500000\".",
+                                ),
+                                FilterKind::Tag => (
+                                    "Filter by tag",
+                                    "Match files carrying a tag that contains this text. Add \
+                                 tags to files in the Browse tab.",
+                                ),
+                            };
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(kind.label()).color(theme::BLUE),
+                                    )
+                                    .fill(theme::PANEL),
+                                )
+                                .explain(self.verbosity, short, verbose)
+                                .clicked()
+                            {
+                                acts.push(Act::AddCond(kind));
+                            }
+                        }
+                    }
+
+                    if !self.filters.is_empty()
+                        && ui
+                            .add(
+                                egui::Button::new(RichText::new("CLEAR").color(theme::BLACK))
+                                    .fill(theme::RED),
+                            )
+                            .explain(
+                                self.verbosity,
+                                "Remove every condition",
+                                "Remove every filter condition, going back to matching all files.",
+                            )
+                            .clicked()
+                    {
+                        acts.push(Act::ClearConds);
+                    }
+                });
+
+                // Inline editor panel for the condition currently being edited.
+                if let Some(idx) = editing_idx {
+                    self.cond_editor(ui, idx, acts);
+                }
+
+                self.preset_row(ui, acts);
+            },
+        );
+    }
+
+    /// The saved-preset row: one pill per preset (click to apply, right-click
+    /// to rename, `×` to forget), and a STORE PRESET pill that saves the
+    /// current condition set under an auto-generated name.
     fn preset_row(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         if !self.adding && self.filters.is_empty() && self.history.presets.is_empty() {
             return;
@@ -520,21 +553,52 @@ impl FilterBuilder {
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("PRESETS").color(theme::TEXT).size(12.0));
-            for (i, preset) in self.history.presets.iter().enumerate() {
-                if ui
+            // Snapshot names first so the loop body is free to mutate `self`
+            // (rename state) without fighting a borrow of `self.history`.
+            let presets: Vec<(usize, String)> = self
+                .history
+                .presets
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (i, p.name.clone()))
+                .collect();
+            for (i, name) in presets {
+                if self.renaming_preset == Some(i) {
+                    let resp = ui
+                        .add(egui::TextEdit::singleline(&mut self.rename_buf).desired_width(120.0));
+                    if self.focus_rename_pending {
+                        resp.request_focus();
+                        self.focus_rename_pending = false;
+                    }
+                    if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        self.renaming_preset = None;
+                    } else if resp.lost_focus() {
+                        acts.push(Act::CommitRenamePreset(i));
+                    }
+                    continue;
+                }
+                let resp = ui
                     .add(
-                        egui::Button::new(RichText::new(&preset.name).color(theme::TAN))
+                        egui::Button::new(RichText::new(&name).color(theme::TAN))
                             .fill(theme::PANEL),
                     )
                     .explain(
                         self.verbosity,
                         "Apply this preset",
-                        "Replace the current filter conditions with this saved preset.",
-                    )
-                    .clicked()
-                {
+                        "Replace the current filter conditions with this saved preset. \
+                         Right-click to rename it.",
+                    );
+                if resp.clicked() {
                     acts.push(Act::ApplyPreset(i));
                 }
+                resp.context_menu(|ui| {
+                    if ui.button("Rename").clicked() {
+                        self.renaming_preset = Some(i);
+                        self.rename_buf = name.clone();
+                        self.focus_rename_pending = true;
+                        ui.close();
+                    }
+                });
                 if ui
                     .add(egui::Button::new(RichText::new("×").color(theme::RED)))
                     .explain(
@@ -548,67 +612,24 @@ impl FilterBuilder {
                     acts.push(Act::RemovePreset(i));
                 }
             }
-            // Saving needs at least one non-blank condition and a name.
+            // Storing needs at least one non-blank condition.
             let has_conds = self.filters.iter().any(|c| !c.value.trim().is_empty());
-            if has_conds {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.preset_name)
-                        .desired_width(120.0)
-                        .hint_text("preset name"),
-                )
-                .explain(
-                    self.verbosity,
-                    "Name for the new preset",
-                    "Name under which to save the current set of filter conditions as a \
-                     reusable preset.",
-                );
-                let can_save = !self.preset_name.trim().is_empty();
-                if ui
-                    .add_enabled(
-                        can_save,
-                        egui::Button::new(RichText::new("SAVE").color(theme::BLACK))
+            if has_conds
+                && ui
+                    .add(
+                        egui::Button::new(RichText::new("STORE PRESET").color(theme::BLACK))
                             .fill(theme::AMBER),
                     )
                     .explain(
                         self.verbosity,
-                        "Save as a preset",
-                        "Save the current condition set as a named preset for one-click \
-                         reuse later.",
+                        "Store the current filter as a preset",
+                        "Save the current condition set as a new preset, named \"Preset #n\" \
+                         automatically. Right-click a preset afterwards to give it a better \
+                         name.",
                     )
                     .clicked()
-                {
-                    acts.push(Act::SavePreset);
-                }
-            }
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("EXPORT").color(theme::BLUE))
-                        .fill(theme::PANEL),
-                )
-                .explain(
-                    self.verbosity,
-                    "Export history + presets",
-                    "Export remembered filter values and saved presets to a JSON file, to \
-                     back up or share with another machine.",
-                )
-                .clicked()
             {
-                acts.push(Act::ExportHistory);
-            }
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("IMPORT").color(theme::BLUE))
-                        .fill(theme::PANEL),
-                )
-                .explain(
-                    self.verbosity,
-                    "Import history + presets",
-                    "Import remembered filter values and presets from a previously \
-                     exported JSON file, merging with what's already saved.",
-                )
-                .clicked()
-            {
-                acts.push(Act::ImportHistory);
+                acts.push(Act::StorePreset);
             }
         });
     }
@@ -723,6 +744,37 @@ impl FilterBuilder {
             });
         }
 
+        // TAG suggestions: the repo's existing annotation tags, filtered by the
+        // typed substring, so a tag is picked rather than retyped. Empty (and
+        // hidden) when the repo has no tags yet.
+        if kind == FilterKind::Tag && !self.tags.is_empty() {
+            let tags = self.tags.clone();
+            let query = current.trim().to_lowercase();
+            ui.horizontal_wrapped(|ui| {
+                for tag in &tags {
+                    if !query.is_empty() && !tag.to_lowercase().contains(&query) {
+                        continue;
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new(tag).color(theme::BLUE))
+                                .fill(theme::PANEL),
+                        )
+                        .explain(
+                            self.verbosity,
+                            "Use this tag value",
+                            &format!("Set the condition value to the existing tag \"{tag}\"."),
+                        )
+                        .clicked()
+                        && let Some(cond) = self.filters.get_mut(idx)
+                    {
+                        cond.value = tag.clone();
+                        changed = true;
+                    }
+                }
+            });
+        }
+
         // Remembered-value quick-picks for this kind.
         let recent = self.history.for_kind(kind).clone();
         if !recent.is_empty() {
@@ -819,8 +871,8 @@ impl FilterBuilder {
                 self.schedule_count();
                 true
             }
-            Act::SavePreset => {
-                self.save_preset(store);
+            Act::StorePreset => {
+                self.store_preset(store);
                 false
             }
             Act::ApplyPreset(i) => {
@@ -849,12 +901,15 @@ impl FilterBuilder {
                 }
                 false
             }
-            Act::ExportHistory => {
-                self.export_history();
-                false
-            }
-            Act::ImportHistory => {
-                self.import_history();
+            Act::CommitRenamePreset(i) => {
+                self.renaming_preset = None;
+                let new_name = self.rename_buf.trim().to_string();
+                if !new_name.is_empty()
+                    && let Some(preset) = self.history.presets.get_mut(i)
+                {
+                    preset.name = new_name;
+                    self.save_history(store);
+                }
                 false
             }
         }
@@ -920,10 +975,10 @@ impl FilterBuilder {
         }
     }
 
-    /// Save the current non-blank conditions as a named preset (replacing a
-    /// same-named one) and remember their values for quick-picks.
-    fn save_preset(&mut self, store: &Store) {
-        let name = self.preset_name.trim().to_string();
+    /// Save the current non-blank conditions as a new preset named
+    /// `Preset #n` (the next unused number) and remember their values for
+    /// quick-picks.
+    fn store_preset(&mut self, store: &Store) {
         let conds: Vec<SavedCond> = self
             .filters
             .iter()
@@ -933,7 +988,7 @@ impl FilterBuilder {
                 value: c.value.trim().to_string(),
             })
             .collect();
-        if name.is_empty() || conds.is_empty() {
+        if conds.is_empty() {
             return;
         }
         for cond in &conds {
@@ -941,83 +996,29 @@ impl FilterBuilder {
                 self.history.record_value(kind, &cond.value);
             }
         }
-        let preset = FilterPreset {
+        let name = self.next_preset_name();
+        self.history.presets.push(FilterPreset {
             name: name.clone(),
             conds,
-        };
-        match self.history.presets.iter_mut().find(|p| p.name == name) {
-            Some(existing) => *existing = preset,
-            None => self.history.presets.push(preset),
-        }
-        self.preset_name.clear();
+        });
         self.save_history(store);
         self.status = Some(format!("Saved filter preset '{name}'."));
     }
 
-    /// Open a native save dialog and write the whole history as JSON to the
-    /// chosen file. Runs off the UI thread.
-    fn export_history(&mut self) {
-        let json = match serde_json::to_vec_pretty(&self.history) {
-            Ok(json) => json,
-            Err(e) => {
-                self.error = Some(e.to_string());
-                return;
+    /// The next unused `Preset #n` name, based on what's already saved.
+    fn next_preset_name(&self) -> String {
+        let mut n = self.history.presets.len() + 1;
+        loop {
+            let candidate = format!("Preset #{n}");
+            if !self.history.presets.iter().any(|p| p.name == candidate) {
+                return candidate;
             }
-        };
-        let tx = self.io_tx.clone();
-        std::thread::spawn(move || {
-            if let Some(path) = rfd::FileDialog::new()
-                .set_title("Export filter history")
-                .set_file_name("dedup-filters.json")
-                .add_filter("JSON", &["json"])
-                .save_file()
-            {
-                let msg = match std::fs::write(&path, json) {
-                    Ok(()) => HistoryIo::Exported(path),
-                    Err(e) => HistoryIo::Failed(e.to_string()),
-                };
-                let _ = tx.send(msg);
-            }
-        });
-    }
-
-    /// Open a native open dialog and merge the chosen JSON history file. Runs
-    /// off the UI thread.
-    fn import_history(&mut self) {
-        let tx = self.io_tx.clone();
-        std::thread::spawn(move || {
-            if let Some(path) = rfd::FileDialog::new()
-                .set_title("Import filter history")
-                .add_filter("JSON", &["json"])
-                .pick_file()
-            {
-                let msg = match std::fs::read(&path) {
-                    Ok(bytes) => match serde_json::from_slice::<FilterHistory>(&bytes) {
-                        Ok(history) => HistoryIo::Imported(history),
-                        Err(e) => HistoryIo::Failed(format!("Not a filter history file: {e}")),
-                    },
-                    Err(e) => HistoryIo::Failed(e.to_string()),
-                };
-                let _ = tx.send(msg);
-            }
-        });
-    }
-
-    /// Drain background export/import and count results into state.
-    fn drain(&mut self, store: &Arc<Store>) {
-        while let Ok(msg) = self.io_rx.try_recv() {
-            match msg {
-                HistoryIo::Imported(history) => {
-                    self.history.merge(history);
-                    self.save_history(store);
-                    self.status = Some("Imported filter history.".to_string());
-                }
-                HistoryIo::Exported(path) => {
-                    self.status = Some(format!("Exported filter history to {}.", path.display()));
-                }
-                HistoryIo::Failed(e) => self.error = Some(e),
-            }
+            n += 1;
         }
+    }
+
+    /// Drain background count results into state.
+    fn drain(&mut self) {
         while let Ok((token, count)) = self.count_rx.try_recv() {
             if token == self.count_token {
                 self.count_in_flight = false;
@@ -1092,34 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_keeps_order_and_replaces_same_named_presets() {
-        let preset = |name: &str, value: &str| FilterPreset {
-            name: name.to_string(),
-            conds: vec![SavedCond {
-                kind: "name".to_string(),
-                value: value.to_string(),
-            }],
-        };
-        let mut local = FilterHistory::default();
-        local.record_value(FilterKind::Name, "old");
-        local.presets.push(preset("mine", "local"));
-
-        let mut imported = FilterHistory::default();
-        imported.record_value(FilterKind::Name, "second");
-        imported.record_value(FilterKind::Name, "first");
-        imported.presets.push(preset("mine", "imported"));
-        imported.presets.push(preset("theirs", "extra"));
-
-        local.merge(imported);
-        assert_eq!(local.name, vec!["first", "second", "old"]);
-        assert_eq!(
-            local.presets,
-            vec![preset("mine", "imported"), preset("theirs", "extra")]
-        );
-    }
-
-    #[test]
-    fn save_and_apply_preset() -> Result<(), Box<dyn std::error::Error>> {
+    fn store_and_apply_preset() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let store = Arc::new(Store::open_at(dir.path().to_path_buf())?);
 
@@ -1128,11 +1102,10 @@ mod tests {
             cond(FilterKind::Mime, "image/"),
             cond(FilterKind::Size, ">=100"),
         ];
-        fb.preset_name = "big images".to_string();
-        fb.apply(&store, Act::SavePreset);
+        fb.apply(&store, Act::StorePreset);
 
         assert_eq!(fb.history.presets.len(), 1);
-        assert!(fb.preset_name.is_empty());
+        assert_eq!(fb.history.presets[0].name, "Preset #1");
         // The preset (and the recorded values) hit the disk immediately.
         let loaded = FilterHistory::load(&store.config_dir().join(HISTORY_FILE));
         assert_eq!(loaded.presets, fb.history.presets);
@@ -1145,6 +1118,18 @@ mod tests {
             fb.filter_string().as_deref(),
             Some("mime:image/ size:>=100")
         );
+
+        // Storing a second preset auto-numbers past the first.
+        fb.filters = vec![cond(FilterKind::Name, "foo")];
+        fb.apply(&store, Act::StorePreset);
+        assert_eq!(fb.history.presets[1].name, "Preset #2");
+
+        // Renaming a preset persists the new name.
+        fb.rename_buf = "big images".to_string();
+        fb.apply(&store, Act::CommitRenamePreset(0));
+        assert_eq!(fb.history.presets[0].name, "big images");
+        let loaded = FilterHistory::load(&store.config_dir().join(HISTORY_FILE));
+        assert_eq!(loaded.presets[0].name, "big images");
         Ok(())
     }
 }

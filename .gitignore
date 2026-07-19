@@ -4,3 +4,6 @@ target
 **/tests/snapshots/*.new.png
 **/tests/snapshots/*.diff.png
 crates/dedup-gui/tests/snapshots
+
+# local packaging output
+dist/

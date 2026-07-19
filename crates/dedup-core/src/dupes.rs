@@ -8,6 +8,7 @@
 //!
 //! The first file of each sorted group is the "best" copy — deletion keeps it.
 
+use crate::filter::{AnnotatedFilter, FileFilter};
 use crate::store::{self, FileEntry, Store, StoreError};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -145,6 +146,57 @@ pub fn find_exact_duplicates(
     load_groups(store, repo_names, &plan)
 }
 
+/// Keep only the group keys whose group has at least one member matching
+/// `filter` — the Duplicates tab's "keep a whole group when any copy matches"
+/// (a group is shown with *all* its copies, filtered only at the group level).
+/// `None` returns the plan unchanged.
+///
+/// Members are streamed per key (like [`load_groups`]) so the memory-light paged
+/// plan is preserved; each repo's annotations are loaded once up front. The
+/// scan short-circuits on the first matching member of a group. `progress`
+/// receives the running count of keys examined.
+pub fn retain_matching_keys(
+    store: &Store,
+    repo_names: &[String],
+    keys: Vec<DupeGroupKey>,
+    filter: Option<&FileFilter>,
+    mut progress: impl FnMut(usize),
+) -> Result<Vec<DupeGroupKey>, StoreError> {
+    let Some(filter) = filter else {
+        return Ok(keys);
+    };
+
+    let mut dbs: Vec<std::sync::Arc<redb::Database>> = Vec::with_capacity(repo_names.len());
+    for name in repo_names {
+        dbs.push(store.open_repo_db(name)?);
+    }
+    // One annotated matcher per repo (tags are per repo+path); built once.
+    let mut matchers: Vec<AnnotatedFilter> = Vec::with_capacity(dbs.len());
+    for db in &dbs {
+        matchers.push(AnnotatedFilter::new(db, filter)?);
+    }
+
+    let mut kept = Vec::with_capacity(keys.len());
+    for (i, key) in keys.into_iter().enumerate() {
+        let mut matched = false;
+        'members: for j in 0..dbs.len() {
+            for rel in store::get_paths_by_size_hash(&dbs[j], key.size, &key.hash)? {
+                if let Some(entry) = store::get_entry(&dbs[j], &rel)?
+                    && matchers[j].matches(&rel, &entry)
+                {
+                    matched = true;
+                    break 'members;
+                }
+            }
+        }
+        if matched {
+            kept.push(key);
+        }
+        progress(i + 1);
+    }
+    Ok(kept)
+}
+
 /// Sort files within each group (best copy first) and order the groups by
 /// wasted bytes descending.
 pub fn sort_groups(groups: &mut [DupeGroup]) {
@@ -152,6 +204,20 @@ pub fn sort_groups(groups: &mut [DupeGroup]) {
         sort_group_members(group);
     }
     groups.sort_by_key(|group| std::cmp::Reverse(wasted_bytes(group)));
+}
+
+/// Within each group, stably move the files the caller marks as protected
+/// (read-only) ahead of the rest, so a protected copy becomes the kept "best"
+/// and any writable duplicate falls to the deletable tail. The content order
+/// from [`sort_groups`] is preserved within the protected and writable
+/// partitions (a stable sort), so among equally-(un)protected copies the best
+/// content still wins.
+pub fn promote_protected_first(groups: &mut [DupeGroup], is_protected: impl Fn(&DupeFile) -> bool) {
+    for group in groups.iter_mut() {
+        // false (0) sorts first, so protected files lead; stable → ties keep
+        // their existing best-first order.
+        group.sort_by_key(|f| !is_protected(f));
+    }
 }
 
 /// Order one group's files best-copy-first: image area desc, then (for
@@ -354,5 +420,41 @@ mod tests {
         let mut group = vec![later, earlier];
         sort_group_members(&mut group);
         assert_eq!(group[0].rel_path, "a.jpg", "earliest capture is best");
+    }
+
+    /// A protected (read-only) copy is promoted to best, so the writable
+    /// duplicate becomes the deletable tail — even when the writable copy would
+    /// otherwise win on content. Ties within a partition keep content order.
+    #[test]
+    fn protected_copy_is_promoted_to_best() {
+        let file = |repo: &str, rel: &str| DupeFile {
+            repo: repo.into(),
+            ..img_file(rel, (4000, 3000), None)
+        };
+        // Content-best order would be writable-first (equal content → path).
+        let mut groups = vec![vec![
+            file("writable", "a_writable.jpg"),
+            file("locked", "b_locked.jpg"),
+        ]];
+        let read_only = |f: &DupeFile| f.repo == "locked";
+        promote_protected_first(&mut groups, read_only);
+        assert_eq!(groups[0][0].repo, "locked", "protected copy is best");
+        assert_eq!(groups[0][1].repo, "writable", "writable copy is deletable");
+
+        // Two protected copies keep their content-best order between them.
+        let mut groups = vec![vec![
+            file("ro2", "z.jpg"),
+            file("ro1", "a.jpg"),
+            file("writable", "m.jpg"),
+        ]];
+        // Establish content order first (path asc among equal content).
+        sort_groups(&mut groups);
+        promote_protected_first(&mut groups, |f| f.repo.starts_with("ro"));
+        let order: Vec<&str> = groups[0].iter().map(|f| f.repo.as_str()).collect();
+        assert_eq!(
+            order,
+            ["ro1", "ro2", "writable"],
+            "protected first, content-ordered"
+        );
     }
 }

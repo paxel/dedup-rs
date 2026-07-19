@@ -2,7 +2,7 @@
 //! empty-directory pruning against a real repo in a tempdir.
 
 use dedup_core::diff::{DiffRun, NoDiffProgress};
-use dedup_core::groom::{delete_by_filter, delete_empty_dirs};
+use dedup_core::groom::{delete_by_filter, delete_empty_dirs, preview_prune, prune};
 use dedup_core::update::{CancellationToken, NoProgress, update_repo};
 use std::path::PathBuf;
 
@@ -81,6 +81,29 @@ fn delete_by_filter_with_no_matches_is_a_noop() -> TestResult {
     Ok(())
 }
 
+/// A purge with no filter (or a blank one) matches nothing — it must never
+/// mean "delete everything". The preview agrees.
+#[test]
+fn delete_by_filter_without_a_filter_deletes_nothing() -> TestResult {
+    let sb = Sandbox::new()?;
+    sb.write("a.txt", b"a")?;
+    sb.write("b.txt", b"b")?;
+    sb.update()?;
+
+    let cancel = CancellationToken::new();
+    let run = DiffRun::new(&NoDiffProgress, &cancel);
+    for filter in [None, Some(""), Some("  ")] {
+        let stats = delete_by_filter(&sb.store, "R", filter, &run)?;
+        assert_eq!(stats.deleted, 0, "filter {filter:?} must delete nothing");
+        let (sample, total) = dedup_core::groom::preview_by_filter(&sb.store, "R", filter, 10)?;
+        assert!(sample.is_empty(), "filter {filter:?} previews nothing");
+        assert_eq!(total, 0);
+    }
+    assert!(sb.root.join("a.txt").exists());
+    assert!(sb.root.join("b.txt").exists());
+    Ok(())
+}
+
 #[test]
 fn delete_empty_dirs_prunes_bottom_up_but_keeps_root() -> TestResult {
     let sb = Sandbox::new()?;
@@ -95,6 +118,55 @@ fn delete_empty_dirs_prunes_bottom_up_but_keeps_root() -> TestResult {
     assert!(!sb.root.join("solo").exists());
     assert!(sb.root.join("full").exists(), "dir with a file is kept");
     assert!(sb.root.exists(), "the repo root itself is never removed");
+    Ok(())
+}
+
+#[test]
+fn prune_drops_missing_records_and_keeps_live_ones() -> TestResult {
+    let sb = Sandbox::new()?;
+    sb.write("keep.txt", b"keep")?;
+    sb.write("cache/a.db", b"db-a")?;
+    sb.write("cache/b.db", b"db-b")?;
+    sb.update()?;
+
+    // Delete the .db files, leaving two missing tombstones behind.
+    let cancel = CancellationToken::new();
+    let run = DiffRun::new(&NoDiffProgress, &cancel);
+    delete_by_filter(&sb.store, "R", Some("name:*.db"), &run)?;
+    assert_eq!(sb.store.get_repo_stats("R")?.missing_count, 2);
+
+    // Preview lists exactly the missing records, without changing anything.
+    let (sample, total) = preview_prune(&sb.store, "R", 10)?;
+    assert_eq!(total, 2);
+    assert_eq!(sample.len(), 2);
+    assert_eq!(
+        sb.store.get_repo_stats("R")?.missing_count,
+        2,
+        "preview is read-only"
+    );
+
+    // Prune removes the tombstones and compacts; the live entry survives.
+    let stats = prune(&sb.store, "R", &run)?;
+    assert_eq!(stats.pruned, 2);
+    assert!(!stats.cancelled);
+    assert_eq!(sb.store.get_repo_stats("R")?.missing_count, 0);
+    assert!(
+        sb.store.get_file_entry("R", "cache/a.db")?.is_none(),
+        "tombstone dropped"
+    );
+    assert!(
+        sb.store.get_file_entry("R", "cache/b.db")?.is_none(),
+        "tombstone dropped"
+    );
+    assert!(
+        !sb.store.get_file_entry("R", "keep.txt")?.unwrap().missing,
+        "live entry untouched"
+    );
+    assert_eq!(sb.store.get_repo_stats("R")?.file_count, 1);
+
+    // A second prune is a no-op (nothing left to drop).
+    let again = prune(&sb.store, "R", &run)?;
+    assert_eq!(again.pruned, 0);
     Ok(())
 }
 

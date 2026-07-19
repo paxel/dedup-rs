@@ -2,15 +2,20 @@
 //! LCARS-themed eframe/egui desktop shell for dedup.
 
 mod app;
+mod browse_view;
 mod dupes_view;
 mod external;
 mod filter_ui;
 mod grooming_view;
+mod help_content;
 mod icon;
 mod id3tags;
 mod imgedit;
+mod lcars;
 mod lightbox;
 mod player;
+mod repo_chip;
+mod review;
 mod settings;
 mod status;
 mod theme;

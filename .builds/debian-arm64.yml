@@ -1,0 +1,54 @@
+# builds.sr.ht — release build for arm64 (aarch64), native hardware.
+#
+# Identical to debian-amd64.yml except `arch: arm64`, which runs the whole build
+# on a native ARM64 runner (no cross-compilation, no emulation) — so the heavy
+# GUI/ALSA stack builds exactly as it would on a Raspberry Pi (64-bit OS).
+#
+# Like the amd64 build, on a tag it uploads its .deb straight to the Pi (token
+# from the same builds.sr.ht file secret — see debian-amd64.yml for the details).
+#
+# NOTE: adjust REPO and DEDUP_PI_URL below for your sr.ht repo / domain.
+image: debian/trixie
+arch: arm64
+packages:
+  - build-essential
+  - pkg-config
+  - libasound2-dev
+  - curl
+  - ca-certificates
+  - git
+  - dpkg-dev
+  - lintian
+secrets:
+  - 00000000-0000-0000-0000-000000000000   # ← your upload-token file secret UUID
+environment:
+  CARGO_TERM_COLOR: always
+  REPO: dedup-rs
+  DEDUP_PI_URL: https://files.example.org/apt/pool/main/d/dedup/
+tasks:
+  - rustup: |
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain stable --profile minimal
+      echo 'source "$HOME/.cargo/env"' >> "$HOME/.buildenv"
+  - build: |
+      cd "$REPO"
+      cargo build --release --locked
+  - test: |
+      cd "$REPO"
+      # Core + CLI only (see debian-amd64.yml): dedup-gui tests need Vulkan.
+      cargo test -p dedup-core -p dedup-cli --locked
+  - package: |
+      cd "$REPO"
+      if ! git describe --exact-match --tags >/dev/null 2>&1; then
+        echo "not a tag build — skipping .deb"; exit 0
+      fi
+      ./packaging/mkdeb.sh --release --no-build
+  - upload: |
+      cd "$REPO"
+      git describe --exact-match --tags >/dev/null 2>&1 || { echo "not a tag — no upload"; exit 0; }
+      [ -f ~/.dedup-upload-token ] || { echo "no upload token secret — skipping"; exit 0; }
+      export DEDUP_UPLOAD=pi
+      export DEDUP_PI_TOKEN="$(cat ~/.dedup-upload-token)"
+      ./packaging/release.sh --no-build
+artifacts:
+  - dedup-rs/dist/*.deb

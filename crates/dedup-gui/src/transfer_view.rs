@@ -1,20 +1,24 @@
 //! The Transfer tab: pick a source repo and a target repo, choose a command
-//! (copy / move), narrow with a filter, preview the first `from → to` transfers,
-//! then run it on a background thread with confirmation.
+//! (copy / move / sync), narrow with a filter, preview the first `from → to`
+//! transfers, then run it on a background thread with confirmation.
 //!
 //! Semantics reuse the core diff operations (content compared by size + hash):
 //! - **Copy/Move** transfer source files whose content the target lacks into the
 //!   target repo's directory (move also marks the source entries missing).
+//! - **Sync** mirrors the source into the target at the same relative path:
+//!   copy content the target lacks, and (with DELETE MISSING on) delete target
+//!   files whose content the source has lost. The source is never changed.
 
 use crate::filter_ui::FilterBuilder;
 use crate::icon;
+use crate::review;
 use crate::settings::TooltipVerbosity;
 use crate::theme;
 use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::diff::{
-    CopyDest, DiffAction, DiffEvent, DiffItem, DiffProgress, DiffRun, FolderMode, diff_copy,
-    diff_print, export_to_folder, plan_folder_export,
+    CopyDest, DiffAction, DiffEvent, DiffItem, DiffProgress, DiffRun, FolderMode, SyncDelete,
+    diff_copy, diff_print, diff_sync, export_to_folder, plan_folder_export, plan_sync,
 };
 use dedup_core::store::Store;
 use dedup_core::update::CancellationToken;
@@ -23,7 +27,8 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const PREVIEW_LIMIT: usize = 30;
+use crate::review::PREVIEW_CAP;
+
 /// How many recent actions the running panel keeps in its scrolling log.
 const RUN_LOG_LIMIT: usize = 10;
 
@@ -31,6 +36,8 @@ const RUN_LOG_LIMIT: usize = 10;
 enum Command {
     Copy,
     Move,
+    Sync,
+    Mirror,
 }
 
 impl Command {
@@ -38,10 +45,21 @@ impl Command {
         match self {
             Command::Copy => "COPY",
             Command::Move => "MOVE",
+            Command::Sync => "SYNC",
+            Command::Mirror => "MIRROR",
         }
     }
+    /// Whether the command is inherently destructive to on-disk data by itself.
+    /// SYNC is additive by default (it only *copies* into the target); its
+    /// optional DELETE MISSING toggle makes a given run destructive — see
+    /// [`TransferView::destructive_run`]. MIRROR always deletes.
     fn destructive(self) -> bool {
-        !matches!(self, Command::Copy)
+        matches!(self, Command::Move | Command::Mirror)
+    }
+    /// Whether the command runs repo→repo at the same relative path (SYNC /
+    /// MIRROR), which hides the DEST / subdir / folder / dupe-pool controls.
+    fn repo_to_repo(self) -> bool {
+        matches!(self, Command::Sync | Command::Mirror)
     }
     /// (short, verbose) tooltip text for this command's selector button.
     fn tooltip(self) -> (&'static str, &'static str) {
@@ -57,6 +75,18 @@ impl Command {
                 "Move source files whose content the target (and any ALSO REF repos) \
                  doesn't already have into the target repo's directory, marking the \
                  source entries missing.",
+            ),
+            Command::Sync => (
+                "Copy the source into the target",
+                "Copy source content the target lacks into the target at the same \
+                 relative path. Turn on DELETE MISSING to also delete target files \
+                 whose content the source has since lost. The source is never changed.",
+            ),
+            Command::Mirror => (
+                "Make the target an exact copy of the source",
+                "Copy source content the target lacks AND delete everything in the target \
+                 the source does not have, so the target ends up holding exactly the \
+                 source's content. Deletions cannot be undone. The source is never changed.",
             ),
         }
     }
@@ -89,11 +119,6 @@ impl SelectMode {
     }
 }
 
-struct PreviewRow {
-    from: String,
-    to: String,
-}
-
 /// A snapshot of the destination captured when a run starts, so the worker
 /// thread owns everything it needs without borrowing the view.
 enum StartDest {
@@ -108,6 +133,11 @@ enum StartDest {
         mode: FolderMode,
         invert: bool,
     },
+    Sync {
+        target: String,
+        delete: SyncDelete,
+        mirror: bool,
+    },
 }
 
 enum OpResult {
@@ -115,6 +145,15 @@ enum OpResult {
         copied: u64,
         cancelled: bool,
         moved: bool,
+    },
+    Synced {
+        copied: u64,
+        deleted: u64,
+        skipped: u64,
+        errors: u64,
+        cancelled: bool,
+        /// True for a MIRROR run (labels the status line), false for SYNC.
+        mirror: bool,
     },
     Error(String),
 }
@@ -155,23 +194,34 @@ pub struct TransferView {
     select_mode: SelectMode,
     /// Export the redundant copies instead of the unique files.
     invert: bool,
+    /// SYNC only: also delete target files whose content the source marks
+    /// missing (off by default — SYNC is additive unless this is on).
+    sync_delete_missing: bool,
+    /// SYNC preview: how many target files a run would delete (companion to
+    /// `preview_total`, which counts the copies).
+    sync_delete_total: usize,
     /// This tab's own similarity threshold (%), shown as a slider in SIMILAR
     /// mode; used when a folder export groups by perceptual similarity.
     similar_threshold: f64,
     subdir: String,
-    subdir_tx: Sender<Result<String, String>>,
-    subdir_rx: Receiver<Result<String, String>>,
-    /// Absolute export folder picked by the native folder dialog thread.
-    folder_tx: Sender<Result<String, String>>,
-    folder_rx: Receiver<Result<String, String>>,
     /// The shared FILTER wizard (conditions, presets, suggestions, live count).
     filter: FilterBuilder,
-    preview: Vec<PreviewRow>,
+    preview: Vec<review::ReviewRow>,
+    /// Full per-kind counts (indexed by [`review::RowKind::idx`]) for the review
+    /// summary; independent of the capped `preview` sample.
+    preview_totals: [usize; 3],
+    /// The two review-table column headers: the source and target absolute paths.
+    preview_source_header: String,
+    preview_target_header: String,
     preview_total: usize,
+    /// Sort column + direction for the review table.
+    review_state: review::ReviewState,
     status: Option<String>,
     error: Option<String>,
     confirm: Option<String>,
     running: bool,
+    /// Set while a single-row APPLY runs: refresh the preview when it finishes.
+    pending_refresh: bool,
     cancel: CancellationToken,
     // Live run progress: the last N actions, the running counters and the
     // file currently being handled.
@@ -190,28 +240,27 @@ enum Act {
     PickSource(String),
     PickTarget(String),
     ToggleExtraRef(String),
-    MarkSourceDone,
     SetCommand(Command),
     SetDestination(Destination),
     SetMode(SelectMode),
     ToggleInvert,
+    ToggleSyncDelete,
     FolderChanged,
     BrowseFolder,
     SubdirChanged,
     BrowseSubdir,
-    Reload,
     Preview,
     Ask,
     Confirm,
     CancelConfirm,
     CancelRun,
+    /// Apply a single review row immediately (its namespaced key).
+    ApplyRow(String),
 }
 
 impl TransferView {
     pub fn new() -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let (subdir_tx, subdir_rx) = crossbeam_channel::unbounded();
-        let (folder_tx, folder_rx) = crossbeam_channel::unbounded();
         Self {
             repos: Vec::new(),
             loaded: false,
@@ -223,19 +272,22 @@ impl TransferView {
             folder: String::new(),
             select_mode: SelectMode::Exact,
             invert: false,
+            sync_delete_missing: false,
+            sync_delete_total: 0,
             similar_threshold: 90.0,
             subdir: String::new(),
-            subdir_tx,
-            subdir_rx,
-            folder_tx,
-            folder_rx,
             filter: FilterBuilder::new(),
             preview: Vec::new(),
+            preview_totals: [0; 3],
+            preview_source_header: String::new(),
+            preview_target_header: String::new(),
             preview_total: 0,
+            review_state: review::ReviewState::default(),
             status: None,
             error: None,
             confirm: None,
             running: false,
+            pending_refresh: false,
             cancel: CancellationToken::new(),
             run_log: VecDeque::new(),
             run_done: 0,
@@ -258,11 +310,24 @@ impl TransferView {
         self.similar_threshold = threshold.clamp(50.0, 100.0);
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, verbosity: TooltipVerbosity) {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        store: &Arc<Store>,
+        verbosity: TooltipVerbosity,
+        frame: Option<&eframe::Frame>,
+    ) {
         self.verbosity = verbosity;
         self.drain(ui);
+        // A finished single-row APPLY refreshes the preview, so the board
+        // reflects the applied action instead of dropping to the run log.
+        if self.pending_refresh && !self.running {
+            self.pending_refresh = false;
+            self.reset_run();
+            self.run_preview(store);
+        }
         if !self.loaded {
-            self.reload(store);
+            self.sync_repos(store);
         }
 
         let mut acts: Vec<Act> = Vec::new();
@@ -277,6 +342,12 @@ impl TransferView {
                 if i.key_pressed(egui::Key::Num2) {
                     acts.push(Act::SetCommand(Command::Move));
                 }
+                if i.key_pressed(egui::Key::Num3) {
+                    acts.push(Act::SetCommand(Command::Sync));
+                }
+                if i.key_pressed(egui::Key::Num4) {
+                    acts.push(Act::SetCommand(Command::Mirror));
+                }
                 if i.key_pressed(egui::Key::P) {
                     acts.push(Act::Preview);
                 }
@@ -286,66 +357,93 @@ impl TransferView {
             });
         }
 
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new("TRANSFER")
-                .color(theme::BLUE)
-                .size(18.0)
-                .strong(),
-        );
-        crate::util::shortcut_bar(ui, "1 copy · 2 move · P preview · R run");
+        // The whole tab scrolls as one page: the controls above the preview
+        // (filter wizard, dest/mode bars) grow with the command, and the
+        // preview table can be tall, so without this the lower rows — and with
+        // enough controls the preview entirely — fall off the bottom of the
+        // window with no way to reach them. The virtualised preview table
+        // culls to the visible band via its clip rect, so nesting it here keeps
+        // the single outer scrollbar cheap.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("TRANSFER")
+                        .color(theme::BLUE)
+                        .size(18.0)
+                        .strong(),
+                );
+                crate::util::shortcut_bar(
+                    ui,
+                    "1 copy · 2 move · 3 sync · 4 mirror · P preview · R run",
+                );
 
-        self.repo_rows(ui, &mut acts);
-        self.command_bar(ui, &mut acts);
-        self.dest_bar(ui, &mut acts);
-        match self.destination {
-            Destination::Repo => self.subdir_bar(ui, &mut acts),
-            Destination::Folder => {
-                self.folder_bar(ui, &mut acts);
-                self.mode_bar(ui, &mut acts);
-            }
-        }
-        // The shared FILTER wizard; the source repo backs its MIME suggestions
-        // and live match count.
-        let source = self.source.clone();
-        let outcome = self.filter.ui(ui, store, source.as_deref(), self.verbosity);
-        if outcome.changed {
-            self.clear_preview();
-        }
-        if outcome.status.is_some() {
-            self.status = outcome.status;
-        }
-        if outcome.error.is_some() {
-            self.error = outcome.error;
-        }
-        self.action_bar(ui, &mut acts);
+                self.repo_rows(ui, &mut acts);
+                self.command_bar(ui, &mut acts);
+                // SYNC/MIRROR are always repo→repo at the same relative path, so
+                // they hide the DEST/subdir/folder controls: SYNC shows its
+                // DELETE MISSING toggle; MIRROR shows a warning (it always
+                // deletes).
+                match self.command {
+                    Command::Sync => self.sync_bar(ui, &mut acts),
+                    Command::Mirror => self.mirror_bar(ui),
+                    _ => {
+                        self.dest_bar(ui, &mut acts);
+                        match self.destination {
+                            Destination::Repo => self.subdir_bar(ui, &mut acts),
+                            Destination::Folder => {
+                                self.folder_bar(ui, &mut acts);
+                                self.mode_bar(ui, &mut acts);
+                            }
+                        }
+                    }
+                }
+                // The shared FILTER wizard; the source repo backs its MIME
+                // suggestions and live match count.
+                let source = self.source.clone();
+                let outcome = self.filter.ui(ui, store, source.as_deref(), self.verbosity);
+                if outcome.changed {
+                    self.clear_preview();
+                }
+                if outcome.status.is_some() {
+                    self.status = outcome.status;
+                }
+                if outcome.error.is_some() {
+                    self.error = outcome.error;
+                }
+                self.action_bar(ui, &mut acts);
 
-        if let Some(err) = &self.error {
-            ui.colored_label(theme::RED, err);
-        }
-        if let Some(status) = &self.status {
-            ui.label(RichText::new(status).color(theme::TAN).size(13.0));
-        }
-        ui.separator();
-        // RUN and PREVIEW are mutually exclusive: while a run is active or has
-        // left a log, show the live run panel; otherwise show the preview.
-        if self.running || !self.run_log.is_empty() {
-            self.run_panel(ui);
-        } else {
-            self.preview_panel(ui);
-        }
+                if let Some(err) = &self.error {
+                    ui.colored_label(theme::RED, err);
+                }
+                if let Some(status) = &self.status {
+                    ui.label(RichText::new(status).color(theme::TAN).size(13.0));
+                }
+                ui.separator();
+                // RUN and PREVIEW are mutually exclusive: while a run is active
+                // or has left a log, show the live run panel; otherwise show the
+                // preview.
+                if self.running || !self.run_log.is_empty() {
+                    self.run_panel(ui);
+                } else {
+                    self.preview_panel(ui, &mut acts);
+                }
+            });
 
         if let Some(prompt) = self.confirm.clone() {
             self.confirm_modal(ui, &prompt, &mut acts);
         }
 
-        let ctx = ui.ctx().clone();
         for act in acts {
-            self.apply(store, &ctx, act);
+            self.apply(store, frame, act);
         }
     }
 
-    fn reload(&mut self, store: &Store) {
+    /// Sync the repo list with the store, keeping the current source/target/pool
+    /// picks and dropping any that no longer exist. Called on first show and
+    /// whenever the tab is re-shown, so no manual refresh button is needed.
+    pub fn sync_repos(&mut self, store: &Store) {
         match store.list_repos() {
             Ok(list) => {
                 self.repos = list.into_iter().map(|(n, _, _)| n).collect();
@@ -359,6 +457,7 @@ impl TransferView {
                 {
                     self.target = None;
                 }
+                self.extra_refs.retain(|r| self.repos.contains(r));
                 self.loaded = true;
                 self.error = None;
             }
@@ -367,110 +466,104 @@ impl TransferView {
     }
 
     fn repo_rows(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::LILAC).show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("SOURCE").color(theme::TEXT).size(12.0));
-                for name in &self.repos {
-                    let sel = self.source.as_deref() == Some(name.as_str());
-                    let fill = if sel { theme::ORANGE } else { theme::PANEL };
-                    let col = if sel { theme::BLACK } else { theme::TEXT };
-                    if ui
-                        .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
-                        .explain(
-                            self.verbosity,
-                            "Pick as the source repo",
-                            "Use this repository as the source: its files are compared \
-                             against the target (and any DupePool repos) to decide what's \
-                             new or already known.",
-                        )
-                        .clicked()
-                    {
-                        acts.push(Act::PickSource(name.clone()));
-                    }
-                }
-                if ui
-                    .button(RichText::new(icon::REFRESH).color(theme::BLACK))
+        crate::lcars::section_lcars(ui, "REPOS — PICK SOURCE & TARGET", theme::LILAC, |ui| {
+            // SOURCE: every repo, orange when picked.
+            let src = self.repos.clone();
+            crate::repo_chip::chip_row(ui, "xfer_source", "SOURCE", src.len(), |ui, i| {
+                let name = &src[i];
+                let sel = self.source.as_deref() == Some(name.as_str());
+                let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::ORANGE, None);
+                if chip
+                    .name
                     .explain(
                         self.verbosity,
-                        "Reload the repository list",
-                        "Reload the list of registered repositories, e.g. after adding one \
-                         in the Repositories tab.",
+                        "Pick as the source repo",
+                        "Use this repository as the source: its files are compared against \
+                         the target (and any DupePool repos) to decide what's new or already \
+                         known.",
                     )
                     .clicked()
                 {
-                    acts.push(Act::Reload);
+                    acts.push(Act::PickSource(name.clone()));
                 }
+                chip.outer
             });
-            // The target repo is only chosen when copying/moving into a repo; a
-            // folder export has no target (the folder is the destination).
+
+            // TARGET (only when copying/moving into a repo — a folder export has
+            // no target): the repos that aren't the source, blue when picked.
             if self.destination == Destination::Repo {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("TARGET").color(theme::TEXT).size(12.0));
-                    for name in &self.repos {
-                        // The target is chosen from the repos that are not the source.
-                        if self.source.as_deref() == Some(name.as_str()) {
-                            continue;
-                        }
-                        let sel = self.target.as_deref() == Some(name.as_str());
-                        let fill = if sel { theme::BLUE } else { theme::PANEL };
-                        let col = if sel { theme::BLACK } else { theme::BLUE };
-                        if ui
-                            .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
-                            .explain(
-                                self.verbosity,
-                                "Pick as the target repo",
-                                "Use this repository as the target: it's where COPY/MOVE files \
-                                 land, and it always counts as a reference for deciding what's \
-                                 new.",
-                            )
-                            .clicked()
-                        {
-                            acts.push(Act::PickTarget(name.clone()));
-                        }
+                let tgt: Vec<String> = self
+                    .repos
+                    .iter()
+                    .filter(|n| self.source.as_deref() != Some(n.as_str()))
+                    .cloned()
+                    .collect();
+                crate::repo_chip::chip_row(ui, "xfer_target", "TARGET", tgt.len(), |ui, i| {
+                    let name = &tgt[i];
+                    let sel = self.target.as_deref() == Some(name.as_str());
+                    let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::BLUE, None);
+                    if chip
+                        .name
+                        .explain(
+                            self.verbosity,
+                            "Pick as the target repo",
+                            "Use this repository as the target: it's where COPY/MOVE files land, \
+                             and it always counts as a reference for deciding what's new.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::PickTarget(name.clone()));
                     }
+                    chip.outer
                 });
             }
-            // Reference repos: content any of them already holds is treated as
-            // "already known" and never re-copied. In REPO mode the target is
-            // always a reference and is shown as a locked chip.
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("DUPEPOOL").color(theme::TEXT).size(12.0));
-                if self.destination == Destination::Repo
-                    && let Some(target) = self.target.clone()
-                {
-                    // A locked, non-toggleable chip: the target is always a
-                    // reference. Rendered filled (not disabled) so it reads
-                    // as "on"; clicks are intentionally ignored.
-                    ui.add(
-                        egui::Button::new(
-                            RichText::new(format!("{} {target}", icon::LOCK)).color(theme::BLACK),
+
+            // DUPEPOOL: content any of these repos already holds is treated as
+            // "already known" and never re-copied. The target is *always* a
+            // reference (handled in `references`), so — like the source — it's
+            // simply left out of this row rather than shown as a locked chip. SYNC
+            // compares source against the single target only, so it has no pool.
+            if !self.command.repo_to_repo() {
+                // The toggleable pool repos: everything except the source and target.
+                let eligible: Vec<String> = self
+                    .repos
+                    .iter()
+                    .filter(|n| {
+                        self.source.as_deref() != Some(n.as_str())
+                            && !(self.destination == Destination::Repo
+                                && self.target.as_deref() == Some(n.as_str()))
+                    })
+                    .cloned()
+                    .collect();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("DUPEPOOL").color(theme::TEXT).size(12.0));
+                    if crate::repo_chip::small_button(ui, "ALL", theme::LILAC)
+                        .explain(
+                            self.verbosity,
+                            "Add every eligible repo to the pool",
+                            "Treat content held by any other repo as already known.",
                         )
-                        .fill(theme::LILAC),
-                    )
-                    .explain(
-                        self.verbosity,
-                        "Always in the pool (it's the target)",
-                        "The target repo is always in the dupe pool — COPY/MOVE never \
-                         re-copies content the target already has — so it can't be \
-                         toggled off.",
-                    );
-                }
-                for name in &self.repos {
-                    // Never a reference to itself; in REPO mode the target is
-                    // shown locked above, so skip it here.
-                    if self.source.as_deref() == Some(name.as_str()) {
-                        continue;
-                    }
-                    if self.destination == Destination::Repo
-                        && self.target.as_deref() == Some(name.as_str())
+                        .clicked()
                     {
-                        continue;
+                        self.extra_refs = eligible.clone();
                     }
+                    if crate::repo_chip::small_button(ui, "NONE", theme::LILAC)
+                        .explain(
+                            self.verbosity,
+                            "Clear the dupe pool",
+                            "Compare against the target only (plus SYNC's single target).",
+                        )
+                        .clicked()
+                    {
+                        self.extra_refs.clear();
+                    }
+                });
+                crate::repo_chip::chip_row(ui, "xfer_pool", "", eligible.len(), |ui, i| {
+                    let name = &eligible[i];
                     let sel = self.extra_refs.iter().any(|r| r == name);
-                    let fill = if sel { theme::LILAC } else { theme::PANEL };
-                    let col = if sel { theme::BLACK } else { theme::LILAC };
-                    if ui
-                        .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
+                    let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::LILAC, None);
+                    if chip
+                        .name
                         .explain(
                             self.verbosity,
                             "Add to the dupe pool",
@@ -480,8 +573,9 @@ impl TransferView {
                     {
                         acts.push(Act::ToggleExtraRef(name.clone()));
                     }
-                }
-            });
+                    chip.outer
+                });
+            }
         });
     }
 
@@ -531,91 +625,100 @@ impl TransferView {
     }
 
     fn command_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::ORANGE).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("COMMAND").color(theme::TEXT).size(12.0));
-                for cmd in [Command::Copy, Command::Move] {
-                    let sel = self.command == cmd;
-                    let accent = if cmd.destructive() {
-                        theme::RED
-                    } else {
-                        theme::AMBER
-                    };
-                    let fill = if sel { accent } else { theme::PANEL };
-                    // Unselected pills sit on the dark panel — black text would
-                    // vanish there, so they carry their accent color instead.
-                    let col = if sel { theme::BLACK } else { accent };
-                    let (short, verbose) = cmd.tooltip();
-                    if ui
-                        .add(egui::Button::new(RichText::new(cmd.label()).color(col)).fill(fill))
-                        .explain(self.verbosity, short, verbose)
-                        .clicked()
-                    {
-                        acts.push(Act::SetCommand(cmd));
+        crate::lcars::section_lcars(
+            ui,
+            "COMMAND — COPY, MOVE, SYNC OR MIRROR",
+            theme::ORANGE,
+            |ui| {
+                ui.horizontal(|ui| {
+                    for cmd in [Command::Copy, Command::Move, Command::Sync, Command::Mirror] {
+                        let sel = self.command == cmd;
+                        let accent = if cmd.destructive() {
+                            theme::RED
+                        } else {
+                            theme::AMBER
+                        };
+                        let fill = if sel { accent } else { theme::PANEL };
+                        // Unselected pills sit on the dark panel — black text would
+                        // vanish there, so they carry their accent color instead.
+                        let col = if sel { theme::BLACK } else { accent };
+                        let (short, verbose) = cmd.tooltip();
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new(cmd.label()).color(col)).fill(fill),
+                            )
+                            .explain(self.verbosity, short, verbose)
+                            .clicked()
+                        {
+                            acts.push(Act::SetCommand(cmd));
+                        }
                     }
-                }
-            });
-            self.hint(ui);
-        });
+                });
+                self.hint(ui);
+            },
+        );
     }
 
     fn subdir_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::BLUE).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("INTO").color(theme::TEXT).size(12.0));
-                let changed = ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.subdir)
-                            .desired_width(220.0)
-                            .hint_text("relative/subdir (optional)"),
-                    )
-                    .explain(
-                        self.verbosity,
-                        "Relative subfolder inside the target",
-                        "Place transferred files under this relative subfolder inside the \
+        crate::lcars::section_lcars(
+            ui,
+            "INTO — SUBFOLDER INSIDE THE TARGET",
+            theme::BLUE,
+            |ui| {
+                ui.horizontal(|ui| {
+                    let changed = ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.subdir)
+                                .desired_width(220.0)
+                                .hint_text("relative/subdir (optional)"),
+                        )
+                        .explain(
+                            self.verbosity,
+                            "Relative subfolder inside the target",
+                            "Place transferred files under this relative subfolder inside the \
                          target repo, preserving each file's source-relative path. Leave \
                          blank to place them at the target root. Paths escaping the target \
                          (absolute or containing `..`) are rejected.",
-                    )
-                    .changed();
-                if changed {
-                    acts.push(Act::SubdirChanged);
-                }
-                let can_browse = self.target.is_some();
-                if ui
-                    .add_enabled(
-                        can_browse,
-                        egui::Button::new(
-                            RichText::new(format!("{} BROWSE", icon::FOLDER_OPEN))
-                                .color(theme::BLACK),
-                        ),
-                    )
-                    .explain(
-                        self.verbosity,
-                        "Pick or create a subfolder",
-                        "Open a native folder picker rooted at the target repo to pick (or \
+                        )
+                        .changed();
+                    if changed {
+                        acts.push(Act::SubdirChanged);
+                    }
+                    let can_browse = self.target.is_some();
+                    if ui
+                        .add_enabled(
+                            can_browse,
+                            egui::Button::new(
+                                RichText::new(format!("{} BROWSE", icon::FOLDER_OPEN))
+                                    .color(theme::BLACK),
+                            ),
+                        )
+                        .explain(
+                            self.verbosity,
+                            "Pick or create a subfolder",
+                            "Open a native folder picker rooted at the target repo to pick (or \
                          create) the subfolder transferred files go into.",
-                    )
-                    .clicked()
-                {
-                    acts.push(Act::BrowseSubdir);
-                }
-            });
-            ui.label(
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::BrowseSubdir);
+                    }
+                });
+                ui.label(
                 RichText::new(
                     "Files keep their source-relative path under this folder inside the target.",
                 )
                 .color(theme::LILAC)
                 .size(11.0),
             );
-        });
+            },
+        );
     }
 
     /// Selector for where COPY/MOVE lands: into a repo or into a picked folder.
     fn dest_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::BLUE).show(ui, |ui| {
+        crate::lcars::section_lcars(ui, "DEST — WHERE COPIED FILES LAND", theme::BLUE, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("DEST").color(theme::TEXT).size(12.0));
                 for (dest, label, short, verbose) in [
                     (
                         Destination::Repo,
@@ -649,112 +752,128 @@ impl TransferView {
 
     /// The export-folder path input and its native folder picker (FOLDER mode).
     fn folder_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::BLUE).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("FOLDER").color(theme::TEXT).size(12.0));
-                let changed = ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.folder)
-                            .desired_width(320.0)
-                            .hint_text("/absolute/export/folder"),
-                    )
-                    .explain(
-                        self.verbosity,
-                        "Absolute export folder",
-                        "The folder the selected files are copied/moved into. Files keep \
+        crate::lcars::section_lcars(
+            ui,
+            "FOLDER — EXPORT DESTINATION ON DISK",
+            theme::BLUE,
+            |ui| {
+                ui.horizontal(|ui| {
+                    let changed = ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.folder)
+                                .desired_width(320.0)
+                                .hint_text("/absolute/export/folder"),
+                        )
+                        .explain(
+                            self.verbosity,
+                            "Absolute export folder",
+                            "The folder the selected files are copied/moved into. Files keep \
                          their source-relative path under it.",
-                    )
-                    .changed();
-                if changed {
-                    acts.push(Act::FolderChanged);
-                }
-                if ui
-                    .add(egui::Button::new(
-                        RichText::new(format!("{} BROWSE", icon::FOLDER_OPEN)).color(theme::BLACK),
-                    ))
-                    .explain(
-                        self.verbosity,
-                        "Pick or create the export folder",
-                        "Open a native folder picker to choose (or create) the folder the \
+                        )
+                        .changed();
+                    if changed {
+                        acts.push(Act::FolderChanged);
+                    }
+                    if ui
+                        .add(egui::Button::new(
+                            RichText::new(format!("{} BROWSE", icon::FOLDER_OPEN))
+                                .color(theme::BLACK),
+                        ))
+                        .explain(
+                            self.verbosity,
+                            "Pick or create the export folder",
+                            "Open a native folder picker to choose (or create) the folder the \
                          selected files go into.",
-                    )
-                    .clicked()
-                {
-                    acts.push(Act::BrowseFolder);
-                }
-            });
-        });
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::BrowseFolder);
+                    }
+                });
+            },
+        );
     }
 
     /// Grouping mode (exact/similar) and the invert toggle for a folder export.
     fn mode_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::LILAC).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("MODE").color(theme::TEXT).size(12.0));
-                for mode in [SelectMode::Exact, SelectMode::Similar] {
-                    let sel = self.select_mode == mode;
-                    let fill = if sel { theme::LILAC } else { theme::PANEL };
-                    let col = if sel { theme::BLACK } else { theme::LILAC };
-                    let (short, verbose) = match mode {
-                        SelectMode::Exact => (
-                            "Group by exact content",
-                            "Treat only byte-identical files (same size + hash) as copies of \
+        crate::lcars::section_lcars(
+            ui,
+            "MODE — EXACT OR SIMILAR MATCHING",
+            theme::LILAC,
+            |ui| {
+                ui.horizontal(|ui| {
+                    for mode in [SelectMode::Exact, SelectMode::Similar] {
+                        let sel = self.select_mode == mode;
+                        let fill = if sel { theme::LILAC } else { theme::PANEL };
+                        let col = if sel { theme::BLACK } else { theme::LILAC };
+                        let (short, verbose) = match mode {
+                            SelectMode::Exact => (
+                                "Group by exact content",
+                                "Treat only byte-identical files (same size + hash) as copies of \
                              each other.",
-                        ),
-                        SelectMode::Similar => (
-                            "Group by perceptual similarity",
-                            "Treat perceptually similar media (at the similarity threshold \
+                            ),
+                            SelectMode::Similar => (
+                                "Group by perceptual similarity",
+                                "Treat perceptually similar media (at the similarity threshold \
                              below) as copies — e.g. one photo per burst.",
-                        ),
+                            ),
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new(mode.label()).color(col))
+                                    .fill(fill),
+                            )
+                            .explain(self.verbosity, short, verbose)
+                            .clicked()
+                        {
+                            acts.push(Act::SetMode(mode));
+                        }
+                    }
+                    ui.separator();
+                    let fill = if self.invert {
+                        theme::ORANGE
+                    } else {
+                        theme::PANEL
+                    };
+                    let col = if self.invert {
+                        theme::BLACK
+                    } else {
+                        theme::ORANGE
                     };
                     if ui
-                        .add(egui::Button::new(RichText::new(mode.label()).color(col)).fill(fill))
-                        .explain(self.verbosity, short, verbose)
-                        .clicked()
-                    {
-                        acts.push(Act::SetMode(mode));
-                    }
-                }
-                ui.separator();
-                let fill = if self.invert {
-                    theme::ORANGE
-                } else {
-                    theme::PANEL
-                };
-                let col = if self.invert {
-                    theme::BLACK
-                } else {
-                    theme::ORANGE
-                };
-                if ui
-                    .add(egui::Button::new(RichText::new("INVERT").color(col)).fill(fill))
-                    .explain(
-                        self.verbosity,
-                        "Export the redundant copies instead",
-                        "Off: export the unique files (one best copy per group plus every \
+                        .add(egui::Button::new(RichText::new("INVERT").color(col)).fill(fill))
+                        .explain(
+                            self.verbosity,
+                            "Export the redundant copies instead",
+                            "Off: export the unique files (one best copy per group plus every \
                          singleton). On: export the redundant copies instead (every \
                          non-best member of a group) — what a dedup would remove.",
-                    )
-                    .clicked()
-                {
-                    acts.push(Act::ToggleInvert);
-                }
-            });
-            // In SIMILAR mode the threshold is chosen right here (the same shared
-            // control as the Duplicates tab), not borrowed from another tab.
-            if self.select_mode == SelectMode::Similar {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    crate::util::similarity_slider(ui, &mut self.similar_threshold, self.verbosity);
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::ToggleInvert);
+                    }
                 });
-            }
-            let hint = if self.invert {
-                "Exports the redundant copies (every non-best member of a group)."
-            } else {
-                "Exports the unique files (best copy of each group plus every singleton)."
-            };
-            ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
-        });
+                // In SIMILAR mode the threshold is chosen right here (the same shared
+                // control as the Duplicates tab), not borrowed from another tab.
+                if self.select_mode == SelectMode::Similar {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        crate::util::similarity_slider(
+                            ui,
+                            &mut self.similar_threshold,
+                            self.verbosity,
+                        );
+                    });
+                }
+                let hint = if self.invert {
+                    "Exports the redundant copies (every non-best member of a group)."
+                } else {
+                    "Exports the unique files (best copy of each group plus every singleton)."
+                };
+                ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
+            },
+        );
     }
 
     fn hint(&self, ui: &mut egui::Ui) {
@@ -764,14 +883,100 @@ impl TransferView {
                 "Move source files the target does not have into the target repo \
                  (they are removed from the source directory)."
             }
+            Command::Sync => {
+                "Copy the source into the target: copy content it lacks (same relative \
+                 path); optionally delete target files the source has lost."
+            }
+            Command::Mirror => {
+                "Make the target an exact copy of the source: copy what it lacks and delete \
+                 everything the source does not have."
+            }
         };
         ui.label(RichText::new(text).color(theme::LILAC).size(11.0));
     }
 
-    fn action_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::AMBER).show(ui, |ui| {
+    /// MIRROR's info bar: no toggle (it always deletes), just a red warning that
+    /// it removes everything in the target the source lacks.
+    fn mirror_bar(&self, ui: &mut egui::Ui) {
+        crate::lcars::section_lcars(
+            ui,
+            &format!("{} DELETES EXTRAS", icon::TRASH),
+            theme::RED,
+            |ui| {
+                ui.label(
+                    RichText::new(
+                        "Everything in the target whose content the source does not have is \
+                     deleted, so the target ends up holding exactly the source's content. \
+                     Deletions cannot be undone.",
+                    )
+                    .color(theme::LILAC)
+                    .size(11.0),
+                );
+            },
+        );
+    }
+
+    /// The delete policy the current command runs with: MIRROR always deletes
+    /// everything the source lacks; SYNC deletes the source's own lost content
+    /// only when DELETE MISSING is on; COPY/MOVE never reach here.
+    fn sync_delete_mode(&self) -> SyncDelete {
+        match self.command {
+            Command::Mirror => SyncDelete::Absent,
+            Command::Sync if self.sync_delete_missing => SyncDelete::Missing,
+            _ => SyncDelete::None,
+        }
+    }
+
+    /// SYNC's option bar: the DELETE MISSING toggle (off by default). SYNC has
+    /// no subdir/folder/mode controls — it always mirrors source→target at the
+    /// same relative path.
+    fn sync_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        crate::lcars::section_lcars(ui, "OPTIONS — SYNC BEHAVIOUR", theme::BLUE, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("ACTION").color(theme::TEXT).size(12.0));
+                let fill = if self.sync_delete_missing {
+                    theme::RED
+                } else {
+                    theme::PANEL
+                };
+                let col = if self.sync_delete_missing {
+                    theme::BLACK
+                } else {
+                    theme::RED
+                };
+                if ui
+                    .add(egui::Button::new(RichText::new("DELETE MISSING").color(col)).fill(fill))
+                    .explain(
+                        self.verbosity,
+                        "Also delete target files the source has lost",
+                        "Off: SYNC only copies content the target lacks (the source is \
+                         mirrored into the target, nothing is deleted). On: also delete \
+                         target files whose content the source once had and has since \
+                         lost — deletions cannot be undone.",
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::ToggleSyncDelete);
+                }
+            });
+            let hint = if self.sync_delete_missing {
+                "Copies content the target lacks AND deletes target files the source has lost."
+            } else {
+                "Copies content the target lacks. Nothing in the target is deleted."
+            };
+            ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
+        });
+    }
+
+    /// Whether the *current* run would delete on-disk data: MOVE and MIRROR
+    /// always do, and SYNC does only when DELETE MISSING is on. Drives the red
+    /// accent on the confirm dialog.
+    fn destructive_run(&self) -> bool {
+        self.command.destructive() || (self.command == Command::Sync && self.sync_delete_missing)
+    }
+
+    fn action_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        crate::lcars::section_lcars(ui, "ACTION — PREVIEW & RUN", theme::AMBER, |ui| {
+            ui.horizontal(|ui| {
                 let ready = self.ready();
                 if ui
                     .add_enabled(
@@ -824,32 +1029,11 @@ impl TransferView {
                         acts.push(Act::CancelRun);
                     }
                 }
-                // After sanitizing a disk, mark the source repo triage-done.
-                if self.source.is_some() && !self.running {
-                    ui.separator();
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("MARK SOURCE DONE").color(theme::BLUE))
-                                .fill(theme::PANEL),
-                        )
-                        .explain(
-                            self.verbosity,
-                            "Flag the source repo as triaged (its uniques copied out)",
-                            "Mark the source repository triage-done: its unique content has \
-                             already been copied out into a sanitized directory, so it shows \
-                             a TRIAGED stat in Repository management and can be treated as \
-                             fully processed.",
-                        )
-                        .clicked()
-                    {
-                        acts.push(Act::MarkSourceDone);
-                    }
-                }
             });
         });
     }
 
-    fn preview_panel(&mut self, ui: &mut egui::Ui) {
+    fn preview_panel(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         if self.preview.is_empty() {
             ui.add_space(6.0);
             ui.colored_label(
@@ -858,31 +1042,25 @@ impl TransferView {
             );
             return;
         }
-        ui.label(
-            RichText::new(format!(
-                "{} file(s) match · showing first {}",
-                self.preview_total,
-                self.preview.len()
-            ))
-            .color(theme::AMBER)
-            .strong(),
-        );
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                egui::Grid::new("preview_grid")
-                    .num_columns(3)
-                    .striped(true)
-                    .spacing(egui::vec2(12.0, 4.0))
-                    .show(ui, |ui| {
-                        for row in &self.preview {
-                            ui.label(RichText::new(&row.from).color(theme::TEXT).size(12.0));
-                            ui.label(RichText::new(icon::ARROW_RIGHT).color(theme::ORANGE));
-                            ui.label(RichText::new(&row.to).color(theme::BLUE).size(12.0));
-                            ui.end_row();
-                        }
-                    });
-            });
+        if let Some(review::ReviewAction::Apply(key)) = review::table(
+            ui,
+            &mut self.review_state,
+            &mut self.preview,
+            self.preview_totals,
+            &self.preview_source_header,
+            &self.preview_target_header,
+        ) {
+            acts.push(Act::ApplyRow(key));
+        }
+    }
+
+    /// A repo's absolute path for a review-table column header, falling back to
+    /// its name if it can't be resolved.
+    fn repo_header(store: &Store, name: &str) -> String {
+        store
+            .get_repo(name)
+            .map(|m| m.abs_path)
+            .unwrap_or_else(|_| name.to_string())
     }
 
     /// The live run panel: a spinner, the file currently being handled, a
@@ -936,7 +1114,7 @@ impl TransferView {
             ui.colored_label(theme::TEXT, prompt);
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                let fill = if self.command.destructive() {
+                let fill = if self.destructive_run() {
                     theme::RED
                 } else {
                     theme::AMBER
@@ -967,7 +1145,7 @@ impl TransferView {
         });
     }
 
-    fn apply(&mut self, store: &Arc<Store>, ctx: &egui::Context, act: Act) {
+    fn apply(&mut self, store: &Arc<Store>, frame: Option<&eframe::Frame>, act: Act) {
         match act {
             Act::PickSource(name) => {
                 if self.target.as_deref() == Some(name.as_str()) {
@@ -990,19 +1168,13 @@ impl TransferView {
                 }
                 self.clear_preview();
             }
-            Act::MarkSourceDone => {
-                if let Some(source) = self.source.clone() {
-                    match store.set_triage_done(&source, true) {
-                        Ok(()) => {
-                            self.status = Some(format!("Marked '{source}' triage-done."));
-                            self.error = None;
-                        }
-                        Err(e) => self.error = Some(e.to_string()),
-                    }
-                }
-            }
             Act::SetCommand(cmd) => {
                 self.command = cmd;
+                // SYNC/MIRROR are repo→repo only; snap the destination back to a
+                // repo so the target row is available (the DEST toggle is hidden).
+                if cmd.repo_to_repo() {
+                    self.destination = Destination::Repo;
+                }
                 self.clear_preview();
             }
             Act::SetDestination(dest) => {
@@ -1017,29 +1189,51 @@ impl TransferView {
                 self.invert = !self.invert;
                 self.clear_preview();
             }
+            Act::ToggleSyncDelete => {
+                self.sync_delete_missing = !self.sync_delete_missing;
+                self.clear_preview();
+            }
             Act::FolderChanged => self.clear_preview(),
-            Act::BrowseFolder => self.browse_folder(ctx),
+            Act::BrowseFolder => {
+                if let Some(frame) = frame {
+                    self.browse_folder(frame);
+                }
+            }
             Act::SubdirChanged => self.clear_preview(),
-            Act::BrowseSubdir => self.browse_subdir(store, ctx),
-            Act::Reload => self.reload(store),
+            Act::BrowseSubdir => {
+                if let Some(frame) = frame {
+                    self.browse_subdir(store, frame);
+                }
+            }
             Act::Preview => self.run_preview(store),
             Act::Ask => {
-                if let Some(prompt) = self.build_prompt(store) {
+                if let Some(mut prompt) = self.build_prompt(store) {
+                    let rejected = self.review_state.rejected.len();
+                    if rejected > 0 {
+                        prompt.push_str(&format!(" {rejected} rejected row(s) will be skipped."));
+                    }
                     self.confirm = Some(prompt);
                 }
             }
             Act::CancelConfirm => self.confirm = None,
             Act::Confirm => {
                 self.confirm = None;
-                self.start(store);
+                self.start(store, None);
             }
+            Act::ApplyRow(key) => self.start(store, Some(key)),
             Act::CancelRun => self.cancel.cancel(),
         }
     }
 
     fn clear_preview(&mut self) {
         self.preview.clear();
+        self.preview_totals = [0; 3];
+        self.preview_source_header.clear();
+        self.preview_target_header.clear();
         self.preview_total = 0;
+        self.sync_delete_total = 0;
+        // Rejections are keyed to the preview they were made in.
+        self.review_state.rejected.clear();
     }
 
     /// The subdir trimmed of surrounding whitespace and slashes; empty means
@@ -1050,7 +1244,7 @@ impl TransferView {
 
     /// Open the native folder dialog rooted at the target repo and, on a pick,
     /// store the chosen folder as a path relative to the target root.
-    fn browse_subdir(&mut self, store: &Arc<Store>, ctx: &egui::Context) {
+    fn browse_subdir(&mut self, store: &Arc<Store>, frame: &eframe::Frame) {
         let Some(target) = self.target.clone() else {
             return;
         };
@@ -1061,41 +1255,45 @@ impl TransferView {
                 return;
             }
         };
-        let tx = self.subdir_tx.clone();
-        let repaint = ctx.clone();
-        std::thread::spawn(move || {
-            if let Some(dir) = rfd::FileDialog::new()
-                .set_title("Choose a subdirectory inside the target")
-                .set_directory(&target_root)
-                .pick_folder()
-            {
-                let msg = match dir.strip_prefix(&target_root) {
-                    Ok(rel) => Ok(rel.to_string_lossy().replace('\\', "/")),
-                    Err(_) => Err("The chosen folder is outside the target repo.".to_string()),
-                };
-                let _ = tx.send(msg);
-                repaint.request_repaint();
+        // Run the native picker modally, parented to our window, so it grabs
+        // focus and a second one can't be opened while it's up.
+        if let Some(dir) = rfd::FileDialog::new()
+            .set_title("Choose a subdirectory inside the target")
+            .set_directory(&target_root)
+            .set_parent(frame)
+            .pick_folder()
+        {
+            match dir.strip_prefix(&target_root) {
+                Ok(rel) => {
+                    self.subdir = rel.to_string_lossy().replace('\\', "/");
+                    self.error = None;
+                    self.clear_preview();
+                }
+                Err(_) => {
+                    self.error = Some("The chosen folder is outside the target repo.".to_string());
+                }
             }
-        });
+        }
     }
 
     /// Open the native folder dialog and store the picked absolute path as the
     /// export folder (Destination::Folder).
-    fn browse_folder(&mut self, ctx: &egui::Context) {
-        let tx = self.folder_tx.clone();
-        let repaint = ctx.clone();
+    fn browse_folder(&mut self, frame: &eframe::Frame) {
         // Start the dialog in the current folder if it is a real directory.
         let start = Some(self.folder.clone()).filter(|f| Path::new(f).is_dir());
-        std::thread::spawn(move || {
-            let mut dialog = rfd::FileDialog::new().set_title("Choose the export folder");
-            if let Some(dir) = start {
-                dialog = dialog.set_directory(dir);
-            }
-            if let Some(dir) = dialog.pick_folder() {
-                let _ = tx.send(Ok(dir.to_string_lossy().into_owned()));
-                repaint.request_repaint();
-            }
-        });
+        // Run the native picker modally, parented to our window, so it grabs
+        // focus and a second one can't be opened while it's up.
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Choose the export folder")
+            .set_parent(frame);
+        if let Some(dir) = start {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(dir) = dialog.pick_folder() {
+            self.folder = dir.to_string_lossy().into_owned();
+            self.error = None;
+            self.clear_preview();
+        }
     }
 
     /// The current filter expression composed by the shared wizard.
@@ -1109,9 +1307,69 @@ impl TransferView {
         };
         // PREVIEW and RUN are mutually exclusive: previewing drops any run log.
         self.reset_run();
+        if self.command.repo_to_repo() {
+            self.run_preview_sync(store, &source);
+            return;
+        }
         match self.destination {
             Destination::Repo => self.run_preview_repo(store, &source),
             Destination::Folder => self.run_preview_folder(store, &source),
+        }
+    }
+
+    fn run_preview_sync(&mut self, store: &Store, source: &str) {
+        let Some(target) = self.target.clone() else {
+            return;
+        };
+        let filter = self.filter_string();
+        let delete = self.sync_delete_mode();
+        match plan_sync(store, source, &target, true, delete, filter.as_deref()) {
+            Ok(plan) => {
+                self.preview_total = plan.copies.len();
+                self.sync_delete_total = plan.deletes.len();
+                self.preview_totals = [plan.copies.len(), plan.deletes.len(), 0];
+                self.preview_source_header = Self::repo_header(store, source);
+                self.preview_target_header = Self::repo_header(store, &target);
+                // A copy: source keeps the file (unchanged), target gains it
+                // (added). A delete: the source no longer has it (absent), the
+                // target loses it (removed). Capped, then sorted.
+                let mut rows: Vec<review::ReviewRow> = plan
+                    .copies
+                    .iter()
+                    .take(PREVIEW_CAP)
+                    .map(|rel| review::ReviewRow {
+                        source: review::SideStatus::Unchanged,
+                        target: review::SideStatus::Added,
+                        source_path: rel.clone(),
+                        target_path: rel.clone(),
+                    })
+                    .collect();
+                for rel in plan
+                    .deletes
+                    .iter()
+                    .take(PREVIEW_CAP.saturating_sub(rows.len()))
+                {
+                    rows.push(review::ReviewRow {
+                        source: review::SideStatus::Absent,
+                        target: review::SideStatus::Removed,
+                        source_path: String::new(),
+                        target_path: rel.clone(),
+                    });
+                }
+                review::sort(&mut rows, &self.review_state);
+                self.preview = rows;
+                let verb = self.command.label();
+                self.status = Some(if delete == SyncDelete::None {
+                    format!("{verb}: {} to copy.", self.preview_total)
+                } else {
+                    format!(
+                        "{verb}: {} to copy, {} to delete.",
+                        self.preview_total, self.sync_delete_total
+                    )
+                });
+                self.error = None;
+            }
+            Err(e) => self.error = Some(e.to_string()),
         }
     }
 
@@ -1124,20 +1382,66 @@ impl TransferView {
         let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
         match diff_print(store, source, &ref_slice, filter.as_deref()) {
             Ok(items) => {
-                // Copy/Move act on content the target lacks (New).
-                let matched: Vec<&DiffItem> = items
-                    .iter()
-                    .filter(|item| matches!(item, DiffItem::New { .. }))
-                    .collect();
-                self.preview_total = matched.len();
-                self.preview = matched
-                    .into_iter()
-                    .take(PREVIEW_LIMIT)
-                    .map(|item| self.preview_row(source, &target, item))
-                    .collect();
+                // A file the target lacks (New) is added on the target side; on
+                // the source side a COPY leaves it unchanged while a MOVE removes
+                // it. Files the target already has (Equal) are unchanged on both
+                // sides. DeletedInReference isn't part of a transfer.
+                let subdir = self.normalized_subdir();
+                let move_files = self.command == Command::Move;
+                let source_state = if move_files {
+                    review::SideStatus::Removed
+                } else {
+                    review::SideStatus::Unchanged
+                };
+                let mut acted = 0usize;
+                let mut unchanged = 0usize;
+                let mut rows: Vec<review::ReviewRow> = Vec::new();
+                for item in &items {
+                    match item {
+                        DiffItem::New { rel_path } => {
+                            acted += 1;
+                            if rows.len() < PREVIEW_CAP {
+                                let to = if subdir.is_empty() {
+                                    rel_path.clone()
+                                } else {
+                                    format!("{subdir}/{rel_path}")
+                                };
+                                rows.push(review::ReviewRow {
+                                    source: source_state,
+                                    target: review::SideStatus::Added,
+                                    source_path: rel_path.clone(),
+                                    target_path: to,
+                                });
+                            }
+                        }
+                        DiffItem::Equal { rel_path, .. } => {
+                            unchanged += 1;
+                            if rows.len() < PREVIEW_CAP {
+                                rows.push(review::ReviewRow {
+                                    source: review::SideStatus::Unchanged,
+                                    target: review::SideStatus::Unchanged,
+                                    source_path: rel_path.clone(),
+                                    target_path: rel_path.clone(),
+                                });
+                            }
+                        }
+                        DiffItem::DeletedInReference { .. } => {}
+                    }
+                }
+                self.preview_total = acted;
+                // A move both removes from source and adds to target; a copy only
+                // adds. Totals are [added, removed, unchanged].
+                self.preview_totals = if move_files {
+                    [acted, acted, unchanged]
+                } else {
+                    [acted, 0, unchanged]
+                };
+                self.preview_source_header = Self::repo_header(store, source);
+                self.preview_target_header = Self::repo_header(store, &target);
+                review::sort(&mut rows, &self.review_state);
+                self.preview = rows;
                 self.status = Some(format!(
-                    "{} match the {}.",
-                    self.preview_total,
+                    "{acted} match the {}.",
                     self.command.label().to_lowercase()
                 ));
                 self.error = None;
@@ -1147,7 +1451,7 @@ impl TransferView {
     }
 
     fn run_preview_folder(&mut self, store: &Store, source: &str) {
-        let folder = self.folder.trim();
+        let folder = self.folder.trim().to_string();
         if folder.is_empty() {
             return;
         }
@@ -1164,14 +1468,33 @@ impl TransferView {
         ) {
             Ok(rels) => {
                 self.preview_total = rels.len();
-                self.preview = rels
+                let move_files = self.command == Command::Move;
+                let source_state = if move_files {
+                    review::SideStatus::Removed
+                } else {
+                    review::SideStatus::Unchanged
+                };
+                // Exporting adds each file into the folder; a MOVE also removes
+                // it from the source repo, a COPY leaves the source unchanged.
+                self.preview_totals = if move_files {
+                    [rels.len(), rels.len(), 0]
+                } else {
+                    [rels.len(), 0, 0]
+                };
+                self.preview_source_header = Self::repo_header(store, source);
+                self.preview_target_header = folder.clone();
+                let mut rows: Vec<review::ReviewRow> = rels
                     .iter()
-                    .take(PREVIEW_LIMIT)
-                    .map(|rel| PreviewRow {
-                        from: format!("{source}/{rel}"),
-                        to: format!("{folder}/{rel}"),
+                    .take(PREVIEW_CAP)
+                    .map(|rel| review::ReviewRow {
+                        source: source_state,
+                        target: review::SideStatus::Added,
+                        source_path: rel.clone(),
+                        target_path: rel.clone(),
                     })
                     .collect();
+                review::sort(&mut rows, &self.review_state);
+                self.preview = rows;
                 let what = if self.invert { "redundant" } else { "unique" };
                 self.status = Some(format!(
                     "{} {what} file(s) to {}.",
@@ -1181,31 +1504,6 @@ impl TransferView {
                 self.error = None;
             }
             Err(e) => self.error = Some(e.to_string()),
-        }
-    }
-
-    fn preview_row(&self, source: &str, target: &str, item: &DiffItem) -> PreviewRow {
-        let subdir = self.normalized_subdir();
-        match item {
-            DiffItem::New { rel_path } => {
-                let to = if subdir.is_empty() {
-                    format!("{target}/{rel_path}")
-                } else {
-                    format!("{target}/{subdir}/{rel_path}")
-                };
-                PreviewRow {
-                    from: format!("{source}/{rel_path}"),
-                    to,
-                }
-            }
-            // Transfer only previews New items (see `run_preview`); content the
-            // target already has is never shown as a transfer.
-            DiffItem::Equal { rel_path, .. } | DiffItem::DeletedInReference { rel_path } => {
-                PreviewRow {
-                    from: format!("{source}/{rel_path}"),
-                    to: String::new(),
-                }
-            }
         }
     }
 
@@ -1240,36 +1538,68 @@ impl TransferView {
                 "Move {} file(s) from '{source}' into '{dest}'? They are removed from the source directory.",
                 self.preview_total
             ),
+            Command::Sync if self.sync_delete_missing => format!(
+                "Sync '{source}' → '{dest}': copy {} file(s) into the target and delete {} \
+                 file(s) from the target. Deletions cannot be undone. The source is not changed.",
+                self.preview_total, self.sync_delete_total
+            ),
+            Command::Sync => format!(
+                "Sync '{source}' → '{dest}': copy {} file(s) into the target. Nothing is \
+                 deleted and the source is not changed.",
+                self.preview_total
+            ),
+            Command::Mirror => format!(
+                "Mirror '{source}' → '{dest}': copy {} file(s) into the target and DELETE {} \
+                 file(s) the source does not have, so the target ends up holding exactly the \
+                 source's content. Deletions cannot be undone. The source is not changed.",
+                self.preview_total, self.sync_delete_total
+            ),
         })
     }
 
-    fn start(&mut self, store: &Arc<Store>) {
+    /// Start the configured command on a worker thread. `only` restricts the
+    /// run to a single review row (the APPLY button); `None` runs the whole
+    /// batch minus any rejected rows.
+    fn start(&mut self, store: &Arc<Store>, only: Option<String>) {
         let Some(source) = self.source.clone() else {
             return;
         };
+        let rejected: std::collections::HashSet<String> = self.review_state.rejected.clone();
         // Snapshot everything the worker needs before spawning, branching on
-        // where the transfer lands.
-        let dest = match self.destination {
-            Destination::Repo => {
-                let Some(target) = self.target.clone() else {
-                    return;
-                };
-                StartDest::Repo {
-                    references: self.references(&target),
-                    target,
-                    subdir: self.normalized_subdir(),
-                }
+        // where the transfer lands. SYNC/MIRROR are their own destination
+        // (repo→repo at the same relative path), independent of REPO/FOLDER.
+        let dest = if self.command.repo_to_repo() {
+            let Some(target) = self.target.clone() else {
+                return;
+            };
+            StartDest::Sync {
+                target,
+                delete: self.sync_delete_mode(),
+                mirror: self.command == Command::Mirror,
             }
-            Destination::Folder => {
-                let folder = self.folder.trim().to_string();
-                if folder.is_empty() {
-                    return;
+        } else {
+            match self.destination {
+                Destination::Repo => {
+                    let Some(target) = self.target.clone() else {
+                        return;
+                    };
+                    StartDest::Repo {
+                        references: self.references(&target),
+                        target,
+                        subdir: self.normalized_subdir(),
+                    }
                 }
-                StartDest::Folder {
-                    references: self.folder_references(),
-                    dir: PathBuf::from(&folder),
-                    mode: self.folder_mode(),
-                    invert: self.invert,
+                Destination::Folder => {
+                    let folder = self.folder.trim().to_string();
+                    if folder.is_empty() {
+                        return;
+                    }
+                    StartDest::Folder {
+                        references: self.folder_references(),
+                        dir: PathBuf::from(&folder),
+                        mode: self.folder_mode(),
+                        invert: self.invert,
+                    }
                 }
             }
         };
@@ -1282,22 +1612,44 @@ impl TransferView {
         let cancel = self.cancel.clone();
         self.running = true;
         self.status = Some(format!("{}…", command.label().to_lowercase()));
-        // RUN and PREVIEW are mutually exclusive: starting a run drops the
-        // stale preview and resets the live run log/counters.
-        self.clear_preview();
-        self.reset_run();
+        if only.is_some() {
+            // A single-row APPLY keeps the preview on screen (it refreshes
+            // when the run finishes) instead of dropping to the run log.
+            self.pending_refresh = true;
+            self.reset_run();
+        } else {
+            // RUN and PREVIEW are mutually exclusive: starting a run drops the
+            // stale preview and resets the live run log/counters.
+            self.clear_preview();
+            self.reset_run();
+        }
 
         std::thread::spawn(move || {
             let progress = ChannelDiffProgress { tx: tx.clone() };
-            let run = DiffRun::new(&progress, &cancel);
-            let stats = match &dest {
+            let only_set: Option<std::collections::HashSet<String>> =
+                only.map(|k| std::collections::HashSet::from([k]));
+            let run = DiffRun::new(&progress, &cancel).with_selection(
+                (!rejected.is_empty()).then_some(&rejected),
+                only_set.as_ref(),
+            );
+            // Copy/Move (repo or folder) both yield CopyStats → Copied; Sync
+            // yields SyncStats → Synced. Map each to its OpResult in place.
+            let copied_result = |stats: Result<dedup_core::diff::CopyStats, String>| match stats {
+                Ok(s) => OpResult::Copied {
+                    copied: s.copied,
+                    cancelled: s.cancelled,
+                    moved: move_files,
+                },
+                Err(e) => OpResult::Error(e),
+            };
+            let result = match &dest {
                 StartDest::Repo {
                     references,
                     target,
                     subdir,
                 } => {
                     let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
-                    match store.get_repo(target) {
+                    let stats = match store.get_repo(target) {
                         Ok(meta) => {
                             let target_dir = PathBuf::from(meta.abs_path);
                             let subdir = if subdir.is_empty() {
@@ -1320,7 +1672,8 @@ impl TransferView {
                             .map_err(|e| e.to_string())
                         }
                         Err(e) => Err(e.to_string()),
-                    }
+                    };
+                    copied_result(stats)
                 }
                 StartDest::Folder {
                     references,
@@ -1329,7 +1682,7 @@ impl TransferView {
                     invert,
                 } => {
                     let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
-                    export_to_folder(
+                    let stats = export_to_folder(
                         &store,
                         &source,
                         &ref_slice,
@@ -1340,16 +1693,32 @@ impl TransferView {
                         filter.as_deref(),
                         &run,
                     )
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| e.to_string());
+                    copied_result(stats)
                 }
-            };
-            let result = match stats {
-                Ok(s) => OpResult::Copied {
-                    copied: s.copied,
-                    cancelled: s.cancelled,
-                    moved: move_files,
+                StartDest::Sync {
+                    target,
+                    delete,
+                    mirror,
+                } => match diff_sync(
+                    &store,
+                    &source,
+                    target,
+                    true,
+                    *delete,
+                    filter.as_deref(),
+                    &run,
+                ) {
+                    Ok(s) => OpResult::Synced {
+                        copied: s.copied,
+                        deleted: s.deleted,
+                        skipped: s.skipped,
+                        errors: s.errors,
+                        cancelled: s.cancelled,
+                        mirror: *mirror,
+                    },
+                    Err(e) => OpResult::Error(e.to_string()),
                 },
-                Err(e) => OpResult::Error(e),
             };
             let _ = tx.send(Msg::Done(result));
         });
@@ -1398,30 +1767,6 @@ impl TransferView {
 
     fn drain(&mut self, ui: &egui::Ui) {
         let mut got = false;
-        // Apply any subfolder picked by the native subdir dialog thread.
-        while let Ok(picked) = self.subdir_rx.try_recv() {
-            got = true;
-            match picked {
-                Ok(rel) => {
-                    self.subdir = rel;
-                    self.error = None;
-                    self.clear_preview();
-                }
-                Err(e) => self.error = Some(e),
-            }
-        }
-        // Apply any export folder picked by the native folder dialog thread.
-        while let Ok(picked) = self.folder_rx.try_recv() {
-            got = true;
-            match picked {
-                Ok(abs) => {
-                    self.folder = abs;
-                    self.error = None;
-                    self.clear_preview();
-                }
-                Err(e) => self.error = Some(e),
-            }
-        }
         while let Ok(msg) = self.rx.try_recv() {
             got = true;
             match msg {
@@ -1437,6 +1782,32 @@ impl TransferView {
                             let verb = if moved { "Moved" } else { "Copied" };
                             self.status = Some(format!(
                                 "{verb} {copied} file(s){}.",
+                                if cancelled { " (cancelled)" } else { "" }
+                            ));
+                            self.error = None;
+                        }
+                        OpResult::Synced {
+                            copied,
+                            deleted,
+                            skipped,
+                            errors,
+                            cancelled,
+                            mirror,
+                        } => {
+                            let mut parts = vec![format!("copied {copied}")];
+                            if deleted > 0 {
+                                parts.push(format!("deleted {deleted}"));
+                            }
+                            if skipped > 0 {
+                                parts.push(format!("skipped {skipped}"));
+                            }
+                            if errors > 0 {
+                                parts.push(format!("errors {errors}"));
+                            }
+                            let verb = if mirror { "Mirror" } else { "Sync" };
+                            self.status = Some(format!(
+                                "{verb} done: {}{}.",
+                                parts.join(", "),
                                 if cancelled { " (cancelled)" } else { "" }
                             ));
                             self.error = None;
@@ -1506,7 +1877,7 @@ mod ui_tests {
                         crate::theme::apply(ui.ctx());
                         init = true;
                     }
-                    view.show(ui, &store_ui, TooltipVerbosity::default());
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), None);
                 },
                 view,
             );
@@ -1526,10 +1897,86 @@ mod ui_tests {
         h.run();
         assert!(h.state().command == Command::Move, "2 selects MOVE");
 
+        h.key_press(egui::Key::Num3);
+        h.run();
+        h.run();
+        assert!(h.state().command == Command::Sync, "3 selects SYNC");
+
+        h.key_press(egui::Key::Num4);
+        h.run();
+        h.run();
+        assert!(h.state().command == Command::Mirror, "4 selects MIRROR");
+
         h.key_press(egui::Key::Num1);
         h.run();
         h.run();
         assert!(h.state().command == Command::Copy, "1 selects COPY");
+    }
+
+    /// MIRROR hides the DELETE MISSING toggle (it always deletes) and the
+    /// copy/move-only controls, keeps the TARGET row, and warns via DELETES
+    /// EXTRAS.
+    #[test]
+    fn mirror_mode_shows_warning_and_hides_toggles() {
+        let (_tmp, store) = sample_store();
+        let harness = transfer_harness(store, |view| {
+            view.command = Command::Mirror;
+            view.target = Some("target".to_string());
+        });
+
+        assert!(
+            harness.query_by_label_contains("DELETES EXTRAS").is_some(),
+            "MIRROR shows the DELETES EXTRAS warning"
+        );
+        assert!(
+            harness.query_by_label("DELETE MISSING").is_none(),
+            "MIRROR has no DELETE MISSING toggle (it always deletes)"
+        );
+        assert!(
+            harness.query_by_label("TARGET").is_some(),
+            "MIRROR still picks a target repo"
+        );
+        assert!(
+            harness.query_by_label_contains("DEST — ").is_none(),
+            "the REPO/FOLDER toggle must be hidden in MIRROR mode"
+        );
+        assert!(
+            harness.query_by_label("DUPEPOOL").is_none(),
+            "MIRROR compares source vs the single target, so no DUPEPOOL row"
+        );
+    }
+
+    /// In SYNC mode the DELETE MISSING toggle appears and the copy/move-only
+    /// controls (DEST toggle, INTO subdir, DUPEPOOL) are hidden; the TARGET row
+    /// stays (SYNC is repo→repo).
+    #[test]
+    fn sync_mode_shows_delete_toggle_and_hides_transfer_controls() {
+        let (_tmp, store) = sample_store();
+        let harness = transfer_harness(store, |view| {
+            view.command = Command::Sync;
+            view.target = Some("target".to_string());
+        });
+
+        assert!(
+            harness.query_by_label("DELETE MISSING").is_some(),
+            "SYNC shows the DELETE MISSING toggle"
+        );
+        assert!(
+            harness.query_by_label("TARGET").is_some(),
+            "SYNC still picks a target repo"
+        );
+        assert!(
+            harness.query_by_label_contains("DEST — ").is_none(),
+            "the REPO/FOLDER destination toggle must be hidden in SYNC mode"
+        );
+        assert!(
+            harness.query_by_label_contains("INTO — ").is_none(),
+            "the INTO subdir bar must be hidden in SYNC mode"
+        );
+        assert!(
+            harness.query_by_label("DUPEPOOL").is_none(),
+            "SYNC compares source vs the single target, so no DUPEPOOL row"
+        );
     }
 
     /// In FOLDER mode the folder/mode/invert controls appear and the repo-only
@@ -1548,7 +1995,7 @@ mod ui_tests {
             "FOLDER destination/label should be shown"
         );
         assert!(
-            harness.query_by_label("MODE").is_some(),
+            harness.query_by_label_contains("MODE — ").is_some(),
             "MODE selector should be shown in folder mode"
         );
         assert!(
@@ -1561,7 +2008,7 @@ mod ui_tests {
             "the TARGET row must be hidden in folder mode"
         );
         assert!(
-            harness.query_by_label("INTO").is_none(),
+            harness.query_by_label_contains("INTO — ").is_none(),
             "the INTO subdir bar must be hidden in folder mode"
         );
     }
@@ -1606,11 +2053,11 @@ mod ui_tests {
             "the TARGET row should be shown in repo mode"
         );
         assert!(
-            harness.query_by_label("INTO").is_some(),
+            harness.query_by_label_contains("INTO — ").is_some(),
             "the INTO subdir bar should be shown in repo mode"
         );
         assert!(
-            harness.query_by_label("MODE").is_none(),
+            harness.query_by_label_contains("MODE — ").is_none(),
             "the MODE selector must be hidden in repo mode"
         );
     }
@@ -1640,7 +2087,7 @@ mod ui_tests {
                         crate::theme::apply(ui.ctx());
                         init = true;
                     }
-                    view.show(ui, &store_ui, TooltipVerbosity::default());
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), None);
                 },
                 view,
             );
@@ -1649,6 +2096,226 @@ mod ui_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("files_tab.png");
         let img = harness.render().expect("wgpu render failed");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Render snapshot of the SYNC command (with DELETE MISSING on) to
+    /// `docs/screenshots/transfer_sync.png`, to eyeball the sync bar and hidden
+    /// transfer controls. Run with `--ignored`.
+    #[test]
+    #[ignore = "generates a render snapshot (needs wgpu)"]
+    fn render_transfer_sync() {
+        let (_tmp, store) = sample_store();
+        let mut view = TransferView::new();
+        view.loaded = true;
+        view.repos = vec!["source".to_string(), "target".to_string()];
+        view.source = Some("source".to_string());
+        view.target = Some("target".to_string());
+        view.command = Command::Sync;
+        view.sync_delete_missing = true;
+
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 620.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut TransferView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), None);
+                },
+                view,
+            );
+        harness.run();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("transfer_sync.png");
+        let img = harness.render().expect("wgpu render failed");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Render snapshot of the MIRROR command to
+    /// `docs/screenshots/transfer_mirror.png`, to eyeball the red DELETES
+    /// EXTRAS warning and hidden toggles. Run with `--ignored`.
+    #[test]
+    #[ignore = "generates a render snapshot (needs wgpu)"]
+    fn render_transfer_mirror() {
+        let (_tmp, store) = sample_store();
+        let mut view = TransferView::new();
+        view.loaded = true;
+        view.repos = vec!["source".to_string(), "target".to_string()];
+        view.source = Some("source".to_string());
+        view.target = Some("target".to_string());
+        view.command = Command::Mirror;
+
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 620.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut TransferView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), None);
+                },
+                view,
+            );
+        harness.run();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("transfer_mirror.png");
+        let img = harness.render().expect("wgpu render failed");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// A harness whose preview is seeded with a mix of kinds, so the review
+    /// table renders without needing a real indexed diff. Uses a tall viewport
+    /// so the table (below the command/repo/filter chrome) is on-screen and its
+    /// headers are clickable.
+    fn review_harness() -> Harness<'static, TransferView> {
+        let (_tmp, store) = sample_store();
+        // Keep the temp dir alive for the harness's lifetime.
+        std::mem::forget(_tmp);
+        let mut view = TransferView::new();
+        view.loaded = true;
+        view.repos = vec!["source".to_string(), "target".to_string()];
+        view.source = Some("source".to_string());
+        view.target = Some("target".to_string());
+        view.preview_source_header = "/repos/source".to_string();
+        view.preview_target_header = "/repos/target".to_string();
+        view.preview = vec![
+            // A copy: source unchanged (grey ✓), target added (green +).
+            review::ReviewRow {
+                source: review::SideStatus::Unchanged,
+                target: review::SideStatus::Added,
+                source_path: "holiday.jpg".to_string(),
+                target_path: "holiday.jpg".to_string(),
+            },
+            // Unchanged on both sides (hidden until the toggle is on).
+            review::ReviewRow {
+                source: review::SideStatus::Unchanged,
+                target: review::SideStatus::Unchanged,
+                source_path: "notes.txt".to_string(),
+                target_path: "notes.txt".to_string(),
+            },
+        ];
+        view.preview_totals = [1, 0, 1];
+        review::sort(&mut view.preview, &view.review_state);
+
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 1100.0))
+            .build_ui_state(
+                move |ui, view: &mut TransferView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store, TooltipVerbosity::default(), None);
+                },
+                view,
+            );
+        harness.run();
+        harness
+    }
+
+    /// The review board summarises the changes, heads the status columns with the
+    /// repo paths, hides unchanged rows until the toggle is on, and sorts on a
+    /// header click.
+    #[test]
+    fn review_board_summarises_hides_unchanged_and_sorts() {
+        let mut h = review_harness();
+        assert!(
+            h.query_by_label_contains("1 added").is_some(),
+            "summary shows the added count"
+        );
+        assert!(
+            h.query_by_label_contains("1 unchanged").is_some(),
+            "summary shows the unchanged count"
+        );
+        // The source path column is headed by the repo's absolute path.
+        assert!(
+            h.query_by_label_contains("/repos/source").is_some(),
+            "the source column is headed by its absolute path"
+        );
+        // Unchanged rows are hidden by default; the toggle reveals them. (The
+        // path appears in both the source and target columns, so use query_all.)
+        assert!(
+            !h.state().review_state.show_unchanged,
+            "unchanged hidden by default"
+        );
+        assert!(
+            h.query_all_by_label("notes.txt").next().is_none(),
+            "the unchanged row is hidden until the toggle is on"
+        );
+        h.get_by_label_contains("SHOW UNCHANGED").click();
+        h.run();
+        assert!(h.state().review_state.show_unchanged, "toggle turns it on");
+        assert!(
+            h.query_all_by_label("notes.txt").next().is_some(),
+            "the unchanged row appears once shown"
+        );
+
+        // Source path is the default sort column; clicking its header (the repo
+        // path) flips direction.
+        assert!(h.state().review_state.sort_asc, "starts ascending");
+        h.get_by_label_contains("/repos/source").click();
+        h.run();
+        assert!(
+            !h.state().review_state.sort_asc,
+            "clicking the source header toggles the sort direction"
+        );
+    }
+
+    /// Renders the review table to a PNG for manual inspection. `--ignored`.
+    #[test]
+    #[ignore = "renders a PNG for manual inspection"]
+    fn render_review_table() {
+        let mut h = review_harness();
+        // Seed one of each status and reveal unchanged, so the PNG shows the full
+        // side-by-side vocabulary (added / removed / unchanged / absent).
+        {
+            let v = h.state_mut();
+            v.review_state.show_unchanged = true;
+            v.preview_totals = [1, 1, 1];
+            v.preview = vec![
+                review::ReviewRow {
+                    source: review::SideStatus::Unchanged,
+                    target: review::SideStatus::Added,
+                    source_path: "holiday.jpg".to_string(),
+                    target_path: "holiday.jpg".to_string(),
+                },
+                review::ReviewRow {
+                    source: review::SideStatus::Removed,
+                    target: review::SideStatus::Absent,
+                    source_path: "old.tmp".to_string(),
+                    target_path: String::new(),
+                },
+                review::ReviewRow {
+                    source: review::SideStatus::Unchanged,
+                    target: review::SideStatus::Unchanged,
+                    source_path: "notes.txt".to_string(),
+                    target_path: "notes.txt".to_string(),
+                },
+            ];
+            review::sort(&mut v.preview, &v.review_state);
+        }
+        h.run();
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/transfer_review.png");
+        let img = h.render().expect("wgpu render failed");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }

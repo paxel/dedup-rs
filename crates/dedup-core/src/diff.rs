@@ -9,8 +9,11 @@
 //! - [`diff_delete`]: delete source files whose content the reference knows
 //!   (present or missing) and mark them missing in the source index.
 //! - [`diff_sync`]: sync source into target — copy new content (never
-//!   overwriting an occupied path), optionally delete target content the
-//!   source marks missing; best effort, errors are counted.
+//!   overwriting an occupied path) and delete target content per a
+//!   [`SyncDelete`] mode (nothing / the source's own deletions / everything the
+//!   source lacks, i.e. a content-mirror); best effort, errors are counted.
+//! - [`plan_sync`]: preview a [`diff_sync`] (the copies and deletes it would
+//!   make) without touching disk.
 //! - [`export_to_folder`]: copy (or move) a deduplicated selection of the
 //!   source into a plain folder (not a repo), keeping source-relative paths.
 
@@ -119,17 +122,71 @@ impl DiffProgress for NoDiffProgress {
 }
 
 /// The execution context shared by the mutating diff operations: where to
-/// report live progress and how to observe cancellation. Grouping the two
-/// keeps the operation signatures compact.
+/// report live progress, how to observe cancellation, and (optionally) which
+/// review-board rows to act on. Grouping these keeps the operation signatures
+/// compact.
+///
+/// Row selection uses namespaced keys, because a source-side row and a
+/// target-side row can share the same relative path (a mirror can delete the
+/// target's `a.txt` and then copy the source's `a.txt`): `s:<rel>` identifies
+/// a source-side row (copy/move/delete-from-source/organize), `t:<rel>` a
+/// target-side row (a sync/mirror deletion in the target).
 #[derive(Clone, Copy)]
 pub struct DiffRun<'a> {
     pub progress: &'a dyn DiffProgress,
     pub cancel: &'a CancellationToken,
+    /// Namespaced row keys the user rejected in review; the op skips them.
+    exclude: Option<&'a HashSet<String>>,
+    /// When set, the op acts *only* on these namespaced row keys (a
+    /// single-row apply is the batch op with a one-element allowlist).
+    only: Option<&'a HashSet<String>>,
+}
+
+/// Build the namespaced selection key for a source-side row.
+pub fn source_key(rel: &str) -> String {
+    format!("s:{rel}")
+}
+
+/// Build the namespaced selection key for a target-side row.
+pub fn target_key(rel: &str) -> String {
+    format!("t:{rel}")
 }
 
 impl<'a> DiffRun<'a> {
     pub fn new(progress: &'a dyn DiffProgress, cancel: &'a CancellationToken) -> Self {
-        Self { progress, cancel }
+        Self {
+            progress,
+            cancel,
+            exclude: None,
+            only: None,
+        }
+    }
+
+    /// Restrict this run to the review-board selection: skip `exclude`d rows,
+    /// and when `only` is set act on those rows alone. Keys are namespaced via
+    /// [`source_key`] / [`target_key`].
+    pub fn with_selection(
+        mut self,
+        exclude: Option<&'a HashSet<String>>,
+        only: Option<&'a HashSet<String>>,
+    ) -> Self {
+        self.exclude = exclude;
+        self.only = only;
+        self
+    }
+
+    /// Whether the op should act on the source-side row for `rel`.
+    pub fn selected_source(&self, rel: &str) -> bool {
+        self.selected(&source_key(rel))
+    }
+
+    /// Whether the op should act on the target-side row for `rel`.
+    pub fn selected_target(&self, rel: &str) -> bool {
+        self.selected(&target_key(rel))
+    }
+
+    fn selected(&self, key: &str) -> bool {
+        self.only.is_none_or(|s| s.contains(key)) && self.exclude.is_none_or(|s| !s.contains(key))
     }
 }
 
@@ -166,7 +223,7 @@ pub struct SyncStats {
     pub equal: u64,
     /// Copies skipped because the target path is occupied by other content.
     pub skipped: u64,
-    /// Target files deleted because the source marks their content missing.
+    /// Target files deleted by the delete phase (per the [`SyncDelete`] mode).
     pub deleted: u64,
     /// Errors encountered (best effort: the sync continues).
     pub errors: u64,
@@ -222,9 +279,10 @@ fn collect_source_entries(
     filter: &FileFilter,
     include_missing: bool,
 ) -> Result<Vec<(String, FileEntry)>, StoreError> {
+    let annotated = crate::filter::AnnotatedFilter::new(db, filter)?;
     let mut entries = Vec::new();
     store::for_each_file_entry(db, |rel_path, entry| {
-        if (include_missing || !entry.missing) && filter.matches(rel_path, &entry) {
+        if (include_missing || !entry.missing) && annotated.matches(rel_path, &entry) {
             entries.push((rel_path.to_string(), entry));
         }
         Ok(())
@@ -312,7 +370,9 @@ pub fn diff_copy(
 
     let candidates: Vec<(String, FileEntry)> = collect_source_entries(&source.db, &filter, false)?
         .into_iter()
-        .filter(|(_, entry)| !ref_index.contains_key(&(entry.size, entry.hash)))
+        .filter(|(rel, entry)| {
+            !ref_index.contains_key(&(entry.size, entry.hash)) && run.selected_source(rel)
+        })
         .collect();
 
     let source_root = PathBuf::from(&source.meta.abs_path);
@@ -423,7 +483,9 @@ pub fn diff_delete(
 
     let candidates: Vec<(String, FileEntry)> = collect_source_entries(&source.db, &filter, false)?
         .into_iter()
-        .filter(|(_, entry)| ref_index.contains_key(&(entry.size, entry.hash)))
+        .filter(|(rel, entry)| {
+            ref_index.contains_key(&(entry.size, entry.hash)) && run.selected_source(rel)
+        })
         .collect();
 
     let source_root = PathBuf::from(&source.meta.abs_path);
@@ -484,21 +546,38 @@ pub fn diff_delete(
     }
 }
 
+/// What [`diff_sync`] deletes in the target (its copy behaviour is separate,
+/// controlled by `copy_new`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncDelete {
+    /// Delete nothing in the target.
+    None,
+    /// Delete target content the source marks *missing* — propagate the
+    /// source's own deletions into the target. Never touches content the
+    /// source simply never had.
+    Missing,
+    /// Delete any target content not currently in the source: make the target a
+    /// content-mirror of the source. This runs *before* the copy so a copy can
+    /// reclaim a path a delete frees. It is a mirror by *content*, so identical
+    /// content living at a different path in the target is kept, not relocated.
+    Absent,
+}
+
 /// Sync the source repo into the target repo (best effort):
 /// - `copy_new`: copy content that exists in source but not in target to the
 ///   same relative path; never overwrite an occupied path (counts as skipped);
 ///   successful copies are added to the target index.
-/// - `delete_missing`: when the source marks content missing and the target
-///   still has it, delete those target files and mark them missing in the
-///   target index.
+/// - `delete`: what to remove from the target — see [`SyncDelete`]. A
+///   [`SyncDelete::Absent`] (mirror) delete runs before the copy so a freed
+///   path can be reused; the milder [`SyncDelete::Missing`] runs after.
 pub fn diff_sync(
     store: &Store,
     source: &str,
     target: &str,
     copy_new: bool,
-    delete_missing: bool,
+    delete: SyncDelete,
     filter: Option<&str>,
-    cancel: &CancellationToken,
+    run: &DiffRun<'_>,
 ) -> Result<SyncStats, DiffError> {
     let filter = FileFilter::parse(filter)?;
     let source_name = source.to_string();
@@ -506,36 +585,273 @@ pub fn diff_sync(
     let target = open_repo(store, target)?;
     let mut target_index = store::read_content_index(&target.db)?;
 
-    let entries = collect_source_entries(&source.db, &filter, true)?;
+    let source_entries = collect_source_entries(&source.db, &filter, true)?;
     let source_root = PathBuf::from(&source.meta.abs_path);
     let target_root = PathBuf::from(&target.meta.abs_path);
     let mut stats = SyncStats::default();
 
-    for (rel_path, entry) in entries {
-        if cancel.is_cancelled() {
-            stats.cancelled = true;
-            break;
-        }
-        if entry.missing {
-            if delete_missing {
-                sync_delete(&target, &target_root, &mut target_index, &entry, &mut stats)?;
+    // Content the source currently holds (non-missing, filter-matched): the
+    // reference set for an Absent (mirror) delete, which removes any target
+    // content outside it.
+    let source_present: HashSet<ContentKey> = source_entries
+        .iter()
+        .filter(|(_, e)| !e.missing)
+        .map(|(_, e)| (e.size, e.hash))
+        .collect();
+    // Live target files (filter-matched) — only an Absent delete needs them.
+    let target_entries = if delete == SyncDelete::Absent {
+        collect_source_entries(&target.db, &filter, false)?
+    } else {
+        Vec::new()
+    };
+
+    // Exact denominator for the live progress: how many copies + deletes the
+    // chosen mode will attempt (equal/occupied entries are excluded).
+    let copy_total = if copy_new {
+        source_entries
+            .iter()
+            .filter(|(rel, e)| {
+                !e.missing
+                    && !target_index
+                        .get(&(e.size, e.hash))
+                        .is_some_and(|s| s.present)
+                    && run.selected_source(rel)
+            })
+            .count()
+    } else {
+        0
+    };
+    let delete_total = match delete {
+        SyncDelete::None => 0,
+        SyncDelete::Missing => source_entries
+            .iter()
+            .filter(|(_, e)| {
+                e.missing
+                    && target_index
+                        .get(&(e.size, e.hash))
+                        .is_some_and(|s| s.present)
+            })
+            .count(),
+        SyncDelete::Absent => target_entries
+            .iter()
+            .filter(|(rel, e)| {
+                !source_present.contains(&(e.size, e.hash)) && run.selected_target(rel)
+            })
+            .count(),
+    };
+    let total = (copy_total + delete_total) as u64;
+    let mut done = 0u64;
+
+    // Mirror deletes first so a copy can reclaim a path a delete frees (the
+    // target may hold different content at a source path); other modes' deletes
+    // never free a path a copy wants, so they run after the copy.
+    if delete == SyncDelete::Absent {
+        delete_absent(
+            &target,
+            &target_root,
+            &target_entries,
+            &source_present,
+            &mut stats,
+            &mut done,
+            total,
+            run,
+        )?;
+    }
+
+    if copy_new && !stats.cancelled {
+        for (rel_path, entry) in &source_entries {
+            if entry.missing || !run.selected_source(rel_path) {
+                continue;
             }
-        } else if copy_new {
-            sync_copy(
+            if run.cancel.is_cancelled() {
+                stats.cancelled = true;
+                break;
+            }
+            if sync_copy(
                 &source_root,
                 &source_name,
                 &target,
                 &target_root,
                 &mut target_index,
-                &rel_path,
-                &entry,
+                rel_path,
+                entry,
                 &mut stats,
-            )?;
+                run,
+            )? {
+                done += 1;
+                run.progress.on(DiffEvent::Progress {
+                    action: DiffAction::Copy,
+                    done,
+                    total,
+                    rel_path: rel_path.clone(),
+                });
+            }
         }
     }
+
+    if delete == SyncDelete::Missing && !stats.cancelled {
+        for (_, entry) in source_entries.iter().filter(|(_, e)| e.missing) {
+            if run.cancel.is_cancelled() {
+                stats.cancelled = true;
+                break;
+            }
+            let deleted = sync_delete(
+                &target,
+                &target_root,
+                &mut target_index,
+                entry,
+                &mut stats,
+                run,
+            )?;
+            // One progress step per acting entry (not per deleted path), so
+            // `done` never overshoots `total`.
+            if let Some(first) = deleted.first() {
+                done += 1;
+                run.progress.on(DiffEvent::Progress {
+                    action: DiffAction::Delete,
+                    done,
+                    total,
+                    rel_path: first.clone(),
+                });
+            }
+        }
+    }
+
     Ok(stats)
 }
 
+/// Delete every live target file whose content is not in `source_present` (the
+/// source's current content set) — the [`SyncDelete::Absent`] mirror delete.
+/// Best effort: failures are counted and reported, the mirror continues.
+#[allow(clippy::too_many_arguments)]
+fn delete_absent(
+    target: &OpenRepo,
+    target_root: &Path,
+    target_entries: &[(String, FileEntry)],
+    source_present: &HashSet<ContentKey>,
+    stats: &mut SyncStats,
+    done: &mut u64,
+    total: u64,
+    run: &DiffRun<'_>,
+) -> Result<(), StoreError> {
+    for (rel_path, entry) in target_entries {
+        if run.cancel.is_cancelled() {
+            stats.cancelled = true;
+            break;
+        }
+        if source_present.contains(&(entry.size, entry.hash)) || !run.selected_target(rel_path) {
+            continue;
+        }
+        let path = target_root.join(rel_path);
+        let removed = match std::fs::remove_file(&path) {
+            Ok(()) => true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+            Err(err) => {
+                stats.errors += 1;
+                run.progress.on(DiffEvent::Error {
+                    path: path.to_string_lossy().into_owned(),
+                    message: err.to_string(),
+                });
+                false
+            }
+        };
+        if removed {
+            store::mark_missing(&target.db, std::iter::once(rel_path.as_str()))?;
+            stats.deleted += 1;
+            *done += 1;
+            run.progress.on(DiffEvent::Progress {
+                action: DiffAction::Delete,
+                done: *done,
+                total,
+                rel_path: rel_path.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A preview of what [`diff_sync`] would do, without touching disk: the
+/// source-relative paths to copy into the target and the target-relative paths
+/// to delete. Classification mirrors [`diff_sync`] (content compared by
+/// size + hash), except the copy list cannot foresee a runtime skip when the
+/// target path is already occupied by *different* content.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncPlan {
+    /// Source-relative paths whose content the target lacks (copied to the
+    /// same relative path).
+    pub copies: Vec<String>,
+    /// Target-relative paths the delete phase would remove (per the chosen
+    /// [`SyncDelete`] mode).
+    pub deletes: Vec<String>,
+}
+
+/// Plan a [`diff_sync`] without changing anything on disk (for a preview /
+/// confirmation count). See [`SyncPlan`] and [`SyncDelete`] for the semantics.
+pub fn plan_sync(
+    store: &Store,
+    source: &str,
+    target: &str,
+    copy_new: bool,
+    delete: SyncDelete,
+    filter: Option<&str>,
+) -> Result<SyncPlan, DiffError> {
+    let filter = FileFilter::parse(filter)?;
+    let source = open_repo(store, source)?;
+    let target = open_repo(store, target)?;
+    let target_index = store::read_content_index(&target.db)?;
+
+    let source_entries = collect_source_entries(&source.db, &filter, true)?;
+    let mut plan = SyncPlan::default();
+
+    if copy_new {
+        for (rel_path, entry) in &source_entries {
+            if entry.missing {
+                continue;
+            }
+            let present = target_index
+                .get(&(entry.size, entry.hash))
+                .is_some_and(|s| s.present);
+            if !present {
+                plan.copies.push(rel_path.clone());
+            }
+        }
+    }
+
+    match delete {
+        SyncDelete::None => {}
+        SyncDelete::Missing => {
+            for (_, entry) in source_entries.iter().filter(|(_, e)| e.missing) {
+                let present = target_index
+                    .get(&(entry.size, entry.hash))
+                    .is_some_and(|s| s.present);
+                if present {
+                    for p in store::get_paths_by_size_hash(&target.db, entry.size, &entry.hash)? {
+                        plan.deletes.push(p);
+                    }
+                }
+            }
+        }
+        SyncDelete::Absent => {
+            let source_present: HashSet<ContentKey> = source_entries
+                .iter()
+                .filter(|(_, e)| !e.missing)
+                .map(|(_, e)| (e.size, e.hash))
+                .collect();
+            for (rel_path, entry) in collect_source_entries(&target.db, &filter, false)? {
+                if !source_present.contains(&(entry.size, entry.hash)) {
+                    plan.deletes.push(rel_path);
+                }
+            }
+        }
+    }
+    Ok(plan)
+}
+
+/// Copy one source file into the target if the target lacks its content and
+/// its path is free. Returns `true` when a file was actually copied (so the
+/// caller can emit one progress step); `equal`/`skipped`/`errors` are folded
+/// into `stats`, and any I/O failure is reported through `run` best-effort
+/// (the sync continues).
 #[allow(clippy::too_many_arguments)]
 fn sync_copy(
     source_root: &Path,
@@ -546,27 +862,36 @@ fn sync_copy(
     rel_path: &str,
     entry: &FileEntry,
     stats: &mut SyncStats,
-) -> Result<(), StoreError> {
+    run: &DiffRun<'_>,
+) -> Result<bool, StoreError> {
     let key = (entry.size, entry.hash);
     if target_index.get(&key).is_some_and(|state| state.present) {
         stats.equal += 1;
-        return Ok(());
+        return Ok(false);
     }
 
     let target_file = target_root.join(rel_path);
     if target_file.exists() {
         stats.skipped += 1;
-        return Ok(());
+        return Ok(false);
     }
     if let Some(parent) = target_file.parent()
-        && std::fs::create_dir_all(parent).is_err()
+        && let Err(err) = std::fs::create_dir_all(parent)
     {
         stats.errors += 1;
-        return Ok(());
+        run.progress.on(DiffEvent::Error {
+            path: target_file.to_string_lossy().into_owned(),
+            message: err.to_string(),
+        });
+        return Ok(false);
     }
-    if std::fs::copy(source_root.join(rel_path), &target_file).is_err() {
+    if let Err(err) = std::fs::copy(source_root.join(rel_path), &target_file) {
         stats.errors += 1;
-        return Ok(());
+        run.progress.on(DiffEvent::Error {
+            path: target_file.to_string_lossy().into_owned(),
+            message: err.to_string(),
+        });
+        return Ok(false);
     }
     stats.copied += 1;
 
@@ -575,39 +900,60 @@ fn sync_copy(
     let new_entry = entry_for_copied_file(entry, &target_file, source_name);
     store::apply_entries(&target.db, std::iter::once((rel_path, &new_entry)))?;
     target_index.entry(key).or_default().present = true;
-    Ok(())
+    Ok(true)
 }
 
+/// Delete every target file whose content matches a missing source entry.
+/// Returns the target-relative paths actually removed (folded into
+/// `stats.deleted`); failures are reported through `run` best-effort.
 fn sync_delete(
     target: &OpenRepo,
     target_root: &Path,
     target_index: &mut HashMap<ContentKey, ContentState>,
     entry: &FileEntry,
     stats: &mut SyncStats,
-) -> Result<(), StoreError> {
+    run: &DiffRun<'_>,
+) -> Result<Vec<String>, StoreError> {
     let key = (entry.size, entry.hash);
     if !target_index.get(&key).is_some_and(|state| state.present) {
-        return Ok(());
+        return Ok(Vec::new());
     }
+    let mut removed_paths = Vec::new();
+    // Paths the review selection excludes stay on disk; if any remain, the
+    // content is still present in the target and the index must say so.
+    let mut kept = 0usize;
     for rel_path in store::get_paths_by_size_hash(&target.db, entry.size, &entry.hash)? {
+        if !run.selected_target(&rel_path) {
+            kept += 1;
+            continue;
+        }
         let path = target_root.join(&rel_path);
         let removed = match std::fs::remove_file(&path) {
             Ok(()) => true,
             // NotFound counts as deleted: the file is gone either way.
-            Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+            Err(err) => {
+                stats.errors += 1;
+                run.progress.on(DiffEvent::Error {
+                    path: path.to_string_lossy().into_owned(),
+                    message: err.to_string(),
+                });
+                false
+            }
         };
         if removed {
             store::mark_missing(&target.db, std::iter::once(rel_path.as_str()))?;
             stats.deleted += 1;
-        } else {
-            stats.errors += 1;
+            removed_paths.push(rel_path);
         }
     }
-    if let Some(state) = target_index.get_mut(&key) {
+    if kept == 0
+        && let Some(state) = target_index.get_mut(&key)
+    {
         state.present = false;
         state.missing = true;
     }
-    Ok(())
+    Ok(removed_paths)
 }
 
 /// Build the index entry for a file that was just copied to `path`: the
@@ -707,7 +1053,7 @@ pub fn plan_folder_export(
     let groups = match mode {
         FolderMode::Exact => crate::dupes::find_exact_duplicates(store, &source_names)?,
         FolderMode::Similar { threshold } => {
-            crate::similar::find_similar(store, &source_names, threshold)?
+            crate::similar::find_similar(store, &source_names, threshold, None)?
         }
     };
     let redundant: HashSet<String> = groups
@@ -739,7 +1085,10 @@ pub fn export_to_folder(
     filter: Option<&str>,
     run: &DiffRun<'_>,
 ) -> Result<CopyStats, DiffError> {
-    let exports = plan_folder_export(store, source, references, mode, invert, filter)?;
+    let exports: Vec<String> = plan_folder_export(store, source, references, mode, invert, filter)?
+        .into_iter()
+        .filter(|rel| run.selected_source(rel))
+        .collect();
     let source_open = open_repo(store, source)?;
     let source_root = PathBuf::from(&source_open.meta.abs_path);
     let total = exports.len() as u64;

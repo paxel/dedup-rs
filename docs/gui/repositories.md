@@ -21,13 +21,13 @@ subcommand](../cli.md#repo).
 Each card shows the repository's name, its on-disk path, status pills, a MIME-type
 breakdown (top few types by share, pinned top-right), and stats:
 
-| Stat    | Meaning                                                                                                                                                                |
-| ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| FILES   | Indexed files (files that vanished from disk since the last scan are excluded).                                                                                        |
-| SIZE    | Total on-disk size of indexed files.                                                                                                                                   |
-| MISSING | Files indexed before but no longer found on disk — kept as history, excluded from stats and duplicate search until a rescan confirms they're back.                     |
-| SCANNED | When this repository was last scanned ("never" if it hasn't been).                                                                                                     |
-| TRIAGED | Only shown once triage-done: when this repo's unique content was already copied into a sanitized directory (via `dedup sanitize` or the Files tab's MARK SOURCE DONE). |
+| Stat    | Meaning                                                                                                                                            |
+| ------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| FILES   | Indexed files (files that vanished from disk since the last scan are excluded).                                                                    |
+| SIZE    | Total on-disk size of indexed files.                                                                                                               |
+| MISSING | Files indexed before but no longer found on disk — kept as history, excluded from stats and duplicate search until a rescan confirms they're back. |
+| SCANNED | When this repository was last scanned ("never" if it hasn't been).                                                                                 |
+| TRIAGED | Only shown once triage-done: when this repo's unique content was already copied into a sanitized directory (via the `dedup sanitize` command).     |
 
 Status pills:
 

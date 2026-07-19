@@ -5,7 +5,8 @@
 
 use dedup_core::diff::{
     CopyDest, DiffAction, DiffEvent, DiffItem, DiffProgress, DiffRun, FolderMode, NoDiffProgress,
-    diff_copy, diff_delete, diff_print, diff_sync, export_to_folder, plan_folder_export,
+    SyncDelete, diff_copy, diff_delete, diff_print, diff_sync, export_to_folder,
+    plan_folder_export, plan_sync,
 };
 use dedup_core::store::{FileEntry, Store};
 use dedup_core::update::{CancellationToken, NoProgress, update_repo};
@@ -87,9 +88,9 @@ fn sync_does_not_copy_when_content_already_present_in_b() -> TestResult {
         "A",
         "B",
         true,
-        false,
+        SyncDelete::None,
         None,
-        &CancellationToken::new(),
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
     )?;
     assert_eq!(stats.copied, 0);
     assert_eq!(stats.equal, 1);
@@ -108,9 +109,9 @@ fn sync_copies_when_missing_in_b_and_updates_index() -> TestResult {
         "A",
         "B",
         true,
-        false,
+        SyncDelete::None,
         None,
-        &CancellationToken::new(),
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
     )?;
     assert_eq!(stats.copied, 1);
     assert_eq!(std::fs::read(sb.b_root.join("dir/a.txt"))?, b"hello");
@@ -148,9 +149,9 @@ fn sync_deletes_when_marked_missing_in_a_and_updates_index() -> TestResult {
         "A",
         "B",
         false,
-        true,
+        SyncDelete::Missing,
         None,
-        &CancellationToken::new(),
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
     )?;
     assert_eq!(stats.deleted, 1);
     assert!(!sb.b_root.join("del.txt").exists());
@@ -177,9 +178,9 @@ fn sync_skips_copy_when_target_path_already_occupied_by_different_content() -> T
         "A",
         "B",
         true,
-        false,
+        SyncDelete::None,
         None,
-        &CancellationToken::new(),
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
     )?;
     assert_eq!(stats.copied, 0);
     assert_eq!(stats.skipped, 1);
@@ -208,9 +209,9 @@ fn sync_obeys_mime_filter() -> TestResult {
         "A",
         "B",
         true,
-        false,
+        SyncDelete::None,
         Some("mime:image"),
-        &CancellationToken::new(),
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
     )?;
     assert_eq!(stats.copied, 1);
     assert!(sb.b_root.join("img.png").exists());
@@ -240,9 +241,9 @@ fn sync_obeys_mime_filter_for_delete() -> TestResult {
         "A",
         "B",
         false,
-        true,
+        SyncDelete::Missing,
         Some("mime:image"),
-        &CancellationToken::new(),
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
     )?;
     assert_eq!(stats.deleted, 1);
     assert!(!sb.b_root.join("img.png").exists());
@@ -273,13 +274,163 @@ fn sync_obeys_size_filter() -> TestResult {
         "A",
         "B",
         true,
-        false,
+        SyncDelete::None,
         Some("size:5"),
-        &CancellationToken::new(),
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
     )?;
     assert_eq!(stats.copied, 1);
     assert!(sb.b_root.join("small.txt").exists());
     assert!(!sb.b_root.join("large.txt").exists());
+    Ok(())
+}
+
+#[test]
+fn plan_sync_lists_copies_and_deletes() -> TestResult {
+    let sb = Sandbox::new()?;
+    // A: "new" is unknown to B; "gone" was indexed then removed (missing in A).
+    Sandbox::write(&sb.a_root, "new.txt", b"new")?;
+    Sandbox::write(&sb.a_root, "gone.txt", b"gone")?;
+    sb.update("A")?;
+    std::fs::remove_file(sb.a_root.join("gone.txt"))?;
+    sb.update("A")?;
+    // B still holds the "gone" content (at another path).
+    Sandbox::write(&sb.b_root, "kept.txt", b"gone")?;
+    sb.update("B")?;
+
+    let plan = plan_sync(&sb.store, "A", "B", true, SyncDelete::Missing, None)?;
+    assert_eq!(plan.copies, vec!["new.txt".to_string()]);
+    assert_eq!(plan.deletes, vec!["kept.txt".to_string()]);
+
+    // With delete_missing off, only copies are planned.
+    let copy_only = plan_sync(&sb.store, "A", "B", true, SyncDelete::None, None)?;
+    assert_eq!(copy_only.copies, vec!["new.txt".to_string()]);
+    assert!(copy_only.deletes.is_empty());
+
+    // Nothing on disk changed (plan is read-only).
+    assert!(sb.b_root.join("kept.txt").exists());
+    assert!(!sb.b_root.join("new.txt").exists());
+    Ok(())
+}
+
+#[test]
+fn sync_emits_progress_for_copies_and_deletes() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "new.txt", b"new")?;
+    Sandbox::write(&sb.a_root, "gone.txt", b"gone")?;
+    sb.update("A")?;
+    std::fs::remove_file(sb.a_root.join("gone.txt"))?;
+    sb.update("A")?;
+    Sandbox::write(&sb.b_root, "kept.txt", b"gone")?;
+    sb.update("B")?;
+
+    let progress = RecordingProgress::default();
+    let stats = diff_sync(
+        &sb.store,
+        "A",
+        "B",
+        true,
+        SyncDelete::Missing,
+        None,
+        &DiffRun::new(&progress, &CancellationToken::new()),
+    )?;
+    assert_eq!(stats.copied, 1);
+    assert_eq!(stats.deleted, 1);
+    // One progress step per acting entry (one copy + one delete), and `done`
+    // never overshoots `total`.
+    assert_eq!(progress.progress_count(), 2);
+    assert_eq!(progress.last_progress(), Some((2, 2)));
+    Ok(())
+}
+
+#[test]
+fn mirror_deletes_target_content_absent_from_source() -> TestResult {
+    let sb = Sandbox::new()?;
+    // A holds "keep" and "new"; B holds "keep" (same content, different path)
+    // and "extra" (content A never had).
+    Sandbox::write(&sb.a_root, "keep.txt", b"keep")?;
+    Sandbox::write(&sb.a_root, "new.txt", b"new")?;
+    Sandbox::write(&sb.b_root, "same-content.txt", b"keep")?;
+    Sandbox::write(&sb.b_root, "extra.txt", b"extra")?;
+    sb.update("A")?;
+    sb.update("B")?;
+
+    let progress = RecordingProgress::default();
+    let stats = diff_sync(
+        &sb.store,
+        "A",
+        "B",
+        true,
+        SyncDelete::Absent,
+        None,
+        &DiffRun::new(&progress, &CancellationToken::new()),
+    )?;
+    // "new" is copied in; "extra" is deleted (A lacks it); "keep" content is
+    // already present in B (at another path), so it is neither copied nor
+    // deleted — the mirror is by content.
+    assert_eq!(stats.copied, 1, "only 'new' is copied");
+    assert_eq!(stats.deleted, 1, "only 'extra' is deleted");
+    assert_eq!(std::fs::read(sb.b_root.join("new.txt"))?, b"new");
+    assert!(!sb.b_root.join("extra.txt").exists(), "extra removed");
+    assert!(
+        sb.b_root.join("same-content.txt").exists(),
+        "identical content kept in place (content-mirror, not path-mirror)"
+    );
+
+    // After the mirror, B's live content set equals A's.
+    assert!(sb.store.get_file_entry("B", "extra.txt")?.unwrap().missing);
+    assert!(!sb.store.get_file_entry("B", "new.txt")?.unwrap().missing);
+    Ok(())
+}
+
+#[test]
+fn mirror_deletes_first_so_a_copy_reclaims_the_freed_path() -> TestResult {
+    let sb = Sandbox::new()?;
+    // Same relative path holds different content in A and B: a true mirror must
+    // end with A's content there (delete B's, then copy A's into the freed path).
+    Sandbox::write(&sb.a_root, "clash.txt", b"from-A")?;
+    Sandbox::write(&sb.b_root, "clash.txt", b"from-B")?;
+    sb.update("A")?;
+    sb.update("B")?;
+
+    let stats = diff_sync(
+        &sb.store,
+        "A",
+        "B",
+        true,
+        SyncDelete::Absent,
+        None,
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
+    )?;
+    assert_eq!(stats.copied, 1);
+    assert_eq!(stats.deleted, 1);
+    assert_eq!(
+        std::fs::read(sb.b_root.join("clash.txt"))?,
+        b"from-A",
+        "the occupied path ends up holding the source's content"
+    );
+    let in_b = sb
+        .store
+        .get_file_entry("B", "clash.txt")?
+        .ok_or("clash.txt not in B index")?;
+    assert!(!in_b.missing);
+    assert_eq!(in_b.hash, *blake3::hash(b"from-A").as_bytes());
+    Ok(())
+}
+
+#[test]
+fn plan_sync_absent_lists_mirror_deletes() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "new.txt", b"new")?;
+    Sandbox::write(&sb.b_root, "extra.txt", b"extra")?;
+    Sandbox::write(&sb.b_root, "shared.txt", b"new")?;
+    sb.update("A")?;
+    sb.update("B")?;
+
+    let plan = plan_sync(&sb.store, "A", "B", true, SyncDelete::Absent, None)?;
+    // "new" content already lives in B as shared.txt, so no copy; "extra" has
+    // no counterpart in A, so it is the sole mirror delete.
+    assert!(plan.copies.is_empty(), "content already present in B");
+    assert_eq!(plan.deletes, vec!["extra.txt".to_string()]);
     Ok(())
 }
 
@@ -983,5 +1134,122 @@ fn folder_export_move_marks_source_missing() -> TestResult {
     // The source entry is marked missing, so it is no longer a candidate.
     let again = plan_folder_export(&sb.store, "A", &[], FolderMode::Exact, false, None)?;
     assert!(again.is_empty(), "the moved file is no longer exportable");
+    Ok(())
+}
+
+// --- Review-board selection (exclude / only) ---------------------------------
+
+/// A rejected review row (exclude set) is skipped by `diff_copy`; the rest of
+/// the batch proceeds.
+#[test]
+fn diff_copy_skips_excluded_rows() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "keep.txt", b"keep")?;
+    Sandbox::write(&sb.a_root, "reject.txt", b"reject")?;
+    sb.update("A")?;
+    sb.update("B")?;
+
+    let exclude: std::collections::HashSet<String> =
+        [dedup_core::diff::source_key("reject.txt")].into();
+    let cancel = CancellationToken::new();
+    let run = DiffRun::new(&NoDiffProgress, &cancel).with_selection(Some(&exclude), None);
+    let stats = diff_copy(
+        &sb.store,
+        "A",
+        &["B"],
+        CopyDest {
+            dir: &sb.b_root,
+            subdir: None,
+        },
+        false,
+        None,
+        &run,
+    )?;
+    assert_eq!(stats.copied, 1, "only the non-rejected file is copied");
+    assert!(sb.b_root.join("keep.txt").exists());
+    assert!(!sb.b_root.join("reject.txt").exists());
+    Ok(())
+}
+
+/// An `only` set of one row applies exactly that action — the single-row
+/// APPLY is the batch op with a one-element allowlist.
+#[test]
+fn diff_copy_only_applies_a_single_row() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "one.txt", b"one")?;
+    Sandbox::write(&sb.a_root, "two.txt", b"two")?;
+    sb.update("A")?;
+    sb.update("B")?;
+
+    let only: std::collections::HashSet<String> = [dedup_core::diff::source_key("two.txt")].into();
+    let cancel = CancellationToken::new();
+    let run = DiffRun::new(&NoDiffProgress, &cancel).with_selection(None, Some(&only));
+    let stats = diff_copy(
+        &sb.store,
+        "A",
+        &["B"],
+        CopyDest {
+            dir: &sb.b_root,
+            subdir: None,
+        },
+        false,
+        None,
+        &run,
+    )?;
+    assert_eq!(stats.copied, 1);
+    assert!(sb.b_root.join("two.txt").exists());
+    assert!(!sb.b_root.join("one.txt").exists());
+    Ok(())
+}
+
+/// A mirror's excluded target-side deletion stays on disk and its index entry
+/// stays present; the selected deletion goes through.
+#[test]
+fn mirror_delete_respects_target_side_exclusion() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "common.txt", b"common")?;
+    Sandbox::write(&sb.b_root, "common.txt", b"common")?;
+    Sandbox::write(&sb.b_root, "extra1.txt", b"extra1")?;
+    Sandbox::write(&sb.b_root, "extra2.txt", b"extra2")?;
+    sb.update("A")?;
+    sb.update("B")?;
+
+    let exclude: std::collections::HashSet<String> =
+        [dedup_core::diff::target_key("extra1.txt")].into();
+    let cancel = CancellationToken::new();
+    let run = DiffRun::new(&NoDiffProgress, &cancel).with_selection(Some(&exclude), None);
+    let stats = diff_sync(&sb.store, "A", "B", true, SyncDelete::Absent, None, &run)?;
+    assert_eq!(stats.deleted, 1, "only the non-rejected extra is deleted");
+    assert!(sb.b_root.join("extra1.txt").exists(), "rejected row kept");
+    assert!(!sb.b_root.join("extra2.txt").exists());
+    assert!(
+        !sb.store.get_file_entry("B", "extra1.txt")?.unwrap().missing,
+        "the kept file's index entry stays present"
+    );
+    Ok(())
+}
+
+/// `organize_apply` with an `only` allowlist moves exactly that file.
+#[test]
+fn organize_only_moves_a_single_row() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "a.txt", b"a")?;
+    Sandbox::write(&sb.a_root, "b.txt", b"b")?;
+    sb.update("A")?;
+
+    let rules = [dedup_core::organize::OrganizeRule {
+        filter: None,
+        template: "moved/{o-name}".into(),
+    }];
+    let only: std::collections::HashSet<String> = [dedup_core::diff::source_key("b.txt")].into();
+    let cancel = CancellationToken::new();
+    let run = DiffRun::new(&NoDiffProgress, &cancel).with_selection(None, Some(&only));
+    let stats = dedup_core::organize::organize_apply(&sb.store, "A", &rules, &run)?;
+    assert_eq!(stats.moved, 1);
+    assert!(sb.a_root.join("moved/b.txt").exists());
+    assert!(
+        sb.a_root.join("a.txt").exists(),
+        "unselected file untouched"
+    );
     Ok(())
 }

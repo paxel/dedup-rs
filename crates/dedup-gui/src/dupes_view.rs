@@ -2,6 +2,7 @@
 //! duplicates or perceptual similars, review paged groups with thumbnails, and
 //! delete the worse copies — batched per repo, never without a confirmation.
 
+use crate::filter_ui::FilterBuilder;
 use crate::icon;
 use crate::id3tags::{self, Tags};
 use crate::imgedit::{self, Orient};
@@ -15,12 +16,13 @@ use crate::waveform::WaveCache;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::dupes::{
     DupeDeleteStats, DupeFile, DupeGroup, DupeGroupKey, delete_paths, load_groups,
-    plan_exact_duplicates, wasted_bytes,
+    plan_exact_duplicates, retain_matching_keys, wasted_bytes,
 };
+use dedup_core::filter::FileFilter;
 use dedup_core::similar::find_similar;
 use dedup_core::store::Store;
 use dedup_core::thumbnail::hash_hex;
-use egui::{Color32, Id, RichText};
+use egui::{Id, RichText};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -82,22 +84,6 @@ enum DeleteFollow {
 enum ConfirmAction {
     EnableQuickDelete,
     DeleteAll,
-}
-
-/// A bold-bordered LCARS section container in the given accent color, used to
-/// group a row of related controls.
-fn section(color: Color32) -> egui::Frame {
-    egui::Frame::new()
-        .fill(theme::PANEL)
-        .corner_radius(theme::PILL)
-        .stroke(egui::Stroke::new(2.0, color))
-        .inner_margin(8.0)
-        .outer_margin(egui::Margin {
-            left: 0,
-            right: 0,
-            top: 0,
-            bottom: 8,
-        })
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -197,47 +183,6 @@ fn paint_audio_glyph(painter: &egui::Painter, rect: egui::Rect, fp: &dedup_core:
     }
 }
 
-/// Magma-ish heat ramp (black → purple → orange → white) for spectrogram cells:
-/// `v` in 0..=1 maps to brightness, so louder frequencies read brighter.
-fn spec_color(v: f32) -> egui::Color32 {
-    const STOPS: [(f32, f32, f32, f32); 5] = [
-        (0.00, 0.0, 0.0, 4.0),
-        (0.25, 60.0, 15.0, 110.0),
-        (0.50, 165.0, 45.0, 110.0),
-        (0.75, 235.0, 105.0, 60.0),
-        (1.00, 252.0, 255.0, 200.0),
-    ];
-    let v = v.clamp(0.0, 1.0);
-    let mut i = 0;
-    while i + 1 < STOPS.len() && v > STOPS[i + 1].0 {
-        i += 1;
-    }
-    let (v0, r0, g0, b0) = STOPS[i];
-    let (v1, r1, g1, b1) = STOPS[(i + 1).min(STOPS.len() - 1)];
-    let t = if v1 > v0 { (v - v0) / (v1 - v0) } else { 0.0 };
-    let lerp = |a: f32, b: f32| (a + (b - a) * t) as u8;
-    egui::Color32::from_rgb(lerp(r0, r1), lerp(g0, g1), lerp(b0, b1))
-}
-
-/// Build a spectrogram image (time on x, frequency on y with bass at the
-/// bottom) from a decoded [`waveform::AudioViz`].
-fn spec_image(viz: &crate::waveform::AudioViz) -> egui::ColorImage {
-    let (w, h) = (viz.spec_w, viz.spec_h);
-    let mut rgba = vec![0u8; w * h * 4];
-    for y in 0..h {
-        let bin = h - 1 - y; // row 0 (top) = highest freq
-        for x in 0..w {
-            let c = spec_color(viz.spec[bin * w + x]);
-            let i = (y * w + x) * 4;
-            rgba[i] = c.r();
-            rgba[i + 1] = c.g();
-            rgba[i + 2] = c.b();
-            rgba[i + 3] = 255;
-        }
-    }
-    egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba)
-}
-
 /// One-line `path · size · WxH · mtime` description used by the lightbox.
 fn lightbox_meta(file: &DupeFile) -> String {
     format!(
@@ -256,7 +201,6 @@ fn lightbox_meta(file: &DupeFile) -> String {
 enum Act {
     ToggleInclude(usize),
     ToggleRo(usize),
-    ReloadRepos,
     Find,
     ToggleMark(FileKey),
     Unlock(FileKey),
@@ -272,6 +216,12 @@ enum Act {
     ToggleQuickDelete,
     AutoResolve,
     DeleteGroup(usize),
+    /// Mark every markable (non-protected) file in group `gi` for deletion.
+    MarkGroup(usize),
+    /// Clear the marks on every file in group `gi` (keep them all).
+    UnmarkGroup(usize),
+    /// Dismiss group `gi` from the list until the next FIND.
+    HideGroup(usize),
     AskDelete,
     ConfirmDelete,
     CancelDelete,
@@ -304,6 +254,9 @@ pub struct DupesView {
     preselected_pages: HashSet<usize>,
     /// Group indices deleted this session (rendered collapsed). Reset on FIND.
     resolved: HashSet<usize>,
+    /// Group indices the user dismissed with HIDE GROUP; skipped from the list
+    /// until the next FIND (a triage aid, not a delete). Reset on FIND.
+    hidden: HashSet<usize>,
     /// When on, per-group DELETE NOW buttons appear and delete immediately.
     quick_delete: bool,
     /// Keys handed to the in-flight delete, applied to `marked` on completion.
@@ -339,6 +292,9 @@ pub struct DupesView {
     /// Tooltip wording for this frame, set at the top of [`Self::show`] from
     /// the app-wide setting (not persisted here; `app.rs` owns that).
     verbosity: TooltipVerbosity,
+    /// The shared FILTER wizard: FIND keeps only groups with at least one member
+    /// matching this (the same widget used by Transfer/Grooming/Browse).
+    filter: FilterBuilder,
 }
 
 /// A pending rotate/flip edit of the lightbox's current image. The `base` pixels
@@ -383,6 +339,7 @@ impl DupesView {
             unlocked: HashSet::new(),
             preselected_pages: HashSet::new(),
             resolved: HashSet::new(),
+            hidden: HashSet::new(),
             quick_delete: false,
             delete_batch: Vec::new(),
             page: 0,
@@ -403,6 +360,7 @@ impl DupesView {
             tags_cache: HashMap::new(),
             tag_edit: None,
             verbosity: TooltipVerbosity::default(),
+            filter: FilterBuilder::new(),
         }
     }
 
@@ -442,7 +400,7 @@ impl DupesView {
         }
         self.drain_messages(store, &ctx);
         if !self.repos_loaded {
-            self.load_repos(store);
+            self.sync_repos(store);
         }
 
         let mut acts: Vec<Act> = Vec::new();
@@ -480,6 +438,16 @@ impl DupesView {
                 .strong(),
         );
         self.repo_bar(ui, &mut acts);
+        // Shared FILTER wizard: FIND keeps only groups with ≥1 member matching
+        // it. The first included repo backs the MIME/TAG pick-lists.
+        let sugg = self.suggestion_repo();
+        let outcome = self.filter.ui(ui, store, sugg.as_deref(), self.verbosity);
+        if outcome.status.is_some() {
+            self.status = outcome.status;
+        }
+        if outcome.error.is_some() {
+            self.error = outcome.error;
+        }
         self.controls(ui, &mut acts);
         crate::util::shortcut_bar(
             ui,
@@ -537,6 +505,7 @@ impl DupesView {
                             self.unlocked.clear();
                             self.preselected_pages.clear();
                             self.resolved.clear();
+                            self.hidden.clear();
                             self.page = 0;
                             self.cached_page = None;
                             self.error = None;
@@ -588,23 +557,25 @@ impl DupesView {
         }
     }
 
-    fn load_repos(&mut self, store: &Store) {
+    /// Sync the repo list with the store, non-destructively: existing repos keep
+    /// their include + read-only state, newly-registered repos default to
+    /// *excluded* + read-only (you opt in the repos to search via the chips or
+    /// MARK ALL; read-only stays the safe default — deleting is a deliberate
+    /// unlock), and removed repos drop out. Called on first show and whenever the
+    /// tab is re-shown, so the list stays fresh without a manual refresh button.
+    pub fn sync_repos(&mut self, store: &Store) {
         match store.list_repos() {
             Ok(list) => {
-                let excluded: HashSet<String> = self
-                    .repos
-                    .iter()
-                    .filter(|r| !r.included)
-                    .map(|r| r.name.clone())
-                    .collect();
-                // Every (re)load re-locks all repos: read-only is the safe
-                // default, so deleting duplicates is always a deliberate unlock.
+                let prev = std::mem::take(&mut self.repos);
                 self.repos = list
                     .into_iter()
-                    .map(|(name, _, _)| RepoSel {
-                        included: !excluded.contains(&name),
-                        read_only: true,
-                        name,
+                    .map(|(name, _, _)| {
+                        let old = prev.iter().find(|r| r.name == name);
+                        RepoSel {
+                            included: old.map(|r| r.included).unwrap_or(false),
+                            read_only: old.map(|r| r.read_only).unwrap_or(true),
+                            name,
+                        }
                     })
                     .collect();
                 self.repos_loaded = true;
@@ -615,235 +586,172 @@ impl DupesView {
     }
 
     fn repo_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        section(theme::LILAC).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("REPOS").color(theme::TEXT).size(12.0));
-                // Top-align the chips. A centered row (`horizontal`/
-                // `horizontal_wrapped`) places earlier items progressively higher
-                // as the row height converges, leaving the first repo a few px
-                // above the rest (see the `repo_row_is_aligned` test). Top-align
-                // pins every chip to one line. It stays bounded because it's
-                // nested inside this outer `horizontal`. A horizontal scroll
-                // area keeps many repos on one line instead of overflowing the
-                // window (solid scrollbar from the theme).
-                egui::ScrollArea::horizontal()
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
-                    for (i, repo) in self.repos.iter().enumerate() {
-                    // Name + lock read as one bordered unit per repo, with room
-                    // between the border and the buttons.
-                    egui::Frame::new()
-                        .stroke(egui::Stroke::new(1.0, theme::BLUE))
-                        .corner_radius(8)
-                        .inner_margin(egui::Margin::symmetric(10, 6))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                let (fill, text) = if repo.included {
-                                    (theme::ORANGE, theme::BLACK)
-                                } else {
-                                    (theme::PANEL, theme::TEXT)
-                                };
-                                if ui
-                                    .add(
-                                        egui::Button::new(RichText::new(&repo.name).color(text))
-                                            .fill(fill),
-                                    )
-                                    .explain(
-                                        self.verbosity,
-                                        "Toggle whether this repo is searched",
-                                        "Include or exclude this repository from FIND results. \
-                                         Excluded repos are skipped entirely — their files \
-                                         won't appear as duplicates or as candidates.",
-                                    )
-                                    .clicked()
-                                {
-                                    acts.push(Act::ToggleInclude(i));
-                                }
-                                // Closed padlock = read-only (protected); open
-                                // padlock = deletable.
-                                let (glyph, ro_fill, ro_text, hover, hover_verbose) = if repo.read_only {
-                                    (
-                                        icon::LOCK,
-                                        theme::BLUE,
-                                        theme::BLACK,
-                                        "Locked: files here are protected from deletion — click to allow deleting",
-                                        "This repo is read-only: none of its files are ever \
-                                         preselected or deletable, even by auto-resolve. Click \
-                                         to unlock the whole repo for deletion.",
-                                    )
-                                } else {
-                                    (
-                                        icon::LOCK_OPEN,
-                                        theme::PANEL,
-                                        theme::BLUE,
-                                        "Unlocked: files here can be deleted — click to protect",
-                                        "This repo is unlocked: its files can be marked and \
-                                         deleted like any other. Click to protect it (read-only) \
-                                         again.",
-                                    )
-                                };
-                                if ui
-                                    .add(
-                                        egui::Button::new(RichText::new(glyph).color(ro_text))
-                                            .fill(ro_fill),
-                                    )
-                                    .explain(self.verbosity, hover, hover_verbose)
-                                    .clicked()
-                                {
-                                    acts.push(Act::ToggleRo(i));
-                                }
-                            });
-                        });
-                    ui.add_space(8.0);
-                }
-                // Inset the refresh button by the chips' frame margin so its top
-                // lines up with the (inset) repo name buttons, not the chip tops.
-                egui::Frame::new()
-                    .inner_margin(egui::Margin {
-                        left: 0,
-                        right: 0,
-                        top: 7,
-                        bottom: 7,
-                    })
-                    .show(ui, |ui| {
-                        let refresh = egui::Button::new(
-                            RichText::new(format!("{} REFRESH", icon::REFRESH))
-                                .color(theme::BLACK),
+        crate::lcars::section_lcars(
+            ui,
+            "REPOS — WHERE TO LOOK FOR DUPLICATES",
+            theme::LILAC,
+            |ui| {
+                // Bulk MARK ALL / NONE (repos start excluded, so this is the quick way
+                // to include/clear all of them at once).
+                ui.horizontal(|ui| {
+                    if crate::lcars::toggle_button(ui, "ALL", false, theme::ORANGE)
+                        .explain(
+                            self.verbosity,
+                            "Include every repo in the search",
+                            "Include (check) every repository so FIND searches them all.",
                         )
-                        .fill(theme::LILAC);
-                        if ui
-                            .add(refresh)
-                            .explain(
-                                self.verbosity,
-                                "Reload the repository list",
-                                "Reload the list of registered repositories (e.g. after \
-                                 adding one in the Repositories tab). Include/read-only \
-                                 choices for repos that still exist are kept.",
-                            )
-                            .clicked()
-                        {
-                            acts.push(Act::ReloadRepos);
-                        }
-                    });
+                        .clicked()
+                    {
+                        self.repos.iter_mut().for_each(|r| r.included = true);
+                    }
+                    if crate::lcars::toggle_button(ui, "NONE", false, theme::ORANGE)
+                        .explain(
+                            self.verbosity,
+                            "Exclude every repo",
+                            "Exclude (uncheck) every repository. FIND needs at least one included.",
+                        )
+                        .clicked()
+                    {
+                        self.repos.iter_mut().for_each(|r| r.included = false);
+                    }
                 });
-                    });
-            });
-        });
+                // The shared wrapping chip row (see `repo_chip::chip_row`) breaks onto
+                // multiple lines when the window is narrow.
+                crate::repo_chip::chip_row(ui, "dupes_repos", "", self.repos.len(), |ui, i| {
+                    self.repo_chip(ui, i, acts)
+                });
+            },
+        );
+    }
+
+    /// One repo chip — the shared identicon + name include-toggle plus the
+    /// read-only padlock (the "3 in the group" variant). Returns the chip frame
+    /// response (its rect feeds the wrap packing in [`repo_chip::chip_row`]).
+    fn repo_chip(&self, ui: &mut egui::Ui, i: usize, acts: &mut Vec<Act>) -> egui::Response {
+        let repo = &self.repos[i];
+        let chip = crate::repo_chip::repo_chip(
+            ui,
+            &repo.name,
+            repo.included,
+            theme::ORANGE,
+            Some(repo.read_only),
+        );
+        if chip
+            .name
+            .explain(
+                self.verbosity,
+                "Toggle whether this repo is searched",
+                "Include or exclude this repository from FIND results. Excluded repos \
+                 are skipped entirely — their files won't appear as duplicates or as \
+                 candidates.",
+            )
+            .clicked()
+        {
+            acts.push(Act::ToggleInclude(i));
+        }
+        if let Some(lock) = chip.lock {
+            // Closed padlock = read-only (protected); open padlock = deletable.
+            let (hover, hover_verbose) = if repo.read_only {
+                (
+                    "Locked: files here are protected from deletion — click to allow deleting",
+                    "This repo is read-only: none of its files are ever preselected or \
+                     deletable, even by auto-resolve. Click to unlock the whole repo for \
+                     deletion.",
+                )
+            } else {
+                (
+                    "Unlocked: files here can be deleted — click to protect",
+                    "This repo is unlocked: its files can be marked and deleted like any \
+                     other. Click to protect it (read-only) again.",
+                )
+            };
+            if lock.explain(self.verbosity, hover, hover_verbose).clicked() {
+                acts.push(Act::ToggleRo(i));
+            }
+        }
+        chip.outer
     }
 
     fn controls(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        section(theme::AMBER).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("MODE").color(theme::TEXT).size(12.0));
-                let exact = self.mode == Mode::Exact;
-                // The two match modes form one segmented toggle.
-                egui::Frame::new()
-                    .stroke(egui::Stroke::new(1.0, theme::BLUE))
-                    .corner_radius(6)
-                    .inner_margin(egui::Margin::symmetric(4, 2))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            // Selected = filled accent + black text; unselected =
-                            // panel fill with accent-colored text (an outline),
-                            // so both stay readable instead of black-on-black.
-                            let (dup_fill, dup_text) = if exact {
-                                (theme::ORANGE, theme::BLACK)
-                            } else {
-                                (theme::PANEL, theme::ORANGE)
-                            };
-                            if ui
-                                .add(
-                                    egui::Button::new(RichText::new("DUPLICATES").color(dup_text))
-                                        .fill(dup_fill),
-                                )
-                                .explain(
-                                    self.verbosity,
-                                    "Exact byte-for-byte duplicates",
-                                    "Find files whose content is byte-for-byte identical \
-                                     (same size and BLAKE3 hash). Fast, no false positives.",
-                                )
-                                .clicked()
-                            {
-                                self.mode = Mode::Exact;
-                            }
-                            let (sim_fill, sim_text) = if exact {
-                                (theme::PANEL, theme::LILAC)
-                            } else {
-                                (theme::LILAC, theme::BLACK)
-                            };
-                            if ui
-                                .add(
-                                    egui::Button::new(RichText::new("SIMILAR").color(sim_text))
-                                        .fill(sim_fill),
-                                )
-                                .explain(
-                                    self.verbosity,
-                                    "Perceptually similar images/videos",
-                                    "Find images and videos that look alike even when their \
-                                     bytes differ — re-saves, re-encodes, or crops — using a \
-                                     perceptual hash and the similarity threshold below.",
-                                )
-                                .clicked()
-                            {
-                                self.mode = Mode::Similar;
-                            }
-                        });
-                    });
-                let find = egui::Button::new(
-                    RichText::new(format!("{} FIND", icon::SEARCH)).color(theme::BLACK),
-                )
-                .fill(theme::AMBER);
-                if ui
-                    .add_enabled(self.busy.is_none(), find)
+        crate::lcars::section_lcars(
+            ui,
+            "MODE — WHAT COUNTS AS A DUPLICATE",
+            theme::AMBER,
+            |ui| {
+                ui.horizontal(|ui| {
+                    let exact = self.mode == Mode::Exact;
+                    // The two match modes: DUPLICATES (orange) / SIMILAR (lilac).
+                    if crate::lcars::toggle_button(ui, "DUPLICATES", exact, theme::ORANGE)
+                        .explain(
+                            self.verbosity,
+                            "Exact byte-for-byte duplicates",
+                            "Find files whose content is byte-for-byte identical \
+                         (same size and BLAKE3 hash). Fast, no false positives.",
+                        )
+                        .clicked()
+                    {
+                        self.mode = Mode::Exact;
+                    }
+                    if crate::lcars::toggle_button(ui, "SIMILAR", !exact, theme::LILAC)
+                        .explain(
+                            self.verbosity,
+                            "Perceptually similar images/videos",
+                            "Find images and videos that look alike even when their \
+                         bytes differ — re-saves, re-encodes, or crops — using a \
+                         perceptual hash and the similarity threshold below.",
+                        )
+                        .clicked()
+                    {
+                        self.mode = Mode::Similar;
+                    }
+                    if crate::lcars::action_button(
+                        ui,
+                        &format!("{} FIND", icon::SEARCH),
+                        self.busy.is_none(),
+                        theme::AMBER,
+                    )
                     .explain(
                         self.verbosity,
                         "Search the included repos",
                         "Search every included (checked) repository for duplicates or \
-                         similars per the selected mode. Excluded repos are skipped.",
+                     similars per the selected mode. Excluded repos are skipped.",
                     )
                     .clicked()
-                {
-                    acts.push(Act::Find);
-                }
-                // Progress while a background op runs.
-                if let Some(op) = &self.busy {
-                    ui.add(egui::Spinner::new().color(theme::AMBER));
-                    let text = match op {
-                        Op::Find(n) => format!("searching… {n} groups"),
-                        Op::AutoResolve { done, total } => {
-                            format!("auto-resolving… {done}/{total}")
-                        }
-                        Op::Delete => "deleting…".to_string(),
-                    };
-                    ui.label(RichText::new(text).color(theme::AMBER).size(12.0));
-                }
-            });
+                    {
+                        acts.push(Act::Find);
+                    }
+                    // Progress while a background op runs.
+                    if let Some(op) = &self.busy {
+                        ui.add(egui::Spinner::new().color(theme::AMBER));
+                        let text = match op {
+                            Op::Find(n) => format!("searching… {n} groups"),
+                            Op::AutoResolve { done, total } => {
+                                format!("auto-resolving… {done}/{total}")
+                            }
+                            Op::Delete => "deleting…".to_string(),
+                        };
+                        ui.label(RichText::new(text).color(theme::AMBER).size(12.0));
+                    }
+                });
 
-            // The similarity threshold gets its own row so the slider has room
-            // to read as a slider (cramming it into the button row hid the track
-            // behind the value box). The value box still accepts typed floats.
-            if self.mode == Mode::Similar {
+                // The similarity threshold gets its own row so the slider has room
+                // to read as a slider (cramming it into the button row hid the track
+                // behind the value box). The value box still accepts typed floats.
+                if self.mode == Mode::Similar {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        crate::util::similarity_slider(ui, &mut self.threshold, self.verbosity);
+                    });
+                }
+
+                // Quick Delete: gives each group a DELETE NOW button that removes
+                // its marked files instantly (no per-group confirmation).
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    crate::util::similarity_slider(ui, &mut self.threshold, self.verbosity);
-                });
-            }
-
-            // Quick Delete: gives each group a DELETE NOW button that removes
-            // its marked files instantly (no per-group confirmation).
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                // Filled pill when on, text-only (frameless) when off — matches
-                // the other LCARS toggles.
+                // A proper bordered toggle now (filled red when on), so it's
+                // clearly a clickable control even when off.
                 let label = format!("{} QUICK DELETE", icon::LIGHTNING);
-                let qd = if self.quick_delete {
-                    egui::Button::new(RichText::new(label).color(theme::BLACK)).fill(theme::RED)
-                } else {
-                    egui::Button::new(RichText::new(label).color(theme::RED)).frame(false)
-                };
-                if ui
-                    .add(qd)
+                if crate::lcars::toggle_button(ui, &label, self.quick_delete, theme::RED)
                     .explain(
                         self.verbosity,
                         "Show a DELETE NOW button on each group that deletes its marked files immediately, no confirmation",
@@ -863,16 +771,14 @@ impl DupesView {
                     );
                 }
             });
-        });
+            },
+        );
 
         if self.total_groups() > 0 {
             ui.horizontal(|ui| {
                 let n = self.marked.len();
                 let idle = self.busy.is_none();
-                let auto =
-                    egui::Button::new(RichText::new("AUTO-RESOLVE REST").color(theme::BLACK));
-                if ui
-                    .add_enabled(idle, auto)
+                if crate::lcars::action_button(ui, "AUTO-RESOLVE REST", idle, theme::ORANGE)
                     .explain(
                         self.verbosity,
                         "Mark every non-best copy in a deletable repo",
@@ -884,20 +790,20 @@ impl DupesView {
                 {
                     acts.push(Act::AutoResolve);
                 }
-                let del = egui::Button::new(
-                    RichText::new(format!("DELETE MARKED ({n})")).color(theme::BLACK),
+                if crate::lcars::action_button(
+                    ui,
+                    &format!("DELETE MARKED ({n})"),
+                    idle && n > 0,
+                    theme::RED,
                 )
-                .fill(theme::RED);
-                if ui
-                    .add_enabled(idle && n > 0, del)
-                    .explain(
-                        self.verbosity,
-                        "Delete every marked file, with confirmation",
-                        "Delete every currently marked file across all groups, batched per \
-                         repo in one transaction. Always asks for confirmation first — use \
-                         QUICK DELETE if you want per-group deletes without asking.",
-                    )
-                    .clicked()
+                .explain(
+                    self.verbosity,
+                    "Delete every marked file, with confirmation",
+                    "Delete every currently marked file across all groups, batched per \
+                     repo in one transaction. Always asks for confirmation first — use \
+                     QUICK DELETE if you want per-group deletes without asking.",
+                )
+                .clicked()
                 {
                     acts.push(Act::AskDelete);
                 }
@@ -962,6 +868,11 @@ impl DupesView {
                 let avail_w = ui.available_width();
                 let spacing = ui.spacing().item_spacing.y;
                 for gi in start..end {
+                    // HIDE GROUP dismisses a group from the list until the next
+                    // FIND — skip it entirely (no card, no reserved space).
+                    if self.hidden.contains(&gi) {
+                        continue;
+                    }
                     // Virtualize: a group we've measured before and that lies
                     // outside the viewport just reserves its known height — we
                     // skip building (and cloning) its widgets entirely. Unmeasured
@@ -1010,11 +921,17 @@ impl DupesView {
         }
         self.cached_page = Some(page);
 
+        // Promote protected (read-only repo) copies to best within each group,
+        // so a protected original is the kept copy and its writable duplicate
+        // falls to the deletable tail (the default mark below then targets the
+        // writable copy, not the protected one).
+        let ro = self.read_only_names();
+        dedup_core::dupes::promote_protected_first(&mut self.page_groups, |f| ro.contains(&f.repo));
+
         // Default-mark this page's worse (non-best) copies once, so the extras
         // show DELETE by default. Read-only repos are never marked, and a page
         // is only preselected once so manual KEEP choices survive a revisit.
         if self.preselected_pages.insert(page) {
-            let ro = self.read_only_names();
             let keys: Vec<FileKey> = self
                 .page_groups
                 .iter()
@@ -1094,6 +1011,41 @@ impl DupesView {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(header).color(theme::AMBER).strong());
+                    // Group-level bulk actions: mark every copy, keep every copy,
+                    // or dismiss the whole group — no need to touch each card.
+                    if crate::repo_chip::small_button(ui, "MARK ALL", theme::RED)
+                        .explain(
+                            self.verbosity,
+                            "Mark every copy in this group for deletion",
+                            "Mark all deletable copies in this group for deletion. \
+                             Protected (locked) copies are left untouched, and nothing is \
+                             removed until you run DELETE.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::MarkGroup(gi));
+                    }
+                    if crate::repo_chip::small_button(ui, "MARK NONE", theme::TAN)
+                        .explain(
+                            self.verbosity,
+                            "Keep every copy in this group",
+                            "Clear all deletion marks in this group, so every copy is kept.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::UnmarkGroup(gi));
+                    }
+                    if crate::repo_chip::small_button(ui, "HIDE", theme::BLUE)
+                        .explain(
+                            self.verbosity,
+                            "Hide this group until the next search",
+                            "Dismiss this group from the list until the next FIND. It isn't \
+                             deleted or changed — just hidden to keep your review focused.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::HideGroup(gi));
+                    }
                     // Quick Delete: one-click removal of this group's marked files.
                     if quick && has_marked {
                         let del = egui::Button::new(
@@ -1353,7 +1305,7 @@ impl DupesView {
             .entry
             .mime
             .as_deref()
-            .is_some_and(|m| m.starts_with("audio/"));
+            .is_some_and(dedup_core::fingerprint::is_audio_mime);
         if !is_audio {
             return;
         }
@@ -1425,7 +1377,7 @@ impl DupesView {
         let mime = file.entry.mime.as_deref();
         let is_image = mime.is_some_and(|m| m.starts_with("image/"));
         let is_video = mime.is_some_and(|m| m.starts_with("video/"));
-        let is_audio = mime.is_some_and(|m| m.starts_with("audio/"));
+        let is_audio = mime.is_some_and(dedup_core::fingerprint::is_audio_mime);
         if is_image || is_video {
             // Only fetch a texture for on-screen cards. The results list is not
             // virtualized, so a page can lay out far more thumbnails than the GPU
@@ -1611,7 +1563,7 @@ impl DupesView {
             .entry
             .mime
             .as_deref()
-            .is_some_and(|m| m.starts_with("audio/"))
+            .is_some_and(dedup_core::fingerprint::is_audio_mime)
         {
             self.audio_lightbox(ctx, state, group, idx);
             return;
@@ -1680,6 +1632,7 @@ impl DupesView {
             idx = new_idx;
             state.index = idx;
             state.reset_view();
+            state.video_frame = None; // a new copy starts on its middle still
         }
 
         // The A file (always the current index) and its texture/metadata.
@@ -1790,14 +1743,13 @@ impl DupesView {
             let big =
                 egui::Rect::from_min_max(vp.min, egui::pos2(vp.max.x, vp.max.y - strip_h - 6.0));
             let strip = egui::Rect::from_min_max(egui::pos2(vp.min.x, vp.max.y - strip_h), vp.max);
-            let scrub = ctx
-                .pointer_hover_pos()
-                .filter(|c| vp.contains(*c))
-                .map(|c| {
-                    ((((c.x - vp.left()) / vp.width()) * VIDEO_STRIP as f32).floor() as i64)
-                        .clamp(0, VIDEO_STRIP as i64 - 1) as usize
-                })
-                .unwrap_or(VIDEO_STRIP / 2);
+            // The shown frame is the still the user clicked (pinned), defaulting
+            // to the middle frame — not a hover, so mouse movement never changes
+            // it. Clamp in case VIDEO_STRIP ever shrinks below a stale pin.
+            let scrub = state
+                .video_frame
+                .unwrap_or(VIDEO_STRIP / 2)
+                .min(VIDEO_STRIP - 1);
             let hexa = hash_hex(&a.entry.hash);
             let srca = a.absolute_path();
             let big_tex = self.thumbs.get_video(&hexa, &srca, scrub, VIDEO_STRIP);
@@ -1829,24 +1781,13 @@ impl DupesView {
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);
                 let cursor = ctx.pointer_hover_pos();
 
-                let draw = |ui: &egui::Ui, rect: egui::Rect, pane: egui::Rect, tex: &Option<egui::TextureHandle>| {
-                    if let Some(tex) = tex {
-                        ui.painter_at(pane).image(tex.id(), rect, uv, egui::Color32::WHITE);
-                    } else {
-                        ui.painter().text(
-                            pane.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "decoding…",
-                            egui::FontId::proportional(16.0),
-                            theme::TAN,
-                        );
-                    }
+                let draw = |ui: &egui::Ui,
+                            rect: egui::Rect,
+                            pane: egui::Rect,
+                            tex: &Option<egui::TextureHandle>| {
+                    crate::lightbox::draw_in_pane(ui, pane, rect, tex);
                 };
-
-                let fit = |target: egui::Rect, size: egui::Vec2| {
-                    let s = (target.width() / size.x).min(target.height() / size.y);
-                    egui::Rect::from_center_size(target.center(), size * s)
-                };
+                let fit = crate::lightbox::fit_rect;
 
                 if let Some((big, strip, scrub, big_tex, frames)) = &video {
                     // Enlarged scrubbed frame.
@@ -1865,11 +1806,12 @@ impl DupesView {
                     ui.painter().text(
                         big.min + egui::vec2(6.0, 6.0),
                         egui::Align2::LEFT_TOP,
-                        "VIDEO — hover to scrub",
+                        "VIDEO — click a still to view",
                         egui::FontId::proportional(14.0),
                         theme::AMBER,
                     );
-                    // Filmstrip of stills; the current one is outlined.
+                    // Filmstrip of stills; the pinned one is outlined. Each cell
+                    // is a click target that pins that frame in the big view.
                     let n = frames.len().max(1);
                     let cell_w = strip.width() / n as f32;
                     for (i, f) in frames.iter().enumerate() {
@@ -1877,12 +1819,20 @@ impl DupesView {
                             egui::pos2(strip.left() + i as f32 * cell_w + 1.0, strip.top()),
                             egui::vec2(cell_w - 2.0, strip.height()),
                         );
+                        let cell_resp = ui
+                            .allocate_rect(cell, egui::Sense::click())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if cell_resp.clicked() {
+                            state.video_frame = Some(i);
+                        }
                         if let Some(t) = f {
                             let r = fit(cell, t.size_vec2());
                             ui.painter_at(cell).image(t.id(), r, uv, egui::Color32::WHITE);
                         }
                         let (col, w) = if i == *scrub {
                             (theme::AMBER, 2.0)
+                        } else if cell_resp.hovered() {
+                            (theme::TAN, 1.5)
                         } else {
                             (theme::HAIRLINE, 1.0)
                         };
@@ -2278,7 +2228,7 @@ impl DupesView {
                             ui.label(RichText::new(&a_meta).color(theme::TEXT).size(13.0));
                             let hint = if a_is_video {
                                 format!(
-                                    "hover: scrub · {}/{} step · Del/K mark · Esc close",
+                                    "click a still to view · {}/{} copy · Del/K mark · Esc close",
                                     icon::CARET_LEFT,
                                     icon::CARET_RIGHT,
                                 )
@@ -2450,7 +2400,7 @@ impl DupesView {
         }
         let tex = ctx.load_texture(
             format!("spec-{hex}"),
-            spec_image(viz),
+            crate::waveform::spec_image(viz),
             egui::TextureOptions::LINEAR,
         );
         self.spec_tex.insert(hex.to_string(), tex.clone());
@@ -3402,7 +3352,6 @@ impl DupesView {
                     }
                 }
             }
-            Act::ReloadRepos => self.load_repos(store),
             Act::Find => self.start_find(store, ctx),
             Act::ToggleMark(k) => {
                 if !self.marked.remove(&k) {
@@ -3457,6 +3406,11 @@ impl DupesView {
             }
             Act::AutoResolve => self.start_auto_resolve(store, ctx),
             Act::DeleteGroup(gi) => self.delete_group(store, ctx, gi),
+            Act::MarkGroup(gi) => self.set_group_mark(gi, true),
+            Act::UnmarkGroup(gi) => self.set_group_mark(gi, false),
+            Act::HideGroup(gi) => {
+                self.hidden.insert(gi);
+            }
             Act::SetPage(p) => self.page = p,
             Act::AskDelete => {
                 let n = self.marked.len();
@@ -3502,12 +3456,47 @@ impl DupesView {
         self.start_delete(store, ctx, keys, DeleteFollow::Resolve(gi));
     }
 
+    /// MARK ALL / MARK NONE for a group: set (`mark`) or clear the deletion mark
+    /// on its files. MARK ALL only touches *markable* copies — protected
+    /// (read-only, not individually unlocked) copies are never marked.
+    fn set_group_mark(&mut self, gi: usize, mark: bool) {
+        let keys: Vec<FileKey> = {
+            let Some(page) = self.cached_page else { return };
+            let page_start = page * PAGE_SIZE;
+            let Some(group) = self.page_groups.get(gi.wrapping_sub(page_start)) else {
+                return;
+            };
+            if mark {
+                group
+                    .iter()
+                    .filter(|f| !self.repo_is_ro(&f.repo) || self.unlocked.contains(&key(f)))
+                    .map(key)
+                    .collect()
+            } else {
+                group.iter().map(key).collect()
+            }
+        };
+        for k in keys {
+            if mark {
+                self.marked.insert(k);
+            } else {
+                self.marked.remove(&k);
+            }
+        }
+    }
+
     fn included_names(&self) -> Vec<String> {
         self.repos
             .iter()
             .filter(|r| r.included)
             .map(|r| r.name.clone())
             .collect()
+    }
+
+    /// The repo whose MIME/tag pick-lists back the FILTER wizard: the first
+    /// included repo (the wizard stays usable-but-unassisted when none is).
+    fn suggestion_repo(&self) -> Option<String> {
+        self.included_names().into_iter().next()
     }
 
     fn read_only_names(&self) -> HashSet<String> {
@@ -3528,6 +3517,18 @@ impl DupesView {
             self.error = Some("Select at least one repo.".into());
             return;
         }
+        // Parse the FILTER once, up front, so a bad expression is reported here
+        // rather than on the worker thread. `None` (no conditions) skips the
+        // per-member matching entirely.
+        let filter_str = self.filter.filter_string();
+        let has_filter = filter_str.is_some();
+        let filter = match FileFilter::parse(filter_str.as_deref()) {
+            Ok(f) => f,
+            Err(e) => {
+                self.error = Some(e.to_string());
+                return;
+            }
+        };
         self.result_names = names.clone();
         self.busy = Some(Op::Find(0));
         self.status = None;
@@ -3538,6 +3539,7 @@ impl DupesView {
         let threshold = self.threshold;
         let repaint = ctx.clone();
         std::thread::spawn(move || {
+            let fref = has_filter.then_some(&filter);
             let result = match mode {
                 Mode::Exact => {
                     let tx2 = tx.clone();
@@ -3546,10 +3548,20 @@ impl DupesView {
                         let _ = tx2.send(Msg::FindProgress(n));
                         r.request_repaint();
                     })
+                    .and_then(|plan| {
+                        // Keep only groups with ≥1 matching member (streams each
+                        // key's members; reports keys examined as progress).
+                        let tx2 = tx.clone();
+                        let r = repaint.clone();
+                        retain_matching_keys(&store, &names, plan, fref, move |n| {
+                            let _ = tx2.send(Msg::FindProgress(n));
+                            r.request_repaint();
+                        })
+                    })
                     .map(Results::Exact)
                     .map_err(|e| e.to_string())
                 }
-                Mode::Similar => find_similar(&store, &names, threshold)
+                Mode::Similar => find_similar(&store, &names, threshold, fref)
                     .map(Results::Similar)
                     .map_err(|e| e.to_string()),
             };
@@ -3693,7 +3705,7 @@ mod ui_tests {
     }
 
     /// Regression test for the recurring "first repo sits higher" bug: every
-    /// repo's name button — and the REFRESH button — must share one top edge.
+    /// repo chip on a row must share one top edge.
     #[test]
     fn repo_row_is_aligned() {
         let (_tmp, store) = sample_store(&SAMPLE_REPOS);
@@ -3710,10 +3722,138 @@ mod ui_tests {
                 "repo '{name}' top {top} != first repo top {base} — row misaligned (tops: {tops:?})"
             );
         }
-        let refresh_top = harness.get_by_label_contains("REFRESH").rect().top();
+    }
+
+    /// Auto-refresh: re-syncing the repo list keeps existing repos' include and
+    /// read-only state, adds newly-registered repos with the default (excluded +
+    /// locked), so a repo added elsewhere shows up without resetting choices.
+    #[test]
+    fn sync_repos_preserves_state_and_adds_new() {
+        let (tmp, store) = sample_store(&["A", "B"]);
+        let mut view = DupesView::new();
+        view.sync_repos(&store);
+        assert_eq!(
+            view.repos
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "B"]
+        );
         assert!(
-            (refresh_top - base).abs() < 0.75,
-            "REFRESH top {refresh_top} != repo name-button top {base}"
+            view.repos.iter().all(|r| !r.included && r.read_only),
+            "repos default to excluded + read-only"
+        );
+        // The user includes A and unlocks it (a non-default state to preserve).
+        let a = view.repos.iter_mut().find(|r| r.name == "A").unwrap();
+        a.included = true;
+        a.read_only = false;
+        // A new repo C is registered, then the tab is re-synced.
+        let dir = tmp.path().join("C");
+        std::fs::create_dir_all(&dir).unwrap();
+        store.create_repo("C", &dir.to_string_lossy()).unwrap();
+        view.sync_repos(&store);
+        let get = |n: &str| {
+            let r = view.repos.iter().find(|r| r.name == n).unwrap();
+            (r.included, r.read_only)
+        };
+        assert_eq!(
+            get("A"),
+            (true, false),
+            "A's include + unlock survive the re-sync"
+        );
+        assert_eq!(get("B"), (false, true), "B keeps the default");
+        assert_eq!(
+            get("C"),
+            (false, true),
+            "the new repo C appears with the default (excluded + locked)"
+        );
+    }
+
+    /// MARK ALL / MARK NONE bulk-toggle every repo's include state (repos start
+    /// excluded by default).
+    #[test]
+    fn mark_all_none_toggles_include() {
+        let (_tmp, store) = sample_store(&SAMPLE_REPOS);
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 360.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default());
+                },
+                DupesView::new(),
+            );
+        harness.run();
+        assert!(
+            harness.state().repos.iter().all(|r| !r.included),
+            "repos start excluded by default"
+        );
+        harness.get_by_label("ALL").click();
+        harness.run();
+        assert!(
+            harness.state().repos.iter().all(|r| r.included),
+            "MARK ALL includes every repo"
+        );
+        harness.get_by_label("NONE").click();
+        harness.run();
+        assert!(
+            harness.state().repos.iter().all(|r| !r.included),
+            "MARK NONE excludes every repo"
+        );
+    }
+
+    /// Many repos in a narrow window must **wrap** onto several rows (rather
+    /// than scroll off-screen), and each wrapped row must stay top-aligned.
+    #[test]
+    fn repo_chips_wrap_when_narrow() {
+        let names: Vec<String> = (0..12).map(|i| format!("repo{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (_tmp, store) = sample_store(&refs);
+
+        let mut view = DupesView::new();
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(420.0, 500.0))
+            .build_ui(move |ui| {
+                if !init {
+                    crate::icon::install(ui.ctx());
+                    crate::theme::apply(ui.ctx());
+                    init = true;
+                }
+                view.show(ui, &store, TooltipVerbosity::default());
+            });
+        harness.run();
+
+        let tops: Vec<f32> = names
+            .iter()
+            .map(|n| harness.get_by_label(n).rect().top())
+            .collect();
+
+        // Cluster tops into rows (0.75 px tolerance, matching the alignment
+        // test). Wrapping means more than one row; top-alignment means the
+        // first row holds several chips that share a top edge.
+        let mut rows: Vec<f32> = Vec::new();
+        for &t in &tops {
+            if !rows.iter().any(|&r| (r - t).abs() < 0.75) {
+                rows.push(t);
+            }
+        }
+        assert!(
+            rows.len() >= 2,
+            "repo chips did not wrap: all {} chips share one row (tops: {tops:?})",
+            tops.len()
+        );
+        let first = tops.iter().cloned().fold(f32::INFINITY, f32::min);
+        let first_row = tops.iter().filter(|&&t| (t - first).abs() < 0.75).count();
+        assert!(
+            first_row >= 2,
+            "first wrapped row is not top-aligned: only {first_row} chip(s) at top {first} (tops: {tops:?})"
         );
     }
 
@@ -3724,12 +3864,32 @@ mod ui_tests {
     fn sections_stay_compact() {
         let (_tmp, store) = sample_store(&SAMPLE_REPOS);
         let harness = dupes_harness(store);
-        // Exact label (the help text also contains "FIND").
-        let find_label = format!("{} FIND", icon::SEARCH);
-        let find_top = harness.get_by_label(&find_label).rect().top();
+        // The FILTER wizard sits directly below the REPOS section, so its top
+        // reflects the REPOS height — a good guard against an expanded repos bar
+        // (the FIND button now sits below FILTER, so it's no longer a tight
+        // proxy for the repos height). The REPOS section is the MARK ALL/NONE
+        // header line plus one chip row here; an over-expansion regression pushed
+        // it hundreds of px down, so a ~200px ceiling still catches that.
+        let filter_top = harness.get_by_label_contains("FILTER — ").rect().top();
         assert!(
-            find_top < 160.0,
-            "FIND button at y={find_top}; the REPOS section is too tall (expanded?)"
+            filter_top < 200.0,
+            "FILTER section at y={filter_top}; the REPOS section is too tall (expanded?)"
+        );
+    }
+
+    /// The shared FILTER wizard is present on the Duplicates tab (its FILTER
+    /// label and the `+` add-condition button), so FIND can be narrowed.
+    #[test]
+    fn filter_wizard_is_present() {
+        let (_tmp, store) = sample_store(&SAMPLE_REPOS);
+        let harness = dupes_harness(store);
+        assert!(
+            harness.query_by_label_contains("FILTER — ").is_some(),
+            "the shared FILTER wizard should render on the Duplicates tab"
+        );
+        assert!(
+            harness.query_by_label("+").is_some(),
+            "the FILTER wizard's add-condition button should be present"
         );
     }
 
@@ -3809,7 +3969,7 @@ mod ui_tests {
 
         let mut init = false;
         let mut harness = Harness::builder()
-            .with_size(egui::vec2(600.0, 400.0))
+            .with_size(egui::vec2(600.0, 520.0))
             .build_ui_state(
                 move |ui, view: &mut DupesView| {
                     if !init {
@@ -3847,7 +4007,7 @@ mod ui_tests {
 
         let mut init = false;
         let mut harness = Harness::builder()
-            .with_size(egui::vec2(600.0, 400.0))
+            .with_size(egui::vec2(600.0, 520.0))
             .build_ui_state(
                 move |ui, view: &mut DupesView| {
                     if !init {
@@ -3934,7 +4094,7 @@ mod ui_tests {
         let store_ui = Arc::clone(&store);
         let mut init = false;
         let mut harness = Harness::builder()
-            .with_size(egui::vec2(600.0, 400.0))
+            .with_size(egui::vec2(600.0, 520.0))
             .build_ui_state(
                 move |ui, view: &mut DupesView| {
                     if !init {
@@ -3976,7 +4136,13 @@ mod ui_tests {
                 },
                 DupesView::new(),
             );
-        harness.run(); // load_repos (all included), initial render
+        harness.run(); // sync_repos (all excluded by default), initial render
+        // Repos start excluded; opt them all in before searching.
+        harness
+            .state_mut()
+            .repos
+            .iter_mut()
+            .for_each(|r| r.included = true);
 
         harness
             .get_by_label(&format!("{} FIND", icon::SEARCH))
@@ -4000,6 +4166,64 @@ mod ui_tests {
         );
         assert_eq!(harness.state().total_groups(), 5);
         assert!(harness.state().busy.is_none(), "op should have settled");
+    }
+
+    /// FIND respects the FILTER: with `name:g0_` set, only group 0 survives.
+    #[test]
+    fn find_applies_the_filter() {
+        let (_tmp, store) = seeded_store(5);
+        let store_ui = Arc::clone(&store);
+        let mut view = DupesView::new();
+        // seed_groups names copies g{g}_c{c}.bin, so this matches only group 0.
+        view.filter.set_expression("name:g0_");
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(700.0, 400.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default());
+                },
+                view,
+            );
+        // The FILTER's live match-count keeps requesting repaints, so `run`
+        // (step-capped) would overflow — step manually to load repos.
+        for _ in 0..5 {
+            harness.step();
+        }
+        // Repos start excluded; opt them all in before searching.
+        harness
+            .state_mut()
+            .repos
+            .iter_mut()
+            .for_each(|r| r.included = true);
+
+        harness
+            .get_by_label(&format!("{} FIND", icon::SEARCH))
+            .click();
+        let mut done = false;
+        for _ in 0..200 {
+            harness.step();
+            if harness.state().results.is_some() {
+                done = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            done,
+            "async FIND never populated (error={:?})",
+            harness.state().error
+        );
+        assert_eq!(
+            harness.state().total_groups(),
+            1,
+            "the filter should keep only group 0 (down from 5)"
+        );
     }
 
     /// A duplicate file in `repo` with rel path `rel` (metadata only).
@@ -4082,6 +4306,82 @@ mod ui_tests {
             "read-only copy is never marked"
         );
         assert!(!m.contains(&("w".into(), "a".into())), "best copy is kept");
+    }
+
+    /// The group-level bulk buttons: MARK NONE clears the group, MARK ALL marks
+    /// every *writable* copy (never the read-only one), and HIDE dismisses the
+    /// whole group from the list.
+    #[test]
+    fn group_bulk_buttons_mark_and_hide() {
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.repos = vec![
+            RepoSel {
+                name: "w".into(),
+                included: true,
+                read_only: false,
+            },
+            RepoSel {
+                name: "ro".into(),
+                included: true,
+                read_only: true,
+            },
+        ];
+        view.results = Some(Results::Similar(vec![vec![
+            dfile("w", "a"),
+            dfile("w", "b"),
+            dfile("ro", "c"),
+        ]]));
+        // Taller than `similar_harness` so the group header buttons clear the
+        // (now taller) LCARS section chrome and are clickable.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(700.0, 760.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+
+        harness.get_by_label("MARK NONE").click();
+        harness.run();
+        assert!(
+            harness.state().marked.is_empty(),
+            "MARK NONE clears every mark in the group"
+        );
+
+        harness.get_by_label("MARK ALL").click();
+        harness.run();
+        let m = &harness.state().marked;
+        assert!(
+            m.contains(&("w".into(), "a".into())) && m.contains(&("w".into(), "b".into())),
+            "MARK ALL marks every writable copy (including the best)"
+        );
+        assert!(
+            !m.contains(&("ro".into(), "c".into())),
+            "MARK ALL never marks a protected read-only copy"
+        );
+
+        harness.get_by_label("HIDE").click();
+        harness.run();
+        assert!(
+            harness.state().hidden.contains(&0),
+            "HIDE dismisses the group"
+        );
+        assert!(
+            harness.query_by_label("MARK ALL").is_none(),
+            "a hidden group renders no card (and no buttons)"
+        );
     }
 
     /// A per-file unlock lets one read-only copy be marked: the locked card
@@ -4372,7 +4672,7 @@ mod ui_tests {
         let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
         let mut init = false;
         let mut harness = Harness::builder()
-            .with_size(egui::vec2(900.0, 700.0))
+            .with_size(egui::vec2(900.0, 820.0))
             .build_ui_state(
                 move |ui, view: &mut DupesView| {
                     if !init {

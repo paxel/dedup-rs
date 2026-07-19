@@ -1,0 +1,61 @@
+# builds.sr.ht — release build for amd64 (x86_64), native hardware.
+#
+# Runs on every push. On a tag it builds a release .deb, publishes it as a build
+# artifact, AND uploads it straight to the Pi's apt pool — so a release is just
+# `git tag && git push`, with no local download/publish step.
+#
+# The upload token is a builds.sr.ht FILE secret written to ~/.dedup-upload-token
+# (create it once in the web UI, then put its UUID under `secrets:` below).
+# sr.ht only decrypts secrets for builds from your own repo, never for PRs/forks.
+# The token grants write to the pool path only and can be rotated any time.
+#
+# NOTE: adjust REPO and DEDUP_PI_URL below for your sr.ht repo / domain.
+image: debian/trixie
+packages:
+  - build-essential
+  - pkg-config
+  - libasound2-dev      # ALSA: the only non-libc link-time dependency
+  - curl
+  - ca-certificates
+  - git
+  - dpkg-dev            # dpkg-deb / dpkg-query for packaging/mkdeb.sh
+  - lintian
+secrets:
+  - 00000000-0000-0000-0000-000000000000   # ← your upload-token file secret UUID
+environment:
+  CARGO_TERM_COLOR: always
+  REPO: dedup-rs
+  DEDUP_PI_URL: https://files.example.org/apt/pool/main/d/dedup/
+tasks:
+  - rustup: |
+      # edition 2024 needs a current toolchain; the distro cargo is too old.
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain stable --profile minimal
+      echo 'source "$HOME/.cargo/env"' >> "$HOME/.buildenv"
+  - build: |
+      cd "$REPO"
+      cargo build --release --locked
+  - test: |
+      cd "$REPO"
+      # Core + CLI only: the dedup-gui tests pull the wgpu dev-dependency and
+      # need a Vulkan device (lavapipe), so they run locally, not on this
+      # headless runner.
+      cargo test -p dedup-core -p dedup-cli --locked
+  - package: |
+      cd "$REPO"
+      # Only build the .deb for tag builds (a release), otherwise stop here.
+      if ! git describe --exact-match --tags >/dev/null 2>&1; then
+        echo "not a tag build — skipping .deb"; exit 0
+      fi
+      ./packaging/mkdeb.sh --release --no-build   # reuse the release build above
+  - upload: |
+      cd "$REPO"
+      # Push the freshly built .deb straight to the Pi's apt pool; the Pi's
+      # systemd path watcher re-indexes and re-signs the repo on arrival.
+      git describe --exact-match --tags >/dev/null 2>&1 || { echo "not a tag — no upload"; exit 0; }
+      [ -f ~/.dedup-upload-token ] || { echo "no upload token secret — skipping"; exit 0; }
+      export DEDUP_UPLOAD=pi
+      export DEDUP_PI_TOKEN="$(cat ~/.dedup-upload-token)"
+      ./packaging/release.sh --no-build           # uploads dist/*.deb via the token
+artifacts:
+  - dedup-rs/dist/*.deb

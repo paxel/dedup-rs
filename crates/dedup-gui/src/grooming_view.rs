@@ -8,17 +8,25 @@
 //!   (wraps `dedup_core::groom::delete_by_filter`).
 //! - **EMPTY DIRS** — remove empty directories under a repo's root
 //!   (wraps `dedup_core::groom::delete_empty_dirs`).
+//! - **ORGANIZE** — move a repo's files into new rule-based paths in place
+//!   (wraps `dedup_core::organize::organize_apply`).
+//! - **PRUNE** — drop missing (deleted-from-disk) records and compact the index
+//!   (wraps `dedup_core::groom::prune`).
 //!
 //! All destructive runs go through a confirmation modal and execute on a
 //! background thread, reusing the same `DiffEvent` progress plumbing as Transfer.
 
 use crate::filter_ui::FilterBuilder;
+use crate::icon;
+use crate::review;
 use crate::settings::TooltipVerbosity;
 use crate::theme;
 use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::diff::{DiffAction, DiffEvent, DiffProgress, DiffRun, diff_delete};
-use dedup_core::groom::{delete_by_filter, delete_empty_dirs, preview_by_filter};
+use dedup_core::groom::{
+    delete_by_filter, delete_empty_dirs, preview_by_filter, preview_prune, prune,
+};
 use dedup_core::organize::{DEFAULT_TEMPLATE, OrganizeRule, organize_apply, plan_organize};
 use dedup_core::store::Store;
 use dedup_core::update::CancellationToken;
@@ -26,7 +34,8 @@ use egui::{Id, RichText};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-const PREVIEW_LIMIT: usize = 30;
+use crate::review::PREVIEW_CAP;
+
 const RUN_LOG_LIMIT: usize = 10;
 
 /// File name of the persisted ORGANIZE presets inside the store's config dir.
@@ -59,6 +68,8 @@ enum Command {
     EmptyDirs,
     /// Reorganize a repo's files in place by rule-based path templates.
     Organize,
+    /// Drop missing (deleted-from-disk) records and compact the index.
+    Prune,
 }
 
 impl Command {
@@ -68,6 +79,7 @@ impl Command {
             Command::Purge => "PURGE",
             Command::EmptyDirs => "EMPTY DIRS",
             Command::Organize => "ORGANIZE",
+            Command::Prune => "PRUNE",
         }
     }
     /// (short, verbose) selector-button tooltip.
@@ -83,7 +95,8 @@ impl Command {
                 "Delete everything matching a filter",
                 "Delete every file in the repo that matches the filter (mime / size / name, \
                  with `*` wildcards) — e.g. everything ending in `.db`. This is not gated \
-                 by any other repo, so use it carefully.",
+                 by any other repo, so use it carefully. Without a filter nothing matches — \
+                 an empty filter never purges the whole repo.",
             ),
             Command::EmptyDirs => (
                 "Remove empty directories",
@@ -96,14 +109,15 @@ impl Command {
                  mime, camera, original name, …). Files matching no rule stay put; nothing \
                  is ever overwritten.",
             ),
+            Command::Prune => (
+                "Forget deleted files and shrink the index",
+                "Permanently remove this repo's records of files that no longer exist on \
+                 disk (its 'missing' entries), then rewrite the index file to reclaim their \
+                 space. The repo's existing files are untouched — only the leftover records \
+                 of already-deleted files are dropped.",
+            ),
         }
     }
-}
-
-/// One preview entry: the source path, and (for ORGANIZE) where it would go.
-struct PreviewRow {
-    from: String,
-    to: Option<String>,
 }
 
 enum OpResult {
@@ -118,6 +132,11 @@ enum OpResult {
         moved: u64,
         skipped: u64,
         errors: u64,
+        cancelled: bool,
+    },
+    Pruned {
+        pruned: u64,
+        compacted: bool,
         cancelled: bool,
     },
     Error(String),
@@ -186,14 +205,31 @@ pub struct GroomingView {
     /// ORGANIZE: saved presets, loaded once from the config dir.
     presets: Vec<OrganizePreset>,
     presets_loaded: bool,
-    /// ORGANIZE: name typed for the preset about to be saved.
-    preset_name: String,
-    preview: Vec<PreviewRow>,
+    /// ORGANIZE: index of the preset currently being renamed inline, if any.
+    renaming_preset: Option<usize>,
+    /// ORGANIZE: text buffer for the in-progress preset rename.
+    rename_buf: String,
+    /// ORGANIZE: set for one frame when a rename just started, so its text
+    /// field can grab keyboard focus.
+    focus_rename_pending: bool,
+    preview: Vec<review::ReviewRow>,
+    /// Full per-kind counts (indexed by [`review::RowKind::idx`]) for the review
+    /// summary; independent of the capped `preview` sample.
+    preview_totals: [usize; 3],
+    /// The two review-table column headers (absolute paths). ORGANIZE uses the
+    /// same repo on both sides (old path → new path); the single-repo deletions
+    /// leave the target header empty.
+    preview_source_header: String,
+    preview_target_header: String,
     preview_total: usize,
+    /// Sort column + direction for the review table.
+    review_state: review::ReviewState,
     status: Option<String>,
     error: Option<String>,
     confirm: Option<String>,
     running: bool,
+    /// Set while a single-row APPLY runs: refresh the preview when it finishes.
+    pending_refresh: bool,
     cancel: CancellationToken,
     run_log: VecDeque<String>,
     run_done: u64,
@@ -211,15 +247,17 @@ enum Act {
     PickRepo(String),
     AddRule,
     RemoveRule(usize),
-    SavePreset,
+    StorePreset,
     ApplyPreset(usize),
     RemovePreset(usize),
-    Reload,
+    CommitRenamePreset(usize),
     Preview,
     Ask,
     Confirm,
     CancelConfirm,
     CancelRun,
+    /// Apply a single review row immediately (its namespaced key).
+    ApplyRow(String),
 }
 
 impl GroomingView {
@@ -236,13 +274,20 @@ impl GroomingView {
             rules: vec![RuleUi::new()],
             presets: Vec::new(),
             presets_loaded: false,
-            preset_name: String::new(),
+            renaming_preset: None,
+            rename_buf: String::new(),
+            focus_rename_pending: false,
             preview: Vec::new(),
+            preview_totals: [0; 3],
+            preview_source_header: String::new(),
+            preview_target_header: String::new(),
             preview_total: 0,
+            review_state: review::ReviewState::default(),
             status: None,
             error: None,
             confirm: None,
             running: false,
+            pending_refresh: false,
             cancel: CancellationToken::new(),
             run_log: VecDeque::new(),
             run_done: 0,
@@ -257,8 +302,15 @@ impl GroomingView {
     pub fn show(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, verbosity: TooltipVerbosity) {
         self.verbosity = verbosity;
         self.drain();
+        // A finished single-row APPLY refreshes the preview, so the board
+        // reflects the applied action instead of dropping to the run log.
+        if self.pending_refresh && !self.running {
+            self.pending_refresh = false;
+            self.reset_run();
+            self.run_preview(store);
+        }
         if !self.loaded {
-            self.reload(store);
+            self.sync_repos(store);
         }
 
         let mut acts: Vec<Act> = Vec::new();
@@ -272,6 +324,7 @@ impl GroomingView {
                     (egui::Key::Num2, Command::Purge),
                     (egui::Key::Num3, Command::EmptyDirs),
                     (egui::Key::Num4, Command::Organize),
+                    (egui::Key::Num5, Command::Prune),
                 ] {
                     if i.key_pressed(key) {
                         acts.push(Act::SetCommand(cmd));
@@ -286,50 +339,61 @@ impl GroomingView {
             });
         }
 
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new("GROOMING")
-                .color(theme::TAN)
-                .size(18.0)
-                .strong(),
-        );
-        crate::util::shortcut_bar(
-            ui,
-            "1 dedupe · 2 purge · 3 empty-dirs · 4 organize · P preview · R run",
-        );
+        // The whole tab scrolls as one page: ORGANIZE stacks a wizard per rule
+        // and the preview table can be tall, so without this the lower rows —
+        // and with enough rules the preview entirely — fall off the bottom of
+        // the window with no way to reach them. The virtualised preview table
+        // culls to the visible band via its clip rect, so nesting it here keeps
+        // the single outer scrollbar cheap.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("GROOMING")
+                        .color(theme::TAN)
+                        .size(18.0)
+                        .strong(),
+                );
+                crate::util::shortcut_bar(
+                    ui,
+                    "1 dedupe · 2 purge · 3 empty-dirs · 4 organize · 5 prune · P preview · R run",
+                );
 
-        self.command_bar(ui, &mut acts);
-        // Each command draws its own controls; DEDUPE/PURGE then get the shared
-        // single FILTER wizard, backed by the repo they act on. ORGANIZE draws
-        // its own per-rule wizards inside its layout.
-        match self.command {
-            Command::Dedupe => {
-                self.dedupe_layout(ui, &mut acts);
-                let repo = self.source.clone();
-                self.shared_filter(ui, store, repo.as_deref());
-            }
-            Command::Purge => {
-                self.purge_layout(ui, &mut acts);
-                let repo = self.repo.clone();
-                self.shared_filter(ui, store, repo.as_deref());
-            }
-            Command::EmptyDirs => self.empty_dirs_layout(ui, &mut acts),
-            Command::Organize => self.organize_layout(ui, store, &mut acts),
-        }
-        self.action_bar(ui, &mut acts);
+                self.command_bar(ui, &mut acts);
+                // Each command draws its own controls; DEDUPE/PURGE then get the
+                // shared single FILTER wizard, backed by the repo they act on.
+                // ORGANIZE draws its own per-rule wizards inside its layout.
+                match self.command {
+                    Command::Dedupe => {
+                        self.dedupe_layout(ui, &mut acts);
+                        let repo = self.source.clone();
+                        self.shared_filter(ui, store, repo.as_deref());
+                    }
+                    Command::Purge => {
+                        self.purge_layout(ui, &mut acts);
+                        let repo = self.repo.clone();
+                        self.shared_filter(ui, store, repo.as_deref());
+                    }
+                    Command::EmptyDirs => self.empty_dirs_layout(ui, &mut acts),
+                    Command::Organize => self.organize_layout(ui, store, &mut acts),
+                    Command::Prune => self.prune_layout(ui, &mut acts),
+                }
+                self.action_bar(ui, &mut acts);
 
-        if let Some(err) = &self.error {
-            ui.colored_label(theme::RED, err);
-        }
-        if let Some(status) = &self.status {
-            ui.label(RichText::new(status).color(theme::TAN).size(13.0));
-        }
-        ui.separator();
-        if self.running || !self.run_log.is_empty() {
-            self.run_panel(ui);
-        } else {
-            self.preview_panel(ui);
-        }
+                if let Some(err) = &self.error {
+                    ui.colored_label(theme::RED, err);
+                }
+                if let Some(status) = &self.status {
+                    ui.label(RichText::new(status).color(theme::TAN).size(13.0));
+                }
+                ui.separator();
+                if self.running || !self.run_log.is_empty() {
+                    self.run_panel(ui);
+                } else {
+                    self.preview_panel(ui, &mut acts);
+                }
+            });
 
         if let Some(prompt) = self.confirm.clone() {
             self.confirm_modal(ui, &prompt, &mut acts);
@@ -341,14 +405,14 @@ impl GroomingView {
     }
 
     fn command_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::ORANGE).show(ui, |ui| {
+        crate::lcars::section_lcars(ui, "COMMAND — PICK A GROOMING TOOL", theme::ORANGE, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("COMMAND").color(theme::TEXT).size(12.0));
                 for cmd in [
                     Command::Dedupe,
                     Command::Purge,
                     Command::EmptyDirs,
                     Command::Organize,
+                    Command::Prune,
                 ] {
                     let sel = self.command == cmd;
                     let fill = if sel { theme::RED } else { theme::PANEL };
@@ -362,76 +426,107 @@ impl GroomingView {
                         acts.push(Act::SetCommand(cmd));
                     }
                 }
-                if ui
-                    .button(RichText::new("RELOAD").color(theme::BLACK))
-                    .explain(
-                        self.verbosity,
-                        "Reload the repository list",
-                        "Reload the list of registered repositories, e.g. after adding one \
-                         in the Repositories tab.",
-                    )
-                    .clicked()
-                {
-                    acts.push(Act::Reload);
-                }
             });
         });
     }
 
     fn dedupe_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::LILAC).show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("SOURCE").color(theme::TEXT).size(12.0));
-                for name in &self.repos {
-                    let sel = self.source.as_deref() == Some(name.as_str());
-                    let fill = if sel { theme::ORANGE } else { theme::PANEL };
-                    let col = if sel { theme::BLACK } else { theme::TEXT };
-                    if ui
-                        .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
-                        .explain(
-                            self.verbosity,
-                            "Pick the repo to delete duplicates from",
-                            "Files in this repo whose content is also in any dupe-pool repo \
-                             are deleted from here.",
-                        )
-                        .clicked()
-                    {
-                        acts.push(Act::PickSource(name.clone()));
-                    }
+        crate::lcars::section_lcars(ui, "REPOS — SOURCE & DUPE POOL", theme::LILAC, |ui| {
+            // SOURCE: the repo duplicates are deleted from, orange when picked.
+            let src = self.repos.clone();
+            crate::repo_chip::chip_row(ui, "groom_source", "SOURCE", src.len(), |ui, i| {
+                let name = &src[i];
+                let sel = self.source.as_deref() == Some(name.as_str());
+                let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::ORANGE, None);
+                if chip
+                    .name
+                    .explain(
+                        self.verbosity,
+                        "Pick the repo to delete duplicates from",
+                        "Files in this repo whose content is also in any dupe-pool repo are \
+                         deleted from here.",
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::PickSource(name.clone()));
+                }
+                chip.outer
+            });
+            // DUPEPOOL: the repos to check the source against, lilac when on.
+            let pool: Vec<String> = self
+                .repos
+                .iter()
+                .filter(|n| self.source.as_deref() != Some(n.as_str()))
+                .cloned()
+                .collect();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("DUPEPOOL").color(theme::TEXT).size(12.0));
+                if crate::repo_chip::small_button(ui, "ALL", theme::LILAC)
+                    .explain(
+                        self.verbosity,
+                        "Add every eligible repo to the pool",
+                        "A source file is deleted when its content exists in any pool repo.",
+                    )
+                    .clicked()
+                {
+                    self.pool = pool.clone();
+                }
+                if crate::repo_chip::small_button(ui, "NONE", theme::LILAC)
+                    .explain(
+                        self.verbosity,
+                        "Clear the dupe pool",
+                        "No pool repos selected.",
+                    )
+                    .clicked()
+                {
+                    self.pool.clear();
                 }
             });
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("DUPEPOOL").color(theme::TEXT).size(12.0));
-                for name in &self.repos {
-                    if self.source.as_deref() == Some(name.as_str()) {
-                        continue;
-                    }
-                    let sel = self.pool.iter().any(|r| r == name);
-                    let fill = if sel { theme::LILAC } else { theme::PANEL };
-                    let col = if sel { theme::BLACK } else { theme::LILAC };
-                    if ui
-                        .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
-                        .explain(
-                            self.verbosity,
-                            "Add to the dupe pool",
-                            "A source file is deleted when its content exists in any of these \
-                             repos. The pool repos themselves are never modified.",
-                        )
-                        .clicked()
-                    {
-                        acts.push(Act::TogglePool(name.clone()));
-                    }
+            crate::repo_chip::chip_row(ui, "groom_pool", "", pool.len(), |ui, i| {
+                let name = &pool[i];
+                let sel = self.pool.iter().any(|r| r == name);
+                let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::LILAC, None);
+                if chip
+                    .name
+                    .explain(
+                        self.verbosity,
+                        "Add to the dupe pool",
+                        "A source file is deleted when its content exists in any of these repos. \
+                         The pool repos themselves are never modified.",
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::TogglePool(name.clone()));
                 }
+                chip.outer
             });
         });
     }
 
     fn purge_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         self.single_repo_bar(ui, acts, "Delete matching files from this repo.");
+        if self.filter_string().is_none() {
+            ui.label(
+                RichText::new(
+                    "PURGE needs at least one filter condition — with no filter, nothing \
+                     matches and nothing can be deleted.",
+                )
+                .color(theme::TAN)
+                .size(12.0),
+            );
+        }
     }
 
     fn empty_dirs_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         self.single_repo_bar(ui, acts, "Remove empty directories under this repo's root.");
+    }
+
+    fn prune_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        self.single_repo_bar(
+            ui,
+            acts,
+            "Drop records of files already deleted from this repo, then shrink its index.",
+        );
     }
 
     /// Draw the shared single FILTER wizard (DEDUPE/PURGE) backed by `count_repo`
@@ -449,128 +544,172 @@ impl GroomingView {
         }
     }
 
-    /// ORGANIZE: a repo picker, the ordered rule list (each rule = the shared
-    /// FILTER wizard + a path template with token chips), and saved presets.
+    /// ORGANIZE: a repo picker and one RULES section holding the add/preset row
+    /// plus every rule as a nested, collapsible section (each rule = the shared
+    /// FILTER wizard + a path template with token chips and an inline delete).
     fn organize_layout(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, acts: &mut Vec<Act>) {
         self.single_repo_bar(ui, acts, "Reorganize the files in this repo in place.");
         let repo = self.repo.clone();
 
-        let rule_count = self.rules.len();
-        for i in 0..rule_count {
-            theme::section(theme::BLUE).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("RULE {}", i + 1))
-                            .color(theme::TEXT)
-                            .size(12.0),
-                    );
-                    // A rule can always be removed (a repo may need zero rules).
+        crate::lcars::section_lcars(
+            ui,
+            "RULES — MATCH FILES & BUILD THEIR NEW PATHS",
+            theme::LILAC,
+            |ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui
-                        .add(egui::Button::new(RichText::new("× rule").color(theme::RED)))
+                        .add(
+                            egui::Button::new(RichText::new("+ RULE").color(theme::BLACK))
+                                .fill(theme::AMBER),
+                        )
                         .explain(
                             self.verbosity,
-                            "Remove this rule",
-                            "Delete this organize rule. Files it would have matched fall \
-                             through to later rules, or stay put if none match.",
+                            "Add a rule",
+                            "Add another filter → template rule. Rules are tried top to bottom; \
+                         the first whose filter matches a file decides its new path.",
                         )
                         .clicked()
                     {
-                        acts.push(Act::RemoveRule(i));
+                        acts.push(Act::AddRule);
                     }
+                    self.preset_row(ui, acts);
                 });
-                // The rule's filter (which files this rule applies to).
-                let outcome = self.rules[i]
-                    .filter
-                    .ui(ui, store, repo.as_deref(), self.verbosity);
-                if outcome.changed {
-                    self.preview.clear();
-                    self.preview_total = 0;
+                let rule_count = self.rules.len();
+                for i in 0..rule_count {
+                    self.rule_section(ui, store, repo.as_deref(), i, acts);
                 }
-                if outcome.error.is_some() {
-                    self.error = outcome.error;
-                }
-                // The target path template + one-click token chips.
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("TEMPLATE").color(theme::TEXT).size(12.0));
-                    let changed = ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.rules[i].template)
-                                .desired_width(360.0)
-                                .hint_text(DEFAULT_TEMPLATE),
-                        )
-                        .explain(
-                            self.verbosity,
-                            "New relative path template",
-                            "The new relative path for matching files. Tokens in {…} are \
-                             filled per file; `|` gives fallbacks and \"quoted\" text is a \
-                             literal default, e.g. {year}/{o-stem}-{camera|\"nocam\"}.{o-ext}.",
-                        )
-                        .changed();
-                    if changed {
-                        self.preview.clear();
-                        self.preview_total = 0;
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("insert:").color(theme::LILAC).size(11.0));
-                    for (label, insert) in TEMPLATE_TOKENS {
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new(*label).color(theme::BLUE))
-                                    .fill(theme::PANEL),
-                            )
-                            .clicked()
-                        {
-                            self.rules[i].template.push_str(insert);
-                            self.preview.clear();
-                            self.preview_total = 0;
-                        }
-                    }
-                });
-            });
-        }
+            },
+        );
+    }
 
-        theme::section(theme::LILAC).show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if ui
+    /// One collapsible RULE section: filter wizard, template row (with the
+    /// inline delete), and the token chips.
+    fn rule_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        store: &Arc<Store>,
+        repo: Option<&str>,
+        i: usize,
+        acts: &mut Vec<Act>,
+    ) {
+        let title = format!("RULE {} — MATCH & RENAME", i + 1);
+        crate::lcars::section_lcars_collapsible(ui, &title, theme::BLUE, true, |ui| {
+            // The rule's filter (which files this rule applies to).
+            let outcome = self.rules[i].filter.ui(ui, store, repo, self.verbosity);
+            if outcome.changed {
+                self.clear_preview();
+            }
+            if outcome.error.is_some() {
+                self.error = outcome.error;
+            }
+            // The target path template, its inline delete, and the token chips.
+            let template_id = egui::Id::new(("organize_template", i));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("TEMPLATE").color(theme::TEXT).size(12.0));
+                let changed = ui
                     .add(
-                        egui::Button::new(RichText::new("+ RULE").color(theme::BLACK))
-                            .fill(theme::AMBER),
+                        egui::TextEdit::singleline(&mut self.rules[i].template)
+                            .id(template_id)
+                            .desired_width(360.0)
+                            .hint_text(DEFAULT_TEMPLATE),
                     )
                     .explain(
                         self.verbosity,
-                        "Add a rule",
-                        "Add another filter → template rule. Rules are tried top to bottom; \
-                         the first whose filter matches a file decides its new path.",
+                        "New relative path template",
+                        "The new relative path for matching files. Tokens in {…} are \
+                         filled per file; `|` gives fallbacks and \"quoted\" text is a \
+                         literal default, e.g. {year}/{o-stem}-{camera|\"nocam\"}.{o-ext}.",
+                    )
+                    .changed();
+                if changed {
+                    self.clear_preview();
+                }
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new(icon::TRASH).color(theme::RED))
+                            .fill(theme::PANEL),
+                    )
+                    .explain(
+                        self.verbosity,
+                        "Delete this rule",
+                        "Delete this organize rule. Files it would have matched fall \
+                         through to later rules, or stay put if none match.",
                     )
                     .clicked()
                 {
-                    acts.push(Act::AddRule);
+                    acts.push(Act::RemoveRule(i));
                 }
-                self.preset_row(ui, acts);
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("insert:").color(theme::LILAC).size(11.0));
+                for (label, insert) in TEMPLATE_TOKENS {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new(*label).color(theme::BLUE))
+                                .fill(theme::PANEL),
+                        )
+                        .clicked()
+                    {
+                        insert_at_cursor(
+                            ui.ctx(),
+                            template_id,
+                            &mut self.rules[i].template,
+                            insert,
+                        );
+                        self.clear_preview();
+                    }
+                }
             });
         });
     }
 
-    /// The ORGANIZE saved-preset row: apply/forget pills, plus name + SAVE.
+    /// The ORGANIZE saved-preset row: apply/forget pills (right-click to
+    /// rename), plus a STORE PRESET pill for the current rule list.
     fn preset_row(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         ui.separator();
         ui.label(RichText::new("PRESETS").color(theme::TEXT).size(12.0));
-        for (i, preset) in self.presets.iter().enumerate() {
-            if ui
-                .add(
-                    egui::Button::new(RichText::new(&preset.name).color(theme::TAN))
-                        .fill(theme::PANEL),
-                )
+        // Snapshot names first so the loop body is free to mutate `self`
+        // (rename state) without fighting a borrow of `self.presets`.
+        let presets: Vec<(usize, String)> = self
+            .presets
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i, p.name.clone()))
+            .collect();
+        for (i, name) in presets {
+            if self.renaming_preset == Some(i) {
+                let resp =
+                    ui.add(egui::TextEdit::singleline(&mut self.rename_buf).desired_width(120.0));
+                if self.focus_rename_pending {
+                    resp.request_focus();
+                    self.focus_rename_pending = false;
+                }
+                if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.renaming_preset = None;
+                } else if resp.lost_focus() {
+                    acts.push(Act::CommitRenamePreset(i));
+                }
+                continue;
+            }
+            let resp = ui
+                .add(egui::Button::new(RichText::new(&name).color(theme::TAN)).fill(theme::PANEL))
                 .explain(
                     self.verbosity,
                     "Apply this preset",
-                    "Replace the current rules with this saved preset's rules.",
-                )
-                .clicked()
-            {
+                    "Replace the current rules with this saved preset's rules. Right-click \
+                     to rename it.",
+                );
+            if resp.clicked() {
                 acts.push(Act::ApplyPreset(i));
             }
+            resp.context_menu(|ui| {
+                if ui.button("Rename").clicked() {
+                    self.renaming_preset = Some(i);
+                    self.rename_buf = name.clone();
+                    self.focus_rename_pending = true;
+                    ui.close();
+                }
+            });
             if ui
                 .add(egui::Button::new(RichText::new("×").color(theme::RED)))
                 .explain(
@@ -583,55 +722,55 @@ impl GroomingView {
                 acts.push(Act::RemovePreset(i));
             }
         }
-        ui.add(
-            egui::TextEdit::singleline(&mut self.preset_name)
-                .desired_width(120.0)
-                .hint_text("preset name"),
-        );
-        let can_save = !self.preset_name.trim().is_empty() && !self.rules.is_empty();
-        if ui
-            .add_enabled(
-                can_save,
-                egui::Button::new(RichText::new("SAVE").color(theme::BLACK)).fill(theme::AMBER),
-            )
-            .explain(
-                self.verbosity,
-                "Save these rules as a preset",
-                "Save the current rule list under this name for one-click reuse on any repo.",
-            )
-            .clicked()
+        if !self.rules.is_empty()
+            && ui
+                .add(
+                    egui::Button::new(RichText::new("STORE PRESET").color(theme::BLACK))
+                        .fill(theme::AMBER),
+                )
+                .explain(
+                    self.verbosity,
+                    "Store the current rules as a preset",
+                    "Save the current rule list as a new preset, named \"Preset #n\" \
+                     automatically, for one-click reuse on any repo. Right-click a preset \
+                     afterwards to give it a better name.",
+                )
+                .clicked()
         {
-            acts.push(Act::SavePreset);
+            acts.push(Act::StorePreset);
         }
     }
 
     /// A single-repo picker used by PURGE and EMPTY DIRS (they act on one repo).
     fn single_repo_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>, hint: &str) {
-        theme::section(theme::LILAC).show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("REPO").color(theme::TEXT).size(12.0));
-                for name in &self.repos {
+        crate::lcars::section_lcars(
+            ui,
+            "REPO — WHICH REPOSITORY TO GROOM",
+            theme::LILAC,
+            |ui| {
+                let repos = self.repos.clone();
+                crate::repo_chip::chip_row(ui, "groom_repo", "", repos.len(), |ui, i| {
+                    let name = &repos[i];
                     let sel = self.repo.as_deref() == Some(name.as_str());
-                    let fill = if sel { theme::ORANGE } else { theme::PANEL };
-                    let col = if sel { theme::BLACK } else { theme::TEXT };
-                    if ui
-                        .add(egui::Button::new(RichText::new(name).color(col)).fill(fill))
+                    let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::ORANGE, None);
+                    if chip
+                        .name
                         .explain(self.verbosity, "Pick the repo to act on", hint)
                         .clicked()
                     {
                         acts.push(Act::PickRepo(name.clone()));
                     }
-                }
-            });
-            ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
-        });
+                    chip.outer
+                });
+                ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
+            },
+        );
     }
 
     /// A single-line filter expression (mime / size / name with `*` wildcards).
     fn action_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        theme::section(theme::AMBER).show(ui, |ui| {
+        crate::lcars::section_lcars(ui, "ACTION — PREVIEW & RUN", theme::AMBER, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("ACTION").color(theme::TEXT).size(12.0));
                 let ready = self.ready();
                 // EMPTY DIRS has no meaningful file preview (its count is only
                 // known after walking), so PREVIEW is offered for the other two.
@@ -687,40 +826,31 @@ impl GroomingView {
         });
     }
 
-    fn preview_panel(&mut self, ui: &mut egui::Ui) {
+    fn preview_panel(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         if self.preview.is_empty() {
             ui.add_space(6.0);
             ui.colored_label(theme::TEXT, "Pick a repo and command, then press PREVIEW.");
             return;
         }
-        ui.label(
-            RichText::new(format!(
-                "{} file(s) match · showing first {}",
-                self.preview_total,
-                self.preview.len()
-            ))
-            .color(theme::AMBER)
-            .strong(),
-        );
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for row in &self.preview {
-                    match &row.to {
-                        // ORGANIZE: show the move as `from → to`.
-                        Some(to) => {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(&row.from).color(theme::TEXT).size(12.0));
-                                ui.label(RichText::new("→").color(theme::ORANGE));
-                                ui.label(RichText::new(to).color(theme::BLUE).size(12.0));
-                            });
-                        }
-                        None => {
-                            ui.label(RichText::new(&row.from).color(theme::TEXT).size(12.0));
-                        }
-                    }
-                }
-            });
+        if let Some(review::ReviewAction::Apply(key)) = review::table(
+            ui,
+            &mut self.review_state,
+            &mut self.preview,
+            self.preview_totals,
+            &self.preview_source_header,
+            &self.preview_target_header,
+        ) {
+            acts.push(Act::ApplyRow(key));
+        }
+    }
+
+    /// A repo's absolute path for a review-table column header, falling back to
+    /// its name if it can't be resolved.
+    fn repo_header(store: &Store, name: &str) -> String {
+        store
+            .get_repo(name)
+            .map(|m| m.abs_path)
+            .unwrap_or_else(|_| name.to_string())
     }
 
     fn run_panel(&mut self, ui: &mut egui::Ui) {
@@ -797,7 +927,9 @@ impl GroomingView {
         }
         match self.command {
             Command::Dedupe => self.source.is_some() && !self.pool.is_empty(),
-            Command::Purge | Command::EmptyDirs => self.repo.is_some(),
+            // PURGE without a filter would match every file; require one.
+            Command::Purge => self.repo.is_some() && self.filter_string().is_some(),
+            Command::EmptyDirs | Command::Prune => self.repo.is_some(),
             Command::Organize => self.repo.is_some() && !self.rules.is_empty(),
         }
     }
@@ -806,11 +938,10 @@ impl GroomingView {
         self.filter.filter_string()
     }
 
-    /// Save the current ORGANIZE rules as a named preset (replacing a same-named
-    /// one), then persist to disk.
-    fn save_preset(&mut self, store: &Store) {
-        let name = self.preset_name.trim().to_string();
-        if name.is_empty() || self.rules.is_empty() {
+    /// Save the current ORGANIZE rules as a new preset named `Preset #n` (the
+    /// next unused number), then persist to disk.
+    fn store_preset(&mut self, store: &Store) {
+        if self.rules.is_empty() {
             return;
         }
         let rules: Vec<SavedRule> = self
@@ -821,17 +952,25 @@ impl GroomingView {
                 template: r.template.clone(),
             })
             .collect();
-        let preset = OrganizePreset {
+        let name = self.next_preset_name();
+        self.presets.push(OrganizePreset {
             name: name.clone(),
             rules,
-        };
-        match self.presets.iter_mut().find(|p| p.name == name) {
-            Some(existing) => *existing = preset,
-            None => self.presets.push(preset),
-        }
-        self.preset_name.clear();
+        });
         self.save_presets(store);
         self.status = Some(format!("Saved organize preset '{name}'."));
+    }
+
+    /// The next unused `Preset #n` name, based on what's already saved.
+    fn next_preset_name(&self) -> String {
+        let mut n = self.presets.len() + 1;
+        loop {
+            let candidate = format!("Preset #{n}");
+            if !self.presets.iter().any(|p| p.name == candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
     }
 
     /// Persist the preset list as JSON in the config dir (best effort).
@@ -890,7 +1029,7 @@ impl GroomingView {
                 }
                 self.clear_preview();
             }
-            Act::SavePreset => self.save_preset(store),
+            Act::StorePreset => self.store_preset(store),
             Act::ApplyPreset(i) => {
                 if let Some(preset) = self.presets.get(i) {
                     self.rules = preset
@@ -917,25 +1056,44 @@ impl GroomingView {
                     self.save_presets(store);
                 }
             }
-            Act::Reload => self.reload(store),
+            Act::CommitRenamePreset(i) => {
+                self.renaming_preset = None;
+                let new_name = self.rename_buf.trim().to_string();
+                if !new_name.is_empty()
+                    && let Some(preset) = self.presets.get_mut(i)
+                {
+                    preset.name = new_name;
+                    self.save_presets(store);
+                }
+            }
             Act::Preview => self.run_preview(store),
             Act::Ask => {
-                if let Some(prompt) = self.build_prompt(store) {
+                if let Some(mut prompt) = self.build_prompt(store) {
+                    let rejected = self.review_state.rejected.len();
+                    if rejected > 0 {
+                        prompt.push_str(&format!(" {rejected} rejected row(s) will be skipped."));
+                    }
                     self.confirm = Some(prompt);
                 }
             }
             Act::CancelConfirm => self.confirm = None,
             Act::Confirm => {
                 self.confirm = None;
-                self.start(store);
+                self.start(store, None);
             }
+            Act::ApplyRow(key) => self.start(store, Some(key)),
             Act::CancelRun => self.cancel.cancel(),
         }
     }
 
     fn clear_preview(&mut self) {
         self.preview.clear();
+        self.preview_totals = [0; 3];
+        self.preview_source_header.clear();
+        self.preview_target_header.clear();
         self.preview_total = 0;
+        // Rejections are keyed to the preview they were made in.
+        self.review_state.rejected.clear();
     }
 
     fn reset_run(&mut self) {
@@ -953,6 +1111,7 @@ impl GroomingView {
                 let Some(source) = self.source.clone() else {
                     return;
                 };
+                self.preview_source_header = Self::repo_header(store, &source);
                 let pool = self.pool.clone();
                 let ref_slice: Vec<&str> = pool.iter().map(String::as_str).collect();
                 dedup_core::diff::diff_print(store, &source, &ref_slice, filter.as_deref())
@@ -968,7 +1127,7 @@ impl GroomingView {
                             })
                             .collect();
                         let total = matched.len();
-                        (matched.into_iter().take(PREVIEW_LIMIT).collect(), total)
+                        (matched.into_iter().take(PREVIEW_CAP).collect(), total)
                     })
                     .map_err(|e| e.to_string())
             }
@@ -976,8 +1135,16 @@ impl GroomingView {
                 let Some(repo) = self.repo.clone() else {
                     return;
                 };
-                preview_by_filter(store, &repo, filter.as_deref(), PREVIEW_LIMIT)
+                self.preview_source_header = Self::repo_header(store, &repo);
+                preview_by_filter(store, &repo, filter.as_deref(), PREVIEW_CAP)
                     .map_err(|e| e.to_string())
+            }
+            Command::Prune => {
+                let Some(repo) = self.repo.clone() else {
+                    return;
+                };
+                self.preview_source_header = Self::repo_header(store, &repo);
+                preview_prune(store, &repo, PREVIEW_CAP).map_err(|e| e.to_string())
             }
             Command::Organize => {
                 self.run_preview_organize(store);
@@ -988,11 +1155,22 @@ impl GroomingView {
         };
         match result {
             Ok((paths, total)) => {
+                // DEDUPE / PURGE / PRUNE all remove files from the one repo: the
+                // source side is removed, the target side is absent.
                 self.preview_total = total;
-                self.preview = paths
+                self.preview_totals = [0, total, 0];
+                self.preview_target_header.clear();
+                let mut rows: Vec<review::ReviewRow> = paths
                     .into_iter()
-                    .map(|from| PreviewRow { from, to: None })
+                    .map(|from| review::ReviewRow {
+                        source: review::SideStatus::Removed,
+                        target: review::SideStatus::Absent,
+                        source_path: from,
+                        target_path: String::new(),
+                    })
                     .collect();
+                review::sort(&mut rows, &self.review_state);
+                self.preview = rows;
                 self.status = Some(format!("{total} file(s) match."));
                 self.error = None;
             }
@@ -1020,11 +1198,25 @@ impl GroomingView {
         match plan_organize(store, &repo, &self.organize_rules()) {
             Ok(moves) => {
                 self.preview_total = moves.len();
-                self.preview = moves
+                // A relocation both removes the old path and adds the new one.
+                self.preview_totals = [moves.len(), moves.len(), 0];
+                // ORGANIZE relocates within one repo: the old path is removed and
+                // the new path added — same repo on both sides.
+                let header = Self::repo_header(store, &repo);
+                self.preview_source_header = header.clone();
+                self.preview_target_header = header;
+                let mut rows: Vec<review::ReviewRow> = moves
                     .into_iter()
-                    .take(PREVIEW_LIMIT)
-                    .map(|(from, to)| PreviewRow { from, to: Some(to) })
+                    .take(PREVIEW_CAP)
+                    .map(|(from, to)| review::ReviewRow {
+                        source: review::SideStatus::Removed,
+                        target: review::SideStatus::Added,
+                        source_path: from,
+                        target_path: to,
+                    })
                     .collect();
+                review::sort(&mut rows, &self.review_state);
+                self.preview = rows;
                 self.status = Some(format!("{} file(s) would move.", self.preview_total));
                 self.error = None;
             }
@@ -1056,6 +1248,15 @@ impl GroomingView {
                 let repo = self.repo.as_ref()?;
                 Some(format!("Remove all empty directories under '{repo}'?"))
             }
+            Command::Prune => {
+                self.run_preview(store);
+                let repo = self.repo.as_ref()?;
+                Some(format!(
+                    "Permanently drop {} record(s) of deleted files from '{repo}' and \
+                     compact its index? This cannot be undone.",
+                    self.preview_total
+                ))
+            }
             Command::Organize => {
                 self.run_preview(store);
                 let repo = self.repo.as_ref()?;
@@ -1068,25 +1269,41 @@ impl GroomingView {
         }
     }
 
-    fn start(&mut self, store: &Arc<Store>) {
+    /// Start the selected command on a worker thread. `only` restricts the run
+    /// to a single review row (the APPLY button); `None` runs the whole batch
+    /// minus any rejected rows.
+    fn start(&mut self, store: &Arc<Store>, only: Option<String>) {
         let command = self.command;
         let filter = self.filter_string();
         let source = self.source.clone();
         let pool = self.pool.clone();
         let repo = self.repo.clone();
         let rules = self.organize_rules();
+        let rejected: std::collections::HashSet<String> = self.review_state.rejected.clone();
         let store = Arc::clone(store);
         let tx = self.tx.clone();
         self.cancel = CancellationToken::new();
         let cancel = self.cancel.clone();
         self.running = true;
         self.status = Some(format!("{}…", command.label().to_lowercase()));
-        self.clear_preview();
-        self.reset_run();
+        if only.is_some() {
+            // A single-row APPLY keeps the preview on screen (it refreshes
+            // when the run finishes) instead of dropping to the run log.
+            self.pending_refresh = true;
+            self.reset_run();
+        } else {
+            self.clear_preview();
+            self.reset_run();
+        }
 
         std::thread::spawn(move || {
             let progress = ChannelDiffProgress { tx: tx.clone() };
-            let run = DiffRun::new(&progress, &cancel);
+            let only_set: Option<std::collections::HashSet<String>> =
+                only.map(|k| std::collections::HashSet::from([k]));
+            let run = DiffRun::new(&progress, &cancel).with_selection(
+                (!rejected.is_empty()).then_some(&rejected),
+                only_set.as_ref(),
+            );
             let result = match command {
                 Command::Dedupe => {
                     let Some(source) = source else { return };
@@ -1123,6 +1340,17 @@ impl GroomingView {
                             moved: s.moved,
                             skipped: s.skipped,
                             errors: s.errors,
+                            cancelled: s.cancelled,
+                        },
+                        Err(e) => OpResult::Error(e.to_string()),
+                    }
+                }
+                Command::Prune => {
+                    let Some(repo) = repo else { return };
+                    match prune(&store, &repo, &run) {
+                        Ok(s) => OpResult::Pruned {
+                            pruned: s.pruned,
+                            compacted: s.compacted,
                             cancelled: s.cancelled,
                         },
                         Err(e) => OpResult::Error(e.to_string()),
@@ -1193,6 +1421,23 @@ impl GroomingView {
                             ));
                             self.error = None;
                         }
+                        OpResult::Pruned {
+                            pruned,
+                            compacted,
+                            cancelled,
+                        } => {
+                            self.status = Some(format!(
+                                "Pruned {pruned} record(s){}.",
+                                if cancelled {
+                                    " (cancelled, index not compacted)"
+                                } else if compacted {
+                                    "; index compacted"
+                                } else {
+                                    "; index already compact"
+                                }
+                            ));
+                            self.error = None;
+                        }
                         OpResult::Error(e) => self.error = Some(e),
                     }
                 }
@@ -1200,7 +1445,10 @@ impl GroomingView {
         }
     }
 
-    fn reload(&mut self, store: &Store) {
+    /// Sync the repo list with the store, keeping the current source/repo/pool
+    /// picks and dropping any that no longer exist. Called on first show and
+    /// whenever the tab is re-shown, so no manual reload button is needed.
+    pub fn sync_repos(&mut self, store: &Store) {
         if !self.presets_loaded {
             self.load_presets(store);
         }
@@ -1224,6 +1472,34 @@ impl GroomingView {
             Err(e) => self.error = Some(e.to_string()),
         }
     }
+}
+
+/// Insert `text` into `template` at the caret of the `TextEdit` identified by
+/// `id`, leaving the caret just after the insertion so consecutive chip clicks
+/// build the template left to right. Appends when the field has no cursor
+/// state yet (never focused).
+fn insert_at_cursor(ctx: &egui::Context, id: egui::Id, template: &mut String, text: &str) {
+    let Some(mut state) = egui::TextEdit::load_state(ctx, id) else {
+        template.push_str(text);
+        return;
+    };
+    let chars = template.chars().count();
+    let at = state
+        .cursor
+        .char_range()
+        .map(|r| r.primary.index.0.min(chars))
+        .unwrap_or(chars);
+    let byte = template
+        .char_indices()
+        .nth(at)
+        .map(|(b, _)| b)
+        .unwrap_or(template.len());
+    template.insert_str(byte, text);
+    let after = egui::text::CCursor::new(at + text.chars().count());
+    state
+        .cursor
+        .set_char_range(Some(egui::text::CCursorRange::one(after)));
+    state.store(ctx, id);
 }
 
 #[cfg(test)]
@@ -1284,6 +1560,31 @@ mod ui_tests {
         h.run();
         h.run();
         assert!(h.state().command == Command::Organize, "4 selects ORGANIZE");
+
+        h.key_press(egui::Key::Num5);
+        h.run();
+        h.run();
+        assert!(h.state().command == Command::Prune, "5 selects PRUNE");
+    }
+
+    /// PRUNE shows just the single REPO picker — no FILTER and no dupe pool
+    /// (its target is the repo's own missing records).
+    #[test]
+    fn prune_layout_shows_repo_only() {
+        let (_tmp, store) = sample_store();
+        let prune = grooming_harness(store, Command::Prune);
+        assert!(
+            prune.query_by_label_contains("REPO — ").is_some(),
+            "PRUNE has REPO"
+        );
+        assert!(
+            prune.query_by_label_contains("FILTER — ").is_none(),
+            "PRUNE has no filter"
+        );
+        assert!(
+            prune.query_by_label("DUPEPOOL").is_none(),
+            "PRUNE has no dupe pool"
+        );
     }
 
     /// DEDUPE shows SOURCE + DUPEPOOL + FILTER; PURGE shows a single REPO +
@@ -1303,17 +1604,23 @@ mod ui_tests {
             "DEDUPE has DUPEPOOL"
         );
         assert!(
-            dedupe.query_by_label("FILTER").is_some(),
+            dedupe.query_by_label_contains("FILTER — ").is_some(),
             "DEDUPE has FILTER"
         );
         assert!(
-            dedupe.query_by_label("REPO").is_none(),
+            dedupe.query_by_label_contains("REPO — ").is_none(),
             "DEDUPE uses SOURCE, not the single REPO picker"
         );
 
         let purge = grooming_harness(Arc::clone(&store), Command::Purge);
-        assert!(purge.query_by_label("REPO").is_some(), "PURGE has REPO");
-        assert!(purge.query_by_label("FILTER").is_some(), "PURGE has FILTER");
+        assert!(
+            purge.query_by_label_contains("REPO — ").is_some(),
+            "PURGE has REPO"
+        );
+        assert!(
+            purge.query_by_label_contains("FILTER — ").is_some(),
+            "PURGE has FILTER"
+        );
         assert!(
             purge.query_by_label("DUPEPOOL").is_none(),
             "PURGE has no dupe pool"
@@ -1321,17 +1628,17 @@ mod ui_tests {
 
         let empty = grooming_harness(Arc::clone(&store), Command::EmptyDirs);
         assert!(
-            empty.query_by_label("REPO").is_some(),
+            empty.query_by_label_contains("REPO — ").is_some(),
             "EMPTY DIRS has REPO"
         );
         assert!(
-            empty.query_by_label("FILTER").is_none(),
+            empty.query_by_label_contains("FILTER — ").is_none(),
             "EMPTY DIRS has no filter"
         );
 
         let organize = grooming_harness(store, Command::Organize);
         assert!(
-            organize.query_by_label("REPO").is_some(),
+            organize.query_by_label_contains("REPO — ").is_some(),
             "ORGANIZE has a repo picker"
         );
         assert!(
@@ -1346,5 +1653,360 @@ mod ui_tests {
             organize.query_by_label("DUPEPOOL").is_none(),
             "ORGANIZE has no dupe pool"
         );
+    }
+
+    /// The rule's remove control is an inline trash button sharing the TEMPLATE
+    /// row (no dedicated full-width delete row), and the preset row offers
+    /// STORE PRESET instead of a name field + SAVE.
+    #[test]
+    fn organize_delete_sits_inline_on_the_template_row() {
+        let (_tmp, store) = sample_store();
+        let organize = grooming_harness(store, Command::Organize);
+        let template = organize.get_by_label("TEMPLATE").rect();
+        let trash = organize.get_by_label(icon::TRASH).rect();
+        assert!(
+            (trash.center().y - template.center().y).abs() < template.height(),
+            "the delete button shares the TEMPLATE row (trash y={}, template y={})",
+            trash.center().y,
+            template.center().y
+        );
+        assert!(
+            organize.query_by_label_contains("DELETE RULE").is_none(),
+            "the old dedicated DELETE RULE row is gone"
+        );
+        assert!(
+            organize.query_by_label_contains("STORE PRESET").is_some(),
+            "the preset row offers a STORE PRESET pill"
+        );
+        assert!(
+            organize.query_by_label("SAVE").is_none(),
+            "the old name-field + SAVE preset UI is gone"
+        );
+    }
+
+    /// Rule sections nest inside the RULES elbow: RULE 1's chrome starts to the
+    /// right of the RULES rail, below the RULES header.
+    #[test]
+    fn rule_sections_nest_inside_rules_elbow() {
+        let (_tmp, store) = sample_store();
+        let organize = grooming_harness(store, Command::Organize);
+        let rules = organize.get_by_label_contains("RULES — ").rect();
+        let rule1 = organize.get_by_label_contains("RULE 1").rect();
+        assert!(
+            rule1.left() > rules.left(),
+            "RULE 1 (left={}) should be inset within the RULES section (left={})",
+            rule1.left(),
+            rules.left()
+        );
+        assert!(
+            rule1.top() > rules.top(),
+            "RULE 1 should sit below the RULES header"
+        );
+    }
+
+    /// Every elbow section collapses on a header click, not just the organize
+    /// rules: folding COMMAND hides the command selector, clicking again
+    /// restores it.
+    #[test]
+    fn every_section_collapses_on_header_click() {
+        let (_tmp, store) = sample_store();
+        let mut h = grooming_harness(store, Command::Purge);
+        assert!(
+            h.query_by_label("DEDUPE").is_some(),
+            "the command selector starts visible"
+        );
+        h.get_by_label_contains("COMMAND — ").click();
+        h.run();
+        assert!(
+            h.query_by_label("DEDUPE").is_none(),
+            "collapsing COMMAND hides the selector"
+        );
+        h.get_by_label_contains("COMMAND — ").click();
+        h.run();
+        assert!(
+            h.query_by_label("DEDUPE").is_some(),
+            "clicking again expands the section"
+        );
+    }
+
+    /// Clicking a rule's header bar collapses its body (the TEMPLATE field
+    /// disappears); clicking again restores it.
+    #[test]
+    fn rule_header_click_collapses_and_expands_the_body() {
+        let (_tmp, store) = sample_store();
+        let mut h = grooming_harness(store, Command::Organize);
+        assert!(
+            h.query_by_label("TEMPLATE").is_some(),
+            "rule body starts expanded"
+        );
+        h.get_by_label_contains("RULE 1").click();
+        h.run();
+        assert!(
+            h.query_by_label("TEMPLATE").is_none(),
+            "collapsing the rule hides its body"
+        );
+        h.get_by_label_contains("RULE 1").click();
+        h.run();
+        assert!(
+            h.query_by_label("TEMPLATE").is_some(),
+            "clicking again expands the body"
+        );
+    }
+
+    /// The FILTER wizard (shared by PURGE) no longer offers EXPORT/IMPORT, and
+    /// offers STORE PRESET once a condition is entered.
+    #[test]
+    fn filter_no_longer_offers_export_import() {
+        let (_tmp, store) = sample_store();
+        let mut h = grooming_harness(store, Command::Purge);
+        h.state_mut().filter.set_expression("name:foo");
+        h.run();
+        assert!(
+            h.query_by_label("EXPORT").is_none(),
+            "EXPORT is gone from the filter preset row"
+        );
+        assert!(
+            h.query_by_label("IMPORT").is_none(),
+            "IMPORT is gone from the filter preset row"
+        );
+        assert!(
+            h.query_by_label_contains("STORE PRESET").is_some(),
+            "the filter preset row offers STORE PRESET once a condition is set"
+        );
+    }
+
+    /// `section_lcars` now always claims the panel's full width, so even a
+    /// narrow-content rule section (a single button + short fields) spans
+    /// nearly the whole window rather than shrinking to fit its content.
+    #[test]
+    fn rule_elbow_spans_full_panel_width() {
+        let (_tmp, store) = sample_store();
+        let width = 1120.0;
+        let organize = grooming_harness(store, Command::Organize);
+        let rule_title = organize.get_by_label_contains("RULE 1").rect();
+        assert!(
+            rule_title.right() > width - 220.0,
+            "the RULE 1 elbow should span nearly the full panel width, right={}",
+            rule_title.right()
+        );
+    }
+
+    /// A seeded PURGE preview renders the review board with a `removed` summary,
+    /// the repo path as the source header, and a click-to-sort FILE header.
+    #[test]
+    fn review_board_shows_removed_and_sorts() {
+        let (_tmp, store) = sample_store();
+        let mut h = grooming_harness(store, Command::Purge);
+        {
+            let v = h.state_mut();
+            v.preview_source_header = "/repos/junk".to_string();
+            v.preview = vec![
+                review::ReviewRow {
+                    source: review::SideStatus::Removed,
+                    target: review::SideStatus::Absent,
+                    source_path: "a.tmp".to_string(),
+                    target_path: String::new(),
+                },
+                review::ReviewRow {
+                    source: review::SideStatus::Removed,
+                    target: review::SideStatus::Absent,
+                    source_path: "b.tmp".to_string(),
+                    target_path: String::new(),
+                },
+            ];
+            v.preview_totals = [0, 2, 0];
+            review::sort(&mut v.preview, &v.review_state);
+        }
+        h.run();
+        assert!(
+            h.query_by_label_contains("2 removed").is_some(),
+            "summary shows the removed count"
+        );
+        assert!(
+            h.query_by_label_contains("/repos/junk").is_some(),
+            "the source column is headed by the repo path"
+        );
+        assert!(h.state().review_state.sort_asc, "starts ascending");
+        h.get_by_label_contains("/repos/junk").click();
+        h.run();
+        assert!(
+            !h.state().review_state.sort_asc,
+            "clicking the source header toggles the sort direction"
+        );
+    }
+
+    /// Clicking a row's ✗ rejects it (tracked in state, shown in the summary);
+    /// clicking again restores it.
+    #[test]
+    fn review_rows_can_be_rejected_and_restored() {
+        let (_tmp, store) = sample_store();
+        let mut h = grooming_harness(store, Command::Purge);
+        {
+            let v = h.state_mut();
+            v.preview_source_header = "/repos/junk".to_string();
+            v.preview = vec![
+                review::ReviewRow {
+                    source: review::SideStatus::Removed,
+                    target: review::SideStatus::Absent,
+                    source_path: "a.tmp".to_string(),
+                    target_path: String::new(),
+                },
+                review::ReviewRow {
+                    source: review::SideStatus::Removed,
+                    target: review::SideStatus::Absent,
+                    source_path: "b.tmp".to_string(),
+                    target_path: String::new(),
+                },
+            ];
+            v.preview_totals = [0, 2, 0];
+            review::sort(&mut v.preview, &v.review_state);
+        }
+        h.run();
+        // Each actionable row leads with a ✗ reject toggle; click the first.
+        h.get_all_by_label(icon::X).next().unwrap().click();
+        h.run();
+        assert_eq!(
+            h.state().review_state.rejected.len(),
+            1,
+            "one row is rejected"
+        );
+        assert!(
+            h.query_by_label_contains("1 rejected").is_some(),
+            "the summary reports the rejected count"
+        );
+        h.get_all_by_label(icon::X).next().unwrap().click();
+        h.run();
+        assert!(
+            h.state().review_state.rejected.is_empty(),
+            "clicking the toggle again restores the row"
+        );
+        // The APPLY arrow is present on non-rejected rows (one per row).
+        assert!(
+            h.get_all_by_label(icon::ARROW_RIGHT).next().is_some(),
+            "rows offer an APPLY control"
+        );
+    }
+
+    /// A preview past one page shows the row count plus PREV/PAGE/NEXT
+    /// controls, and NEXT advances the page.
+    #[test]
+    fn review_preview_pages_past_page_size() {
+        let (_tmp, store) = sample_store();
+        let mut h = grooming_harness(store, Command::Purge);
+        {
+            let v = h.state_mut();
+            v.preview_source_header = "/repos/junk".to_string();
+            v.preview = (0..501)
+                .map(|i| review::ReviewRow {
+                    source: review::SideStatus::Removed,
+                    target: review::SideStatus::Absent,
+                    source_path: format!("f{i:04}.tmp"),
+                    target_path: String::new(),
+                })
+                .collect();
+            v.preview_totals = [0, 501, 0];
+            review::sort(&mut v.preview, &v.review_state);
+        }
+        h.run();
+        assert!(
+            h.query_by_label_contains("501 rows").is_some(),
+            "the row count is always shown"
+        );
+        assert!(
+            h.query_by_label_contains("PAGE 1 / 2").is_some(),
+            "page indicator starts on page 1 of 2"
+        );
+        h.get_by_label("NEXT").click();
+        h.run();
+        assert!(
+            h.query_by_label_contains("PAGE 2 / 2").is_some(),
+            "NEXT advances to page 2"
+        );
+    }
+
+    /// Token chips insert at the caret (and move it), not blindly at the end.
+    #[test]
+    fn insert_at_cursor_inserts_at_caret_and_advances_it() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("tpl-test");
+        let mut template = String::from("{year}/{o-name}");
+        // No cursor state yet (field never focused) → appends.
+        insert_at_cursor(&ctx, id, &mut template, "{day}");
+        assert_eq!(template, "{year}/{o-name}{day}");
+        // Caret after "{year}" (6 chars) → the token lands mid-string.
+        let mut st = egui::widgets::text_edit::TextEditState::default();
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(6),
+        )));
+        st.store(&ctx, id);
+        insert_at_cursor(&ctx, id, &mut template, "{month}");
+        assert_eq!(template, "{year}{month}/{o-name}{day}");
+        let caret = egui::TextEdit::load_state(&ctx, id)
+            .expect("state was stored")
+            .cursor
+            .char_range()
+            .expect("caret was set")
+            .primary
+            .index
+            .0;
+        assert_eq!(
+            caret,
+            "{year}{month}".chars().count(),
+            "caret follows the insertion"
+        );
+    }
+
+    /// Manual visual check of the review board's reject/apply controls:
+    /// `cargo test -p dedup-gui review_snapshot -- --ignored`.
+    #[test]
+    #[ignore = "renders a PNG for manual inspection"]
+    fn render_review_snapshot() {
+        let (_tmp, store) = sample_store();
+        let mut h = grooming_harness(store, Command::Purge);
+        {
+            let v = h.state_mut();
+            v.preview_source_header = "/repos/junk".to_string();
+            v.preview = (0..6)
+                .map(|i| review::ReviewRow {
+                    source: review::SideStatus::Removed,
+                    target: review::SideStatus::Absent,
+                    source_path: format!("cache/file{i}.db"),
+                    target_path: String::new(),
+                })
+                .collect();
+            v.preview_totals = [0, 6, 0];
+            review::sort(&mut v.preview, &v.review_state);
+            v.review_state
+                .rejected
+                .insert(dedup_core::diff::source_key("cache/file2.db"));
+        }
+        h.run();
+        let img = h.render().expect("wgpu render failed");
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/review_snapshot.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Manual visual check of the reworked ORGANIZE layout (nested collapsible
+    /// rules, inline delete): `cargo test -p dedup-gui organize_snapshot -- --ignored`.
+    #[test]
+    #[ignore = "renders a PNG for manual inspection"]
+    fn render_organize_snapshot() {
+        let (_tmp, store) = sample_store();
+        let mut h = grooming_harness(store, Command::Organize);
+        h.state_mut().rules.push(RuleUi::new());
+        h.run();
+        // Fold two sections so the snapshot also shows the collapsed form
+        // (stadium bar + right-caret hint) next to open ones.
+        h.get_by_label_contains("REPO — ").click();
+        h.run();
+        h.get_by_label_contains("RULE 2").click();
+        h.run();
+        let img = h.render().expect("wgpu render failed");
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/organize_snapshot.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 }

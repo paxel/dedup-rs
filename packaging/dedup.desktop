@@ -2,8 +2,8 @@
 Type=Application
 Name=dedup
 GenericName=Deduplication Triage
-Comment=Forensic data-inheritance triage: find the useful material in heaps of redundant backups
-Exec=dedup
+Comment=Manage your (media) files
+Exec=/usr/bin/dedup
 Icon=dedup
 Terminal=false
 Categories=Utility;FileTools;

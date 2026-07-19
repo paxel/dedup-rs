@@ -17,7 +17,7 @@ use crossbeam_channel::{Receiver, Sender};
 use dedup_core::store::{RepoStats, Store};
 use dedup_core::update::{CancellationToken, ProgressEvent, check_repo, update_repo};
 use egui::{Align, Color32, Id, Layout, RichText};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,11 +27,12 @@ use std::time::Duration;
 const MAX_CONCURRENT: usize = 1;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
-enum Tab {
+pub(crate) enum Tab {
     Repositories,
     Duplicates,
     Transfer,
     Grooming,
+    Browse,
 }
 
 /// Freshness of a repo's index relative to disk, from the last CHECK.
@@ -59,6 +60,18 @@ struct RepoRow {
     location: Option<Location>,
     /// Index freshness, from the last CHECK.
     freshness: Freshness,
+}
+
+/// Where a native folder-picker result should be routed, since the pick is
+/// resolved on a background thread after the invoking widget is gone.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FolderTarget {
+    /// The "add repository" form's path field.
+    Add,
+    /// The inline relocate editor's path buffer.
+    Relocate,
+    /// The inline duplicate editor's path buffer.
+    Duplicate,
 }
 
 /// In-progress inline edit for a repo row.
@@ -104,27 +117,31 @@ enum Action {
     CancelEdit,
     OpenAdd,
     CloseAdd,
-    ChooseFolder,
+    ChooseFolder(FolderTarget),
     Create,
 }
 
 pub struct DedupApp {
     store: Arc<Store>,
     tab: Tab,
+    /// The tab shown last frame; when it changes we re-sync the newly-shown
+    /// view's repo list from the store (so a repo added in the Repositories tab
+    /// appears immediately — no manual refresh button needed).
+    synced_tab: Option<Tab>,
     repos: Vec<RepoRow>,
     load_error: Option<String>,
+    /// Transient non-error notice (e.g. a drag-and-drop add summary).
+    notice: Option<String>,
 
     show_add: bool,
     new_name: String,
     new_path: String,
     form_error: Option<String>,
-    /// Native folder-picker results delivered from a background thread.
-    folder_tx: Sender<PathBuf>,
-    folder_rx: Receiver<PathBuf>,
     edit: Option<Edit>,
 
     show_settings: bool,
     show_about: bool,
+    show_help: bool,
     /// Whether the one-time startup status probe has been kicked off.
     did_initial_status: bool,
     threads: usize,
@@ -142,6 +159,7 @@ pub struct DedupApp {
     dupes: DupesView,
     transfer: TransferView,
     grooming: GroomingView,
+    browse: crate::browse_view::BrowseView,
     /// Last settings written to disk, to avoid rewriting an unchanged file.
     saved_settings: crate::settings::Settings,
     /// Current window inner size (logical points), captured each frame and
@@ -152,22 +170,22 @@ pub struct DedupApp {
 impl DedupApp {
     pub fn new(store: Arc<Store>) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let (folder_tx, folder_rx) = crossbeam_channel::unbounded();
         let (status_tx, status_rx) = crossbeam_channel::unbounded();
         let mut app = Self {
             store,
             tab: Tab::Repositories,
+            synced_tab: None,
             repos: Vec::new(),
             load_error: None,
+            notice: None,
             show_add: false,
             new_name: String::new(),
             new_path: String::new(),
             form_error: None,
-            folder_tx,
-            folder_rx,
             edit: None,
             show_settings: false,
             show_about: false,
+            show_help: false,
             did_initial_status: false,
             threads: 0,
             tooltip_verbosity: TooltipVerbosity::default(),
@@ -181,6 +199,7 @@ impl DedupApp {
             dupes: DupesView::new(),
             transfer: TransferView::new(),
             grooming: GroomingView::new(),
+            browse: crate::browse_view::BrowseView::new(),
             saved_settings: crate::settings::Settings::default(),
             window_size: None,
         };
@@ -254,8 +273,90 @@ impl DedupApp {
                 }
                 self.repos = rows;
                 self.load_error = None;
+                self.notice = None;
+                // The repo set may have changed (add/remove/rename/relocate);
+                // force the selector tabs to re-sync when next shown.
+                self.synced_tab = None;
             }
             Err(e) => self.load_error = Some(e.to_string()),
+        }
+    }
+
+    /// Add any folders dropped onto the window as repositories. Non-directory
+    /// drops are ignored; each repo's name is derived from the folder's basename
+    /// and made unique against existing repos and others in the same drop. No-op
+    /// while an update runs (the registry is locked then, like the ADD button).
+    fn handle_dropped_folders(&mut self, ctx: &egui::Context) {
+        let (dropped, drop_count) = ctx.input(|i| {
+            let dropped: Vec<PathBuf> = i
+                .raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect();
+            (dropped, i.raw.dropped_files.len())
+        });
+        if drop_count == 0 {
+            return;
+        }
+        // Something was dropped but the windowing backend delivered no usable
+        // path (seen on Wayland) — say so instead of silently ignoring it.
+        if dropped.is_empty() {
+            self.load_error = Some(
+                "Your desktop didn't provide file paths for the drop (common on Wayland) — \
+                 use ADD REPOSITORY instead."
+                    .into(),
+            );
+            return;
+        }
+        if self.worker.active_count() > 0 {
+            self.load_error = Some(
+                "Can't add repositories while an update is running — try again once it finishes."
+                    .into(),
+            );
+            return;
+        }
+
+        let mut taken: HashSet<String> = self.repos.iter().map(|r| r.name.clone()).collect();
+        let mut added: Vec<String> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut non_dirs = 0usize;
+        for path in dropped {
+            if !path.is_dir() {
+                non_dirs += 1;
+                continue;
+            }
+            let name = unique_repo_name(&sanitize_repo_name(&path), &taken);
+            match self.store.create_repo(&name, &path.to_string_lossy()) {
+                Ok(()) => {
+                    taken.insert(name.clone());
+                    added.push(name);
+                }
+                Err(e) => errors.push(format!("{}: {e}", path.display())),
+            }
+        }
+
+        if !added.is_empty() {
+            self.reload_all();
+            self.refresh_status(ctx);
+            self.tab = Tab::Repositories; // show the result of the drop
+            self.load_error = None;
+            self.notice = Some(format!(
+                "Added {} repositor{}: {}",
+                added.len(),
+                if added.len() == 1 { "y" } else { "ies" },
+                added.join(", "),
+            ));
+        }
+        let mut problems: Vec<String> = Vec::new();
+        if non_dirs > 0 {
+            problems.push(format!(
+                "ignored {non_dirs} dropped item(s) that weren't folders"
+            ));
+        }
+        problems.extend(errors);
+        if !problems.is_empty() {
+            self.load_error = Some(problems.join("; "));
         }
     }
 
@@ -323,7 +424,43 @@ impl DedupApp {
         }
     }
 
-    fn apply(&mut self, ctx: &egui::Context, action: Action) {
+    /// Route a folder chosen from the native picker into whichever field asked
+    /// for it (add form, relocate editor, or duplicate editor).
+    fn route_picked_folder(&mut self, target: FolderTarget, dir: PathBuf) {
+        let picked = dir.to_string_lossy().into_owned();
+        match target {
+            // Add form: fill the path and auto-name from the last path component
+            // unless the user already typed a name.
+            FolderTarget::Add => {
+                if self.new_name.trim().is_empty()
+                    && let Some(base) = dir.file_name()
+                {
+                    self.new_name = base.to_string_lossy().into_owned();
+                }
+                self.new_path = picked;
+            }
+            // Relocate editor: fill its path buffer (if still open).
+            FolderTarget::Relocate => {
+                if let Some(Edit::Relocate { buf, .. }) = &mut self.edit {
+                    *buf = picked;
+                }
+            }
+            // Duplicate editor: fill the path, and auto-name the copy from the
+            // folder's basename unless a name was already typed.
+            FolderTarget::Duplicate => {
+                if let Some(Edit::Duplicate { dest, path, .. }) = &mut self.edit {
+                    if dest.trim().is_empty()
+                        && let Some(base) = dir.file_name()
+                    {
+                        *dest = base.to_string_lossy().into_owned();
+                    }
+                    *path = picked;
+                }
+            }
+        }
+    }
+
+    fn apply(&mut self, ctx: &egui::Context, frame: &eframe::Frame, action: Action) {
         match action {
             Action::Update(name) => self.enqueue(name, JobKind::Update),
             Action::UpdateAll => {
@@ -405,12 +542,23 @@ impl DedupApp {
             }
             Action::CommitRelocate(name, new_path) => {
                 self.edit = None;
-                if !new_path.is_empty()
-                    && let Err(e) = self.store.relocate_repo(&name, &new_path)
-                {
-                    self.load_error = Some(e.to_string());
+                let mut relocated = false;
+                if !new_path.is_empty() {
+                    match self.store.relocate_repo(&name, &new_path) {
+                        Ok(()) => relocated = true,
+                        Err(e) => self.load_error = Some(e.to_string()),
+                    }
                 }
                 self.reload_all();
+                if relocated {
+                    // A moved repo's stale "missing" status must not linger:
+                    // clear it and re-probe location/reachability against the new
+                    // path (so it reads Local/Remote if the folder is now there).
+                    if let Some(row) = self.repos.iter_mut().find(|r| r.name == name) {
+                        row.location = None;
+                    }
+                    self.refresh_status(ctx);
+                }
             }
             Action::CommitDuplicate { source, dest, path } => {
                 self.edit = None;
@@ -440,18 +588,17 @@ impl DedupApp {
                 self.show_add = false;
                 self.form_error = None;
             }
-            Action::ChooseFolder => {
-                let tx = self.folder_tx.clone();
-                let repaint = ctx.clone();
-                std::thread::spawn(move || {
-                    if let Some(dir) = rfd::FileDialog::new()
-                        .set_title("Choose a folder")
-                        .pick_folder()
-                    {
-                        let _ = tx.send(dir);
-                        repaint.request_repaint();
-                    }
-                });
+            Action::ChooseFolder(target) => {
+                // Run the native picker modally, parented to our window: it grabs
+                // focus and the app can't spawn a second one while it's open.
+                // This blocks the UI thread until the user picks or cancels.
+                if let Some(dir) = rfd::FileDialog::new()
+                    .set_title("Choose a folder")
+                    .set_parent(frame)
+                    .pick_folder()
+                {
+                    self.route_picked_folder(target, dir);
+                }
             }
             Action::Create => {
                 let path = self.new_path.trim().to_string();
@@ -474,7 +621,7 @@ impl DedupApp {
 }
 
 impl eframe::App for DedupApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         // One-time startup probe of every repo's location/reachability.
         if !self.did_initial_status {
@@ -539,16 +686,23 @@ impl eframe::App for DedupApp {
             }
         }
 
-        // Folder-picker results: fill the path and auto-name from the last path
-        // component unless the user already typed a name.
-        while let Ok(dir) = self.folder_rx.try_recv() {
-            if self.new_name.trim().is_empty()
-                && let Some(base) = dir.file_name()
-            {
-                self.new_name = base.to_string_lossy().into_owned();
-            }
-            self.new_path = dir.to_string_lossy().into_owned();
-            ctx.request_repaint();
+        // Folders dropped onto the window are added as repositories.
+        self.handle_dropped_folders(&ctx);
+        // While folders hover the window, show a full-window drop affordance.
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let screen = ctx.content_rect();
+            let p = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("dnd-hint"),
+            ));
+            p.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(190));
+            p.text(
+                screen.center(),
+                egui::Align2::CENTER_CENTER,
+                "Drop folders to add them as repositories",
+                egui::FontId::proportional(22.0),
+                theme::AMBER,
+            );
         }
 
         let mut actions: Vec<Action> = Vec::new();
@@ -557,11 +711,30 @@ impl eframe::App for DedupApp {
         if self.tab != Tab::Duplicates {
             self.dupes.stop_audio();
         }
+        // On each tab switch, re-sync the newly-shown view's repo list from the
+        // store, so repos added/removed elsewhere appear without a refresh
+        // button. (The Repositories tab refreshes its own cards separately.)
+        if self.synced_tab != Some(self.tab) {
+            match self.tab {
+                // The Repositories tab manages its own cards (refreshed after
+                // add/scan operations), so it isn't re-synced here.
+                Tab::Repositories => {}
+                Tab::Duplicates => self.dupes.sync_repos(&self.store),
+                Tab::Transfer => self.transfer.sync_repos(&self.store),
+                Tab::Grooming => self.grooming.sync_repos(&self.store),
+                Tab::Browse => self.browse.sync_repos(&self.store),
+            }
+            self.synced_tab = Some(self.tab);
+        }
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Repositories => self.repositories_view(ui, &mut actions),
             Tab::Duplicates => self.dupes.show(ui, &self.store, self.tooltip_verbosity),
-            Tab::Transfer => self.transfer.show(ui, &self.store, self.tooltip_verbosity),
+            Tab::Transfer => {
+                self.transfer
+                    .show(ui, &self.store, self.tooltip_verbosity, Some(frame))
+            }
             Tab::Grooming => self.grooming.show(ui, &self.store, self.tooltip_verbosity),
+            Tab::Browse => self.browse.show(ui, &self.store, self.tooltip_verbosity),
         });
         if self.show_settings {
             self.settings_modal(&ctx);
@@ -569,11 +742,14 @@ impl eframe::App for DedupApp {
         if self.show_about {
             self.about_modal(&ctx);
         }
+        if self.show_help {
+            self.help_window(&ctx);
+        }
         if self.show_add {
             self.add_modal(&ctx, &mut actions);
         }
         for action in actions {
-            self.apply(&ctx, action);
+            self.apply(&ctx, frame, action);
         }
 
         // Completions (drained above) free the running slot; the actions loop
@@ -640,64 +816,31 @@ impl DedupApp {
                             .size(13.0),
                     );
                     ui.add_space(16.0);
-                    tab_button(
-                        ui,
-                        &mut self.tab,
-                        Tab::Repositories,
-                        "REPOSITORIES",
-                        theme::ORANGE,
-                        self.tooltip_verbosity,
-                        "Add, update, and manage repository links",
-                    );
-                    tab_button(
-                        ui,
-                        &mut self.tab,
-                        Tab::Duplicates,
-                        "DUPLICATES",
-                        theme::LILAC,
-                        self.tooltip_verbosity,
-                        "Find and review exact or perceptually similar duplicates",
-                    );
-                    tab_button(
-                        ui,
-                        &mut self.tab,
-                        Tab::Transfer,
-                        "TRANSFER",
-                        theme::BLUE,
-                        self.tooltip_verbosity,
-                        "Copy or move files between repositories by content",
-                    );
-                    tab_button(
-                        ui,
-                        &mut self.tab,
-                        Tab::Grooming,
-                        "GROOMING",
-                        theme::TAN,
-                        self.tooltip_verbosity,
-                        "Prune and reorganize repositories (coming soon)",
-                    );
-
+                    // SETTINGS/ABOUT are pinned to the right (reserved first, in a
+                    // right-to-left layout); the tab strip fills the space between
+                    // the version and those buttons. The minimum window width can't
+                    // fit all five tabs plus these buttons, so the strip scrolls
+                    // horizontally when cramped (auto-hiding scrollbar) instead of
+                    // letting the last tab slide behind ABOUT.
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(egui::Button::new(
-                                RichText::new(format!("{} SETTINGS", icon::GEAR))
-                                    .color(theme::BLACK),
-                            ))
-                            .explain(
-                                self.tooltip_verbosity,
-                                "App settings",
-                                "Open app settings: hashing thread count and tooltip verbosity.",
-                            )
-                            .clicked()
+                        if crate::lcars::action_button(
+                            ui,
+                            &format!("{} SETTINGS", icon::GEAR),
+                            true,
+                            theme::TAN,
+                        )
+                        .explain(
+                            self.tooltip_verbosity,
+                            "App settings",
+                            "Open app settings: hashing thread count and tooltip verbosity.",
+                        )
+                        .clicked()
                         {
                             self.show_settings = true;
                         }
                         // Added after SETTINGS so it renders immediately to its
                         // left in this right-to-left layout.
-                        if ui
-                            .add(egui::Button::new(
-                                RichText::new("ABOUT").color(theme::BLACK),
-                            ))
+                        if crate::lcars::action_button(ui, "ABOUT", true, theme::TAN)
                             .explain(
                                 self.tooltip_verbosity,
                                 "Version and license",
@@ -707,6 +850,72 @@ impl DedupApp {
                         {
                             self.show_about = true;
                         }
+                        // Added after ABOUT so it renders immediately to its left.
+                        if crate::lcars::action_button(ui, "HELP", true, theme::TAN)
+                            .explain(
+                                self.tooltip_verbosity,
+                                "Explain the current tab",
+                                "Open a help window describing what the current tab is for \
+                                 and how its controls fit together. Stays open (and updates) \
+                                 as you switch tabs.",
+                            )
+                            .clicked()
+                        {
+                            self.show_help = true;
+                        }
+                        // The remaining width (left of HELP) holds the scrollable
+                        // tab strip, laid out left-to-right in its natural order.
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            egui::ScrollArea::horizontal()
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    tab_button(
+                                        ui,
+                                        &mut self.tab,
+                                        Tab::Repositories,
+                                        "REPOSITORIES",
+                                        theme::ORANGE,
+                                        self.tooltip_verbosity,
+                                        "Add, update, and manage repository links",
+                                    );
+                                    tab_button(
+                                        ui,
+                                        &mut self.tab,
+                                        Tab::Duplicates,
+                                        "DUPLICATES",
+                                        theme::LILAC,
+                                        self.tooltip_verbosity,
+                                        "Find and review exact or perceptually similar duplicates",
+                                    );
+                                    tab_button(
+                                        ui,
+                                        &mut self.tab,
+                                        Tab::Transfer,
+                                        "TRANSFER",
+                                        theme::BLUE,
+                                        self.tooltip_verbosity,
+                                        "Copy or move files between repositories by content",
+                                    );
+                                    tab_button(
+                                        ui,
+                                        &mut self.tab,
+                                        Tab::Grooming,
+                                        "GROOMING",
+                                        theme::TAN,
+                                        self.tooltip_verbosity,
+                                        "Prune and reorganize repositories (coming soon)",
+                                    );
+                                    tab_button(
+                                        ui,
+                                        &mut self.tab,
+                                        Tab::Browse,
+                                        "BROWSE",
+                                        theme::AMBER,
+                                        self.tooltip_verbosity,
+                                        "Browse a repo's files by directory, from the index",
+                                    );
+                                });
+                        });
                     });
                 });
             });
@@ -725,71 +934,82 @@ impl DedupApp {
         if let Some(err) = &self.load_error {
             ui.colored_label(theme::RED, err);
         }
+        if let Some(notice) = &self.notice {
+            ui.colored_label(theme::AMBER, notice);
+        }
 
         // The registry is locked while any repo is updating, so adding a repo
         // (which reads every repo's stats) must wait until scans finish.
         let busy = self.worker.active_count() > 0;
-        ui.horizontal(|ui| {
-            let add = egui::Button::new(
-                RichText::new(format!("{} ADD REPOSITORY", icon::PLUS)).color(theme::BLACK),
-            )
-            .fill(theme::BLUE);
-            if ui
-                .add_enabled(!busy, add)
-                .explain(
-                    self.tooltip_verbosity,
-                    "Register a new repository",
-                    "Register a new repository: pick a folder on disk to track and scan for \
+        crate::lcars::section_lcars(
+            ui,
+            "MANAGE — ADD & UPDATE REPOSITORIES",
+            theme::BLUE,
+            |ui| {
+                ui.horizontal(|ui| {
+                    let add = egui::Button::new(
+                        RichText::new(format!("{} ADD REPOSITORY", icon::PLUS)).color(theme::BLACK),
+                    )
+                    .fill(theme::BLUE);
+                    if ui
+                    .add_enabled(!busy, add)
+                    .explain(
+                        self.tooltip_verbosity,
+                        "Register a new repository",
+                        "Register a new repository: pick a folder on disk to track and scan for \
                      duplicates. Disabled while a scan is running elsewhere in the app.",
-                )
-                .clicked()
-            {
-                actions.push(Action::OpenAdd);
-            }
-            // Enqueues every repo; it only touches names (no db access), so it
-            // stays enabled even while a batch is running.
-            let update_all = egui::Button::new(
-                RichText::new(format!("{} UPDATE ALL", icon::REFRESH)).color(theme::BLACK),
-            )
-            .fill(theme::ORANGE);
-            if ui
-                .add_enabled(!self.repos.is_empty(), update_all)
-                .explain(
-                    self.tooltip_verbosity,
-                    "Scan every repository",
-                    "Queue an UPDATE / SCAN for every registered repository, one at a time. \
+                    )
+                    .clicked()
+                {
+                    actions.push(Action::OpenAdd);
+                }
+                    // Enqueues every repo; it only touches names (no db access), so it
+                    // stays enabled even while a batch is running.
+                    let update_all = egui::Button::new(
+                        RichText::new(format!("{} UPDATE ALL", icon::REFRESH)).color(theme::BLACK),
+                    )
+                    .fill(theme::ORANGE);
+                    if ui
+                    .add_enabled(!self.repos.is_empty(), update_all)
+                    .explain(
+                        self.tooltip_verbosity,
+                        "Scan every repository",
+                        "Queue an UPDATE / SCAN for every registered repository, one at a time. \
                      Already up-to-date repos finish almost instantly.",
-                )
-                .clicked()
-            {
-                actions.push(Action::UpdateAll);
-            }
-            // Re-probe every repo's location/reachability (filesystem only, no
-            // db access), so it is fine to run any time.
-            let refresh = egui::Button::new(
-                RichText::new(format!("{} REFRESH STATUS", icon::REFRESH)).color(theme::BLACK),
-            )
-            .fill(theme::LILAC);
-            if ui
-                .add_enabled(!self.repos.is_empty(), refresh)
-                .explain(
-                    self.tooltip_verbosity,
-                    "Re-check location and staleness",
-                    "Re-check every repository's location and reachability, and whether its \
+                    )
+                    .clicked()
+                {
+                    actions.push(Action::UpdateAll);
+                }
+                    // Re-probe every repo's location/reachability (filesystem only, no
+                    // db access), so it is fine to run any time.
+                    let refresh = egui::Button::new(
+                        RichText::new(format!("{} REFRESH STATUS", icon::REFRESH))
+                            .color(theme::BLACK),
+                    )
+                    .fill(theme::LILAC);
+                    if ui
+                    .add_enabled(!self.repos.is_empty(), refresh)
+                    .explain(
+                        self.tooltip_verbosity,
+                        "Re-check location and staleness",
+                        "Re-check every repository's location and reachability, and whether its \
                      index is stale (dry-run — no hashing, no writes).",
-                )
-                .clicked()
-            {
-                actions.push(Action::RefreshStatus);
-            }
-            if busy {
-                ui.label(
-                    RichText::new("· busy: a scan is running")
-                        .color(theme::TAN)
-                        .size(12.0),
-                );
-            }
-        });
+                    )
+                    .clicked()
+                {
+                    actions.push(Action::RefreshStatus);
+                }
+                    if busy {
+                        ui.label(
+                            RichText::new("· busy: a scan is running")
+                                .color(theme::TAN)
+                                .size(12.0),
+                        );
+                    }
+                });
+            },
+        );
         ui.add_space(4.0);
 
         let rows = self.repos.clone();
@@ -839,15 +1059,26 @@ impl DedupApp {
                             .strong(),
                     );
                     status_pills(ui, row, self.tooltip_verbosity);
-                    ui.label(RichText::new(&row.path).color(theme::TEXT).size(12.0))
-                        .explain(
-                            self.tooltip_verbosity,
-                            &row.path,
-                            &format!("On-disk folder this repository indexes: {}", row.path),
-                        );
-                    // MIME breakdown, share-sorted, pinned to the top-right.
+                    // MIME breakdown, share-sorted, pinned to the top-right. It is
+                    // reserved first (right-to-left) so the path — added inside,
+                    // filling the gap between the status pills and the tags — can
+                    // truncate to fit instead of running under the tags on a narrow
+                    // window (the full path stays on hover). Both share one row.
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         mime_tags(ui, row, self.tooltip_verbosity);
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&row.path).color(theme::TEXT).size(12.0),
+                                )
+                                .truncate(),
+                            )
+                            .explain(
+                                self.tooltip_verbosity,
+                                &row.path,
+                                &format!("On-disk folder this repository indexes: {}", row.path),
+                            );
+                        });
                     });
                 });
                 ui.horizontal(|ui| {
@@ -901,9 +1132,8 @@ impl DedupApp {
                             theme::BLUE,
                             "This repo's unique content was copied into a sanitized dir",
                             "This repository was marked triage-done: its unique content was \
-                             already copied into a sanitized directory (via `dedup sanitize` \
-                             or MARK SOURCE DONE in the Transfer tab), so it's safe to \
-                             consider fully processed.",
+                             already copied into a sanitized directory (via the `dedup \
+                             sanitize` command), so it's safe to consider fully processed.",
                             self.tooltip_verbosity,
                         );
                     }
@@ -1046,6 +1276,21 @@ impl DedupApp {
                 let verbosity = self.tooltip_verbosity;
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("RELOCATE →").color(theme::LILAC));
+                    if ui
+                        .button(
+                            RichText::new(format!("{} CHOOSE…", icon::FOLDER_OPEN))
+                                .color(theme::BLACK),
+                        )
+                        .explain(
+                            verbosity,
+                            "Pick a folder",
+                            "Open a native folder picker to choose the new folder this \
+                             repository should point at.",
+                        )
+                        .clicked()
+                    {
+                        actions.push(Action::ChooseFolder(FolderTarget::Relocate));
+                    }
                     ui.text_edit_singleline(buf).explain(
                         verbosity,
                         "New folder path",
@@ -1084,6 +1329,21 @@ impl DedupApp {
                             "Name for the new repository the index is copied into.",
                         );
                     ui.label(RichText::new("PATH").color(theme::LILAC));
+                    if ui
+                        .button(
+                            RichText::new(format!("{} CHOOSE…", icon::FOLDER_OPEN))
+                                .color(theme::BLACK),
+                        )
+                        .explain(
+                            verbosity,
+                            "Pick a folder",
+                            "Open a native folder picker to choose the on-disk folder the \
+                             new repository will point at.",
+                        )
+                        .clicked()
+                    {
+                        actions.push(Action::ChooseFolder(FolderTarget::Duplicate));
+                    }
                     ui.add(
                         egui::TextEdit::singleline(path)
                             .desired_width(240.0)
@@ -1288,7 +1548,7 @@ impl DedupApp {
                     )
                     .clicked()
                 {
-                    actions.push(Action::ChooseFolder);
+                    actions.push(Action::ChooseFolder(FolderTarget::Add));
                 }
                 ui.add(
                     egui::TextEdit::singleline(&mut self.new_path)
@@ -1517,6 +1777,71 @@ impl DedupApp {
             self.show_about = false;
         }
     }
+
+    /// A real second OS window (not a modal) describing the current tab's
+    /// purpose and controls, so it can sit beside the main window instead of
+    /// blocking it. Content tracks `self.tab` live, so switching tabs while
+    /// it's open updates what's shown.
+    fn help_window(&mut self, ctx: &egui::Context) {
+        let tab_label = match self.tab {
+            Tab::Repositories => "REPOSITORIES",
+            Tab::Duplicates => "DUPLICATES",
+            Tab::Transfer => "TRANSFER",
+            Tab::Grooming => "GROOMING",
+            Tab::Browse => "BROWSE",
+        };
+        let text = crate::help_content::help_text(self.tab);
+        // Park it just to the right of the main window when its position is
+        // knowable (not on Wayland, where inner/outer rect is always None); a
+        // fixed fallback otherwise. This is only honored by the backend when
+        // the window is first created, so it never fights the user dragging
+        // the help window elsewhere afterwards.
+        let pos = ctx
+            .input(|i| i.viewport().outer_rect)
+            .map(|r| r.right_top())
+            .unwrap_or(egui::pos2(120.0, 120.0));
+
+        let close_requested = ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("dedup_help"),
+            egui::ViewportBuilder::default()
+                .with_title(format!("dedup help — {tab_label}"))
+                .with_inner_size([420.0, 600.0])
+                .with_position(pos),
+            |ui, _class| {
+                let mut close_clicked = false;
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(tab_label)
+                                .color(theme::AMBER)
+                                .size(18.0)
+                                .strong(),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .add(egui::Button::new(
+                                    RichText::new("CLOSE").color(theme::BLACK),
+                                ))
+                                .clicked()
+                            {
+                                close_clicked = true;
+                            }
+                        });
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(text).color(theme::TEXT));
+                        });
+                });
+                close_clicked || ui.input(|i| i.viewport().close_requested())
+            },
+        );
+        if close_requested {
+            self.show_help = false;
+        }
+    }
 }
 
 /// A small rounded status chip with black text on `fill`.
@@ -1614,10 +1939,7 @@ fn tab_button(
     hover_verbose: &str,
 ) {
     let selected = *current == tab;
-    let fill = if selected { color } else { theme::PANEL };
-    let text_color = if selected { theme::BLACK } else { color };
-    if ui
-        .add(egui::Button::new(RichText::new(label).color(text_color)).fill(fill))
+    if crate::lcars::toggle_button(ui, label, selected, color)
         .explain(verbosity, label, hover_verbose)
         .clicked()
     {
@@ -1721,29 +2043,7 @@ fn mime_pct(count: u64, total: u64) -> String {
 /// A stable pastel color for a MIME type: the name is hashed to a hue, with
 /// fixed saturation/lightness so every tag shares one cohesive palette.
 fn mime_color(mime: &str) -> Color32 {
-    let mut hash: u32 = 2166136261; // FNV-1a
-    for b in mime.bytes() {
-        hash ^= u32::from(b);
-        hash = hash.wrapping_mul(16777619);
-    }
-    hsl_to_color((hash % 360) as f32, 0.50, 0.74)
-}
-
-fn hsl_to_color(h: f32, s: f32, l: f32) -> Color32 {
-    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
-    let hp = h / 60.0;
-    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
-    let (r, g, b) = match hp as u32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    let m = l - c / 2.0;
-    let to = |v: f32| (((v + m) * 255.0).round()).clamp(0.0, 255.0) as u8;
-    Color32::from_rgb(to(r), to(g), to(b))
+    theme::hsl((theme::name_hash(mime) % 360) as f32, 0.50, 0.74)
 }
 
 /// The repo name Create will use: the typed name, or the chosen folder's own
@@ -1757,6 +2057,45 @@ fn effective_name(name: &str, path: &str) -> String {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// Derive a filesystem-safe repository name from a folder path's basename (the
+/// name becomes a directory under the config dir). Path separators and control
+/// characters are replaced with `_`; an empty result falls back to `repo`.
+fn sanitize_repo_name(path: &std::path::Path) -> String {
+    let base = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let cleaned: String = base
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '/' | '\\') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim().to_string();
+    if cleaned.is_empty() {
+        "repo".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Return `base` if it isn't already `taken`, else the first `base-2`, `base-3`,
+/// … that is free — so a batch of dropped folders with clashing names (or names
+/// clashing with existing repos) all get distinct repositories.
+fn unique_repo_name(base: &str, taken: &HashSet<String>) -> String {
+    if !taken.contains(base) {
+        return base.to_string();
+    }
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|c| !taken.contains(c))
+        .expect("an unbounded range always yields a free name")
 }
 
 /// Format a duration compactly: `"45s"`, `"3m 12s"`, or `"1h 04m"`.
@@ -1784,7 +2123,32 @@ fn progress_line(event: &ProgressEvent) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::effective_name;
+    use super::{effective_name, sanitize_repo_name, unique_repo_name};
+    use std::collections::HashSet;
+    use std::path::Path;
+
+    #[test]
+    fn sanitize_repo_name_from_folder_basename() {
+        assert_eq!(
+            sanitize_repo_name(Path::new("/data/Holiday 2019")),
+            "Holiday 2019"
+        );
+        // Hidden folders keep their leading dot (a valid dir name).
+        assert_eq!(sanitize_repo_name(Path::new("/home/x/.config")), ".config");
+        // A path with no basename falls back.
+        assert_eq!(sanitize_repo_name(Path::new("/")), "repo");
+    }
+
+    #[test]
+    fn unique_repo_name_suffixes_on_clash() {
+        let taken: HashSet<String> = ["photos".to_string(), "photos-2".to_string()]
+            .into_iter()
+            .collect();
+        // Free name is used as-is.
+        assert_eq!(unique_repo_name("docs", &taken), "docs");
+        // Clash skips past every taken suffix.
+        assert_eq!(unique_repo_name("photos", &taken), "photos-3");
+    }
 
     #[test]
     fn effective_name_prefers_typed_name() {
@@ -1845,6 +2209,211 @@ mod ui_tests {
             update_repo(&store, name, 1, &NoProgress, &CancellationToken::new()).unwrap();
         }
         (tmp, DedupApp::new(store))
+    }
+
+    /// The DUPLICATE editor offers a folder picker (CHOOSE…), like RELOCATE and
+    /// ADD — so the new repo's path can be browsed, not just typed.
+    #[test]
+    fn duplicate_editor_has_a_browse_button() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, mut app) = sample_app();
+        app.edit = Some(Edit::Duplicate {
+            name: "Automatic Upload".into(),
+            dest: String::new(),
+            path: String::new(),
+        });
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 400.0))
+            .build_ui_state(
+                move |ui, app: &mut DedupApp| {
+                    if !init {
+                        icon::install(ui.ctx());
+                        theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let mut actions = Vec::new();
+                    app.repositories_view(ui, &mut actions);
+                },
+                app,
+            );
+        harness.run();
+        assert!(
+            harness.query_by_label_contains("CHOOSE").is_some(),
+            "the DUPLICATE editor should offer a folder-picker button"
+        );
+    }
+
+    /// The HELP window shows the current tab's help copy, and its in-window
+    /// CLOSE button clears `show_help`. This headless harness has no native
+    /// eframe integration, so `Context::embed_viewports` stays at its default
+    /// `true` and `show_viewport_immediate` renders the content as a regular
+    /// embedded `Window` instead of a real second OS window — this exercises
+    /// the content and the CLOSE path, but not real cross-window placement or
+    /// the native OS close button (only the running app can show those).
+    #[test]
+    fn help_window_shows_tab_copy_and_close_clears_flag() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, mut app) = sample_app();
+        app.show_help = true;
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, app: &mut DedupApp| {
+                    if !init {
+                        icon::install(ui.ctx());
+                        theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let ctx = ui.ctx().clone();
+                    if app.show_help {
+                        app.help_window(&ctx);
+                    }
+                },
+                app,
+            );
+        harness.run();
+        assert!(
+            harness
+                .query_by_label_contains("Register the folders you want to triage")
+                .is_some(),
+            "the HELP window shows the current (REPOSITORIES) tab's help copy"
+        );
+        harness.get_by_label("CLOSE").click();
+        harness.run();
+        assert!(!harness.state().show_help, "CLOSE clears show_help");
+    }
+
+    /// A temp store with one scanned repo whose on-disk path is very long, to
+    /// exercise the narrow-window path/MIME overlap.
+    fn app_with_long_path() -> (tempfile::TempDir, DedupApp, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let dir = tmp
+            .path()
+            .join("a/very/deeply/nested/photos/library/originals/2024/imports/raw");
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..4 {
+            std::fs::write(dir.join(format!("f{i}.bin")), format!("data {i}")).unwrap();
+        }
+        store.create_repo("Photos", &dir.to_string_lossy()).unwrap();
+        update_repo(&store, "Photos", 1, &NoProgress, &CancellationToken::new()).unwrap();
+        let path = dir.to_string_lossy().into_owned();
+        (tmp, DedupApp::new(store), path)
+    }
+
+    fn topbar_harness<'a>(app: DedupApp, width: f32) -> Harness<'a, DedupApp> {
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(width, 200.0))
+            .build_ui_state(
+                move |ui, app: &mut DedupApp| {
+                    if !init {
+                        icon::install(ui.ctx());
+                        theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    app.top_bar(ui);
+                },
+                app,
+            );
+        harness.run();
+        harness
+    }
+
+    /// At the minimum window width the five tabs no longer fit beside
+    /// SETTINGS/ABOUT. Those two buttons must stay fully on-screen and pinned to
+    /// the right (the tab strip scrolls, clipped, instead of a tab sliding behind
+    /// ABOUT or SETTINGS spilling off the edge — the reported regression).
+    #[test]
+    fn top_bar_pins_settings_about_when_narrow() {
+        use egui_kittest::kittest::Queryable;
+        let width = 760.0;
+        let (_tmp, app) = sample_app();
+        let harness = topbar_harness(app, width);
+        let settings = harness.get_by_label_contains("SETTINGS").rect();
+        let about = harness.get_by_label("ABOUT").rect();
+        let repos = harness.get_by_label("REPOSITORIES").rect();
+        assert!(
+            settings.right() <= width + 0.5,
+            "SETTINGS spills off the right edge (right={} > {width})",
+            settings.right()
+        );
+        assert!(
+            about.right() <= settings.left() + 0.5,
+            "ABOUT ({about:?}) overlaps SETTINGS ({settings:?})"
+        );
+        // The tab strip lives entirely to the left of ABOUT (it scrolls/clips
+        // there), so no tab is drawn behind ABOUT.
+        assert!(
+            repos.left() < about.left(),
+            "tab strip starts at/after ABOUT — it is not clipped to the left of it"
+        );
+    }
+
+    /// Wide enough for every tab: all five are laid out (none clipped) and
+    /// SETTINGS/ABOUT still sit to their right.
+    #[test]
+    fn top_bar_shows_all_tabs_when_wide() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, app) = sample_app();
+        let harness = topbar_harness(app, 1100.0);
+        for tab in [
+            "REPOSITORIES",
+            "DUPLICATES",
+            "TRANSFER",
+            "GROOMING",
+            "BROWSE",
+        ] {
+            assert!(
+                harness.query_by_label(tab).is_some(),
+                "tab {tab} missing at wide width"
+            );
+        }
+        let browse = harness.get_by_label("BROWSE").rect();
+        let about = harness.get_by_label("ABOUT").rect();
+        assert!(
+            browse.right() <= about.left() + 0.5,
+            "BROWSE ({browse:?}) overlaps ABOUT ({about:?}) even when wide"
+        );
+    }
+
+    /// A long repo path must truncate to the gap between the status pills and the
+    /// MIME tags instead of running under the (right-pinned) MIME tags.
+    #[test]
+    fn repo_card_path_does_not_overlap_mime_tags() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, app, _path) = app_with_long_path();
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(760.0, 300.0))
+            .build_ui_state(
+                move |ui, app: &mut DedupApp| {
+                    if !init {
+                        icon::install(ui.ctx());
+                        theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let mut actions = Vec::new();
+                    app.repositories_view(ui, &mut actions);
+                },
+                app,
+            );
+        harness.run();
+        // The lone repo is all one MIME type, so exactly one MIME pill renders.
+        let mime = harness.get_by_label_contains("100%").rect();
+        assert!(
+            mime.right() <= 760.0 + 0.5,
+            "MIME tag spills off the right edge (right={})",
+            mime.right()
+        );
+        // The path label (truncated) must end at or before the MIME tag begins.
+        let path = harness.get_by_label_contains("nested/photos").rect();
+        assert!(
+            path.right() <= mime.left() + 1.0,
+            "path ({path:?}) runs under the MIME tag ({mime:?})"
+        );
     }
 
     /// The window size is flushed on exit and restored (via `Settings`) on the
