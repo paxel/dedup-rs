@@ -117,6 +117,35 @@ tests for the tab and the collapsed-sink chip rows.
 
 ---
 
+## Prio 4 — Remove the sanitize workflow  *(S)*
+
+The `dedup sanitize` disk-triage workflow (added 2026-07-11) was built on a
+misunderstanding of the original request and is retired wholesale. The
+multi-reference `--ref` diff machinery it uses is a separate feature and **stays**.
+
+**Remove.**
+- CLI: the `Sanitize` subcommand (declaration, dispatch, `run_sanitize` in
+  `crates/dedup-cli/src/main.rs`) and its integration test
+  (`sanitize_copies_uniques_against_references_and_marks_done` in
+  `crates/dedup-cli/tests/diff_dupes_cli.rs`).
+- Core: the triage-done marker — `triage_done_ms` / `set_triage_done` in
+  `store.rs` (META-table key; old databases keep the stale key, it is simply
+  ignored) and the `triage_done_ms` field in `report.rs`.
+- CLI report: the "Triaged:" line.
+- GUI: the TRIAGED stat on the Repository card (`app.rs`) and the triage
+  mentions in `help_content.rs`. (The unrelated `sanitize_repo_name` slug
+  helper and `organize.rs` filename sanitizer are **not** touched.)
+- Docs: the `sanitize` section in `docs/cli.md`, the README command-table row
+  and CLI-reference link, the TRIAGED stat in `docs/gui/repositories.md`, and
+  the disk-triage mentions in `docs/gui/index.md` / `docs/gui/files.md`.
+
+**CHANGELOG.** Sanitize shipped in 0.1.0, so the removal gets a "Removed"
+entry in the next version (do not rewrite the 0.1.0 history).
+
+**Tests.** `cargo test` clean after removal; no replacement feature.
+
+---
+
 ## Standing discipline (applies to every item above)
 
 - Every GUI feature ships with kittest geometric tests + an `--ignored` render
