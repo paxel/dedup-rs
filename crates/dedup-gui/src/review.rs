@@ -5,9 +5,12 @@
 //! |--------|-------------------|-------------------|--------|
 //! | source status glyph | source relative path | target relative path | target status glyph |
 //!
-//! Each side's status is one icon — added (green `+`), unchanged (grey `✓`),
-//! removed (red trash) — and the relative-path cell is coloured to match; a side
-//! where the file is absent shows a grey `✗` glyph and an empty path cell.
+//! Each side's status is an icon plus its meaning — added (green `+ ADDED`),
+//! unchanged (grey `✓ UNCHANGED`), removed (red trash `REMOVED`) — and the
+//! relative-path cell is coloured to match; a side where the file is absent
+//! shows a grey `✗` and an empty path cell. Commands that have no target side at all (PURGE and
+//! the other single-repo grooming commands) pass an empty `target_header`, and
+//! the two target columns are dropped entirely.
 //!
 //! Built on the same virtualised, click-to-sort `egui_extras` table as the
 //! Browse tab (reusing [`crate::util::sort_header`]), paged [`PAGE_SIZE`] rows
@@ -40,6 +43,17 @@ pub enum SideStatus {
 }
 
 impl SideStatus {
+    /// The word shown next to the icon in a status cell. An absent side has
+    /// nothing to say — the cell stays empty.
+    fn word(self) -> &'static str {
+        match self {
+            SideStatus::Added => "ADDED",
+            SideStatus::Removed => "REMOVED",
+            SideStatus::Unchanged => "UNCHANGED",
+            SideStatus::Absent => "",
+        }
+    }
+
     /// The single status icon (Phosphor glyph).
     pub fn symbol(self) -> &'static str {
         match self {
@@ -182,6 +196,15 @@ pub fn table(
 ) -> Option<ReviewAction> {
     summary(ui, totals, state.rejected.len());
 
+    // No target repo (PURGE and the other single-repo commands): the target
+    // columns would be two empty columns, so they are left out — and the sort
+    // must not sit on one of them.
+    let two_sided = !target_header.is_empty();
+    if !two_sided && matches!(state.sort_col, ReviewCol::Target | ReviewCol::TargetStatus) {
+        state.sort_col = ReviewCol::Source;
+        sort(rows, state);
+    }
+
     // The unchanged toggle only matters when there are unchanged rows to hide.
     if totals[2] > 0 {
         let label = format!(
@@ -244,41 +267,56 @@ pub fn table(
     });
     ui.add_space(2.0);
 
-    let cols = [
-        (ReviewCol::SourceStatus, "STATUS"),
-        (ReviewCol::Source, source_header),
-        (ReviewCol::Target, target_header),
-        (ReviewCol::TargetStatus, "STATUS"),
-    ];
+    let cols: &[(ReviewCol, &str)] = if two_sided {
+        &[
+            (ReviewCol::SourceStatus, "STATUS"),
+            (ReviewCol::Source, source_header),
+            (ReviewCol::Target, target_header),
+            (ReviewCol::TargetStatus, "STATUS"),
+        ]
+    } else {
+        &[
+            (ReviewCol::SourceStatus, "STATUS"),
+            (ReviewCol::Source, source_header),
+        ]
+    };
     let (sort_col, sort_asc) = (state.sort_col, state.sort_asc);
     let mut clicked: Option<ReviewCol> = None;
     let mut action: Option<ReviewAction> = None;
     let mut toggle_reject: Option<String> = None;
 
-    TableBuilder::new(ui)
+    let mut table = TableBuilder::new(ui)
         .striped(true)
         .resizable(true)
         .cell_layout(Layout::left_to_right(Align::Center))
         .column(Column::exact(76.0))
-        .column(Column::initial(90.0).at_least(70.0).resizable(true))
-        .column(
-            Column::initial(340.0)
-                .at_least(140.0)
-                .clip(true)
-                .resizable(true),
-        )
-        .column(
-            Column::remainder()
-                .at_least(140.0)
-                .clip(true)
-                .resizable(true),
-        )
-        .column(Column::initial(90.0).at_least(70.0))
+        .column(Column::initial(120.0).at_least(90.0).clip(true));
+    if two_sided {
+        table = table
+            .column(
+                Column::initial(340.0)
+                    .at_least(140.0)
+                    .clip(true)
+                    .resizable(true),
+            )
+            .column(
+                Column::remainder()
+                    .at_least(140.0)
+                    .clip(true)
+                    .resizable(true),
+            )
+            .column(Column::initial(120.0).at_least(90.0).clip(true));
+    } else {
+        // One repo: the source path takes everything the two fixed columns
+        // leave over.
+        table = table.column(Column::remainder().at_least(140.0).clip(true));
+    }
+    table
         .header(24.0, |mut header| {
             header.col(|ui| {
                 ui.label(RichText::new("REVIEW").color(theme::TEXT).size(12.0));
             });
-            for (col, title) in cols {
+            for &(col, title) in cols {
                 header.col(|ui| {
                     if crate::util::sort_header(ui, title, sort_col == col, sort_asc).clicked() {
                         clicked = Some(col);
@@ -287,7 +325,8 @@ pub fn table(
             }
         })
         .body(|body| {
-            body.rows(20.0, page_rows.len(), |mut row| {
+            // Tall enough for the row's action buttons to fit uncut.
+            body.rows(26.0, page_rows.len(), |mut row| {
                 let r = &rows[page_rows[row.index()]];
                 let key = r.key();
                 let rejected = state.rejected.contains(&key);
@@ -332,8 +371,10 @@ pub fn table(
                 });
                 row.col(|ui| status_cell(ui, r.source, rejected));
                 row.col(|ui| path_cell(ui, r.source, &r.source_path, rejected));
-                row.col(|ui| path_cell(ui, r.target, &r.target_path, rejected));
-                row.col(|ui| status_cell(ui, r.target, rejected));
+                if two_sided {
+                    row.col(|ui| path_cell(ui, r.target, &r.target_path, rejected));
+                    row.col(|ui| status_cell(ui, r.target, rejected));
+                }
             });
         });
 
@@ -355,8 +396,9 @@ pub fn table(
     action
 }
 
-/// One side's status cell: just the coloured status icon, dimmed for a
-/// rejected row.
+/// One side's status cell: the coloured status icon and what it means, dimmed
+/// for a rejected row. An absent side keeps its bare `✗` — there is nothing to
+/// spell out.
 fn status_cell(ui: &mut egui::Ui, status: SideStatus, rejected: bool) {
     let color = if rejected {
         theme::HAIRLINE
@@ -364,6 +406,13 @@ fn status_cell(ui: &mut egui::Ui, status: SideStatus, rejected: bool) {
         status.color()
     };
     ui.label(RichText::new(status.symbol()).color(color).size(15.0));
+    if !status.word().is_empty() {
+        ui.add(
+            egui::Label::new(RichText::new(status.word()).color(color).size(11.0))
+                .truncate()
+                .selectable(false),
+        );
+    }
 }
 
 /// One side's path cell: the relative path coloured by that side's status.

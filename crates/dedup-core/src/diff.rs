@@ -885,7 +885,8 @@ fn sync_copy(
         });
         return Ok(false);
     }
-    if let Err(err) = std::fs::copy(source_root.join(rel_path), &target_file) {
+    let source_file = source_root.join(rel_path);
+    if let Err(err) = std::fs::copy(&source_file, &target_file) {
         stats.errors += 1;
         run.progress.on(DiffEvent::Error {
             path: target_file.to_string_lossy().into_owned(),
@@ -893,6 +894,8 @@ fn sync_copy(
         });
         return Ok(false);
     }
+    // Best effort, before the entry below reads the mtime back off disk.
+    let _ = crate::update::copy_mtime(&source_file, &target_file);
     stats.copied += 1;
 
     // Index the copy with the mtime the file actually has on the target so
@@ -994,12 +997,18 @@ fn transfer_file(from: &Path, to: &Path, move_file: bool) -> Result<(), DiffErro
     };
     if move_file {
         if std::fs::rename(from, to).is_err() {
-            // Cross-device move: copy, then remove the source.
+            // Cross-device move: copy, then remove the source. (A plain rename
+            // keeps the timestamps; a copy does not, hence `copy_mtime`.)
             std::fs::copy(from, to).map_err(|e| io_err("move", e))?;
+            // Best effort: a filesystem that refuses the timestamp must not
+            // fail an otherwise-complete transfer — the index records the
+            // file's real on-disk mtime either way.
+            let _ = crate::update::copy_mtime(from, to);
             std::fs::remove_file(from).map_err(|e| io_err("move", e))?;
         }
     } else {
         std::fs::copy(from, to).map_err(|e| io_err("copy", e))?;
+        let _ = crate::update::copy_mtime(from, to);
     }
     Ok(())
 }

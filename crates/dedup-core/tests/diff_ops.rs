@@ -15,6 +15,16 @@ use std::sync::Mutex;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+/// 2000-01-01T00:00:00Z — far enough in the past that a fresh copy's mtime
+/// can never coincide with it.
+fn old_mtime() -> std::time::SystemTime {
+    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800)
+}
+
+fn mtime_of(path: &Path) -> Result<std::time::SystemTime, Box<dyn std::error::Error>> {
+    Ok(std::fs::metadata(path)?.modified()?)
+}
+
 struct Sandbox {
     _tempdir: tempfile::TempDir,
     store: Store,
@@ -47,6 +57,17 @@ impl Sandbox {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, content)?;
+        Ok(())
+    }
+
+    /// Like [`Sandbox::write`], but backdates the file so a copy that fails to
+    /// carry the timestamp over is obvious.
+    fn write_dated(root: &Path, rel: &str, content: &[u8]) -> TestResult {
+        Sandbox::write(root, rel, content)?;
+        std::fs::File::options()
+            .write(true)
+            .open(root.join(rel))?
+            .set_modified(old_mtime())?;
         Ok(())
     }
 
@@ -746,6 +767,82 @@ fn copy_into_target_repo_updates_target_index() -> TestResult {
         .get_file_entry("A", "dir/a.txt")?
         .ok_or("dir/a.txt entry dropped from A")?;
     assert!(!in_a.missing);
+    Ok(())
+}
+
+#[test]
+fn copy_preserves_the_source_file_date() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write_dated(&sb.a_root, "dir/a.txt", b"fresh")?;
+    sb.update("A")?;
+
+    diff_copy(
+        &sb.store,
+        "A",
+        &["B"],
+        CopyDest {
+            dir: &sb.b_root,
+            subdir: None,
+        },
+        false,
+        None,
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
+    )?;
+    assert_eq!(mtime_of(&sb.b_root.join("dir/a.txt"))?, old_mtime());
+
+    // Index and disk agree, so a follow-up update re-hashes nothing.
+    let update_stats = update_repo(&sb.store, "B", 1, &NoProgress, &CancellationToken::new())?;
+    assert_eq!(update_stats.unchanged, 1);
+    assert_eq!(update_stats.added + update_stats.updated, 0);
+    Ok(())
+}
+
+#[test]
+fn move_preserves_the_source_file_date() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write_dated(&sb.a_root, "note.txt", b"moved")?;
+    sb.update("A")?;
+
+    diff_copy(
+        &sb.store,
+        "A",
+        &["B"],
+        CopyDest {
+            dir: &sb.b_root,
+            subdir: None,
+        },
+        true,
+        None,
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
+    )?;
+    assert_eq!(mtime_of(&sb.b_root.join("note.txt"))?, old_mtime());
+
+    let update_stats = update_repo(&sb.store, "B", 1, &NoProgress, &CancellationToken::new())?;
+    assert_eq!(update_stats.unchanged, 1);
+    assert_eq!(update_stats.added + update_stats.updated, 0);
+    Ok(())
+}
+
+#[test]
+fn sync_preserves_the_source_file_date() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write_dated(&sb.a_root, "dir/a.txt", b"hello")?;
+    sb.update("A")?;
+
+    diff_sync(
+        &sb.store,
+        "A",
+        "B",
+        true,
+        SyncDelete::None,
+        None,
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
+    )?;
+    assert_eq!(mtime_of(&sb.b_root.join("dir/a.txt"))?, old_mtime());
+
+    let update_stats = update_repo(&sb.store, "B", 1, &NoProgress, &CancellationToken::new())?;
+    assert_eq!(update_stats.unchanged, 1);
+    assert_eq!(update_stats.added + update_stats.updated, 0);
     Ok(())
 }
 

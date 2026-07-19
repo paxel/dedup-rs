@@ -1887,6 +1887,56 @@ mod ui_tests {
         );
     }
 
+    /// PURGE acts on a single repo, so the board drops the two target columns,
+    /// spells each status out next to its icon, and gives every row enough
+    /// height that its action buttons are not cut off.
+    #[test]
+    fn purge_review_board_is_single_sided_with_rows_fitting_their_buttons() {
+        let (_tmp, store) = sample_store();
+        let mut h = grooming_harness(store, Command::Purge);
+        {
+            let v = h.state_mut();
+            v.preview_source_header = "/repos/junk".to_string();
+            v.preview = ["a.tmp", "b.tmp"]
+                .iter()
+                .map(|p| review::ReviewRow {
+                    source: review::SideStatus::Removed,
+                    target: review::SideStatus::Absent,
+                    source_path: (*p).to_string(),
+                    target_path: String::new(),
+                })
+                .collect();
+            v.preview_totals = [0, 2, 0];
+            review::sort(&mut v.preview, &v.review_state);
+        }
+        h.run();
+        assert_eq!(
+            h.get_all_by_label("REMOVED").count(),
+            2,
+            "each status cell names the status, not just its icon"
+        );
+        assert_eq!(
+            h.get_all_by_label("STATUS").count(),
+            1,
+            "only the source STATUS column is shown when there is no target repo"
+        );
+
+        // Consecutive rows' reject buttons must not overlap — an overlap is
+        // exactly what clipped the buttons before.
+        let buttons: Vec<egui::Rect> = h
+            .get_all_by_label(icon::X)
+            .map(|n| n.rect())
+            .take(2)
+            .collect();
+        assert_eq!(buttons.len(), 2, "one reject button per row");
+        assert!(
+            buttons[1].top() >= buttons[0].bottom(),
+            "row buttons must fit inside their row: {:?} then {:?}",
+            buttons[0],
+            buttons[1]
+        );
+    }
+
     /// A preview past one page shows the row count plus PREV/PAGE/NEXT
     /// controls, and NEXT advances the page.
     #[test]

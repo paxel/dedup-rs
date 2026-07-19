@@ -6,28 +6,6 @@ Decisions baked in below were confirmed 2026-07-19.
 
 ---
 
-## Prio 1 — Preserve file dates on copy/move  *(S)*
-
-**Problem.** Cross-repo copies (`diff.rs` — `diff_copy`, the move fallback in
-`move_file`, `diff_sync`; `organize.rs` export copy) use `std::fs::copy`, which does
-**not** copy timestamps. The new file gets a fresh mtime, so the next `repo update`
-sees size-ok/mtime-changed and re-hashes every file we just copied.
-
-**Fix.**
-- After every file copy into a repo or export dir, set the destination mtime from the
-  source's metadata via `std::fs::File::set_modified` (std, stable — no new crate).
-- Applies to: `diff.rs` copy path (including the cross-device rename fallback used by
-  move) and `organize.rs` `Dest::Copy`.
-- Make sure the index entry recorded for the target keeps matching the on-disk mtime
-  (the transfer already records "real on-disk mtime" — after this change that equals
-  the source's), so the next `update` skips the file entirely.
-
-**Tests.** Extend `crates/dedup-core/tests/diff_ops.rs`: after `diff cp` / `diff mv`,
-assert destination mtime == source mtime, and assert a follow-up `update` on the
-target re-hashes nothing (entry not stale, hash unchanged, `last_scan` bumps only).
-
----
-
 ## Prio 2 — Repo diff view: new DIFF command in the Transfer tab  *(M/L)*
 
 A manual, Beyond-Compare-style diff of any two repos (in or out of a sync group).
@@ -65,7 +43,8 @@ its buttons adapt after every action until the row reaches the plain 1:1 state:
   other-side, single copy, single delete. Where a batch op restricted to one row
   already exists (the `DiffRun` `only`/exclude machinery powering the review table's
   per-row apply), reuse it instead of new code.
-- Every copy/overwrite obeys Prio 1's mtime rule.
+- Every copy/overwrite preserves the source file's mtime
+  (`update::copy_mtime`, as the existing copy paths already do).
 
 **UI (`dedup-gui`).**
 - New DIFF command beside COPY/MOVE/DELETE in `transfer_view.rs`; both repos picked

@@ -105,10 +105,19 @@ pub fn export_by_date(
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| rel_path.replace('/', "_"));
             match dest_for(&dir, &file_name, size, &hash) {
-                Dest::Copy(dest) => match std::fs::copy(root.join(&rel_path), &dest) {
-                    Ok(_) => stats.copied += 1,
-                    Err(_) => stats.errors += 1,
-                },
+                Dest::Copy(dest) => {
+                    let from = root.join(&rel_path);
+                    match std::fs::copy(&from, &dest) {
+                        Ok(_) => {
+                            // Keep the exported copy's date: the export tree is
+                            // organised by date, so a fresh mtime would make the
+                            // file disagree with the folder it sits in.
+                            let _ = crate::update::copy_mtime(&from, &dest);
+                            stats.copied += 1;
+                        }
+                        Err(_) => stats.errors += 1,
+                    }
+                }
                 Dest::AlreadyThere => stats.skipped += 1,
                 Dest::Exhausted => stats.errors += 1,
             }
