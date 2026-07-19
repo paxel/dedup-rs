@@ -110,18 +110,22 @@ const ELBOW_R: f32 = 12.0;
 /// A section framed by the LCARS elbow rail. `title` is set into the header cap
 /// bar (black on `accent`); `add` renders the section body, inset to the right of
 /// the rail and below the header.
+///
+/// Every section is collapsible: clicking the header bar folds the body down to
+/// a single stadium bar (the caret before the title shows the state), and the
+/// open state persists under an id derived from `title`. Starts open. Returns
+/// the body result, or `None` while collapsed (the body closure is not run).
 pub fn section_lcars<R>(
     ui: &mut egui::Ui,
     title: &str,
     accent: Color32,
     add: impl FnOnce(&mut egui::Ui) -> R,
-) -> R {
-    section_impl(ui, title, accent, None, add).0
+) -> Option<R> {
+    section_lcars_collapsible(ui, title, accent, true, add)
 }
 
-/// A [`section_lcars`] whose header bar collapses/expands the body on click.
-/// The open state persists under an id derived from `title`. Returns the body
-/// result when open, `None` when collapsed (the body closure is not run).
+/// A [`section_lcars`] with an explicit initial state (`default_open`), for
+/// sections that should start folded.
 pub fn section_lcars_collapsible<R>(
     ui: &mut egui::Ui,
     title: &str,
@@ -136,7 +140,7 @@ pub fn section_lcars_collapsible<R>(
         default_open,
     );
     let (out, header) = if state.is_open() {
-        let (r, header) = section_impl(ui, title, accent, Some(icon::CARET_DOWN), add);
+        let (r, header) = section_impl(ui, title, accent, add);
         (Some(r), header)
     } else {
         (None, collapsed_header(ui, title, accent))
@@ -148,15 +152,13 @@ pub fn section_lcars_collapsible<R>(
     out
 }
 
-/// The shared body of [`section_lcars`] / [`section_lcars_collapsible`].
-/// `caret` prefixes the painted title (collapsible sections show an open-state
-/// hint there) and makes the header respond to clicks; the returned response is
-/// the header bar's.
+/// The open form of a section: elbow chrome, caret-down before the title, and
+/// the clickable header bar whose response is returned alongside the body's
+/// result.
 fn section_impl<R>(
     ui: &mut egui::Ui,
     title: &str,
     accent: Color32,
-    caret: Option<&str>,
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> (R, egui::Response) {
     // Reserve a paint slot *behind* the body: the elbow chrome (and the dark body
@@ -186,25 +188,21 @@ fn section_impl<R>(
             add(ui)
         });
     let r = inner.response.rect;
-    let painted = match caret {
-        Some(c) => format!("{c} {title}"),
-        None => title.to_owned(),
-    };
+    let painted = format!("{} {title}", icon::CARET_DOWN);
     ui.painter()
         .set(bg, egui::Shape::Vec(elbow_shapes(ui, r, &painted, accent)));
     // Expose the painted title to accesskit (so tests and screen readers can find
-    // the section by name) without affecting layout. Collapsible sections make
-    // the whole header bar the click target.
+    // the section by name) without affecting layout. The whole header bar is
+    // the collapse click target.
     let title_rect = Rect::from_min_max(
         pos2(r.min.x + RAIL_W, r.min.y),
         pos2(r.max.x, r.min.y + HEAD_H),
     );
-    let sense = if caret.is_some() {
-        Sense::click()
-    } else {
-        Sense::hover()
-    };
-    let header = ui.interact(title_rect, ui.id().with(("lcars_title", title)), sense);
+    let header = ui.interact(
+        title_rect,
+        ui.id().with(("lcars_title", title)),
+        Sense::click(),
+    );
     header.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, title));
     (inner.inner, header)
 }

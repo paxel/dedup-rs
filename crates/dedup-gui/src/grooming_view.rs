@@ -1704,6 +1704,31 @@ mod ui_tests {
         );
     }
 
+    /// Every elbow section collapses on a header click, not just the organize
+    /// rules: folding COMMAND hides the command selector, clicking again
+    /// restores it.
+    #[test]
+    fn every_section_collapses_on_header_click() {
+        let (_tmp, store) = sample_store();
+        let mut h = grooming_harness(store, Command::Purge);
+        assert!(
+            h.query_by_label("DEDUPE").is_some(),
+            "the command selector starts visible"
+        );
+        h.get_by_label_contains("COMMAND — ").click();
+        h.run();
+        assert!(
+            h.query_by_label("DEDUPE").is_none(),
+            "collapsing COMMAND hides the selector"
+        );
+        h.get_by_label_contains("COMMAND — ").click();
+        h.run();
+        assert!(
+            h.query_by_label("DEDUPE").is_some(),
+            "clicking again expands the section"
+        );
+    }
+
     /// Clicking a rule's header bar collapses its body (the TEMPLATE field
     /// disappears); clicking again restores it.
     #[test]
@@ -1971,6 +1996,12 @@ mod ui_tests {
         let (_tmp, store) = sample_store();
         let mut h = grooming_harness(store, Command::Organize);
         h.state_mut().rules.push(RuleUi::new());
+        h.run();
+        // Fold two sections so the snapshot also shows the collapsed form
+        // (stadium bar + right-caret hint) next to open ones.
+        h.get_by_label_contains("REPO — ").click();
+        h.run();
+        h.get_by_label_contains("RULE 2").click();
         h.run();
         let img = h.render().expect("wgpu render failed");
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
