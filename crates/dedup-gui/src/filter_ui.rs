@@ -14,7 +14,6 @@ use crossbeam_channel::{Receiver, Sender};
 use dedup_core::filter::{FileFilter, count_matches};
 use dedup_core::store::Store;
 use egui::RichText;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -172,23 +171,6 @@ impl FilterHistory {
         let json = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
         std::fs::write(path, json).map_err(|e| e.to_string())
     }
-
-    /// Merge an imported history into this one: imported values are recorded
-    /// (keeping their order at the front) and imported presets replace
-    /// same-named local presets or are appended.
-    fn merge(&mut self, other: FilterHistory) {
-        for kind in FILTER_KINDS {
-            for value in other.for_kind(kind).iter().rev() {
-                self.record_value(kind, value);
-            }
-        }
-        for preset in other.presets {
-            match self.presets.iter_mut().find(|p| p.name == preset.name) {
-                Some(existing) => *existing = preset,
-                None => self.presets.push(preset),
-            }
-        }
-    }
 }
 
 /// Split a filter expression into wizard conditions, mirroring the way
@@ -234,13 +216,6 @@ fn parse_conditions(expr: &str) -> Vec<FilterCond> {
     conds
 }
 
-/// Result of a background export/import file dialog, reported to the UI thread.
-enum HistoryIo {
-    Imported(FilterHistory),
-    Exported(PathBuf),
-    Failed(String),
-}
-
 /// Deferred UI action, collected during a frame and applied after the render
 /// closures release their borrow of the builder.
 enum Act {
@@ -249,11 +224,10 @@ enum Act {
     EditCond(usize),
     CommitCond,
     ClearConds,
-    SavePreset,
+    StorePreset,
     ApplyPreset(usize),
     RemovePreset(usize),
-    ExportHistory,
-    ImportHistory,
+    CommitRenamePreset(usize),
     FilterChanged,
 }
 
@@ -275,8 +249,13 @@ pub struct FilterBuilder {
     adding: bool,
     history: FilterHistory,
     history_loaded: bool,
-    /// Name typed for the preset about to be saved.
-    preset_name: String,
+    /// Index of the preset currently being renamed inline, if any.
+    renaming_preset: Option<usize>,
+    /// Text buffer for the in-progress preset rename.
+    rename_buf: String,
+    /// Set for one frame when a rename just started, so its text field can
+    /// grab keyboard focus.
+    focus_rename_pending: bool,
     /// The repo whose MIME stats / match count the wizard reflects, updated when
     /// the host passes a different repo to [`Self::ui`].
     repo: Option<String>,
@@ -285,9 +264,6 @@ pub struct FilterBuilder {
     /// The `repo`'s existing annotation tags (sorted, deduped), cached for the
     /// TAG editor's suggestions so a tag can be picked instead of retyped.
     tags: Vec<String>,
-    // Background export/import file-dialog results.
-    io_tx: Sender<HistoryIo>,
-    io_rx: Receiver<HistoryIo>,
     // Debounced background NAME match count against the repo index. A `None`
     // count means the count failed (unparsable filter or unreadable index).
     count_tx: Sender<(u64, Option<usize>)>,
@@ -309,19 +285,18 @@ pub struct FilterBuilder {
 
 impl FilterBuilder {
     pub fn new() -> Self {
-        let (io_tx, io_rx) = crossbeam_channel::unbounded();
         let (count_tx, count_rx) = crossbeam_channel::unbounded();
         Self {
             filters: Vec::new(),
             adding: false,
             history: FilterHistory::default(),
             history_loaded: false,
-            preset_name: String::new(),
+            renaming_preset: None,
+            rename_buf: String::new(),
+            focus_rename_pending: false,
             repo: None,
             mime_stats: Vec::new(),
             tags: Vec::new(),
-            io_tx,
-            io_rx,
             count_tx,
             count_rx,
             count_token: 0,
@@ -396,7 +371,7 @@ impl FilterBuilder {
             self.reload_tags(store);
         }
 
-        self.drain(store);
+        self.drain();
 
         let mut acts: Vec<Act> = Vec::new();
         self.filter_bar(ui, &mut acts);
@@ -561,9 +536,9 @@ impl FilterBuilder {
         });
     }
 
-    /// The saved-preset row: one pill per preset (click to apply, `×` to
-    /// forget), a name field + SAVE for the current condition set, and
-    /// EXPORT / IMPORT of the whole history as a JSON file.
+    /// The saved-preset row: one pill per preset (click to apply, right-click
+    /// to rename, `×` to forget), and a STORE PRESET pill that saves the
+    /// current condition set under an auto-generated name.
     fn preset_row(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         if !self.adding && self.filters.is_empty() && self.history.presets.is_empty() {
             return;
@@ -571,21 +546,52 @@ impl FilterBuilder {
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("PRESETS").color(theme::TEXT).size(12.0));
-            for (i, preset) in self.history.presets.iter().enumerate() {
-                if ui
+            // Snapshot names first so the loop body is free to mutate `self`
+            // (rename state) without fighting a borrow of `self.history`.
+            let presets: Vec<(usize, String)> = self
+                .history
+                .presets
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (i, p.name.clone()))
+                .collect();
+            for (i, name) in presets {
+                if self.renaming_preset == Some(i) {
+                    let resp = ui
+                        .add(egui::TextEdit::singleline(&mut self.rename_buf).desired_width(120.0));
+                    if self.focus_rename_pending {
+                        resp.request_focus();
+                        self.focus_rename_pending = false;
+                    }
+                    if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        self.renaming_preset = None;
+                    } else if resp.lost_focus() {
+                        acts.push(Act::CommitRenamePreset(i));
+                    }
+                    continue;
+                }
+                let resp = ui
                     .add(
-                        egui::Button::new(RichText::new(&preset.name).color(theme::TAN))
+                        egui::Button::new(RichText::new(&name).color(theme::TAN))
                             .fill(theme::PANEL),
                     )
                     .explain(
                         self.verbosity,
                         "Apply this preset",
-                        "Replace the current filter conditions with this saved preset.",
-                    )
-                    .clicked()
-                {
+                        "Replace the current filter conditions with this saved preset. \
+                         Right-click to rename it.",
+                    );
+                if resp.clicked() {
                     acts.push(Act::ApplyPreset(i));
                 }
+                resp.context_menu(|ui| {
+                    if ui.button("Rename").clicked() {
+                        self.renaming_preset = Some(i);
+                        self.rename_buf = name.clone();
+                        self.focus_rename_pending = true;
+                        ui.close();
+                    }
+                });
                 if ui
                     .add(egui::Button::new(RichText::new("×").color(theme::RED)))
                     .explain(
@@ -599,67 +605,24 @@ impl FilterBuilder {
                     acts.push(Act::RemovePreset(i));
                 }
             }
-            // Saving needs at least one non-blank condition and a name.
+            // Storing needs at least one non-blank condition.
             let has_conds = self.filters.iter().any(|c| !c.value.trim().is_empty());
-            if has_conds {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.preset_name)
-                        .desired_width(120.0)
-                        .hint_text("preset name"),
-                )
-                .explain(
-                    self.verbosity,
-                    "Name for the new preset",
-                    "Name under which to save the current set of filter conditions as a \
-                     reusable preset.",
-                );
-                let can_save = !self.preset_name.trim().is_empty();
-                if ui
-                    .add_enabled(
-                        can_save,
-                        egui::Button::new(RichText::new("SAVE").color(theme::BLACK))
+            if has_conds
+                && ui
+                    .add(
+                        egui::Button::new(RichText::new("STORE PRESET").color(theme::BLACK))
                             .fill(theme::AMBER),
                     )
                     .explain(
                         self.verbosity,
-                        "Save as a preset",
-                        "Save the current condition set as a named preset for one-click \
-                         reuse later.",
+                        "Store the current filter as a preset",
+                        "Save the current condition set as a new preset, named \"Preset #n\" \
+                         automatically. Right-click a preset afterwards to give it a better \
+                         name.",
                     )
                     .clicked()
-                {
-                    acts.push(Act::SavePreset);
-                }
-            }
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("EXPORT").color(theme::BLUE))
-                        .fill(theme::PANEL),
-                )
-                .explain(
-                    self.verbosity,
-                    "Export history + presets",
-                    "Export remembered filter values and saved presets to a JSON file, to \
-                     back up or share with another machine.",
-                )
-                .clicked()
             {
-                acts.push(Act::ExportHistory);
-            }
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("IMPORT").color(theme::BLUE))
-                        .fill(theme::PANEL),
-                )
-                .explain(
-                    self.verbosity,
-                    "Import history + presets",
-                    "Import remembered filter values and presets from a previously \
-                     exported JSON file, merging with what's already saved.",
-                )
-                .clicked()
-            {
-                acts.push(Act::ImportHistory);
+                acts.push(Act::StorePreset);
             }
         });
     }
@@ -901,8 +864,8 @@ impl FilterBuilder {
                 self.schedule_count();
                 true
             }
-            Act::SavePreset => {
-                self.save_preset(store);
+            Act::StorePreset => {
+                self.store_preset(store);
                 false
             }
             Act::ApplyPreset(i) => {
@@ -931,12 +894,15 @@ impl FilterBuilder {
                 }
                 false
             }
-            Act::ExportHistory => {
-                self.export_history();
-                false
-            }
-            Act::ImportHistory => {
-                self.import_history();
+            Act::CommitRenamePreset(i) => {
+                self.renaming_preset = None;
+                let new_name = self.rename_buf.trim().to_string();
+                if !new_name.is_empty()
+                    && let Some(preset) = self.history.presets.get_mut(i)
+                {
+                    preset.name = new_name;
+                    self.save_history(store);
+                }
                 false
             }
         }
@@ -1002,10 +968,10 @@ impl FilterBuilder {
         }
     }
 
-    /// Save the current non-blank conditions as a named preset (replacing a
-    /// same-named one) and remember their values for quick-picks.
-    fn save_preset(&mut self, store: &Store) {
-        let name = self.preset_name.trim().to_string();
+    /// Save the current non-blank conditions as a new preset named
+    /// `Preset #n` (the next unused number) and remember their values for
+    /// quick-picks.
+    fn store_preset(&mut self, store: &Store) {
         let conds: Vec<SavedCond> = self
             .filters
             .iter()
@@ -1015,7 +981,7 @@ impl FilterBuilder {
                 value: c.value.trim().to_string(),
             })
             .collect();
-        if name.is_empty() || conds.is_empty() {
+        if conds.is_empty() {
             return;
         }
         for cond in &conds {
@@ -1023,83 +989,29 @@ impl FilterBuilder {
                 self.history.record_value(kind, &cond.value);
             }
         }
-        let preset = FilterPreset {
+        let name = self.next_preset_name();
+        self.history.presets.push(FilterPreset {
             name: name.clone(),
             conds,
-        };
-        match self.history.presets.iter_mut().find(|p| p.name == name) {
-            Some(existing) => *existing = preset,
-            None => self.history.presets.push(preset),
-        }
-        self.preset_name.clear();
+        });
         self.save_history(store);
         self.status = Some(format!("Saved filter preset '{name}'."));
     }
 
-    /// Open a native save dialog and write the whole history as JSON to the
-    /// chosen file. Runs off the UI thread.
-    fn export_history(&mut self) {
-        let json = match serde_json::to_vec_pretty(&self.history) {
-            Ok(json) => json,
-            Err(e) => {
-                self.error = Some(e.to_string());
-                return;
+    /// The next unused `Preset #n` name, based on what's already saved.
+    fn next_preset_name(&self) -> String {
+        let mut n = self.history.presets.len() + 1;
+        loop {
+            let candidate = format!("Preset #{n}");
+            if !self.history.presets.iter().any(|p| p.name == candidate) {
+                return candidate;
             }
-        };
-        let tx = self.io_tx.clone();
-        std::thread::spawn(move || {
-            if let Some(path) = rfd::FileDialog::new()
-                .set_title("Export filter history")
-                .set_file_name("dedup-filters.json")
-                .add_filter("JSON", &["json"])
-                .save_file()
-            {
-                let msg = match std::fs::write(&path, json) {
-                    Ok(()) => HistoryIo::Exported(path),
-                    Err(e) => HistoryIo::Failed(e.to_string()),
-                };
-                let _ = tx.send(msg);
-            }
-        });
-    }
-
-    /// Open a native open dialog and merge the chosen JSON history file. Runs
-    /// off the UI thread.
-    fn import_history(&mut self) {
-        let tx = self.io_tx.clone();
-        std::thread::spawn(move || {
-            if let Some(path) = rfd::FileDialog::new()
-                .set_title("Import filter history")
-                .add_filter("JSON", &["json"])
-                .pick_file()
-            {
-                let msg = match std::fs::read(&path) {
-                    Ok(bytes) => match serde_json::from_slice::<FilterHistory>(&bytes) {
-                        Ok(history) => HistoryIo::Imported(history),
-                        Err(e) => HistoryIo::Failed(format!("Not a filter history file: {e}")),
-                    },
-                    Err(e) => HistoryIo::Failed(e.to_string()),
-                };
-                let _ = tx.send(msg);
-            }
-        });
-    }
-
-    /// Drain background export/import and count results into state.
-    fn drain(&mut self, store: &Arc<Store>) {
-        while let Ok(msg) = self.io_rx.try_recv() {
-            match msg {
-                HistoryIo::Imported(history) => {
-                    self.history.merge(history);
-                    self.save_history(store);
-                    self.status = Some("Imported filter history.".to_string());
-                }
-                HistoryIo::Exported(path) => {
-                    self.status = Some(format!("Exported filter history to {}.", path.display()));
-                }
-                HistoryIo::Failed(e) => self.error = Some(e),
-            }
+            n += 1;
         }
+    }
+
+    /// Drain background count results into state.
+    fn drain(&mut self) {
         while let Ok((token, count)) = self.count_rx.try_recv() {
             if token == self.count_token {
                 self.count_in_flight = false;
@@ -1174,34 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_keeps_order_and_replaces_same_named_presets() {
-        let preset = |name: &str, value: &str| FilterPreset {
-            name: name.to_string(),
-            conds: vec![SavedCond {
-                kind: "name".to_string(),
-                value: value.to_string(),
-            }],
-        };
-        let mut local = FilterHistory::default();
-        local.record_value(FilterKind::Name, "old");
-        local.presets.push(preset("mine", "local"));
-
-        let mut imported = FilterHistory::default();
-        imported.record_value(FilterKind::Name, "second");
-        imported.record_value(FilterKind::Name, "first");
-        imported.presets.push(preset("mine", "imported"));
-        imported.presets.push(preset("theirs", "extra"));
-
-        local.merge(imported);
-        assert_eq!(local.name, vec!["first", "second", "old"]);
-        assert_eq!(
-            local.presets,
-            vec![preset("mine", "imported"), preset("theirs", "extra")]
-        );
-    }
-
-    #[test]
-    fn save_and_apply_preset() -> Result<(), Box<dyn std::error::Error>> {
+    fn store_and_apply_preset() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let store = Arc::new(Store::open_at(dir.path().to_path_buf())?);
 
@@ -1210,11 +1095,10 @@ mod tests {
             cond(FilterKind::Mime, "image/"),
             cond(FilterKind::Size, ">=100"),
         ];
-        fb.preset_name = "big images".to_string();
-        fb.apply(&store, Act::SavePreset);
+        fb.apply(&store, Act::StorePreset);
 
         assert_eq!(fb.history.presets.len(), 1);
-        assert!(fb.preset_name.is_empty());
+        assert_eq!(fb.history.presets[0].name, "Preset #1");
         // The preset (and the recorded values) hit the disk immediately.
         let loaded = FilterHistory::load(&store.config_dir().join(HISTORY_FILE));
         assert_eq!(loaded.presets, fb.history.presets);
@@ -1227,6 +1111,18 @@ mod tests {
             fb.filter_string().as_deref(),
             Some("mime:image/ size:>=100")
         );
+
+        // Storing a second preset auto-numbers past the first.
+        fb.filters = vec![cond(FilterKind::Name, "foo")];
+        fb.apply(&store, Act::StorePreset);
+        assert_eq!(fb.history.presets[1].name, "Preset #2");
+
+        // Renaming a preset persists the new name.
+        fb.rename_buf = "big images".to_string();
+        fb.apply(&store, Act::CommitRenamePreset(0));
+        assert_eq!(fb.history.presets[0].name, "big images");
+        let loaded = FilterHistory::load(&store.config_dir().join(HISTORY_FILE));
+        assert_eq!(loaded.presets[0].name, "big images");
         Ok(())
     }
 }

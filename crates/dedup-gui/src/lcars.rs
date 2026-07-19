@@ -135,7 +135,12 @@ pub fn section_lcars<R>(
             top: 0,
             bottom: 8,
         })
-        .show(ui, |ui| add(ui));
+        .show(ui, |ui| {
+            // Always claim the full panel width, so the elbow rail/header spans
+            // the whole panel even when the body's own content is narrow.
+            ui.set_min_width(ui.available_width());
+            add(ui)
+        });
     let r = inner.response.rect;
     ui.painter()
         .set(bg, egui::Shape::Vec(elbow_shapes(ui, r, title, accent)));
@@ -160,14 +165,23 @@ pub fn section_lcars<R>(
 fn elbow_shapes(ui: &egui::Ui, rect: Rect, title: &str, accent: Color32) -> Vec<egui::Shape> {
     let out = (RAIL_W / 2.0) as u8; // rounded outer corners
     let cap = (HEAD_H / 2.0) as u8; // rounded right cap on the header bar
-    let rail = Rect::from_min_max(rect.min, pos2(rect.min.x + RAIL_W, rect.max.y));
-    let head = Rect::from_min_max(rect.min, pos2(rect.max.x, rect.min.y + HEAD_H));
-    let body = Rect::from_min_max(pos2(rect.min.x + RAIL_W, rect.min.y + HEAD_H), rect.max);
     let galley = ui.painter().layout_no_wrap(
         title.to_owned(),
         egui::FontId::proportional(13.0),
         theme::BLACK,
     );
+    // Safety net: the panel is always full-width (see `section_lcars`), so this
+    // only bites for a title too long even for that — widen the chrome rather
+    // than let the galley overflow past the header bar uncontained.
+    let min_width = RAIL_W + 10.0 + galley.size().x + 10.0;
+    let rect = if rect.width() < min_width {
+        Rect::from_min_max(rect.min, pos2(rect.min.x + min_width, rect.max.y))
+    } else {
+        rect
+    };
+    let rail = Rect::from_min_max(rect.min, pos2(rect.min.x + RAIL_W, rect.max.y));
+    let head = Rect::from_min_max(rect.min, pos2(rect.max.x, rect.min.y + HEAD_H));
+    let body = Rect::from_min_max(pos2(rect.min.x + RAIL_W, rect.min.y + HEAD_H), rect.max);
     let tpos = pos2(
         rect.min.x + RAIL_W + 10.0,
         rect.min.y + HEAD_H / 2.0 - galley.size().y / 2.0,

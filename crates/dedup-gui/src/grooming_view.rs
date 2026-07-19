@@ -205,8 +205,13 @@ pub struct GroomingView {
     /// ORGANIZE: saved presets, loaded once from the config dir.
     presets: Vec<OrganizePreset>,
     presets_loaded: bool,
-    /// ORGANIZE: name typed for the preset about to be saved.
-    preset_name: String,
+    /// ORGANIZE: index of the preset currently being renamed inline, if any.
+    renaming_preset: Option<usize>,
+    /// ORGANIZE: text buffer for the in-progress preset rename.
+    rename_buf: String,
+    /// ORGANIZE: set for one frame when a rename just started, so its text
+    /// field can grab keyboard focus.
+    focus_rename_pending: bool,
     preview: Vec<review::ReviewRow>,
     /// Full per-kind counts (indexed by [`review::RowKind::idx`]) for the review
     /// summary; independent of the capped `preview` sample.
@@ -240,9 +245,10 @@ enum Act {
     PickRepo(String),
     AddRule,
     RemoveRule(usize),
-    SavePreset,
+    StorePreset,
     ApplyPreset(usize),
     RemovePreset(usize),
+    CommitRenamePreset(usize),
     Preview,
     Ask,
     Confirm,
@@ -264,7 +270,9 @@ impl GroomingView {
             rules: vec![RuleUi::new()],
             presets: Vec::new(),
             presets_loaded: false,
-            preset_name: String::new(),
+            renaming_preset: None,
+            rename_buf: String::new(),
+            focus_rename_pending: false,
             preview: Vec::new(),
             preview_totals: [0; 3],
             preview_source_header: String::new(),
@@ -520,24 +528,36 @@ impl GroomingView {
         self.single_repo_bar(ui, acts, "Reorganize the files in this repo in place.");
         let repo = self.repo.clone();
 
-        let rule_count = self.rules.len();
-        for i in 0..rule_count {
-            crate::lcars::section_lcars(ui, &format!("RULE {}", i + 1), theme::BLUE, |ui| {
-                ui.horizontal(|ui| {
-                    // A rule can always be removed (a repo may need zero rules).
+        crate::lcars::section_lcars(
+            ui,
+            "RULES — ADD RULES & MANAGE PRESETS",
+            theme::LILAC,
+            |ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui
-                        .add(egui::Button::new(RichText::new("× rule").color(theme::RED)))
+                        .add(
+                            egui::Button::new(RichText::new("+ RULE").color(theme::BLACK))
+                                .fill(theme::AMBER),
+                        )
                         .explain(
                             self.verbosity,
-                            "Remove this rule",
-                            "Delete this organize rule. Files it would have matched fall \
-                             through to later rules, or stay put if none match.",
+                            "Add a rule",
+                            "Add another filter → template rule. Rules are tried top to bottom; \
+                         the first whose filter matches a file decides its new path.",
                         )
                         .clicked()
                     {
-                        acts.push(Act::RemoveRule(i));
+                        acts.push(Act::AddRule);
                     }
+                    self.preset_row(ui, acts);
                 });
+            },
+        );
+
+        let rule_count = self.rules.len();
+        for i in 0..rule_count {
+            let title = format!("RULE {} — MATCH & RENAME", i + 1);
+            crate::lcars::section_lcars(ui, &title, theme::BLUE, |ui| {
                 // The rule's filter (which files this rule applies to).
                 let outcome = self.rules[i]
                     .filter
@@ -584,50 +604,72 @@ impl GroomingView {
                         }
                     }
                 });
+                // A rule can always be removed (a repo may need zero rules).
+                // Bottom-right, out of the way of the fields above it.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if crate::lcars::action_button(ui, "DELETE RULE", true, theme::RED)
+                        .explain(
+                            self.verbosity,
+                            "Delete this rule",
+                            "Delete this organize rule. Files it would have matched fall \
+                             through to later rules, or stay put if none match.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::RemoveRule(i));
+                    }
+                });
             });
         }
-
-        crate::lcars::section_lcars(ui, "RULES", theme::LILAC, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("+ RULE").color(theme::BLACK))
-                            .fill(theme::AMBER),
-                    )
-                    .explain(
-                        self.verbosity,
-                        "Add a rule",
-                        "Add another filter → template rule. Rules are tried top to bottom; \
-                         the first whose filter matches a file decides its new path.",
-                    )
-                    .clicked()
-                {
-                    acts.push(Act::AddRule);
-                }
-                self.preset_row(ui, acts);
-            });
-        });
     }
 
-    /// The ORGANIZE saved-preset row: apply/forget pills, plus name + SAVE.
+    /// The ORGANIZE saved-preset row: apply/forget pills (right-click to
+    /// rename), plus a STORE PRESET pill for the current rule list.
     fn preset_row(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         ui.separator();
         ui.label(RichText::new("PRESETS").color(theme::TEXT).size(12.0));
-        for (i, preset) in self.presets.iter().enumerate() {
-            if ui
-                .add(
-                    egui::Button::new(RichText::new(&preset.name).color(theme::TAN))
-                        .fill(theme::PANEL),
-                )
+        // Snapshot names first so the loop body is free to mutate `self`
+        // (rename state) without fighting a borrow of `self.presets`.
+        let presets: Vec<(usize, String)> = self
+            .presets
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i, p.name.clone()))
+            .collect();
+        for (i, name) in presets {
+            if self.renaming_preset == Some(i) {
+                let resp =
+                    ui.add(egui::TextEdit::singleline(&mut self.rename_buf).desired_width(120.0));
+                if self.focus_rename_pending {
+                    resp.request_focus();
+                    self.focus_rename_pending = false;
+                }
+                if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.renaming_preset = None;
+                } else if resp.lost_focus() {
+                    acts.push(Act::CommitRenamePreset(i));
+                }
+                continue;
+            }
+            let resp = ui
+                .add(egui::Button::new(RichText::new(&name).color(theme::TAN)).fill(theme::PANEL))
                 .explain(
                     self.verbosity,
                     "Apply this preset",
-                    "Replace the current rules with this saved preset's rules.",
-                )
-                .clicked()
-            {
+                    "Replace the current rules with this saved preset's rules. Right-click \
+                     to rename it.",
+                );
+            if resp.clicked() {
                 acts.push(Act::ApplyPreset(i));
             }
+            resp.context_menu(|ui| {
+                if ui.button("Rename").clicked() {
+                    self.renaming_preset = Some(i);
+                    self.rename_buf = name.clone();
+                    self.focus_rename_pending = true;
+                    ui.close();
+                }
+            });
             if ui
                 .add(egui::Button::new(RichText::new("×").color(theme::RED)))
                 .explain(
@@ -640,25 +682,22 @@ impl GroomingView {
                 acts.push(Act::RemovePreset(i));
             }
         }
-        ui.add(
-            egui::TextEdit::singleline(&mut self.preset_name)
-                .desired_width(120.0)
-                .hint_text("preset name"),
-        );
-        let can_save = !self.preset_name.trim().is_empty() && !self.rules.is_empty();
-        if ui
-            .add_enabled(
-                can_save,
-                egui::Button::new(RichText::new("SAVE").color(theme::BLACK)).fill(theme::AMBER),
-            )
-            .explain(
-                self.verbosity,
-                "Save these rules as a preset",
-                "Save the current rule list under this name for one-click reuse on any repo.",
-            )
-            .clicked()
+        if !self.rules.is_empty()
+            && ui
+                .add(
+                    egui::Button::new(RichText::new("STORE PRESET").color(theme::BLACK))
+                        .fill(theme::AMBER),
+                )
+                .explain(
+                    self.verbosity,
+                    "Store the current rules as a preset",
+                    "Save the current rule list as a new preset, named \"Preset #n\" \
+                     automatically, for one-click reuse on any repo. Right-click a preset \
+                     afterwards to give it a better name.",
+                )
+                .clicked()
         {
-            acts.push(Act::SavePreset);
+            acts.push(Act::StorePreset);
         }
     }
 
@@ -850,11 +889,10 @@ impl GroomingView {
         self.filter.filter_string()
     }
 
-    /// Save the current ORGANIZE rules as a named preset (replacing a same-named
-    /// one), then persist to disk.
-    fn save_preset(&mut self, store: &Store) {
-        let name = self.preset_name.trim().to_string();
-        if name.is_empty() || self.rules.is_empty() {
+    /// Save the current ORGANIZE rules as a new preset named `Preset #n` (the
+    /// next unused number), then persist to disk.
+    fn store_preset(&mut self, store: &Store) {
+        if self.rules.is_empty() {
             return;
         }
         let rules: Vec<SavedRule> = self
@@ -865,17 +903,25 @@ impl GroomingView {
                 template: r.template.clone(),
             })
             .collect();
-        let preset = OrganizePreset {
+        let name = self.next_preset_name();
+        self.presets.push(OrganizePreset {
             name: name.clone(),
             rules,
-        };
-        match self.presets.iter_mut().find(|p| p.name == name) {
-            Some(existing) => *existing = preset,
-            None => self.presets.push(preset),
-        }
-        self.preset_name.clear();
+        });
         self.save_presets(store);
         self.status = Some(format!("Saved organize preset '{name}'."));
+    }
+
+    /// The next unused `Preset #n` name, based on what's already saved.
+    fn next_preset_name(&self) -> String {
+        let mut n = self.presets.len() + 1;
+        loop {
+            let candidate = format!("Preset #{n}");
+            if !self.presets.iter().any(|p| p.name == candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
     }
 
     /// Persist the preset list as JSON in the config dir (best effort).
@@ -934,7 +980,7 @@ impl GroomingView {
                 }
                 self.clear_preview();
             }
-            Act::SavePreset => self.save_preset(store),
+            Act::StorePreset => self.store_preset(store),
             Act::ApplyPreset(i) => {
                 if let Some(preset) = self.presets.get(i) {
                     self.rules = preset
@@ -958,6 +1004,16 @@ impl GroomingView {
             Act::RemovePreset(i) => {
                 if i < self.presets.len() {
                     self.presets.remove(i);
+                    self.save_presets(store);
+                }
+            }
+            Act::CommitRenamePreset(i) => {
+                self.renaming_preset = None;
+                let new_name = self.rename_buf.trim().to_string();
+                if !new_name.is_empty()
+                    && let Some(preset) = self.presets.get_mut(i)
+                {
+                    preset.name = new_name;
                     self.save_presets(store);
                 }
             }
@@ -1487,6 +1543,68 @@ mod ui_tests {
         assert!(
             organize.query_by_label("DUPEPOOL").is_none(),
             "ORGANIZE has no dupe pool"
+        );
+    }
+
+    /// The rule's remove control reads "DELETE RULE" (not the old "× rule"), and
+    /// the preset row offers STORE PRESET instead of a name field + SAVE.
+    #[test]
+    fn organize_shows_delete_rule_and_store_preset() {
+        let (_tmp, store) = sample_store();
+        let organize = grooming_harness(store, Command::Organize);
+        assert!(
+            organize.query_by_label_contains("DELETE RULE").is_some(),
+            "the rule remove control is labeled DELETE RULE"
+        );
+        assert!(
+            organize.query_by_label("× rule").is_none(),
+            "the old '× rule' label is gone"
+        );
+        assert!(
+            organize.query_by_label_contains("STORE PRESET").is_some(),
+            "the preset row offers a STORE PRESET pill"
+        );
+        assert!(
+            organize.query_by_label("SAVE").is_none(),
+            "the old name-field + SAVE preset UI is gone"
+        );
+    }
+
+    /// The FILTER wizard (shared by PURGE) no longer offers EXPORT/IMPORT, and
+    /// offers STORE PRESET once a condition is entered.
+    #[test]
+    fn filter_no_longer_offers_export_import() {
+        let (_tmp, store) = sample_store();
+        let mut h = grooming_harness(store, Command::Purge);
+        h.state_mut().filter.set_expression("name:foo");
+        h.run();
+        assert!(
+            h.query_by_label("EXPORT").is_none(),
+            "EXPORT is gone from the filter preset row"
+        );
+        assert!(
+            h.query_by_label("IMPORT").is_none(),
+            "IMPORT is gone from the filter preset row"
+        );
+        assert!(
+            h.query_by_label_contains("STORE PRESET").is_some(),
+            "the filter preset row offers STORE PRESET once a condition is set"
+        );
+    }
+
+    /// `section_lcars` now always claims the panel's full width, so even a
+    /// narrow-content rule section (a single button + short fields) spans
+    /// nearly the whole window rather than shrinking to fit its content.
+    #[test]
+    fn rule_elbow_spans_full_panel_width() {
+        let (_tmp, store) = sample_store();
+        let width = 1120.0;
+        let organize = grooming_harness(store, Command::Organize);
+        let rule_title = organize.get_by_label_contains("RULE 1").rect();
+        assert!(
+            rule_title.right() > width - 220.0,
+            "the RULE 1 elbow should span nearly the full panel width, right={}",
+            rule_title.right()
         );
     }
 

@@ -27,7 +27,7 @@ use std::time::Duration;
 const MAX_CONCURRENT: usize = 1;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
-enum Tab {
+pub(crate) enum Tab {
     Repositories,
     Duplicates,
     Transfer,
@@ -141,6 +141,7 @@ pub struct DedupApp {
 
     show_settings: bool,
     show_about: bool,
+    show_help: bool,
     /// Whether the one-time startup status probe has been kicked off.
     did_initial_status: bool,
     threads: usize,
@@ -184,6 +185,7 @@ impl DedupApp {
             edit: None,
             show_settings: false,
             show_about: false,
+            show_help: false,
             did_initial_status: false,
             threads: 0,
             tooltip_verbosity: TooltipVerbosity::default(),
@@ -728,6 +730,9 @@ impl eframe::App for DedupApp {
         if self.show_about {
             self.about_modal(&ctx);
         }
+        if self.show_help {
+            self.help_window(&ctx);
+        }
         if self.show_add {
             self.add_modal(&ctx, &mut actions);
         }
@@ -833,7 +838,20 @@ impl DedupApp {
                         {
                             self.show_about = true;
                         }
-                        // The remaining width (left of ABOUT) holds the scrollable
+                        // Added after ABOUT so it renders immediately to its left.
+                        if crate::lcars::action_button(ui, "HELP", true, theme::TAN)
+                            .explain(
+                                self.tooltip_verbosity,
+                                "Explain the current tab",
+                                "Open a help window describing what the current tab is for \
+                                 and how its controls fit together. Stays open (and updates) \
+                                 as you switch tabs.",
+                            )
+                            .clicked()
+                        {
+                            self.show_help = true;
+                        }
+                        // The remaining width (left of HELP) holds the scrollable
                         // tab strip, laid out left-to-right in its natural order.
                         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                             egui::ScrollArea::horizontal()
@@ -1742,6 +1760,71 @@ impl DedupApp {
             self.show_about = false;
         }
     }
+
+    /// A real second OS window (not a modal) describing the current tab's
+    /// purpose and controls, so it can sit beside the main window instead of
+    /// blocking it. Content tracks `self.tab` live, so switching tabs while
+    /// it's open updates what's shown.
+    fn help_window(&mut self, ctx: &egui::Context) {
+        let tab_label = match self.tab {
+            Tab::Repositories => "REPOSITORIES",
+            Tab::Duplicates => "DUPLICATES",
+            Tab::Transfer => "TRANSFER",
+            Tab::Grooming => "GROOMING",
+            Tab::Browse => "BROWSE",
+        };
+        let text = crate::help_content::help_text(self.tab);
+        // Park it just to the right of the main window when its position is
+        // knowable (not on Wayland, where inner/outer rect is always None); a
+        // fixed fallback otherwise. This is only honored by the backend when
+        // the window is first created, so it never fights the user dragging
+        // the help window elsewhere afterwards.
+        let pos = ctx
+            .input(|i| i.viewport().outer_rect)
+            .map(|r| r.right_top())
+            .unwrap_or(egui::pos2(120.0, 120.0));
+
+        let close_requested = ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("dedup_help"),
+            egui::ViewportBuilder::default()
+                .with_title(format!("dedup help — {tab_label}"))
+                .with_inner_size([420.0, 600.0])
+                .with_position(pos),
+            |ui, _class| {
+                let mut close_clicked = false;
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(tab_label)
+                                .color(theme::AMBER)
+                                .size(18.0)
+                                .strong(),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .add(egui::Button::new(
+                                    RichText::new("CLOSE").color(theme::BLACK),
+                                ))
+                                .clicked()
+                            {
+                                close_clicked = true;
+                            }
+                        });
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(text).color(theme::TEXT));
+                        });
+                });
+                close_clicked || ui.input(|i| i.viewport().close_requested())
+            },
+        );
+        if close_requested {
+            self.show_help = false;
+        }
+    }
 }
 
 /// A small rounded status chip with black text on `fill`.
@@ -2142,6 +2225,47 @@ mod ui_tests {
             harness.query_by_label_contains("CHOOSE").is_some(),
             "the DUPLICATE editor should offer a folder-picker button"
         );
+    }
+
+    /// The HELP window shows the current tab's help copy, and its in-window
+    /// CLOSE button clears `show_help`. This headless harness has no native
+    /// eframe integration, so `Context::embed_viewports` stays at its default
+    /// `true` and `show_viewport_immediate` renders the content as a regular
+    /// embedded `Window` instead of a real second OS window — this exercises
+    /// the content and the CLOSE path, but not real cross-window placement or
+    /// the native OS close button (only the running app can show those).
+    #[test]
+    fn help_window_shows_tab_copy_and_close_clears_flag() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, mut app) = sample_app();
+        app.show_help = true;
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, app: &mut DedupApp| {
+                    if !init {
+                        icon::install(ui.ctx());
+                        theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let ctx = ui.ctx().clone();
+                    if app.show_help {
+                        app.help_window(&ctx);
+                    }
+                },
+                app,
+            );
+        harness.run();
+        assert!(
+            harness
+                .query_by_label_contains("Register, scan, and manage repositories")
+                .is_some(),
+            "the HELP window shows the current (REPOSITORIES) tab's help copy"
+        );
+        harness.get_by_label("CLOSE").click();
+        harness.run();
+        assert!(!harness.state().show_help, "CLOSE clears show_help");
     }
 
     /// A temp store with one scanned repo whose on-disk path is very long, to

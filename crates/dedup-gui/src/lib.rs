@@ -7,6 +7,7 @@ mod dupes_view;
 mod external;
 mod filter_ui;
 mod grooming_view;
+mod help_content;
 mod icon;
 mod id3tags;
 mod imgedit;
