@@ -84,6 +84,29 @@ impl ReviewRow {
     fn is_unchanged(&self) -> bool {
         self.source == SideStatus::Unchanged && self.target == SideStatus::Unchanged
     }
+
+    /// The row's namespaced selection key, matching what the core ops check
+    /// (see `dedup_core::diff`): the source path for source-side actions, the
+    /// target path for target-side-only rows (sync/mirror deletions).
+    pub fn key(&self) -> String {
+        if self.source_path.is_empty() {
+            dedup_core::diff::target_key(&self.target_path)
+        } else {
+            dedup_core::diff::source_key(&self.source_path)
+        }
+    }
+
+    /// Whether the row represents an action at all (unchanged rows have
+    /// nothing to reject or apply).
+    fn is_actionable(&self) -> bool {
+        !self.is_unchanged()
+    }
+}
+
+/// A row-level interaction the caller must execute: apply this row's action
+/// now (the batch op restricted to the row's [`ReviewRow::key`]).
+pub enum ReviewAction {
+    Apply(String),
 }
 
 /// Which column the table is sorted on.
@@ -103,6 +126,9 @@ pub struct ReviewState {
     pub show_unchanged: bool,
     /// Current zero-based page of the visible rows.
     pub page: usize,
+    /// Namespaced keys ([`ReviewRow::key`]) of rows the user rejected: RUN
+    /// skips them. Cleared whenever the preview is rebuilt.
+    pub rejected: std::collections::HashSet<String>,
 }
 
 impl Default for ReviewState {
@@ -112,6 +138,7 @@ impl Default for ReviewState {
             sort_asc: true,
             show_unchanged: false,
             page: 0,
+            rejected: std::collections::HashSet::new(),
         }
     }
 }
@@ -152,8 +179,8 @@ pub fn table(
     totals: [usize; 3],
     source_header: &str,
     target_header: &str,
-) {
-    summary(ui, totals);
+) -> Option<ReviewAction> {
+    summary(ui, totals, state.rejected.len());
 
     // The unchanged toggle only matters when there are unchanged rows to hide.
     if totals[2] > 0 {
@@ -225,11 +252,14 @@ pub fn table(
     ];
     let (sort_col, sort_asc) = (state.sort_col, state.sort_asc);
     let mut clicked: Option<ReviewCol> = None;
+    let mut action: Option<ReviewAction> = None;
+    let mut toggle_reject: Option<String> = None;
 
     TableBuilder::new(ui)
         .striped(true)
         .resizable(true)
         .cell_layout(Layout::left_to_right(Align::Center))
+        .column(Column::exact(76.0))
         .column(Column::initial(90.0).at_least(70.0).resizable(true))
         .column(
             Column::initial(340.0)
@@ -245,6 +275,9 @@ pub fn table(
         )
         .column(Column::initial(90.0).at_least(70.0))
         .header(24.0, |mut header| {
+            header.col(|ui| {
+                ui.label(RichText::new("REVIEW").color(theme::TEXT).size(12.0));
+            });
             for (col, title) in cols {
                 header.col(|ui| {
                     if crate::util::sort_header(ui, title, sort_col == col, sort_asc).clicked() {
@@ -256,13 +289,59 @@ pub fn table(
         .body(|body| {
             body.rows(20.0, page_rows.len(), |mut row| {
                 let r = &rows[page_rows[row.index()]];
-                row.col(|ui| status_cell(ui, r.source));
-                row.col(|ui| path_cell(ui, r.source, &r.source_path));
-                row.col(|ui| path_cell(ui, r.target, &r.target_path));
-                row.col(|ui| status_cell(ui, r.target));
+                let key = r.key();
+                let rejected = state.rejected.contains(&key);
+                row.col(|ui| {
+                    if !r.is_actionable() {
+                        return;
+                    }
+                    // Reject toggle: red ✗, filled while the row is rejected.
+                    let x = egui::Button::new(RichText::new(icon::X).color(if rejected {
+                        theme::BLACK
+                    } else {
+                        theme::RED
+                    }))
+                    .small()
+                    .fill(if rejected { theme::RED } else { theme::PANEL });
+                    if ui
+                        .add(x)
+                        .on_hover_text(if rejected {
+                            "Restore this action (it runs again with RUN)"
+                        } else {
+                            "Reject this action — RUN will skip it"
+                        })
+                        .clicked()
+                    {
+                        toggle_reject = Some(key.clone());
+                    }
+                    // Apply: execute just this row, right now.
+                    if !rejected
+                        && ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(icon::ARROW_RIGHT).color(theme::GREEN),
+                                )
+                                .small()
+                                .fill(theme::PANEL),
+                            )
+                            .on_hover_text("Apply only this action, immediately")
+                            .clicked()
+                    {
+                        action = Some(ReviewAction::Apply(key.clone()));
+                    }
+                });
+                row.col(|ui| status_cell(ui, r.source, rejected));
+                row.col(|ui| path_cell(ui, r.source, &r.source_path, rejected));
+                row.col(|ui| path_cell(ui, r.target, &r.target_path, rejected));
+                row.col(|ui| status_cell(ui, r.target, rejected));
             });
         });
 
+    if let Some(key) = toggle_reject
+        && !state.rejected.remove(&key)
+    {
+        state.rejected.insert(key);
+    }
     if let Some(col) = clicked {
         if state.sort_col == col {
             state.sort_asc = !state.sort_asc;
@@ -273,29 +352,42 @@ pub fn table(
         state.page = 0;
         sort(rows, state);
     }
+    action
 }
 
-/// One side's status cell: just the coloured status icon.
-fn status_cell(ui: &mut egui::Ui, status: SideStatus) {
-    ui.label(
-        RichText::new(status.symbol())
-            .color(status.color())
-            .size(15.0),
-    );
+/// One side's status cell: just the coloured status icon, dimmed for a
+/// rejected row.
+fn status_cell(ui: &mut egui::Ui, status: SideStatus, rejected: bool) {
+    let color = if rejected {
+        theme::HAIRLINE
+    } else {
+        status.color()
+    };
+    ui.label(RichText::new(status.symbol()).color(color).size(15.0));
 }
 
 /// One side's path cell: the relative path coloured by that side's status.
-/// Absent sides (or empty paths) render nothing.
-fn path_cell(ui: &mut egui::Ui, status: SideStatus, path: &str) {
+/// Absent sides (or empty paths) render nothing; a rejected row's path is
+/// dimmed and struck through.
+fn path_cell(ui: &mut egui::Ui, status: SideStatus, path: &str, rejected: bool) {
     if status == SideStatus::Absent || path.is_empty() {
         return;
     }
-    ui.add(egui::Label::new(RichText::new(path).color(status.color())).truncate());
+    let mut text = RichText::new(path).color(if rejected {
+        theme::HAIRLINE
+    } else {
+        status.color()
+    });
+    if rejected {
+        text = text.strikethrough();
+    }
+    ui.add(egui::Label::new(text).truncate());
 }
 
 /// The summary line: `«icon» «count» «label»` for each non-zero status, in its
-/// colour, using the true full totals `[added, removed, unchanged]`.
-fn summary(ui: &mut egui::Ui, totals: [usize; 3]) {
+/// colour, using the true full totals `[added, removed, unchanged]` — plus the
+/// rejected count when any rows are rejected.
+fn summary(ui: &mut egui::Ui, totals: [usize; 3], rejected: usize) {
     let entries = [
         (SideStatus::Added, totals[0], "added"),
         (SideStatus::Removed, totals[1], "removed"),
@@ -312,6 +404,13 @@ fn summary(ui: &mut egui::Ui, totals: [usize; 3]) {
                     .strong(),
             );
             ui.add_space(10.0);
+        }
+        if rejected > 0 {
+            ui.label(
+                RichText::new(format!("{} {rejected} rejected — RUN skips these", icon::X))
+                    .color(theme::HAIRLINE)
+                    .strong(),
+            );
         }
     });
 }
@@ -345,6 +444,21 @@ mod tests {
     }
 
     #[test]
+    fn row_key_namespaces_source_and_target_rows() {
+        // A copy row acts on the source side; a sync deletion (no source
+        // path) acts on the target side. Keys must match the core ops'.
+        let copy = row(SideStatus::Unchanged, SideStatus::Added, "a.txt", "a.txt");
+        assert_eq!(copy.key(), dedup_core::diff::source_key("a.txt"));
+        let del = row(SideStatus::Absent, SideStatus::Removed, "", "b.txt");
+        assert_eq!(del.key(), dedup_core::diff::target_key("b.txt"));
+        assert_ne!(
+            row(SideStatus::Unchanged, SideStatus::Added, "x", "x").key(),
+            row(SideStatus::Absent, SideStatus::Removed, "", "x").key(),
+            "source- and target-side rows with the same rel path never collide"
+        );
+    }
+
+    #[test]
     fn is_unchanged_requires_both_sides() {
         assert!(row(SideStatus::Unchanged, SideStatus::Unchanged, "a", "a").is_unchanged());
         assert!(!row(SideStatus::Unchanged, SideStatus::Added, "a", "a").is_unchanged());
@@ -360,8 +474,7 @@ mod tests {
         let mut state = ReviewState {
             sort_col: ReviewCol::TargetStatus,
             sort_asc: true,
-            show_unchanged: false,
-            page: 0,
+            ..Default::default()
         };
         sort(&mut rows, &state);
         assert_eq!(rows[0].target, SideStatus::Added);
@@ -381,8 +494,7 @@ mod tests {
         let state = ReviewState {
             sort_col: ReviewCol::Source,
             sort_asc: true,
-            show_unchanged: false,
-            page: 0,
+            ..Default::default()
         };
         sort(&mut rows, &state);
         assert_eq!(rows[0].source_path, "alpha");

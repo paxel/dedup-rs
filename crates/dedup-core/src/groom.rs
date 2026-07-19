@@ -42,7 +42,7 @@ pub fn delete_by_filter(
     let annotated = crate::filter::AnnotatedFilter::new(&db, &filter)?;
     let mut candidates: Vec<String> = Vec::new();
     store::for_each_file_entry(&db, |rel_path, entry: FileEntry| {
-        if !entry.missing && annotated.matches(rel_path, &entry) {
+        if !entry.missing && annotated.matches(rel_path, &entry) && run.selected_source(rel_path) {
             candidates.push(rel_path.to_string());
         }
         Ok(())
@@ -184,7 +184,7 @@ pub fn prune(store: &Store, repo: &str, run: &DiffRun<'_>) -> Result<PruneStats,
     // Collect first so the read transaction isn't held during the removals.
     let mut tombstones: Vec<String> = Vec::new();
     store::for_each_file_entry(&db, |rel_path, entry: FileEntry| {
-        if entry.missing {
+        if entry.missing && run.selected_source(rel_path) {
             tombstones.push(rel_path.to_string());
         }
         Ok(())

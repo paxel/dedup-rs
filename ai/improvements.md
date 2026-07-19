@@ -89,12 +89,18 @@
   `egui_extras` pattern + the now-shared `util::sort_header` and scrolls through huge sets —
   sort a status column to group e.g. all deletions. No core changes; the summary shows true
   totals even when the sample is capped.
-- **Remaining (interactive half).** Give each row **reject** and **apply** buttons, turning
-  the board into a review the user edits: reject individual actions before RUN, or execute a
-  single action immediately. Needs new core primitives (an exclude/accept set on the batch
-  ops + a single-file copy/move/delete). The same panel later powers **sync-group compare**
-  (deleted / different / new files across group repos; equal files optional — usually too
-  noisy) and **manual per-file sync** between repos.
+- **Interactive half — ✅ done (2026-07-19).** Every actionable row now has a **✗ reject**
+  toggle (row dims + strikes through; RUN skips it; the summary counts rejections and the
+  confirmation notes them) and a **→ apply** button (execute just that action immediately;
+  the preview refreshes when it finishes). No new single-file primitives were needed: the
+  core `DiffRun` carries an optional exclude set + `only` allowlist consulted by every batch
+  op (copy/move/sync/mirror/export/dedupe/purge/organize/prune), so a single-row apply is
+  the battle-tested batch op restricted to one row. Row keys are namespaced (`s:<rel>` /
+  `t:<rel>`, `diff::source_key`/`target_key`) because a mirror can delete and copy the same
+  relative path. Rejections clear whenever the preview's configuration changes
+  (`clear_preview`), and survive a single-row apply's refresh. The same panel later powers
+  **sync-group compare** (deleted / different / new files across group repos; equal files
+  optional — usually too noisy) and **manual per-file sync** between repos.
 
 ---
 

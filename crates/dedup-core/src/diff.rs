@@ -122,17 +122,71 @@ impl DiffProgress for NoDiffProgress {
 }
 
 /// The execution context shared by the mutating diff operations: where to
-/// report live progress and how to observe cancellation. Grouping the two
-/// keeps the operation signatures compact.
+/// report live progress, how to observe cancellation, and (optionally) which
+/// review-board rows to act on. Grouping these keeps the operation signatures
+/// compact.
+///
+/// Row selection uses namespaced keys, because a source-side row and a
+/// target-side row can share the same relative path (a mirror can delete the
+/// target's `a.txt` and then copy the source's `a.txt`): `s:<rel>` identifies
+/// a source-side row (copy/move/delete-from-source/organize), `t:<rel>` a
+/// target-side row (a sync/mirror deletion in the target).
 #[derive(Clone, Copy)]
 pub struct DiffRun<'a> {
     pub progress: &'a dyn DiffProgress,
     pub cancel: &'a CancellationToken,
+    /// Namespaced row keys the user rejected in review; the op skips them.
+    exclude: Option<&'a HashSet<String>>,
+    /// When set, the op acts *only* on these namespaced row keys (a
+    /// single-row apply is the batch op with a one-element allowlist).
+    only: Option<&'a HashSet<String>>,
+}
+
+/// Build the namespaced selection key for a source-side row.
+pub fn source_key(rel: &str) -> String {
+    format!("s:{rel}")
+}
+
+/// Build the namespaced selection key for a target-side row.
+pub fn target_key(rel: &str) -> String {
+    format!("t:{rel}")
 }
 
 impl<'a> DiffRun<'a> {
     pub fn new(progress: &'a dyn DiffProgress, cancel: &'a CancellationToken) -> Self {
-        Self { progress, cancel }
+        Self {
+            progress,
+            cancel,
+            exclude: None,
+            only: None,
+        }
+    }
+
+    /// Restrict this run to the review-board selection: skip `exclude`d rows,
+    /// and when `only` is set act on those rows alone. Keys are namespaced via
+    /// [`source_key`] / [`target_key`].
+    pub fn with_selection(
+        mut self,
+        exclude: Option<&'a HashSet<String>>,
+        only: Option<&'a HashSet<String>>,
+    ) -> Self {
+        self.exclude = exclude;
+        self.only = only;
+        self
+    }
+
+    /// Whether the op should act on the source-side row for `rel`.
+    pub fn selected_source(&self, rel: &str) -> bool {
+        self.selected(&source_key(rel))
+    }
+
+    /// Whether the op should act on the target-side row for `rel`.
+    pub fn selected_target(&self, rel: &str) -> bool {
+        self.selected(&target_key(rel))
+    }
+
+    fn selected(&self, key: &str) -> bool {
+        self.only.is_none_or(|s| s.contains(key)) && self.exclude.is_none_or(|s| !s.contains(key))
     }
 }
 
@@ -316,7 +370,9 @@ pub fn diff_copy(
 
     let candidates: Vec<(String, FileEntry)> = collect_source_entries(&source.db, &filter, false)?
         .into_iter()
-        .filter(|(_, entry)| !ref_index.contains_key(&(entry.size, entry.hash)))
+        .filter(|(rel, entry)| {
+            !ref_index.contains_key(&(entry.size, entry.hash)) && run.selected_source(rel)
+        })
         .collect();
 
     let source_root = PathBuf::from(&source.meta.abs_path);
@@ -427,7 +483,9 @@ pub fn diff_delete(
 
     let candidates: Vec<(String, FileEntry)> = collect_source_entries(&source.db, &filter, false)?
         .into_iter()
-        .filter(|(_, entry)| ref_index.contains_key(&(entry.size, entry.hash)))
+        .filter(|(rel, entry)| {
+            ref_index.contains_key(&(entry.size, entry.hash)) && run.selected_source(rel)
+        })
         .collect();
 
     let source_root = PathBuf::from(&source.meta.abs_path);
@@ -552,11 +610,12 @@ pub fn diff_sync(
     let copy_total = if copy_new {
         source_entries
             .iter()
-            .filter(|(_, e)| {
+            .filter(|(rel, e)| {
                 !e.missing
                     && !target_index
                         .get(&(e.size, e.hash))
                         .is_some_and(|s| s.present)
+                    && run.selected_source(rel)
             })
             .count()
     } else {
@@ -575,7 +634,9 @@ pub fn diff_sync(
             .count(),
         SyncDelete::Absent => target_entries
             .iter()
-            .filter(|(_, e)| !source_present.contains(&(e.size, e.hash)))
+            .filter(|(rel, e)| {
+                !source_present.contains(&(e.size, e.hash)) && run.selected_target(rel)
+            })
             .count(),
     };
     let total = (copy_total + delete_total) as u64;
@@ -599,7 +660,7 @@ pub fn diff_sync(
 
     if copy_new && !stats.cancelled {
         for (rel_path, entry) in &source_entries {
-            if entry.missing {
+            if entry.missing || !run.selected_source(rel_path) {
                 continue;
             }
             if run.cancel.is_cancelled() {
@@ -678,7 +739,7 @@ fn delete_absent(
             stats.cancelled = true;
             break;
         }
-        if source_present.contains(&(entry.size, entry.hash)) {
+        if source_present.contains(&(entry.size, entry.hash)) || !run.selected_target(rel_path) {
             continue;
         }
         let path = target_root.join(rel_path);
@@ -858,7 +919,14 @@ fn sync_delete(
         return Ok(Vec::new());
     }
     let mut removed_paths = Vec::new();
+    // Paths the review selection excludes stay on disk; if any remain, the
+    // content is still present in the target and the index must say so.
+    let mut kept = 0usize;
     for rel_path in store::get_paths_by_size_hash(&target.db, entry.size, &entry.hash)? {
+        if !run.selected_target(&rel_path) {
+            kept += 1;
+            continue;
+        }
         let path = target_root.join(&rel_path);
         let removed = match std::fs::remove_file(&path) {
             Ok(()) => true,
@@ -879,7 +947,9 @@ fn sync_delete(
             removed_paths.push(rel_path);
         }
     }
-    if let Some(state) = target_index.get_mut(&key) {
+    if kept == 0
+        && let Some(state) = target_index.get_mut(&key)
+    {
         state.present = false;
         state.missing = true;
     }
@@ -1015,7 +1085,10 @@ pub fn export_to_folder(
     filter: Option<&str>,
     run: &DiffRun<'_>,
 ) -> Result<CopyStats, DiffError> {
-    let exports = plan_folder_export(store, source, references, mode, invert, filter)?;
+    let exports: Vec<String> = plan_folder_export(store, source, references, mode, invert, filter)?
+        .into_iter()
+        .filter(|rel| run.selected_source(rel))
+        .collect();
     let source_open = open_repo(store, source)?;
     let source_root = PathBuf::from(&source_open.meta.abs_path);
     let total = exports.len() as u64;

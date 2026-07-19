@@ -220,6 +220,8 @@ pub struct TransferView {
     error: Option<String>,
     confirm: Option<String>,
     running: bool,
+    /// Set while a single-row APPLY runs: refresh the preview when it finishes.
+    pending_refresh: bool,
     cancel: CancellationToken,
     // Live run progress: the last N actions, the running counters and the
     // file currently being handled.
@@ -253,6 +255,8 @@ enum Act {
     Confirm,
     CancelConfirm,
     CancelRun,
+    /// Apply a single review row immediately (its namespaced key).
+    ApplyRow(String),
 }
 
 impl TransferView {
@@ -284,6 +288,7 @@ impl TransferView {
             error: None,
             confirm: None,
             running: false,
+            pending_refresh: false,
             cancel: CancellationToken::new(),
             run_log: VecDeque::new(),
             run_done: 0,
@@ -315,6 +320,13 @@ impl TransferView {
     ) {
         self.verbosity = verbosity;
         self.drain(ui);
+        // A finished single-row APPLY refreshes the preview, so the board
+        // reflects the applied action instead of dropping to the run log.
+        if self.pending_refresh && !self.running {
+            self.pending_refresh = false;
+            self.reset_run();
+            self.run_preview(store);
+        }
         if !self.loaded {
             self.sync_repos(store);
         }
@@ -416,7 +428,7 @@ impl TransferView {
                 if self.running || !self.run_log.is_empty() {
                     self.run_panel(ui);
                 } else {
-                    self.preview_panel(ui);
+                    self.preview_panel(ui, &mut acts);
                 }
             });
 
@@ -1043,7 +1055,7 @@ impl TransferView {
         });
     }
 
-    fn preview_panel(&mut self, ui: &mut egui::Ui) {
+    fn preview_panel(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         if self.preview.is_empty() {
             ui.add_space(6.0);
             ui.colored_label(
@@ -1052,14 +1064,16 @@ impl TransferView {
             );
             return;
         }
-        review::table(
+        if let Some(review::ReviewAction::Apply(key)) = review::table(
             ui,
             &mut self.review_state,
             &mut self.preview,
             self.preview_totals,
             &self.preview_source_header,
             &self.preview_target_header,
-        );
+        ) {
+            acts.push(Act::ApplyRow(key));
+        }
     }
 
     /// A repo's absolute path for a review-table column header, falling back to
@@ -1226,15 +1240,20 @@ impl TransferView {
             }
             Act::Preview => self.run_preview(store),
             Act::Ask => {
-                if let Some(prompt) = self.build_prompt(store) {
+                if let Some(mut prompt) = self.build_prompt(store) {
+                    let rejected = self.review_state.rejected.len();
+                    if rejected > 0 {
+                        prompt.push_str(&format!(" {rejected} rejected row(s) will be skipped."));
+                    }
                     self.confirm = Some(prompt);
                 }
             }
             Act::CancelConfirm => self.confirm = None,
             Act::Confirm => {
                 self.confirm = None;
-                self.start(store);
+                self.start(store, None);
             }
+            Act::ApplyRow(key) => self.start(store, Some(key)),
             Act::CancelRun => self.cancel.cancel(),
         }
     }
@@ -1246,6 +1265,8 @@ impl TransferView {
         self.preview_target_header.clear();
         self.preview_total = 0;
         self.sync_delete_total = 0;
+        // Rejections are keyed to the preview they were made in.
+        self.review_state.rejected.clear();
     }
 
     /// The subdir trimmed of surrounding whitespace and slashes; empty means
@@ -1569,10 +1590,14 @@ impl TransferView {
         })
     }
 
-    fn start(&mut self, store: &Arc<Store>) {
+    /// Start the configured command on a worker thread. `only` restricts the
+    /// run to a single review row (the APPLY button); `None` runs the whole
+    /// batch minus any rejected rows.
+    fn start(&mut self, store: &Arc<Store>, only: Option<String>) {
         let Some(source) = self.source.clone() else {
             return;
         };
+        let rejected: std::collections::HashSet<String> = self.review_state.rejected.clone();
         // Snapshot everything the worker needs before spawning, branching on
         // where the transfer lands. SYNC/MIRROR are their own destination
         // (repo→repo at the same relative path), independent of REPO/FOLDER.
@@ -1620,14 +1645,26 @@ impl TransferView {
         let cancel = self.cancel.clone();
         self.running = true;
         self.status = Some(format!("{}…", command.label().to_lowercase()));
-        // RUN and PREVIEW are mutually exclusive: starting a run drops the
-        // stale preview and resets the live run log/counters.
-        self.clear_preview();
-        self.reset_run();
+        if only.is_some() {
+            // A single-row APPLY keeps the preview on screen (it refreshes
+            // when the run finishes) instead of dropping to the run log.
+            self.pending_refresh = true;
+            self.reset_run();
+        } else {
+            // RUN and PREVIEW are mutually exclusive: starting a run drops the
+            // stale preview and resets the live run log/counters.
+            self.clear_preview();
+            self.reset_run();
+        }
 
         std::thread::spawn(move || {
             let progress = ChannelDiffProgress { tx: tx.clone() };
-            let run = DiffRun::new(&progress, &cancel);
+            let only_set: Option<std::collections::HashSet<String>> =
+                only.map(|k| std::collections::HashSet::from([k]));
+            let run = DiffRun::new(&progress, &cancel).with_selection(
+                (!rejected.is_empty()).then_some(&rejected),
+                only_set.as_ref(),
+            );
             // Copy/Move (repo or folder) both yield CopyStats → Copied; Sync
             // yields SyncStats → Synced. Map each to its OpResult in place.
             let copied_result = |stats: Result<dedup_core::diff::CopyStats, String>| match stats {

@@ -228,6 +228,8 @@ pub struct GroomingView {
     error: Option<String>,
     confirm: Option<String>,
     running: bool,
+    /// Set while a single-row APPLY runs: refresh the preview when it finishes.
+    pending_refresh: bool,
     cancel: CancellationToken,
     run_log: VecDeque<String>,
     run_done: u64,
@@ -254,6 +256,8 @@ enum Act {
     Confirm,
     CancelConfirm,
     CancelRun,
+    /// Apply a single review row immediately (its namespaced key).
+    ApplyRow(String),
 }
 
 impl GroomingView {
@@ -283,6 +287,7 @@ impl GroomingView {
             error: None,
             confirm: None,
             running: false,
+            pending_refresh: false,
             cancel: CancellationToken::new(),
             run_log: VecDeque::new(),
             run_done: 0,
@@ -297,6 +302,13 @@ impl GroomingView {
     pub fn show(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, verbosity: TooltipVerbosity) {
         self.verbosity = verbosity;
         self.drain();
+        // A finished single-row APPLY refreshes the preview, so the board
+        // reflects the applied action instead of dropping to the run log.
+        if self.pending_refresh && !self.running {
+            self.pending_refresh = false;
+            self.reset_run();
+            self.run_preview(store);
+        }
         if !self.loaded {
             self.sync_repos(store);
         }
@@ -379,7 +391,7 @@ impl GroomingView {
                 if self.running || !self.run_log.is_empty() {
                     self.run_panel(ui);
                 } else {
-                    self.preview_panel(ui);
+                    self.preview_panel(ui, &mut acts);
                 }
             });
 
@@ -814,20 +826,22 @@ impl GroomingView {
         });
     }
 
-    fn preview_panel(&mut self, ui: &mut egui::Ui) {
+    fn preview_panel(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         if self.preview.is_empty() {
             ui.add_space(6.0);
             ui.colored_label(theme::TEXT, "Pick a repo and command, then press PREVIEW.");
             return;
         }
-        review::table(
+        if let Some(review::ReviewAction::Apply(key)) = review::table(
             ui,
             &mut self.review_state,
             &mut self.preview,
             self.preview_totals,
             &self.preview_source_header,
             &self.preview_target_header,
-        );
+        ) {
+            acts.push(Act::ApplyRow(key));
+        }
     }
 
     /// A repo's absolute path for a review-table column header, falling back to
@@ -1054,15 +1068,20 @@ impl GroomingView {
             }
             Act::Preview => self.run_preview(store),
             Act::Ask => {
-                if let Some(prompt) = self.build_prompt(store) {
+                if let Some(mut prompt) = self.build_prompt(store) {
+                    let rejected = self.review_state.rejected.len();
+                    if rejected > 0 {
+                        prompt.push_str(&format!(" {rejected} rejected row(s) will be skipped."));
+                    }
                     self.confirm = Some(prompt);
                 }
             }
             Act::CancelConfirm => self.confirm = None,
             Act::Confirm => {
                 self.confirm = None;
-                self.start(store);
+                self.start(store, None);
             }
+            Act::ApplyRow(key) => self.start(store, Some(key)),
             Act::CancelRun => self.cancel.cancel(),
         }
     }
@@ -1073,6 +1092,8 @@ impl GroomingView {
         self.preview_source_header.clear();
         self.preview_target_header.clear();
         self.preview_total = 0;
+        // Rejections are keyed to the preview they were made in.
+        self.review_state.rejected.clear();
     }
 
     fn reset_run(&mut self) {
@@ -1248,25 +1269,41 @@ impl GroomingView {
         }
     }
 
-    fn start(&mut self, store: &Arc<Store>) {
+    /// Start the selected command on a worker thread. `only` restricts the run
+    /// to a single review row (the APPLY button); `None` runs the whole batch
+    /// minus any rejected rows.
+    fn start(&mut self, store: &Arc<Store>, only: Option<String>) {
         let command = self.command;
         let filter = self.filter_string();
         let source = self.source.clone();
         let pool = self.pool.clone();
         let repo = self.repo.clone();
         let rules = self.organize_rules();
+        let rejected: std::collections::HashSet<String> = self.review_state.rejected.clone();
         let store = Arc::clone(store);
         let tx = self.tx.clone();
         self.cancel = CancellationToken::new();
         let cancel = self.cancel.clone();
         self.running = true;
         self.status = Some(format!("{}…", command.label().to_lowercase()));
-        self.clear_preview();
-        self.reset_run();
+        if only.is_some() {
+            // A single-row APPLY keeps the preview on screen (it refreshes
+            // when the run finishes) instead of dropping to the run log.
+            self.pending_refresh = true;
+            self.reset_run();
+        } else {
+            self.clear_preview();
+            self.reset_run();
+        }
 
         std::thread::spawn(move || {
             let progress = ChannelDiffProgress { tx: tx.clone() };
-            let run = DiffRun::new(&progress, &cancel);
+            let only_set: Option<std::collections::HashSet<String>> =
+                only.map(|k| std::collections::HashSet::from([k]));
+            let run = DiffRun::new(&progress, &cancel).with_selection(
+                (!rejected.is_empty()).then_some(&rejected),
+                only_set.as_ref(),
+            );
             let result = match command {
                 Command::Dedupe => {
                     let Some(source) = source else { return };
@@ -1773,6 +1810,58 @@ mod ui_tests {
         );
     }
 
+    /// Clicking a row's ✗ rejects it (tracked in state, shown in the summary);
+    /// clicking again restores it.
+    #[test]
+    fn review_rows_can_be_rejected_and_restored() {
+        let (_tmp, store) = sample_store();
+        let mut h = grooming_harness(store, Command::Purge);
+        {
+            let v = h.state_mut();
+            v.preview_source_header = "/repos/junk".to_string();
+            v.preview = vec![
+                review::ReviewRow {
+                    source: review::SideStatus::Removed,
+                    target: review::SideStatus::Absent,
+                    source_path: "a.tmp".to_string(),
+                    target_path: String::new(),
+                },
+                review::ReviewRow {
+                    source: review::SideStatus::Removed,
+                    target: review::SideStatus::Absent,
+                    source_path: "b.tmp".to_string(),
+                    target_path: String::new(),
+                },
+            ];
+            v.preview_totals = [0, 2, 0];
+            review::sort(&mut v.preview, &v.review_state);
+        }
+        h.run();
+        // Each actionable row leads with a ✗ reject toggle; click the first.
+        h.get_all_by_label(icon::X).next().unwrap().click();
+        h.run();
+        assert_eq!(
+            h.state().review_state.rejected.len(),
+            1,
+            "one row is rejected"
+        );
+        assert!(
+            h.query_by_label_contains("1 rejected").is_some(),
+            "the summary reports the rejected count"
+        );
+        h.get_all_by_label(icon::X).next().unwrap().click();
+        h.run();
+        assert!(
+            h.state().review_state.rejected.is_empty(),
+            "clicking the toggle again restores the row"
+        );
+        // The APPLY arrow is present on non-rejected rows (one per row).
+        assert!(
+            h.get_all_by_label(icon::ARROW_RIGHT).next().is_some(),
+            "rows offer an APPLY control"
+        );
+    }
+
     /// A preview past one page shows the row count plus PREV/PAGE/NEXT
     /// controls, and NEXT advances the page.
     #[test]
@@ -1840,6 +1929,38 @@ mod ui_tests {
             "{year}{month}".chars().count(),
             "caret follows the insertion"
         );
+    }
+
+    /// Manual visual check of the review board's reject/apply controls:
+    /// `cargo test -p dedup-gui review_snapshot -- --ignored`.
+    #[test]
+    #[ignore = "renders a PNG for manual inspection"]
+    fn render_review_snapshot() {
+        let (_tmp, store) = sample_store();
+        let mut h = grooming_harness(store, Command::Purge);
+        {
+            let v = h.state_mut();
+            v.preview_source_header = "/repos/junk".to_string();
+            v.preview = (0..6)
+                .map(|i| review::ReviewRow {
+                    source: review::SideStatus::Removed,
+                    target: review::SideStatus::Absent,
+                    source_path: format!("cache/file{i}.db"),
+                    target_path: String::new(),
+                })
+                .collect();
+            v.preview_totals = [0, 6, 0];
+            review::sort(&mut v.preview, &v.review_state);
+            v.review_state
+                .rejected
+                .insert(dedup_core::diff::source_key("cache/file2.db"));
+        }
+        h.run();
+        let img = h.render().expect("wgpu render failed");
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/review_snapshot.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 
     /// Manual visual check of the reworked ORGANIZE layout (nested collapsible

@@ -401,7 +401,10 @@ pub fn organize_apply(
     rules: &[OrganizeRule],
     run: &DiffRun<'_>,
 ) -> Result<OrganizeStats, DiffError> {
-    let plan = plan_organize(store, repo, rules)?;
+    let plan: Vec<(String, String)> = plan_organize(store, repo, rules)?
+        .into_iter()
+        .filter(|(from, _)| run.selected_source(from))
+        .collect();
     let db = store.open_repo_db(repo)?;
     let root = PathBuf::from(&store.get_repo(repo)?.abs_path);
     let total = plan.len() as u64;

@@ -1136,3 +1136,120 @@ fn folder_export_move_marks_source_missing() -> TestResult {
     assert!(again.is_empty(), "the moved file is no longer exportable");
     Ok(())
 }
+
+// --- Review-board selection (exclude / only) ---------------------------------
+
+/// A rejected review row (exclude set) is skipped by `diff_copy`; the rest of
+/// the batch proceeds.
+#[test]
+fn diff_copy_skips_excluded_rows() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "keep.txt", b"keep")?;
+    Sandbox::write(&sb.a_root, "reject.txt", b"reject")?;
+    sb.update("A")?;
+    sb.update("B")?;
+
+    let exclude: std::collections::HashSet<String> =
+        [dedup_core::diff::source_key("reject.txt")].into();
+    let cancel = CancellationToken::new();
+    let run = DiffRun::new(&NoDiffProgress, &cancel).with_selection(Some(&exclude), None);
+    let stats = diff_copy(
+        &sb.store,
+        "A",
+        &["B"],
+        CopyDest {
+            dir: &sb.b_root,
+            subdir: None,
+        },
+        false,
+        None,
+        &run,
+    )?;
+    assert_eq!(stats.copied, 1, "only the non-rejected file is copied");
+    assert!(sb.b_root.join("keep.txt").exists());
+    assert!(!sb.b_root.join("reject.txt").exists());
+    Ok(())
+}
+
+/// An `only` set of one row applies exactly that action — the single-row
+/// APPLY is the batch op with a one-element allowlist.
+#[test]
+fn diff_copy_only_applies_a_single_row() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "one.txt", b"one")?;
+    Sandbox::write(&sb.a_root, "two.txt", b"two")?;
+    sb.update("A")?;
+    sb.update("B")?;
+
+    let only: std::collections::HashSet<String> = [dedup_core::diff::source_key("two.txt")].into();
+    let cancel = CancellationToken::new();
+    let run = DiffRun::new(&NoDiffProgress, &cancel).with_selection(None, Some(&only));
+    let stats = diff_copy(
+        &sb.store,
+        "A",
+        &["B"],
+        CopyDest {
+            dir: &sb.b_root,
+            subdir: None,
+        },
+        false,
+        None,
+        &run,
+    )?;
+    assert_eq!(stats.copied, 1);
+    assert!(sb.b_root.join("two.txt").exists());
+    assert!(!sb.b_root.join("one.txt").exists());
+    Ok(())
+}
+
+/// A mirror's excluded target-side deletion stays on disk and its index entry
+/// stays present; the selected deletion goes through.
+#[test]
+fn mirror_delete_respects_target_side_exclusion() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "common.txt", b"common")?;
+    Sandbox::write(&sb.b_root, "common.txt", b"common")?;
+    Sandbox::write(&sb.b_root, "extra1.txt", b"extra1")?;
+    Sandbox::write(&sb.b_root, "extra2.txt", b"extra2")?;
+    sb.update("A")?;
+    sb.update("B")?;
+
+    let exclude: std::collections::HashSet<String> =
+        [dedup_core::diff::target_key("extra1.txt")].into();
+    let cancel = CancellationToken::new();
+    let run = DiffRun::new(&NoDiffProgress, &cancel).with_selection(Some(&exclude), None);
+    let stats = diff_sync(&sb.store, "A", "B", true, SyncDelete::Absent, None, &run)?;
+    assert_eq!(stats.deleted, 1, "only the non-rejected extra is deleted");
+    assert!(sb.b_root.join("extra1.txt").exists(), "rejected row kept");
+    assert!(!sb.b_root.join("extra2.txt").exists());
+    assert!(
+        !sb.store.get_file_entry("B", "extra1.txt")?.unwrap().missing,
+        "the kept file's index entry stays present"
+    );
+    Ok(())
+}
+
+/// `organize_apply` with an `only` allowlist moves exactly that file.
+#[test]
+fn organize_only_moves_a_single_row() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "a.txt", b"a")?;
+    Sandbox::write(&sb.a_root, "b.txt", b"b")?;
+    sb.update("A")?;
+
+    let rules = [dedup_core::organize::OrganizeRule {
+        filter: None,
+        template: "moved/{o-name}".into(),
+    }];
+    let only: std::collections::HashSet<String> = [dedup_core::diff::source_key("b.txt")].into();
+    let cancel = CancellationToken::new();
+    let run = DiffRun::new(&NoDiffProgress, &cancel).with_selection(None, Some(&only));
+    let stats = dedup_core::organize::organize_apply(&sb.store, "A", &rules, &run)?;
+    assert_eq!(stats.moved, 1);
+    assert!(sb.a_root.join("moved/b.txt").exists());
+    assert!(
+        sb.a_root.join("a.txt").exists(),
+        "unselected file untouched"
+    );
+    Ok(())
+}
