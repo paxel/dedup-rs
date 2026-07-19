@@ -65,6 +65,15 @@ the same, then marks the source entries missing. SYNC mirrors the source into th
 the same relative path, and can also delete target files whose content the source has lost \
 (DELETE MISSING).
 
+DIFF is the manual view: it compares the two repos side by side and leaves every decision \
+to you. PAIR BY HASH matches files by content, so the same file under two names is one row \
+you can settle with a rename; PAIR BY PATH matches by name and folder, so the same name \
+holding different content shows up as a conflict. Each row offers what makes sense for it — \
+copy the file across, delete it, rename one side to the other's name, or overwrite one side \
+with the other — and a side holding several copies of the same content is narrowed down \
+first with DELETE ALL or KEEP 1. Nothing happens until you click a row's button; rows that \
+are equal on both sides are hidden until you ask for them.
+
 Use the FILTER wizard below to narrow which files are considered — conditions combine with \
 AND. PREVIEW shows the matching transfers, paged, plus a total count, without touching \
 disk. RUN asks for confirmation, then performs the transfer while you watch its progress — \

@@ -24,6 +24,9 @@ equivalent of [`diff cp`/`mv`/`rm`](../cli.md#diff).
 - **DELETE** — delete source files whose content the target (or an ALSO REF repo) already
   has; nothing is written to the target.
 
+- **DIFF** — compare the two repos side by side and resolve the differences yourself, one
+  row at a time (see [Diff board](#diff-board) below). Nothing runs as a batch.
+
 ## Into (subfolder)
 
 For COPY/MOVE, an optional relative subfolder inside the target — files keep their
@@ -49,6 +52,30 @@ sessions. **CLEAR** removes every condition.
 apply a saved preset (click its pill), or forget one (**×**). **EXPORT**/**IMPORT** move the
 whole remembered-value + preset history to/from a JSON file, for backup or sharing between
 machines.
+
+## Diff board
+
+**DIFF** replaces the preview table with a two-sided comparison of the source (left) and
+target (right) repo, with each side's path, size and modification date in sortable columns.
+
+**PAIR BY** decides what counts as one row:
+
+- **BY HASH** — files are matched by content, so the same photo under two names is a single
+  row. Same content at the same path is *equal*; same content under different names offers
+  **RENAME** on either side (renaming that side to the other's name); content only one side
+  has offers **COPY** on the side that lacks it and **DELETE** on the side that has it.
+- **BY PATH** — files are matched by their path inside the repo. Same path with the same
+  content is *equal*; same path with different content is a conflict, offering **OVERWRITE**
+  (replace the other side's file with this one) and **DELETE** per side.
+
+When one side holds the same content under several names, that side is narrowed down first:
+**DELETE ALL** drops every copy (after confirming) and **KEEP 1** asks which copy to keep and
+deletes the others. When the *other* side offers several names, **RENAME** asks which name to
+take. After every action the board re-compares the two repos, so the row's buttons always
+reflect the current state.
+
+Equal rows are hidden until **SHOW EQUAL** is pressed, and each action is applied to disk
+and to both repo indexes immediately — there is no RUN button and no batch confirmation.
 
 ## Preview and run
 

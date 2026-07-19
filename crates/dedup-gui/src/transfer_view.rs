@@ -8,6 +8,9 @@
 //! - **Sync** mirrors the source into the target at the same relative path:
 //!   copy content the target lacks, and (with DELETE MISSING on) delete target
 //!   files whose content the source has lost. The source is never changed.
+//! - **Diff** compares the two repos side by side (by content or by path) and
+//!   leaves every decision to the user: each row offers copy / delete / rename /
+//!   overwrite per side, applied one click at a time (see `diff_board.rs`).
 
 use crate::filter_ui::FilterBuilder;
 use crate::icon;
@@ -17,8 +20,9 @@ use crate::theme;
 use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::diff::{
-    CopyDest, DiffAction, DiffEvent, DiffItem, DiffProgress, DiffRun, FolderMode, SyncDelete,
-    diff_copy, diff_print, diff_sync, export_to_folder, plan_folder_export, plan_sync,
+    CopyDest, DiffAction, DiffEvent, DiffItem, DiffPairing, DiffProgress, DiffRun, FolderMode,
+    RepoDiffRow, SyncDelete, copy_file_between, delete_file, diff_copy, diff_print, diff_sync,
+    export_to_folder, overwrite_file, plan_folder_export, plan_repo_diff, plan_sync, rename_file,
 };
 use dedup_core::store::Store;
 use dedup_core::update::CancellationToken;
@@ -38,6 +42,7 @@ enum Command {
     Move,
     Sync,
     Mirror,
+    Diff,
 }
 
 impl Command {
@@ -47,6 +52,7 @@ impl Command {
             Command::Move => "MOVE",
             Command::Sync => "SYNC",
             Command::Mirror => "MIRROR",
+            Command::Diff => "DIFF",
         }
     }
     /// Whether the command is inherently destructive to on-disk data by itself.
@@ -59,7 +65,13 @@ impl Command {
     /// Whether the command runs repo→repo at the same relative path (SYNC /
     /// MIRROR), which hides the DEST / subdir / folder / dupe-pool controls.
     fn repo_to_repo(self) -> bool {
-        matches!(self, Command::Sync | Command::Mirror)
+        matches!(self, Command::Sync | Command::Mirror | Command::Diff)
+    }
+    /// DIFF is a manual side-by-side view rather than a batch run: it has no
+    /// filter, no RUN button and no confirmation — every change is made by
+    /// clicking a single row's action.
+    fn is_diff(self) -> bool {
+        matches!(self, Command::Diff)
     }
     /// (short, verbose) tooltip text for this command's selector button.
     fn tooltip(self) -> (&'static str, &'static str) {
@@ -87,6 +99,13 @@ impl Command {
                 "Copy source content the target lacks AND delete everything in the target \
                  the source does not have, so the target ends up holding exactly the \
                  source's content. Deletions cannot be undone. The source is never changed.",
+            ),
+            Command::Diff => (
+                "Compare the two repos side by side",
+                "Compare the source and target repository file by file and resolve the \
+                 differences one row at a time: copy what only one side has, delete it, \
+                 rename a file to the other side's name, or overwrite one side with the \
+                 other. Nothing happens until you click a row's button.",
             ),
         }
     }
@@ -155,6 +174,10 @@ enum OpResult {
         /// True for a MIRROR run (labels the status line), false for SYNC.
         mirror: bool,
     },
+    /// A single DIFF board row action finished; the message is the status line.
+    Applied {
+        message: String,
+    },
     Error(String),
 }
 
@@ -207,6 +230,12 @@ pub struct TransferView {
     /// The shared FILTER wizard (conditions, presets, suggestions, live count).
     filter: FilterBuilder,
     preview: Vec<review::ReviewRow>,
+    /// DIFF: how the two repos are paired up (by content or by path).
+    pairing: DiffPairing,
+    /// DIFF: the rows of the current comparison, empty until PREVIEW.
+    diff_rows: Vec<RepoDiffRow>,
+    /// Sort/paging state of the diff board.
+    board_state: crate::diff_board::BoardState,
     /// Full per-kind counts (indexed by [`review::RowKind::idx`]) for the review
     /// summary; independent of the capped `preview` sample.
     preview_totals: [usize; 3],
@@ -256,6 +285,9 @@ enum Act {
     CancelRun,
     /// Apply a single review row immediately (its namespaced key).
     ApplyRow(String),
+    SetPairing(DiffPairing),
+    /// Execute a single DIFF board row action.
+    Board(crate::diff_board::BoardAction),
 }
 
 impl TransferView {
@@ -278,6 +310,9 @@ impl TransferView {
             subdir: String::new(),
             filter: FilterBuilder::new(),
             preview: Vec::new(),
+            pairing: DiffPairing::ByHash,
+            diff_rows: Vec::new(),
+            board_state: crate::diff_board::BoardState::default(),
             preview_totals: [0; 3],
             preview_source_header: String::new(),
             preview_target_header: String::new(),
@@ -348,6 +383,9 @@ impl TransferView {
                 if i.key_pressed(egui::Key::Num4) {
                     acts.push(Act::SetCommand(Command::Mirror));
                 }
+                if i.key_pressed(egui::Key::Num5) {
+                    acts.push(Act::SetCommand(Command::Diff));
+                }
                 if i.key_pressed(egui::Key::P) {
                     acts.push(Act::Preview);
                 }
@@ -376,7 +414,7 @@ impl TransferView {
                 );
                 crate::util::shortcut_bar(
                     ui,
-                    "1 copy · 2 move · 3 sync · 4 mirror · P preview · R run",
+                    "1 copy · 2 move · 3 sync · 4 mirror · 5 diff · P preview · R run",
                 );
 
                 self.repo_rows(ui, &mut acts);
@@ -386,6 +424,7 @@ impl TransferView {
                 // DELETE MISSING toggle; MIRROR shows a warning (it always
                 // deletes).
                 match self.command {
+                    Command::Diff => self.pairing_bar(ui, &mut acts),
                     Command::Sync => self.sync_bar(ui, &mut acts),
                     Command::Mirror => self.mirror_bar(ui),
                     _ => {
@@ -400,17 +439,20 @@ impl TransferView {
                     }
                 }
                 // The shared FILTER wizard; the source repo backs its MIME
-                // suggestions and live match count.
-                let source = self.source.clone();
-                let outcome = self.filter.ui(ui, store, source.as_deref(), self.verbosity);
-                if outcome.changed {
-                    self.clear_preview();
-                }
-                if outcome.status.is_some() {
-                    self.status = outcome.status;
-                }
-                if outcome.error.is_some() {
-                    self.error = outcome.error;
+                // suggestions and live match count. DIFF compares the repos
+                // whole, so it has nothing to filter.
+                if !self.command.is_diff() {
+                    let source = self.source.clone();
+                    let outcome = self.filter.ui(ui, store, source.as_deref(), self.verbosity);
+                    if outcome.changed {
+                        self.clear_preview();
+                    }
+                    if outcome.status.is_some() {
+                        self.status = outcome.status;
+                    }
+                    if outcome.error.is_some() {
+                        self.error = outcome.error;
+                    }
                 }
                 self.action_bar(ui, &mut acts);
 
@@ -627,11 +669,17 @@ impl TransferView {
     fn command_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         crate::lcars::section_lcars(
             ui,
-            "COMMAND — COPY, MOVE, SYNC OR MIRROR",
+            "COMMAND — COPY, MOVE, SYNC, MIRROR OR DIFF",
             theme::ORANGE,
             |ui| {
                 ui.horizontal(|ui| {
-                    for cmd in [Command::Copy, Command::Move, Command::Sync, Command::Mirror] {
+                    for cmd in [
+                        Command::Copy,
+                        Command::Move,
+                        Command::Sync,
+                        Command::Mirror,
+                        Command::Diff,
+                    ] {
                         let sel = self.command == cmd;
                         let accent = if cmd.destructive() {
                             theme::RED
@@ -891,6 +939,10 @@ impl TransferView {
                 "Make the target an exact copy of the source: copy what it lacks and delete \
                  everything the source does not have."
             }
+            Command::Diff => {
+                "Compare the two repos side by side and resolve each difference yourself — \
+                 copy, delete, rename or overwrite, one row at a time."
+            }
         };
         ui.label(RichText::new(text).color(theme::LILAC).size(11.0));
     }
@@ -930,6 +982,53 @@ impl TransferView {
     /// SYNC's option bar: the DELETE MISSING toggle (off by default). SYNC has
     /// no subdir/folder/mode controls — it always mirrors source→target at the
     /// same relative path.
+    /// DIFF's option bar: how the two repos are paired up.
+    fn pairing_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        crate::lcars::section_lcars(ui, "PAIR BY — HOW FILES ARE MATCHED", theme::BLUE, |ui| {
+            ui.horizontal(|ui| {
+                for (pairing, label, short, verbose) in [
+                    (
+                        DiffPairing::ByHash,
+                        "BY HASH",
+                        "Match files by content",
+                        "Match files by their content, so the same photo under two \
+                         different names is one row you can resolve with a rename. \
+                         This is the view for finding what one repo has and the other \
+                         doesn't, whatever things are called.",
+                    ),
+                    (
+                        DiffPairing::ByPath,
+                        "BY PATH",
+                        "Match files by name and folder",
+                        "Match files by their path inside the repo, so the same name on \
+                         both sides is one row — and when the two versions differ you can \
+                         overwrite one side with the other. This is the view for spotting \
+                         edited files.",
+                    ),
+                ] {
+                    let selected = self.pairing == pairing;
+                    if crate::lcars::toggle_button(ui, label, selected, theme::BLUE)
+                        .explain(self.verbosity, short, verbose)
+                        .clicked()
+                    {
+                        acts.push(Act::SetPairing(pairing));
+                    }
+                }
+            });
+            let hint = match self.pairing {
+                DiffPairing::ByHash => {
+                    "Rows pair files with identical content; a file only one side has can \
+                     be copied across or deleted."
+                }
+                DiffPairing::ByPath => {
+                    "Rows pair files with the same path; same name with different content \
+                     is a conflict you resolve per side."
+                }
+            };
+            ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
+        });
+    }
+
     fn sync_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         crate::lcars::section_lcars(ui, "OPTIONS — SYNC BEHAVIOUR", theme::BLUE, |ui| {
             ui.horizontal(|ui| {
@@ -995,6 +1094,12 @@ impl TransferView {
                 {
                     acts.push(Act::Preview);
                 }
+                if self.command.is_diff() {
+                    if self.running {
+                        ui.add(egui::Spinner::new().color(theme::AMBER));
+                    }
+                    return;
+                }
                 let run =
                     egui::Button::new(RichText::new("RUN").color(theme::BLACK)).fill(theme::AMBER);
                 if ui
@@ -1034,6 +1139,26 @@ impl TransferView {
     }
 
     fn preview_panel(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        if self.command.is_diff() {
+            if self.diff_rows.is_empty() {
+                ui.add_space(6.0);
+                ui.colored_label(
+                    theme::TEXT,
+                    "Pick two repos and press PREVIEW to compare them.",
+                );
+                return;
+            }
+            if let Some(action) = crate::diff_board::board(
+                ui,
+                &mut self.board_state,
+                &self.diff_rows,
+                &self.preview_source_header,
+                &self.preview_target_header,
+            ) {
+                acts.push(Act::Board(action));
+            }
+            return;
+        }
         if self.preview.is_empty() {
             ui.add_space(6.0);
             ui.colored_label(
@@ -1221,12 +1346,21 @@ impl TransferView {
                 self.start(store, None);
             }
             Act::ApplyRow(key) => self.start(store, Some(key)),
+            Act::SetPairing(pairing) => {
+                self.pairing = pairing;
+                self.clear_preview();
+            }
+            Act::Board(action) => self.start_board_action(store, action),
             Act::CancelRun => self.cancel.cancel(),
         }
     }
 
     fn clear_preview(&mut self) {
         self.preview.clear();
+        self.diff_rows.clear();
+        self.board_state.page = 0;
+        // A popup belongs to the rows it was opened from.
+        self.board_state.popup = None;
         self.preview_totals = [0; 3];
         self.preview_source_header.clear();
         self.preview_target_header.clear();
@@ -1307,6 +1441,10 @@ impl TransferView {
         };
         // PREVIEW and RUN are mutually exclusive: previewing drops any run log.
         self.reset_run();
+        if self.command.is_diff() {
+            self.run_preview_diff(store, &source);
+            return;
+        }
         if self.command.repo_to_repo() {
             self.run_preview_sync(store, &source);
             return;
@@ -1450,6 +1588,114 @@ impl TransferView {
         }
     }
 
+    /// DIFF: compare source and target and fill the board. Like the other
+    /// previews this is a plain index read, so it runs on the UI thread.
+    fn run_preview_diff(&mut self, store: &Store, source: &str) {
+        let Some(target) = self.target.clone() else {
+            return;
+        };
+        match plan_repo_diff(store, source, &target, self.pairing) {
+            Ok(mut rows) => {
+                crate::diff_board::sort(&mut rows, &self.board_state);
+                let differing = rows
+                    .iter()
+                    .filter(|r| r.relation != dedup_core::diff::DiffRelation::Equal)
+                    .count();
+                self.preview_source_header = Self::repo_header(store, source);
+                self.preview_target_header = Self::repo_header(store, &target);
+                self.preview_total = differing;
+                self.diff_rows = rows;
+                self.status = Some(format!(
+                    "{differing} difference(s) between '{source}' and '{target}'."
+                ));
+                self.error = None;
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    /// Execute one DIFF board row action on a worker thread (a single file can
+    /// still be large), then re-plan the diff so the row reflects the result.
+    fn start_board_action(&mut self, store: &Arc<Store>, action: crate::diff_board::BoardAction) {
+        use crate::diff_board::BoardAction;
+        let (Some(source), Some(target)) = (self.source.clone(), self.target.clone()) else {
+            return;
+        };
+        let store = Arc::clone(store);
+        let tx = self.tx.clone();
+        self.running = true;
+        self.pending_refresh = true;
+        self.reset_run();
+        self.status = Some("applying…".to_string());
+
+        std::thread::spawn(move || {
+            // "left" is always the source repo, "right" the target.
+            let side = |on_left: bool| {
+                if on_left {
+                    (source.clone(), target.clone())
+                } else {
+                    (target.clone(), source.clone())
+                }
+            };
+            let outcome = match action {
+                BoardAction::Copy {
+                    from_left,
+                    rel_path,
+                } => {
+                    let (from, to) = side(from_left);
+                    copy_file_between(&store, &from, &rel_path, &to, &rel_path)
+                        .map(|()| format!("Copied '{rel_path}' to '{to}'."))
+                }
+                BoardAction::Delete { on_left, rel_path } => {
+                    let (repo, _) = side(on_left);
+                    delete_file(&store, &repo, &rel_path)
+                        .map(|()| format!("Deleted '{rel_path}' from '{repo}'."))
+                }
+                BoardAction::Rename { on_left, from, to } => {
+                    let (repo, _) = side(on_left);
+                    rename_file(&store, &repo, &from, &to)
+                        .map(|()| format!("Renamed '{from}' to '{to}' in '{repo}'."))
+                }
+                BoardAction::Overwrite {
+                    from_left,
+                    from_rel,
+                    to_rel,
+                } => {
+                    let (from, to) = side(from_left);
+                    overwrite_file(&store, &from, &from_rel, &to, &to_rel)
+                        .map(|()| format!("Overwrote '{to_rel}' in '{to}' with '{from}'s copy."))
+                }
+                BoardAction::DeleteMany { on_left, rel_paths } => {
+                    let (repo, _) = side(on_left);
+                    // Best effort as a batch: stop at the first failure so the
+                    // message names the file that could not be removed.
+                    let mut deleted = 0usize;
+                    let mut failed = None;
+                    for rel_path in &rel_paths {
+                        match delete_file(&store, &repo, rel_path) {
+                            Ok(()) => deleted += 1,
+                            Err(e) => {
+                                failed = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    match failed {
+                        Some(e) => Err(e),
+                        None => Ok(format!("Deleted {deleted} file(s) from '{repo}'.")),
+                    }
+                }
+                // Popups are answered in the board itself; nothing to run.
+                BoardAction::OpenPopup { .. } => Ok(String::new()),
+            };
+            let result = match outcome {
+                Ok(message) => OpResult::Applied { message },
+                Err(e) => OpResult::Error(e.to_string()),
+            };
+            let _ = tx.send(Msg::Done(result));
+        });
+    }
+
     fn run_preview_folder(&mut self, store: &Store, source: &str) {
         let folder = self.folder.trim().to_string();
         if folder.is_empty() {
@@ -1554,6 +1800,8 @@ impl TransferView {
                  source's content. Deletions cannot be undone. The source is not changed.",
                 self.preview_total, self.sync_delete_total
             ),
+            // DIFF never runs as a batch: its rows are applied one by one.
+            Command::Diff => return None,
         })
     }
 
@@ -1810,6 +2058,10 @@ impl TransferView {
                                 parts.join(", "),
                                 if cancelled { " (cancelled)" } else { "" }
                             ));
+                            self.error = None;
+                        }
+                        OpResult::Applied { message } => {
+                            self.status = Some(message);
                             self.error = None;
                         }
                         OpResult::Error(e) => self.error = Some(e),
@@ -2229,6 +2481,247 @@ mod ui_tests {
             );
         harness.run();
         harness
+    }
+
+    /// A harness in DIFF mode with a seeded board: one file only the source
+    /// has, one renamed pair, one equal pair.
+    fn diff_harness() -> Harness<'static, TransferView> {
+        let (_tmp, store) = sample_store();
+        std::mem::forget(_tmp);
+        diff_harness_over(store)
+    }
+
+    /// The DIFF harness over an existing store (so a test can index the repos
+    /// first and let the row actions really run).
+    fn diff_harness_over(store: Arc<Store>) -> Harness<'static, TransferView> {
+        let mut view = TransferView::new();
+        view.loaded = true;
+        view.repos = vec!["source".to_string(), "target".to_string()];
+        view.source = Some("source".to_string());
+        view.target = Some("target".to_string());
+        view.command = Command::Diff;
+        view.preview_source_header = "/repos/source".to_string();
+        view.preview_target_header = "/repos/target".to_string();
+        let file = |rel: &str, size: u64| dedup_core::diff::DiffFile {
+            rel_path: rel.to_string(),
+            size,
+            modified_ms: 1_700_000_000_000,
+        };
+        view.diff_rows = vec![
+            RepoDiffRow {
+                relation: dedup_core::diff::DiffRelation::OnlyLeft,
+                left: vec![file("holiday.jpg", 2048)],
+                right: Vec::new(),
+            },
+            RepoDiffRow {
+                relation: dedup_core::diff::DiffRelation::Renamed,
+                left: vec![file("old-name.txt", 12)],
+                right: vec![file("new-name.txt", 12)],
+            },
+            RepoDiffRow {
+                relation: dedup_core::diff::DiffRelation::Equal,
+                left: vec![file("notes.txt", 15)],
+                right: vec![file("notes.txt", 15)],
+            },
+        ];
+        view.preview_total = 2;
+
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 1100.0))
+            .build_ui_state(
+                move |ui, view: &mut TransferView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store, TooltipVerbosity::default(), None);
+                },
+                view,
+            );
+        harness.run();
+        harness
+    }
+
+    /// DIFF mode shows the pairing toggles and drops the controls that make no
+    /// sense for a manual comparison: no filter wizard, no RUN.
+    #[test]
+    fn diff_mode_shows_pairing_and_hides_filter_and_run() {
+        let h = diff_harness();
+        assert!(
+            h.query_by_label("BY HASH").is_some(),
+            "pairing toggles show"
+        );
+        assert!(h.query_by_label("BY PATH").is_some());
+        assert!(
+            h.query_by_label("RUN").is_none(),
+            "DIFF has no batch RUN — rows are applied one at a time"
+        );
+        assert!(
+            h.query_by_label_contains("FILTER").is_none(),
+            "DIFF compares the repos whole, so the filter wizard is hidden"
+        );
+        assert!(
+            h.query_by_label("PREVIEW").is_some(),
+            "PREVIEW still builds the comparison"
+        );
+    }
+
+    /// The board offers the actions each row's relation allows, and hides the
+    /// equal row until the toggle is on.
+    #[test]
+    fn diff_board_offers_row_actions_and_hides_equal_rows() {
+        let mut h = diff_harness();
+        assert!(
+            h.query_by_label_contains("holiday.jpg").is_some(),
+            "the file only the source has is listed"
+        );
+        assert_eq!(
+            h.query_all_by_label("notes.txt").count(),
+            0,
+            "equal rows are hidden by default"
+        );
+        // A one-sided row offers COPY on the side that lacks it and DELETE on
+        // the side that has it; a rename offers RENAME on both sides.
+        assert_eq!(
+            h.get_all_by_label("COPY").count(),
+            2,
+            "the COPY command button plus the row's copy-across action"
+        );
+        assert!(h.query_by_label("DELETE").is_some(), "or delete it here");
+        assert_eq!(
+            h.get_all_by_label("RENAME").count(),
+            2,
+            "a renamed pair can be resolved from either side"
+        );
+        // Sizes and dates are shown for both sides.
+        assert!(
+            h.query_by_label_contains("2.00 KB").is_some(),
+            "the size column is filled"
+        );
+
+        h.get_by_label_contains("SHOW EQUAL").click();
+        h.run();
+        assert_eq!(
+            h.get_all_by_label("notes.txt").count(),
+            2,
+            "the toggle reveals the equal row, listed on both sides"
+        );
+    }
+
+    /// Clicking a row's COPY hands that exact file to the core primitive: the
+    /// file lands in the other repo, and the board refreshes itself.
+    #[test]
+    fn clicking_copy_copies_that_file_into_the_other_repo() {
+        let (tmp, store) = sample_store();
+        // Index both repos so the copy has a real entry to work from.
+        for repo in ["source", "target"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &dedup_core::update::CancellationToken::new(),
+            )
+            .expect("scan test repo");
+        }
+        let target_dir = tmp.path().join("target");
+        let mut h = diff_harness_over(Arc::clone(&store));
+        // The board renders below the command bar, so the row's COPY button is
+        // the second one on screen (the first is the COPY command).
+        match h.get_all_by_label("COPY").last() {
+            Some(button) => button.click(),
+            None => panic!("no COPY button on the board"),
+        }
+        // The action runs on a worker thread; pump frames until it lands.
+        for _ in 0..200 {
+            // step(), not run(): the running spinner repaints every frame.
+            h.step();
+            if target_dir.join("holiday.jpg").exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            target_dir.join("holiday.jpg").exists(),
+            "the clicked row's file was copied into the target repo: {:?}",
+            h.state().error
+        );
+    }
+
+    /// A side holding the same content under several names is narrowed down
+    /// first: KEEP 1 asks which copy survives, and the answer deletes the rest.
+    #[test]
+    fn keep_one_popup_deletes_the_copies_the_user_did_not_pick() {
+        let (tmp, store) = sample_store();
+        let src_dir = tmp.path().join("source");
+        // Three identical copies on the source side, one on the target under
+        // another name — the classic "narrow it down" row.
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(src_dir.join(name), b"same content").expect("write copy");
+        }
+        std::fs::write(tmp.path().join("target/z.txt"), b"same content").expect("write target");
+        for repo in ["source", "target"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &dedup_core::update::CancellationToken::new(),
+            )
+            .expect("scan test repo");
+        }
+        let mut h = diff_harness_over(Arc::clone(&store));
+        {
+            // Real rows this time, straight from the core planner.
+            let view = h.state_mut();
+            view.diff_rows = dedup_core::diff::plan_repo_diff(
+                &store,
+                "source",
+                "target",
+                dedup_core::diff::DiffPairing::ByHash,
+            )
+            .expect("plan diff");
+        }
+        h.run();
+        h.get_by_label("KEEP 1").click();
+        h.run();
+        // The popup lists all three copies; keep b.txt.
+        assert!(
+            h.query_by_label_contains("KEEP ONE COPY").is_some(),
+            "the popup asks which copy to keep"
+        );
+        // The path is both a table cell and a popup button — pick the button.
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "b.txt")
+            .click();
+        for _ in 0..200 {
+            // step(), not run(): the running spinner repaints every frame.
+            h.step();
+            if !src_dir.join("a.txt").exists() && !src_dir.join("c.txt").exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(src_dir.join("b.txt").exists(), "the picked copy stays");
+        assert!(!src_dir.join("a.txt").exists(), "the others are deleted");
+        assert!(!src_dir.join("c.txt").exists(), "the others are deleted");
+        assert!(
+            h.state().board_state.popup.is_none(),
+            "answering closes the popup"
+        );
+    }
+
+    /// Render snapshot of the DIFF board to `target/transfer_diff.png`.
+    #[test]
+    #[ignore = "renders a PNG for manual inspection"]
+    fn render_diff_board() {
+        let mut h = diff_harness();
+        let out =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/transfer_diff.png");
+        let img = h.render().expect("wgpu render failed");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 
     /// The review board summarises the changes, heads the status columns with the
