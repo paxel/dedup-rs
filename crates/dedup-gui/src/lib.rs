@@ -14,6 +14,7 @@ mod lcars;
 mod lightbox;
 mod player;
 mod repo_chip;
+mod review;
 mod settings;
 mod status;
 mod theme;

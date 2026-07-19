@@ -77,13 +77,24 @@
   resolve divergence, etc.
 
 ### Preview panel → review board  *(near-term; grows into sync compare)*
-- Rework the transfer/grooming preview into a **source ⇄ target table**: unchanged = grey,
-  added = greenish, deleted = red — each with a redundant colorblind-safe cue (`+ / − / =`,
-  emoji, or similar) so color is never the only signal. Give each row **reject** and
-  **apply** buttons per side, turning the preview into a **review board**: the user rejects
-  individual actions and can execute a single action immediately. The same panel later
-  powers **sync-group compare** (deleted / different / new files across group repos; equal
-  files optional — usually too noisy) and **manual per-file sync** between repos.
+- **Visual pass — ✅ done (2026-07-19).** Both transfer/grooming previews now render through
+  one shared, scalable **side-by-side diff** (`review.rs`, à la Beyond Compare). Four columns:
+  `STATUS │ ⟨source abs path⟩ │ ⟨target abs path⟩ │ STATUS` — the two status columns are
+  per-side icons (Phosphor: green `+` added, red trash removed, grey `✓` unchanged, grey `✗`
+  absent), and each middle column shows the file's **relative path** on that side, coloured to
+  match its status; a side where the file is absent is an empty path cell. So a copy is
+  source-`✓`/grey path + target-`+`/green path; a deletion is source-trash/red path +
+  target-`✗`/empty. An icon summary sits on top and unchanged rows (least interesting) are
+  **hidden behind a toggle** by default. The virtualised, click-to-sort table reuses Browse's
+  `egui_extras` pattern + the now-shared `util::sort_header` and scrolls through huge sets —
+  sort a status column to group e.g. all deletions. No core changes; the summary shows true
+  totals even when the sample is capped.
+- **Remaining (interactive half).** Give each row **reject** and **apply** buttons, turning
+  the board into a review the user edits: reject individual actions before RUN, or execute a
+  single action immediately. Needs new core primitives (an exclude/accept set on the batch
+  ops + a single-file copy/move/delete). The same panel later powers **sync-group compare**
+  (deleted / different / new files across group repos; equal files optional — usually too
+  noisy) and **manual per-file sync** between repos.
 
 ---
 

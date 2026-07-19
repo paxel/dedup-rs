@@ -11,6 +11,11 @@ pub const TAN: Color32 = Color32::from_rgb(0xFF, 0xCC, 0x99);
 pub const LILAC: Color32 = Color32::from_rgb(0xCC, 0x99, 0xFF);
 pub const BLUE: Color32 = Color32::from_rgb(0x66, 0x99, 0xFF);
 pub const RED: Color32 = Color32::from_rgb(0xE0, 0x66, 0x55);
+/// Muted LCARS green for "added" review rows (kept distinct from the amber/red
+/// pills so the review table's colour cue reads clearly on the black backdrop).
+pub const GREEN: Color32 = Color32::from_rgb(0x66, 0xCC, 0x77);
+/// Dim warm grey for "unchanged" review rows — present but visually recessive.
+pub const GREY: Color32 = Color32::from_rgb(0x8A, 0x82, 0x74);
 pub const TEXT: Color32 = Color32::from_rgb(0xEB, 0xD0, 0xA0);
 pub const PANEL: Color32 = Color32::from_rgb(0x0A, 0x08, 0x0C);
 /// Subtle warm outline that separates dark image content from the dark panels.

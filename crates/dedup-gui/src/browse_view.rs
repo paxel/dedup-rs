@@ -777,7 +777,8 @@ impl BrowseView {
             .header(24.0, |mut header| {
                 for (col, title) in cols {
                     header.col(|ui| {
-                        if sort_header(ui, title, sort_col == col, sort_asc).clicked() {
+                        if crate::util::sort_header(ui, title, sort_col == col, sort_asc).clicked()
+                        {
                             clicked_header = Some(col);
                         }
                     });
@@ -1410,25 +1411,6 @@ fn annotation_chip(ui: &mut egui::Ui, text: &str, mode: ChipMode) -> egui::Respo
     }
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, text));
     resp
-}
-
-/// A clickable file-table column header: the title, plus an up/down caret when
-/// it's the active sort column (amber then, cream otherwise). No background, so
-/// it never turns into an unreadable pill on hover.
-fn sort_header(ui: &mut egui::Ui, title: &str, active: bool, asc: bool) -> egui::Response {
-    let text = if active {
-        let caret = if asc {
-            crate::icon::CARET_UP
-        } else {
-            crate::icon::CARET_DOWN
-        };
-        format!("{title} {caret}")
-    } else {
-        title.to_string()
-    };
-    let color = if active { theme::AMBER } else { theme::TEXT };
-    ui.add(egui::Label::new(RichText::new(text).color(color).strong()).sense(egui::Sense::click()))
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Bright/dim blue selection so both panes keep their selection marked TUI-style

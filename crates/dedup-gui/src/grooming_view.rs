@@ -17,6 +17,7 @@
 //! background thread, reusing the same `DiffEvent` progress plumbing as Transfer.
 
 use crate::filter_ui::FilterBuilder;
+use crate::review;
 use crate::settings::TooltipVerbosity;
 use crate::theme;
 use crate::util::ExplainExt;
@@ -32,7 +33,10 @@ use egui::{Id, RichText};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-const PREVIEW_LIMIT: usize = 30;
+/// Safety cap on how many rows the review table materialises. The virtualised
+/// table renders only visible rows, but we still bound the in-memory sample;
+/// the summary counts are the true totals regardless of this cap.
+const PREVIEW_CAP: usize = 100_000;
 const RUN_LOG_LIMIT: usize = 10;
 
 /// File name of the persisted ORGANIZE presets inside the store's config dir.
@@ -116,11 +120,6 @@ impl Command {
     }
 }
 
-/// One preview entry: the source path, and (for ORGANIZE) where it would go.
-struct PreviewRow {
-    from: String,
-    to: Option<String>,
-}
 
 enum OpResult {
     Deleted {
@@ -209,8 +208,18 @@ pub struct GroomingView {
     presets_loaded: bool,
     /// ORGANIZE: name typed for the preset about to be saved.
     preset_name: String,
-    preview: Vec<PreviewRow>,
+    preview: Vec<review::ReviewRow>,
+    /// Full per-kind counts (indexed by [`review::RowKind::idx`]) for the review
+    /// summary; independent of the capped `preview` sample.
+    preview_totals: [usize; 3],
+    /// The two review-table column headers (absolute paths). ORGANIZE uses the
+    /// same repo on both sides (old path → new path); the single-repo deletions
+    /// leave the target header empty.
+    preview_source_header: String,
+    preview_target_header: String,
     preview_total: usize,
+    /// Sort column + direction for the review table.
+    review_state: review::ReviewState,
     status: Option<String>,
     error: Option<String>,
     confirm: Option<String>,
@@ -258,7 +267,11 @@ impl GroomingView {
             presets_loaded: false,
             preset_name: String::new(),
             preview: Vec::new(),
+            preview_totals: [0; 3],
+            preview_source_header: String::new(),
+            preview_target_header: String::new(),
             preview_total: 0,
+            review_state: review::ReviewState::default(),
             status: None,
             error: None,
             confirm: None,
@@ -521,8 +534,7 @@ impl GroomingView {
                     .filter
                     .ui(ui, store, repo.as_deref(), self.verbosity);
                 if outcome.changed {
-                    self.preview.clear();
-                    self.preview_total = 0;
+                    self.clear_preview();
                 }
                 if outcome.error.is_some() {
                     self.error = outcome.error;
@@ -545,8 +557,7 @@ impl GroomingView {
                         )
                         .changed();
                     if changed {
-                        self.preview.clear();
-                        self.preview_total = 0;
+                        self.clear_preview();
                     }
                 });
                 ui.horizontal_wrapped(|ui| {
@@ -560,8 +571,7 @@ impl GroomingView {
                             .clicked()
                         {
                             self.rules[i].template.push_str(insert);
-                            self.preview.clear();
-                            self.preview_total = 0;
+                            self.clear_preview();
                         }
                     }
                 });
@@ -729,34 +739,23 @@ impl GroomingView {
             ui.colored_label(theme::TEXT, "Pick a repo and command, then press PREVIEW.");
             return;
         }
-        ui.label(
-            RichText::new(format!(
-                "{} file(s) match · showing first {}",
-                self.preview_total,
-                self.preview.len()
-            ))
-            .color(theme::AMBER)
-            .strong(),
+        review::table(
+            ui,
+            &mut self.review_state,
+            &mut self.preview,
+            self.preview_totals,
+            &self.preview_source_header,
+            &self.preview_target_header,
         );
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for row in &self.preview {
-                    match &row.to {
-                        // ORGANIZE: show the move as `from → to`.
-                        Some(to) => {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(&row.from).color(theme::TEXT).size(12.0));
-                                ui.label(RichText::new("→").color(theme::ORANGE));
-                                ui.label(RichText::new(to).color(theme::BLUE).size(12.0));
-                            });
-                        }
-                        None => {
-                            ui.label(RichText::new(&row.from).color(theme::TEXT).size(12.0));
-                        }
-                    }
-                }
-            });
+    }
+
+    /// A repo's absolute path for a review-table column header, falling back to
+    /// its name if it can't be resolved.
+    fn repo_header(store: &Store, name: &str) -> String {
+        store
+            .get_repo(name)
+            .map(|m| m.abs_path)
+            .unwrap_or_else(|_| name.to_string())
     }
 
     fn run_panel(&mut self, ui: &mut egui::Ui) {
@@ -970,6 +969,9 @@ impl GroomingView {
 
     fn clear_preview(&mut self) {
         self.preview.clear();
+        self.preview_totals = [0; 3];
+        self.preview_source_header.clear();
+        self.preview_target_header.clear();
         self.preview_total = 0;
     }
 
@@ -988,6 +990,7 @@ impl GroomingView {
                 let Some(source) = self.source.clone() else {
                     return;
                 };
+                self.preview_source_header = Self::repo_header(store, &source);
                 let pool = self.pool.clone();
                 let ref_slice: Vec<&str> = pool.iter().map(String::as_str).collect();
                 dedup_core::diff::diff_print(store, &source, &ref_slice, filter.as_deref())
@@ -1003,7 +1006,7 @@ impl GroomingView {
                             })
                             .collect();
                         let total = matched.len();
-                        (matched.into_iter().take(PREVIEW_LIMIT).collect(), total)
+                        (matched.into_iter().take(PREVIEW_CAP).collect(), total)
                     })
                     .map_err(|e| e.to_string())
             }
@@ -1011,14 +1014,16 @@ impl GroomingView {
                 let Some(repo) = self.repo.clone() else {
                     return;
                 };
-                preview_by_filter(store, &repo, filter.as_deref(), PREVIEW_LIMIT)
+                self.preview_source_header = Self::repo_header(store, &repo);
+                preview_by_filter(store, &repo, filter.as_deref(), PREVIEW_CAP)
                     .map_err(|e| e.to_string())
             }
             Command::Prune => {
                 let Some(repo) = self.repo.clone() else {
                     return;
                 };
-                preview_prune(store, &repo, PREVIEW_LIMIT).map_err(|e| e.to_string())
+                self.preview_source_header = Self::repo_header(store, &repo);
+                preview_prune(store, &repo, PREVIEW_CAP).map_err(|e| e.to_string())
             }
             Command::Organize => {
                 self.run_preview_organize(store);
@@ -1029,11 +1034,22 @@ impl GroomingView {
         };
         match result {
             Ok((paths, total)) => {
+                // DEDUPE / PURGE / PRUNE all remove files from the one repo: the
+                // source side is removed, the target side is absent.
                 self.preview_total = total;
-                self.preview = paths
+                self.preview_totals = [0, total, 0];
+                self.preview_target_header.clear();
+                let mut rows: Vec<review::ReviewRow> = paths
                     .into_iter()
-                    .map(|from| PreviewRow { from, to: None })
+                    .map(|from| review::ReviewRow {
+                        source: review::SideStatus::Removed,
+                        target: review::SideStatus::Absent,
+                        source_path: from,
+                        target_path: String::new(),
+                    })
                     .collect();
+                review::sort(&mut rows, &self.review_state);
+                self.preview = rows;
                 self.status = Some(format!("{total} file(s) match."));
                 self.error = None;
             }
@@ -1061,11 +1077,25 @@ impl GroomingView {
         match plan_organize(store, &repo, &self.organize_rules()) {
             Ok(moves) => {
                 self.preview_total = moves.len();
-                self.preview = moves
+                // A relocation both removes the old path and adds the new one.
+                self.preview_totals = [moves.len(), moves.len(), 0];
+                // ORGANIZE relocates within one repo: the old path is removed and
+                // the new path added — same repo on both sides.
+                let header = Self::repo_header(store, &repo);
+                self.preview_source_header = header.clone();
+                self.preview_target_header = header;
+                let mut rows: Vec<review::ReviewRow> = moves
                     .into_iter()
-                    .take(PREVIEW_LIMIT)
-                    .map(|(from, to)| PreviewRow { from, to: Some(to) })
+                    .take(PREVIEW_CAP)
+                    .map(|(from, to)| review::ReviewRow {
+                        source: review::SideStatus::Removed,
+                        target: review::SideStatus::Added,
+                        source_path: from,
+                        target_path: to,
+                    })
                     .collect();
+                review::sort(&mut rows, &self.review_state);
+                self.preview = rows;
                 self.status = Some(format!("{} file(s) would move.", self.preview_total));
                 self.error = None;
             }
@@ -1448,6 +1478,50 @@ mod ui_tests {
         assert!(
             organize.query_by_label("DUPEPOOL").is_none(),
             "ORGANIZE has no dupe pool"
+        );
+    }
+
+    /// A seeded PURGE preview renders the review board with a `removed` summary,
+    /// the repo path as the source header, and a click-to-sort FILE header.
+    #[test]
+    fn review_board_shows_removed_and_sorts() {
+        let (_tmp, store) = sample_store();
+        let mut h = grooming_harness(store, Command::Purge);
+        {
+            let v = h.state_mut();
+            v.preview_source_header = "/repos/junk".to_string();
+            v.preview = vec![
+                review::ReviewRow {
+                    source: review::SideStatus::Removed,
+                    target: review::SideStatus::Absent,
+                    source_path: "a.tmp".to_string(),
+                    target_path: String::new(),
+                },
+                review::ReviewRow {
+                    source: review::SideStatus::Removed,
+                    target: review::SideStatus::Absent,
+                    source_path: "b.tmp".to_string(),
+                    target_path: String::new(),
+                },
+            ];
+            v.preview_totals = [0, 2, 0];
+            review::sort(&mut v.preview, &v.review_state);
+        }
+        h.run();
+        assert!(
+            h.query_by_label_contains("2 removed").is_some(),
+            "summary shows the removed count"
+        );
+        assert!(
+            h.query_by_label_contains("/repos/junk").is_some(),
+            "the source column is headed by the repo path"
+        );
+        assert!(h.state().review_state.sort_asc, "starts ascending");
+        h.get_by_label_contains("/repos/junk").click();
+        h.run();
+        assert!(
+            !h.state().review_state.sort_asc,
+            "clicking the source header toggles the sort direction"
         );
     }
 }

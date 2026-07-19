@@ -11,6 +11,7 @@
 
 use crate::filter_ui::FilterBuilder;
 use crate::icon;
+use crate::review;
 use crate::settings::TooltipVerbosity;
 use crate::theme;
 use crate::util::ExplainExt;
@@ -26,7 +27,10 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const PREVIEW_LIMIT: usize = 30;
+/// Safety cap on how many rows the review table materialises. The virtualised
+/// table renders only visible rows, but we still bound the in-memory sample;
+/// the summary counts are the true totals regardless of this cap.
+const PREVIEW_CAP: usize = 100_000;
 /// How many recent actions the running panel keeps in its scrolling log.
 const RUN_LOG_LIMIT: usize = 10;
 
@@ -117,14 +121,6 @@ impl SelectMode {
     }
 }
 
-struct PreviewRow {
-    from: String,
-    to: String,
-    /// A SYNC deletion (rendered in red as `path → deleted`) rather than a
-    /// `from → to` transfer.
-    del: bool,
-}
-
 /// A snapshot of the destination captured when a run starts, so the worker
 /// thread owns everything it needs without borrowing the view.
 enum StartDest {
@@ -212,8 +208,16 @@ pub struct TransferView {
     subdir: String,
     /// The shared FILTER wizard (conditions, presets, suggestions, live count).
     filter: FilterBuilder,
-    preview: Vec<PreviewRow>,
+    preview: Vec<review::ReviewRow>,
+    /// Full per-kind counts (indexed by [`review::RowKind::idx`]) for the review
+    /// summary; independent of the capped `preview` sample.
+    preview_totals: [usize; 3],
+    /// The two review-table column headers: the source and target absolute paths.
+    preview_source_header: String,
+    preview_target_header: String,
     preview_total: usize,
+    /// Sort column + direction for the review table.
+    review_state: review::ReviewState,
     status: Option<String>,
     error: Option<String>,
     confirm: Option<String>,
@@ -273,7 +277,11 @@ impl TransferView {
             subdir: String::new(),
             filter: FilterBuilder::new(),
             preview: Vec::new(),
+            preview_totals: [0; 3],
+            preview_source_header: String::new(),
+            preview_target_header: String::new(),
             preview_total: 0,
+            review_state: review::ReviewState::default(),
             status: None,
             error: None,
             confirm: None,
@@ -1003,44 +1011,23 @@ impl TransferView {
             );
             return;
         }
-        let header = if self.command.repo_to_repo() && self.sync_delete_mode() != SyncDelete::None {
-            format!(
-                "{} to copy · {} to delete · showing first {}",
-                self.preview_total,
-                self.sync_delete_total,
-                self.preview.len()
-            )
-        } else {
-            format!(
-                "{} file(s) match · showing first {}",
-                self.preview_total,
-                self.preview.len()
-            )
-        };
-        ui.label(RichText::new(header).color(theme::AMBER).strong());
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                egui::Grid::new("preview_grid")
-                    .num_columns(3)
-                    .striped(true)
-                    .spacing(egui::vec2(12.0, 4.0))
-                    .show(ui, |ui| {
-                        for row in &self.preview {
-                            if row.del {
-                                // A SYNC deletion: `target/path → deleted`, in red.
-                                ui.label(RichText::new(&row.from).color(theme::RED).size(12.0));
-                                ui.label(RichText::new(icon::ARROW_RIGHT).color(theme::RED));
-                                ui.label(RichText::new("deleted").color(theme::RED).size(12.0));
-                            } else {
-                                ui.label(RichText::new(&row.from).color(theme::TEXT).size(12.0));
-                                ui.label(RichText::new(icon::ARROW_RIGHT).color(theme::ORANGE));
-                                ui.label(RichText::new(&row.to).color(theme::BLUE).size(12.0));
-                            }
-                            ui.end_row();
-                        }
-                    });
-            });
+        review::table(
+            ui,
+            &mut self.review_state,
+            &mut self.preview,
+            self.preview_totals,
+            &self.preview_source_header,
+            &self.preview_target_header,
+        );
+    }
+
+    /// A repo's absolute path for a review-table column header, falling back to
+    /// its name if it can't be resolved.
+    fn repo_header(store: &Store, name: &str) -> String {
+        store
+            .get_repo(name)
+            .map(|m| m.abs_path)
+            .unwrap_or_else(|_| name.to_string())
     }
 
     /// The live run panel: a spinner, the file currently being handled, a
@@ -1213,6 +1200,9 @@ impl TransferView {
 
     fn clear_preview(&mut self) {
         self.preview.clear();
+        self.preview_totals = [0; 3];
+        self.preview_source_header.clear();
+        self.preview_target_header.clear();
         self.preview_total = 0;
         self.sync_delete_total = 0;
     }
@@ -1308,29 +1298,32 @@ impl TransferView {
             Ok(plan) => {
                 self.preview_total = plan.copies.len();
                 self.sync_delete_total = plan.deletes.len();
-                // Copies first (green-ish `from → to`), then any deletions
-                // (red `path → deleted`), up to the shared preview limit.
-                let mut rows: Vec<PreviewRow> = plan
+                self.preview_totals = [plan.copies.len(), plan.deletes.len(), 0];
+                self.preview_source_header = Self::repo_header(store, source);
+                self.preview_target_header = Self::repo_header(store, &target);
+                // A copy: source keeps the file (unchanged), target gains it
+                // (added). A delete: the source no longer has it (absent), the
+                // target loses it (removed). Capped, then sorted.
+                let mut rows: Vec<review::ReviewRow> = plan
                     .copies
                     .iter()
-                    .take(PREVIEW_LIMIT)
-                    .map(|rel| PreviewRow {
-                        from: format!("{source}/{rel}"),
-                        to: format!("{target}/{rel}"),
-                        del: false,
+                    .take(PREVIEW_CAP)
+                    .map(|rel| review::ReviewRow {
+                        source: review::SideStatus::Unchanged,
+                        target: review::SideStatus::Added,
+                        source_path: rel.clone(),
+                        target_path: rel.clone(),
                     })
                     .collect();
-                for rel in plan
-                    .deletes
-                    .iter()
-                    .take(PREVIEW_LIMIT.saturating_sub(rows.len()))
-                {
-                    rows.push(PreviewRow {
-                        from: format!("{target}/{rel}"),
-                        to: String::new(),
-                        del: true,
+                for rel in plan.deletes.iter().take(PREVIEW_CAP.saturating_sub(rows.len())) {
+                    rows.push(review::ReviewRow {
+                        source: review::SideStatus::Absent,
+                        target: review::SideStatus::Removed,
+                        source_path: String::new(),
+                        target_path: rel.clone(),
                     });
                 }
+                review::sort(&mut rows, &self.review_state);
                 self.preview = rows;
                 let verb = self.command.label();
                 self.status = Some(if delete == SyncDelete::None {
@@ -1356,20 +1349,66 @@ impl TransferView {
         let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
         match diff_print(store, source, &ref_slice, filter.as_deref()) {
             Ok(items) => {
-                // Copy/Move act on content the target lacks (New).
-                let matched: Vec<&DiffItem> = items
-                    .iter()
-                    .filter(|item| matches!(item, DiffItem::New { .. }))
-                    .collect();
-                self.preview_total = matched.len();
-                self.preview = matched
-                    .into_iter()
-                    .take(PREVIEW_LIMIT)
-                    .map(|item| self.preview_row(source, &target, item))
-                    .collect();
+                // A file the target lacks (New) is added on the target side; on
+                // the source side a COPY leaves it unchanged while a MOVE removes
+                // it. Files the target already has (Equal) are unchanged on both
+                // sides. DeletedInReference isn't part of a transfer.
+                let subdir = self.normalized_subdir();
+                let move_files = self.command == Command::Move;
+                let source_state = if move_files {
+                    review::SideStatus::Removed
+                } else {
+                    review::SideStatus::Unchanged
+                };
+                let mut acted = 0usize;
+                let mut unchanged = 0usize;
+                let mut rows: Vec<review::ReviewRow> = Vec::new();
+                for item in &items {
+                    match item {
+                        DiffItem::New { rel_path } => {
+                            acted += 1;
+                            if rows.len() < PREVIEW_CAP {
+                                let to = if subdir.is_empty() {
+                                    rel_path.clone()
+                                } else {
+                                    format!("{subdir}/{rel_path}")
+                                };
+                                rows.push(review::ReviewRow {
+                                    source: source_state,
+                                    target: review::SideStatus::Added,
+                                    source_path: rel_path.clone(),
+                                    target_path: to,
+                                });
+                            }
+                        }
+                        DiffItem::Equal { rel_path, .. } => {
+                            unchanged += 1;
+                            if rows.len() < PREVIEW_CAP {
+                                rows.push(review::ReviewRow {
+                                    source: review::SideStatus::Unchanged,
+                                    target: review::SideStatus::Unchanged,
+                                    source_path: rel_path.clone(),
+                                    target_path: rel_path.clone(),
+                                });
+                            }
+                        }
+                        DiffItem::DeletedInReference { .. } => {}
+                    }
+                }
+                self.preview_total = acted;
+                // A move both removes from source and adds to target; a copy only
+                // adds. Totals are [added, removed, unchanged].
+                self.preview_totals = if move_files {
+                    [acted, acted, unchanged]
+                } else {
+                    [acted, 0, unchanged]
+                };
+                self.preview_source_header = Self::repo_header(store, source);
+                self.preview_target_header = Self::repo_header(store, &target);
+                review::sort(&mut rows, &self.review_state);
+                self.preview = rows;
                 self.status = Some(format!(
-                    "{} match the {}.",
-                    self.preview_total,
+                    "{acted} match the {}.",
                     self.command.label().to_lowercase()
                 ));
                 self.error = None;
@@ -1379,7 +1418,7 @@ impl TransferView {
     }
 
     fn run_preview_folder(&mut self, store: &Store, source: &str) {
-        let folder = self.folder.trim();
+        let folder = self.folder.trim().to_string();
         if folder.is_empty() {
             return;
         }
@@ -1396,15 +1435,33 @@ impl TransferView {
         ) {
             Ok(rels) => {
                 self.preview_total = rels.len();
-                self.preview = rels
+                let move_files = self.command == Command::Move;
+                let source_state = if move_files {
+                    review::SideStatus::Removed
+                } else {
+                    review::SideStatus::Unchanged
+                };
+                // Exporting adds each file into the folder; a MOVE also removes
+                // it from the source repo, a COPY leaves the source unchanged.
+                self.preview_totals = if move_files {
+                    [rels.len(), rels.len(), 0]
+                } else {
+                    [rels.len(), 0, 0]
+                };
+                self.preview_source_header = Self::repo_header(store, source);
+                self.preview_target_header = folder.clone();
+                let mut rows: Vec<review::ReviewRow> = rels
                     .iter()
-                    .take(PREVIEW_LIMIT)
-                    .map(|rel| PreviewRow {
-                        from: format!("{source}/{rel}"),
-                        to: format!("{folder}/{rel}"),
-                        del: false,
+                    .take(PREVIEW_CAP)
+                    .map(|rel| review::ReviewRow {
+                        source: source_state,
+                        target: review::SideStatus::Added,
+                        source_path: rel.clone(),
+                        target_path: rel.clone(),
                     })
                     .collect();
+                review::sort(&mut rows, &self.review_state);
+                self.preview = rows;
                 let what = if self.invert { "redundant" } else { "unique" };
                 self.status = Some(format!(
                     "{} {what} file(s) to {}.",
@@ -1414,33 +1471,6 @@ impl TransferView {
                 self.error = None;
             }
             Err(e) => self.error = Some(e.to_string()),
-        }
-    }
-
-    fn preview_row(&self, source: &str, target: &str, item: &DiffItem) -> PreviewRow {
-        let subdir = self.normalized_subdir();
-        match item {
-            DiffItem::New { rel_path } => {
-                let to = if subdir.is_empty() {
-                    format!("{target}/{rel_path}")
-                } else {
-                    format!("{target}/{subdir}/{rel_path}")
-                };
-                PreviewRow {
-                    from: format!("{source}/{rel_path}"),
-                    to,
-                    del: false,
-                }
-            }
-            // Transfer only previews New items (see `run_preview`); content the
-            // target already has is never shown as a transfer.
-            DiffItem::Equal { rel_path, .. } | DiffItem::DeletedInReference { rel_path } => {
-                PreviewRow {
-                    from: format!("{source}/{rel_path}"),
-                    to: String::new(),
-                    del: false,
-                }
-            }
         }
     }
 
@@ -2096,6 +2126,147 @@ mod ui_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("transfer_mirror.png");
         let img = harness.render().expect("wgpu render failed");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// A harness whose preview is seeded with a mix of kinds, so the review
+    /// table renders without needing a real indexed diff. Uses a tall viewport
+    /// so the table (below the command/repo/filter chrome) is on-screen and its
+    /// headers are clickable.
+    fn review_harness() -> Harness<'static, TransferView> {
+        let (_tmp, store) = sample_store();
+        // Keep the temp dir alive for the harness's lifetime.
+        std::mem::forget(_tmp);
+        let mut view = TransferView::new();
+        view.loaded = true;
+        view.repos = vec!["source".to_string(), "target".to_string()];
+        view.source = Some("source".to_string());
+        view.target = Some("target".to_string());
+        view.preview_source_header = "/repos/source".to_string();
+        view.preview_target_header = "/repos/target".to_string();
+        view.preview = vec![
+            // A copy: source unchanged (grey ✓), target added (green +).
+            review::ReviewRow {
+                source: review::SideStatus::Unchanged,
+                target: review::SideStatus::Added,
+                source_path: "holiday.jpg".to_string(),
+                target_path: "holiday.jpg".to_string(),
+            },
+            // Unchanged on both sides (hidden until the toggle is on).
+            review::ReviewRow {
+                source: review::SideStatus::Unchanged,
+                target: review::SideStatus::Unchanged,
+                source_path: "notes.txt".to_string(),
+                target_path: "notes.txt".to_string(),
+            },
+        ];
+        view.preview_totals = [1, 0, 1];
+        review::sort(&mut view.preview, &view.review_state);
+
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 1100.0))
+            .build_ui_state(
+                move |ui, view: &mut TransferView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store, TooltipVerbosity::default(), None);
+                },
+                view,
+            );
+        harness.run();
+        harness
+    }
+
+    /// The review board summarises the changes, heads the status columns with the
+    /// repo paths, hides unchanged rows until the toggle is on, and sorts on a
+    /// header click.
+    #[test]
+    fn review_board_summarises_hides_unchanged_and_sorts() {
+        let mut h = review_harness();
+        assert!(
+            h.query_by_label_contains("1 added").is_some(),
+            "summary shows the added count"
+        );
+        assert!(
+            h.query_by_label_contains("1 unchanged").is_some(),
+            "summary shows the unchanged count"
+        );
+        // The source path column is headed by the repo's absolute path.
+        assert!(
+            h.query_by_label_contains("/repos/source").is_some(),
+            "the source column is headed by its absolute path"
+        );
+        // Unchanged rows are hidden by default; the toggle reveals them. (The
+        // path appears in both the source and target columns, so use query_all.)
+        assert!(
+            !h.state().review_state.show_unchanged,
+            "unchanged hidden by default"
+        );
+        assert!(
+            h.query_all_by_label("notes.txt").next().is_none(),
+            "the unchanged row is hidden until the toggle is on"
+        );
+        h.get_by_label_contains("SHOW UNCHANGED").click();
+        h.run();
+        assert!(h.state().review_state.show_unchanged, "toggle turns it on");
+        assert!(
+            h.query_all_by_label("notes.txt").next().is_some(),
+            "the unchanged row appears once shown"
+        );
+
+        // Source path is the default sort column; clicking its header (the repo
+        // path) flips direction.
+        assert!(h.state().review_state.sort_asc, "starts ascending");
+        h.get_by_label_contains("/repos/source").click();
+        h.run();
+        assert!(
+            !h.state().review_state.sort_asc,
+            "clicking the source header toggles the sort direction"
+        );
+    }
+
+    /// Renders the review table to a PNG for manual inspection. `--ignored`.
+    #[test]
+    #[ignore = "renders a PNG for manual inspection"]
+    fn render_review_table() {
+        let mut h = review_harness();
+        // Seed one of each status and reveal unchanged, so the PNG shows the full
+        // side-by-side vocabulary (added / removed / unchanged / absent).
+        {
+            let v = h.state_mut();
+            v.review_state.show_unchanged = true;
+            v.preview_totals = [1, 1, 1];
+            v.preview = vec![
+                review::ReviewRow {
+                    source: review::SideStatus::Unchanged,
+                    target: review::SideStatus::Added,
+                    source_path: "holiday.jpg".to_string(),
+                    target_path: "holiday.jpg".to_string(),
+                },
+                review::ReviewRow {
+                    source: review::SideStatus::Removed,
+                    target: review::SideStatus::Absent,
+                    source_path: "old.tmp".to_string(),
+                    target_path: String::new(),
+                },
+                review::ReviewRow {
+                    source: review::SideStatus::Unchanged,
+                    target: review::SideStatus::Unchanged,
+                    source_path: "notes.txt".to_string(),
+                    target_path: "notes.txt".to_string(),
+                },
+            ];
+            review::sort(&mut v.preview, &v.review_state);
+        }
+        h.run();
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/transfer_review.png");
+        let img = h.render().expect("wgpu render failed");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }

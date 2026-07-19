@@ -65,6 +65,26 @@ pub fn similarity_slider(ui: &mut egui::Ui, threshold: &mut f64, verbosity: Tool
     }
 }
 
+/// A click-to-sort column header label: shows the title, and when this column
+/// is the active sort key appends an up/down caret and paints it amber. Shared
+/// by every `egui_extras` table (Browse, the review board) so their headers
+/// behave identically. Returns the label's `Response` so callers detect clicks.
+pub fn sort_header(ui: &mut egui::Ui, title: &str, active: bool, asc: bool) -> egui::Response {
+    let text = if active {
+        let caret = if asc {
+            crate::icon::CARET_UP
+        } else {
+            crate::icon::CARET_DOWN
+        };
+        format!("{title} {caret}")
+    } else {
+        title.to_string()
+    };
+    let color = if active { theme::AMBER } else { theme::TEXT };
+    ui.add(egui::Label::new(RichText::new(text).color(color).strong()).sense(egui::Sense::click()))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// Human-readable byte size (binary units).
 pub fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
