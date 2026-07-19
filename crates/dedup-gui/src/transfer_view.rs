@@ -27,10 +27,8 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Safety cap on how many rows the review table materialises. The virtualised
-/// table renders only visible rows, but we still bound the in-memory sample;
-/// the summary counts are the true totals regardless of this cap.
-const PREVIEW_CAP: usize = 100_000;
+use crate::review::PREVIEW_CAP;
+
 /// How many recent actions the running panel keeps in its scrolling log.
 const RUN_LOG_LIMIT: usize = 10;
 
@@ -457,7 +455,7 @@ impl TransferView {
     }
 
     fn repo_rows(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "REPOS", theme::LILAC, |ui| {
+        crate::lcars::section_lcars(ui, "REPOS — PICK SOURCE & TARGET", theme::LILAC, |ui| {
             // SOURCE: every repo, orange when picked.
             let src = self.repos.clone();
             crate::repo_chip::chip_row(ui, "xfer_source", "SOURCE", src.len(), |ui, i| {
@@ -616,87 +614,99 @@ impl TransferView {
     }
 
     fn command_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "COMMAND", theme::ORANGE, |ui| {
-            ui.horizontal(|ui| {
-                for cmd in [Command::Copy, Command::Move, Command::Sync, Command::Mirror] {
-                    let sel = self.command == cmd;
-                    let accent = if cmd.destructive() {
-                        theme::RED
-                    } else {
-                        theme::AMBER
-                    };
-                    let fill = if sel { accent } else { theme::PANEL };
-                    // Unselected pills sit on the dark panel — black text would
-                    // vanish there, so they carry their accent color instead.
-                    let col = if sel { theme::BLACK } else { accent };
-                    let (short, verbose) = cmd.tooltip();
-                    if ui
-                        .add(egui::Button::new(RichText::new(cmd.label()).color(col)).fill(fill))
-                        .explain(self.verbosity, short, verbose)
-                        .clicked()
-                    {
-                        acts.push(Act::SetCommand(cmd));
+        crate::lcars::section_lcars(
+            ui,
+            "COMMAND — COPY, MOVE, SYNC OR MIRROR",
+            theme::ORANGE,
+            |ui| {
+                ui.horizontal(|ui| {
+                    for cmd in [Command::Copy, Command::Move, Command::Sync, Command::Mirror] {
+                        let sel = self.command == cmd;
+                        let accent = if cmd.destructive() {
+                            theme::RED
+                        } else {
+                            theme::AMBER
+                        };
+                        let fill = if sel { accent } else { theme::PANEL };
+                        // Unselected pills sit on the dark panel — black text would
+                        // vanish there, so they carry their accent color instead.
+                        let col = if sel { theme::BLACK } else { accent };
+                        let (short, verbose) = cmd.tooltip();
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new(cmd.label()).color(col)).fill(fill),
+                            )
+                            .explain(self.verbosity, short, verbose)
+                            .clicked()
+                        {
+                            acts.push(Act::SetCommand(cmd));
+                        }
                     }
-                }
-            });
-            self.hint(ui);
-        });
+                });
+                self.hint(ui);
+            },
+        );
     }
 
     fn subdir_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "INTO", theme::BLUE, |ui| {
-            ui.horizontal(|ui| {
-                let changed = ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.subdir)
-                            .desired_width(220.0)
-                            .hint_text("relative/subdir (optional)"),
-                    )
-                    .explain(
-                        self.verbosity,
-                        "Relative subfolder inside the target",
-                        "Place transferred files under this relative subfolder inside the \
+        crate::lcars::section_lcars(
+            ui,
+            "INTO — SUBFOLDER INSIDE THE TARGET",
+            theme::BLUE,
+            |ui| {
+                ui.horizontal(|ui| {
+                    let changed = ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.subdir)
+                                .desired_width(220.0)
+                                .hint_text("relative/subdir (optional)"),
+                        )
+                        .explain(
+                            self.verbosity,
+                            "Relative subfolder inside the target",
+                            "Place transferred files under this relative subfolder inside the \
                          target repo, preserving each file's source-relative path. Leave \
                          blank to place them at the target root. Paths escaping the target \
                          (absolute or containing `..`) are rejected.",
-                    )
-                    .changed();
-                if changed {
-                    acts.push(Act::SubdirChanged);
-                }
-                let can_browse = self.target.is_some();
-                if ui
-                    .add_enabled(
-                        can_browse,
-                        egui::Button::new(
-                            RichText::new(format!("{} BROWSE", icon::FOLDER_OPEN))
-                                .color(theme::BLACK),
-                        ),
-                    )
-                    .explain(
-                        self.verbosity,
-                        "Pick or create a subfolder",
-                        "Open a native folder picker rooted at the target repo to pick (or \
+                        )
+                        .changed();
+                    if changed {
+                        acts.push(Act::SubdirChanged);
+                    }
+                    let can_browse = self.target.is_some();
+                    if ui
+                        .add_enabled(
+                            can_browse,
+                            egui::Button::new(
+                                RichText::new(format!("{} BROWSE", icon::FOLDER_OPEN))
+                                    .color(theme::BLACK),
+                            ),
+                        )
+                        .explain(
+                            self.verbosity,
+                            "Pick or create a subfolder",
+                            "Open a native folder picker rooted at the target repo to pick (or \
                          create) the subfolder transferred files go into.",
-                    )
-                    .clicked()
-                {
-                    acts.push(Act::BrowseSubdir);
-                }
-            });
-            ui.label(
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::BrowseSubdir);
+                    }
+                });
+                ui.label(
                 RichText::new(
                     "Files keep their source-relative path under this folder inside the target.",
                 )
                 .color(theme::LILAC)
                 .size(11.0),
             );
-        });
+            },
+        );
     }
 
     /// Selector for where COPY/MOVE lands: into a repo or into a picked folder.
     fn dest_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "DEST", theme::BLUE, |ui| {
+        crate::lcars::section_lcars(ui, "DEST — WHERE COPIED FILES LAND", theme::BLUE, |ui| {
             ui.horizontal(|ui| {
                 for (dest, label, short, verbose) in [
                     (
@@ -731,110 +741,128 @@ impl TransferView {
 
     /// The export-folder path input and its native folder picker (FOLDER mode).
     fn folder_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "FOLDER", theme::BLUE, |ui| {
-            ui.horizontal(|ui| {
-                let changed = ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.folder)
-                            .desired_width(320.0)
-                            .hint_text("/absolute/export/folder"),
-                    )
-                    .explain(
-                        self.verbosity,
-                        "Absolute export folder",
-                        "The folder the selected files are copied/moved into. Files keep \
+        crate::lcars::section_lcars(
+            ui,
+            "FOLDER — EXPORT DESTINATION ON DISK",
+            theme::BLUE,
+            |ui| {
+                ui.horizontal(|ui| {
+                    let changed = ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.folder)
+                                .desired_width(320.0)
+                                .hint_text("/absolute/export/folder"),
+                        )
+                        .explain(
+                            self.verbosity,
+                            "Absolute export folder",
+                            "The folder the selected files are copied/moved into. Files keep \
                          their source-relative path under it.",
-                    )
-                    .changed();
-                if changed {
-                    acts.push(Act::FolderChanged);
-                }
-                if ui
-                    .add(egui::Button::new(
-                        RichText::new(format!("{} BROWSE", icon::FOLDER_OPEN)).color(theme::BLACK),
-                    ))
-                    .explain(
-                        self.verbosity,
-                        "Pick or create the export folder",
-                        "Open a native folder picker to choose (or create) the folder the \
+                        )
+                        .changed();
+                    if changed {
+                        acts.push(Act::FolderChanged);
+                    }
+                    if ui
+                        .add(egui::Button::new(
+                            RichText::new(format!("{} BROWSE", icon::FOLDER_OPEN))
+                                .color(theme::BLACK),
+                        ))
+                        .explain(
+                            self.verbosity,
+                            "Pick or create the export folder",
+                            "Open a native folder picker to choose (or create) the folder the \
                          selected files go into.",
-                    )
-                    .clicked()
-                {
-                    acts.push(Act::BrowseFolder);
-                }
-            });
-        });
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::BrowseFolder);
+                    }
+                });
+            },
+        );
     }
 
     /// Grouping mode (exact/similar) and the invert toggle for a folder export.
     fn mode_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "MODE", theme::LILAC, |ui| {
-            ui.horizontal(|ui| {
-                for mode in [SelectMode::Exact, SelectMode::Similar] {
-                    let sel = self.select_mode == mode;
-                    let fill = if sel { theme::LILAC } else { theme::PANEL };
-                    let col = if sel { theme::BLACK } else { theme::LILAC };
-                    let (short, verbose) = match mode {
-                        SelectMode::Exact => (
-                            "Group by exact content",
-                            "Treat only byte-identical files (same size + hash) as copies of \
+        crate::lcars::section_lcars(
+            ui,
+            "MODE — EXACT OR SIMILAR MATCHING",
+            theme::LILAC,
+            |ui| {
+                ui.horizontal(|ui| {
+                    for mode in [SelectMode::Exact, SelectMode::Similar] {
+                        let sel = self.select_mode == mode;
+                        let fill = if sel { theme::LILAC } else { theme::PANEL };
+                        let col = if sel { theme::BLACK } else { theme::LILAC };
+                        let (short, verbose) = match mode {
+                            SelectMode::Exact => (
+                                "Group by exact content",
+                                "Treat only byte-identical files (same size + hash) as copies of \
                              each other.",
-                        ),
-                        SelectMode::Similar => (
-                            "Group by perceptual similarity",
-                            "Treat perceptually similar media (at the similarity threshold \
+                            ),
+                            SelectMode::Similar => (
+                                "Group by perceptual similarity",
+                                "Treat perceptually similar media (at the similarity threshold \
                              below) as copies — e.g. one photo per burst.",
-                        ),
+                            ),
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new(mode.label()).color(col))
+                                    .fill(fill),
+                            )
+                            .explain(self.verbosity, short, verbose)
+                            .clicked()
+                        {
+                            acts.push(Act::SetMode(mode));
+                        }
+                    }
+                    ui.separator();
+                    let fill = if self.invert {
+                        theme::ORANGE
+                    } else {
+                        theme::PANEL
+                    };
+                    let col = if self.invert {
+                        theme::BLACK
+                    } else {
+                        theme::ORANGE
                     };
                     if ui
-                        .add(egui::Button::new(RichText::new(mode.label()).color(col)).fill(fill))
-                        .explain(self.verbosity, short, verbose)
-                        .clicked()
-                    {
-                        acts.push(Act::SetMode(mode));
-                    }
-                }
-                ui.separator();
-                let fill = if self.invert {
-                    theme::ORANGE
-                } else {
-                    theme::PANEL
-                };
-                let col = if self.invert {
-                    theme::BLACK
-                } else {
-                    theme::ORANGE
-                };
-                if ui
-                    .add(egui::Button::new(RichText::new("INVERT").color(col)).fill(fill))
-                    .explain(
-                        self.verbosity,
-                        "Export the redundant copies instead",
-                        "Off: export the unique files (one best copy per group plus every \
+                        .add(egui::Button::new(RichText::new("INVERT").color(col)).fill(fill))
+                        .explain(
+                            self.verbosity,
+                            "Export the redundant copies instead",
+                            "Off: export the unique files (one best copy per group plus every \
                          singleton). On: export the redundant copies instead (every \
                          non-best member of a group) — what a dedup would remove.",
-                    )
-                    .clicked()
-                {
-                    acts.push(Act::ToggleInvert);
-                }
-            });
-            // In SIMILAR mode the threshold is chosen right here (the same shared
-            // control as the Duplicates tab), not borrowed from another tab.
-            if self.select_mode == SelectMode::Similar {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    crate::util::similarity_slider(ui, &mut self.similar_threshold, self.verbosity);
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::ToggleInvert);
+                    }
                 });
-            }
-            let hint = if self.invert {
-                "Exports the redundant copies (every non-best member of a group)."
-            } else {
-                "Exports the unique files (best copy of each group plus every singleton)."
-            };
-            ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
-        });
+                // In SIMILAR mode the threshold is chosen right here (the same shared
+                // control as the Duplicates tab), not borrowed from another tab.
+                if self.select_mode == SelectMode::Similar {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        crate::util::similarity_slider(
+                            ui,
+                            &mut self.similar_threshold,
+                            self.verbosity,
+                        );
+                    });
+                }
+                let hint = if self.invert {
+                    "Exports the redundant copies (every non-best member of a group)."
+                } else {
+                    "Exports the unique files (best copy of each group plus every singleton)."
+                };
+                ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
+            },
+        );
     }
 
     fn hint(&self, ui: &mut egui::Ui) {
@@ -892,7 +920,7 @@ impl TransferView {
     /// no subdir/folder/mode controls — it always mirrors source→target at the
     /// same relative path.
     fn sync_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "OPTIONS", theme::BLUE, |ui| {
+        crate::lcars::section_lcars(ui, "OPTIONS — SYNC BEHAVIOUR", theme::BLUE, |ui| {
             ui.horizontal(|ui| {
                 let fill = if self.sync_delete_missing {
                     theme::RED
@@ -936,7 +964,7 @@ impl TransferView {
     }
 
     fn action_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "ACTION", theme::AMBER, |ui| {
+        crate::lcars::section_lcars(ui, "ACTION — PREVIEW & RUN", theme::AMBER, |ui| {
             ui.horizontal(|ui| {
                 let ready = self.ready();
                 if ui
@@ -1905,7 +1933,7 @@ mod ui_tests {
             "MIRROR still picks a target repo"
         );
         assert!(
-            harness.query_by_label("DEST").is_none(),
+            harness.query_by_label_contains("DEST — ").is_none(),
             "the REPO/FOLDER toggle must be hidden in MIRROR mode"
         );
         assert!(
@@ -1934,11 +1962,11 @@ mod ui_tests {
             "SYNC still picks a target repo"
         );
         assert!(
-            harness.query_by_label("DEST").is_none(),
+            harness.query_by_label_contains("DEST — ").is_none(),
             "the REPO/FOLDER destination toggle must be hidden in SYNC mode"
         );
         assert!(
-            harness.query_by_label("INTO").is_none(),
+            harness.query_by_label_contains("INTO — ").is_none(),
             "the INTO subdir bar must be hidden in SYNC mode"
         );
         assert!(
@@ -1963,7 +1991,7 @@ mod ui_tests {
             "FOLDER destination/label should be shown"
         );
         assert!(
-            harness.query_by_label("MODE").is_some(),
+            harness.query_by_label_contains("MODE — ").is_some(),
             "MODE selector should be shown in folder mode"
         );
         assert!(
@@ -1976,7 +2004,7 @@ mod ui_tests {
             "the TARGET row must be hidden in folder mode"
         );
         assert!(
-            harness.query_by_label("INTO").is_none(),
+            harness.query_by_label_contains("INTO — ").is_none(),
             "the INTO subdir bar must be hidden in folder mode"
         );
     }
@@ -2021,11 +2049,11 @@ mod ui_tests {
             "the TARGET row should be shown in repo mode"
         );
         assert!(
-            harness.query_by_label("INTO").is_some(),
+            harness.query_by_label_contains("INTO — ").is_some(),
             "the INTO subdir bar should be shown in repo mode"
         );
         assert!(
-            harness.query_by_label("MODE").is_none(),
+            harness.query_by_label_contains("MODE — ").is_none(),
             "the MODE selector must be hidden in repo mode"
         );
     }

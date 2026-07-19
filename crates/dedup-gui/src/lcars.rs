@@ -9,6 +9,7 @@
 //!   (elbows) into a horizontal header cap bar carrying the section title. This
 //!   is the "lines that reach out from the edges" chrome.
 
+use crate::icon;
 use crate::theme;
 use egui::{Align2, Color32, CornerRadius, Rect, Sense, Stroke, StrokeKind, Vec2, pos2};
 
@@ -115,6 +116,49 @@ pub fn section_lcars<R>(
     accent: Color32,
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
+    section_impl(ui, title, accent, None, add).0
+}
+
+/// A [`section_lcars`] whose header bar collapses/expands the body on click.
+/// The open state persists under an id derived from `title`. Returns the body
+/// result when open, `None` when collapsed (the body closure is not run).
+pub fn section_lcars_collapsible<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    accent: Color32,
+    default_open: bool,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<R> {
+    let id = ui.id().with(("lcars_sec", title));
+    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        id,
+        default_open,
+    );
+    let (out, header) = if state.is_open() {
+        let (r, header) = section_impl(ui, title, accent, Some(icon::CARET_DOWN), add);
+        (Some(r), header)
+    } else {
+        (None, collapsed_header(ui, title, accent))
+    };
+    if header.clicked() {
+        state.toggle(ui);
+    }
+    state.store(ui.ctx());
+    out
+}
+
+/// The shared body of [`section_lcars`] / [`section_lcars_collapsible`].
+/// `caret` prefixes the painted title (collapsible sections show an open-state
+/// hint there) and makes the header respond to clicks; the returned response is
+/// the header bar's.
+fn section_impl<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    accent: Color32,
+    caret: Option<&str>,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> (R, egui::Response) {
     // Reserve a paint slot *behind* the body: the elbow chrome (and the dark body
     // background that forms the concave curve) draw here, so the body's own
     // widgets always render on top of it and are never overpainted.
@@ -142,21 +186,54 @@ pub fn section_lcars<R>(
             add(ui)
         });
     let r = inner.response.rect;
+    let painted = match caret {
+        Some(c) => format!("{c} {title}"),
+        None => title.to_owned(),
+    };
     ui.painter()
-        .set(bg, egui::Shape::Vec(elbow_shapes(ui, r, title, accent)));
+        .set(bg, egui::Shape::Vec(elbow_shapes(ui, r, &painted, accent)));
     // Expose the painted title to accesskit (so tests and screen readers can find
-    // the section by name) without affecting layout.
+    // the section by name) without affecting layout. Collapsible sections make
+    // the whole header bar the click target.
     let title_rect = Rect::from_min_max(
         pos2(r.min.x + RAIL_W, r.min.y),
         pos2(r.max.x, r.min.y + HEAD_H),
     );
-    ui.interact(
-        title_rect,
-        ui.id().with(("lcars_title", title)),
-        Sense::hover(),
-    )
-    .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, title));
-    inner.inner
+    let sense = if caret.is_some() {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let header = ui.interact(title_rect, ui.id().with(("lcars_title", title)), sense);
+    header.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, title));
+    (inner.inner, header)
+}
+
+/// The collapsed form of a collapsible section: just the header bar, a full
+/// stadium with a "click to open" caret before the title. Same width and bottom
+/// spacing as the open section, so collapsing doesn't shift siblings sideways.
+fn collapsed_header(ui: &mut egui::Ui, title: &str, accent: Color32) -> egui::Response {
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), HEAD_H), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let fill = if resp.hovered() {
+            accent.gamma_multiply(1.2)
+        } else {
+            accent
+        };
+        let p = ui.painter();
+        p.rect_filled(rect, CornerRadius::same((HEAD_H / 2.0) as u8), fill);
+        p.text(
+            pos2(rect.min.x + RAIL_W + 10.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            format!("{} {title}", icon::CARET_RIGHT),
+            egui::FontId::proportional(13.0),
+            theme::BLACK,
+        );
+    }
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, title));
+    ui.add_space(8.0); // match the open section's bottom outer margin
+    resp
 }
 
 /// The elbow chrome as a back-to-front shape list: accent rail, accent header cap

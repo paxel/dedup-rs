@@ -17,6 +17,7 @@
 //! background thread, reusing the same `DiffEvent` progress plumbing as Transfer.
 
 use crate::filter_ui::FilterBuilder;
+use crate::icon;
 use crate::review;
 use crate::settings::TooltipVerbosity;
 use crate::theme;
@@ -33,10 +34,8 @@ use egui::{Id, RichText};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-/// Safety cap on how many rows the review table materialises. The virtualised
-/// table renders only visible rows, but we still bound the in-memory sample;
-/// the summary counts are the true totals regardless of this cap.
-const PREVIEW_CAP: usize = 100_000;
+use crate::review::PREVIEW_CAP;
+
 const RUN_LOG_LIMIT: usize = 10;
 
 /// File name of the persisted ORGANIZE presets inside the store's config dir.
@@ -96,7 +95,8 @@ impl Command {
                 "Delete everything matching a filter",
                 "Delete every file in the repo that matches the filter (mime / size / name, \
                  with `*` wildcards) — e.g. everything ending in `.db`. This is not gated \
-                 by any other repo, so use it carefully.",
+                 by any other repo, so use it carefully. Without a filter nothing matches — \
+                 an empty filter never purges the whole repo.",
             ),
             Command::EmptyDirs => (
                 "Remove empty directories",
@@ -393,7 +393,7 @@ impl GroomingView {
     }
 
     fn command_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "COMMAND", theme::ORANGE, |ui| {
+        crate::lcars::section_lcars(ui, "COMMAND — PICK A GROOMING TOOL", theme::ORANGE, |ui| {
             ui.horizontal(|ui| {
                 for cmd in [
                     Command::Dedupe,
@@ -419,7 +419,7 @@ impl GroomingView {
     }
 
     fn dedupe_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "REPOS", theme::LILAC, |ui| {
+        crate::lcars::section_lcars(ui, "REPOS — SOURCE & DUPE POOL", theme::LILAC, |ui| {
             // SOURCE: the repo duplicates are deleted from, orange when picked.
             let src = self.repos.clone();
             crate::repo_chip::chip_row(ui, "groom_source", "SOURCE", src.len(), |ui, i| {
@@ -493,6 +493,16 @@ impl GroomingView {
 
     fn purge_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         self.single_repo_bar(ui, acts, "Delete matching files from this repo.");
+        if self.filter_string().is_none() {
+            ui.label(
+                RichText::new(
+                    "PURGE needs at least one filter condition — with no filter, nothing \
+                     matches and nothing can be deleted.",
+                )
+                .color(theme::TAN)
+                .size(12.0),
+            );
+        }
     }
 
     fn empty_dirs_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
@@ -522,15 +532,16 @@ impl GroomingView {
         }
     }
 
-    /// ORGANIZE: a repo picker, the ordered rule list (each rule = the shared
-    /// FILTER wizard + a path template with token chips), and saved presets.
+    /// ORGANIZE: a repo picker and one RULES section holding the add/preset row
+    /// plus every rule as a nested, collapsible section (each rule = the shared
+    /// FILTER wizard + a path template with token chips and an inline delete).
     fn organize_layout(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, acts: &mut Vec<Act>) {
         self.single_repo_bar(ui, acts, "Reorganize the files in this repo in place.");
         let repo = self.repo.clone();
 
         crate::lcars::section_lcars(
             ui,
-            "RULES — ADD RULES & MANAGE PRESETS",
+            "RULES — MATCH FILES & BUILD THEIR NEW PATHS",
             theme::LILAC,
             |ui| {
                 ui.horizontal_wrapped(|ui| {
@@ -551,76 +562,93 @@ impl GroomingView {
                     }
                     self.preset_row(ui, acts);
                 });
+                let rule_count = self.rules.len();
+                for i in 0..rule_count {
+                    self.rule_section(ui, store, repo.as_deref(), i, acts);
+                }
             },
         );
+    }
 
-        let rule_count = self.rules.len();
-        for i in 0..rule_count {
-            let title = format!("RULE {} — MATCH & RENAME", i + 1);
-            crate::lcars::section_lcars(ui, &title, theme::BLUE, |ui| {
-                // The rule's filter (which files this rule applies to).
-                let outcome = self.rules[i]
-                    .filter
-                    .ui(ui, store, repo.as_deref(), self.verbosity);
-                if outcome.changed {
+    /// One collapsible RULE section: filter wizard, template row (with the
+    /// inline delete), and the token chips.
+    fn rule_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        store: &Arc<Store>,
+        repo: Option<&str>,
+        i: usize,
+        acts: &mut Vec<Act>,
+    ) {
+        let title = format!("RULE {} — MATCH & RENAME", i + 1);
+        crate::lcars::section_lcars_collapsible(ui, &title, theme::BLUE, true, |ui| {
+            // The rule's filter (which files this rule applies to).
+            let outcome = self.rules[i].filter.ui(ui, store, repo, self.verbosity);
+            if outcome.changed {
+                self.clear_preview();
+            }
+            if outcome.error.is_some() {
+                self.error = outcome.error;
+            }
+            // The target path template, its inline delete, and the token chips.
+            let template_id = egui::Id::new(("organize_template", i));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("TEMPLATE").color(theme::TEXT).size(12.0));
+                let changed = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.rules[i].template)
+                            .id(template_id)
+                            .desired_width(360.0)
+                            .hint_text(DEFAULT_TEMPLATE),
+                    )
+                    .explain(
+                        self.verbosity,
+                        "New relative path template",
+                        "The new relative path for matching files. Tokens in {…} are \
+                         filled per file; `|` gives fallbacks and \"quoted\" text is a \
+                         literal default, e.g. {year}/{o-stem}-{camera|\"nocam\"}.{o-ext}.",
+                    )
+                    .changed();
+                if changed {
                     self.clear_preview();
                 }
-                if outcome.error.is_some() {
-                    self.error = outcome.error;
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new(icon::TRASH).color(theme::RED))
+                            .fill(theme::PANEL),
+                    )
+                    .explain(
+                        self.verbosity,
+                        "Delete this rule",
+                        "Delete this organize rule. Files it would have matched fall \
+                         through to later rules, or stay put if none match.",
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::RemoveRule(i));
                 }
-                // The target path template + one-click token chips.
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("TEMPLATE").color(theme::TEXT).size(12.0));
-                    let changed = ui
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("insert:").color(theme::LILAC).size(11.0));
+                for (label, insert) in TEMPLATE_TOKENS {
+                    if ui
                         .add(
-                            egui::TextEdit::singleline(&mut self.rules[i].template)
-                                .desired_width(360.0)
-                                .hint_text(DEFAULT_TEMPLATE),
-                        )
-                        .explain(
-                            self.verbosity,
-                            "New relative path template",
-                            "The new relative path for matching files. Tokens in {…} are \
-                             filled per file; `|` gives fallbacks and \"quoted\" text is a \
-                             literal default, e.g. {year}/{o-stem}-{camera|\"nocam\"}.{o-ext}.",
-                        )
-                        .changed();
-                    if changed {
-                        self.clear_preview();
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("insert:").color(theme::LILAC).size(11.0));
-                    for (label, insert) in TEMPLATE_TOKENS {
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new(*label).color(theme::BLUE))
-                                    .fill(theme::PANEL),
-                            )
-                            .clicked()
-                        {
-                            self.rules[i].template.push_str(insert);
-                            self.clear_preview();
-                        }
-                    }
-                });
-                // A rule can always be removed (a repo may need zero rules).
-                // Bottom-right, out of the way of the fields above it.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if crate::lcars::action_button(ui, "DELETE RULE", true, theme::RED)
-                        .explain(
-                            self.verbosity,
-                            "Delete this rule",
-                            "Delete this organize rule. Files it would have matched fall \
-                             through to later rules, or stay put if none match.",
+                            egui::Button::new(RichText::new(*label).color(theme::BLUE))
+                                .fill(theme::PANEL),
                         )
                         .clicked()
                     {
-                        acts.push(Act::RemoveRule(i));
+                        insert_at_cursor(
+                            ui.ctx(),
+                            template_id,
+                            &mut self.rules[i].template,
+                            insert,
+                        );
+                        self.clear_preview();
                     }
-                });
+                }
             });
-        }
+        });
     }
 
     /// The ORGANIZE saved-preset row: apply/forget pills (right-click to
@@ -703,28 +731,33 @@ impl GroomingView {
 
     /// A single-repo picker used by PURGE and EMPTY DIRS (they act on one repo).
     fn single_repo_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>, hint: &str) {
-        crate::lcars::section_lcars(ui, "REPO", theme::LILAC, |ui| {
-            let repos = self.repos.clone();
-            crate::repo_chip::chip_row(ui, "groom_repo", "", repos.len(), |ui, i| {
-                let name = &repos[i];
-                let sel = self.repo.as_deref() == Some(name.as_str());
-                let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::ORANGE, None);
-                if chip
-                    .name
-                    .explain(self.verbosity, "Pick the repo to act on", hint)
-                    .clicked()
-                {
-                    acts.push(Act::PickRepo(name.clone()));
-                }
-                chip.outer
-            });
-            ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
-        });
+        crate::lcars::section_lcars(
+            ui,
+            "REPO — WHICH REPOSITORY TO GROOM",
+            theme::LILAC,
+            |ui| {
+                let repos = self.repos.clone();
+                crate::repo_chip::chip_row(ui, "groom_repo", "", repos.len(), |ui, i| {
+                    let name = &repos[i];
+                    let sel = self.repo.as_deref() == Some(name.as_str());
+                    let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::ORANGE, None);
+                    if chip
+                        .name
+                        .explain(self.verbosity, "Pick the repo to act on", hint)
+                        .clicked()
+                    {
+                        acts.push(Act::PickRepo(name.clone()));
+                    }
+                    chip.outer
+                });
+                ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
+            },
+        );
     }
 
     /// A single-line filter expression (mime / size / name with `*` wildcards).
     fn action_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "ACTION", theme::AMBER, |ui| {
+        crate::lcars::section_lcars(ui, "ACTION — PREVIEW & RUN", theme::AMBER, |ui| {
             ui.horizontal(|ui| {
                 let ready = self.ready();
                 // EMPTY DIRS has no meaningful file preview (its count is only
@@ -880,7 +913,9 @@ impl GroomingView {
         }
         match self.command {
             Command::Dedupe => self.source.is_some() && !self.pool.is_empty(),
-            Command::Purge | Command::EmptyDirs | Command::Prune => self.repo.is_some(),
+            // PURGE without a filter would match every file; require one.
+            Command::Purge => self.repo.is_some() && self.filter_string().is_some(),
+            Command::EmptyDirs | Command::Prune => self.repo.is_some(),
             Command::Organize => self.repo.is_some() && !self.rules.is_empty(),
         }
     }
@@ -1402,6 +1437,34 @@ impl GroomingView {
     }
 }
 
+/// Insert `text` into `template` at the caret of the `TextEdit` identified by
+/// `id`, leaving the caret just after the insertion so consecutive chip clicks
+/// build the template left to right. Appends when the field has no cursor
+/// state yet (never focused).
+fn insert_at_cursor(ctx: &egui::Context, id: egui::Id, template: &mut String, text: &str) {
+    let Some(mut state) = egui::TextEdit::load_state(ctx, id) else {
+        template.push_str(text);
+        return;
+    };
+    let chars = template.chars().count();
+    let at = state
+        .cursor
+        .char_range()
+        .map(|r| r.primary.index.0.min(chars))
+        .unwrap_or(chars);
+    let byte = template
+        .char_indices()
+        .nth(at)
+        .map(|(b, _)| b)
+        .unwrap_or(template.len());
+    template.insert_str(byte, text);
+    let after = egui::text::CCursor::new(at + text.chars().count());
+    state
+        .cursor
+        .set_char_range(Some(egui::text::CCursorRange::one(after)));
+    state.store(ctx, id);
+}
+
 #[cfg(test)]
 mod ui_tests {
     use super::*;
@@ -1473,9 +1536,12 @@ mod ui_tests {
     fn prune_layout_shows_repo_only() {
         let (_tmp, store) = sample_store();
         let prune = grooming_harness(store, Command::Prune);
-        assert!(prune.query_by_label("REPO").is_some(), "PRUNE has REPO");
         assert!(
-            prune.query_by_label("FILTER").is_none(),
+            prune.query_by_label_contains("REPO — ").is_some(),
+            "PRUNE has REPO"
+        );
+        assert!(
+            prune.query_by_label_contains("FILTER — ").is_none(),
             "PRUNE has no filter"
         );
         assert!(
@@ -1501,17 +1567,23 @@ mod ui_tests {
             "DEDUPE has DUPEPOOL"
         );
         assert!(
-            dedupe.query_by_label("FILTER").is_some(),
+            dedupe.query_by_label_contains("FILTER — ").is_some(),
             "DEDUPE has FILTER"
         );
         assert!(
-            dedupe.query_by_label("REPO").is_none(),
+            dedupe.query_by_label_contains("REPO — ").is_none(),
             "DEDUPE uses SOURCE, not the single REPO picker"
         );
 
         let purge = grooming_harness(Arc::clone(&store), Command::Purge);
-        assert!(purge.query_by_label("REPO").is_some(), "PURGE has REPO");
-        assert!(purge.query_by_label("FILTER").is_some(), "PURGE has FILTER");
+        assert!(
+            purge.query_by_label_contains("REPO — ").is_some(),
+            "PURGE has REPO"
+        );
+        assert!(
+            purge.query_by_label_contains("FILTER — ").is_some(),
+            "PURGE has FILTER"
+        );
         assert!(
             purge.query_by_label("DUPEPOOL").is_none(),
             "PURGE has no dupe pool"
@@ -1519,17 +1591,17 @@ mod ui_tests {
 
         let empty = grooming_harness(Arc::clone(&store), Command::EmptyDirs);
         assert!(
-            empty.query_by_label("REPO").is_some(),
+            empty.query_by_label_contains("REPO — ").is_some(),
             "EMPTY DIRS has REPO"
         );
         assert!(
-            empty.query_by_label("FILTER").is_none(),
+            empty.query_by_label_contains("FILTER — ").is_none(),
             "EMPTY DIRS has no filter"
         );
 
         let organize = grooming_harness(store, Command::Organize);
         assert!(
-            organize.query_by_label("REPO").is_some(),
+            organize.query_by_label_contains("REPO — ").is_some(),
             "ORGANIZE has a repo picker"
         );
         assert!(
@@ -1546,19 +1618,24 @@ mod ui_tests {
         );
     }
 
-    /// The rule's remove control reads "DELETE RULE" (not the old "× rule"), and
-    /// the preset row offers STORE PRESET instead of a name field + SAVE.
+    /// The rule's remove control is an inline trash button sharing the TEMPLATE
+    /// row (no dedicated full-width delete row), and the preset row offers
+    /// STORE PRESET instead of a name field + SAVE.
     #[test]
-    fn organize_shows_delete_rule_and_store_preset() {
+    fn organize_delete_sits_inline_on_the_template_row() {
         let (_tmp, store) = sample_store();
         let organize = grooming_harness(store, Command::Organize);
+        let template = organize.get_by_label("TEMPLATE").rect();
+        let trash = organize.get_by_label(icon::TRASH).rect();
         assert!(
-            organize.query_by_label_contains("DELETE RULE").is_some(),
-            "the rule remove control is labeled DELETE RULE"
+            (trash.center().y - template.center().y).abs() < template.height(),
+            "the delete button shares the TEMPLATE row (trash y={}, template y={})",
+            trash.center().y,
+            template.center().y
         );
         assert!(
-            organize.query_by_label("× rule").is_none(),
-            "the old '× rule' label is gone"
+            organize.query_by_label_contains("DELETE RULE").is_none(),
+            "the old dedicated DELETE RULE row is gone"
         );
         assert!(
             organize.query_by_label_contains("STORE PRESET").is_some(),
@@ -1567,6 +1644,50 @@ mod ui_tests {
         assert!(
             organize.query_by_label("SAVE").is_none(),
             "the old name-field + SAVE preset UI is gone"
+        );
+    }
+
+    /// Rule sections nest inside the RULES elbow: RULE 1's chrome starts to the
+    /// right of the RULES rail, below the RULES header.
+    #[test]
+    fn rule_sections_nest_inside_rules_elbow() {
+        let (_tmp, store) = sample_store();
+        let organize = grooming_harness(store, Command::Organize);
+        let rules = organize.get_by_label_contains("RULES — ").rect();
+        let rule1 = organize.get_by_label_contains("RULE 1").rect();
+        assert!(
+            rule1.left() > rules.left(),
+            "RULE 1 (left={}) should be inset within the RULES section (left={})",
+            rule1.left(),
+            rules.left()
+        );
+        assert!(
+            rule1.top() > rules.top(),
+            "RULE 1 should sit below the RULES header"
+        );
+    }
+
+    /// Clicking a rule's header bar collapses its body (the TEMPLATE field
+    /// disappears); clicking again restores it.
+    #[test]
+    fn rule_header_click_collapses_and_expands_the_body() {
+        let (_tmp, store) = sample_store();
+        let mut h = grooming_harness(store, Command::Organize);
+        assert!(
+            h.query_by_label("TEMPLATE").is_some(),
+            "rule body starts expanded"
+        );
+        h.get_by_label_contains("RULE 1").click();
+        h.run();
+        assert!(
+            h.query_by_label("TEMPLATE").is_none(),
+            "collapsing the rule hides its body"
+        );
+        h.get_by_label_contains("RULE 1").click();
+        h.run();
+        assert!(
+            h.query_by_label("TEMPLATE").is_some(),
+            "clicking again expands the body"
         );
     }
 
@@ -1650,5 +1771,90 @@ mod ui_tests {
             !h.state().review_state.sort_asc,
             "clicking the source header toggles the sort direction"
         );
+    }
+
+    /// A preview past one page shows the row count plus PREV/PAGE/NEXT
+    /// controls, and NEXT advances the page.
+    #[test]
+    fn review_preview_pages_past_page_size() {
+        let (_tmp, store) = sample_store();
+        let mut h = grooming_harness(store, Command::Purge);
+        {
+            let v = h.state_mut();
+            v.preview_source_header = "/repos/junk".to_string();
+            v.preview = (0..501)
+                .map(|i| review::ReviewRow {
+                    source: review::SideStatus::Removed,
+                    target: review::SideStatus::Absent,
+                    source_path: format!("f{i:04}.tmp"),
+                    target_path: String::new(),
+                })
+                .collect();
+            v.preview_totals = [0, 501, 0];
+            review::sort(&mut v.preview, &v.review_state);
+        }
+        h.run();
+        assert!(
+            h.query_by_label_contains("501 rows").is_some(),
+            "the row count is always shown"
+        );
+        assert!(
+            h.query_by_label_contains("PAGE 1 / 2").is_some(),
+            "page indicator starts on page 1 of 2"
+        );
+        h.get_by_label("NEXT").click();
+        h.run();
+        assert!(
+            h.query_by_label_contains("PAGE 2 / 2").is_some(),
+            "NEXT advances to page 2"
+        );
+    }
+
+    /// Token chips insert at the caret (and move it), not blindly at the end.
+    #[test]
+    fn insert_at_cursor_inserts_at_caret_and_advances_it() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("tpl-test");
+        let mut template = String::from("{year}/{o-name}");
+        // No cursor state yet (field never focused) → appends.
+        insert_at_cursor(&ctx, id, &mut template, "{day}");
+        assert_eq!(template, "{year}/{o-name}{day}");
+        // Caret after "{year}" (6 chars) → the token lands mid-string.
+        let mut st = egui::widgets::text_edit::TextEditState::default();
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(6),
+        )));
+        st.store(&ctx, id);
+        insert_at_cursor(&ctx, id, &mut template, "{month}");
+        assert_eq!(template, "{year}{month}/{o-name}{day}");
+        let caret = egui::TextEdit::load_state(&ctx, id)
+            .expect("state was stored")
+            .cursor
+            .char_range()
+            .expect("caret was set")
+            .primary
+            .index
+            .0;
+        assert_eq!(
+            caret,
+            "{year}{month}".chars().count(),
+            "caret follows the insertion"
+        );
+    }
+
+    /// Manual visual check of the reworked ORGANIZE layout (nested collapsible
+    /// rules, inline delete): `cargo test -p dedup-gui organize_snapshot -- --ignored`.
+    #[test]
+    #[ignore = "renders a PNG for manual inspection"]
+    fn render_organize_snapshot() {
+        let (_tmp, store) = sample_store();
+        let mut h = grooming_harness(store, Command::Organize);
+        h.state_mut().rules.push(RuleUi::new());
+        h.run();
+        let img = h.render().expect("wgpu render failed");
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/organize_snapshot.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 }

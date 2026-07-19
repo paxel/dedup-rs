@@ -10,14 +10,23 @@
 //! where the file is absent shows a grey `✗` glyph and an empty path cell.
 //!
 //! Built on the same virtualised, click-to-sort `egui_extras` table as the
-//! Browse tab (reusing [`crate::util::sort_header`]), so it scrolls through
-//! arbitrarily many rows. Unchanged rows are the least interesting, so they are
-//! hidden by default behind a toggle. This module is presentation only.
+//! Browse tab (reusing [`crate::util::sort_header`]), paged [`PAGE_SIZE`] rows
+//! at a time with PREV/NEXT controls. Unchanged rows are the least interesting,
+//! so they are hidden by default behind a toggle. This module is presentation
+//! only.
 
 use crate::icon;
 use crate::theme;
 use egui::{Align, Layout, RichText};
 use egui_extras::{Column, TableBuilder};
+
+/// Safety cap on how many rows a preview materialises in memory. The summary
+/// counts stay the true totals regardless; past the cap the table tells the
+/// user to refine the filter.
+pub const PREVIEW_CAP: usize = 10_000;
+
+/// Rows shown per page of the review table.
+const PAGE_SIZE: usize = 500;
 
 /// A file's status on one side of the diff.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -92,6 +101,8 @@ pub struct ReviewState {
     pub sort_asc: bool,
     /// Whether the (least-interesting) unchanged rows are shown. Off by default.
     pub show_unchanged: bool,
+    /// Current zero-based page of the visible rows.
+    pub page: usize,
 }
 
 impl Default for ReviewState {
@@ -100,6 +111,7 @@ impl Default for ReviewState {
             sort_col: ReviewCol::Source,
             sort_asc: true,
             show_unchanged: false,
+            page: 0,
         }
     }
 }
@@ -129,9 +141,10 @@ pub fn sort(rows: &mut [ReviewRow], state: &ReviewState) {
 }
 
 /// Render the review board: a summary line (true full counts), an optional
-/// "show unchanged" toggle, an "only showing first N" note when the sample was
-/// capped, then the virtualised, click-to-sort four-column diff. `totals` is
-/// `[added, removed, unchanged]` full counts, independent of the capped sample.
+/// "show unchanged" toggle, a "previewing first N" note when the sample was
+/// capped, a row count with page controls, then the virtualised, click-to-sort
+/// four-column diff. `totals` is `[added, removed, unchanged]` full counts,
+/// independent of the capped sample.
 pub fn table(
     ui: &mut egui::Ui,
     state: &mut ReviewState,
@@ -150,6 +163,7 @@ pub fn table(
         );
         if crate::lcars::toggle_button(ui, &label, state.show_unchanged, theme::GREY).clicked() {
             state.show_unchanged = !state.show_unchanged;
+            state.page = 0;
         }
     }
 
@@ -165,13 +179,42 @@ pub fn table(
     if full > rows.len() {
         ui.label(
             RichText::new(format!(
-                "showing first {} of {full} — refine the filter to see the rest",
+                "previewing the first {} of {full} — refine the filter to see the rest",
                 rows.len()
             ))
             .color(theme::TAN)
             .size(11.0),
         );
     }
+
+    // Page the visible rows; the count line and PREV/NEXT controls always tell
+    // the user where they are, even for a single page.
+    let pages = visible.len().div_ceil(PAGE_SIZE).max(1);
+    state.page = state.page.min(pages - 1);
+    let page_rows =
+        &visible[state.page * PAGE_SIZE..(visible.len().min((state.page + 1) * PAGE_SIZE))];
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(format!("{} rows", visible.len()))
+                .color(theme::TAN)
+                .size(11.0),
+        );
+        if pages > 1 {
+            if crate::lcars::action_button(ui, "PREV", state.page > 0, theme::LILAC).clicked() {
+                state.page -= 1;
+            }
+            ui.label(
+                RichText::new(format!("PAGE {} / {pages}", state.page + 1))
+                    .color(theme::TEXT)
+                    .size(11.0),
+            );
+            if crate::lcars::action_button(ui, "NEXT", state.page + 1 < pages, theme::LILAC)
+                .clicked()
+            {
+                state.page += 1;
+            }
+        }
+    });
     ui.add_space(2.0);
 
     let cols = [
@@ -211,8 +254,8 @@ pub fn table(
             }
         })
         .body(|body| {
-            body.rows(20.0, visible.len(), |mut row| {
-                let r = &rows[visible[row.index()]];
+            body.rows(20.0, page_rows.len(), |mut row| {
+                let r = &rows[page_rows[row.index()]];
                 row.col(|ui| status_cell(ui, r.source));
                 row.col(|ui| path_cell(ui, r.source, &r.source_path));
                 row.col(|ui| path_cell(ui, r.target, &r.target_path));
@@ -227,6 +270,7 @@ pub fn table(
             state.sort_col = col;
             state.sort_asc = true;
         }
+        state.page = 0;
         sort(rows, state);
     }
 }
@@ -317,6 +361,7 @@ mod tests {
             sort_col: ReviewCol::TargetStatus,
             sort_asc: true,
             show_unchanged: false,
+            page: 0,
         };
         sort(&mut rows, &state);
         assert_eq!(rows[0].target, SideStatus::Added);
@@ -337,6 +382,7 @@ mod tests {
             sort_col: ReviewCol::Source,
             sort_asc: true,
             show_unchanged: false,
+            page: 0,
         };
         sort(&mut rows, &state);
         assert_eq!(rows[0].source_path, "alpha");

@@ -317,12 +317,15 @@ fn resolve_placeholder(expr: &str, entry: &FileEntry, rel_path: &str) -> String 
 fn normalize_rel(rendered: &str) -> Option<String> {
     let mut segments = Vec::new();
     for raw in rendered.split('/') {
-        let seg = raw.trim().trim_end_matches(['.', ' ']);
+        // Check for `..` before the trailing-dot trim, which would otherwise
+        // reduce it to an (ignorable) empty segment instead of a rejection.
+        let trimmed = raw.trim();
+        if trimmed == ".." {
+            return None;
+        }
+        let seg = trimmed.trim_end_matches(['.', ' ']);
         if seg.is_empty() || seg == "." {
             continue;
-        }
-        if seg == ".." {
-            return None;
         }
         segments.push(seg);
     }
@@ -560,4 +563,94 @@ fn is_same_content(path: &Path, size: u64, hash: &[u8; 32]) -> bool {
         return false;
     }
     hasher.finalize().as_bytes() == hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal entry for template tests; only the fields tokens read matter.
+    fn entry() -> FileEntry {
+        FileEntry {
+            size: 5 * 1024 * 1024,
+            hash: [0; 32],
+            modified_ms: 0,
+            missing: false,
+            mime: Some("image/jpeg".into()),
+            img_fingerprint: None,
+            video_hash: None,
+            pdf_hash: None,
+            audio: None,
+            img_size: Some((640, 480)),
+            origin: Some("usb-stick".into()),
+            exif: None,
+        }
+    }
+
+    #[test]
+    fn token_wins_when_it_resolves_non_empty() {
+        let e = entry();
+        assert_eq!(
+            render_template("{o-stem}.{o-ext}", &e, "dir/Photo.JPG"),
+            "Photo.jpg"
+        );
+        assert_eq!(render_template("{mimetop}", &e, "a"), "image");
+    }
+
+    #[test]
+    fn empty_token_falls_through_to_next_alternative() {
+        // `camera` is empty (no EXIF) → falls through to `origin`.
+        assert_eq!(
+            render_template("{camera|origin}", &entry(), "a"),
+            "usb-stick"
+        );
+    }
+
+    #[test]
+    fn quoted_literal_terminates_even_when_later_tokens_would_resolve() {
+        let e = entry();
+        assert_eq!(
+            render_template("{camera|\"nocam\"|origin}", &e, "a"),
+            "nocam"
+        );
+        // An empty literal still terminates the choice.
+        assert_eq!(render_template("x{camera|\"\"|origin}y", &e, "a"), "xy");
+    }
+
+    #[test]
+    fn all_empty_placeholder_renders_nothing() {
+        let mut e = entry();
+        e.origin = None;
+        assert_eq!(render_template("a/{camera|origin}/b", &e, "f"), "a//b");
+    }
+
+    #[test]
+    fn unknown_token_is_empty_and_falls_through() {
+        assert_eq!(
+            render_template("{bogus|origin}", &entry(), "a"),
+            "usb-stick"
+        );
+    }
+
+    #[test]
+    fn unclosed_brace_is_copied_literally() {
+        assert_eq!(render_template("a/{year", &entry(), "f"), "a/{year");
+    }
+
+    #[test]
+    fn text_outside_braces_is_verbatim() {
+        let e = entry();
+        assert_eq!(
+            render_template("pics/{size}/all", &e, "f"),
+            "pics/small/all"
+        );
+    }
+
+    #[test]
+    fn normalize_rejects_escapes_and_drops_empty_segments() {
+        assert_eq!(normalize_rel("a//b/./c"), Some("a/b/c".into()));
+        assert_eq!(normalize_rel("../a"), None);
+        assert_eq!(normalize_rel("a/../b"), None);
+        assert_eq!(normalize_rel(" / // "), None);
+    }
 }

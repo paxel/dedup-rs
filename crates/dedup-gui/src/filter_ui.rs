@@ -406,134 +406,141 @@ impl FilterBuilder {
     }
 
     fn filter_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "FILTER", theme::LILAC, |ui| {
-            let mut editing_idx = None;
-            ui.horizontal_wrapped(|ui| {
-                // One pill per active condition: a clickable label opening its
-                // editor, followed by a small remove button.
-                for (i, cond) in self.filters.iter().enumerate() {
-                    if cond.editing {
-                        editing_idx = Some(i);
-                    }
-                    let shown = cond.value.trim();
-                    let text = if shown.is_empty() {
-                        format!("{}: …", cond.kind.label())
-                    } else {
-                        format!("{}: {}", cond.kind.label(), shown)
-                    };
-                    let fill = if cond.editing {
-                        theme::ORANGE
-                    } else {
-                        theme::PANEL
-                    };
-                    let col = if cond.editing {
-                        theme::BLACK
-                    } else {
-                        theme::TEXT
-                    };
-                    if ui
-                        .add(egui::Button::new(RichText::new(text).color(col)).fill(fill))
-                        .explain(
-                            self.verbosity,
-                            "Edit this condition",
-                            "Open this filter condition's inline editor to change its value.",
-                        )
-                        .clicked()
-                    {
-                        acts.push(Act::EditCond(i));
-                    }
-                    if ui
-                        .add(egui::Button::new(RichText::new("×").color(theme::RED)))
-                        .explain(
-                            self.verbosity,
-                            "Remove this condition",
-                            "Remove this filter condition. Remaining conditions still combine \
-                             with AND.",
-                        )
-                        .clicked()
-                    {
-                        acts.push(Act::RemoveCond(i));
-                    }
-                }
-
-                // The trailing `+` pill toggles the type picker.
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("+").color(theme::BLACK))
-                            .fill(theme::AMBER),
-                    )
-                    .explain(
-                        self.verbosity,
-                        "Add a filter condition",
-                        "Show the MIME / NAME / SIZE condition-type picker to add another \
-                         filter condition. Multiple conditions combine with AND.",
-                    )
-                    .clicked()
-                {
-                    self.adding = !self.adding;
-                }
-                if self.adding {
-                    for kind in FILTER_KINDS {
-                        let (short, verbose) = match kind {
-                            FilterKind::Mime => (
-                                "Filter by MIME type",
-                                "Match files whose detected MIME type contains this substring \
-                                 (e.g. \"image/\" matches every image type).",
-                            ),
-                            FilterKind::Name => (
-                                "Filter by path (with wildcards)",
-                                "Match files by relative path: a plain substring, or a `*` \
-                                 wildcard glob like \"*.db\" (ends with) or \"copy_of*\" \
-                                 (starts with).",
-                            ),
-                            FilterKind::Size => (
-                                "Filter by size",
-                                "Match files by size with an operator and byte count, e.g. \
-                                 \">=1000\" or \"<500000\".",
-                            ),
-                            FilterKind::Tag => (
-                                "Filter by tag",
-                                "Match files carrying a tag that contains this text. Add \
-                                 tags to files in the Browse tab.",
-                            ),
+        crate::lcars::section_lcars(
+            ui,
+            "FILTER — NARROW WHICH FILES COUNT",
+            theme::LILAC,
+            |ui| {
+                let mut editing_idx = None;
+                ui.horizontal_wrapped(|ui| {
+                    // One pill per active condition: a clickable label opening its
+                    // editor, followed by a small remove button.
+                    for (i, cond) in self.filters.iter().enumerate() {
+                        if cond.editing {
+                            editing_idx = Some(i);
+                        }
+                        let shown = cond.value.trim();
+                        let text = if shown.is_empty() {
+                            format!("{}: …", cond.kind.label())
+                        } else {
+                            format!("{}: {}", cond.kind.label(), shown)
+                        };
+                        let fill = if cond.editing {
+                            theme::ORANGE
+                        } else {
+                            theme::PANEL
+                        };
+                        let col = if cond.editing {
+                            theme::BLACK
+                        } else {
+                            theme::TEXT
                         };
                         if ui
-                            .add(
-                                egui::Button::new(RichText::new(kind.label()).color(theme::BLUE))
-                                    .fill(theme::PANEL),
+                            .add(egui::Button::new(RichText::new(text).color(col)).fill(fill))
+                            .explain(
+                                self.verbosity,
+                                "Edit this condition",
+                                "Open this filter condition's inline editor to change its value.",
                             )
-                            .explain(self.verbosity, short, verbose)
                             .clicked()
                         {
-                            acts.push(Act::AddCond(kind));
+                            acts.push(Act::EditCond(i));
+                        }
+                        if ui
+                            .add(egui::Button::new(RichText::new("×").color(theme::RED)))
+                            .explain(
+                                self.verbosity,
+                                "Remove this condition",
+                                "Remove this filter condition. Remaining conditions still combine \
+                             with AND.",
+                            )
+                            .clicked()
+                        {
+                            acts.push(Act::RemoveCond(i));
                         }
                     }
-                }
 
-                if !self.filters.is_empty()
-                    && ui
+                    // The trailing `+` pill toggles the type picker.
+                    if ui
                         .add(
-                            egui::Button::new(RichText::new("CLEAR").color(theme::BLACK))
-                                .fill(theme::RED),
+                            egui::Button::new(RichText::new("+").color(theme::BLACK))
+                                .fill(theme::AMBER),
                         )
                         .explain(
                             self.verbosity,
-                            "Remove every condition",
-                            "Remove every filter condition, going back to matching all files.",
+                            "Add a filter condition",
+                            "Show the MIME / NAME / SIZE condition-type picker to add another \
+                         filter condition. Multiple conditions combine with AND.",
                         )
                         .clicked()
-                {
-                    acts.push(Act::ClearConds);
+                    {
+                        self.adding = !self.adding;
+                    }
+                    if self.adding {
+                        for kind in FILTER_KINDS {
+                            let (short, verbose) = match kind {
+                                FilterKind::Mime => (
+                                    "Filter by MIME type",
+                                    "Match files whose detected MIME type contains this substring \
+                                 (e.g. \"image/\" matches every image type).",
+                                ),
+                                FilterKind::Name => (
+                                    "Filter by path (with wildcards)",
+                                    "Match files by relative path: a plain substring, or a `*` \
+                                 wildcard glob like \"*.db\" (ends with) or \"copy_of*\" \
+                                 (starts with).",
+                                ),
+                                FilterKind::Size => (
+                                    "Filter by size",
+                                    "Match files by size with an operator and byte count, e.g. \
+                                 \">=1000\" or \"<500000\".",
+                                ),
+                                FilterKind::Tag => (
+                                    "Filter by tag",
+                                    "Match files carrying a tag that contains this text. Add \
+                                 tags to files in the Browse tab.",
+                                ),
+                            };
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(kind.label()).color(theme::BLUE),
+                                    )
+                                    .fill(theme::PANEL),
+                                )
+                                .explain(self.verbosity, short, verbose)
+                                .clicked()
+                            {
+                                acts.push(Act::AddCond(kind));
+                            }
+                        }
+                    }
+
+                    if !self.filters.is_empty()
+                        && ui
+                            .add(
+                                egui::Button::new(RichText::new("CLEAR").color(theme::BLACK))
+                                    .fill(theme::RED),
+                            )
+                            .explain(
+                                self.verbosity,
+                                "Remove every condition",
+                                "Remove every filter condition, going back to matching all files.",
+                            )
+                            .clicked()
+                    {
+                        acts.push(Act::ClearConds);
+                    }
+                });
+
+                // Inline editor panel for the condition currently being edited.
+                if let Some(idx) = editing_idx {
+                    self.cond_editor(ui, idx, acts);
                 }
-            });
 
-            // Inline editor panel for the condition currently being edited.
-            if let Some(idx) = editing_idx {
-                self.cond_editor(ui, idx, acts);
-            }
-
-            self.preset_row(ui, acts);
-        });
+                self.preset_row(ui, acts);
+            },
+        );
     }
 
     /// The saved-preset row: one pill per preset (click to apply, right-click

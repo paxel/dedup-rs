@@ -30,6 +30,7 @@
 
 use crate::external;
 use crate::filter_ui::FilterBuilder;
+use crate::lightbox::{FullResCache, LightboxState};
 use crate::settings::TooltipVerbosity;
 use crate::theme;
 use crate::thumbs::ThumbCache;
@@ -208,6 +209,36 @@ pub struct BrowseView {
     /// be evaluated. Reloaded alongside `all_tags`.
     annos_map: HashMap<String, Vec<String>>,
     verbosity: TooltipVerbosity,
+    /// Open full-window viewer for the previewed image/video, if any.
+    lightbox: Option<OpenLightbox>,
+    /// Full-resolution texture cache backing the lightbox.
+    full_res: FullResCache,
+    /// Audio preview: show the spectrogram instead of the amplitude waveform.
+    audio_spec: bool,
+    /// One-entry spectrogram texture cache for the previewed audio file.
+    spec_tex: Option<(String, egui::TextureHandle)>,
+    /// One-entry ID3 tag cache for the previewed audio file (`None` inside =
+    /// the file has no readable tags).
+    audio_tags: Option<(String, Option<crate::id3tags::Tags>)>,
+    /// Inline ID3 tag editor, open for the previewed audio file.
+    tag_edit: Option<BrowseTagEdit>,
+}
+
+/// The in-progress ID3 edit for the previewed audio file.
+struct BrowseTagEdit {
+    hex: String,
+    abs: std::path::PathBuf,
+    tags: crate::id3tags::Tags,
+}
+
+/// Everything the open lightbox needs, captured when the preview is clicked so
+/// the viewer stays valid even if the selection changes underneath it.
+struct OpenLightbox {
+    state: LightboxState,
+    hex: String,
+    abs: std::path::PathBuf,
+    is_video: bool,
+    meta: String,
 }
 
 impl BrowseView {
@@ -245,6 +276,12 @@ impl BrowseView {
             all_tags_repo: None,
             annos_map: HashMap::new(),
             verbosity: TooltipVerbosity::default(),
+            lightbox: None,
+            full_res: FullResCache::new(1),
+            audio_spec: false,
+            spec_tex: None,
+            audio_tags: None,
+            tag_edit: None,
         }
     }
 
@@ -482,25 +519,30 @@ impl BrowseView {
         // Repo picker (single repo), amber when selected.
         let repos = self.repos.clone();
         let mut picked: Option<String> = None;
-        crate::lcars::section_lcars(ui, "REPO", theme::AMBER, |ui| {
-            crate::repo_chip::chip_row(ui, "browse_repo", "", repos.len(), |ui, i| {
-                let name = &repos[i];
-                let sel = self.repo.as_deref() == Some(name.as_str());
-                let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::AMBER, None);
-                if chip
-                    .name
-                    .explain(
-                        self.verbosity,
-                        "Browse this repository",
-                        "Load this repository's index and browse its files by directory.",
-                    )
-                    .clicked()
-                {
-                    picked = Some(name.clone());
-                }
-                chip.outer
-            });
-        });
+        crate::lcars::section_lcars(
+            ui,
+            "REPO — WHICH REPOSITORY TO BROWSE",
+            theme::AMBER,
+            |ui| {
+                crate::repo_chip::chip_row(ui, "browse_repo", "", repos.len(), |ui, i| {
+                    let name = &repos[i];
+                    let sel = self.repo.as_deref() == Some(name.as_str());
+                    let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::AMBER, None);
+                    if chip
+                        .name
+                        .explain(
+                            self.verbosity,
+                            "Browse this repository",
+                            "Load this repository's index and browse its files by directory.",
+                        )
+                        .clicked()
+                    {
+                        picked = Some(name.clone());
+                    }
+                    chip.outer
+                });
+            },
+        );
         if let Some(name) = picked {
             self.repo = Some(name);
         }
@@ -660,6 +702,32 @@ impl BrowseView {
         // Remember the selection by identity (rel path) after any click/key this
         // frame, so it survives the next re-sort or refresh.
         self.sel_rel = files.get(self.file_sel).map(|f| f.rel.clone());
+
+        self.lightbox_modal(ui.ctx());
+    }
+
+    /// The full-window viewer for the clicked preview: full resolution for
+    /// images (the thumbnail stands in while it decodes), the scrub frame for
+    /// videos. Rendering and interactions live in [`crate::lightbox`].
+    fn lightbox_modal(&mut self, ctx: &egui::Context) {
+        let Some(lb) = self.lightbox.as_mut() else {
+            return;
+        };
+        self.full_res.poll(ctx);
+        let tex = if lb.is_video {
+            self.thumbs.get_video(&lb.hex, &lb.abs, 2, 5)
+        } else {
+            self.full_res
+                .get(&lb.hex, &lb.abs)
+                .or_else(|| self.thumbs.get(&lb.hex, &lb.abs))
+        };
+        let img = tex
+            .as_ref()
+            .map(|t| t.size_vec2())
+            .unwrap_or(egui::vec2(1.0, 1.0));
+        if crate::lightbox::single_view(ctx, &mut lb.state, tex, img, &lb.meta, self.verbosity) {
+            self.lightbox = None;
+        }
     }
 
     /// Point `file_sel` at the remembered selection's new index, so it stays on
@@ -946,31 +1014,88 @@ impl BrowseView {
                     }
                 });
                 if let Some(tex) = tex {
-                    ui.centered_and_justified(|ui| {
-                        ui.add(
-                            egui::Image::new(egui::load::SizedTexture::from_handle(&tex))
-                                .max_height(height - 8.0)
-                                .maintain_aspect_ratio(true)
-                                .corner_radius(4),
+                    let resp = ui
+                        .centered_and_justified(|ui| {
+                            ui.add(
+                                egui::Image::new(egui::load::SizedTexture::from_handle(&tex))
+                                    .max_height(height - 8.0)
+                                    .maintain_aspect_ratio(true)
+                                    .corner_radius(4),
+                            )
+                            .interact(egui::Sense::click())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        })
+                        .inner
+                        .explain(
+                            self.verbosity,
+                            "Open in the viewer",
+                            "Open this file full-window in the lightbox — wheel zoom, drag \
+                             pan, F fit, 1 true pixels, Esc closes.",
                         );
-                    });
+                    if resp.clicked()
+                        && let Some(abs) = abs
+                    {
+                        let mut meta = vec![sel.rel.clone(), format_size(sel.size)];
+                        if !sel.info.is_empty() {
+                            meta.push(sel.info.clone());
+                        }
+                        meta.push(format_mtime(sel.modified_ms));
+                        self.lightbox = Some(OpenLightbox {
+                            state: LightboxState::new(0, 0),
+                            hex: hash_hex(&sel.hash),
+                            abs: abs.to_path_buf(),
+                            is_video: cat == Cat::Video,
+                            meta: meta.join(" · "),
+                        });
+                    }
                 } else {
                     placeholder(ui, "decoding…");
                 }
             }
-            Cat::Audio => {
-                let viz = abs.and_then(|abs| self.waves.get(&hash_hex(&sel.hash), abs));
+            Cat::Audio => self.audio_preview(ui, sel, abs, height),
+            Cat::Text | Cat::Other => self.draw_preview_body(ui),
+        }
+    }
+
+    /// The audio preview: a waveform/spectrogram visual (switchable) on the
+    /// left, and this file's ID3 tags — with an inline editor — on the right.
+    fn audio_preview(&mut self, ui: &mut egui::Ui, sel: &FileRow, abs: Option<&Path>, height: f32) {
+        let hex = hash_hex(&sel.hash);
+        let viz = abs.and_then(|abs| self.waves.get(&hex, abs));
+        let tag_w = 250.0;
+        ui.horizontal_top(|ui| {
+            let vis_w = (ui.available_width() - tag_w - 12.0).max(80.0);
+            ui.vertical(|ui| {
+                ui.set_width(vis_w);
+                ui.horizontal(|ui| {
+                    for (spec, label) in [(false, "Waveform"), (true, "Spectrogram")] {
+                        if pill_toggle(ui, self.audio_spec == spec, label).clicked() {
+                            self.audio_spec = spec;
+                        }
+                    }
+                });
                 let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), height - 8.0),
+                    egui::vec2(vis_w, (height - 38.0).max(40.0)),
                     egui::Sense::hover(),
                 );
                 let p = ui.painter_at(rect);
                 p.rect_filled(rect, 4.0, theme::PANEL);
-                match viz.map(|v| v.envelope.clone()).filter(|e| !e.is_empty()) {
-                    Some(env) => {
+                match viz {
+                    Some(viz) if self.audio_spec && viz.spec_w > 0 => {
+                        let tex = self.spec_texture(ui.ctx(), &hex, &viz);
+                        let uv =
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                        ui.painter_at(rect).image(
+                            tex.id(),
+                            rect.shrink(2.0),
+                            uv,
+                            egui::Color32::WHITE,
+                        );
+                    }
+                    Some(viz) if !self.audio_spec && !viz.envelope.is_empty() => {
                         let mid = rect.center().y;
-                        let bw = rect.width() / env.len() as f32;
-                        for (i, &amp) in env.iter().enumerate() {
+                        let bw = rect.width() / viz.envelope.len() as f32;
+                        for (i, &amp) in viz.envelope.iter().enumerate() {
                             let h = amp * rect.height() * 0.46;
                             let x = rect.left() + i as f32 * bw;
                             p.rect_filled(
@@ -983,7 +1108,7 @@ impl BrowseView {
                             );
                         }
                     }
-                    None => {
+                    _ => {
                         p.text(
                             rect.center(),
                             egui::Align2::CENTER_CENTER,
@@ -993,8 +1118,165 @@ impl BrowseView {
                         );
                     }
                 }
+            });
+            ui.vertical(|ui| self.audio_tag_panel(ui, sel, abs, &hex));
+        });
+    }
+
+    /// Lazily upload (and cache) the previewed file's spectrogram texture.
+    fn spec_texture(
+        &mut self,
+        ctx: &egui::Context,
+        hex: &str,
+        viz: &crate::waveform::AudioViz,
+    ) -> egui::TextureHandle {
+        if let Some((h, t)) = &self.spec_tex
+            && h == hex
+        {
+            return t.clone();
+        }
+        let tex = ctx.load_texture(
+            format!("browse-spec-{hex}"),
+            crate::waveform::spec_image(viz),
+            egui::TextureOptions::LINEAR,
+        );
+        self.spec_tex = Some((hex.to_string(), tex.clone()));
+        tex
+    }
+
+    /// The previewed file's ID3 tags, read once per file and cached.
+    fn cached_tags(&mut self, hex: &str, abs: Option<&Path>) -> Option<crate::id3tags::Tags> {
+        if let Some((h, t)) = &self.audio_tags
+            && h == hex
+        {
+            return t.clone();
+        }
+        let read = abs.and_then(crate::id3tags::read);
+        self.audio_tags = Some((hex.to_string(), read.clone()));
+        read
+    }
+
+    /// The ID3 side of the audio preview: the tag values (or a "none" note) and
+    /// EDIT TAGS, which swaps the panel for an inline editor with SAVE/CANCEL.
+    fn audio_tag_panel(&mut self, ui: &mut egui::Ui, sel: &FileRow, abs: Option<&Path>, hex: &str) {
+        ui.label(RichText::new("ID3 TAGS").color(theme::LILAC).size(11.0));
+
+        // Editor open for this file → text fields + SAVE/CANCEL.
+        if self.tag_edit.as_ref().is_some_and(|te| te.hex == hex) {
+            let (mut save, mut cancel) = (false, false);
+            if let Some(te) = self.tag_edit.as_mut() {
+                let row = |ui: &mut egui::Ui, label: &str, v: &mut String| {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            egui::vec2(48.0, 16.0),
+                            egui::Label::new(RichText::new(label).color(theme::TAN).size(11.0)),
+                        );
+                        ui.add(egui::TextEdit::singleline(v).desired_width(160.0));
+                    });
+                };
+                row(ui, "TITLE", &mut te.tags.title);
+                row(ui, "ARTIST", &mut te.tags.artist);
+                row(ui, "ALBUM", &mut te.tags.album);
+                row(ui, "YEAR", &mut te.tags.year);
+                row(ui, "TRACK", &mut te.tags.track);
+                row(ui, "GENRE", &mut te.tags.genre);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("SAVE TAGS").color(theme::BLACK))
+                                .fill(theme::AMBER),
+                        )
+                        .clicked()
+                    {
+                        save = true;
+                    }
+                    if ui
+                        .button(RichText::new("CANCEL").color(theme::TEXT))
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+                ui.label(
+                    RichText::new(
+                        "Saving writes the tags into the file on disk (the audio is \
+                         unchanged). Run UPDATE on the repo afterwards so the index sees \
+                         the modified file.",
+                    )
+                    .color(theme::LILAC)
+                    .size(11.0),
+                );
             }
-            Cat::Text | Cat::Other => self.draw_preview_body(ui),
+            if cancel {
+                self.tag_edit = None;
+            } else if save && let Some(te) = self.tag_edit.take() {
+                match crate::id3tags::write(&te.abs, &te.tags) {
+                    Ok(()) => {
+                        self.audio_tags = Some((te.hex, Some(te.tags)));
+                        self.error = None;
+                    }
+                    Err(e) => self.error = Some(format!("Tag save failed: {e}")),
+                }
+            }
+            return;
+        }
+
+        // Display: each non-empty field, or a "none" note.
+        let tags = self.cached_tags(hex, abs);
+        match &tags {
+            Some(t) => {
+                let fields = [
+                    ("TITLE", &t.title),
+                    ("ARTIST", &t.artist),
+                    ("ALBUM", &t.album),
+                    ("YEAR", &t.year),
+                    ("TRACK", &t.track),
+                    ("GENRE", &t.genre),
+                ];
+                let mut any = false;
+                for (label, v) in fields {
+                    if v.is_empty() {
+                        continue;
+                    }
+                    any = true;
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            egui::vec2(48.0, 16.0),
+                            egui::Label::new(RichText::new(label).color(theme::TAN).size(11.0)),
+                        );
+                        ui.add(egui::Label::new(RichText::new(v).color(theme::TEXT)).truncate());
+                    });
+                }
+                if !any {
+                    ui.label(RichText::new("All tags empty.").color(theme::HAIRLINE));
+                }
+            }
+            None => {
+                ui.label(RichText::new("No ID3 tags.").color(theme::HAIRLINE));
+            }
+        }
+        // Editing covers the ID3-capable containers the `id3` crate writes.
+        let editable = ["mpeg", "wav", "aiff"].iter().any(|k| sel.mime.contains(k));
+        if editable
+            && let Some(abs) = abs
+            && ui
+                .add(
+                    egui::Button::new(RichText::new("EDIT TAGS").color(theme::BLACK))
+                        .fill(theme::AMBER),
+                )
+                .explain(
+                    self.verbosity,
+                    "Edit this file's ID3 tags",
+                    "Edit the embedded ID3v2 tags (title, artist, album, year, track, \
+                     genre) and write them back into the audio file.",
+                )
+                .clicked()
+        {
+            self.tag_edit = Some(BrowseTagEdit {
+                hex: hex.to_string(),
+                abs: abs.to_path_buf(),
+                tags: tags.unwrap_or_default(),
+            });
         }
     }
 
@@ -2342,5 +2624,124 @@ mod tests {
             .join("../../target/dupes_browse_flat.png");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// An open Browse lightbox shows the viewer chrome (CLOSE / FIT / 1:1) and
+    /// Esc closes it.
+    #[test]
+    fn lightbox_opens_and_esc_closes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let repo_dir = tmp.path().join("R");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        store.create_repo("R", &repo_dir.to_string_lossy()).unwrap();
+        store.update_file_entry("R", "pic.png", &entry()).unwrap();
+
+        let mut view = BrowseView::new();
+        view.repo = Some("R".into());
+        view.lightbox = Some(OpenLightbox {
+            state: LightboxState::new(0, 0),
+            hex: "00".into(),
+            abs: repo_dir.join("pic.png"),
+            is_video: false,
+            meta: "pic.png · 100 B".into(),
+        });
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut BrowseView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    ui.allocate_ui(egui::vec2(ui.available_width(), 600.0), |ui| {
+                        view.show(ui, &store_ui, TooltipVerbosity::default());
+                    });
+                },
+                view,
+            );
+        h.run();
+        assert!(
+            h.query_by_label_contains("CLOSE").is_some(),
+            "the open lightbox shows its CLOSE control"
+        );
+        assert!(
+            h.query_by_label("FIT").is_some() && h.query_by_label("1:1").is_some(),
+            "the open lightbox shows FIT and 1:1"
+        );
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!(
+            h.state().lightbox.is_none(),
+            "Esc closes the Browse lightbox"
+        );
+    }
+
+    /// An audio file's preview shows its ID3 tags, the Waveform/Spectrogram
+    /// toggle, and EDIT TAGS — which swaps the tag panel for the inline editor.
+    #[test]
+    fn audio_preview_shows_tags_spectrogram_toggle_and_editor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let repo_dir = tmp.path().join("R");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        store.create_repo("R", &repo_dir.to_string_lossy()).unwrap();
+        let mp3 = repo_dir.join("song.mp3");
+        crate::id3tags::write_bare_mp3(&mp3);
+        crate::id3tags::write(
+            &mp3,
+            &crate::id3tags::Tags {
+                title: "Chelsea Hotel".into(),
+                artist: "Leonard Cohen".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut e = entry();
+        e.mime = Some("audio/mpeg".into());
+        store.update_file_entry("R", "song.mp3", &e).unwrap();
+
+        let mut view = BrowseView::new();
+        view.repo = Some("R".into());
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut BrowseView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    ui.allocate_ui(egui::vec2(ui.available_width(), 600.0), |ui| {
+                        view.show(ui, &store_ui, TooltipVerbosity::default());
+                    });
+                },
+                view,
+            );
+        h.run();
+        h.run();
+        assert!(
+            h.query_by_label("Chelsea Hotel").is_some(),
+            "the tag panel shows the ID3 title"
+        );
+        assert!(
+            h.query_by_label("Spectrogram").is_some() && h.query_by_label("Waveform").is_some(),
+            "the visual toggle offers Waveform and Spectrogram"
+        );
+        h.get_by_label("EDIT TAGS").click_accesskit();
+        h.run();
+        assert!(
+            h.query_by_label("SAVE TAGS").is_some(),
+            "EDIT TAGS opens the inline editor"
+        );
+        assert!(
+            h.state().tag_edit.is_some(),
+            "the editor state is bound to the previewed file"
+        );
     }
 }

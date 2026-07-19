@@ -382,6 +382,48 @@ fn fft(re: &mut [f32], im: &mut [f32]) {
     }
 }
 
+/// Magma-ish heat ramp (black → purple → orange → white) for spectrogram cells:
+/// `v` in 0..=1 maps to brightness, so louder frequencies read brighter.
+fn spec_color(v: f32) -> egui::Color32 {
+    const STOPS: [(f32, f32, f32, f32); 5] = [
+        (0.00, 0.0, 0.0, 4.0),
+        (0.25, 60.0, 15.0, 110.0),
+        (0.50, 165.0, 45.0, 110.0),
+        (0.75, 235.0, 105.0, 60.0),
+        (1.00, 252.0, 255.0, 200.0),
+    ];
+    let v = v.clamp(0.0, 1.0);
+    let mut i = 0;
+    while i + 1 < STOPS.len() && v > STOPS[i + 1].0 {
+        i += 1;
+    }
+    let (v0, r0, g0, b0) = STOPS[i];
+    let (v1, r1, g1, b1) = STOPS[(i + 1).min(STOPS.len() - 1)];
+    let t = if v1 > v0 { (v - v0) / (v1 - v0) } else { 0.0 };
+    let lerp = |a: f32, b: f32| (a + (b - a) * t) as u8;
+    egui::Color32::from_rgb(lerp(r0, r1), lerp(g0, g1), lerp(b0, b1))
+}
+
+/// Build a spectrogram image (time on x, frequency on y with bass at the
+/// bottom) from a decoded [`AudioViz`]. Shared by the Duplicates audio lightbox
+/// and the Browse audio preview.
+pub fn spec_image(viz: &AudioViz) -> egui::ColorImage {
+    let (w, h) = (viz.spec_w, viz.spec_h);
+    let mut rgba = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let bin = h - 1 - y; // row 0 (top) = highest freq
+        for x in 0..w {
+            let c = spec_color(viz.spec[bin * w + x]);
+            let i = (y * w + x) * 4;
+            rgba[i] = c.r();
+            rgba[i + 1] = c.g();
+            rgba[i + 2] = c.b();
+            rgba[i + 3] = 255;
+        }
+    }
+    egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba)
+}
+
 /// Write a minimal PCM16 mono WAV (used by tests and the ignored render, since
 /// no audio-writer crate is a dependency and rodio's symphonia-all decodes WAV).
 #[cfg(test)]

@@ -287,14 +287,26 @@ impl DedupApp {
     /// and made unique against existing repos and others in the same drop. No-op
     /// while an update runs (the registry is locked then, like the ADD button).
     fn handle_dropped_folders(&mut self, ctx: &egui::Context) {
-        let dropped: Vec<PathBuf> = ctx.input(|i| {
-            i.raw
+        let (dropped, drop_count) = ctx.input(|i| {
+            let dropped: Vec<PathBuf> = i
+                .raw
                 .dropped_files
                 .iter()
                 .filter_map(|f| f.path.clone())
-                .collect()
+                .collect();
+            (dropped, i.raw.dropped_files.len())
         });
+        if drop_count == 0 {
+            return;
+        }
+        // Something was dropped but the windowing backend delivered no usable
+        // path (seen on Wayland) — say so instead of silently ignoring it.
         if dropped.is_empty() {
+            self.load_error = Some(
+                "Your desktop didn't provide file paths for the drop (common on Wayland) — \
+                 use ADD REPOSITORY instead."
+                    .into(),
+            );
             return;
         }
         if self.worker.active_count() > 0 {
@@ -929,13 +941,17 @@ impl DedupApp {
         // The registry is locked while any repo is updating, so adding a repo
         // (which reads every repo's stats) must wait until scans finish.
         let busy = self.worker.active_count() > 0;
-        crate::lcars::section_lcars(ui, "MANAGE", theme::BLUE, |ui| {
-            ui.horizontal(|ui| {
-                let add = egui::Button::new(
-                    RichText::new(format!("{} ADD REPOSITORY", icon::PLUS)).color(theme::BLACK),
-                )
-                .fill(theme::BLUE);
-                if ui
+        crate::lcars::section_lcars(
+            ui,
+            "MANAGE — ADD & UPDATE REPOSITORIES",
+            theme::BLUE,
+            |ui| {
+                ui.horizontal(|ui| {
+                    let add = egui::Button::new(
+                        RichText::new(format!("{} ADD REPOSITORY", icon::PLUS)).color(theme::BLACK),
+                    )
+                    .fill(theme::BLUE);
+                    if ui
                     .add_enabled(!busy, add)
                     .explain(
                         self.tooltip_verbosity,
@@ -947,13 +963,13 @@ impl DedupApp {
                 {
                     actions.push(Action::OpenAdd);
                 }
-                // Enqueues every repo; it only touches names (no db access), so it
-                // stays enabled even while a batch is running.
-                let update_all = egui::Button::new(
-                    RichText::new(format!("{} UPDATE ALL", icon::REFRESH)).color(theme::BLACK),
-                )
-                .fill(theme::ORANGE);
-                if ui
+                    // Enqueues every repo; it only touches names (no db access), so it
+                    // stays enabled even while a batch is running.
+                    let update_all = egui::Button::new(
+                        RichText::new(format!("{} UPDATE ALL", icon::REFRESH)).color(theme::BLACK),
+                    )
+                    .fill(theme::ORANGE);
+                    if ui
                     .add_enabled(!self.repos.is_empty(), update_all)
                     .explain(
                         self.tooltip_verbosity,
@@ -965,13 +981,14 @@ impl DedupApp {
                 {
                     actions.push(Action::UpdateAll);
                 }
-                // Re-probe every repo's location/reachability (filesystem only, no
-                // db access), so it is fine to run any time.
-                let refresh = egui::Button::new(
-                    RichText::new(format!("{} REFRESH STATUS", icon::REFRESH)).color(theme::BLACK),
-                )
-                .fill(theme::LILAC);
-                if ui
+                    // Re-probe every repo's location/reachability (filesystem only, no
+                    // db access), so it is fine to run any time.
+                    let refresh = egui::Button::new(
+                        RichText::new(format!("{} REFRESH STATUS", icon::REFRESH))
+                            .color(theme::BLACK),
+                    )
+                    .fill(theme::LILAC);
+                    if ui
                     .add_enabled(!self.repos.is_empty(), refresh)
                     .explain(
                         self.tooltip_verbosity,
@@ -983,15 +1000,16 @@ impl DedupApp {
                 {
                     actions.push(Action::RefreshStatus);
                 }
-                if busy {
-                    ui.label(
-                        RichText::new("· busy: a scan is running")
-                            .color(theme::TAN)
-                            .size(12.0),
-                    );
-                }
-            });
-        });
+                    if busy {
+                        ui.label(
+                            RichText::new("· busy: a scan is running")
+                                .color(theme::TAN)
+                                .size(12.0),
+                        );
+                    }
+                });
+            },
+        );
         ui.add_space(4.0);
 
         let rows = self.repos.clone();
@@ -2259,7 +2277,7 @@ mod ui_tests {
         harness.run();
         assert!(
             harness
-                .query_by_label_contains("Register, scan, and manage repositories")
+                .query_by_label_contains("Register the folders you want to triage")
                 .is_some(),
             "the HELP window shows the current (REPOSITORIES) tab's help copy"
         );

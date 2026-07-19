@@ -183,47 +183,6 @@ fn paint_audio_glyph(painter: &egui::Painter, rect: egui::Rect, fp: &dedup_core:
     }
 }
 
-/// Magma-ish heat ramp (black → purple → orange → white) for spectrogram cells:
-/// `v` in 0..=1 maps to brightness, so louder frequencies read brighter.
-fn spec_color(v: f32) -> egui::Color32 {
-    const STOPS: [(f32, f32, f32, f32); 5] = [
-        (0.00, 0.0, 0.0, 4.0),
-        (0.25, 60.0, 15.0, 110.0),
-        (0.50, 165.0, 45.0, 110.0),
-        (0.75, 235.0, 105.0, 60.0),
-        (1.00, 252.0, 255.0, 200.0),
-    ];
-    let v = v.clamp(0.0, 1.0);
-    let mut i = 0;
-    while i + 1 < STOPS.len() && v > STOPS[i + 1].0 {
-        i += 1;
-    }
-    let (v0, r0, g0, b0) = STOPS[i];
-    let (v1, r1, g1, b1) = STOPS[(i + 1).min(STOPS.len() - 1)];
-    let t = if v1 > v0 { (v - v0) / (v1 - v0) } else { 0.0 };
-    let lerp = |a: f32, b: f32| (a + (b - a) * t) as u8;
-    egui::Color32::from_rgb(lerp(r0, r1), lerp(g0, g1), lerp(b0, b1))
-}
-
-/// Build a spectrogram image (time on x, frequency on y with bass at the
-/// bottom) from a decoded [`waveform::AudioViz`].
-fn spec_image(viz: &crate::waveform::AudioViz) -> egui::ColorImage {
-    let (w, h) = (viz.spec_w, viz.spec_h);
-    let mut rgba = vec![0u8; w * h * 4];
-    for y in 0..h {
-        let bin = h - 1 - y; // row 0 (top) = highest freq
-        for x in 0..w {
-            let c = spec_color(viz.spec[bin * w + x]);
-            let i = (y * w + x) * 4;
-            rgba[i] = c.r();
-            rgba[i + 1] = c.g();
-            rgba[i + 2] = c.b();
-            rgba[i + 3] = 255;
-        }
-    }
-    egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba)
-}
-
 /// One-line `path · size · WxH · mtime` description used by the lightbox.
 fn lightbox_meta(file: &DupeFile) -> String {
     format!(
@@ -627,37 +586,42 @@ impl DupesView {
     }
 
     fn repo_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "REPOS", theme::LILAC, |ui| {
-            // Bulk MARK ALL / NONE (repos start excluded, so this is the quick way
-            // to include/clear all of them at once).
-            ui.horizontal(|ui| {
-                if crate::lcars::toggle_button(ui, "ALL", false, theme::ORANGE)
-                    .explain(
-                        self.verbosity,
-                        "Include every repo in the search",
-                        "Include (check) every repository so FIND searches them all.",
-                    )
-                    .clicked()
-                {
-                    self.repos.iter_mut().for_each(|r| r.included = true);
-                }
-                if crate::lcars::toggle_button(ui, "NONE", false, theme::ORANGE)
-                    .explain(
-                        self.verbosity,
-                        "Exclude every repo",
-                        "Exclude (uncheck) every repository. FIND needs at least one included.",
-                    )
-                    .clicked()
-                {
-                    self.repos.iter_mut().for_each(|r| r.included = false);
-                }
-            });
-            // The shared wrapping chip row (see `repo_chip::chip_row`) breaks onto
-            // multiple lines when the window is narrow.
-            crate::repo_chip::chip_row(ui, "dupes_repos", "", self.repos.len(), |ui, i| {
-                self.repo_chip(ui, i, acts)
-            });
-        });
+        crate::lcars::section_lcars(
+            ui,
+            "REPOS — WHERE TO LOOK FOR DUPLICATES",
+            theme::LILAC,
+            |ui| {
+                // Bulk MARK ALL / NONE (repos start excluded, so this is the quick way
+                // to include/clear all of them at once).
+                ui.horizontal(|ui| {
+                    if crate::lcars::toggle_button(ui, "ALL", false, theme::ORANGE)
+                        .explain(
+                            self.verbosity,
+                            "Include every repo in the search",
+                            "Include (check) every repository so FIND searches them all.",
+                        )
+                        .clicked()
+                    {
+                        self.repos.iter_mut().for_each(|r| r.included = true);
+                    }
+                    if crate::lcars::toggle_button(ui, "NONE", false, theme::ORANGE)
+                        .explain(
+                            self.verbosity,
+                            "Exclude every repo",
+                            "Exclude (uncheck) every repository. FIND needs at least one included.",
+                        )
+                        .clicked()
+                    {
+                        self.repos.iter_mut().for_each(|r| r.included = false);
+                    }
+                });
+                // The shared wrapping chip row (see `repo_chip::chip_row`) breaks onto
+                // multiple lines when the window is narrow.
+                crate::repo_chip::chip_row(ui, "dupes_repos", "", self.repos.len(), |ui, i| {
+                    self.repo_chip(ui, i, acts)
+                });
+            },
+        );
     }
 
     /// One repo chip — the shared identicon + name include-toggle plus the
@@ -709,77 +673,81 @@ impl DupesView {
     }
 
     fn controls(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "MODE", theme::AMBER, |ui| {
-            ui.horizontal(|ui| {
-                let exact = self.mode == Mode::Exact;
-                // The two match modes: DUPLICATES (orange) / SIMILAR (lilac).
-                if crate::lcars::toggle_button(ui, "DUPLICATES", exact, theme::ORANGE)
-                    .explain(
-                        self.verbosity,
-                        "Exact byte-for-byte duplicates",
-                        "Find files whose content is byte-for-byte identical \
+        crate::lcars::section_lcars(
+            ui,
+            "MODE — WHAT COUNTS AS A DUPLICATE",
+            theme::AMBER,
+            |ui| {
+                ui.horizontal(|ui| {
+                    let exact = self.mode == Mode::Exact;
+                    // The two match modes: DUPLICATES (orange) / SIMILAR (lilac).
+                    if crate::lcars::toggle_button(ui, "DUPLICATES", exact, theme::ORANGE)
+                        .explain(
+                            self.verbosity,
+                            "Exact byte-for-byte duplicates",
+                            "Find files whose content is byte-for-byte identical \
                          (same size and BLAKE3 hash). Fast, no false positives.",
-                    )
-                    .clicked()
-                {
-                    self.mode = Mode::Exact;
-                }
-                if crate::lcars::toggle_button(ui, "SIMILAR", !exact, theme::LILAC)
-                    .explain(
-                        self.verbosity,
-                        "Perceptually similar images/videos",
-                        "Find images and videos that look alike even when their \
+                        )
+                        .clicked()
+                    {
+                        self.mode = Mode::Exact;
+                    }
+                    if crate::lcars::toggle_button(ui, "SIMILAR", !exact, theme::LILAC)
+                        .explain(
+                            self.verbosity,
+                            "Perceptually similar images/videos",
+                            "Find images and videos that look alike even when their \
                          bytes differ — re-saves, re-encodes, or crops — using a \
                          perceptual hash and the similarity threshold below.",
+                        )
+                        .clicked()
+                    {
+                        self.mode = Mode::Similar;
+                    }
+                    if crate::lcars::action_button(
+                        ui,
+                        &format!("{} FIND", icon::SEARCH),
+                        self.busy.is_none(),
+                        theme::AMBER,
+                    )
+                    .explain(
+                        self.verbosity,
+                        "Search the included repos",
+                        "Search every included (checked) repository for duplicates or \
+                     similars per the selected mode. Excluded repos are skipped.",
                     )
                     .clicked()
-                {
-                    self.mode = Mode::Similar;
-                }
-                if crate::lcars::action_button(
-                    ui,
-                    &format!("{} FIND", icon::SEARCH),
-                    self.busy.is_none(),
-                    theme::AMBER,
-                )
-                .explain(
-                    self.verbosity,
-                    "Search the included repos",
-                    "Search every included (checked) repository for duplicates or \
-                     similars per the selected mode. Excluded repos are skipped.",
-                )
-                .clicked()
-                {
-                    acts.push(Act::Find);
-                }
-                // Progress while a background op runs.
-                if let Some(op) = &self.busy {
-                    ui.add(egui::Spinner::new().color(theme::AMBER));
-                    let text = match op {
-                        Op::Find(n) => format!("searching… {n} groups"),
-                        Op::AutoResolve { done, total } => {
-                            format!("auto-resolving… {done}/{total}")
-                        }
-                        Op::Delete => "deleting…".to_string(),
-                    };
-                    ui.label(RichText::new(text).color(theme::AMBER).size(12.0));
-                }
-            });
+                    {
+                        acts.push(Act::Find);
+                    }
+                    // Progress while a background op runs.
+                    if let Some(op) = &self.busy {
+                        ui.add(egui::Spinner::new().color(theme::AMBER));
+                        let text = match op {
+                            Op::Find(n) => format!("searching… {n} groups"),
+                            Op::AutoResolve { done, total } => {
+                                format!("auto-resolving… {done}/{total}")
+                            }
+                            Op::Delete => "deleting…".to_string(),
+                        };
+                        ui.label(RichText::new(text).color(theme::AMBER).size(12.0));
+                    }
+                });
 
-            // The similarity threshold gets its own row so the slider has room
-            // to read as a slider (cramming it into the button row hid the track
-            // behind the value box). The value box still accepts typed floats.
-            if self.mode == Mode::Similar {
+                // The similarity threshold gets its own row so the slider has room
+                // to read as a slider (cramming it into the button row hid the track
+                // behind the value box). The value box still accepts typed floats.
+                if self.mode == Mode::Similar {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        crate::util::similarity_slider(ui, &mut self.threshold, self.verbosity);
+                    });
+                }
+
+                // Quick Delete: gives each group a DELETE NOW button that removes
+                // its marked files instantly (no per-group confirmation).
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    crate::util::similarity_slider(ui, &mut self.threshold, self.verbosity);
-                });
-            }
-
-            // Quick Delete: gives each group a DELETE NOW button that removes
-            // its marked files instantly (no per-group confirmation).
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
                 // A proper bordered toggle now (filled red when on), so it's
                 // clearly a clickable control even when off.
                 let label = format!("{} QUICK DELETE", icon::LIGHTNING);
@@ -803,7 +771,8 @@ impl DupesView {
                     );
                 }
             });
-        });
+            },
+        );
 
         if self.total_groups() > 0 {
             ui.horizontal(|ui| {
@@ -1812,24 +1781,13 @@ impl DupesView {
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);
                 let cursor = ctx.pointer_hover_pos();
 
-                let draw = |ui: &egui::Ui, rect: egui::Rect, pane: egui::Rect, tex: &Option<egui::TextureHandle>| {
-                    if let Some(tex) = tex {
-                        ui.painter_at(pane).image(tex.id(), rect, uv, egui::Color32::WHITE);
-                    } else {
-                        ui.painter().text(
-                            pane.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "decoding…",
-                            egui::FontId::proportional(16.0),
-                            theme::TAN,
-                        );
-                    }
+                let draw = |ui: &egui::Ui,
+                            rect: egui::Rect,
+                            pane: egui::Rect,
+                            tex: &Option<egui::TextureHandle>| {
+                    crate::lightbox::draw_in_pane(ui, pane, rect, tex);
                 };
-
-                let fit = |target: egui::Rect, size: egui::Vec2| {
-                    let s = (target.width() / size.x).min(target.height() / size.y);
-                    egui::Rect::from_center_size(target.center(), size * s)
-                };
+                let fit = crate::lightbox::fit_rect;
 
                 if let Some((big, strip, scrub, big_tex, frames)) = &video {
                     // Enlarged scrubbed frame.
@@ -2442,7 +2400,7 @@ impl DupesView {
         }
         let tex = ctx.load_texture(
             format!("spec-{hex}"),
-            spec_image(viz),
+            crate::waveform::spec_image(viz),
             egui::TextureOptions::LINEAR,
         );
         self.spec_tex.insert(hex.to_string(), tex.clone());
@@ -3912,7 +3870,7 @@ mod ui_tests {
         // proxy for the repos height). The REPOS section is the MARK ALL/NONE
         // header line plus one chip row here; an over-expansion regression pushed
         // it hundreds of px down, so a ~200px ceiling still catches that.
-        let filter_top = harness.get_by_label("FILTER").rect().top();
+        let filter_top = harness.get_by_label_contains("FILTER — ").rect().top();
         assert!(
             filter_top < 200.0,
             "FILTER section at y={filter_top}; the REPOS section is too tall (expanded?)"
@@ -3926,7 +3884,7 @@ mod ui_tests {
         let (_tmp, store) = sample_store(&SAMPLE_REPOS);
         let harness = dupes_harness(store);
         assert!(
-            harness.query_by_label("FILTER").is_some(),
+            harness.query_by_label_contains("FILTER — ").is_some(),
             "the shared FILTER wizard should render on the Duplicates tab"
         );
         assert!(

@@ -81,6 +81,29 @@ fn delete_by_filter_with_no_matches_is_a_noop() -> TestResult {
     Ok(())
 }
 
+/// A purge with no filter (or a blank one) matches nothing — it must never
+/// mean "delete everything". The preview agrees.
+#[test]
+fn delete_by_filter_without_a_filter_deletes_nothing() -> TestResult {
+    let sb = Sandbox::new()?;
+    sb.write("a.txt", b"a")?;
+    sb.write("b.txt", b"b")?;
+    sb.update()?;
+
+    let cancel = CancellationToken::new();
+    let run = DiffRun::new(&NoDiffProgress, &cancel);
+    for filter in [None, Some(""), Some("  ")] {
+        let stats = delete_by_filter(&sb.store, "R", filter, &run)?;
+        assert_eq!(stats.deleted, 0, "filter {filter:?} must delete nothing");
+        let (sample, total) = dedup_core::groom::preview_by_filter(&sb.store, "R", filter, 10)?;
+        assert!(sample.is_empty(), "filter {filter:?} previews nothing");
+        assert_eq!(total, 0);
+    }
+    assert!(sb.root.join("a.txt").exists());
+    assert!(sb.root.join("b.txt").exists());
+    Ok(())
+}
+
 #[test]
 fn delete_empty_dirs_prunes_bottom_up_but_keeps_root() -> TestResult {
     let sb = Sandbox::new()?;

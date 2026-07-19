@@ -27,6 +27,12 @@ pub fn delete_by_filter(
     filter: Option<&str>,
     run: &DiffRun<'_>,
 ) -> Result<DeleteStats, DiffError> {
+    // A purge with no filter must never mean "delete everything": an absent or
+    // empty filter matches nothing. A deliberate full purge is still possible
+    // with an explicit wildcard (e.g. `name:*`).
+    if filter.is_none_or(|f| f.trim().is_empty()) {
+        return Ok(DeleteStats::default());
+    }
     let filter = FileFilter::parse(filter)?;
     let meta = store.get_repo(repo)?;
     let db = store.open_repo_db(repo)?;
@@ -101,13 +107,17 @@ pub fn delete_by_filter(
 
 /// The non-missing relative paths in `repo` that match `filter`: the first
 /// `limit` of them (for a preview list) plus the total match count. Streams the
-/// index without deleting anything.
+/// index without deleting anything. Like [`delete_by_filter`], an absent or
+/// empty filter matches nothing.
 pub fn preview_by_filter(
     store: &Store,
     repo: &str,
     filter: Option<&str>,
     limit: usize,
 ) -> Result<(Vec<String>, usize), DiffError> {
+    if filter.is_none_or(|f| f.trim().is_empty()) {
+        return Ok((Vec::new(), 0));
+    }
     let filter = FileFilter::parse(filter)?;
     let db = store.open_repo_db(repo)?;
     let annotated = crate::filter::AnnotatedFilter::new(&db, &filter)?;
