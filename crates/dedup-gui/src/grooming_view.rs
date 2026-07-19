@@ -120,7 +120,6 @@ impl Command {
     }
 }
 
-
 enum OpResult {
     Deleted {
         deleted: u64,
@@ -320,51 +319,61 @@ impl GroomingView {
             });
         }
 
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new("GROOMING")
-                .color(theme::TAN)
-                .size(18.0)
-                .strong(),
-        );
-        crate::util::shortcut_bar(
-            ui,
-            "1 dedupe · 2 purge · 3 empty-dirs · 4 organize · 5 prune · P preview · R run",
-        );
+        // The whole tab scrolls as one page: ORGANIZE stacks a wizard per rule
+        // and the preview table can be tall, so without this the lower rows —
+        // and with enough rules the preview entirely — fall off the bottom of
+        // the window with no way to reach them. The virtualised preview table
+        // culls to the visible band via its clip rect, so nesting it here keeps
+        // the single outer scrollbar cheap.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("GROOMING")
+                        .color(theme::TAN)
+                        .size(18.0)
+                        .strong(),
+                );
+                crate::util::shortcut_bar(
+                    ui,
+                    "1 dedupe · 2 purge · 3 empty-dirs · 4 organize · 5 prune · P preview · R run",
+                );
 
-        self.command_bar(ui, &mut acts);
-        // Each command draws its own controls; DEDUPE/PURGE then get the shared
-        // single FILTER wizard, backed by the repo they act on. ORGANIZE draws
-        // its own per-rule wizards inside its layout.
-        match self.command {
-            Command::Dedupe => {
-                self.dedupe_layout(ui, &mut acts);
-                let repo = self.source.clone();
-                self.shared_filter(ui, store, repo.as_deref());
-            }
-            Command::Purge => {
-                self.purge_layout(ui, &mut acts);
-                let repo = self.repo.clone();
-                self.shared_filter(ui, store, repo.as_deref());
-            }
-            Command::EmptyDirs => self.empty_dirs_layout(ui, &mut acts),
-            Command::Organize => self.organize_layout(ui, store, &mut acts),
-            Command::Prune => self.prune_layout(ui, &mut acts),
-        }
-        self.action_bar(ui, &mut acts);
+                self.command_bar(ui, &mut acts);
+                // Each command draws its own controls; DEDUPE/PURGE then get the
+                // shared single FILTER wizard, backed by the repo they act on.
+                // ORGANIZE draws its own per-rule wizards inside its layout.
+                match self.command {
+                    Command::Dedupe => {
+                        self.dedupe_layout(ui, &mut acts);
+                        let repo = self.source.clone();
+                        self.shared_filter(ui, store, repo.as_deref());
+                    }
+                    Command::Purge => {
+                        self.purge_layout(ui, &mut acts);
+                        let repo = self.repo.clone();
+                        self.shared_filter(ui, store, repo.as_deref());
+                    }
+                    Command::EmptyDirs => self.empty_dirs_layout(ui, &mut acts),
+                    Command::Organize => self.organize_layout(ui, store, &mut acts),
+                    Command::Prune => self.prune_layout(ui, &mut acts),
+                }
+                self.action_bar(ui, &mut acts);
 
-        if let Some(err) = &self.error {
-            ui.colored_label(theme::RED, err);
-        }
-        if let Some(status) = &self.status {
-            ui.label(RichText::new(status).color(theme::TAN).size(13.0));
-        }
-        ui.separator();
-        if self.running || !self.run_log.is_empty() {
-            self.run_panel(ui);
-        } else {
-            self.preview_panel(ui);
-        }
+                if let Some(err) = &self.error {
+                    ui.colored_label(theme::RED, err);
+                }
+                if let Some(status) = &self.status {
+                    ui.label(RichText::new(status).color(theme::TAN).size(13.0));
+                }
+                ui.separator();
+                if self.running || !self.run_log.is_empty() {
+                    self.run_panel(ui);
+                } else {
+                    self.preview_panel(ui);
+                }
+            });
 
         if let Some(prompt) = self.confirm.clone() {
             self.confirm_modal(ui, &prompt, &mut acts);

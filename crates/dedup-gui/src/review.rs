@@ -109,7 +109,11 @@ impl Default for ReviewState {
 /// additions / deletions together.
 pub fn sort(rows: &mut [ReviewRow], state: &ReviewState) {
     rows.sort_by(|a, b| {
-        let by_source = || a.source_path.to_lowercase().cmp(&b.source_path.to_lowercase());
+        let by_source = || {
+            a.source_path
+                .to_lowercase()
+                .cmp(&b.source_path.to_lowercase())
+        };
         let ord = match state.sort_col {
             ReviewCol::SourceStatus => a.source.rank().cmp(&b.source.rank()).then_with(by_source),
             ReviewCol::Source => by_source(),
@@ -140,7 +144,10 @@ pub fn table(
 
     // The unchanged toggle only matters when there are unchanged rows to hide.
     if totals[2] > 0 {
-        let label = format!("{} UNCHANGED", if state.show_unchanged { "HIDE" } else { "SHOW" });
+        let label = format!(
+            "{} UNCHANGED",
+            if state.show_unchanged { "HIDE" } else { "SHOW" }
+        );
         if crate::lcars::toggle_button(ui, &label, state.show_unchanged, theme::GREY).clicked() {
             state.show_unchanged = !state.show_unchanged;
         }
@@ -181,8 +188,18 @@ pub fn table(
         .resizable(true)
         .cell_layout(Layout::left_to_right(Align::Center))
         .column(Column::initial(90.0).at_least(70.0).resizable(true))
-        .column(Column::initial(340.0).at_least(140.0).clip(true).resizable(true))
-        .column(Column::remainder().at_least(140.0).clip(true).resizable(true))
+        .column(
+            Column::initial(340.0)
+                .at_least(140.0)
+                .clip(true)
+                .resizable(true),
+        )
+        .column(
+            Column::remainder()
+                .at_least(140.0)
+                .clip(true)
+                .resizable(true),
+        )
         .column(Column::initial(90.0).at_least(70.0))
         .header(24.0, |mut header| {
             for (col, title) in cols {
@@ -216,7 +233,11 @@ pub fn table(
 
 /// One side's status cell: just the coloured status icon.
 fn status_cell(ui: &mut egui::Ui, status: SideStatus) {
-    ui.label(RichText::new(status.symbol()).color(status.color()).size(15.0));
+    ui.label(
+        RichText::new(status.symbol())
+            .color(status.color())
+            .size(15.0),
+    );
 }
 
 /// One side's path cell: the relative path coloured by that side's status.

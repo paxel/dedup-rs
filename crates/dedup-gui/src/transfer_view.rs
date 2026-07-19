@@ -348,66 +348,79 @@ impl TransferView {
             });
         }
 
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new("TRANSFER")
-                .color(theme::BLUE)
-                .size(18.0)
-                .strong(),
-        );
-        crate::util::shortcut_bar(
-            ui,
-            "1 copy · 2 move · 3 sync · 4 mirror · P preview · R run",
-        );
+        // The whole tab scrolls as one page: the controls above the preview
+        // (filter wizard, dest/mode bars) grow with the command, and the
+        // preview table can be tall, so without this the lower rows — and with
+        // enough controls the preview entirely — fall off the bottom of the
+        // window with no way to reach them. The virtualised preview table
+        // culls to the visible band via its clip rect, so nesting it here keeps
+        // the single outer scrollbar cheap.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("TRANSFER")
+                        .color(theme::BLUE)
+                        .size(18.0)
+                        .strong(),
+                );
+                crate::util::shortcut_bar(
+                    ui,
+                    "1 copy · 2 move · 3 sync · 4 mirror · P preview · R run",
+                );
 
-        self.repo_rows(ui, &mut acts);
-        self.command_bar(ui, &mut acts);
-        // SYNC/MIRROR are always repo→repo at the same relative path, so they
-        // hide the DEST/subdir/folder controls: SYNC shows its DELETE MISSING
-        // toggle; MIRROR shows a warning (it always deletes).
-        match self.command {
-            Command::Sync => self.sync_bar(ui, &mut acts),
-            Command::Mirror => self.mirror_bar(ui),
-            _ => {
-                self.dest_bar(ui, &mut acts);
-                match self.destination {
-                    Destination::Repo => self.subdir_bar(ui, &mut acts),
-                    Destination::Folder => {
-                        self.folder_bar(ui, &mut acts);
-                        self.mode_bar(ui, &mut acts);
+                self.repo_rows(ui, &mut acts);
+                self.command_bar(ui, &mut acts);
+                // SYNC/MIRROR are always repo→repo at the same relative path, so
+                // they hide the DEST/subdir/folder controls: SYNC shows its
+                // DELETE MISSING toggle; MIRROR shows a warning (it always
+                // deletes).
+                match self.command {
+                    Command::Sync => self.sync_bar(ui, &mut acts),
+                    Command::Mirror => self.mirror_bar(ui),
+                    _ => {
+                        self.dest_bar(ui, &mut acts);
+                        match self.destination {
+                            Destination::Repo => self.subdir_bar(ui, &mut acts),
+                            Destination::Folder => {
+                                self.folder_bar(ui, &mut acts);
+                                self.mode_bar(ui, &mut acts);
+                            }
+                        }
                     }
                 }
-            }
-        }
-        // The shared FILTER wizard; the source repo backs its MIME suggestions
-        // and live match count.
-        let source = self.source.clone();
-        let outcome = self.filter.ui(ui, store, source.as_deref(), self.verbosity);
-        if outcome.changed {
-            self.clear_preview();
-        }
-        if outcome.status.is_some() {
-            self.status = outcome.status;
-        }
-        if outcome.error.is_some() {
-            self.error = outcome.error;
-        }
-        self.action_bar(ui, &mut acts);
+                // The shared FILTER wizard; the source repo backs its MIME
+                // suggestions and live match count.
+                let source = self.source.clone();
+                let outcome = self.filter.ui(ui, store, source.as_deref(), self.verbosity);
+                if outcome.changed {
+                    self.clear_preview();
+                }
+                if outcome.status.is_some() {
+                    self.status = outcome.status;
+                }
+                if outcome.error.is_some() {
+                    self.error = outcome.error;
+                }
+                self.action_bar(ui, &mut acts);
 
-        if let Some(err) = &self.error {
-            ui.colored_label(theme::RED, err);
-        }
-        if let Some(status) = &self.status {
-            ui.label(RichText::new(status).color(theme::TAN).size(13.0));
-        }
-        ui.separator();
-        // RUN and PREVIEW are mutually exclusive: while a run is active or has
-        // left a log, show the live run panel; otherwise show the preview.
-        if self.running || !self.run_log.is_empty() {
-            self.run_panel(ui);
-        } else {
-            self.preview_panel(ui);
-        }
+                if let Some(err) = &self.error {
+                    ui.colored_label(theme::RED, err);
+                }
+                if let Some(status) = &self.status {
+                    ui.label(RichText::new(status).color(theme::TAN).size(13.0));
+                }
+                ui.separator();
+                // RUN and PREVIEW are mutually exclusive: while a run is active
+                // or has left a log, show the live run panel; otherwise show the
+                // preview.
+                if self.running || !self.run_log.is_empty() {
+                    self.run_panel(ui);
+                } else {
+                    self.preview_panel(ui);
+                }
+            });
 
         if let Some(prompt) = self.confirm.clone() {
             self.confirm_modal(ui, &prompt, &mut acts);
@@ -1315,7 +1328,11 @@ impl TransferView {
                         target_path: rel.clone(),
                     })
                     .collect();
-                for rel in plan.deletes.iter().take(PREVIEW_CAP.saturating_sub(rows.len())) {
+                for rel in plan
+                    .deletes
+                    .iter()
+                    .take(PREVIEW_CAP.saturating_sub(rows.len()))
+                {
                     rows.push(review::ReviewRow {
                         source: review::SideStatus::Absent,
                         target: review::SideStatus::Removed,
