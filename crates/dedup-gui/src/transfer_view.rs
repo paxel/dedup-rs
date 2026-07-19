@@ -240,7 +240,6 @@ enum Act {
     PickSource(String),
     PickTarget(String),
     ToggleExtraRef(String),
-    MarkSourceDone,
     SetCommand(Command),
     SetDestination(Destination),
     SetMode(SelectMode),
@@ -1030,27 +1029,6 @@ impl TransferView {
                         acts.push(Act::CancelRun);
                     }
                 }
-                // After sanitizing a disk, mark the source repo triage-done.
-                if self.source.is_some() && !self.running {
-                    ui.separator();
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("MARK SOURCE DONE").color(theme::BLUE))
-                                .fill(theme::PANEL),
-                        )
-                        .explain(
-                            self.verbosity,
-                            "Flag the source repo as triaged (its uniques copied out)",
-                            "Mark the source repository triage-done: its unique content has \
-                             already been copied out into a sanitized directory, so it shows \
-                             a TRIAGED stat in Repository management and can be treated as \
-                             fully processed.",
-                        )
-                        .clicked()
-                    {
-                        acts.push(Act::MarkSourceDone);
-                    }
-                }
             });
         });
     }
@@ -1189,17 +1167,6 @@ impl TransferView {
                     self.extra_refs.push(name);
                 }
                 self.clear_preview();
-            }
-            Act::MarkSourceDone => {
-                if let Some(source) = self.source.clone() {
-                    match store.set_triage_done(&source, true) {
-                        Ok(()) => {
-                            self.status = Some(format!("Marked '{source}' triage-done."));
-                            self.error = None;
-                        }
-                        Err(e) => self.error = Some(e.to_string()),
-                    }
-                }
             }
             Act::SetCommand(cmd) => {
                 self.command = cmd;

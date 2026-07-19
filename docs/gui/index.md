@@ -34,10 +34,9 @@ unlocking for deletion should be a fresh, conscious choice each session.
 
 ## What's not here
 
-The important-file scanner (`dedup scan`) and the triage report (`dedup report`) are
-CLI-only today — there's no dedicated GUI tab for them yet. The Files tab's **MARK SOURCE
-DONE** button (see [`files.md`](files.md)) surfaces the one piece of that workflow that
-already has a GUI hook: flagging a repo as triaged after copying out its unique content.
+The important-file scanner (`dedup scan`), the triage report (`dedup report`), and the
+disk-triage workflow (`dedup sanitize`, including flagging a repo as triage-done) are
+CLI-only today — there's no dedicated GUI tab for them yet.
 
 ## See also
 

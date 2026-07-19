@@ -1132,9 +1132,8 @@ impl DedupApp {
                             theme::BLUE,
                             "This repo's unique content was copied into a sanitized dir",
                             "This repository was marked triage-done: its unique content was \
-                             already copied into a sanitized directory (via `dedup sanitize` \
-                             or MARK SOURCE DONE in the Transfer tab), so it's safe to \
-                             consider fully processed.",
+                             already copied into a sanitized directory (via the `dedup \
+                             sanitize` command), so it's safe to consider fully processed.",
                             self.tooltip_verbosity,
                         );
                     }

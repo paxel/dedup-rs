@@ -62,10 +62,3 @@ machines.
 - Both repos' indexes are kept in sync as a run proceeds: COPY/MOVE record each transferred
   file in the target's index (with its real on-disk mtime, plus provenance — which repo it
   came from); MOVE/DELETE mark the source entries missing.
-
-## Mark source done
-
-Once a source repository's unique content has been copied out (the disk-triage workflow —
-see [`dedup sanitize`](../cli.md#sanitize)), **MARK SOURCE DONE** flags it triage-done: a
-timestamp recorded in its index, shown as a **TRIAGED** stat on its card in [Repository
-Management](repositories.md).
