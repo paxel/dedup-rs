@@ -22,11 +22,88 @@ use dedup_core::update::CancellationToken;
 use egui::{Id, RichText};
 use std::sync::{Arc, Mutex};
 
-/// Messages from the pushing worker thread.
+/// Messages from a worker thread.
 enum Msg {
     /// A finished push, as the shared report — or a group-level refusal that
     /// meant nothing ran at all.
     Done(Result<crate::run_result::RunReport, String>),
+    /// A finished plan. `confirm` asks the UI to raise the RUN confirmation
+    /// once the plan is in hand — the deferred half of a RUN SYNC click.
+    Preview {
+        result: Result<PreviewOutcome, String>,
+        confirm: bool,
+    },
+}
+
+/// The result of planning a group push, built off the UI thread. The board rows
+/// come back unsorted; the (cheap) sort happens when they are applied.
+struct PreviewOutcome {
+    /// The group this plan is for. Carried through so the confirmation and the
+    /// push both act on the group that was *planned*, not whatever is selected
+    /// when the async result lands — the user may have clicked another group
+    /// while the scan ran.
+    group_name: String,
+    group: SyncGroup,
+    rows: Vec<review::ReviewRow>,
+    added: usize,
+    removed: usize,
+    sink_count: usize,
+    main_header: String,
+    /// Sinks the plan would empty of their current contents, `(sink, live)`.
+    wholesale_sinks: Vec<(String, u64)>,
+}
+
+/// Plan every sink and turn it into review-board rows: a copy shows as *added*
+/// on the sink side, a mirror deletion as *removed*. Runs the full index scan,
+/// so callers keep it off the UI thread.
+fn build_preview(
+    store: &Store,
+    group_name: &str,
+    group: &SyncGroup,
+) -> Result<PreviewOutcome, String> {
+    let plans = plan_group_sync(store, group).map_err(|e| e.to_string())?;
+    let mut rows = Vec::new();
+    let (mut added, mut removed) = (0usize, 0usize);
+    let mut wholesale_sinks = Vec::new();
+    for (sink, plan) in &plans {
+        // A plan that deletes everything the sink holds today is a wholesale
+        // replacement, not an incremental sync — worth naming before proceeding.
+        let live = store
+            .get_repo_stats(sink)
+            .map(|s| s.file_count)
+            .unwrap_or(0);
+        if live > 0 && plan.deletes.len() as u64 >= live {
+            wholesale_sinks.push((sink.clone(), live));
+        }
+        for rel in &plan.copies {
+            added += 1;
+            rows.push(review::ReviewRow {
+                source: review::SideStatus::Unchanged,
+                target: review::SideStatus::Added,
+                source_path: rel.clone(),
+                target_path: format!("{sink}: {rel}"),
+            });
+        }
+        for rel in &plan.deletes {
+            removed += 1;
+            rows.push(review::ReviewRow {
+                source: review::SideStatus::Absent,
+                target: review::SideStatus::Removed,
+                source_path: String::new(),
+                target_path: format!("{sink}: {rel}"),
+            });
+        }
+    }
+    Ok(PreviewOutcome {
+        group_name: group_name.to_string(),
+        group: group.clone(),
+        rows,
+        added,
+        removed,
+        sink_count: plans.len(),
+        main_header: group.main.clone(),
+        wholesale_sinks,
+    })
 }
 
 /// Collects the per-file failures of a push so the result panel can list them.
@@ -89,6 +166,11 @@ pub struct SyncView {
     status: Option<String>,
     error: Option<String>,
     confirm: Option<String>,
+    /// The group a raised confirmation is about, captured when the plan landed.
+    /// PROCEED pushes *this* group, not whatever is selected when the button is
+    /// clicked — the two can differ if the confirmation was built from an async
+    /// plan. Set with `confirm`, cleared when it closes.
+    pending_push: Option<(String, SyncGroup)>,
     /// The report of the last finished push.
     result: crate::run_result::ResultModal,
     running: bool,
@@ -139,6 +221,7 @@ impl SyncView {
             status: None,
             error: None,
             confirm: None,
+            pending_push: None,
             result: crate::run_result::ResultModal::default(),
             running: false,
             cancel: CancellationToken::new(),
@@ -652,53 +735,20 @@ impl SyncView {
                 self.clear_preview();
             }),
             Act::Preview => {
-                self.run_preview(store);
+                self.spawn_preview(store, false);
                 Ok(())
             }
             Act::Ask => {
-                // Plan first: a confirmation that cannot say how much it
-                // deletes is not one the user can weigh. A refused or failing
-                // plan (an empty MIRROR main, say) never reaches the dialog.
-                self.run_preview(store);
-                if let Some((name, group)) = self.selected_group()
-                    && self.error.is_none()
-                {
-                    let [copies, deletes, _] = self.preview_totals;
-                    let mut prompt = format!(
-                        "Push '{}' to {} sink(s) of group '{name}': copy {copies} file(s)",
-                        group.main,
-                        group.sinks.len()
-                    );
-                    if group.mode == SyncMode::Mirror {
-                        prompt.push_str(&format!(
-                            " and DELETE {deletes} file(s) from the sink(s), which cannot be \
-                             undone"
-                        ));
-                    }
-                    prompt.push_str(". The main is never changed.");
-                    if !self.wholesale_sinks.is_empty() {
-                        // Say what actually happens: nothing the sink holds today
-                        // survives, and the main's content takes its place. It is
-                        // not left empty — claiming that would be false, and a
-                        // confirmation nobody trusts is worse than none.
-                        let listed: Vec<String> = self
-                            .wholesale_sinks
-                            .iter()
-                            .map(|(sink, live)| format!("{sink} (all {live} of its files)"))
-                            .collect();
-                        prompt.push_str(&format!(
-                            "\n\nWARNING: this replaces the entire current contents of {} with \
-                             the main's content — nothing they hold today survives. If that is \
-                             not what you expect, check the main is complete first.",
-                            listed.join(", ")
-                        ));
-                    }
-                    self.confirm = Some(prompt);
-                }
+                // Plan on a worker thread, then raise the confirmation when it
+                // lands (the `confirm` flag rides through). A refused or failing
+                // plan — an empty MIRROR main, say — surfaces as an error and
+                // never reaches the dialog.
+                self.spawn_preview(store, true);
                 Ok(())
             }
             Act::CancelConfirm => {
                 self.confirm = None;
+                self.pending_push = None;
                 Ok(())
             }
             Act::Confirm => {
@@ -721,6 +771,7 @@ impl SyncView {
     }
 
     fn clear_preview(&mut self) {
+        self.pending_push = None;
         self.preview.clear();
         self.preview_totals = [0; 3];
         self.preview_main_header.clear();
@@ -729,64 +780,93 @@ impl SyncView {
         self.review_state.rejected.clear();
     }
 
-    /// Plan every sink and render the result as review rows: a copy is added on
-    /// the sink side, a mirror deletion is removed there.
-    fn run_preview(&mut self, store: &Store) {
-        let Some((_, group)) = self.selected_group() else {
+    /// Plan the selected group on a worker thread. `confirm` carries through to
+    /// the result: when set, the RUN confirmation is raised once the plan lands.
+    /// The full index scan runs off the UI thread so a large group does not
+    /// freeze the window.
+    fn spawn_preview(&mut self, store: &Arc<Store>, confirm: bool) {
+        let Some((name, group)) = self.selected_group() else {
             return;
         };
-        match plan_group_sync(store, &group) {
-            Ok(plans) => {
-                let mut rows = Vec::new();
-                let (mut added, mut removed) = (0usize, 0usize);
-                self.wholesale_sinks.clear();
-                for (sink, plan) in &plans {
-                    // A plan that deletes everything the sink holds today is a
-                    // wholesale replacement, not an incremental sync — worth
-                    // naming before the user proceeds.
-                    let live = store
-                        .get_repo_stats(sink)
-                        .map(|s| s.file_count)
-                        .unwrap_or(0);
-                    if live > 0 && plan.deletes.len() as u64 >= live {
-                        self.wholesale_sinks.push((sink.clone(), live));
-                    }
-                    for rel in &plan.copies {
-                        added += 1;
-                        rows.push(review::ReviewRow {
-                            source: review::SideStatus::Unchanged,
-                            target: review::SideStatus::Added,
-                            source_path: rel.clone(),
-                            target_path: format!("{sink}: {rel}"),
-                        });
-                    }
-                    for rel in &plan.deletes {
-                        removed += 1;
-                        rows.push(review::ReviewRow {
-                            source: review::SideStatus::Absent,
-                            target: review::SideStatus::Removed,
-                            source_path: String::new(),
-                            target_path: format!("{sink}: {rel}"),
-                        });
-                    }
-                }
-                self.preview_totals = [added, removed, 0];
-                self.preview_main_header = group.main.clone();
-                self.preview_sink_header = "SINKS".to_string();
-                review::sort(&mut rows, &self.review_state);
-                self.preview = rows;
-                self.status = Some(format!(
-                    "{added} file(s) to copy, {removed} to delete across {} sink(s).",
-                    plans.len()
-                ));
-                self.error = None;
+        let store = Arc::clone(store);
+        let tx = self.tx.clone();
+        self.running = true;
+        self.status = Some("planning…".to_string());
+        std::thread::spawn(move || {
+            let result = build_preview(&store, &name, &group);
+            let _ = tx.send(Msg::Preview { result, confirm });
+        });
+    }
+
+    /// Fold a finished plan into the board and, if this plan was for a RUN
+    /// click, raise the confirmation now that the real counts are known.
+    fn apply_preview(&mut self, result: Result<PreviewOutcome, String>, confirm: bool) {
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                self.error = Some(e);
+                return;
             }
-            Err(e) => self.error = Some(e.to_string()),
+        };
+        self.preview_totals = [outcome.added, outcome.removed, 0];
+        self.preview_main_header = outcome.main_header;
+        self.preview_sink_header = "SINKS".to_string();
+        self.wholesale_sinks = outcome.wholesale_sinks;
+        let mut rows = outcome.rows;
+        review::sort(&mut rows, &self.review_state);
+        self.preview = rows;
+        self.status = Some(format!(
+            "{} file(s) to copy, {} to delete across {} sink(s).",
+            outcome.added, outcome.removed, outcome.sink_count
+        ));
+        self.error = None;
+        if confirm {
+            // Confirm and push the group that was *planned*, captured here — the
+            // selection may have changed while the scan ran.
+            self.raise_confirm(&outcome.group_name, &outcome.group);
+            self.pending_push = Some((outcome.group_name, outcome.group));
         }
     }
 
+    /// Build the RUN confirmation from the plan just applied. A confirmation
+    /// that cannot say how much it deletes is not one the user can weigh.
+    fn raise_confirm(&mut self, name: &str, group: &SyncGroup) {
+        let [copies, deletes, _] = self.preview_totals;
+        let mut prompt = format!(
+            "Push '{}' to {} sink(s) of group '{name}': copy {copies} file(s)",
+            group.main,
+            group.sinks.len()
+        );
+        if group.mode == SyncMode::Mirror {
+            prompt.push_str(&format!(
+                " and DELETE {deletes} file(s) from the sink(s), which cannot be undone"
+            ));
+        }
+        prompt.push_str(". The main is never changed.");
+        if !self.wholesale_sinks.is_empty() {
+            // Say what actually happens: nothing the sink holds today survives,
+            // and the main's content takes its place. It is not left empty —
+            // claiming that would be false, and a confirmation nobody trusts is
+            // worse than none.
+            let listed: Vec<String> = self
+                .wholesale_sinks
+                .iter()
+                .map(|(sink, live)| format!("{sink} (all {live} of its files)"))
+                .collect();
+            prompt.push_str(&format!(
+                "\n\nWARNING: this replaces the entire current contents of {} with the main's \
+                 content — nothing they hold today survives. If that is not what you expect, \
+                 check the main is complete first.",
+                listed.join(", ")
+            ));
+        }
+        self.confirm = Some(prompt);
+    }
+
     fn start(&mut self, store: &Arc<Store>) {
-        let Some((name, group)) = self.selected_group() else {
+        // Push the group the confirmation was built for, not the current
+        // selection — see `pending_push`.
+        let Some((name, group)) = self.pending_push.take() else {
             return;
         };
         let store = Arc::clone(store);
@@ -858,11 +938,12 @@ impl SyncView {
 
     fn drain(&mut self, ui: &egui::Ui) {
         let mut got = false;
-        while let Ok(Msg::Done(result)) = self.rx.try_recv() {
+        while let Ok(msg) = self.rx.try_recv() {
             got = true;
             self.running = false;
-            match result {
-                Ok(report) => {
+            match msg {
+                Msg::Preview { result, confirm } => self.apply_preview(result, confirm),
+                Msg::Done(Ok(report)) => {
                     let headline = report.headline();
                     if report.complete() {
                         log::info!("sync group push: {headline}");
@@ -877,7 +958,7 @@ impl SyncView {
                     // The panel carries the detail the status line cannot.
                     self.result.open(report);
                 }
-                Err(e) => {
+                Msg::Done(Err(e)) => {
                     log::error!("sync group push: {e}");
                     self.error = Some(e);
                 }
@@ -927,6 +1008,23 @@ mod ui_tests {
             );
         harness.run();
         harness
+    }
+
+    /// Pump frames until the current worker thread (preview or push) has
+    /// delivered its result and the view is idle again. Preview and RUN plan
+    /// off the UI thread now, so a click's own `run()` returns before the
+    /// result arrives; the tiny test repos finish near-instantly.
+    fn settle(h: &mut Harness<'static, SyncView>) {
+        for _ in 0..100 {
+            h.run();
+            if !h.state().running {
+                // One more frame so the result (confirm dialog, board) renders.
+                h.run();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("worker thread did not settle");
     }
 
     /// With no groups yet the tab explains itself and offers the NEW GROUP
@@ -1043,7 +1141,7 @@ mod ui_tests {
         h.get_by_label("offsite").click();
         h.run();
         h.get_by_label("PREVIEW").click();
-        h.run();
+        settle(&mut h);
 
         assert_eq!(
             h.state().preview_totals,
@@ -1087,7 +1185,7 @@ mod ui_tests {
         h.get_by_label("offsite").click();
         h.run();
         h.get_by_label("PREVIEW").click();
-        h.run();
+        settle(&mut h);
 
         assert!(
             h.query_by_label_contains("BACKUP1: gone.txt").is_some(),
@@ -1132,7 +1230,7 @@ mod ui_tests {
         h.run();
 
         h.get_by_label("RUN SYNC").click();
-        h.run();
+        settle(&mut h);
         assert!(
             h.query_by_label_contains("CONFIRM SYNC").is_some(),
             "a push is always confirmed"
@@ -1163,6 +1261,44 @@ mod ui_tests {
         assert!(!h.state().running, "and nothing was pushed");
     }
 
+    /// The plan is built off-thread, so the selection can change before it
+    /// lands. The confirmation and the push must describe the group that was
+    /// *planned*, never whatever is selected when the result arrives —
+    /// otherwise a MIRROR confirm could name one group while another is pushed.
+    #[test]
+    fn confirm_targets_the_planned_group_not_the_current_selection() {
+        let mut view = SyncView::new();
+        let planned = SyncGroup {
+            main: "A_MAIN".to_string(),
+            sinks: vec!["A_SINK".to_string()],
+            mode: SyncMode::AddOnly,
+        };
+        let outcome = PreviewOutcome {
+            group_name: "groupA".to_string(),
+            group: planned,
+            rows: Vec::new(),
+            added: 3,
+            removed: 0,
+            sink_count: 1,
+            main_header: "A_MAIN".to_string(),
+            wholesale_sinks: Vec::new(),
+        };
+        // The user has since clicked another group; its plan is what lands.
+        view.selected = Some("groupB".to_string());
+        view.apply_preview(Ok(outcome), true);
+
+        assert!(
+            view.confirm
+                .as_deref()
+                .unwrap_or_default()
+                .contains("A_MAIN"),
+            "the confirmation names the planned group's main, not the selection"
+        );
+        let (name, group) = view.pending_push.as_ref().expect("a push is pending");
+        assert_eq!(name, "groupA", "PROCEED will push the planned group");
+        assert_eq!(group.main, "A_MAIN");
+    }
+
     /// A MIRROR whose main holds nothing would delete every file in the sink.
     /// RUN SYNC must refuse outright rather than offer a confirmation — the
     /// main being empty is virtually always an unscanned or unmounted drive.
@@ -1188,7 +1324,7 @@ mod ui_tests {
         h.run();
 
         h.get_by_label("RUN SYNC").click();
-        h.run();
+        settle(&mut h);
         assert!(
             h.state().confirm.is_none(),
             "no confirmation is offered for a push that would wipe the sink"

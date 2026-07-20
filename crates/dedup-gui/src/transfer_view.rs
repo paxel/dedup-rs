@@ -187,6 +187,16 @@ enum OpResult {
 enum Msg {
     Progress(DiffEvent),
     Done(OpResult),
+    /// A finished DIFF comparison, built off the UI thread (it scans both
+    /// repos' full indexes). Rows come back unsorted; the board sorts them.
+    DiffPreview(Result<DiffPreviewData, String>),
+}
+
+/// The result of a DIFF preview: the paired rows and each side's header.
+struct DiffPreviewData {
+    rows: Vec<RepoDiffRow>,
+    source_header: String,
+    target_header: String,
 }
 
 /// [`DiffProgress`] adapter that forwards every diff event onto the TransferView
@@ -252,6 +262,9 @@ pub struct TransferView {
     error: Option<String>,
     confirm: Option<String>,
     running: bool,
+    /// Set while a DIFF comparison is being planned on a worker thread, so the
+    /// UI shows it is busy and does not launch a second one.
+    previewing: bool,
     /// Set while a single-row APPLY runs: refresh the preview when it finishes.
     pending_refresh: bool,
     cancel: CancellationToken,
@@ -332,6 +345,7 @@ impl TransferView {
             error: None,
             confirm: None,
             running: false,
+            previewing: false,
             pending_refresh: false,
             cancel: CancellationToken::new(),
             run_log: VecDeque::new(),
@@ -382,11 +396,12 @@ impl TransferView {
 
         let mut acts: Vec<Act> = Vec::new();
 
-        // Keyboard shortcuts — skipped while a modal is up, a run is active, or
-        // a text field is focused.
+        // Keyboard shortcuts — skipped while a modal is up, a run or preview is
+        // active, or a text field is focused.
         if self.confirm.is_none()
             && !result_open
             && !self.running
+            && !self.previewing
             && !ui.ctx().egui_wants_keyboard_input()
         {
             ui.input(|i| {
@@ -708,7 +723,9 @@ impl TransferView {
     /// resolved (a target repo, or a non-blank export folder), and nothing is
     /// already running.
     fn ready(&self) -> bool {
-        if self.running || self.source.is_none() {
+        // A preview in flight disables PREVIEW/RUN too, so a second click cannot
+        // launch an overlapping worker.
+        if self.running || self.previewing || self.source.is_none() {
             return false;
         }
         match self.destination {
@@ -1146,7 +1163,7 @@ impl TransferView {
                     acts.push(Act::Preview);
                 }
                 if self.command.is_diff() {
-                    if self.running {
+                    if self.running || self.previewing {
                         ui.add(egui::Spinner::new().color(theme::AMBER));
                     }
                     return;
@@ -1493,7 +1510,7 @@ impl TransferView {
         self.filter.filter_string()
     }
 
-    fn run_preview(&mut self, store: &Store) {
+    fn run_preview(&mut self, store: &Arc<Store>) {
         let Some(source) = self.source.clone() else {
             return;
         };
@@ -1648,27 +1665,50 @@ impl TransferView {
 
     /// DIFF: compare source and target and fill the board. Like the other
     /// previews this is a plain index read, so it runs on the UI thread.
-    fn run_preview_diff(&mut self, store: &Store, source: &str) {
+    /// Plan the two-repo DIFF on a worker thread. `plan_repo_diff` reads both
+    /// repos' full indexes, so on the whole-disk repos this tool targets it
+    /// would freeze the window for seconds if run inline; the result comes back
+    /// over the channel and is applied in [`Self::apply_diff_preview`].
+    fn run_preview_diff(&mut self, store: &Arc<Store>, source: &str) {
         let Some(target) = self.target.clone() else {
             return;
         };
-        match plan_repo_diff(store, source, &target, self.pairing) {
-            Ok(mut rows) => {
+        let store = Arc::clone(store);
+        let source = source.to_string();
+        let pairing = self.pairing;
+        let tx = self.tx.clone();
+        self.previewing = true;
+        self.status = Some(format!("comparing '{source}' and '{target}'…"));
+        std::thread::spawn(move || {
+            let result = plan_repo_diff(&store, &source, &target, pairing)
+                .map(|rows| DiffPreviewData {
+                    rows,
+                    source_header: Self::repo_header(&store, &source),
+                    target_header: Self::repo_header(&store, &target),
+                })
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Msg::DiffPreview(result));
+        });
+    }
+
+    /// Fold a finished DIFF comparison into the board.
+    fn apply_diff_preview(&mut self, result: Result<DiffPreviewData, String>) {
+        match result {
+            Ok(data) => {
+                let mut rows = data.rows;
                 crate::diff_board::sort(&mut rows, &self.board_state);
                 let differing = rows
                     .iter()
                     .filter(|r| r.relation != dedup_core::diff::DiffRelation::Equal)
                     .count();
-                self.preview_source_header = Self::repo_header(store, source);
-                self.preview_target_header = Self::repo_header(store, &target);
+                self.preview_source_header = data.source_header;
+                self.preview_target_header = data.target_header;
                 self.preview_total = differing;
                 self.diff_rows = rows;
-                self.status = Some(format!(
-                    "{differing} difference(s) between '{source}' and '{target}'."
-                ));
+                self.status = Some(format!("{differing} difference(s)."));
                 self.error = None;
             }
-            Err(e) => self.error = Some(e.to_string()),
+            Err(e) => self.error = Some(e),
         }
     }
 
@@ -1839,8 +1879,10 @@ impl TransferView {
         }
     }
 
-    fn build_prompt(&mut self, store: &Store) -> Option<String> {
+    fn build_prompt(&mut self, store: &Arc<Store>) -> Option<String> {
         // Refresh the count so the confirmation reflects the current filter.
+        // DIFF has no RUN, so this only reaches the synchronous sync/repo/folder
+        // previews — the async DIFF preview is never planned from here.
         self.run_preview(store);
         let source = self.source.as_ref()?;
         let dest = match self.destination {
@@ -2114,6 +2156,10 @@ impl TransferView {
             got = true;
             match msg {
                 Msg::Progress(event) => self.apply_progress(event),
+                Msg::DiffPreview(result) => {
+                    self.previewing = false;
+                    self.apply_diff_preview(result);
+                }
                 Msg::Done(result) => {
                     self.running = false;
                     // The session log gets every finished run, so a bug report
@@ -2167,7 +2213,7 @@ impl TransferView {
                 }
             }
         }
-        if got || self.running {
+        if got || self.running || self.previewing {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -3010,5 +3056,60 @@ mod ui_tests {
         let img = h.render().expect("wgpu render failed");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Pump frames until the DIFF preview worker has delivered its result.
+    /// PREVIEW plans off the UI thread now, so the click's own `run()` returns
+    /// before the rows arrive; the tiny test repos finish near-instantly.
+    fn settle_preview(h: &mut Harness<'static, TransferView>) {
+        for _ in 0..100 {
+            h.run();
+            if !h.state().previewing {
+                h.run();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("diff preview did not settle");
+    }
+
+    /// PREVIEW on a DIFF command plans on a worker thread and fills the board
+    /// once the comparison lands — the UI thread is never blocked on the scan.
+    #[test]
+    fn diff_preview_runs_off_thread_and_fills_the_board() {
+        let (_tmp, store) = sample_store();
+        // Give the two repos a difference to find: source has holiday.jpg,
+        // target does not; both are scanned.
+        for repo in ["source", "target"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .expect("scan");
+        }
+        let mut h = transfer_harness(Arc::clone(&store), |v| {
+            v.target = Some("target".to_string());
+            v.command = Command::Diff;
+        });
+
+        // Nothing on the board yet — the plan hasn't been asked for.
+        assert!(h.state().diff_rows.is_empty(), "board starts empty");
+
+        h.get_by_label("PREVIEW").click();
+        // The result arrives over the channel from a worker thread, never inline
+        // on the UI thread; settle pumps frames until it lands.
+        settle_preview(&mut h);
+
+        assert!(!h.state().previewing, "preview finished");
+        assert!(
+            h.state()
+                .diff_rows
+                .iter()
+                .any(|r| r.left.iter().any(|f| f.rel_path == "holiday.jpg")),
+            "the comparison landed and filled the board via the worker channel"
+        );
     }
 }
