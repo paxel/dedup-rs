@@ -90,6 +90,11 @@ pub struct UpdateStats {
     pub hashed_bytes: u64,
     /// True if the update was cancelled before completion.
     pub cancelled: bool,
+    /// True when the walk found no file at all over an index that held some.
+    /// Usually a drive that failed to mount rather than a repo somebody
+    /// emptied; the entries are still marked missing, but callers should say so
+    /// loudly — an emptied main is what makes a MIRROR sync a wipe.
+    pub empty_walk: bool,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -365,10 +370,28 @@ pub fn update_repo(
     });
     write_result?;
 
+    // A walk that saw no file at all, over an index that held some, is more
+    // often an unmounted drive than a repo somebody emptied: an unmounted
+    // mountpoint is still a directory, so the `is_dir` check above lets it
+    // through. Emptying a repo really is legitimate, so the entries are still
+    // marked missing — but the caller is told, because an emptied main is what
+    // turns a MIRROR sync into a wipe.
+    stats.empty_walk = total == 0 && stats.unchanged == 0 && !remaining.is_empty();
+
     // Only a complete, uncancelled walk proves a file vanished.
     if cancel.is_cancelled() {
         stats.cancelled = true;
     } else {
+        if stats.empty_walk {
+            progress.on(ProgressEvent::Error {
+                path: meta.abs_path.clone(),
+                message: format!(
+                    "Found no files at all, but the index held {}. If this drive should not \
+                     be empty, check it is mounted — every entry is now marked missing.",
+                    remaining.len()
+                ),
+            });
+        }
         stats.marked_missing = remaining.len() as u64;
         store::mark_missing(&db, remaining.iter().map(|s| s.as_str()))?;
         let now_ms = std::time::SystemTime::now()

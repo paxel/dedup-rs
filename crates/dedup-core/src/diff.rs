@@ -43,6 +43,13 @@ pub enum DiffError {
 
     #[error("at least one reference repo is required")]
     NoReference,
+
+    #[error(
+        "Sync group main '{main}' has no indexed files, so a MIRROR push would delete \
+         everything in its sink(s). Scan '{main}' first — a drive that failed to mount \
+         scans as an empty directory."
+    )]
+    EmptyMirrorSource { main: String },
 }
 
 /// Where a copy/move should place files: a target directory and an optional

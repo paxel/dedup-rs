@@ -26,12 +26,33 @@ fn delete_mode(mode: SyncMode) -> SyncDelete {
     }
 }
 
+/// Refuse a MIRROR push whose main holds no indexed files.
+///
+/// A mirror deletes sink content whose hash the main does not have, so an empty
+/// main means "delete everything". That is almost never what the user wants: it
+/// happens when the main was never scanned, or when its drive failed to mount
+/// and scanned as an empty directory. `AddOnly` never deletes, so it is exempt.
+fn guard_mirror_source(store: &Store, group: &SyncGroup) -> Result<(), DiffError> {
+    if group.mode != SyncMode::Mirror {
+        return Ok(());
+    }
+    // `file_count` is maintained per live entry, so this is a META read rather
+    // than a scan of the whole index.
+    if store.get_repo_stats(&group.main)?.file_count == 0 {
+        return Err(DiffError::EmptyMirrorSource {
+            main: group.main.clone(),
+        });
+    }
+    Ok(())
+}
+
 /// What a push would do to each sink, without touching disk. Sinks come back
 /// in group order, each with its own plan.
 pub fn plan_group_sync(
     store: &Store,
     group: &SyncGroup,
 ) -> Result<Vec<(String, SyncPlan)>, DiffError> {
+    guard_mirror_source(store, group)?;
     let mut plans = Vec::with_capacity(group.sinks.len());
     for sink in &group.sinks {
         let plan = plan_sync(
@@ -47,31 +68,51 @@ pub fn plan_group_sync(
     Ok(plans)
 }
 
+/// A sink's outcome: the stats of its push, or why it did not happen.
+pub enum SinkOutcome {
+    Pushed(SyncStats),
+    Failed(DiffError),
+    /// The run was cancelled before this sink was reached.
+    Skipped,
+}
+
 /// Push the main to every sink. Each sink is synced independently: a sink that
-/// fails outright is reported as an error against its own name and the rest
-/// still run, because a group is a set of backups, not a transaction.
+/// fails outright is reported as [`SinkOutcome::Failed`] against its own name
+/// and the rest still run, because a group is a set of backups, not a
+/// transaction. Cancelling reports the untouched sinks as
+/// [`SinkOutcome::Skipped`] rather than dropping them, so the caller can say
+/// which backups are now stale. The whole push is refused up front if it would
+/// mirror from an empty main.
 pub fn run_group_sync(
     store: &Store,
     group: &SyncGroup,
     run: &DiffRun<'_>,
-) -> Vec<(String, Result<SyncStats, DiffError>)> {
+) -> Result<Vec<(String, SinkOutcome)>, DiffError> {
+    // A group-level refusal is not a per-sink failure: nothing is attempted.
+    guard_mirror_source(store, group)?;
     let mut results = Vec::with_capacity(group.sinks.len());
     for sink in &group.sinks {
-        if run.cancel.is_cancelled() {
-            break;
-        }
-        let outcome = diff_sync(
-            store,
-            &group.main,
-            sink,
-            true,
-            delete_mode(group.mode),
-            None,
-            run,
-        );
+        // Sinks the cancel cut short are still reported, so the caller can say
+        // which backups are now stale instead of silently dropping them.
+        let outcome = if run.cancel.is_cancelled() {
+            SinkOutcome::Skipped
+        } else {
+            match diff_sync(
+                store,
+                &group.main,
+                sink,
+                true,
+                delete_mode(group.mode),
+                None,
+                run,
+            ) {
+                Ok(stats) => SinkOutcome::Pushed(stats),
+                Err(e) => SinkOutcome::Failed(e),
+            }
+        };
         results.push((sink.clone(), outcome));
     }
-    results
+    Ok(results)
 }
 
 #[cfg(test)]

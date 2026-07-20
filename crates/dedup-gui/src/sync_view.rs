@@ -17,7 +17,7 @@ use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::diff::{DiffEvent, DiffProgress, DiffRun};
 use dedup_core::store::{Store, SyncGroup, SyncMode};
-use dedup_core::sync_group::{plan_group_sync, run_group_sync};
+use dedup_core::sync_group::{SinkOutcome, plan_group_sync, run_group_sync};
 use dedup_core::update::CancellationToken;
 use egui::{Id, RichText};
 use std::sync::Arc;
@@ -50,6 +50,11 @@ pub struct SyncView {
     preview_totals: [usize; 3],
     preview_main_header: String,
     preview_sink_header: String,
+    /// Sinks whose entire current contents the last plan would delete, as
+    /// `(sink, files it holds now)`. The main's content is copied in to replace
+    /// them, so the sink does not end up empty — but nothing it holds today
+    /// survives, which the confirm dialog spells out.
+    wholesale_sinks: Vec<(String, u64)>,
     review_state: review::ReviewState,
     status: Option<String>,
     error: Option<String>,
@@ -97,6 +102,7 @@ impl SyncView {
             preview_totals: [0; 3],
             preview_main_header: String::new(),
             preview_sink_header: String::new(),
+            wholesale_sinks: Vec::new(),
             review_state: review::ReviewState::default(),
             status: None,
             error: None,
@@ -556,6 +562,18 @@ impl SyncView {
     }
 
     fn apply(&mut self, store: &Arc<Store>, act: Act) {
+        // Only membership changes invalidate the cached repo/group lists.
+        // Reloading after every act would also wipe an error a preview or a
+        // refused push just reported, since `sync_repos` clears it on success.
+        let reload = matches!(
+            act,
+            Act::CreateGroup
+                | Act::DeleteGroup(_)
+                | Act::AddSink(..)
+                | Act::RemoveSink(..)
+                | Act::MakeMain(..)
+                | Act::SetMode(..)
+        );
         let result = match act {
             Act::Select(name) => {
                 self.selected = Some(name);
@@ -600,20 +618,44 @@ impl SyncView {
                 Ok(())
             }
             Act::Ask => {
-                if let Some((name, group)) = self.selected_group() {
-                    let what = match group.mode {
-                        SyncMode::AddOnly => "copying content each sink lacks",
-                        SyncMode::Mirror => {
-                            "copying content each sink lacks AND deleting sink content the \
-                             main does not have (deletions cannot be undone)"
-                        }
-                    };
-                    self.confirm = Some(format!(
-                        "Push '{}' to {} sink(s) of group '{name}', {what}? The main is never \
-                         changed.",
+                // Plan first: a confirmation that cannot say how much it
+                // deletes is not one the user can weigh. A refused or failing
+                // plan (an empty MIRROR main, say) never reaches the dialog.
+                self.run_preview(store);
+                if let Some((name, group)) = self.selected_group()
+                    && self.error.is_none()
+                {
+                    let [copies, deletes, _] = self.preview_totals;
+                    let mut prompt = format!(
+                        "Push '{}' to {} sink(s) of group '{name}': copy {copies} file(s)",
                         group.main,
                         group.sinks.len()
-                    ));
+                    );
+                    if group.mode == SyncMode::Mirror {
+                        prompt.push_str(&format!(
+                            " and DELETE {deletes} file(s) from the sink(s), which cannot be \
+                             undone"
+                        ));
+                    }
+                    prompt.push_str(". The main is never changed.");
+                    if !self.wholesale_sinks.is_empty() {
+                        // Say what actually happens: nothing the sink holds today
+                        // survives, and the main's content takes its place. It is
+                        // not left empty — claiming that would be false, and a
+                        // confirmation nobody trusts is worse than none.
+                        let listed: Vec<String> = self
+                            .wholesale_sinks
+                            .iter()
+                            .map(|(sink, live)| format!("{sink} (all {live} of its files)"))
+                            .collect();
+                        prompt.push_str(&format!(
+                            "\n\nWARNING: this replaces the entire current contents of {} with \
+                             the main's content — nothing they hold today survives. If that is \
+                             not what you expect, check the main is complete first.",
+                            listed.join(", ")
+                        ));
+                    }
+                    self.confirm = Some(prompt);
                 }
                 Ok(())
             }
@@ -632,11 +674,10 @@ impl SyncView {
             }
         };
         match result {
-            Ok(()) => {
-                // Membership changed under us? Re-read, so the UI always shows
-                // what the registry actually holds.
-                self.sync_repos(store);
-            }
+            // Membership changed under us? Re-read, so the UI always shows
+            // what the registry actually holds.
+            Ok(()) if reload => self.sync_repos(store),
+            Ok(()) => {}
             Err(e) => self.error = Some(e.to_string()),
         }
     }
@@ -646,6 +687,7 @@ impl SyncView {
         self.preview_totals = [0; 3];
         self.preview_main_header.clear();
         self.preview_sink_header.clear();
+        self.wholesale_sinks.clear();
         self.review_state.rejected.clear();
     }
 
@@ -659,7 +701,18 @@ impl SyncView {
             Ok(plans) => {
                 let mut rows = Vec::new();
                 let (mut added, mut removed) = (0usize, 0usize);
+                self.wholesale_sinks.clear();
                 for (sink, plan) in &plans {
+                    // A plan that deletes everything the sink holds today is a
+                    // wholesale replacement, not an incremental sync — worth
+                    // naming before the user proceeds.
+                    let live = store
+                        .get_repo_stats(sink)
+                        .map(|s| s.file_count)
+                        .unwrap_or(0);
+                    if live > 0 && plan.deletes.len() as u64 >= live {
+                        self.wholesale_sinks.push((sink.clone(), live));
+                    }
                     for rel in &plan.copies {
                         added += 1;
                         rows.push(review::ReviewRow {
@@ -709,28 +762,61 @@ impl SyncView {
         std::thread::spawn(move || {
             let progress = NoProgress;
             let run = DiffRun::new(&progress, &cancel);
-            let results = run_group_sync(&store, &group, &run);
-            let mut copied = 0u64;
-            let mut deleted = 0u64;
+            let results = match run_group_sync(&store, &group, &run) {
+                Ok(results) => results,
+                // The group was refused outright (e.g. an empty MIRROR main):
+                // nothing was attempted, so say so plainly.
+                Err(e) => {
+                    let _ = tx.send(Msg::Done(Err(e.to_string())));
+                    return;
+                }
+            };
+            let (mut copied, mut deleted, mut file_errors) = (0u64, 0u64, 0u64);
             let mut failures = Vec::new();
+            let mut skipped = Vec::new();
+            let mut cancelled = false;
             for (sink, outcome) in results {
                 match outcome {
-                    Ok(stats) => {
+                    SinkOutcome::Pushed(stats) => {
                         copied += stats.copied;
                         deleted += stats.deleted;
+                        file_errors += stats.errors;
+                        cancelled |= stats.cancelled;
                     }
-                    Err(e) => failures.push(format!("{sink}: {e}")),
+                    SinkOutcome::Failed(e) => failures.push(format!("{sink}: {e}")),
+                    SinkOutcome::Skipped => {
+                        cancelled = true;
+                        skipped.push(sink);
+                    }
                 }
             }
-            let message = if failures.is_empty() {
-                Ok(format!(
-                    "Sync done: copied {copied} file(s), deleted {deleted}."
-                ))
+            // Every way a push can fall short of "done" has to reach the user —
+            // a backup that silently did nothing is worse than one that failed
+            // loudly.
+            let mut notes = Vec::new();
+            if cancelled {
+                notes.push("cancelled".to_string());
+            }
+            if !skipped.is_empty() {
+                notes.push(format!(
+                    "{} sink(s) never pushed and are now stale: {}",
+                    skipped.len(),
+                    skipped.join(", ")
+                ));
+            }
+            if file_errors > 0 {
+                notes.push(format!("{file_errors} file(s) failed to copy"));
+            }
+            for failure in &failures {
+                notes.push(failure.clone());
+            }
+            let summary = format!("copied {copied} file(s), deleted {deleted}");
+            let message = if notes.is_empty() {
+                Ok(format!("Sync done: {summary}."))
             } else {
                 Err(format!(
-                    "Copied {copied}, deleted {deleted}; {} sink(s) failed — {}",
-                    failures.len(),
-                    failures.join("; ")
+                    "Sync incomplete — {summary}; {}.",
+                    notes.join("; ")
                 ))
             };
             let _ = tx.send(Msg::Done(message));
@@ -972,10 +1058,24 @@ mod ui_tests {
         );
     }
 
-    /// RUN SYNC always confirms first, and says what MIRROR would delete.
+    /// RUN SYNC always confirms first, and the prompt carries the real counts —
+    /// "deletions cannot be undone" is not something a user can weigh without
+    /// knowing how many.
     #[test]
-    fn run_sync_asks_before_pushing() {
-        let (_tmp, store) = sample_store();
+    fn run_sync_asks_before_pushing_and_says_how_much() {
+        let (tmp, store) = sample_store();
+        std::fs::write(tmp.path().join("PRIMARY/a.txt"), b"alpha").expect("write");
+        std::fs::write(tmp.path().join("BACKUP1/gone.txt"), b"only in sink").expect("write");
+        for repo in ["PRIMARY", "BACKUP1"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .expect("scan");
+        }
         store
             .create_sync_group("offsite", "PRIMARY", SyncMode::Mirror)
             .expect("create group");
@@ -991,14 +1091,70 @@ mod ui_tests {
             "a push is always confirmed"
         );
         assert!(
-            h.query_by_label_contains("deletions cannot be undone")
+            h.query_by_label_contains("copy 1 file(s)").is_some(),
+            "the prompt counts the copies"
+        );
+        assert!(
+            h.query_by_label_contains("DELETE 1 file(s)").is_some(),
+            "and the deletions, so MIRROR can be weighed"
+        );
+        // BACKUP1's only file goes, so this is a wholesale replacement — but the
+        // main's content is copied in, so the sink is NOT left empty. The
+        // warning must say the former and never claim the latter.
+        assert!(
+            h.query_by_label_contains("replaces the entire current contents")
                 .is_some(),
-            "MIRROR says what it will delete"
+            "a push that drops everything the sink holds says so"
+        );
+        assert!(
+            h.query_by_label_contains("empties").is_none(),
+            "and never claims the sink ends up empty — the main's content replaces it"
         );
         h.get_by_label("CANCEL").click();
         h.run();
         assert!(h.state().confirm.is_none(), "cancelling closes the dialog");
         assert!(!h.state().running, "and nothing was pushed");
+    }
+
+    /// A MIRROR whose main holds nothing would delete every file in the sink.
+    /// RUN SYNC must refuse outright rather than offer a confirmation — the
+    /// main being empty is virtually always an unscanned or unmounted drive.
+    #[test]
+    fn run_sync_refuses_to_mirror_from_an_empty_main() {
+        let (tmp, store) = sample_store();
+        std::fs::write(tmp.path().join("BACKUP1/precious.txt"), b"the only copy").expect("write");
+        // Only the sink is scanned: PRIMARY's index stays empty.
+        dedup_core::update::update_repo(
+            &store,
+            "BACKUP1",
+            1,
+            &dedup_core::update::NoProgress,
+            &CancellationToken::new(),
+        )
+        .expect("scan");
+        store
+            .create_sync_group("offsite", "PRIMARY", SyncMode::Mirror)
+            .expect("create group");
+        store.add_sync_sink("offsite", "BACKUP1").expect("add sink");
+        let mut h = harness(Arc::clone(&store));
+        h.get_by_label("offsite").click();
+        h.run();
+
+        h.get_by_label("RUN SYNC").click();
+        h.run();
+        assert!(
+            h.state().confirm.is_none(),
+            "no confirmation is offered for a push that would wipe the sink"
+        );
+        assert!(!h.state().running, "and nothing is pushed");
+        assert!(
+            h.query_by_label_contains("has no indexed files").is_some(),
+            "the refusal explains itself"
+        );
+        assert!(
+            tmp.path().join("BACKUP1/precious.txt").exists(),
+            "the sink still holds its content"
+        );
     }
 
     /// Render snapshot of the tab: `cargo test -p dedup-gui render_sync_groups

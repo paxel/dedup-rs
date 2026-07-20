@@ -238,7 +238,7 @@ fn a_pre_sync_group_registry_still_opens_and_has_no_groups() -> TestResult {
 // --- pushing a group out ---------------------------------------------------
 
 use dedup_core::diff::{DiffRun, NoDiffProgress};
-use dedup_core::sync_group::{plan_group_sync, run_group_sync};
+use dedup_core::sync_group::{SinkOutcome, plan_group_sync, run_group_sync};
 use dedup_core::update::{CancellationToken, NoProgress, update_repo};
 use std::path::Path;
 
@@ -250,6 +250,14 @@ fn write(root: &Path, rel: &str, content: &[u8]) -> TestResult {
     }
     std::fs::write(path, content)?;
     Ok(())
+}
+
+/// The stats of the first sink's push, if it actually ran.
+fn first_stats(results: Vec<(String, SinkOutcome)>) -> Option<dedup_core::diff::SyncStats> {
+    match results.into_iter().next() {
+        Some((_, SinkOutcome::Pushed(stats))) => Some(stats),
+        _ => None,
+    }
 }
 
 /// A repo's live (non-missing) relative paths, sorted.
@@ -308,12 +316,8 @@ fn add_only_copies_what_the_sink_lacks_and_deletes_nothing() -> TestResult {
         &sb.store,
         &group,
         &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
-    );
-    let stats = results
-        .into_iter()
-        .next()
-        .and_then(|(_, r)| r.ok())
-        .ok_or("sync failed")?;
+    )?;
+    let stats = first_stats(results).ok_or("sync failed")?;
     assert_eq!((stats.copied, stats.deleted), (1, 0));
     assert_eq!(
         live_paths(&sb.store, "SINK1")?,
@@ -341,12 +345,8 @@ fn mirror_converges_the_sink_on_the_main() -> TestResult {
         &sb.store,
         &group,
         &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
-    );
-    let stats = results
-        .into_iter()
-        .next()
-        .and_then(|(_, r)| r.ok())
-        .ok_or("sync failed")?;
+    )?;
+    let stats = first_stats(results).ok_or("sync failed")?;
     assert_eq!((stats.copied, stats.deleted), (1, 1));
     assert_eq!(
         live_paths(&sb.store, "SINK1")?,
@@ -374,7 +374,7 @@ fn every_sink_is_pushed_independently() -> TestResult {
         &sb.store,
         &group,
         &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
-    );
+    )?;
     assert_eq!(
         results
             .iter()
@@ -384,7 +384,9 @@ fn every_sink_is_pushed_independently() -> TestResult {
         "one result per sink, in group order"
     );
     for (sink, outcome) in results {
-        let stats = outcome.map_err(|e| format!("{sink}: {e}"))?;
+        let SinkOutcome::Pushed(stats) = outcome else {
+            return Err(format!("{sink} was not pushed").into());
+        };
         assert_eq!(stats.copied, 1, "{sink} got the file");
         assert_eq!(live_paths(&sb.store, &sink)?, ["a.txt"]);
     }
@@ -396,12 +398,165 @@ fn a_second_push_has_nothing_left_to_do() -> TestResult {
     let sb = seeded_group(SyncMode::Mirror)?;
     let group = sb.store.get_sync_group("offsite")?;
     let cancel = CancellationToken::new();
-    run_group_sync(&sb.store, &group, &DiffRun::new(&NoDiffProgress, &cancel));
+    run_group_sync(&sb.store, &group, &DiffRun::new(&NoDiffProgress, &cancel))?;
 
     // Re-planning right after a push: the sink already matches the main, so a
     // push is idempotent (no re-copying, no re-deleting).
     let plans = plan_group_sync(&sb.store, &group)?;
     assert!(plans[0].1.copies.is_empty(), "nothing left to copy");
     assert!(plans[0].1.deletes.is_empty(), "nothing left to delete");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The empty-main guard: a MIRROR push must never read "delete everything"
+// ---------------------------------------------------------------------------
+
+/// A main that was never scanned holds no content, so mirroring from it would
+/// classify every sink file as "absent from the main" and delete the lot.
+#[test]
+fn mirror_refuses_a_main_that_was_never_scanned() -> TestResult {
+    let sb = Sandbox::new()?;
+    write(&sb.dir("MAIN"), "a.txt", b"alpha")?;
+    write(&sb.dir("SINK1"), "precious.txt", b"the only copy")?;
+    // Only the sink is scanned: the main's index stays empty.
+    sb.scan(&["SINK1"])?;
+    sb.store
+        .create_sync_group("offsite", "MAIN", SyncMode::Mirror)?;
+    sb.store.add_sync_sink("offsite", "SINK1")?;
+    let group = sb.store.get_sync_group("offsite")?;
+
+    assert!(
+        matches!(
+            plan_group_sync(&sb.store, &group),
+            Err(dedup_core::diff::DiffError::EmptyMirrorSource { .. })
+        ),
+        "planning is refused before it can propose deletions"
+    );
+    assert!(
+        matches!(
+            run_group_sync(
+                &sb.store,
+                &group,
+                &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
+            ),
+            Err(dedup_core::diff::DiffError::EmptyMirrorSource { .. })
+        ),
+        "and so is the push"
+    );
+    assert_eq!(
+        live_paths(&sb.store, "SINK1")?,
+        ["precious.txt"],
+        "the sink still holds its content"
+    );
+    assert!(sb.dir("SINK1").join("precious.txt").exists());
+    Ok(())
+}
+
+/// ADD ONLY never deletes, so an empty main is harmless there and must not be
+/// refused — it simply has nothing to copy.
+#[test]
+fn add_only_still_runs_with_an_empty_main() -> TestResult {
+    let sb = Sandbox::new()?;
+    write(&sb.dir("SINK1"), "precious.txt", b"the only copy")?;
+    sb.scan(&["SINK1"])?;
+    sb.store
+        .create_sync_group("offsite", "MAIN", SyncMode::AddOnly)?;
+    sb.store.add_sync_sink("offsite", "SINK1")?;
+    let group = sb.store.get_sync_group("offsite")?;
+
+    let plans = plan_group_sync(&sb.store, &group)?;
+    assert!(plans[0].1.copies.is_empty(), "an empty main copies nothing");
+    assert!(plans[0].1.deletes.is_empty(), "and AddOnly never deletes");
+    assert_eq!(live_paths(&sb.store, "SINK1")?, ["precious.txt"]);
+    Ok(())
+}
+
+/// The dangerous variant of an empty main: the drive failed to mount, so the
+/// root is still a directory (passing the `RootMissing` check) but holds
+/// nothing. The scan flags it, and — the part that actually protects the sink —
+/// MIRROR then refuses to push from the emptied main.
+#[test]
+fn an_empty_walk_is_flagged_and_disarms_mirror() -> TestResult {
+    let sb = seeded_group(SyncMode::Mirror)?;
+    assert_eq!(live_paths(&sb.store, "MAIN")?, ["a.txt", "b.txt"]);
+
+    // Simulate the unmounted mountpoint: the directory is there, empty.
+    std::fs::remove_file(sb.dir("MAIN").join("a.txt"))?;
+    std::fs::remove_file(sb.dir("MAIN").join("b.txt"))?;
+    let stats = update_repo(&sb.store, "MAIN", 1, &NoProgress, &CancellationToken::new())?;
+
+    assert!(stats.empty_walk, "the scan flags a walk that found nothing");
+    assert_eq!(stats.marked_missing, 2);
+
+    // The main now looks empty — which is exactly when a mirror must not run.
+    let group = sb.store.get_sync_group("offsite")?;
+    assert!(
+        matches!(
+            plan_group_sync(&sb.store, &group),
+            Err(dedup_core::diff::DiffError::EmptyMirrorSource { .. })
+        ),
+        "MIRROR refuses an emptied main instead of wiping the sink"
+    );
+    assert_eq!(
+        live_paths(&sb.store, "SINK1")?,
+        ["a.txt", "extra.txt"],
+        "the sink is untouched"
+    );
+    Ok(())
+}
+
+/// A repo that lost only some of its files is an ordinary scan: nothing is
+/// flagged, and the vanished entry is marked missing as always.
+#[test]
+fn a_partial_deletion_is_not_flagged() -> TestResult {
+    let sb = seeded_group(SyncMode::Mirror)?;
+    std::fs::remove_file(sb.dir("MAIN").join("b.txt"))?;
+    let stats = update_repo(&sb.store, "MAIN", 1, &NoProgress, &CancellationToken::new())?;
+
+    assert_eq!(stats.marked_missing, 1);
+    assert!(!stats.empty_walk, "some files were still found");
+    assert_eq!(live_paths(&sb.store, "MAIN")?, ["a.txt"]);
+    Ok(())
+}
+
+/// Cancelling mid-push must not look like a completed one: the sinks that were
+/// never reached are reported as skipped, so the caller can say which backups
+/// are now stale instead of silently dropping them from the results.
+#[test]
+fn a_cancelled_push_reports_the_sinks_it_never_reached() -> TestResult {
+    let sb = Sandbox::new()?;
+    write(&sb.dir("MAIN"), "a.txt", b"alpha")?;
+    sb.scan(&["MAIN", "SINK1", "SINK2"])?;
+    sb.store
+        .create_sync_group("offsite", "MAIN", SyncMode::AddOnly)?;
+    sb.store.add_sync_sink("offsite", "SINK1")?;
+    sb.store.add_sync_sink("offsite", "SINK2")?;
+    let group = sb.store.get_sync_group("offsite")?;
+
+    // Cancelled before anything ran: both sinks are still accounted for.
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let results = run_group_sync(&sb.store, &group, &DiffRun::new(&NoDiffProgress, &cancel))?;
+
+    assert_eq!(results.len(), 2, "every sink is still reported");
+    assert!(
+        results
+            .iter()
+            .all(|(_, o)| matches!(o, SinkOutcome::Skipped)),
+        "a cancelled run marks untouched sinks skipped, not done"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .map(|(sink, _)| sink.as_str())
+            .collect::<Vec<_>>(),
+        ["SINK1", "SINK2"],
+        "named, so the caller can list the stale backups"
+    );
+    assert!(
+        live_paths(&sb.store, "SINK1")?.is_empty(),
+        "and nothing was actually pushed"
+    );
     Ok(())
 }

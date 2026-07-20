@@ -20,7 +20,15 @@
   - for purge no diff button but still the info panel. 
   - these type based info panels should be in a way that we can easily extend them in the future
 - sync repos. it seems the grouping of repos belongs to the first tab
-  - repositories get a "main repo button. if clicked they are converted to repo group. getting an elbow and and an add repo button. the add repo button is for adding new repos. they inherit all of the main repo but the path"
+  - repositories get a "main repo button. if clicked they are converted to repo group. getting an elbow and and an add repo button. 
+  - the add repo button is for adding new repos. they inherit everything of the main repo but the path
+  - existing repos get a "sink" button. which when clicked offers existing groups to be added to
+  - the main group gets a sub elbow sinks, that can be colapsed
+  - the main group gets a update all button that updates all repos of the group
+  - each sink has a toggle pill mirror to select if the repo should be mirrored or just copied to
+  - in all transfer groom etc views only the main groups are offered
+  - group sync becomes repo sync where groups can be synced, but also ALL repos diffed vs another
+- 
 
 ## B Recognition & extensibility  *(far future)*
 
@@ -47,6 +55,115 @@
   - you can diff by path, if both exist and have equal hash: grey (default is hide equals completely), otherwise we need to have some lightbox where we can display all the details of both files depending on their types. in the lightbox and in the table view we need the options to delete, rename or overwrite with other side is needed for both sides.
     - if one side is missing the copy and delete buttons as in the hash based diff is required
 - we could also think about having size and modified date in the table.
+
+
+## Open issues & requests — 2026-07-20
+
+### C Safety: MIRROR can wipe a sink  — **done 2026-07-20**
+
+A MIRROR push deletes sink content whose hash is absent from the main's **live**
+entry set (`diff.rs::diff_sync`, `source_present`). Nothing guards the case where
+that set is empty, so an empty main deletes the sink outright. Two reachable ways in:
+
+- The main was added but never scanned — its `FILES` table is empty.
+- The main's path is an **unmounted mountpoint**. `update_repo` only refuses when
+  the root is not a directory (`update.rs:251`, `:426`), and an unmounted `/mnt/x`
+  is normally still an empty directory: the walk finds nothing, every entry is
+  marked missing (`update.rs:373`), and the main now looks legitimately scanned
+  and empty. A fully absent path *is* already refused (`UpdateError::RootMissing`).
+
+Done:
+- `sync_group::guard_mirror_source` refuses a MIRROR plan *and* push when the main's
+  `file_count` is 0 (`DiffError::EmptyMirrorSource`). ADD ONLY is exempt — it never
+  deletes. Checked once per group, off the maintained META counter, not a scan.
+- The confirm prompt now states the real copy and delete counts (it plans first, so a
+  refused plan never reaches the dialog) and warns when a push would replace a sink's
+  entire current contents. Note it says *replaces*, not *empties*: because the mirror
+  guard proves the main is non-empty, its content is always copied in, so a sink can
+  never actually end up empty — the earlier "empties completely" wording would have
+  been false on every firing.
+- `UpdateStats::empty_walk` flags a scan that found no file at all over a non-empty
+  index, and `update_repo` emits a progress error naming the directory.
+- Tests: `sync_groups.rs::mirror_refuses_a_main_that_was_never_scanned`,
+  `::add_only_still_runs_with_an_empty_main`, `::an_empty_walk_is_flagged_and_disarms_mirror`,
+  `::a_partial_deletion_is_not_flagged`, `::a_cancelled_push_reports_the_sinks_it_never_reached`; GUI
+  `sync_view::run_sync_refuses_to_mirror_from_an_empty_main` and
+  `::run_sync_asks_before_pushing_and_says_how_much`.
+
+Deliberately **not** done — the empty-walk scan was left non-destructive-by-warning
+rather than by refusal. Keeping the index on an empty walk breaks a legitimate
+workflow (emptying a small repo so the deletion propagates — see
+`diff_ops.rs::sync_deletes_when_marked_missing_in_a_and_updates_index`), and a
+threshold for "too many to be real" would be arbitrary. The files are protected by
+the MIRROR guard regardless of how the main got to zero. Follow-up if the index loss
+itself proves annoying: a confirmation (GUI) / `--force` (CLI) path before a scan is
+allowed to mark *every* entry missing.
+
+### D Error handling, logging & diagnostics  *(blocker before beta)*
+
+Beta users cannot report what the app never tells them. Today a sync that copied
+nothing and failed on every file reports success.
+
+- **Surface run outcomes.** *Done for the Sync Groups tab in section C* — `SyncView::start`
+  now reports cancellation, per-file `stats.errors`, failed sinks and skipped sinks, and
+  says "Sync incomplete" rather than "Sync done" whenever any of those fire. **Still open:**
+  the same audit across the other long-running operations (Transfer, Grooming, scans), and
+  promoting the one-line status into a proper result panel/modal listing the per-item errors
+  instead of a joined string.
+- **Report skipped sinks.** *Done in section C* — `run_group_sync` returns
+  `SinkOutcome::Skipped` for sinks a cancel never reached, and the GUI names them as stale.
+- **Stop swallowing store errors.** `app.rs:285` does
+  `list_sync_groups().unwrap_or_default()`, so a failed registry read silently renders
+  every sink as an unrelated top-level repo with no error shown. Audit for the same pattern.
+- **Session log, rolling.** Write a full session log and keep the last ~10.
+  Not `/var/log/dedup` — that needs root and dedup is a user-level app. Use the XDG
+  state dir, `$XDG_STATE_HOME/dedup/logs` (default `~/.local/state/dedup/logs`).
+  Related: `get_config_dir` (`store.rs:388`) hardcodes `~/.config/dedup` and ignores
+  `$XDG_CONFIG_HOME` — worth aligning while touching this.
+- **Make the log reachable from the GUI** (a button that opens the log directory), so
+  a beta report can carry it.
+
+### E Code review backlog — 2026-07-20 (`feature/master/qa`)
+
+Correctness:
+- `rename_file` (`diff.rs:1472`) writes the new path and removes the old one in two
+  separate write transactions. Interrupted in between, the index holds the same
+  content under both names: phantom duplicate, inflated `file_count`/`total_size`.
+  Both writes belong in one `RepoTables` transaction.
+
+Performance:
+- `run_preview_diff` (`transfer_view.rs:1635`) and `run_preview` (`sync_view.rs:654`)
+  run full index scans on the egui UI thread. At the 10⁵–10⁶ entries this tool targets
+  that is a multi-second freeze on the main workload; move both onto the existing
+  `worker.rs` thread + crossbeam channel.
+- `plan_group_sync`/`run_group_sync` re-read and re-deserialize the main's entire
+  index once per sink. Collect the main's entries and content-key set once before
+  the loop.
+- `Store::get_sync_group`/`sync_group_of` are full-table scans over a keyed redb
+  table; `create_sync_group` scans twice. `get_sync_group` can be a keyed `get`.
+
+Design depth:
+- `review::table` infers "single-sided board" from an empty `target_header`
+  (`review.rs:221`). A header that is empty for a frame silently drops the target
+  columns and rewrites `sort_col`. Model it like the neighbouring `RowControls`:
+  an explicit `Option<&str>` or `BoardSides` parameter.
+- The sync preview bakes the sink name into `ReviewRow.target_path` as
+  `format!("{sink}: {rel}")` (`sync_view.rs:669`), so sorting by target path sorts by
+  sink name and a path containing ": " is ambiguous. Give `ReviewRow` a repo/scope field.
+- `resolve_in_repo` (`diff.rs:1410`) re-implements the path-escape check already in
+  `resolve_subdir` (`diff.rs:62`). Two copies of a security check drift; factor into one.
+
+Cleanup:
+- `diff_board.rs` passes the popup's row index through a `thread_local` `PENDING_ROW`
+  cell with an `unwrap_or(0)` fallback; `BoardAction::OpenPopup` could just carry
+  `row: usize`. (Not currently exploitable — `rows.get()` is bounds-checked and the
+  modal blocks background input — but it is hidden global state for one value.)
+- Dead arm: `BoardAction::OpenPopup | Inspect` in `start_board_action`
+  (`transfer_view.rs:1759`) is unreachable — `board()` returns `None` for popups and
+  `Inspect` is intercepted at `transfer_view.rs:1389`.
+- `sync_view.rs` defines a private `NoProgress` duplicating
+  `dedup_core::diff::NoDiffProgress`; `diff_board.rs` duplicates review.rs's paging
+  strip and computes `totals(rows)` twice per frame.
 
 
 

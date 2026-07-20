@@ -32,6 +32,12 @@ The mode is configured **per group** and decides what a push does:
 - **MIRROR** — also delete sink content the main does not have, so each sink ends up holding
   exactly the main's content. Those deletions cannot be undone.
 
+Because MIRROR deletes whatever the main lacks, a main that holds *nothing* would mean
+"delete everything". A push is therefore refused outright when the main has no indexed
+files — most often a main that was never scanned, or one whose drive failed to mount and
+so scanned as an empty directory. Scan the main and try again. ADD ONLY never deletes and
+is never refused.
+
 Content is compared by size + BLAKE3 hash, never by path, so a file that already exists in
 the sink under a different name is not copied again.
 
@@ -41,10 +47,13 @@ the sink under a different name is not copied again.
   row is a file to copy into a sink (marked *added*) or, in MIRROR mode, to delete from it
   (marked *removed*), with the sink named in the path so several sinks read as one list.
   Nothing on disk is touched.
-- **RUN SYNC** (`R`) asks for confirmation — spelling out that MIRROR deletes — and then
-  pushes on a background thread. Sinks are handled one after another and independently, so
-  one unplugged backup drive doesn't stop the others; the summary reports what was copied
-  and deleted, and names any sink that failed.
+- **RUN SYNC** (`R`) plans the push, then asks for confirmation stating how many files it
+  will copy and — in MIRROR mode — how many it will delete, naming any sink the push would
+  empty completely. It then pushes on a background thread. Sinks are handled one after
+  another and independently, so one unplugged backup drive doesn't stop the others. The
+  summary reports what was copied and deleted, and says plainly when a run fell short:
+  which sinks failed, which were never reached (and are therefore stale), how many files
+  failed to copy, and whether it was cancelled.
 
 The main is never changed by a push. To bring a change that was made *inside a sink* back to
 the main, use the [Files tab's](files.md#diff-board) **DIFF** command with the sink and the
