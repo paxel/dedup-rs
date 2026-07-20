@@ -14,8 +14,15 @@
   temp-repo integration tests; store format changes must include a legacy-decode test
   (pattern: `store.rs::v1_entries_decode_and_flag_images_stale`).
 
+## A usability
+- the preview button should be renamed review as it is now a way for the user to review the action
+- for the review pane we need more infos. the filename columns need to contain basically the same infos as the duplicate tabs group items. thumbnail, audio duration, size, etc. extremely nice would be a diff button between both that opens a lightbox diff view
+  - for purge no diff button but still the info panel. 
+  - these type based info panels should be in a way that we can easily extend them in the future
+- sync repos. it seems the grouping of repos belongs to the first tab
+  - repositories get a "main repo button. if clicked they are converted to repo group. getting an elbow and and an add repo button. the add repo button is for adding new repos. they inherit all of the main repo but the path"
 
-## Phase 8 — Recognition & extensibility  *(far future)*
+## B Recognition & extensibility  *(far future)*
 
 - Face recognition and object recognition for photos/images.
 - VLA tagging of files to topics; word clouds for documents.
