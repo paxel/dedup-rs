@@ -67,30 +67,6 @@ enum Commands {
         #[command(subcommand)]
         command: ArchiveCommands,
     },
-    /// Triage a disk: scan it, copy its unique content into a sanitized repo
-    /// (diffing against the sanitized repo and any extra references), then mark
-    /// the source repo triage-done. The one-shot disk-inheritance workflow.
-    Sanitize {
-        /// Source repository (the disk to triage)
-        source: String,
-        /// Sanitized repository to copy unique content into (also a reference)
-        sanitized: String,
-        /// Additional already-processed reference repos; repeatable
-        #[arg(long = "ref", value_name = "REPO")]
-        refs: Vec<String>,
-        /// Relative subfolder inside the sanitized repo to place files under
-        #[arg(short = 'i', long)]
-        into: Option<String>,
-        /// Move instead of copy (marks source entries missing)
-        #[arg(long)]
-        move_files: bool,
-        /// Skip the initial scan of the source (use the existing index)
-        #[arg(long)]
-        no_scan: bool,
-        /// Filter: mime:/name:/size:/origin:
-        #[arg(short, long)]
-        filter: Option<String>,
-    },
 }
 
 #[derive(Subcommand)]
@@ -376,20 +352,6 @@ fn main() -> anyhow::Result<()> {
             let store = Store::open()?;
             run_archive(&store, command)?;
         }
-        Some(Commands::Sanitize {
-            source,
-            sanitized,
-            refs,
-            into,
-            move_files,
-            no_scan,
-            filter,
-        }) => {
-            let store = Store::open()?;
-            run_sanitize(
-                &store, &source, &sanitized, &refs, into, move_files, no_scan, filter,
-            )?;
-        }
         None => {
             println!("Starting GUI...");
             if let Err(e) = dedup_gui::run(cli.ui_scale) {
@@ -490,8 +452,6 @@ fn run_report(store: &Store, names: Vec<String>, all: bool) -> anyhow::Result<()
             r.dup_groups,
             format_size(r.reclaimable)
         );
-        let triaged = if r.triage_done_ms > 0 { "yes" } else { "no" };
-        println!("- Triaged: {triaged}");
         if r.flags.is_empty() {
             println!("- Flagged critical files: none");
         } else {
@@ -584,67 +544,6 @@ fn run_archive(store: &Store, command: ArchiveCommands) -> anyhow::Result<()> {
             );
         }
     }
-    Ok(())
-}
-
-/// The one-shot disk-triage workflow: scan the source, copy its unique content
-/// into the sanitized repo (diffing against the sanitized repo plus any extra
-/// references), and mark the source triage-done.
-#[allow(clippy::too_many_arguments)]
-fn run_sanitize(
-    store: &Store,
-    source: &str,
-    sanitized: &str,
-    refs: &[String],
-    into: Option<String>,
-    move_files: bool,
-    no_scan: bool,
-    filter: Option<String>,
-) -> anyhow::Result<()> {
-    let cancel = CancellationToken::new();
-    {
-        let cancel = cancel.clone();
-        ctrlc::set_handler(move || cancel.cancel())?;
-    }
-
-    if !no_scan {
-        println!("Scanning '{source}'…");
-        // Same live progress as `repo update` — a whole-disk scan can run for
-        // hours and must not look like a hang.
-        let progress = TerminalProgress::new();
-        update_repo(store, source, 0, &progress, &cancel)?;
-        progress.finish();
-    }
-
-    // The sanitized repo's directory receives the copies (and is a reference).
-    let sanitized_dir = store.get_repo(sanitized)?.abs_path;
-    let references = diff_refs(sanitized, refs);
-    let stats = diff_copy(
-        store,
-        source,
-        &references,
-        CopyDest {
-            dir: std::path::Path::new(&sanitized_dir),
-            subdir: into.as_deref(),
-        },
-        move_files,
-        filter.as_deref(),
-        &DiffRun::new(&NoDiffProgress, &cancel),
-    )?;
-
-    let verb = if move_files { "Moved" } else { "Copied" };
-    println!(
-        "{verb} {} unique file(s) from '{source}' into '{}'.",
-        stats.copied,
-        destination(sanitized, &into)
-    );
-    if stats.cancelled {
-        println!("Sanitize cancelled by user; source not marked done.");
-        return Ok(());
-    }
-
-    store.set_triage_done(source, true)?;
-    println!("Marked '{source}' triage-done.");
     Ok(())
 }
 

@@ -839,6 +839,7 @@ impl GroomingView {
             self.preview_totals,
             &self.preview_source_header,
             &self.preview_target_header,
+            review::RowControls::Enabled,
         ) {
             acts.push(Act::ApplyRow(key));
         }

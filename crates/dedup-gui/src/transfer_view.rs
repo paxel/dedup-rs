@@ -236,6 +236,8 @@ pub struct TransferView {
     diff_rows: Vec<RepoDiffRow>,
     /// Sort/paging state of the diff board.
     board_state: crate::diff_board::BoardState,
+    /// The open side-by-side comparison of one conflicting row, if any.
+    inspect: Option<crate::diff_inspect::Inspect>,
     /// Full per-kind counts (indexed by [`review::RowKind::idx`]) for the review
     /// summary; independent of the capped `preview` sample.
     preview_totals: [usize; 3],
@@ -313,6 +315,7 @@ impl TransferView {
             pairing: DiffPairing::ByHash,
             diff_rows: Vec::new(),
             board_state: crate::diff_board::BoardState::default(),
+            inspect: None,
             preview_totals: [0; 3],
             preview_source_header: String::new(),
             preview_target_header: String::new(),
@@ -475,6 +478,38 @@ impl TransferView {
 
         if let Some(prompt) = self.confirm.clone() {
             self.confirm_modal(ui, &prompt, &mut acts);
+        }
+        // The comparison sits above everything, and its buttons feed the same
+        // row actions the board offers.
+        if let Some(inspect) = self.inspect.as_mut()
+            && let Some(outcome) = inspect.view(&ui.ctx().clone(), verbosity)
+        {
+            use crate::diff_inspect::InspectOutcome;
+            let (left_rel, right_rel) = (
+                inspect.left.rel_path.clone(),
+                inspect.right.rel_path.clone(),
+            );
+            self.inspect = None;
+            match outcome {
+                InspectOutcome::Close => {}
+                InspectOutcome::Delete { on_left } => {
+                    acts.push(Act::Board(crate::diff_board::BoardAction::Delete {
+                        on_left,
+                        rel_path: if on_left { left_rel } else { right_rel },
+                    }));
+                }
+                InspectOutcome::Overwrite { from_left } => {
+                    acts.push(Act::Board(crate::diff_board::BoardAction::Overwrite {
+                        from_left,
+                        from_rel: if from_left {
+                            left_rel.clone()
+                        } else {
+                            right_rel.clone()
+                        },
+                        to_rel: if from_left { right_rel } else { left_rel },
+                    }));
+                }
+            }
         }
 
         for act in acts {
@@ -1174,6 +1209,7 @@ impl TransferView {
             self.preview_totals,
             &self.preview_source_header,
             &self.preview_target_header,
+            review::RowControls::Enabled,
         ) {
             acts.push(Act::ApplyRow(key));
         }
@@ -1350,6 +1386,10 @@ impl TransferView {
                 self.pairing = pairing;
                 self.clear_preview();
             }
+            Act::Board(crate::diff_board::BoardAction::Inspect {
+                left_rel,
+                right_rel,
+            }) => self.open_inspect(store, &left_rel, &right_rel),
             Act::Board(action) => self.start_board_action(store, action),
             Act::CancelRun => self.cancel.cancel(),
         }
@@ -1359,8 +1399,10 @@ impl TransferView {
         self.preview.clear();
         self.diff_rows.clear();
         self.board_state.page = 0;
-        // A popup belongs to the rows it was opened from.
+        // A popup (and an open comparison) belongs to the rows it was opened
+        // from.
         self.board_state.popup = None;
+        self.inspect = None;
         self.preview_totals = [0; 3];
         self.preview_source_header.clear();
         self.preview_target_header.clear();
@@ -1614,6 +1656,34 @@ impl TransferView {
         }
     }
 
+    /// Open the side-by-side comparison for a conflicting row: both versions
+    /// of the same path, with everything needed to judge them.
+    fn open_inspect(&mut self, store: &Arc<Store>, left_rel: &str, right_rel: &str) {
+        let (Some(source), Some(target)) = (self.source.clone(), self.target.clone()) else {
+            return;
+        };
+        let side = |repo: &str, rel: &str| -> Option<crate::diff_inspect::InspectSide> {
+            let meta = store.get_repo(repo).ok()?;
+            let entry = store.get_file_entry(repo, rel).ok().flatten()?;
+            Some(crate::diff_inspect::InspectSide {
+                repo: repo.to_string(),
+                rel_path: rel.to_string(),
+                abs_path: PathBuf::from(&meta.abs_path).join(rel),
+                size: entry.size,
+                modified_ms: entry.modified_ms,
+                mime: entry.mime.clone(),
+                hash_hex: dedup_core::thumbnail::hash_hex(&entry.hash),
+            })
+        };
+        match (side(&source, left_rel), side(&target, right_rel)) {
+            (Some(left), Some(right)) => {
+                self.inspect = Some(crate::diff_inspect::Inspect::new(left, right));
+                self.error = None;
+            }
+            _ => self.error = Some("Could not read both versions of that file.".to_string()),
+        }
+    }
+
     /// Execute one DIFF board row action on a worker thread (a single file can
     /// still be large), then re-plan the diff so the row reflects the result.
     fn start_board_action(&mut self, store: &Arc<Store>, action: crate::diff_board::BoardAction) {
@@ -1685,8 +1755,8 @@ impl TransferView {
                         None => Ok(format!("Deleted {deleted} file(s) from '{repo}'.")),
                     }
                 }
-                // Popups are answered in the board itself; nothing to run.
-                BoardAction::OpenPopup { .. } => Ok(String::new()),
+                // Popups and the compare view are handled in the UI itself.
+                BoardAction::OpenPopup { .. } | BoardAction::Inspect { .. } => Ok(String::new()),
             };
             let result = match outcome {
                 Ok(message) => OpResult::Applied { message },
@@ -2710,6 +2780,107 @@ mod ui_tests {
             h.state().board_state.popup.is_none(),
             "answering closes the popup"
         );
+    }
+
+    /// A BY PATH conflict can be inspected side by side, and the comparison's
+    /// own buttons carry out the same row actions.
+    #[test]
+    fn compare_opens_both_versions_and_can_delete_one() {
+        let (tmp, store) = sample_store();
+        // Same name on both sides, different content: a conflict row.
+        std::fs::write(tmp.path().join("target/notes.txt"), b"other version").expect("write");
+        for repo in ["source", "target"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &dedup_core::update::CancellationToken::new(),
+            )
+            .expect("scan test repo");
+        }
+        let mut h = diff_harness_over(Arc::clone(&store));
+        {
+            let view = h.state_mut();
+            view.pairing = dedup_core::diff::DiffPairing::ByPath;
+            view.diff_rows = dedup_core::diff::plan_repo_diff(
+                &store,
+                "source",
+                "target",
+                dedup_core::diff::DiffPairing::ByPath,
+            )
+            .expect("plan diff");
+        }
+        h.run();
+        h.get_by_label("COMPARE").click();
+        h.run();
+        assert!(
+            h.query_by_label_contains("SAME PATH, DIFFERENT CONTENT")
+                .is_some(),
+            "the comparison opened"
+        );
+        assert!(
+            h.state().inspect.is_some(),
+            "the view holds the open comparison"
+        );
+        // Delete the target's version from inside the comparison.
+        let target_file = tmp.path().join("target/notes.txt");
+        match h.get_all_by_label("DELETE").last() {
+            Some(button) => button.click(),
+            None => panic!("no DELETE button in the comparison"),
+        }
+        for _ in 0..200 {
+            h.step();
+            if !target_file.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !target_file.exists(),
+            "the comparison's DELETE removed that side's file: {:?}",
+            h.state().error
+        );
+        assert!(h.state().inspect.is_none(), "acting closes the comparison");
+    }
+
+    /// Render snapshot of the side-by-side comparison to
+    /// `target/transfer_compare.png`.
+    #[test]
+    #[ignore = "renders a PNG for manual inspection"]
+    fn render_diff_compare() {
+        let (tmp, store) = sample_store();
+        std::fs::write(tmp.path().join("target/notes.txt"), b"a different version").expect("write");
+        for repo in ["source", "target"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &dedup_core::update::CancellationToken::new(),
+            )
+            .expect("scan test repo");
+        }
+        let mut h = diff_harness_over(Arc::clone(&store));
+        {
+            let view = h.state_mut();
+            view.pairing = dedup_core::diff::DiffPairing::ByPath;
+            view.diff_rows = dedup_core::diff::plan_repo_diff(
+                &store,
+                "source",
+                "target",
+                dedup_core::diff::DiffPairing::ByPath,
+            )
+            .expect("plan diff");
+        }
+        h.run();
+        h.get_by_label("COMPARE").click();
+        h.run();
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/transfer_compare.png");
+        let img = h.render().expect("wgpu render failed");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 
     /// Render snapshot of the DIFF board to `target/transfer_diff.png`.

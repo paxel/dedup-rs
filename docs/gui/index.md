@@ -1,15 +1,15 @@
 # GUI guide
 
-`dedup` with no arguments opens the desktop app: a single window with three tabs —
-[Repositories](repositories.md), [Duplicates](duplicates.md), and [Files](files.md) — plus a
-settings cog and an about button in the top-right.
+`dedup` with no arguments opens the desktop app: a single window with tabs for
+[Repositories](repositories.md), [Duplicates](duplicates.md), [Files](files.md) and
+[Sync Groups](sync-groups.md) — plus a settings cog and an about button in the top-right.
 
 Launch with `--ui-scale <0.5–3.0>` to scale the whole interface, e.g. `dedup --ui-scale 1.25`
 for a HiDPI display or a projector.
 
 ## Top bar
 
-The three tab buttons switch views; the current tab is highlighted. On the right:
+The tab buttons switch views; the current tab is highlighted. On the right:
 
 - **SETTINGS** (cog icon) opens the settings dialog below.
 - **ABOUT** shows the version, license, and contact info.
@@ -34,8 +34,7 @@ unlocking for deletion should be a fresh, conscious choice each session.
 
 ## What's not here
 
-The important-file scanner (`dedup scan`), the triage report (`dedup report`), and the
-disk-triage workflow (`dedup sanitize`, including flagging a repo as triage-done) are
+The important-file scanner (`dedup scan`) and the triage report (`dedup report`) are
 CLI-only today — there's no dedicated GUI tab for them yet.
 
 ## See also

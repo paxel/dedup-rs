@@ -17,6 +17,11 @@
 //! at a time with PREV/NEXT controls. Unchanged rows are the least interesting,
 //! so they are hidden by default behind a toggle. This module is presentation
 //! only.
+//!
+//! Per-row reject/apply controls are opt-in ([`RowControls`]): a caller that
+//! runs its plan all-or-nothing (the Sync Groups push) asks for a read-only
+//! board, because a reject toggle that the run ignores would promise to skip a
+//! deletion and then make it anyway.
 
 use crate::icon;
 use crate::theme;
@@ -123,6 +128,18 @@ pub enum ReviewAction {
     Apply(String),
 }
 
+/// Whether a board offers per-row controls.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowControls {
+    /// Each row can be rejected (RUN skips it) or applied on its own. Only
+    /// valid when the caller actually honors [`ReviewState::rejected`] and can
+    /// run a single row.
+    Enabled,
+    /// A read-only preview: the run is all-or-nothing, so offering a reject
+    /// toggle would promise something the caller cannot deliver.
+    ReadOnly,
+}
+
 /// Which column the table is sorted on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReviewCol {
@@ -193,8 +210,10 @@ pub fn table(
     totals: [usize; 3],
     source_header: &str,
     target_header: &str,
+    controls: RowControls,
 ) -> Option<ReviewAction> {
     summary(ui, totals, state.rejected.len());
+    let interactive = controls == RowControls::Enabled;
 
     // No target repo (PURGE and the other single-repo commands): the target
     // columns would be two empty columns, so they are left out — and the sort
@@ -288,9 +307,11 @@ pub fn table(
     let mut table = TableBuilder::new(ui)
         .striped(true)
         .resizable(true)
-        .cell_layout(Layout::left_to_right(Align::Center))
-        .column(Column::exact(76.0))
-        .column(Column::initial(120.0).at_least(90.0).clip(true));
+        .cell_layout(Layout::left_to_right(Align::Center));
+    if interactive {
+        table = table.column(Column::exact(76.0));
+    }
+    table = table.column(Column::initial(120.0).at_least(90.0).clip(true));
     if two_sided {
         table = table
             .column(
@@ -313,9 +334,11 @@ pub fn table(
     }
     table
         .header(24.0, |mut header| {
-            header.col(|ui| {
-                ui.label(RichText::new("REVIEW").color(theme::TEXT).size(12.0));
-            });
+            if interactive {
+                header.col(|ui| {
+                    ui.label(RichText::new("REVIEW").color(theme::TEXT).size(12.0));
+                });
+            }
             for &(col, title) in cols {
                 header.col(|ui| {
                     if crate::util::sort_header(ui, title, sort_col == col, sort_asc).clicked() {
@@ -329,46 +352,52 @@ pub fn table(
             body.rows(26.0, page_rows.len(), |mut row| {
                 let r = &rows[page_rows[row.index()]];
                 let key = r.key();
-                let rejected = state.rejected.contains(&key);
-                row.col(|ui| {
-                    if !r.is_actionable() {
-                        return;
-                    }
-                    // Reject toggle: red ✗, filled while the row is rejected.
-                    let x = egui::Button::new(RichText::new(icon::X).color(if rejected {
-                        theme::BLACK
-                    } else {
-                        theme::RED
-                    }))
-                    .small()
-                    .fill(if rejected { theme::RED } else { theme::PANEL });
-                    if ui
-                        .add(x)
-                        .on_hover_text(if rejected {
-                            "Restore this action (it runs again with RUN)"
+                let rejected = interactive && state.rejected.contains(&key);
+                if interactive {
+                    row.col(|ui| {
+                        if !r.is_actionable() {
+                            return;
+                        }
+                        // Reject toggle: red ✗, filled while the row is rejected.
+                        let x = egui::Button::new(RichText::new(icon::X).color(if rejected {
+                            theme::BLACK
                         } else {
-                            "Reject this action — RUN will skip it"
-                        })
-                        .clicked()
-                    {
-                        toggle_reject = Some(key.clone());
-                    }
-                    // Apply: execute just this row, right now.
-                    if !rejected
-                        && ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(icon::ARROW_RIGHT).color(theme::GREEN),
-                                )
-                                .small()
-                                .fill(theme::PANEL),
-                            )
-                            .on_hover_text("Apply only this action, immediately")
+                            theme::RED
+                        }))
+                        .small()
+                        .fill(if rejected {
+                            theme::RED
+                        } else {
+                            theme::PANEL
+                        });
+                        if ui
+                            .add(x)
+                            .on_hover_text(if rejected {
+                                "Restore this action (it runs again with RUN)"
+                            } else {
+                                "Reject this action — RUN will skip it"
+                            })
                             .clicked()
-                    {
-                        action = Some(ReviewAction::Apply(key.clone()));
-                    }
-                });
+                        {
+                            toggle_reject = Some(key.clone());
+                        }
+                        // Apply: execute just this row, right now.
+                        if !rejected
+                            && ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(icon::ARROW_RIGHT).color(theme::GREEN),
+                                    )
+                                    .small()
+                                    .fill(theme::PANEL),
+                                )
+                                .on_hover_text("Apply only this action, immediately")
+                                .clicked()
+                        {
+                            action = Some(ReviewAction::Apply(key.clone()));
+                        }
+                    });
+                }
                 row.col(|ui| status_cell(ui, r.source, rejected));
                 row.col(|ui| path_cell(ui, r.source, &r.source_path, rejected));
                 if two_sided {

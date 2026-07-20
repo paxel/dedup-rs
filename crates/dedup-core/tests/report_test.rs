@@ -33,6 +33,5 @@ fn report_aggregates_stats_dupes_and_flags() -> TestResult {
             .any(|(c, n)| *c == Category::Wallet && *n == 1),
         "wallet.dat is flagged"
     );
-    assert_eq!(r.triage_done_ms, 0, "not triaged yet");
     Ok(())
 }

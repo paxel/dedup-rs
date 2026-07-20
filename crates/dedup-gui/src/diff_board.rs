@@ -112,6 +112,8 @@ pub enum BoardAction {
         on_left: bool,
         rel_paths: Vec<String>,
     },
+    /// Not a file operation: open the two versions side by side.
+    Inspect { left_rel: String, right_rel: String },
     /// Not a file operation: a row's button needs a follow-up answer first.
     OpenPopup { on_left: bool, kind: PopupKind },
 }
@@ -595,9 +597,19 @@ fn side_actions(ui: &mut egui::Ui, row: &RepoDiffRow, on_left: bool) -> Option<B
                 }
             }
             DiffRelation::Conflict => {
-                // Same name, different content: push this version across, or
-                // drop it.
+                // Same name, different content: look at both, push this
+                // version across, or drop it.
                 if let (Some(mine), Some(theirs)) = (here.first(), there.first()) {
+                    if on_left
+                        && button(ui, "COMPARE", theme::LILAC)
+                            .on_hover_text("Show both versions side by side")
+                            .clicked()
+                    {
+                        action = Some(BoardAction::Inspect {
+                            left_rel: mine.rel_path.clone(),
+                            right_rel: theirs.rel_path.clone(),
+                        });
+                    }
                     if button(ui, "OVERWRITE", theme::TAN)
                         .on_hover_text("Replace the other repository's file with this one")
                         .clicked()

@@ -10,6 +10,7 @@ pub fn help_text(tab: Tab) -> &'static str {
         Tab::Duplicates => DUPLICATES,
         Tab::Transfer => TRANSFER,
         Tab::Grooming => GROOMING,
+        Tab::SyncGroups => SYNC_GROUPS,
         Tab::Browse => BROWSE,
     }
 }
@@ -24,7 +25,7 @@ run UPDATE ALL so the indexes match the disk again — repositories that are alr
 date finish almost instantly. REFRESH STATUS re-checks each repository's reachability and \
 whether it needs an update, without changing anything.
 
-Each card shows FILES, SIZE, MISSING, SCANNED, and (once triage-done) TRIAGED stats, plus \
+Each card shows FILES, SIZE, MISSING and SCANNED stats, plus \
 status pills: LOCAL / REMOTE / OFFLINE / MISSING for reachability, and UP TO DATE / UPDATE \
 REQUIRED from the last CHECK.
 
@@ -71,13 +72,35 @@ you can settle with a rename; PAIR BY PATH matches by name and folder, so the sa
 holding different content shows up as a conflict. Each row offers what makes sense for it — \
 copy the file across, delete it, rename one side to the other's name, or overwrite one side \
 with the other — and a side holding several copies of the same content is narrowed down \
-first with DELETE ALL or KEEP 1. Nothing happens until you click a row's button; rows that \
-are equal on both sides are hidden until you ask for them.
+first with DELETE ALL or KEEP 1. A conflicting row also offers COMPARE, which shows both \
+versions side by side with a preview, their size, date and type — the larger and newer \
+values highlighted — and the same actions per side. Nothing happens until you click a row's \
+button; rows that are equal on both sides are hidden until you ask for them.
 
 Use the FILTER wizard below to narrow which files are considered — conditions combine with \
 AND. PREVIEW shows the matching transfers, paged, plus a total count, without touching \
 disk. RUN asks for confirmation, then performs the transfer while you watch its progress — \
 CANCEL stops it at any point.";
+
+const SYNC_GROUPS: &str = "\
+Keep one repository backed up to one or more others, without the manual duplicate-and-\
+relocate dance.
+
+A sync group is a MAIN repository plus the SINKS it is pushed to. Create a group around \
+the repo you want backed up, then add each backup location as a sink — a repository \
+belongs to at most one group, and while it is in one it cannot be renamed or removed by \
+accident.
+
+The group's mode decides what a push does. ADD ONLY copies content a sink lacks and never \
+deletes anything, so a sink may keep files the main no longer has. MIRROR also deletes \
+sink content the main does not have, so each sink ends up holding exactly the main's \
+content — those deletions cannot be undone.
+
+PREVIEW plans every sink and shows what would be copied and deleted without touching disk; \
+RUN SYNC asks for confirmation and then pushes on a background thread. Each sink is handled \
+independently, so one unreachable backup drive does not stop the others, and the main is \
+never changed. To bring changes made inside a sink back to the main, use the Transfer tab's \
+DIFF command with the sink and the main.";
 
 const GROOMING: &str = "\
 Prune and reorganize a single repository. Pick a command from the bar at the top; each has \

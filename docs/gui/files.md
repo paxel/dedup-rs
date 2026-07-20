@@ -13,7 +13,7 @@ equivalent of [`diff cp`/`mv`/`rm`](../cli.md#diff).
   DELETE, the reference whose known content makes source files deletable.
 - **ALSO REF** — optional extra reference repositories. A source file counts as new only when
   **none** of the target or these extra references already has its content — this is what
-  makes multi-disk triage correct (unique against the sanitized dir *and* every
+  makes multi-disk triage correct (unique against the destination repo *and* every
   already-processed disk, not just one).
 
 ## Command
@@ -65,8 +65,15 @@ target (right) repo, with each side's path, size and modification date in sortab
   **RENAME** on either side (renaming that side to the other's name); content only one side
   has offers **COPY** on the side that lacks it and **DELETE** on the side that has it.
 - **BY PATH** — files are matched by their path inside the repo. Same path with the same
-  content is *equal*; same path with different content is a conflict, offering **OVERWRITE**
-  (replace the other side's file with this one) and **DELETE** per side.
+  content is *equal*; same path with different content is a conflict, offering **COMPARE**,
+  **OVERWRITE** (replace the other side's file with this one) and **DELETE** per side.
+
+**COMPARE** opens the two versions side by side over the whole window: each side shows a
+preview appropriate to the file (image, or a still for video), the repo it lives in, and its
+size, modification date and type — with the larger size and the newer date highlighted, so
+which is which is obvious at a glance. The same OVERWRITE OTHER / DELETE actions are
+available per side inside the comparison, so the decision is made where it is being judged.
+`Esc` or **CLOSE** leaves without changing anything.
 
 When one side holds the same content under several names, that side is narrowed down first:
 **DELETE ALL** drops every copy (after confirming) and **KEEP 1** asks which copy to keep and
