@@ -32,6 +32,7 @@ pub(crate) enum Tab {
     Duplicates,
     Transfer,
     Grooming,
+    SyncGroups,
     Browse,
 }
 
@@ -159,6 +160,12 @@ pub struct DedupApp {
     dupes: DupesView,
     transfer: TransferView,
     grooming: GroomingView,
+    sync_groups: crate::sync_view::SyncView,
+    /// Sync groups as of the last reload: the Repositories list collapses a
+    /// group's sinks under its main.
+    groups: Vec<(String, dedup_core::store::SyncGroup)>,
+    /// Mains whose sinks are currently expanded in the repo list.
+    expanded_mains: std::collections::HashSet<String>,
     browse: crate::browse_view::BrowseView,
     /// Last settings written to disk, to avoid rewriting an unchanged file.
     saved_settings: crate::settings::Settings,
@@ -199,6 +206,9 @@ impl DedupApp {
             dupes: DupesView::new(),
             transfer: TransferView::new(),
             grooming: GroomingView::new(),
+            sync_groups: crate::sync_view::SyncView::new(),
+            groups: Vec::new(),
+            expanded_mains: std::collections::HashSet::new(),
             browse: crate::browse_view::BrowseView::new(),
             saved_settings: crate::settings::Settings::default(),
             window_size: None,
@@ -272,6 +282,7 @@ impl DedupApp {
                     });
                 }
                 self.repos = rows;
+                self.groups = self.store.list_sync_groups().unwrap_or_default();
                 self.load_error = None;
                 self.notice = None;
                 // The repo set may have changed (add/remove/rename/relocate);
@@ -722,6 +733,7 @@ impl eframe::App for DedupApp {
                 Tab::Duplicates => self.dupes.sync_repos(&self.store),
                 Tab::Transfer => self.transfer.sync_repos(&self.store),
                 Tab::Grooming => self.grooming.sync_repos(&self.store),
+                Tab::SyncGroups => self.sync_groups.sync_repos(&self.store),
                 Tab::Browse => self.browse.sync_repos(&self.store),
             }
             self.synced_tab = Some(self.tab);
@@ -734,6 +746,9 @@ impl eframe::App for DedupApp {
                     .show(ui, &self.store, self.tooltip_verbosity, Some(frame))
             }
             Tab::Grooming => self.grooming.show(ui, &self.store, self.tooltip_verbosity),
+            Tab::SyncGroups => self
+                .sync_groups
+                .show(ui, &self.store, self.tooltip_verbosity),
             Tab::Browse => self.browse.show(ui, &self.store, self.tooltip_verbosity),
         });
         if self.show_settings {
@@ -908,6 +923,15 @@ impl DedupApp {
                                     tab_button(
                                         ui,
                                         &mut self.tab,
+                                        Tab::SyncGroups,
+                                        "SYNC GROUPS",
+                                        theme::GREEN,
+                                        self.tooltip_verbosity,
+                                        "Keep a repository backed up to one or more remote copies",
+                                    );
+                                    tab_button(
+                                        ui,
+                                        &mut self.tab,
                                         Tab::Browse,
                                         "BROWSE",
                                         theme::AMBER,
@@ -1021,9 +1045,78 @@ impl DedupApp {
                     ui.colored_label(theme::TEXT, "No repositories yet — use ADD REPOSITORY.");
                 }
                 for row in &rows {
+                    // A sink is shown under its main, not as a top-level repo.
+                    if self.sink_of(&row.name).is_some() {
+                        continue;
+                    }
                     self.repo_card(ui, row, actions);
+                    self.sink_rows(ui, &row.name, &rows, actions);
                 }
             });
+    }
+
+    /// The group a repo is a *sink* of, if any (a main is never collapsed).
+    fn sink_of(&self, repo: &str) -> Option<&(String, dedup_core::store::SyncGroup)> {
+        self.groups
+            .iter()
+            .find(|(_, g)| g.sinks.iter().any(|s| s == repo))
+    }
+
+    /// After a main's card: a chevron summarising its sinks, and — while
+    /// expanded — the sinks' own cards. Collapsed by default, so a group reads
+    /// as one repository with backups rather than several unrelated repos.
+    fn sink_rows(
+        &mut self,
+        ui: &mut egui::Ui,
+        main: &str,
+        rows: &[RepoRow],
+        actions: &mut Vec<Action>,
+    ) {
+        let Some((group_name, group)) = self
+            .groups
+            .iter()
+            .find(|(_, g)| g.main == main)
+            .map(|(n, g)| (n.clone(), g.clone()))
+        else {
+            return;
+        };
+        if group.sinks.is_empty() {
+            return;
+        }
+        let expanded = self.expanded_mains.contains(main);
+        let chevron = if expanded {
+            icon::CARET_DOWN
+        } else {
+            icon::CARET_RIGHT
+        };
+        let label = format!("{chevron} {} SINK(S) IN '{group_name}'", group.sinks.len());
+        ui.horizontal(|ui| {
+            ui.add_space(16.0);
+            if crate::lcars::action_button(ui, &label, true, theme::GREEN)
+                .explain(
+                    self.tooltip_verbosity,
+                    "Show the repositories this one is backed up to",
+                    "This repository is the main of a sync group. Its sinks — the copies it \
+                     is pushed to — are folded away here so the list stays about your \
+                     originals; expand to manage them like any other repository.",
+                )
+                .clicked()
+            {
+                if expanded {
+                    self.expanded_mains.remove(main);
+                } else {
+                    self.expanded_mains.insert(main.to_string());
+                }
+            }
+        });
+        if !expanded {
+            return;
+        }
+        for sink in &group.sinks {
+            if let Some(row) = rows.iter().find(|r| &r.name == sink) {
+                self.repo_card(ui, row, actions);
+            }
+        }
     }
 
     fn repo_card(&mut self, ui: &mut egui::Ui, row: &RepoRow, actions: &mut Vec<Action>) {
@@ -1124,19 +1217,6 @@ impl DedupApp {
                          repository. \"never\" means it hasn't been scanned yet.",
                         self.tooltip_verbosity,
                     );
-                    if row.stats.triage_done_ms > 0 {
-                        stat(
-                            ui,
-                            "TRIAGED",
-                            &format_last_scan(row.stats.triage_done_ms),
-                            theme::BLUE,
-                            "This repo's unique content was copied into a sanitized dir",
-                            "This repository was marked triage-done: its unique content was \
-                             already copied into a sanitized directory (via the `dedup \
-                             sanitize` command), so it's safe to consider fully processed.",
-                            self.tooltip_verbosity,
-                        );
-                    }
                 });
 
                 match tracked {
@@ -1788,6 +1868,7 @@ impl DedupApp {
             Tab::Duplicates => "DUPLICATES",
             Tab::Transfer => "TRANSFER",
             Tab::Grooming => "GROOMING",
+            Tab::SyncGroups => "SYNC GROUPS",
             Tab::Browse => "BROWSE",
         };
         let text = crate::help_content::help_text(self.tab);
@@ -2209,6 +2290,67 @@ mod ui_tests {
             update_repo(&store, name, 1, &NoProgress, &CancellationToken::new()).unwrap();
         }
         (tmp, DedupApp::new(store))
+    }
+
+    /// A sync group's sinks are folded away under their main in the repo list —
+    /// the list is about your originals — and the chevron brings them back.
+    #[test]
+    fn sink_repos_are_collapsed_under_their_main() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, mut app) = sample_app();
+        app.store
+            .create_sync_group(
+                "offsite",
+                "Automatic Upload",
+                dedup_core::store::SyncMode::AddOnly,
+            )
+            .expect("create group");
+        app.store
+            .add_sync_sink("offsite", "Videos")
+            .expect("add sink");
+        app.reload_all();
+
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 900.0))
+            .build_ui_state(
+                move |ui, app: &mut DedupApp| {
+                    if !init {
+                        icon::install(ui.ctx());
+                        theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let mut actions = Vec::new();
+                    app.repositories_view(ui, &mut actions);
+                },
+                app,
+            );
+        harness.run();
+        assert!(
+            harness
+                .query_by_label_contains("Automatic Upload")
+                .is_some(),
+            "the main is listed"
+        );
+        assert!(
+            harness.query_all_by_label_contains("Videos").count() == 0,
+            "its sink is folded away"
+        );
+        assert!(
+            harness
+                .query_by_label_contains("SINK(S) IN 'offsite'")
+                .is_some(),
+            "a chevron summarises the folded sinks"
+        );
+
+        harness
+            .get_by_label_contains("SINK(S) IN 'offsite'")
+            .click();
+        harness.run();
+        assert!(
+            harness.query_all_by_label_contains("Videos").count() > 0,
+            "expanding shows the sink's own card"
+        );
     }
 
     /// The DUPLICATE editor offers a folder picker (CHOOSE…), like RELOCATE and

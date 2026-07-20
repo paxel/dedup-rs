@@ -19,7 +19,6 @@ dedup repo update photos
 - [`report` — Markdown triage report](#report)
 - [`scan` — flag critical files](#scan)
 - [`archive` — index and check archive redundancy](#archive)
-- [`sanitize` — one-shot disk triage](#sanitize)
 - [Filter syntax](#filter-syntax)
 
 ---
@@ -156,30 +155,6 @@ content identity (size + BLAKE3) — opt-in and expensive, since it reads every 
 exist as loose content in the repo itself and any `--ref` repos; an archive at 100% coverage
 is fully redundant and safe to delete. `--redundant-only` lists just those. Nested archives
 are treated as opaque members (one level deep); encrypted or unreadable archives are skipped.
-
----
-
-## `sanitize`
-
-```
-dedup sanitize <source> <sanitized> [--ref <repo>...] [-i/--into <rel>] [--move-files] [--no-scan] [-f filter]
-```
-
-The one-shot disk-inheritance workflow, combining `repo update` + `diff cp` + marking done:
-
-1. Scans `source` (skip with `--no-scan` to reuse its existing index) — with the same live
-   progress bar as `repo update`, since a whole-disk scan can run for hours.
-2. Copies (or with `--move-files`, moves) the content that's unique against `sanitized` *and*
-   every extra `--ref` repo into `sanitized`.
-3. Marks `source` triage-done (a timestamp recorded in its index, shown as a `TRIAGED` stat
-   in the GUI's Repository Management tab).
-
-```
-dedup sanitize disk3 sanitized --ref disk1 --ref disk2
-```
-
-If the run is cancelled partway, `source` is **not** marked triage-done — only a completed
-copy earns that mark.
 
 ---
 

@@ -3,6 +3,8 @@
 
 mod app;
 mod browse_view;
+mod diff_board;
+mod diff_inspect;
 mod dupes_view;
 mod external;
 mod filter_ui;
@@ -18,6 +20,7 @@ mod repo_chip;
 mod review;
 mod settings;
 mod status;
+mod sync_view;
 mod theme;
 mod thumbs;
 mod transfer_view;

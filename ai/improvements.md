@@ -40,7 +40,6 @@
   - you can diff by path, if both exist and have equal hash: grey (default is hide equals completely), otherwise we need to have some lightbox where we can display all the details of both files depending on their types. in the lightbox and in the table view we need the options to delete, rename or overwrite with other side is needed for both sides.
     - if one side is missing the copy and delete buttons as in the hash based diff is required
 - we could also think about having size and modified date in the table.
-- btw whenever we copy or move files from one to the other repo we must set the dates of the files to those of the source in the filesystem. otherwise we will have to scan them next time!
 
 
 

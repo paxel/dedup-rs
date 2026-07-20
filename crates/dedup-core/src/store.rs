@@ -22,6 +22,10 @@ const ENTRY_VERSION: u8 = 8;
 
 // Registry table definition
 const REPOS: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("repos");
+/// Registry table of sync groups: group name → postcard-encoded [`SyncGroup`].
+/// Added after the first release, so a registry written before it simply has
+/// no such table and reads back as "no groups".
+const SYNC_GROUPS: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("sync_groups");
 
 // Repo-specific table definitions
 const FILES: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("files");
@@ -85,6 +89,21 @@ pub enum StoreError {
 
     #[error("Repository '{0}' is in use by another operation")]
     Busy(String),
+
+    #[error("Sync group '{0}' already exists")]
+    GroupExists(String),
+
+    #[error("Sync group '{0}' not found")]
+    GroupNotFound(String),
+
+    #[error("Repository '{repo}' is already in sync group '{group}'")]
+    AlreadyGrouped { repo: String, group: String },
+
+    #[error("Repository '{repo}' belongs to sync group '{group}' — take it out of the group first")]
+    InSyncGroup { repo: String, group: String },
+
+    #[error("Repository '{repo}' is not a member of sync group '{group}'")]
+    NotInGroup { repo: String, group: String },
 }
 
 impl From<redb::Error> for StoreError {
@@ -135,6 +154,37 @@ pub struct RepoMeta {
     pub created: u64,
     pub hash_algo: String,
     pub schema_ver: u8,
+}
+
+/// How a sync group pushes its main repo out to its sinks.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SyncMode {
+    /// Copy content the sink lacks; never delete anything in the sink.
+    #[default]
+    AddOnly,
+    /// Copy what the sink lacks *and* delete what the main no longer has, so
+    /// the sink ends up holding exactly the main's content.
+    Mirror,
+}
+
+/// One backup group: a **main** repository plus the remote **sinks** it is
+/// pushed to. A repository belongs to at most one group.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SyncGroup {
+    pub main: String,
+    pub sinks: Vec<String>,
+    pub mode: SyncMode,
+}
+
+impl SyncGroup {
+    /// The main repo and its sinks, in display order.
+    pub fn members(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.main.as_str()).chain(self.sinks.iter().map(String::as_str))
+    }
+
+    pub fn has_member(&self, repo: &str) -> bool {
+        self.members().any(|m| m == repo)
+    }
 }
 
 /// 512-bit perceptual image hash; see `fingerprint::image_hash`.
@@ -261,9 +311,6 @@ pub struct RepoStats {
     pub missing_count: u64,
     /// Epoch milliseconds of the last completed scan; 0 if never scanned.
     pub last_scan_ms: u64,
-    /// Epoch milliseconds when this repo was marked triage-done (its unique
-    /// content copied into a sanitized dir); 0 if not yet done.
-    pub triage_done_ms: u64,
 }
 
 pub type DuplicateGroup = (u64, [u8; 32], Vec<String>);
@@ -487,6 +534,7 @@ impl Store {
         let write_txn = registry.begin_write()?;
         {
             let _table = write_txn.open_table(REPOS)?;
+            let _groups = write_txn.open_table(SYNC_GROUPS)?;
         }
         write_txn.commit()?;
 
@@ -665,7 +713,6 @@ impl Store {
                 total_size: 0,
                 missing_count: 0,
                 last_scan_ms: 0,
-                triage_done_ms: 0,
             });
         }
 
@@ -682,29 +729,7 @@ impl Store {
             total_size: get("total_size")?,
             missing_count: get("missing_count")?,
             last_scan_ms: get("last_scan_ms")?,
-            triage_done_ms: get("triage_done_ms")?,
         })
-    }
-
-    /// Mark a repo triage-done now (or clear it with `done == false`). Records an
-    /// epoch-millisecond timestamp in the repo's `META` table.
-    pub fn set_triage_done(&self, name: &str, done: bool) -> Result<(), StoreError> {
-        let db = self.open_repo_db(name)?;
-        let ms = if done {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64
-        } else {
-            0
-        };
-        let write_txn = db.begin_write()?;
-        {
-            let mut meta = write_txn.open_table(META)?;
-            meta.insert("triage_done_ms", ms)?;
-        }
-        write_txn.commit()?;
-        Ok(())
     }
 
     /// MIME-type distribution for a repo (`mime → count`), sorted by count
@@ -727,7 +752,157 @@ impl Store {
         Ok(stats)
     }
 
+    // --- sync groups ------------------------------------------------------
+
+    /// Every sync group, by name, in registry order. A registry written before
+    /// sync groups existed simply has no such table and reports none.
+    pub fn list_sync_groups(&self) -> Result<Vec<(String, SyncGroup)>, StoreError> {
+        let read_txn = self.registry.begin_read()?;
+        let table = match read_txn.open_table(SYNC_GROUPS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut groups = Vec::new();
+        for item in table.iter()? {
+            let (name_guard, val_guard) = item?;
+            let group: SyncGroup = deserialize_value(SCHEMA_VERSION, val_guard.value())?;
+            groups.push((name_guard.value().to_string(), group));
+        }
+        Ok(groups)
+    }
+
+    pub fn get_sync_group(&self, name: &str) -> Result<SyncGroup, StoreError> {
+        self.list_sync_groups()?
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, group)| group)
+            .ok_or_else(|| StoreError::GroupNotFound(name.to_string()))
+    }
+
+    /// The group a repository belongs to, if any — the lookup the repo lists
+    /// use to collapse sinks under their main.
+    pub fn sync_group_of(&self, repo: &str) -> Result<Option<(String, SyncGroup)>, StoreError> {
+        Ok(self
+            .list_sync_groups()?
+            .into_iter()
+            .find(|(_, group)| group.has_member(repo)))
+    }
+
+    /// Create a group around `main`. The repo must exist and must not already
+    /// belong to another group.
+    pub fn create_sync_group(
+        &self,
+        name: &str,
+        main: &str,
+        mode: SyncMode,
+    ) -> Result<(), StoreError> {
+        if self.list_sync_groups()?.iter().any(|(n, _)| n == name) {
+            return Err(StoreError::GroupExists(name.to_string()));
+        }
+        self.get_repo(main)?;
+        self.reject_if_grouped(main)?;
+        self.put_sync_group(
+            name,
+            &SyncGroup {
+                main: main.to_string(),
+                sinks: Vec::new(),
+                mode,
+            },
+        )
+    }
+
+    pub fn delete_sync_group(&self, name: &str) -> Result<(), StoreError> {
+        let write_txn = self.registry.begin_write()?;
+        {
+            let mut table = write_txn.open_table(SYNC_GROUPS)?;
+            if table.remove(name)?.is_none() {
+                return Err(StoreError::GroupNotFound(name.to_string()));
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Add an existing repository to a group as a sink.
+    pub fn add_sync_sink(&self, group_name: &str, repo: &str) -> Result<(), StoreError> {
+        let mut group = self.get_sync_group(group_name)?;
+        self.get_repo(repo)?;
+        self.reject_if_grouped(repo)?;
+        group.sinks.push(repo.to_string());
+        self.put_sync_group(group_name, &group)
+    }
+
+    /// Take a sink out of its group. The main cannot be removed this way —
+    /// promote another member first, or delete the group.
+    pub fn remove_sync_sink(&self, group_name: &str, repo: &str) -> Result<(), StoreError> {
+        let mut group = self.get_sync_group(group_name)?;
+        if group.main == repo || !group.sinks.iter().any(|s| s == repo) {
+            return Err(StoreError::NotInGroup {
+                repo: repo.to_string(),
+                group: group_name.to_string(),
+            });
+        }
+        group.sinks.retain(|s| s != repo);
+        self.put_sync_group(group_name, &group)
+    }
+
+    /// Promote a member to main; the previous main becomes a sink, so nothing
+    /// leaves the group by switching which way it is pushed.
+    pub fn set_sync_main(&self, group_name: &str, repo: &str) -> Result<(), StoreError> {
+        let mut group = self.get_sync_group(group_name)?;
+        if group.main == repo {
+            return Ok(());
+        }
+        if !group.sinks.iter().any(|s| s == repo) {
+            return Err(StoreError::NotInGroup {
+                repo: repo.to_string(),
+                group: group_name.to_string(),
+            });
+        }
+        group.sinks.retain(|s| s != repo);
+        group
+            .sinks
+            .push(std::mem::replace(&mut group.main, repo.to_string()));
+        self.put_sync_group(group_name, &group)
+    }
+
+    pub fn set_sync_mode(&self, group_name: &str, mode: SyncMode) -> Result<(), StoreError> {
+        let mut group = self.get_sync_group(group_name)?;
+        group.mode = mode;
+        self.put_sync_group(group_name, &group)
+    }
+
+    /// Refuse to touch a repo that is spoken for by a group.
+    fn reject_if_grouped(&self, repo: &str) -> Result<(), StoreError> {
+        match self.sync_group_of(repo)? {
+            Some((group, _)) => Err(StoreError::AlreadyGrouped {
+                repo: repo.to_string(),
+                group,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    fn put_sync_group(&self, name: &str, group: &SyncGroup) -> Result<(), StoreError> {
+        let bytes = serialize_value(SCHEMA_VERSION, group)?;
+        let write_txn = self.registry.begin_write()?;
+        {
+            let mut table = write_txn.open_table(SYNC_GROUPS)?;
+            table.insert(name, bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     pub fn remove_repo(&self, name: &str) -> Result<(), StoreError> {
+        // A repo a sync group is built on must not vanish under it.
+        if let Some((group, _)) = self.sync_group_of(name)? {
+            return Err(StoreError::InSyncGroup {
+                repo: name.to_string(),
+                group,
+            });
+        }
         // Frozen across the registry removal and the directory delete so no
         // thread can re-open the index mid-removal (without blocking access
         // to other repos while the delete runs).
@@ -753,6 +928,14 @@ impl Store {
     pub fn rename_repo(&self, name: &str, new_name: &str) -> Result<(), StoreError> {
         if name == new_name {
             return Err(StoreError::AlreadyExists(new_name.to_string()));
+        }
+        // Group membership is by name, so a member cannot be renamed out from
+        // under its group.
+        if let Some((group, _)) = self.sync_group_of(name)? {
+            return Err(StoreError::InSyncGroup {
+                repo: name.to_string(),
+                group,
+            });
         }
         // Both names frozen across the registry update and the directory
         // rename: nobody may re-open the old index mid-rename, and nobody may

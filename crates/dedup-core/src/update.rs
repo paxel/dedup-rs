@@ -470,6 +470,19 @@ fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
     Ok(*hasher.finalize().as_bytes())
 }
 
+/// Give `to` the modification time of `from`.
+///
+/// `std::fs::copy` does not carry timestamps over, so a copied file would
+/// otherwise get a fresh mtime — losing the date the whole timeline/date
+/// machinery relies on, and making the copy look changed against its source.
+pub(crate) fn copy_mtime(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    let modified = std::fs::metadata(from)?.modified()?;
+    std::fs::File::options()
+        .write(true)
+        .open(to)?
+        .set_modified(modified)
+}
+
 pub(crate) fn system_time_to_ms(time: std::time::SystemTime) -> i64 {
     match time.duration_since(std::time::UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),

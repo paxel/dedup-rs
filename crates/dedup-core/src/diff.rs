@@ -885,7 +885,8 @@ fn sync_copy(
         });
         return Ok(false);
     }
-    if let Err(err) = std::fs::copy(source_root.join(rel_path), &target_file) {
+    let source_file = source_root.join(rel_path);
+    if let Err(err) = std::fs::copy(&source_file, &target_file) {
         stats.errors += 1;
         run.progress.on(DiffEvent::Error {
             path: target_file.to_string_lossy().into_owned(),
@@ -893,6 +894,8 @@ fn sync_copy(
         });
         return Ok(false);
     }
+    // Best effort, before the entry below reads the mtime back off disk.
+    let _ = crate::update::copy_mtime(&source_file, &target_file);
     stats.copied += 1;
 
     // Index the copy with the mtime the file actually has on the target so
@@ -994,12 +997,18 @@ fn transfer_file(from: &Path, to: &Path, move_file: bool) -> Result<(), DiffErro
     };
     if move_file {
         if std::fs::rename(from, to).is_err() {
-            // Cross-device move: copy, then remove the source.
+            // Cross-device move: copy, then remove the source. (A plain rename
+            // keeps the timestamps; a copy does not, hence `copy_mtime`.)
             std::fs::copy(from, to).map_err(|e| io_err("move", e))?;
+            // Best effort: a filesystem that refuses the timestamp must not
+            // fail an otherwise-complete transfer — the index records the
+            // file's real on-disk mtime either way.
+            let _ = crate::update::copy_mtime(from, to);
             std::fs::remove_file(from).map_err(|e| io_err("move", e))?;
         }
     } else {
         std::fs::copy(from, to).map_err(|e| io_err("copy", e))?;
+        let _ = crate::update::copy_mtime(from, to);
     }
     Ok(())
 }
@@ -1150,5 +1159,415 @@ fn flush_moved(source_db: &redb::Database, moved: &mut Vec<String>) -> Result<()
         store::mark_missing(source_db, moved.iter().map(String::as_str))?;
         moved.clear();
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Manual two-repo diff (the Transfer tab's DIFF command)
+// ---------------------------------------------------------------------------
+
+/// How a manual two-repo diff pairs the two sides' files up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffPairing {
+    /// Pair by content identity (size + BLAKE3 hash) — paths never matter, so
+    /// the same photo under two names is one row.
+    ByHash,
+    /// Pair by repo-relative path — the same name on both sides is one row,
+    /// even when the contents differ.
+    ByPath,
+}
+
+/// One file on one side of a [`RepoDiffRow`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffFile {
+    pub rel_path: String,
+    pub size: u64,
+    pub modified_ms: i64,
+}
+
+/// What the two sides of a [`RepoDiffRow`] say about each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffRelation {
+    /// Both sides hold this file, under the same name(s): nothing to do.
+    Equal,
+    /// Both sides hold the same content under different names (hash pairing) —
+    /// resolved by renaming one side to the other's name.
+    Renamed,
+    /// Both sides hold different content under the same name (path pairing) —
+    /// resolved by overwriting one side with the other, or deleting one.
+    Conflict,
+    /// Only the left side has it: copy it right, or delete it left.
+    OnlyLeft,
+    /// Only the right side has it: copy it left, or delete it right.
+    OnlyRight,
+}
+
+/// One row of a manual two-repo diff: everything each side holds for one
+/// pairing key. With [`DiffPairing::ByHash`] a side can hold the same content
+/// under several names (all listed, so the UI can narrow them down); with
+/// [`DiffPairing::ByPath`] a side holds at most one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoDiffRow {
+    pub relation: DiffRelation,
+    pub left: Vec<DiffFile>,
+    pub right: Vec<DiffFile>,
+}
+
+impl RepoDiffRow {
+    /// The row's sort key: the first path either side offers.
+    fn sort_key(&self) -> &str {
+        self.left
+            .first()
+            .or_else(|| self.right.first())
+            .map(|f| f.rel_path.as_str())
+            .unwrap_or_default()
+    }
+}
+
+/// Compare two repos file by file, in one pass over each index, and return the
+/// rows a manual diff shows — both directions at once, ordered by path.
+///
+/// Missing entries are ignored: the diff describes what is on disk right now.
+/// Equal rows are included (the UI hides them by default) so the caller can
+/// report true totals.
+pub fn plan_repo_diff(
+    store: &Store,
+    left: &str,
+    right: &str,
+    pairing: DiffPairing,
+) -> Result<Vec<RepoDiffRow>, DiffError> {
+    let left_repo = open_repo(store, left)?;
+    let right_repo = open_repo(store, right)?;
+    let mut rows = match pairing {
+        DiffPairing::ByHash => rows_by_hash(&left_repo.db, &right_repo.db)?,
+        DiffPairing::ByPath => rows_by_path(&left_repo.db, &right_repo.db)?,
+    };
+    rows.sort_by(|a, b| {
+        a.sort_key()
+            .to_lowercase()
+            .cmp(&b.sort_key().to_lowercase())
+            .then_with(|| a.sort_key().cmp(b.sort_key()))
+    });
+    Ok(rows)
+}
+
+/// Collect one repo's live files, keyed by content, as diff-ready files.
+fn live_files_by_content(
+    db: &redb::Database,
+) -> Result<HashMap<ContentKey, Vec<DiffFile>>, StoreError> {
+    let mut by_content: HashMap<ContentKey, Vec<DiffFile>> = HashMap::new();
+    store::for_each_file_entry(db, |rel_path, entry| {
+        if !entry.missing {
+            by_content
+                .entry((entry.size, entry.hash))
+                .or_default()
+                .push(DiffFile {
+                    rel_path: rel_path.to_string(),
+                    size: entry.size,
+                    modified_ms: entry.modified_ms,
+                });
+        }
+        Ok(())
+    })?;
+    for paths in by_content.values_mut() {
+        paths.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    }
+    Ok(by_content)
+}
+
+/// Pair by content: one row per content key either side holds.
+fn rows_by_hash(
+    left_db: &redb::Database,
+    right_db: &redb::Database,
+) -> Result<Vec<RepoDiffRow>, StoreError> {
+    let mut left = live_files_by_content(left_db)?;
+    let right = live_files_by_content(right_db)?;
+    let mut rows = Vec::new();
+    for (key, right_files) in right {
+        let left_files = left.remove(&key).unwrap_or_default();
+        rows.push(hash_row(left_files, right_files));
+    }
+    // Whatever the right side never had is left-only.
+    for (_, left_files) in left {
+        rows.push(hash_row(left_files, Vec::new()));
+    }
+    Ok(rows)
+}
+
+/// Classify one content key's two path lists.
+fn hash_row(left: Vec<DiffFile>, right: Vec<DiffFile>) -> RepoDiffRow {
+    let relation = match (left.is_empty(), right.is_empty()) {
+        (false, true) => DiffRelation::OnlyLeft,
+        (true, false) => DiffRelation::OnlyRight,
+        // Identical name(s) on both sides: there is nothing left to reconcile.
+        // Any difference (a rename, or a duplicate on one side) is a Renamed
+        // row the UI narrows down action by action.
+        _ if left
+            .iter()
+            .map(|f| &f.rel_path)
+            .eq(right.iter().map(|f| &f.rel_path)) =>
+        {
+            DiffRelation::Equal
+        }
+        _ => DiffRelation::Renamed,
+    };
+    RepoDiffRow {
+        relation,
+        left,
+        right,
+    }
+}
+
+/// Pair by path: one row per relative path either side holds.
+fn rows_by_path(
+    left_db: &redb::Database,
+    right_db: &redb::Database,
+) -> Result<Vec<RepoDiffRow>, StoreError> {
+    // Path → (file, content key) per side; the key decides equal vs conflict.
+    let live =
+        |db: &redb::Database| -> Result<HashMap<String, (DiffFile, ContentKey)>, StoreError> {
+            let mut files = HashMap::new();
+            store::for_each_file_entry(db, |rel_path, entry| {
+                if !entry.missing {
+                    files.insert(
+                        rel_path.to_string(),
+                        (
+                            DiffFile {
+                                rel_path: rel_path.to_string(),
+                                size: entry.size,
+                                modified_ms: entry.modified_ms,
+                            },
+                            (entry.size, entry.hash),
+                        ),
+                    );
+                }
+                Ok(())
+            })?;
+            Ok(files)
+        };
+    let mut left = live(left_db)?;
+    let right = live(right_db)?;
+    let mut rows = Vec::new();
+    for (path, (right_file, right_key)) in right {
+        match left.remove(&path) {
+            Some((left_file, left_key)) => rows.push(RepoDiffRow {
+                relation: if left_key == right_key {
+                    DiffRelation::Equal
+                } else {
+                    DiffRelation::Conflict
+                },
+                left: vec![left_file],
+                right: vec![right_file],
+            }),
+            None => rows.push(RepoDiffRow {
+                relation: DiffRelation::OnlyRight,
+                left: Vec::new(),
+                right: vec![right_file],
+            }),
+        }
+    }
+    for (_, (left_file, _)) in left {
+        rows.push(RepoDiffRow {
+            relation: DiffRelation::OnlyLeft,
+            left: vec![left_file],
+            right: Vec::new(),
+        });
+    }
+    Ok(rows)
+}
+
+/// Single-file operations the manual diff's row actions execute. Each one
+/// touches disk *and* both repo indexes, so the diff can be re-planned right
+/// after without a rescan.
+///
+/// They are deliberately strict: nothing is overwritten unless the caller says
+/// so explicitly ([`overwrite_file`]), and an operation that cannot be carried
+/// out exactly as asked fails instead of guessing.
+#[derive(thiserror::Error, Debug)]
+pub enum DiffOpError {
+    #[error(transparent)]
+    Store(#[from] StoreError),
+
+    #[error("Could not {action} '{path}': {source}")]
+    Io {
+        action: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[error("'{path}' does not exist in repository '{repo}'")]
+    NoSuchFile { repo: String, path: String },
+
+    #[error("'{path}' already exists in repository '{repo}'")]
+    AlreadyExists { repo: String, path: String },
+
+    #[error("'{path}' is not a valid repository-relative path")]
+    InvalidPath { path: String },
+}
+
+/// Resolve a repo-relative path to an absolute one, refusing anything that
+/// would escape the repo root (absolute components or `..`).
+fn resolve_in_repo(root: &Path, rel_path: &str) -> Result<PathBuf, DiffOpError> {
+    let rel = Path::new(rel_path);
+    if rel_path.trim().is_empty()
+        || rel.components().any(|c| {
+            !matches!(
+                c,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(DiffOpError::InvalidPath {
+            path: rel_path.to_string(),
+        });
+    }
+    Ok(root.join(rel))
+}
+
+/// Rename one file inside a repo — on disk and in the index — keeping its
+/// content identity (and therefore its fingerprints) untouched.
+///
+/// Fails if the source is unknown or the destination path is already taken,
+/// so a rename can never silently swallow another file.
+pub fn rename_file(
+    store: &Store,
+    repo: &str,
+    from_rel: &str,
+    to_rel: &str,
+) -> Result<(), DiffOpError> {
+    if from_rel == to_rel {
+        return Ok(());
+    }
+    let open = open_repo(store, repo)?;
+    let root = PathBuf::from(&open.meta.abs_path);
+    let from = resolve_in_repo(&root, from_rel)?;
+    let to = resolve_in_repo(&root, to_rel)?;
+    let Some(entry) = store::get_entry(&open.db, from_rel)?.filter(|e| !e.missing) else {
+        return Err(DiffOpError::NoSuchFile {
+            repo: repo.to_string(),
+            path: from_rel.to_string(),
+        });
+    };
+    if to.exists() {
+        return Err(DiffOpError::AlreadyExists {
+            repo: repo.to_string(),
+            path: to_rel.to_string(),
+        });
+    }
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| DiffOpError::Io {
+            action: "create directory",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    std::fs::rename(&from, &to).map_err(|source| DiffOpError::Io {
+        action: "rename",
+        path: from.clone(),
+        source,
+    })?;
+    // The content did not change, so the entry moves over as it is; the old
+    // path is dropped outright rather than left behind as missing (the file
+    // was not lost, it just has another name now).
+    store::apply_entries(&open.db, std::iter::once((to_rel, &entry)))?;
+    store::remove_entries(&open.db, std::iter::once(from_rel))?;
+    Ok(())
+}
+
+/// Copy one file from one repo into another, at `to_rel`, and index it in the
+/// target. The copy keeps the source's modification time, and records the
+/// source repo as its origin (like every other transfer).
+///
+/// Refuses to touch an occupied destination — use [`overwrite_file`] to
+/// replace one deliberately.
+pub fn copy_file_between(
+    store: &Store,
+    from_repo: &str,
+    from_rel: &str,
+    to_repo: &str,
+    to_rel: &str,
+) -> Result<(), DiffOpError> {
+    copy_into(store, from_repo, from_rel, to_repo, to_rel, false)
+}
+
+/// Replace the target file with the other side's content: the same as
+/// [`copy_file_between`], except an existing destination is overwritten.
+pub fn overwrite_file(
+    store: &Store,
+    from_repo: &str,
+    from_rel: &str,
+    to_repo: &str,
+    to_rel: &str,
+) -> Result<(), DiffOpError> {
+    copy_into(store, from_repo, from_rel, to_repo, to_rel, true)
+}
+
+fn copy_into(
+    store: &Store,
+    from_repo: &str,
+    from_rel: &str,
+    to_repo: &str,
+    to_rel: &str,
+    overwrite: bool,
+) -> Result<(), DiffOpError> {
+    let source = open_repo(store, from_repo)?;
+    let target = open_repo(store, to_repo)?;
+    let from = resolve_in_repo(&PathBuf::from(&source.meta.abs_path), from_rel)?;
+    let to = resolve_in_repo(&PathBuf::from(&target.meta.abs_path), to_rel)?;
+    let Some(entry) = store::get_entry(&source.db, from_rel)?.filter(|e| !e.missing) else {
+        return Err(DiffOpError::NoSuchFile {
+            repo: from_repo.to_string(),
+            path: from_rel.to_string(),
+        });
+    };
+    if !overwrite && to.exists() {
+        return Err(DiffOpError::AlreadyExists {
+            repo: to_repo.to_string(),
+            path: to_rel.to_string(),
+        });
+    }
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| DiffOpError::Io {
+            action: "create directory",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    std::fs::copy(&from, &to).map_err(|source| DiffOpError::Io {
+        action: "copy",
+        path: from.clone(),
+        source,
+    })?;
+    let _ = crate::update::copy_mtime(&from, &to);
+    let new_entry = entry_for_copied_file(&entry, &to, from_repo);
+    store::apply_entries(&target.db, std::iter::once((to_rel, &new_entry)))?;
+    Ok(())
+}
+
+/// Delete one file from a repo: remove it from disk and mark its index entry
+/// missing (the repo still remembers it once held that content, exactly like a
+/// batch delete).
+pub fn delete_file(store: &Store, repo: &str, rel_path: &str) -> Result<(), DiffOpError> {
+    let open = open_repo(store, repo)?;
+    let path = resolve_in_repo(&PathBuf::from(&open.meta.abs_path), rel_path)?;
+    if store::get_entry(&open.db, rel_path)?.is_none() {
+        return Err(DiffOpError::NoSuchFile {
+            repo: repo.to_string(),
+            path: rel_path.to_string(),
+        });
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        // Already gone counts as deleted — the index still has to catch up.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(DiffOpError::Io {
+                action: "delete",
+                path,
+                source,
+            });
+        }
+    }
+    store::mark_missing(&open.db, std::iter::once(rel_path))?;
     Ok(())
 }

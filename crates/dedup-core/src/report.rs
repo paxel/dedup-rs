@@ -14,8 +14,6 @@ pub struct RepoReport {
     pub files: u64,
     pub bytes: u64,
     pub missing: u64,
-    /// Epoch ms the repo was marked triage-done; 0 if not.
-    pub triage_done_ms: u64,
     /// Number of exact-duplicate groups and the bytes reclaimable by keeping
     /// one copy of each.
     pub dup_groups: usize,
@@ -59,7 +57,6 @@ pub fn build_report(store: &Store, repo_names: &[String]) -> Result<Vec<RepoRepo
             files: stats.file_count,
             bytes: stats.total_size,
             missing: stats.missing_count,
-            triage_done_ms: stats.triage_done_ms,
             dup_groups: plan.len(),
             reclaimable,
             flags: flags_by_category,
