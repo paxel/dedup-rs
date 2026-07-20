@@ -11,6 +11,7 @@
 //! RUN asks before touching anything and then pushes on a worker thread.
 
 use crate::review;
+use crate::review::PREVIEW_CAP;
 use crate::settings::TooltipVerbosity;
 use crate::theme;
 use crate::util::ExplainExt;
@@ -75,23 +76,30 @@ fn build_preview(
         if live > 0 && plan.deletes.len() as u64 >= live {
             wholesale_sinks.push((sink.clone(), live));
         }
+        // Counts cover the whole plan; the board rows are a capped sample, like
+        // the Transfer tab's — an initial whole-disk push would otherwise build
+        // one row per file.
         for rel in &plan.copies {
             added += 1;
-            rows.push(review::ReviewRow {
-                source: review::SideStatus::Unchanged,
-                target: review::SideStatus::Added,
-                source_path: rel.clone(),
-                target_path: format!("{sink}: {rel}"),
-            });
+            if rows.len() < PREVIEW_CAP {
+                rows.push(review::ReviewRow {
+                    source: review::SideStatus::Unchanged,
+                    target: review::SideStatus::Added,
+                    source_path: rel.clone(),
+                    target_path: format!("{sink}: {rel}"),
+                });
+            }
         }
         for rel in &plan.deletes {
             removed += 1;
-            rows.push(review::ReviewRow {
-                source: review::SideStatus::Absent,
-                target: review::SideStatus::Removed,
-                source_path: String::new(),
-                target_path: format!("{sink}: {rel}"),
-            });
+            if rows.len() < PREVIEW_CAP {
+                rows.push(review::ReviewRow {
+                    source: review::SideStatus::Absent,
+                    target: review::SideStatus::Removed,
+                    source_path: String::new(),
+                    target_path: format!("{sink}: {rel}"),
+                });
+            }
         }
     }
     Ok(PreviewOutcome {
@@ -174,6 +182,10 @@ pub struct SyncView {
     /// The report of the last finished push.
     result: crate::run_result::ResultModal,
     running: bool,
+    /// Set while a plan is being built on a worker thread, so the UI shows it
+    /// is busy without offering CANCEL — planning takes no cancel token, only a
+    /// push does. (Same split as the Transfer tab.)
+    previewing: bool,
     cancel: CancellationToken,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
@@ -224,6 +236,7 @@ impl SyncView {
             pending_push: None,
             result: crate::run_result::ResultModal::default(),
             running: false,
+            previewing: false,
             cancel: CancellationToken::new(),
             tx,
             rx,
@@ -308,6 +321,7 @@ impl SyncView {
         if self.confirm.is_none()
             && !self.result.is_open()
             && !self.running
+            && !self.previewing
             && !ui.ctx().egui_wants_keyboard_input()
         {
             ui.input(|i| {
@@ -572,6 +586,7 @@ impl SyncView {
         crate::lcars::section_lcars(ui, "ACTION — PREVIEW & RUN SYNC", theme::AMBER, |ui| {
             ui.horizontal(|ui| {
                 let ready = !self.running
+                    && !self.previewing
                     && self
                         .selected_group()
                         .is_some_and(|(_, g)| !g.sinks.is_empty());
@@ -606,6 +621,11 @@ impl SyncView {
                     .clicked()
                 {
                     acts.push(Act::Ask);
+                }
+                if self.previewing {
+                    // Planning takes no cancel token, so no CANCEL — a button
+                    // that does nothing is worse than none.
+                    ui.add(egui::Spinner::new().color(theme::AMBER));
                 }
                 if self.running {
                     ui.add(egui::Spinner::new().color(theme::AMBER));
@@ -791,7 +811,7 @@ impl SyncView {
         };
         let store = Arc::clone(store);
         let tx = self.tx.clone();
-        self.running = true;
+        self.previewing = true;
         self.status = Some("planning…".to_string());
         std::thread::spawn(move || {
             let result = build_preview(&store, &name, &group);
@@ -941,10 +961,13 @@ impl SyncView {
         let mut got = false;
         while let Ok(msg) = self.rx.try_recv() {
             got = true;
-            self.running = false;
             match msg {
-                Msg::Preview { result, confirm } => self.apply_preview(result, confirm),
+                Msg::Preview { result, confirm } => {
+                    self.previewing = false;
+                    self.apply_preview(result, confirm);
+                }
                 Msg::Done(Ok(report)) => {
+                    self.running = false;
                     let headline = report.headline();
                     if report.complete() {
                         log::info!("sync group push: {headline}");
@@ -960,12 +983,13 @@ impl SyncView {
                     self.result.open(report);
                 }
                 Msg::Done(Err(e)) => {
+                    self.running = false;
                     log::error!("sync group push: {e}");
                     self.error = Some(e);
                 }
             }
         }
-        if got || self.running {
+        if got || self.running || self.previewing {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -1018,7 +1042,7 @@ mod ui_tests {
     fn settle(h: &mut Harness<'static, SyncView>) {
         for _ in 0..100 {
             h.run();
-            if !h.state().running {
+            if !h.state().running && !h.state().previewing {
                 // One more frame so the result (confirm dialog, board) renders.
                 h.run();
                 return;

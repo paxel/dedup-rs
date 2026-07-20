@@ -365,6 +365,24 @@ fn copy_refuses_an_occupied_path_but_overwrite_replaces_it() -> TestResult {
     Ok(())
 }
 
+/// An overwrite whose source and destination are the same file must not touch
+/// it: `fs::copy` onto oneself truncates the file it is about to read. Nothing
+/// in the GUI can ask for this, but the API must survive a caller that does.
+#[test]
+fn overwrite_onto_the_same_file_leaves_it_intact() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.left, "notes.txt", b"irreplaceable")?;
+    sb.update_both()?;
+
+    overwrite_file(&sb.store, "LEFT", "notes.txt", "LEFT", "notes.txt")?;
+    assert_eq!(std::fs::read(sb.left.join("notes.txt"))?, b"irreplaceable");
+
+    // A same-name rename is equally a no-op — the entry must survive it.
+    rename_file(&sb.store, "LEFT", "notes.txt", "notes.txt")?;
+    assert_eq!(live_paths(&sb.store, "LEFT")?, ["notes.txt"]);
+    Ok(())
+}
+
 #[test]
 fn delete_removes_the_file_and_marks_the_entry_missing() -> TestResult {
     let sb = Sandbox::new()?;

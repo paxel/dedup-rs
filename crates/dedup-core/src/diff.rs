@@ -1523,6 +1523,11 @@ fn copy_into(
     let target = open_repo(store, to_repo)?;
     let from = resolve_in_repo(&PathBuf::from(&source.meta.abs_path), from_rel)?;
     let to = resolve_in_repo(&PathBuf::from(&target.meta.abs_path), to_rel)?;
+    // A copy onto itself is complete before it starts — and must not reach
+    // `fs::copy`, which would truncate the file it is about to read.
+    if from == to {
+        return Ok(());
+    }
     let Some(entry) = store::get_entry(&source.db, from_rel)?.filter(|e| !e.missing) else {
         return Err(DiffOpError::NoSuchFile {
             repo: from_repo.to_string(),

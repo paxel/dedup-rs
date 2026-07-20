@@ -49,5 +49,5 @@ Prefer integration tests over manual binary runs: core behavior is verified in `
 
 - `unwrap()` / `expect()` are forbidden; handle fallible operations with `?`, `match`, or `if let`. `#[allow(...)]` is forbidden unless strictly necessary.
 - Prefer borrowing over cloning; `Arc<T>` for shared state.
-- Documentation upkeep is part of the same change, not a follow-up: `README.md` (features/usage), `CHANGELOG.md` (Keep a Changelog format, user-facing changes), `ai/rewrite.md` (phase status).
+- Documentation upkeep is part of the same change, not a follow-up: `README.md` (features/usage), `CHANGELOG.md` (Keep a Changelog format, user-facing changes), `ai/improvements.md` (phase status).
 - One focused change per pass; if a change's relation to the request is unclear, ask rather than assume.

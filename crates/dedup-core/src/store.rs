@@ -1531,6 +1531,11 @@ pub fn rename_entry(
     to_rel: &str,
     entry: &FileEntry,
 ) -> Result<(), StoreError> {
+    // Renaming onto the same name would upsert then remove the same key —
+    // deleting the entry outright. There is nothing to move, so do nothing.
+    if from_rel == to_rel {
+        return Ok(());
+    }
     let write_txn = db.begin_write()?;
     {
         let mut tables = RepoTables::open(&write_txn)?;
