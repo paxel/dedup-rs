@@ -270,7 +270,10 @@ impl DedupApp {
                     let (last, location, freshness) =
                         prev.remove(&name)
                             .unwrap_or((None, None, Freshness::Unknown));
-                    let mimes = self.store.get_mime_stats(&name).unwrap_or_default();
+                    let mimes = crate::util::or_log_default(
+                        self.store.get_mime_stats(&name),
+                        &format!("mime stats for '{name}'"),
+                    );
                     rows.push(RepoRow {
                         name,
                         path: meta.abs_path,
@@ -282,9 +285,22 @@ impl DedupApp {
                     });
                 }
                 self.repos = rows;
-                self.groups = self.store.list_sync_groups().unwrap_or_default();
                 self.load_error = None;
                 self.notice = None;
+                // Not silently defaulted: without the groups a sink renders as
+                // an unrelated top-level repo, so the user would be acting on a
+                // list that misrepresents what they own.
+                match self.store.list_sync_groups() {
+                    Ok(groups) => self.groups = groups,
+                    Err(e) => {
+                        log::error!("could not read sync groups: {e}");
+                        self.groups.clear();
+                        self.load_error = Some(format!(
+                            "Could not read sync groups: {e}. Backup sinks are listed as \
+                             ordinary repositories until this is resolved."
+                        ));
+                    }
+                }
                 // The repo set may have changed (add/remove/rename/relocate);
                 // force the selector tabs to re-sync when next shown.
                 self.synced_tab = None;
@@ -416,6 +432,7 @@ impl DedupApp {
             let threads = self.threads;
             let repaint = ctx.clone();
             std::thread::spawn(move || {
+                log::info!("starting {kind:?} of '{name}' on {threads} thread(s)");
                 let progress = ChannelProgress::new(name.clone(), tx.clone());
                 let outcome = match kind {
                     JobKind::Update => JobOutcome::Update(
@@ -647,16 +664,38 @@ impl eframe::App for DedupApp {
                 JobOutcome::Update(result) => {
                     // A clean, uncancelled update brings the index in sync.
                     let clean = matches!(&result, Ok(s) if !s.cancelled);
+                    // Anything a bug report would want to find in the log.
+                    let worrying = match &result {
+                        Err(_) => true,
+                        Ok(s) => s.empty_walk || s.errors > 0,
+                    };
                     let summary = match result {
                         Ok(s) if s.cancelled => {
                             format!("cancelled — added {}, updated {}", s.added, s.updated)
                         }
-                        Ok(s) => format!(
-                            "added {}, updated {}, unchanged {}, missing {}, errors {}",
-                            s.added, s.updated, s.unchanged, s.marked_missing, s.errors
-                        ),
+                        Ok(s) => {
+                            let mut text = format!(
+                                "added {}, updated {}, unchanged {}, missing {}, errors {}",
+                                s.added, s.updated, s.unchanged, s.marked_missing, s.errors
+                            );
+                            // The scan saw an empty directory where the index
+                            // held files. Usually a drive that did not mount —
+                            // and an emptied repo is what turns a MIRROR sync
+                            // into a wipe, so it must not read as a normal scan.
+                            if s.empty_walk {
+                                text.push_str(
+                                    " — FOUND NO FILES AT ALL; check the drive is mounted",
+                                );
+                            }
+                            text
+                        }
                         Err(e) => format!("error: {e}"),
                     };
+                    if worrying {
+                        log::warn!("scan of '{repo}': {summary}");
+                    } else {
+                        log::info!("scan of '{repo}': {summary}");
+                    }
                     self.refresh_repo(&repo);
                     if let Some(row) = self.repos.iter_mut().find(|r| r.name == repo) {
                         row.last = Some(summary);
@@ -1787,6 +1826,41 @@ impl DedupApp {
                     .size(12.0),
             );
             ui.add_space(12.0);
+
+            ui.label(RichText::new("DIAGNOSTICS").color(theme::TAN).size(13.0));
+            ui.add_space(4.0);
+            if ui
+                .add(egui::Button::new(
+                    RichText::new("OPEN LOG FOLDER").color(theme::BLACK),
+                ))
+                .explain(
+                    self.tooltip_verbosity,
+                    "Open the folder holding this app's logs",
+                    "Opens the folder where dedup records what each run did. The last few \
+                     sessions are kept; attach the newest file when reporting a problem.",
+                )
+                .clicked()
+                && let Err(e) = crate::external::open(&dedup_core::logging::log_dir())
+            {
+                log::error!("could not open the log folder: {e}");
+                self.notice = Some(format!(
+                    "Could not open the log folder ({}): {e}",
+                    dedup_core::logging::log_dir().display()
+                ));
+            }
+            ui.label(
+                RichText::new(match dedup_core::logging::current_log() {
+                    Some(path) => format!("This session: {}", path.display()),
+                    None => format!(
+                        "No log this session — {} could not be opened.",
+                        dedup_core::logging::log_dir().display()
+                    ),
+                })
+                .color(theme::TAN)
+                .size(11.0),
+            );
+            ui.add_space(12.0);
+
             if ui
                 .add(egui::Button::new(
                     RichText::new("CLOSE").color(theme::BLACK),

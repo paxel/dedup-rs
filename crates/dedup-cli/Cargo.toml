@@ -13,6 +13,7 @@ dedup-gui = { path = "../dedup-gui" }
 clap = { version = "4.5", features = ["derive"] }
 chrono = "0.4"
 anyhow = "1.0"
+log = "0.4"
 indicatif = "0.17"
 ctrlc = "3.4"
 

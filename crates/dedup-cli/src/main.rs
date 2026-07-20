@@ -244,8 +244,21 @@ enum RepoCommands {
     },
 }
 
+/// Open this run's log. A diagnostic that cannot be written is worth a warning
+/// on stderr, never a failed command.
+fn start_logging() {
+    match dedup_core::logging::init() {
+        Ok(path) => log::info!("dedup CLI started; logging to {}", path.display()),
+        Err(e) => eprintln!(
+            "warning: could not open a session log in {}: {e}",
+            dedup_core::logging::log_dir().display()
+        ),
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    start_logging();
 
     match cli.command {
         Some(Commands::Repo { command }) => {

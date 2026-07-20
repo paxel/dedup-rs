@@ -39,6 +39,12 @@ fn guard_mirror_source(store: &Store, group: &SyncGroup) -> Result<(), DiffError
     // `file_count` is maintained per live entry, so this is a META read rather
     // than a scan of the whole index.
     if store.get_repo_stats(&group.main)?.file_count == 0 {
+        log::error!(
+            "refusing to MIRROR from '{}': it has no indexed files, which would delete \
+             everything in {} sink(s)",
+            group.main,
+            group.sinks.len()
+        );
         return Err(DiffError::EmptyMirrorSource {
             main: group.main.clone(),
         });
@@ -90,6 +96,12 @@ pub fn run_group_sync(
 ) -> Result<Vec<(String, SinkOutcome)>, DiffError> {
     // A group-level refusal is not a per-sink failure: nothing is attempted.
     guard_mirror_source(store, group)?;
+    log::info!(
+        "pushing '{}' to {} sink(s) in {:?} mode",
+        group.main,
+        group.sinks.len(),
+        group.mode
+    );
     let mut results = Vec::with_capacity(group.sinks.len());
     for sink in &group.sinks {
         // Sinks the cancel cut short are still reported, so the caller can say
@@ -106,8 +118,20 @@ pub fn run_group_sync(
                 None,
                 run,
             ) {
-                Ok(stats) => SinkOutcome::Pushed(stats),
-                Err(e) => SinkOutcome::Failed(e),
+                Ok(stats) => {
+                    log::info!(
+                        "sink '{sink}': copied {}, deleted {}, {} error(s){}",
+                        stats.copied,
+                        stats.deleted,
+                        stats.errors,
+                        if stats.cancelled { ", cancelled" } else { "" }
+                    );
+                    SinkOutcome::Pushed(stats)
+                }
+                Err(e) => {
+                    log::error!("sink '{sink}' failed: {e}");
+                    SinkOutcome::Failed(e)
+                }
             }
         };
         results.push((sink.clone(), outcome));

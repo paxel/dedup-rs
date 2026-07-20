@@ -28,7 +28,9 @@ The tab buttons switch views; the current tab is highlighted. On the right:
   once you know your way around.
 
 Both settings persist across launches, written to `gui_settings.json` in the config
-directory (`~/.config/dedup` by default) the moment they change. Per-repo read-only state is
+directory (`$XDG_CONFIG_HOME/dedup`, or `~/.config/dedup` by default) the moment they change.
+Session logs live separately under `$XDG_STATE_HOME/dedup/logs` (default
+`~/.local/state/dedup/logs`), ten runs deep, reachable from Settings → OPEN LOG FOLDER. Per-repo read-only state is
 deliberately **not** persisted — every repo re-locks on launch as a safety default, since
 unlocking for deletion should be a fresh, conscious choice each session.
 

@@ -1531,7 +1531,9 @@ impl BrowseView {
         }
         self.annos_key = Some(rel.to_string());
         self.annos = match &self.repo {
-            Some(repo) => store.get_annotations(repo, rel).unwrap_or_default(),
+            Some(repo) => {
+                crate::util::or_log_default(store.get_annotations(repo, rel), "tags for a file")
+            }
             None => Vec::new(),
         };
     }
@@ -1547,7 +1549,9 @@ impl BrowseView {
     fn reload_all_tags(&mut self, store: &Store) {
         self.all_tags_repo = self.repo.clone();
         let map = match &self.repo {
-            Some(repo) => store.all_annotations(repo).unwrap_or_default(),
+            Some(repo) => {
+                crate::util::or_log_default(store.all_annotations(repo), "tags for the repo")
+            }
             None => HashMap::new(),
         };
         let mut set = std::collections::BTreeSet::new();
@@ -1594,7 +1598,8 @@ impl BrowseView {
             return;
         }
         for rel in self.selected.clone() {
-            let mut tags = store.get_annotations(&repo, &rel).unwrap_or_default();
+            let mut tags =
+                crate::util::or_log_default(store.get_annotations(&repo, &rel), "tags for a file");
             if !tags.iter().any(|t| t == tag) {
                 tags.push(tag.to_string());
                 if let Err(e) = store.set_annotations(&repo, &rel, &tags) {

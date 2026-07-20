@@ -24,6 +24,8 @@ tar = "0.4.46"
 flate2 = "1.1.9"
 mail-parser = "0.11.5"
 bip39 = "2.2.2"
+log = "0.4"
+chrono = "0.4"
 
 [dev-dependencies]
 tempfile = "3.10"

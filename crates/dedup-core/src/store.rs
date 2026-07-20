@@ -385,11 +385,18 @@ fn create_db_file(path: &std::path::Path) -> Result<redb::Database, StoreError> 
     Ok(db)
 }
 
+/// The registry's directory: `$XDG_CONFIG_HOME/dedup`, else `~/.config/dedup`.
+/// Honouring the XDG variable keeps it consistent with
+/// [`crate::logging::state_dir`], which reads `$XDG_STATE_HOME`.
 fn get_config_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".config").join("dedup")
-    } else {
-        PathBuf::from(".config").join("dedup")
+    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME")
+        && !dir.trim().is_empty()
+    {
+        return PathBuf::from(dir).join("dedup");
+    }
+    match std::env::var("HOME") {
+        Ok(home) => PathBuf::from(home).join(".config").join("dedup"),
+        Err(_) => PathBuf::from(".config").join("dedup"),
     }
 }
 

@@ -113,6 +113,22 @@ pub fn format_mtime(ms: i64) -> String {
     }
 }
 
+/// Fall back to the default for a read whose failure only costs a hint — a tag
+/// list, a mime suggestion — while still recording it in the session log.
+///
+/// Only for reads the user can't act on. A failure that changes what is on
+/// screen (which repos exist, which are sinks) must reach the user directly,
+/// not just the log.
+pub fn or_log_default<T: Default, E: std::fmt::Display>(result: Result<T, E>, what: &str) -> T {
+    match result {
+        Ok(value) => value,
+        Err(e) => {
+            log::warn!("{what}: {e}");
+            T::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod explain_tests {
     use super::*;
@@ -121,5 +137,13 @@ mod explain_tests {
     fn picks_short_or_verbose_by_setting() {
         assert_eq!(pick_tooltip(TooltipVerbosity::Short, "s", "v"), "s");
         assert_eq!(pick_tooltip(TooltipVerbosity::Verbose, "s", "v"), "v");
+    }
+
+    #[test]
+    fn or_log_default_passes_values_through_and_defaults_on_error() {
+        let ok: Result<Vec<u8>, String> = Ok(vec![1, 2]);
+        assert_eq!(or_log_default(ok, "reading"), vec![1, 2]);
+        let err: Result<Vec<u8>, String> = Err("boom".to_string());
+        assert!(or_log_default(err, "reading").is_empty());
     }
 }

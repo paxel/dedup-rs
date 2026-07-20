@@ -159,6 +159,7 @@ enum StartDest {
     },
 }
 
+#[derive(Debug)]
 enum OpResult {
     Copied {
         copied: u64,
@@ -260,6 +261,12 @@ pub struct TransferView {
     run_done: u64,
     run_total: u64,
     run_current: String,
+    /// Every per-file failure of the current run, capped. The live `run_log`
+    /// keeps only the last handful, so on a large run its errors scroll away;
+    /// this retains the full list for the end-of-run report.
+    run_problems: Vec<String>,
+    /// The report of the last finished batch run.
+    result: crate::run_result::ResultModal,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     /// Tooltip wording for this frame, set at the top of [`Self::show`] from
@@ -328,6 +335,8 @@ impl TransferView {
             pending_refresh: false,
             cancel: CancellationToken::new(),
             run_log: VecDeque::new(),
+            run_problems: Vec::new(),
+            result: crate::run_result::ResultModal::default(),
             run_done: 0,
             run_total: 0,
             run_current: String::new(),
@@ -367,12 +376,19 @@ impl TransferView {
         if !self.loaded {
             self.sync_repos(store);
         }
+        // The end-of-run report sits above everything, and swallows shortcuts
+        // while it is up.
+        let result_open = self.result.show(ui);
 
         let mut acts: Vec<Act> = Vec::new();
 
-        // Keyboard shortcuts — skipped while the confirm modal is up, a run is
-        // active, or a text field is focused.
-        if self.confirm.is_none() && !self.running && !ui.ctx().egui_wants_keyboard_input() {
+        // Keyboard shortcuts — skipped while a modal is up, a run is active, or
+        // a text field is focused.
+        if self.confirm.is_none()
+            && !result_open
+            && !self.running
+            && !ui.ctx().egui_wants_keyboard_input()
+        {
             ui.input(|i| {
                 if i.key_pressed(egui::Key::Num1) {
                     acts.push(Act::SetCommand(Command::Copy));
@@ -2046,6 +2062,8 @@ impl TransferView {
     /// preview replaces it).
     fn reset_run(&mut self) {
         self.run_log.clear();
+        self.run_problems.clear();
+        self.result.close();
         self.run_done = 0;
         self.run_total = 0;
         self.run_current.clear();
@@ -2075,6 +2093,13 @@ impl TransferView {
                 }
             }
             DiffEvent::Error { path, message } => {
+                // Session log gets every failure, so a large run's error list
+                // survives even as the live log rolls; the report keeps a
+                // capped copy for the UI.
+                log::warn!("transfer error: {path}: {message}");
+                if self.run_problems.len() < crate::run_result::MAX_PROBLEMS {
+                    self.run_problems.push(format!("{path}: {message}"));
+                }
                 self.run_log.push_back(format!("✗ {path}: {message}"));
                 while self.run_log.len() > RUN_LOG_LIMIT {
                     self.run_log.pop_front();
@@ -2091,18 +2116,23 @@ impl TransferView {
                 Msg::Progress(event) => self.apply_progress(event),
                 Msg::Done(result) => {
                     self.running = false;
+                    // The session log gets every finished run, so a bug report
+                    // covering the Transfer tab has a trail.
+                    log::info!("transfer finished: {result:?}");
                     match result {
                         OpResult::Copied {
                             copied,
                             cancelled,
                             moved,
                         } => {
-                            let verb = if moved { "Moved" } else { "Copied" };
-                            self.status = Some(format!(
-                                "{verb} {copied} file(s){}.",
-                                if cancelled { " (cancelled)" } else { "" }
-                            ));
+                            let verb = if moved { "Move" } else { "Copy" };
+                            let report = crate::run_result::RunReport::new(verb)
+                                .count("copied", copied)
+                                .cancelled(cancelled)
+                                .problems(std::mem::take(&mut self.run_problems));
+                            self.status = Some(report.headline());
                             self.error = None;
+                            self.result.open(report);
                         }
                         OpResult::Synced {
                             copied,
@@ -2112,23 +2142,21 @@ impl TransferView {
                             cancelled,
                             mirror,
                         } => {
-                            let mut parts = vec![format!("copied {copied}")];
-                            if deleted > 0 {
-                                parts.push(format!("deleted {deleted}"));
+                            let title = if mirror { "Mirror" } else { "Sync" };
+                            let mut report = crate::run_result::RunReport::new(title)
+                                .count("copied", copied)
+                                .count("deleted", deleted)
+                                .count("skipped", skipped)
+                                .cancelled(cancelled)
+                                .problems(std::mem::take(&mut self.run_problems));
+                            // `errors` counts failures the capped list may not
+                            // hold all of; keep the true count visible.
+                            if errors > report.problem_count() {
+                                report = report.count("errors", errors);
                             }
-                            if skipped > 0 {
-                                parts.push(format!("skipped {skipped}"));
-                            }
-                            if errors > 0 {
-                                parts.push(format!("errors {errors}"));
-                            }
-                            let verb = if mirror { "Mirror" } else { "Sync" };
-                            self.status = Some(format!(
-                                "{verb} done: {}{}.",
-                                parts.join(", "),
-                                if cancelled { " (cancelled)" } else { "" }
-                            ));
+                            self.status = Some(report.headline());
                             self.error = None;
+                            self.result.open(report);
                         }
                         OpResult::Applied { message } => {
                             self.status = Some(message);

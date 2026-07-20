@@ -18,6 +18,7 @@ mod lightbox;
 mod player;
 mod repo_chip;
 mod review;
+mod run_result;
 mod settings;
 mod status;
 mod sync_view;
@@ -36,6 +37,14 @@ use std::sync::Arc;
 /// `ui_scale` (from `--ui-scale`) multiplies the interface size; `None` keeps
 /// the default.
 pub fn run(ui_scale: Option<f32>) -> Result<(), String> {
+    // Diagnostics only: a log that cannot be opened must not stop the app.
+    match dedup_core::logging::init() {
+        Ok(path) => log::info!("dedup GUI started; logging to {}", path.display()),
+        Err(e) => eprintln!(
+            "warning: could not open a session log in {}: {e}",
+            dedup_core::logging::log_dir().display()
+        ),
+    }
     let store = Arc::new(Store::open().map_err(|e| e.to_string())?);
 
     // Restore the last window size (clamped to something sane), so the app opens

@@ -99,10 +99,43 @@ the MIRROR guard regardless of how the main got to zero. Follow-up if the index 
 itself proves annoying: a confirmation (GUI) / `--force` (CLI) path before a scan is
 allowed to mark *every* entry missing.
 
-### D Error handling, logging & diagnostics  *(blocker before beta)*
+### D Error handling, logging & diagnostics  — **done 2026-07-20**
 
 Beta users cannot report what the app never tells them. Today a sync that copied
 nothing and failed on every file reports success.
+
+Done:
+- `dedup_core::logging` writes one session log per run under
+  `$XDG_STATE_HOME/dedup/logs` (default `~/.local/state/dedup/logs`), keeps the newest
+  `SESSIONS_KEPT` (10) and prunes the rest. Installed behind the `log` facade, so
+  `log::error!` anywhere in the workspace lands in it. Millisecond-stamped filenames so
+  two runs in the same second don't truncate each other; flushed per record so a crashed
+  session's log is complete. Both entry points (`main.rs`, `gui::run`) initialise it, and
+  a log that cannot be opened warns without stopping the app.
+- `store::get_config_dir` now honours `$XDG_CONFIG_HOME`, matching `logging::state_dir`.
+- Settings gains **OPEN LOG FOLDER** plus the current session's path.
+- `util::or_log_default` replaces the silent `unwrap_or_default()` reads (mime stats,
+  annotations) so they are logged; the sync-group read in `app.rs` is now surfaced as a
+  `load_error` because it changes what the repo list *means*.
+- Logged at the points that matter for a bug report: group push start and per-sink
+  outcome, mirror refusal, empty-walk scans, GUI push result.
+- `logging::capture_panics` routes panics (message, source location, thread) into the log
+  and chains to the previous hook, so a worker thread that falls over no longer just
+  freezes the window. Installed by `init`.
+- Scan results now surface `empty_walk` in the repo row ("FOUND NO FILES AT ALL; check the
+  drive is mounted") rather than reading as an ordinary scan, and are logged at warn level
+  when the scan errored or found nothing.
+- Operation trail: scan start and result, transfer and grooming completions, group push
+  start and per-sink outcome.
+- Tests: `logging.rs` (pruning, cap counts the new session, records written with level,
+  debug filtered out, panic payload shapes, no `/var/log`), `util.rs::or_log_default_*`,
+  and `tests/logging_session.rs` — its own process, asserting a real panic reaches the file
+  with its source location.
+
+**Checked, not a problem:** the Transfer and Grooming tabs already reported cancellation
+and per-item error counts (`transfer_view.rs` `OpResult::Synced`, `grooming_view.rs`), as
+did the scan summary. The earlier note that they claimed success was wrong — only the new
+`empty_walk` flag was unreported.
 
 - **Surface run outcomes.** *Done for the Sync Groups tab in section C* — `SyncView::start`
   now reports cancellation, per-file `stats.errors`, failed sinks and skipped sinks, and
@@ -112,16 +145,24 @@ nothing and failed on every file reports success.
   instead of a joined string.
 - **Report skipped sinks.** *Done in section C* — `run_group_sync` returns
   `SinkOutcome::Skipped` for sinks a cancel never reached, and the GUI names them as stale.
-- **Stop swallowing store errors.** `app.rs:285` does
-  `list_sync_groups().unwrap_or_default()`, so a failed registry read silently renders
-  every sink as an unrelated top-level repo with no error shown. Audit for the same pattern.
-- **Session log, rolling.** Write a full session log and keep the last ~10.
-  Not `/var/log/dedup` — that needs root and dedup is a user-level app. Use the XDG
-  state dir, `$XDG_STATE_HOME/dedup/logs` (default `~/.local/state/dedup/logs`).
-  Related: `get_config_dir` (`store.rs:388`) hardcodes `~/.config/dedup` and ignores
-  `$XDG_CONFIG_HOME` — worth aligning while touching this.
-- **Make the log reachable from the GUI** (a button that opens the log directory), so
-  a beta report can carry it.
+Result panel — done:
+- `run_result::{RunReport, ResultModal}` is the shared end-of-run report: counts, the
+  individual failures listed one per line (not joined), an amber note for stale sinks,
+  and a headline that says "incomplete" whenever anything went wrong. Capped at
+  `MAX_PROBLEMS` (200) with an exact overflow count, so a catastrophic run cannot pin the
+  heap. Wired into Sync Groups, Transfer (Copy/Move/Sync/Mirror) and Grooming
+  (Delete/Empty-dirs/Organize).
+- The real gap this closed: the live `run_log` in Transfer/Grooming caps at **10** lines
+  (`RUN_LOG_LIMIT`), so on a 10⁵–10⁶-file run a file's error scrolls out within ten more
+  files — it was never retained in the UI *or* written anywhere. Both tabs now
+  `log::warn!` every `DiffEvent::Error` (full list in the session log regardless of the UI
+  cap) and accumulate a capped copy into the report. My earlier "the other tabs are
+  already adequate" note was wrong on exactly the large runs where the list matters — the
+  advisor caught it against `RUN_LOG_LIMIT = 10`.
+- `Pruned` (index maintenance, not per-file) keeps its own status line rather than a
+  file-list panel. Single-row APPLY in Transfer keeps the preview, no panel.
+- Tests: `run_result.rs` (headline complete/incomplete, cap-with-exact-overflow, modal
+  open/close, and a kittest asserting each failure renders on its own line).
 
 ### E Code review backlog — 2026-07-20 (`feature/master/qa`)
 

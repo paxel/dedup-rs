@@ -5,7 +5,10 @@ deeper, example-driven walkthrough; the [README](../README.md#cli-commands) has 
 quick-reference table.
 
 All commands operate on **registered repositories** — a repository is a name linked to a
-folder on disk, tracked in an index at `~/.config/dedup/repos/<name>/index.redb`. Register
+folder on disk, tracked in an index at `~/.config/dedup/repos/<name>/index.redb` (or under
+`$XDG_CONFIG_HOME/dedup` when that is set). Each run also writes a session log to
+`$XDG_STATE_HOME/dedup/logs`, defaulting to `~/.local/state/dedup/logs`; the ten newest are kept.
+Register
 one before anything else will work:
 
 ```

@@ -353,7 +353,10 @@ impl FilterBuilder {
         if self.repo.as_deref() != count_repo {
             self.repo = count_repo.map(str::to_string);
             self.mime_stats = match count_repo {
-                Some(r) => store.get_mime_stats(r).unwrap_or_default(),
+                Some(r) => crate::util::or_log_default(
+                    store.get_mime_stats(r),
+                    "mime stats for the filter wizard",
+                ),
                 None => Vec::new(),
             };
             self.reload_tags(store);
@@ -396,7 +399,12 @@ impl FilterBuilder {
         self.tags = match self.repo.as_deref() {
             Some(r) => {
                 let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-                for tags in store.all_annotations(r).unwrap_or_default().into_values() {
+                for tags in crate::util::or_log_default(
+                    store.all_annotations(r),
+                    "tags for the filter wizard",
+                )
+                .into_values()
+                {
                     set.extend(tags);
                 }
                 set.into_iter().collect()

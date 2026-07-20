@@ -17,6 +17,7 @@ rodio = { version = "0.20", default-features = false, features = ["symphonia-all
 image = "0.25"
 id3 = "1"
 egui_extras = "0.35"
+log = "0.4"
 
 [dev-dependencies]
 egui_kittest = { version = "0.35", features = ["wgpu", "snapshot"] }

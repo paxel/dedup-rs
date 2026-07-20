@@ -383,6 +383,12 @@ pub fn update_repo(
         stats.cancelled = true;
     } else {
         if stats.empty_walk {
+            log::warn!(
+                "scan of '{}' found no files at all, but the index held {} — marking them \
+                 missing; check the directory is mounted",
+                meta.abs_path,
+                remaining.len()
+            );
             progress.on(ProgressEvent::Error {
                 path: meta.abs_path.clone(),
                 message: format!(

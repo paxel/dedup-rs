@@ -120,6 +120,7 @@ impl Command {
     }
 }
 
+#[derive(Debug)]
 enum OpResult {
     Deleted {
         deleted: u64,
@@ -232,6 +233,11 @@ pub struct GroomingView {
     pending_refresh: bool,
     cancel: CancellationToken,
     run_log: VecDeque<String>,
+    /// Every per-file failure of the current run, capped — the live `run_log`
+    /// keeps only the last few, so this retains the full list for the report.
+    run_problems: Vec<String>,
+    /// The report of the last finished run.
+    result: crate::run_result::ResultModal,
     run_done: u64,
     run_total: u64,
     run_current: String,
@@ -290,6 +296,8 @@ impl GroomingView {
             pending_refresh: false,
             cancel: CancellationToken::new(),
             run_log: VecDeque::new(),
+            run_problems: Vec::new(),
+            result: crate::run_result::ResultModal::default(),
             run_done: 0,
             run_total: 0,
             run_current: String::new(),
@@ -312,12 +320,18 @@ impl GroomingView {
         if !self.loaded {
             self.sync_repos(store);
         }
+        // The end-of-run report sits above everything and swallows shortcuts.
+        let result_open = self.result.show(ui);
 
         let mut acts: Vec<Act> = Vec::new();
 
-        // Keyboard shortcuts — skipped while the confirm modal is up, a run is
-        // active, or a text field is focused.
-        if self.confirm.is_none() && !self.running && !ui.ctx().egui_wants_keyboard_input() {
+        // Keyboard shortcuts — skipped while a modal is up, a run is active, or
+        // a text field is focused.
+        if self.confirm.is_none()
+            && !result_open
+            && !self.running
+            && !ui.ctx().egui_wants_keyboard_input()
+        {
             ui.input(|i| {
                 for (key, cmd) in [
                     (egui::Key::Num1, Command::Dedupe),
@@ -1099,6 +1113,8 @@ impl GroomingView {
 
     fn reset_run(&mut self) {
         self.run_log.clear();
+        self.run_problems.clear();
+        self.result.close();
         self.run_done = 0;
         self.run_total = 0;
         self.run_current.clear();
@@ -1384,6 +1400,12 @@ impl GroomingView {
                 }
             }
             DiffEvent::Error { path, message } => {
+                // Every failure to the session log, so a large run's error list
+                // outlives the rolling live log; a capped copy for the report.
+                log::warn!("grooming error: {path}: {message}");
+                if self.run_problems.len() < crate::run_result::MAX_PROBLEMS {
+                    self.run_problems.push(format!("{path}: {message}"));
+                }
                 self.run_log.push_back(format!("✗ {path}: {message}"));
                 while self.run_log.len() > RUN_LOG_LIMIT {
                     self.run_log.pop_front();
@@ -1398,17 +1420,25 @@ impl GroomingView {
                 Msg::Progress(event) => self.apply_progress(event),
                 Msg::Done(result) => {
                     self.running = false;
+                    log::info!("grooming finished: {result:?}");
+                    let problems = std::mem::take(&mut self.run_problems);
                     match result {
                         OpResult::Deleted { deleted, cancelled } => {
-                            self.status = Some(format!(
-                                "Deleted {deleted} file(s){}.",
-                                if cancelled { " (cancelled)" } else { "" }
-                            ));
+                            let report = crate::run_result::RunReport::new("Delete")
+                                .count("deleted", deleted)
+                                .cancelled(cancelled)
+                                .problems(problems);
+                            self.status = Some(report.headline());
                             self.error = None;
+                            self.result.open(report);
                         }
                         OpResult::EmptyDirs { removed } => {
-                            self.status = Some(format!("Removed {removed} empty director(ies)."));
+                            let report = crate::run_result::RunReport::new("Remove empty dirs")
+                                .count("removed", removed)
+                                .problems(problems);
+                            self.status = Some(report.headline());
                             self.error = None;
+                            self.result.open(report);
                         }
                         OpResult::Organized {
                             moved,
@@ -1416,17 +1446,25 @@ impl GroomingView {
                             errors,
                             cancelled,
                         } => {
-                            self.status = Some(format!(
-                                "Moved {moved}, skipped {skipped}, {errors} error(s){}.",
-                                if cancelled { " (cancelled)" } else { "" }
-                            ));
+                            let mut report = crate::run_result::RunReport::new("Organize")
+                                .count("moved", moved)
+                                .count("skipped", skipped)
+                                .cancelled(cancelled)
+                                .problems(problems);
+                            if errors > report.problem_count() {
+                                report = report.count("errors", errors);
+                            }
+                            self.status = Some(report.headline());
                             self.error = None;
+                            self.result.open(report);
                         }
                         OpResult::Pruned {
                             pruned,
                             compacted,
                             cancelled,
                         } => {
+                            // An index maintenance run, not a per-file one: keep
+                            // its own status line rather than the shared report.
                             self.status = Some(format!(
                                 "Pruned {pruned} record(s){}.",
                                 if cancelled {

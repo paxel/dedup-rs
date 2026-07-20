@@ -20,18 +20,48 @@ use dedup_core::store::{Store, SyncGroup, SyncMode};
 use dedup_core::sync_group::{SinkOutcome, plan_group_sync, run_group_sync};
 use dedup_core::update::CancellationToken;
 use egui::{Id, RichText};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Messages from the pushing worker thread.
 enum Msg {
-    Done(Result<String, String>),
+    /// A finished push, as the shared report — or a group-level refusal that
+    /// meant nothing ran at all.
+    Done(Result<crate::run_result::RunReport, String>),
 }
 
-/// Swallows per-file progress: a group push reports per sink, not per file.
-struct NoProgress;
+/// Collects the per-file failures of a push so the result panel can list them.
+///
+/// Live per-file progress is still dropped (a group push reports per sink), but
+/// the errors are not: "12 error(s)" without saying which files is exactly the
+/// report a beta user cannot act on.
+struct CollectProblems {
+    problems: Mutex<Vec<String>>,
+}
 
-impl DiffProgress for NoProgress {
-    fn on(&self, _event: DiffEvent) {}
+impl CollectProblems {
+    fn new() -> Self {
+        Self {
+            problems: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn take(&self) -> Vec<String> {
+        match self.problems.lock() {
+            Ok(mut held) => std::mem::take(&mut held),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+impl DiffProgress for CollectProblems {
+    fn on(&self, event: DiffEvent) {
+        if let DiffEvent::Error { path, message } = event
+            && let Ok(mut held) = self.problems.lock()
+            && held.len() < crate::run_result::MAX_PROBLEMS
+        {
+            held.push(format!("{path}: {message}"));
+        }
+    }
 }
 
 pub struct SyncView {
@@ -59,6 +89,8 @@ pub struct SyncView {
     status: Option<String>,
     error: Option<String>,
     confirm: Option<String>,
+    /// The report of the last finished push.
+    result: crate::run_result::ResultModal,
     running: bool,
     cancel: CancellationToken,
     tx: Sender<Msg>,
@@ -107,6 +139,7 @@ impl SyncView {
             status: None,
             error: None,
             confirm: None,
+            result: crate::run_result::ResultModal::default(),
             running: false,
             cancel: CancellationToken::new(),
             tx,
@@ -189,7 +222,11 @@ impl SyncView {
                 self.preview_panel(ui);
             });
 
-        if self.confirm.is_none() && !self.running && !ui.ctx().egui_wants_keyboard_input() {
+        if self.confirm.is_none()
+            && !self.result.is_open()
+            && !self.running
+            && !ui.ctx().egui_wants_keyboard_input()
+        {
             ui.input(|i| {
                 if i.key_pressed(egui::Key::P) {
                     acts.push(Act::Preview);
@@ -202,6 +239,7 @@ impl SyncView {
         if let Some(prompt) = self.confirm.clone() {
             self.confirm_modal(ui, &prompt, &mut acts);
         }
+        self.result.show(ui);
         for act in acts {
             self.apply(store, act);
         }
@@ -757,10 +795,12 @@ impl SyncView {
         let cancel = self.cancel.clone();
         self.running = true;
         self.status = Some(format!("syncing '{name}'…"));
+        // The previous run's report is about to be superseded.
+        self.result.close();
         self.clear_preview();
 
         std::thread::spawn(move || {
-            let progress = NoProgress;
+            let progress = CollectProblems::new();
             let run = DiffRun::new(&progress, &cancel);
             let results = match run_group_sync(&store, &group, &run) {
                 Ok(results) => results,
@@ -792,34 +832,27 @@ impl SyncView {
             }
             // Every way a push can fall short of "done" has to reach the user —
             // a backup that silently did nothing is worse than one that failed
-            // loudly.
-            let mut notes = Vec::new();
-            if cancelled {
-                notes.push("cancelled".to_string());
-            }
+            // loudly. The individual per-file failures come from the progress
+            // sink; the whole-sink ones from the outcomes.
+            let mut report = crate::run_result::RunReport::new(format!("Sync group '{name}'"))
+                .count("copied", copied)
+                .count("deleted", deleted)
+                .cancelled(cancelled)
+                .problems(progress.take())
+                .problems(failures);
             if !skipped.is_empty() {
-                notes.push(format!(
-                    "{} sink(s) never pushed and are now stale: {}",
+                report = report.note(format!(
+                    "{} sink(s) were never pushed and are now stale: {}",
                     skipped.len(),
                     skipped.join(", ")
                 ));
             }
-            if file_errors > 0 {
-                notes.push(format!("{file_errors} file(s) failed to copy"));
+            // `stats.errors` counts failures the progress sink may have capped;
+            // trust the count, and let the panel say how many it is showing.
+            if file_errors > report.problem_count() {
+                report = report.count("files that failed to copy", file_errors);
             }
-            for failure in &failures {
-                notes.push(failure.clone());
-            }
-            let summary = format!("copied {copied} file(s), deleted {deleted}");
-            let message = if notes.is_empty() {
-                Ok(format!("Sync done: {summary}."))
-            } else {
-                Err(format!(
-                    "Sync incomplete — {summary}; {}.",
-                    notes.join("; ")
-                ))
-            };
-            let _ = tx.send(Msg::Done(message));
+            let _ = tx.send(Msg::Done(Ok(report)));
         });
     }
 
@@ -829,11 +862,25 @@ impl SyncView {
             got = true;
             self.running = false;
             match result {
-                Ok(message) => {
-                    self.status = Some(message);
+                Ok(report) => {
+                    let headline = report.headline();
+                    if report.complete() {
+                        log::info!("sync group push: {headline}");
+                    } else {
+                        log::warn!("sync group push: {headline}");
+                        for problem in report.problem_lines() {
+                            log::warn!("  {problem}");
+                        }
+                    }
+                    self.status = Some(headline);
                     self.error = None;
+                    // The panel carries the detail the status line cannot.
+                    self.result.open(report);
                 }
-                Err(e) => self.error = Some(e),
+                Err(e) => {
+                    log::error!("sync group push: {e}");
+                    self.error = Some(e);
+                }
             }
         }
         if got || self.running {
