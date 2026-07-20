@@ -62,9 +62,6 @@ Sequence: (1) previewable abstraction + generalise `CompareState`; (2) route DIF
 `diff_inspect`; (3) fold in audio; (4) enable video/cross-type compare.
 
 ## Engineering backlog
-- **Move the remaining Transfer previews off the UI thread.** Copy/Move/Sync and folder
-  previews (`run_preview_sync`/`run_preview_repo`/`run_preview_folder`) still scan
-  synchronously, like DIFF did. Give them the worker-thread + channel treatment.
 - **Per-sink main re-read.** `plan_group_sync`/`run_group_sync` re-open the main and
   re-run `collect_source_entries` over its whole index once per sink. Collect the main's
   entries and content-key set once before the loop. Touches the shared `plan_sync`/

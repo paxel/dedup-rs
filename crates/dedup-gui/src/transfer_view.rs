@@ -140,6 +140,7 @@ impl SelectMode {
 
 /// A snapshot of the destination captured when a run starts, so the worker
 /// thread owns everything it needs without borrowing the view.
+#[derive(Clone)]
 enum StartDest {
     Repo {
         references: Vec<String>,
@@ -157,6 +158,286 @@ enum StartDest {
         delete: SyncDelete,
         mirror: bool,
     },
+}
+
+/// Everything a PREVIEW, its confirmation, and the RUN it authorises need,
+/// snapshotted at the moment the user asks — so nothing the live controls do
+/// between an async plan landing and PROCEED can change what actually runs.
+/// (Same reasoning as sync_view's `pending_push`.)
+#[derive(Clone)]
+struct RunConfig {
+    source: String,
+    command: Command,
+    dest: StartDest,
+    filter: Option<String>,
+    move_files: bool,
+}
+
+/// The result of a review-board preview (Copy/Move/Sync/folder), built off the
+/// UI thread. Rows come back unsorted; the board sorts them when applied.
+struct ReviewPreviewData {
+    rows: Vec<review::ReviewRow>,
+    preview_total: usize,
+    sync_delete_total: usize,
+    preview_totals: [usize; 3],
+    source_header: String,
+    target_header: String,
+    status: String,
+}
+
+/// Plan a review-board preview for `config`, off the UI thread. Dispatches on
+/// where the transfer lands; each branch reads the relevant index(es), which is
+/// the work that must not block the window on large repos.
+fn build_review_preview(store: &Store, config: &RunConfig) -> Result<ReviewPreviewData, String> {
+    match &config.dest {
+        StartDest::Sync { target, delete, .. } => preview_sync(store, config, target, *delete),
+        StartDest::Repo {
+            references,
+            target,
+            subdir,
+        } => preview_repo(store, config, references, target, subdir),
+        StartDest::Folder {
+            references,
+            dir,
+            mode,
+            invert,
+        } => preview_folder(store, config, references, dir, *mode, *invert),
+    }
+}
+
+fn preview_sync(
+    store: &Store,
+    config: &RunConfig,
+    target: &str,
+    delete: SyncDelete,
+) -> Result<ReviewPreviewData, String> {
+    let plan = plan_sync(
+        store,
+        &config.source,
+        target,
+        true,
+        delete,
+        config.filter.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
+    // A copy: source keeps the file (unchanged), target gains it (added). A
+    // delete: the source no longer has it (absent), the target loses it
+    // (removed). Capped.
+    let mut rows: Vec<review::ReviewRow> = plan
+        .copies
+        .iter()
+        .take(PREVIEW_CAP)
+        .map(|rel| review::ReviewRow {
+            source: review::SideStatus::Unchanged,
+            target: review::SideStatus::Added,
+            source_path: rel.clone(),
+            target_path: rel.clone(),
+        })
+        .collect();
+    for rel in plan
+        .deletes
+        .iter()
+        .take(PREVIEW_CAP.saturating_sub(rows.len()))
+    {
+        rows.push(review::ReviewRow {
+            source: review::SideStatus::Absent,
+            target: review::SideStatus::Removed,
+            source_path: String::new(),
+            target_path: rel.clone(),
+        });
+    }
+    let verb = config.command.label();
+    let status = if delete == SyncDelete::None {
+        format!("{verb}: {} to copy.", plan.copies.len())
+    } else {
+        format!(
+            "{verb}: {} to copy, {} to delete.",
+            plan.copies.len(),
+            plan.deletes.len()
+        )
+    };
+    Ok(ReviewPreviewData {
+        rows,
+        preview_total: plan.copies.len(),
+        sync_delete_total: plan.deletes.len(),
+        preview_totals: [plan.copies.len(), plan.deletes.len(), 0],
+        source_header: TransferView::repo_header(store, &config.source),
+        target_header: TransferView::repo_header(store, target),
+        status,
+    })
+}
+
+fn preview_repo(
+    store: &Store,
+    config: &RunConfig,
+    references: &[String],
+    target: &str,
+    subdir: &str,
+) -> Result<ReviewPreviewData, String> {
+    let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
+    let items = diff_print(store, &config.source, &ref_slice, config.filter.as_deref())
+        .map_err(|e| e.to_string())?;
+    // A file the target lacks (New) is added on the target side; on the source
+    // side a COPY leaves it unchanged while a MOVE removes it. Files the target
+    // already has (Equal) are unchanged on both sides. DeletedInReference isn't
+    // part of a transfer.
+    let source_state = if config.move_files {
+        review::SideStatus::Removed
+    } else {
+        review::SideStatus::Unchanged
+    };
+    let mut acted = 0usize;
+    let mut unchanged = 0usize;
+    let mut rows: Vec<review::ReviewRow> = Vec::new();
+    for item in &items {
+        match item {
+            DiffItem::New { rel_path } => {
+                acted += 1;
+                if rows.len() < PREVIEW_CAP {
+                    let to = if subdir.is_empty() {
+                        rel_path.clone()
+                    } else {
+                        format!("{subdir}/{rel_path}")
+                    };
+                    rows.push(review::ReviewRow {
+                        source: source_state,
+                        target: review::SideStatus::Added,
+                        source_path: rel_path.clone(),
+                        target_path: to,
+                    });
+                }
+            }
+            DiffItem::Equal { rel_path, .. } => {
+                unchanged += 1;
+                if rows.len() < PREVIEW_CAP {
+                    rows.push(review::ReviewRow {
+                        source: review::SideStatus::Unchanged,
+                        target: review::SideStatus::Unchanged,
+                        source_path: rel_path.clone(),
+                        target_path: rel_path.clone(),
+                    });
+                }
+            }
+            DiffItem::DeletedInReference { .. } => {}
+        }
+    }
+    // A move both removes from source and adds to target; a copy only adds.
+    // Totals are [added, removed, unchanged].
+    let preview_totals = if config.move_files {
+        [acted, acted, unchanged]
+    } else {
+        [acted, 0, unchanged]
+    };
+    Ok(ReviewPreviewData {
+        rows,
+        preview_total: acted,
+        sync_delete_total: 0,
+        preview_totals,
+        source_header: TransferView::repo_header(store, &config.source),
+        target_header: TransferView::repo_header(store, target),
+        status: format!(
+            "{acted} match the {}.",
+            config.command.label().to_lowercase()
+        ),
+    })
+}
+
+fn preview_folder(
+    store: &Store,
+    config: &RunConfig,
+    references: &[String],
+    dir: &Path,
+    mode: FolderMode,
+    invert: bool,
+) -> Result<ReviewPreviewData, String> {
+    let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
+    let rels = plan_folder_export(
+        store,
+        &config.source,
+        &ref_slice,
+        mode,
+        invert,
+        config.filter.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
+    // Exporting adds each file into the folder; a MOVE also removes it from the
+    // source repo, a COPY leaves the source unchanged.
+    let source_state = if config.move_files {
+        review::SideStatus::Removed
+    } else {
+        review::SideStatus::Unchanged
+    };
+    let rows: Vec<review::ReviewRow> = rels
+        .iter()
+        .take(PREVIEW_CAP)
+        .map(|rel| review::ReviewRow {
+            source: source_state,
+            target: review::SideStatus::Added,
+            source_path: rel.clone(),
+            target_path: rel.clone(),
+        })
+        .collect();
+    let preview_totals = if config.move_files {
+        [rels.len(), rels.len(), 0]
+    } else {
+        [rels.len(), 0, 0]
+    };
+    let what = if invert { "redundant" } else { "unique" };
+    Ok(ReviewPreviewData {
+        rows,
+        preview_total: rels.len(),
+        sync_delete_total: 0,
+        preview_totals,
+        source_header: TransferView::repo_header(store, &config.source),
+        target_header: dir.to_string_lossy().into_owned(),
+        status: format!(
+            "{} {what} file(s) to {}.",
+            rels.len(),
+            config.command.label().to_lowercase()
+        ),
+    })
+}
+
+/// The confirmation text for a batch RUN of `config`, from its counts. Pure, so
+/// the prompt describes exactly what was planned. `None` for DIFF (no batch).
+fn prompt_for(config: &RunConfig, copies: usize, deletes: usize) -> Option<String> {
+    let source = &config.source;
+    let dest = match &config.dest {
+        StartDest::Repo { target, subdir, .. } => {
+            if subdir.is_empty() {
+                target.clone()
+            } else {
+                format!("{target}/{subdir}")
+            }
+        }
+        StartDest::Folder { dir, .. } => dir.to_string_lossy().into_owned(),
+        StartDest::Sync { target, .. } => target.clone(),
+    };
+    let deletes_missing =
+        matches!(&config.dest, StartDest::Sync { delete, .. } if *delete != SyncDelete::None);
+    Some(match config.command {
+        Command::Copy => format!("Copy {copies} file(s) from '{source}' into '{dest}'?"),
+        Command::Move => format!(
+            "Move {copies} file(s) from '{source}' into '{dest}'? They are removed from the \
+             source directory."
+        ),
+        Command::Sync if deletes_missing => format!(
+            "Sync '{source}' → '{dest}': copy {copies} file(s) into the target and delete \
+             {deletes} file(s) from the target. Deletions cannot be undone. The source is not \
+             changed."
+        ),
+        Command::Sync => format!(
+            "Sync '{source}' → '{dest}': copy {copies} file(s) into the target. Nothing is \
+             deleted and the source is not changed."
+        ),
+        Command::Mirror => format!(
+            "Mirror '{source}' → '{dest}': copy {copies} file(s) into the target and DELETE \
+             {deletes} file(s) the source does not have, so the target ends up holding exactly \
+             the source's content. Deletions cannot be undone. The source is not changed."
+        ),
+        // DIFF never runs as a batch: its rows are applied one by one.
+        Command::Diff => return None,
+    })
 }
 
 #[derive(Debug)]
@@ -190,6 +471,13 @@ enum Msg {
     /// A finished DIFF comparison, built off the UI thread (it scans both
     /// repos' full indexes). Rows come back unsorted; the board sorts them.
     DiffPreview(Result<DiffPreviewData, String>),
+    /// A finished review-board preview (Copy/Move/Sync/folder). `confirm`
+    /// carries the run to authorise once the plan is in hand — the deferred
+    /// half of a RUN click.
+    ReviewPreview {
+        result: Result<ReviewPreviewData, String>,
+        confirm: Option<Box<RunConfig>>,
+    },
 }
 
 /// The result of a DIFF preview: the paired rows and each side's header.
@@ -262,9 +550,13 @@ pub struct TransferView {
     error: Option<String>,
     confirm: Option<String>,
     running: bool,
-    /// Set while a DIFF comparison is being planned on a worker thread, so the
-    /// UI shows it is busy and does not launch a second one.
+    /// Set while a preview (DIFF or review-board) is being planned on a worker
+    /// thread, so the UI shows it is busy and does not launch a second one.
     previewing: bool,
+    /// The run a raised confirmation authorises, captured when its plan landed.
+    /// PROCEED runs *this*, not whatever the live controls say — the two can
+    /// differ across the async plan/confirm gap. Cleared when the dialog closes.
+    pending_confirm: Option<Box<RunConfig>>,
     /// Set while a single-row APPLY runs: refresh the preview when it finishes.
     pending_refresh: bool,
     cancel: CancellationToken,
@@ -346,6 +638,7 @@ impl TransferView {
             confirm: None,
             running: false,
             previewing: false,
+            pending_confirm: None,
             pending_refresh: false,
             cancel: CancellationToken::new(),
             run_log: VecDeque::new(),
@@ -1401,20 +1694,33 @@ impl TransferView {
             }
             Act::Preview => self.run_preview(store),
             Act::Ask => {
-                if let Some(mut prompt) = self.build_prompt(store) {
-                    let rejected = self.review_state.rejected.len();
-                    if rejected > 0 {
-                        prompt.push_str(&format!(" {rejected} rejected row(s) will be skipped."));
-                    }
-                    self.confirm = Some(prompt);
+                // Plan on a worker thread; the confirmation is raised (for this
+                // captured config) once the plan lands with real counts. DIFF
+                // has no batch RUN, so it never reaches here.
+                self.reset_run();
+                if let Some(config) = self.capture_run_config() {
+                    let confirm = Box::new(config.clone());
+                    self.spawn_review_preview(store, config, Some(confirm));
                 }
             }
-            Act::CancelConfirm => self.confirm = None,
+            Act::CancelConfirm => {
+                self.confirm = None;
+                self.pending_confirm = None;
+            }
             Act::Confirm => {
                 self.confirm = None;
-                self.start(store, None);
+                // Run the config the confirmation was built for, not live state.
+                if let Some(config) = self.pending_confirm.take() {
+                    self.start(store, *config, None);
+                }
             }
-            Act::ApplyRow(key) => self.start(store, Some(key)),
+            Act::ApplyRow(key) => {
+                // A single-row APPLY runs immediately against the config the
+                // board was previewed with — no confirmation, so capture now.
+                if let Some(config) = self.capture_run_config() {
+                    self.start(store, config, Some(key));
+                }
+            }
             Act::SetPairing(pairing) => {
                 self.pairing = pairing;
                 self.clear_preview();
@@ -1429,6 +1735,7 @@ impl TransferView {
     }
 
     fn clear_preview(&mut self) {
+        self.pending_confirm = None;
         self.preview.clear();
         self.diff_rows.clear();
         self.board_state.page = 0;
@@ -1520,151 +1827,122 @@ impl TransferView {
             self.run_preview_diff(store, &source);
             return;
         }
-        if self.command.repo_to_repo() {
-            self.run_preview_sync(store, &source);
-            return;
-        }
-        match self.destination {
-            Destination::Repo => self.run_preview_repo(store, &source),
-            Destination::Folder => self.run_preview_folder(store, &source),
+        // Every other command feeds the review board. Plan off the UI thread.
+        if let Some(config) = self.capture_run_config() {
+            self.spawn_review_preview(store, config, None);
         }
     }
 
-    fn run_preview_sync(&mut self, store: &Store, source: &str) {
-        let Some(target) = self.target.clone() else {
-            return;
-        };
-        let filter = self.filter_string();
-        let delete = self.sync_delete_mode();
-        match plan_sync(store, source, &target, true, delete, filter.as_deref()) {
-            Ok(plan) => {
-                self.preview_total = plan.copies.len();
-                self.sync_delete_total = plan.deletes.len();
-                self.preview_totals = [plan.copies.len(), plan.deletes.len(), 0];
-                self.preview_source_header = Self::repo_header(store, source);
-                self.preview_target_header = Self::repo_header(store, &target);
-                // A copy: source keeps the file (unchanged), target gains it
-                // (added). A delete: the source no longer has it (absent), the
-                // target loses it (removed). Capped, then sorted.
-                let mut rows: Vec<review::ReviewRow> = plan
-                    .copies
-                    .iter()
-                    .take(PREVIEW_CAP)
-                    .map(|rel| review::ReviewRow {
-                        source: review::SideStatus::Unchanged,
-                        target: review::SideStatus::Added,
-                        source_path: rel.clone(),
-                        target_path: rel.clone(),
-                    })
-                    .collect();
-                for rel in plan
-                    .deletes
-                    .iter()
-                    .take(PREVIEW_CAP.saturating_sub(rows.len()))
-                {
-                    rows.push(review::ReviewRow {
-                        source: review::SideStatus::Absent,
-                        target: review::SideStatus::Removed,
-                        source_path: String::new(),
-                        target_path: rel.clone(),
-                    });
-                }
-                review::sort(&mut rows, &self.review_state);
-                self.preview = rows;
-                let verb = self.command.label();
-                self.status = Some(if delete == SyncDelete::None {
-                    format!("{verb}: {} to copy.", self.preview_total)
-                } else {
-                    format!(
-                        "{verb}: {} to copy, {} to delete.",
-                        self.preview_total, self.sync_delete_total
-                    )
-                });
-                self.error = None;
+    /// Snapshot the source, command, destination, filter and move flag the
+    /// current controls describe — the whole of what a preview and a run need.
+    /// Returns `None` when a required repo/folder is not chosen.
+    fn capture_run_config(&self) -> Option<RunConfig> {
+        // DIFF has no batch run — it is applied row by row. `Command::Diff` is
+        // in `repo_to_repo()`, so without this it would build a bogus Sync
+        // config (reachable via the R shortcut, which fires regardless of mode).
+        if self.command.is_diff() {
+            return None;
+        }
+        let source = self.source.clone()?;
+        let command = self.command;
+        let dest = if command.repo_to_repo() {
+            StartDest::Sync {
+                target: self.target.clone()?,
+                delete: self.sync_delete_mode(),
+                mirror: command == Command::Mirror,
             }
-            Err(e) => self.error = Some(e.to_string()),
-        }
-    }
-
-    fn run_preview_repo(&mut self, store: &Store, source: &str) {
-        let Some(target) = self.target.clone() else {
-            return;
-        };
-        let filter = self.filter_string();
-        let references = self.references(&target);
-        let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
-        match diff_print(store, source, &ref_slice, filter.as_deref()) {
-            Ok(items) => {
-                // A file the target lacks (New) is added on the target side; on
-                // the source side a COPY leaves it unchanged while a MOVE removes
-                // it. Files the target already has (Equal) are unchanged on both
-                // sides. DeletedInReference isn't part of a transfer.
-                let subdir = self.normalized_subdir();
-                let move_files = self.command == Command::Move;
-                let source_state = if move_files {
-                    review::SideStatus::Removed
-                } else {
-                    review::SideStatus::Unchanged
-                };
-                let mut acted = 0usize;
-                let mut unchanged = 0usize;
-                let mut rows: Vec<review::ReviewRow> = Vec::new();
-                for item in &items {
-                    match item {
-                        DiffItem::New { rel_path } => {
-                            acted += 1;
-                            if rows.len() < PREVIEW_CAP {
-                                let to = if subdir.is_empty() {
-                                    rel_path.clone()
-                                } else {
-                                    format!("{subdir}/{rel_path}")
-                                };
-                                rows.push(review::ReviewRow {
-                                    source: source_state,
-                                    target: review::SideStatus::Added,
-                                    source_path: rel_path.clone(),
-                                    target_path: to,
-                                });
-                            }
-                        }
-                        DiffItem::Equal { rel_path, .. } => {
-                            unchanged += 1;
-                            if rows.len() < PREVIEW_CAP {
-                                rows.push(review::ReviewRow {
-                                    source: review::SideStatus::Unchanged,
-                                    target: review::SideStatus::Unchanged,
-                                    source_path: rel_path.clone(),
-                                    target_path: rel_path.clone(),
-                                });
-                            }
-                        }
-                        DiffItem::DeletedInReference { .. } => {}
+        } else {
+            match self.destination {
+                Destination::Repo => {
+                    let target = self.target.clone()?;
+                    StartDest::Repo {
+                        references: self.references(&target),
+                        target,
+                        subdir: self.normalized_subdir(),
                     }
                 }
-                self.preview_total = acted;
-                // A move both removes from source and adds to target; a copy only
-                // adds. Totals are [added, removed, unchanged].
-                self.preview_totals = if move_files {
-                    [acted, acted, unchanged]
-                } else {
-                    [acted, 0, unchanged]
-                };
-                self.preview_source_header = Self::repo_header(store, source);
-                self.preview_target_header = Self::repo_header(store, &target);
-                review::sort(&mut rows, &self.review_state);
-                self.preview = rows;
-                self.status = Some(format!(
-                    "{acted} match the {}.",
-                    self.command.label().to_lowercase()
-                ));
-                self.error = None;
+                Destination::Folder => {
+                    let folder = self.folder.trim().to_string();
+                    if folder.is_empty() {
+                        return None;
+                    }
+                    StartDest::Folder {
+                        references: self.folder_references(),
+                        dir: PathBuf::from(&folder),
+                        mode: self.folder_mode(),
+                        invert: self.invert,
+                    }
+                }
             }
-            Err(e) => self.error = Some(e.to_string()),
+        };
+        Some(RunConfig {
+            source,
+            command,
+            dest,
+            filter: self.filter_string(),
+            move_files: command == Command::Move,
+        })
+    }
+
+    /// Plan a review-board preview on a worker thread. `confirm`, when set,
+    /// rides through to the result: the RUN confirmation is raised (for that
+    /// captured config) once the plan lands with real counts.
+    fn spawn_review_preview(
+        &mut self,
+        store: &Arc<Store>,
+        config: RunConfig,
+        confirm: Option<Box<RunConfig>>,
+    ) {
+        let store = Arc::clone(store);
+        let tx = self.tx.clone();
+        self.previewing = true;
+        self.status = Some(format!("{}…", config.command.label().to_lowercase()));
+        std::thread::spawn(move || {
+            let result = build_review_preview(&store, &config);
+            let _ = tx.send(Msg::ReviewPreview { result, confirm });
+        });
+    }
+
+    /// Fold a finished review preview into the board, and — if the plan was for
+    /// a RUN click — raise its confirmation now that the counts are known.
+    fn apply_review_preview(
+        &mut self,
+        result: Result<ReviewPreviewData, String>,
+        confirm: Option<Box<RunConfig>>,
+    ) {
+        let data = match result {
+            Ok(data) => data,
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
+        };
+        self.preview_total = data.preview_total;
+        self.sync_delete_total = data.sync_delete_total;
+        self.preview_totals = data.preview_totals;
+        self.preview_source_header = data.source_header;
+        self.preview_target_header = data.target_header;
+        let mut rows = data.rows;
+        review::sort(&mut rows, &self.review_state);
+        self.preview = rows;
+        self.status = Some(data.status);
+        self.error = None;
+        if let Some(config) = confirm {
+            // Confirm and run the config that was *planned*, not whatever the
+            // live controls say now — the two can differ across the async gap.
+            if let Some(mut prompt) =
+                prompt_for(&config, data.preview_total, data.sync_delete_total)
+            {
+                let rejected = self.review_state.rejected.len();
+                if rejected > 0 {
+                    prompt.push_str(&format!(" {rejected} rejected row(s) will be skipped."));
+                }
+                self.confirm = Some(prompt);
+                self.pending_confirm = Some(config);
+            }
         }
     }
 
-    /// DIFF: compare source and target and fill the board. Like the other
-    /// previews this is a plain index read, so it runs on the UI thread.
     /// Plan the two-repo DIFF on a worker thread. `plan_repo_diff` reads both
     /// repos' full indexes, so on the whole-disk repos this tool targets it
     /// would freeze the window for seconds if run inline; the result comes back
@@ -1822,166 +2100,19 @@ impl TransferView {
         });
     }
 
-    fn run_preview_folder(&mut self, store: &Store, source: &str) {
-        let folder = self.folder.trim().to_string();
-        if folder.is_empty() {
-            return;
-        }
-        let filter = self.filter_string();
-        let references = self.folder_references();
-        let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
-        match plan_folder_export(
-            store,
+    /// Start `config`'s command on a worker thread. `only` restricts the run to
+    /// a single review row (the APPLY button); `None` runs the whole batch minus
+    /// any rejected rows. `config` is a snapshot taken when the run was asked
+    /// for, so nothing the live controls do since can change what runs.
+    fn start(&mut self, store: &Arc<Store>, config: RunConfig, only: Option<String>) {
+        let RunConfig {
             source,
-            &ref_slice,
-            self.folder_mode(),
-            self.invert,
-            filter.as_deref(),
-        ) {
-            Ok(rels) => {
-                self.preview_total = rels.len();
-                let move_files = self.command == Command::Move;
-                let source_state = if move_files {
-                    review::SideStatus::Removed
-                } else {
-                    review::SideStatus::Unchanged
-                };
-                // Exporting adds each file into the folder; a MOVE also removes
-                // it from the source repo, a COPY leaves the source unchanged.
-                self.preview_totals = if move_files {
-                    [rels.len(), rels.len(), 0]
-                } else {
-                    [rels.len(), 0, 0]
-                };
-                self.preview_source_header = Self::repo_header(store, source);
-                self.preview_target_header = folder.clone();
-                let mut rows: Vec<review::ReviewRow> = rels
-                    .iter()
-                    .take(PREVIEW_CAP)
-                    .map(|rel| review::ReviewRow {
-                        source: source_state,
-                        target: review::SideStatus::Added,
-                        source_path: rel.clone(),
-                        target_path: rel.clone(),
-                    })
-                    .collect();
-                review::sort(&mut rows, &self.review_state);
-                self.preview = rows;
-                let what = if self.invert { "redundant" } else { "unique" };
-                self.status = Some(format!(
-                    "{} {what} file(s) to {}.",
-                    self.preview_total,
-                    self.command.label().to_lowercase()
-                ));
-                self.error = None;
-            }
-            Err(e) => self.error = Some(e.to_string()),
-        }
-    }
-
-    fn build_prompt(&mut self, store: &Arc<Store>) -> Option<String> {
-        // Refresh the count so the confirmation reflects the current filter.
-        // DIFF has no RUN, so this only reaches the synchronous sync/repo/folder
-        // previews — the async DIFF preview is never planned from here.
-        self.run_preview(store);
-        let source = self.source.as_ref()?;
-        let dest = match self.destination {
-            Destination::Repo => {
-                let target = self.target.as_ref()?;
-                let subdir = self.normalized_subdir();
-                if subdir.is_empty() {
-                    target.to_string()
-                } else {
-                    format!("{target}/{subdir}")
-                }
-            }
-            Destination::Folder => {
-                let folder = self.folder.trim();
-                if folder.is_empty() {
-                    return None;
-                }
-                folder.to_string()
-            }
-        };
-        Some(match self.command {
-            Command::Copy => format!(
-                "Copy {} file(s) from '{source}' into '{dest}'?",
-                self.preview_total
-            ),
-            Command::Move => format!(
-                "Move {} file(s) from '{source}' into '{dest}'? They are removed from the source directory.",
-                self.preview_total
-            ),
-            Command::Sync if self.sync_delete_missing => format!(
-                "Sync '{source}' → '{dest}': copy {} file(s) into the target and delete {} \
-                 file(s) from the target. Deletions cannot be undone. The source is not changed.",
-                self.preview_total, self.sync_delete_total
-            ),
-            Command::Sync => format!(
-                "Sync '{source}' → '{dest}': copy {} file(s) into the target. Nothing is \
-                 deleted and the source is not changed.",
-                self.preview_total
-            ),
-            Command::Mirror => format!(
-                "Mirror '{source}' → '{dest}': copy {} file(s) into the target and DELETE {} \
-                 file(s) the source does not have, so the target ends up holding exactly the \
-                 source's content. Deletions cannot be undone. The source is not changed.",
-                self.preview_total, self.sync_delete_total
-            ),
-            // DIFF never runs as a batch: its rows are applied one by one.
-            Command::Diff => return None,
-        })
-    }
-
-    /// Start the configured command on a worker thread. `only` restricts the
-    /// run to a single review row (the APPLY button); `None` runs the whole
-    /// batch minus any rejected rows.
-    fn start(&mut self, store: &Arc<Store>, only: Option<String>) {
-        let Some(source) = self.source.clone() else {
-            return;
-        };
+            command,
+            dest,
+            filter,
+            move_files,
+        } = config;
         let rejected: std::collections::HashSet<String> = self.review_state.rejected.clone();
-        // Snapshot everything the worker needs before spawning, branching on
-        // where the transfer lands. SYNC/MIRROR are their own destination
-        // (repo→repo at the same relative path), independent of REPO/FOLDER.
-        let dest = if self.command.repo_to_repo() {
-            let Some(target) = self.target.clone() else {
-                return;
-            };
-            StartDest::Sync {
-                target,
-                delete: self.sync_delete_mode(),
-                mirror: self.command == Command::Mirror,
-            }
-        } else {
-            match self.destination {
-                Destination::Repo => {
-                    let Some(target) = self.target.clone() else {
-                        return;
-                    };
-                    StartDest::Repo {
-                        references: self.references(&target),
-                        target,
-                        subdir: self.normalized_subdir(),
-                    }
-                }
-                Destination::Folder => {
-                    let folder = self.folder.trim().to_string();
-                    if folder.is_empty() {
-                        return;
-                    }
-                    StartDest::Folder {
-                        references: self.folder_references(),
-                        dir: PathBuf::from(&folder),
-                        mode: self.folder_mode(),
-                        invert: self.invert,
-                    }
-                }
-            }
-        };
-        let filter = self.filter_string();
-        let command = self.command;
-        let move_files = command == Command::Move;
         let store = Arc::clone(store);
         let tx = self.tx.clone();
         self.cancel = CancellationToken::new();
@@ -2159,6 +2290,10 @@ impl TransferView {
                 Msg::DiffPreview(result) => {
                     self.previewing = false;
                     self.apply_diff_preview(result);
+                }
+                Msg::ReviewPreview { result, confirm } => {
+                    self.previewing = false;
+                    self.apply_review_preview(result, confirm);
                 }
                 Msg::Done(result) => {
                     self.running = false;
@@ -3110,6 +3245,143 @@ mod ui_tests {
                 .iter()
                 .any(|r| r.left.iter().any(|f| f.rel_path == "holiday.jpg")),
             "the comparison landed and filled the board via the worker channel"
+        );
+    }
+
+    /// PREVIEW on a Copy command plans off-thread and fills the review board
+    /// once the plan lands — end to end through spawn → channel → drain, the
+    /// path the review-board tests otherwise inject around.
+    #[test]
+    fn review_preview_runs_off_thread_and_fills_the_board() {
+        let (_tmp, store) = sample_store();
+        for repo in ["source", "target"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .expect("scan");
+        }
+        // source has holiday.jpg + notes.txt, target is empty → both are "new".
+        let mut h = transfer_harness(Arc::clone(&store), |v| {
+            v.target = Some("target".to_string());
+            v.command = Command::Copy;
+        });
+        assert!(h.state().preview.is_empty(), "board starts empty");
+
+        // The button can be scrolled off the short test window; accesskit clicks
+        // reach it regardless.
+        h.get_by_label("PREVIEW").click_accesskit();
+        settle_preview(&mut h);
+
+        assert!(!h.state().previewing, "preview finished");
+        assert!(
+            h.state()
+                .preview
+                .iter()
+                .any(|r| r.source_path == "holiday.jpg"),
+            "the plan landed and filled the review board via the worker channel"
+        );
+    }
+
+    /// The full batch flow: RUN plans off-thread, the confirmation appears with
+    /// the real count, and PROCEED actually copies the files.
+    #[test]
+    fn run_asks_then_copies_on_proceed() {
+        let (tmp, store) = sample_store();
+        for repo in ["source", "target"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .expect("scan");
+        }
+        let target_dir = tmp.path().join("target");
+        let mut h = transfer_harness(Arc::clone(&store), |v| {
+            v.target = Some("target".to_string());
+            v.command = Command::Copy;
+        });
+
+        h.get_by_label("RUN").click_accesskit();
+        settle_preview(&mut h); // the plan lands and raises the confirmation
+        assert!(
+            h.state().confirm.is_some(),
+            "RUN raises a confirmation once the plan lands"
+        );
+        assert!(
+            h.state()
+                .confirm
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Copy 2 file(s)"),
+            "the prompt carries the real count: {:?}",
+            h.state().confirm
+        );
+
+        h.get_by_label("PROCEED").click_accesskit();
+        for _ in 0..200 {
+            h.step();
+            if target_dir.join("holiday.jpg").exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            target_dir.join("holiday.jpg").exists() && target_dir.join("notes.txt").exists(),
+            "PROCEED copied the planned files: {:?}",
+            h.state().error
+        );
+    }
+
+    /// A batch RUN plans off-thread, so the command/target can change before the
+    /// confirmation lands. The prompt and the run it authorises must describe the
+    /// config that was *planned*, not whatever the live controls say now.
+    #[test]
+    fn confirm_runs_the_planned_config_not_the_current_controls() {
+        let mut view = TransferView::new();
+        let planned = RunConfig {
+            source: "SRC".to_string(),
+            command: Command::Copy,
+            dest: StartDest::Repo {
+                references: Vec::new(),
+                target: "DEST_A".to_string(),
+                subdir: String::new(),
+            },
+            filter: None,
+            move_files: false,
+        };
+        let data = ReviewPreviewData {
+            rows: Vec::new(),
+            preview_total: 5,
+            sync_delete_total: 0,
+            preview_totals: [5, 0, 0],
+            source_header: "SRC".to_string(),
+            target_header: "DEST_A".to_string(),
+            status: String::new(),
+        };
+        // The user has since flipped the live controls to a Move elsewhere.
+        view.command = Command::Move;
+        view.target = Some("DEST_B".to_string());
+        view.apply_review_preview(Ok(data), Some(Box::new(planned)));
+
+        let prompt = view.confirm.as_deref().unwrap_or_default();
+        assert!(
+            prompt.contains("Copy 5 file(s)") && prompt.contains("DEST_A"),
+            "the confirmation describes the planned Copy into DEST_A, got: {prompt}"
+        );
+        let pending = view.pending_confirm.as_ref().expect("a run is pending");
+        assert!(
+            pending.command == Command::Copy,
+            "PROCEED runs the planned command"
+        );
+        assert!(
+            matches!(&pending.dest, StartDest::Repo { target, .. } if target == "DEST_A"),
+            "and the planned target"
         );
     }
 }
