@@ -254,6 +254,37 @@ fn rename_moves_the_file_and_its_index_entry() -> TestResult {
     Ok(())
 }
 
+/// A rename must leave the content indexed under exactly one path — never both.
+/// If the insert-new and drop-old writes were separate transactions, a crash
+/// between them would list the same (size, hash) twice: a phantom duplicate and
+/// inflated counts. Here we assert the post-condition the single transaction
+/// guarantees.
+#[test]
+fn rename_leaves_the_content_under_one_path_only() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.left, "old.txt", b"content")?;
+    sb.update_both()?;
+    let before = sb.store.get_repo_stats("LEFT")?;
+
+    rename_file(&sb.store, "LEFT", "old.txt", "new.txt")?;
+
+    let after = sb.store.get_repo_stats("LEFT")?;
+    assert_eq!(
+        (after.file_count, after.total_size),
+        (before.file_count, before.total_size),
+        "a rename changes neither the file count nor the total size"
+    );
+    assert_eq!(after.file_count, 1, "still exactly one file");
+    // The content-hash index lists the new path and only the new path, so the
+    // single copy is never reported as a duplicate group.
+    assert!(
+        sb.store.get_duplicate_groups("LEFT")?.is_empty(),
+        "one path per content: no phantom duplicate group"
+    );
+    assert_eq!(live_paths(&sb.store, "LEFT")?, ["new.txt"]);
+    Ok(())
+}
+
 #[test]
 fn rename_refuses_to_overwrite_an_existing_name() -> TestResult {
     let sb = Sandbox::new()?;

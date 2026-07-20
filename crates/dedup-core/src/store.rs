@@ -780,11 +780,20 @@ impl Store {
     }
 
     pub fn get_sync_group(&self, name: &str) -> Result<SyncGroup, StoreError> {
-        self.list_sync_groups()?
-            .into_iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, group)| group)
-            .ok_or_else(|| StoreError::GroupNotFound(name.to_string()))
+        let read_txn = self.registry.begin_read()?;
+        let table = match read_txn.open_table(SYNC_GROUPS) {
+            Ok(table) => table,
+            // No table yet means no groups, so the name is simply not found.
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(StoreError::GroupNotFound(name.to_string()));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        // A keyed lookup, not a scan of every group: the name is the table key.
+        match table.get(name)? {
+            Some(guard) => deserialize_value(SCHEMA_VERSION, guard.value()),
+            None => Err(StoreError::GroupNotFound(name.to_string())),
+        }
     }
 
     /// The group a repository belongs to, if any — the lookup the repo lists
@@ -804,8 +813,11 @@ impl Store {
         main: &str,
         mode: SyncMode,
     ) -> Result<(), StoreError> {
-        if self.list_sync_groups()?.iter().any(|(n, _)| n == name) {
-            return Err(StoreError::GroupExists(name.to_string()));
+        // Keyed existence check rather than a scan of every group.
+        match self.get_sync_group(name) {
+            Ok(_) => return Err(StoreError::GroupExists(name.to_string())),
+            Err(StoreError::GroupNotFound(_)) => {}
+            Err(e) => return Err(e),
         }
         self.get_repo(main)?;
         self.reject_if_grouped(main)?;
@@ -1501,6 +1513,29 @@ where
         for rel_path in rel_paths {
             tables.remove(rel_path)?;
         }
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+
+/// Move one entry from `from_rel` to `to_rel` in a single write transaction:
+/// insert the entry at the new path and drop the old one together, so a crash
+/// can never leave the same content indexed under both names (which would show
+/// as a phantom duplicate and inflate `file_count`/`total_size`).
+///
+/// The entry is written verbatim — a rename keeps the content, and therefore
+/// the fingerprints, untouched.
+pub fn rename_entry(
+    db: &redb::Database,
+    from_rel: &str,
+    to_rel: &str,
+    entry: &FileEntry,
+) -> Result<(), StoreError> {
+    let write_txn = db.begin_write()?;
+    {
+        let mut tables = RepoTables::open(&write_txn)?;
+        tables.upsert(to_rel, entry)?;
+        tables.remove(from_rel)?;
     }
     write_txn.commit()?;
     Ok(())

@@ -166,45 +166,49 @@ Result panel — done:
 
 ### E Code review backlog — 2026-07-20 (`feature/master/qa`)
 
-Correctness:
-- `rename_file` (`diff.rs:1472`) writes the new path and removes the old one in two
-  separate write transactions. Interrupted in between, the index holds the same
-  content under both names: phantom duplicate, inflated `file_count`/`total_size`.
-  Both writes belong in one `RepoTables` transaction.
+**Done 2026-07-20:**
+- Correctness: `rename_file` was two separate write transactions (insert new path,
+  remove old) — a crash between them left the same content indexed under both names
+  (phantom duplicate, inflated counts). Now one transaction via `store::rename_entry`.
+  Test: `repo_diff.rs::rename_leaves_the_content_under_one_path_only`.
+- Reuse: the repo-escape check is now one predicate, `diff.rs::stays_within_root`, called
+  by both `resolve_subdir` and `resolve_in_repo` — a hardening change can't touch one and
+  miss the other.
+- Performance: `Store::get_sync_group` is a keyed redb `get`, not a scan of every group;
+  `create_sync_group`'s existence check is keyed too.
+- Cleanup: the `diff_board` popup row travels in `BoardAction::OpenPopup { row }` — the
+  `thread_local! PENDING_ROW` (and its `unwrap_or(0)`) is gone.
+- Not a defect (kept, documented): the `BoardAction::OpenPopup | Inspect` arm in
+  `start_board_action` is required for match exhaustiveness. `board()` filters both out
+  before dispatch so it is unreachable, but removing it needs `unreachable!`, which
+  AGENTS forbids — the harmless empty-string arm stays.
+- Already resolved earlier: `sync_view`'s private `NoProgress` duplicate was replaced by
+  `CollectProblems` during the section-D result-panel work.
 
-Performance:
-- `run_preview_diff` (`transfer_view.rs:1635`) and `run_preview` (`sync_view.rs:654`)
-  run full index scans on the egui UI thread. At the 10⁵–10⁶ entries this tool targets
-  that is a multi-second freeze on the main workload; move both onto the existing
-  `worker.rs` thread + crossbeam channel.
-- `plan_group_sync`/`run_group_sync` re-read and re-deserialize the main's entire
-  index once per sink. Collect the main's entries and content-key set once before
-  the loop.
-- `Store::get_sync_group`/`sync_group_of` are full-table scans over a keyed redb
-  table; `create_sync_group` scans twice. `get_sync_group` can be a keyed `get`.
-
-Design depth:
-- `review::table` infers "single-sided board" from an empty `target_header`
-  (`review.rs:221`). A header that is empty for a frame silently drops the target
-  columns and rewrites `sort_col`. Model it like the neighbouring `RowControls`:
-  an explicit `Option<&str>` or `BoardSides` parameter.
-- The sync preview bakes the sink name into `ReviewRow.target_path` as
-  `format!("{sink}: {rel}")` (`sync_view.rs:669`), so sorting by target path sorts by
-  sink name and a path containing ": " is ambiguous. Give `ReviewRow` a repo/scope field.
-- `resolve_in_repo` (`diff.rs:1410`) re-implements the path-escape check already in
-  `resolve_subdir` (`diff.rs:62`). Two copies of a security check drift; factor into one.
-
-Cleanup:
-- `diff_board.rs` passes the popup's row index through a `thread_local` `PENDING_ROW`
-  cell with an `unwrap_or(0)` fallback; `BoardAction::OpenPopup` could just carry
-  `row: usize`. (Not currently exploitable — `rows.get()` is bounds-checked and the
-  modal blocks background input — but it is hidden global state for one value.)
-- Dead arm: `BoardAction::OpenPopup | Inspect` in `start_board_action`
-  (`transfer_view.rs:1759`) is unreachable — `board()` returns `None` for popups and
-  `Inspect` is intercepted at `transfer_view.rs:1389`.
-- `sync_view.rs` defines a private `NoProgress` duplicating
-  `dedup_core::diff::NoDiffProgress`; `diff_board.rs` duplicates review.rs's paging
-  strip and computes `totals(rows)` twice per frame.
+**Deferred — each wants its own focused pass:**
+- **[top remaining] UI-thread freeze.** `run_preview_diff` (`transfer_view.rs`) and
+  `run_preview` (`sync_view.rs`) scan both repos' full indexes synchronously on the egui
+  thread. At 10⁵–10⁶ entries — the main workload — that is a multi-second freeze on every
+  PREVIEW. This was a CONFIRMED top-three review finding. Move both onto the existing
+  `worker.rs` thread + crossbeam channel. Invasive because `Act::Ask` plans-then-confirms
+  synchronously, so it becomes a small state machine (Ask → spawn plan → on result show
+  confirm) — hence its own pass rather than bundled with the cleanups above.
+- **Per-sink main re-read.** `plan_group_sync`/`run_group_sync` re-open the main and
+  re-run `collect_source_entries` over its whole index once per sink. Collect the main's
+  entries and content-key set once before the loop and pass them in. Touches the shared
+  `plan_sync`/`diff_sync` signatures (also used by Transfer, CLI), so it needs care.
+- **Altitude: `review::table` single-sided sentinel.** Infers "no target side" from an
+  empty `target_header` (`review.rs`); an empty header for a frame silently drops the
+  target columns and rewrites `sort_col`. Model it like the neighbouring `RowControls`:
+  an explicit `Option<&str>` / `BoardSides`.
+- **Altitude: sink baked into `ReviewRow.target_path`.** The sync preview stores
+  `format!("{sink}: {rel}")`, so sorting by target path sorts by sink name and a rel-path
+  containing ": " is ambiguous. Give `ReviewRow` a repo/scope field rendered as its own
+  column.
+- **Minor efficiency in `diff_board`:** `totals(rows)` is computed twice per frame; the
+  paging strip duplicates `review.rs`'s; `sort`'s comparator clones a whole `DiffFile`
+  per comparison to read one field. All cosmetic at current scale; fold into whichever
+  pass touches the board next.
 
 
 

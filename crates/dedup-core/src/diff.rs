@@ -61,6 +61,19 @@ pub struct CopyDest<'a> {
     pub subdir: Option<&'a str>,
 }
 
+/// Whether a relative path stays inside its root: every component is an ordinary
+/// name or `.`, so joining it onto a root cannot escape (no absolute prefix, no
+/// drive/root, no `..`). The single place the repo-escape rule is defined, so
+/// [`resolve_subdir`] and [`resolve_in_repo`] cannot drift apart.
+fn stays_within_root(rel: &Path) -> bool {
+    rel.components().all(|c| {
+        matches!(
+            c,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    })
+}
+
 /// Resolve the destination root for a copy/move: `target_dir` optionally
 /// prefixed by a relative `subdir` inside it. An empty/blank subdir means the
 /// target root itself. A subdir that would escape the target root (absolute
@@ -71,15 +84,10 @@ fn resolve_subdir(target_dir: &Path, subdir: Option<&str>) -> Result<PathBuf, Di
         return Ok(target_dir.to_path_buf());
     }
     let rel = Path::new(raw);
-    for component in rel.components() {
-        match component {
-            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
-            _ => {
-                return Err(DiffError::InvalidSubdir {
-                    subdir: raw.to_string(),
-                });
-            }
-        }
+    if !stays_within_root(rel) {
+        return Err(DiffError::InvalidSubdir {
+            subdir: raw.to_string(),
+        });
     }
     Ok(target_dir.join(rel))
 }
@@ -1413,17 +1421,11 @@ pub enum DiffOpError {
 }
 
 /// Resolve a repo-relative path to an absolute one, refusing anything that
-/// would escape the repo root (absolute components or `..`).
+/// would escape the repo root (absolute components or `..`) or is empty. Shares
+/// its escape rule with [`resolve_subdir`] via [`stays_within_root`].
 fn resolve_in_repo(root: &Path, rel_path: &str) -> Result<PathBuf, DiffOpError> {
     let rel = Path::new(rel_path);
-    if rel_path.trim().is_empty()
-        || rel.components().any(|c| {
-            !matches!(
-                c,
-                std::path::Component::Normal(_) | std::path::Component::CurDir
-            )
-        })
-    {
+    if rel_path.trim().is_empty() || !stays_within_root(rel) {
         return Err(DiffOpError::InvalidPath {
             path: rel_path.to_string(),
         });
@@ -1475,9 +1477,9 @@ pub fn rename_file(
     })?;
     // The content did not change, so the entry moves over as it is; the old
     // path is dropped outright rather than left behind as missing (the file
-    // was not lost, it just has another name now).
-    store::apply_entries(&open.db, std::iter::once((to_rel, &entry)))?;
-    store::remove_entries(&open.db, std::iter::once(from_rel))?;
+    // was not lost, it just has another name now). Both index writes happen in
+    // one transaction, so a crash can never leave the content under both names.
+    store::rename_entry(&open.db, from_rel, to_rel, &entry)?;
     Ok(())
 }
 

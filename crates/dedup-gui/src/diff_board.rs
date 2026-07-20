@@ -115,7 +115,12 @@ pub enum BoardAction {
     /// Not a file operation: open the two versions side by side.
     Inspect { left_rel: String, right_rel: String },
     /// Not a file operation: a row's button needs a follow-up answer first.
-    OpenPopup { on_left: bool, kind: PopupKind },
+    /// Carries the row it came from, so the popup knows which row it acts on.
+    OpenPopup {
+        row: usize,
+        on_left: bool,
+        kind: PopupKind,
+    },
 }
 
 /// Colour vocabulary shared with the review board: what a row means at a
@@ -246,7 +251,6 @@ pub fn board(
     let (sort_col, sort_asc) = (state.sort_col, state.sort_asc);
     let mut clicked: Option<BoardCol> = None;
     let mut action: Option<BoardAction> = None;
-    PENDING_ROW.with(|cell| cell.set(None));
 
     TableBuilder::new(ui)
         .striped(true)
@@ -286,8 +290,8 @@ pub fn board(
                 let r = &rows[row_index];
                 let color = relation_color(r.relation);
                 row.col(|ui| {
-                    if let Some(a) = side_actions(ui, r, true) {
-                        action = Some(with_row(a, row_index));
+                    if let Some(a) = side_actions(ui, r, row_index, true) {
+                        action = Some(a);
                     }
                 });
                 row.col(|ui| paths_cell(ui, &r.left, color));
@@ -297,8 +301,8 @@ pub fn board(
                 row.col(|ui| sizes_cell(ui, &r.right, color));
                 row.col(|ui| dates_cell(ui, &r.right, color));
                 row.col(|ui| {
-                    if let Some(a) = side_actions(ui, r, false) {
-                        action = Some(with_row(a, row_index));
+                    if let Some(a) = side_actions(ui, r, row_index, false) {
+                        action = Some(a);
                     }
                 });
             });
@@ -314,9 +318,10 @@ pub fn board(
         state.page = 0;
     }
     // A button that needs a follow-up answer opens a popup instead of acting.
-    if let Some(BoardAction::OpenPopup { on_left, kind }) = &action {
+    // The action carries the row it came from, so no side channel is needed.
+    if let Some(BoardAction::OpenPopup { row, on_left, kind }) = &action {
         state.popup = Some(Popup {
-            row: PENDING_ROW.with(|cell| cell.get()).unwrap_or(0),
+            row: *row,
             on_left: *on_left,
             kind: *kind,
         });
@@ -328,22 +333,6 @@ pub fn board(
         return action;
     }
     popup(ui, state, rows)
-}
-
-/// Remember which row a popup-opening click came from (the action itself
-/// carries only the side).
-fn with_row(action: BoardAction, row: usize) -> BoardAction {
-    if let BoardAction::OpenPopup { on_left, kind } = action {
-        PENDING_ROW.with(|cell| cell.set(Some(row)));
-        return BoardAction::OpenPopup { on_left, kind };
-    }
-    action
-}
-
-thread_local! {
-    /// The row index of the last popup-opening click, handed from the table
-    /// body (which knows the index) to the popup state (which needs it).
-    static PENDING_ROW: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// Render the open popup, if any, and turn the user's answer into an action.
@@ -511,7 +500,12 @@ fn dates_cell(ui: &mut egui::Ui, files: &[DiffFile], color: egui::Color32) {
 /// depends on the row's relation and on how many names each side holds — a
 /// side with several names is narrowed down first (that is step-by-step
 /// duplicate resolution), so only 1:1 rows offer RENAME / OVERWRITE.
-fn side_actions(ui: &mut egui::Ui, row: &RepoDiffRow, on_left: bool) -> Option<BoardAction> {
+fn side_actions(
+    ui: &mut egui::Ui,
+    row: &RepoDiffRow,
+    row_index: usize,
+    on_left: bool,
+) -> Option<BoardAction> {
     let (here, there) = if on_left {
         (&row.left, &row.right)
     } else {
@@ -554,6 +548,7 @@ fn side_actions(ui: &mut egui::Ui, row: &RepoDiffRow, on_left: bool) -> Option<B
                         .clicked()
                     {
                         action = Some(BoardAction::OpenPopup {
+                            row: row_index,
                             on_left,
                             kind: PopupKind::ConfirmDeleteAll,
                         });
@@ -563,6 +558,7 @@ fn side_actions(ui: &mut egui::Ui, row: &RepoDiffRow, on_left: bool) -> Option<B
                         .clicked()
                     {
                         action = Some(BoardAction::OpenPopup {
+                            row: row_index,
                             on_left,
                             kind: PopupKind::KeepOne,
                         });
@@ -580,6 +576,7 @@ fn side_actions(ui: &mut egui::Ui, row: &RepoDiffRow, on_left: bool) -> Option<B
                         .clicked()
                     {
                         action = Some(BoardAction::OpenPopup {
+                            row: row_index,
                             on_left,
                             kind: PopupKind::PickName,
                         });
