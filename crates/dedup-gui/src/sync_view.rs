@@ -6,8 +6,8 @@
 //! removes sink content the main no longer has, so the sink converges on
 //! exactly the main's content.
 //!
-//! The tab follows the same PREVIEW → confirm → RUN shape as the Transfer tab:
-//! PREVIEW plans every sink and renders the result in the shared review board,
+//! The tab follows the same REVIEW → confirm → RUN shape as the Transfer tab:
+//! REVIEW plans every sink and renders the result in the shared review board,
 //! RUN asks before touching anything and then pushes on a worker thread.
 
 use crate::review;
@@ -299,7 +299,7 @@ impl SyncView {
                         .size(18.0)
                         .strong(),
                 );
-                crate::util::shortcut_bar(ui, "P preview · R run sync");
+                crate::util::shortcut_bar(ui, "P review · R run sync");
 
                 self.groups_section(ui, &mut acts);
                 self.new_group_section(ui, &mut acts);
@@ -583,7 +583,7 @@ impl SyncView {
     }
 
     fn action_section(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "ACTION — PREVIEW & RUN SYNC", theme::AMBER, |ui| {
+        crate::lcars::section_lcars(ui, "ACTION — REVIEW & RUN SYNC", theme::AMBER, |ui| {
             ui.horizontal(|ui| {
                 let ready = !self.running
                     && !self.previewing
@@ -593,11 +593,11 @@ impl SyncView {
                 if ui
                     .add_enabled(
                         ready,
-                        egui::Button::new(RichText::new("PREVIEW").color(theme::BLACK)),
+                        egui::Button::new(RichText::new("REVIEW").color(theme::BLACK)),
                     )
                     .explain(
                         self.verbosity,
-                        "Preview the next push",
+                        "Review the next push",
                         "Show what a push would copy into each sink (and, in MIRROR mode, \
                          what it would delete there) without touching disk.",
                     )
@@ -654,7 +654,7 @@ impl SyncView {
             ui.add_space(6.0);
             ui.colored_label(
                 theme::TEXT,
-                "Pick a group and press PREVIEW to see what its next push would do.",
+                "Pick a group and press REVIEW to see what its next push would do.",
             );
             return;
         }
@@ -1140,7 +1140,7 @@ mod ui_tests {
         );
     }
 
-    /// PREVIEW plans every sink and renders the result in the shared review
+    /// REVIEW plans every sink and renders the result in the shared review
     /// board — copies on the sink side, mirror deletions marked removed.
     #[test]
     fn preview_shows_what_the_push_would_do() {
@@ -1165,7 +1165,7 @@ mod ui_tests {
         let mut h = harness(Arc::clone(&store));
         h.get_by_label("offsite").click();
         h.run();
-        h.get_by_label("PREVIEW").click();
+        h.get_by_label("REVIEW").click();
         settle(&mut h);
 
         assert_eq!(
@@ -1209,7 +1209,7 @@ mod ui_tests {
         let mut h = harness(Arc::clone(&store));
         h.get_by_label("offsite").click();
         h.run();
-        h.get_by_label("PREVIEW").click();
+        h.get_by_label("REVIEW").click();
         settle(&mut h);
 
         assert!(
@@ -1217,7 +1217,7 @@ mod ui_tests {
             "the deletion is listed"
         );
         assert_eq!(
-            h.query_all_by_label("REVIEW").count(),
+            h.query_all_by_label("ACTIONS").count(),
             0,
             "no per-row action column"
         );

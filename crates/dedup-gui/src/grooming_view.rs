@@ -372,7 +372,7 @@ impl GroomingView {
                 );
                 crate::util::shortcut_bar(
                     ui,
-                    "1 dedupe · 2 purge · 3 empty-dirs · 4 organize · 5 prune · P preview · R run",
+                    "1 dedupe · 2 purge · 3 empty-dirs · 4 organize · 5 prune · P review · R run",
                 );
 
                 self.command_bar(ui, &mut acts);
@@ -784,20 +784,20 @@ impl GroomingView {
 
     /// A single-line filter expression (mime / size / name with `*` wildcards).
     fn action_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "ACTION — PREVIEW & RUN", theme::AMBER, |ui| {
+        crate::lcars::section_lcars(ui, "ACTION — REVIEW & RUN", theme::AMBER, |ui| {
             ui.horizontal(|ui| {
                 let ready = self.ready();
                 // EMPTY DIRS has no meaningful file preview (its count is only
-                // known after walking), so PREVIEW is offered for the other two.
+                // known after walking), so REVIEW is offered for the other two.
                 if self.command != Command::EmptyDirs
                     && ui
                         .add_enabled(
                             ready,
-                            egui::Button::new(RichText::new("PREVIEW").color(theme::BLACK)),
+                            egui::Button::new(RichText::new("REVIEW").color(theme::BLACK)),
                         )
                         .explain(
                             self.verbosity,
-                            "Preview what would be deleted",
+                            "Review what would be deleted",
                             "List the first matching files (up to a limit) and a total count, \
                              without changing anything on disk.",
                         )
@@ -844,7 +844,7 @@ impl GroomingView {
     fn preview_panel(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         if self.preview.is_empty() {
             ui.add_space(6.0);
-            ui.colored_label(theme::TEXT, "Pick a repo and command, then press PREVIEW.");
+            ui.colored_label(theme::TEXT, "Pick a repo and command, then press REVIEW.");
             return;
         }
         if let Some(review::ReviewAction::Apply(key)) = review::table(

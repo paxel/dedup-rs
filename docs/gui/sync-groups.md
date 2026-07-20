@@ -41,9 +41,9 @@ is never refused.
 Content is compared by size + BLAKE3 hash, never by path, so a file that already exists in
 the sink under a different name is not copied again.
 
-## Preview and run
+## Review and run
 
-- **PREVIEW** (`P`) plans every sink and shows the result in the shared review board: each
+- **REVIEW** (`P`) plans every sink and shows the result in the shared review board: each
   row is a file to copy into a sink (marked *added*) or, in MIRROR mode, to delete from it
   (marked *removed*), with the sink named in the path so several sinks read as one list.
   Nothing on disk is touched.

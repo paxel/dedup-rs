@@ -3,7 +3,7 @@
 ![File Management tab](../screenshots/files_tab.png)
 
 Copy, move, or delete files between repositories by content (size + BLAKE3 — paths never
-matter), with an assisted filter builder and a preview before anything runs. This is the GUI
+matter), with an assisted filter builder and a review before anything runs. This is the GUI
 equivalent of [`diff cp`/`mv`/`rm`](../cli.md#diff).
 
 ## Repo pickers
@@ -55,7 +55,7 @@ machines.
 
 ## Diff board
 
-**DIFF** replaces the preview table with a two-sided comparison of the source (left) and
+**DIFF** replaces the review board with a two-sided comparison of the source (left) and
 target (right) repo, with each side's path, size and modification date in sortable columns.
 
 **PAIR BY** decides what counts as one row:
@@ -84,11 +84,11 @@ reflect the current state.
 Equal rows are hidden until **SHOW EQUAL** is pressed, and each action is applied to disk
 and to both repo indexes immediately — there is no RUN button and no batch confirmation.
 
-## Preview and run
+## Review and run
 
-- **PREVIEW** shows the first matching `from → to` transfers (up to a limit) and a total
-  count, without touching disk. PREVIEW and RUN are mutually exclusive — starting a run
-  clears the preview and vice versa.
+- **REVIEW** shows the first matching `from → to` transfers (up to a limit) and a total
+  count, without touching disk. REVIEW and RUN are mutually exclusive — starting a run
+  clears the review and vice versa.
 - **RUN** starts the command on a background thread after a confirmation dialog. Live
   progress shows a spinner, the file currently being handled, the last few actions, and a
   running count. **CANCEL** stops the operation — files already transferred or deleted before

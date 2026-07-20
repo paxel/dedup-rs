@@ -78,7 +78,7 @@ values highlighted — and the same actions per side. Nothing happens until you 
 button; rows that are equal on both sides are hidden until you ask for them.
 
 Use the FILTER wizard below to narrow which files are considered — conditions combine with \
-AND. PREVIEW shows the matching transfers, paged, plus a total count, without touching \
+AND. REVIEW shows the matching transfers, paged, plus a total count, without touching \
 disk. RUN asks for confirmation, then performs the transfer while you watch its progress — \
 CANCEL stops it at any point.";
 
@@ -96,7 +96,7 @@ deletes anything, so a sink may keep files the main no longer has. MIRROR also d
 sink content the main does not have, so each sink ends up holding exactly the main's \
 content — those deletions cannot be undone.
 
-PREVIEW plans every sink and shows what would be copied and deleted without touching disk; \
+REVIEW plans every sink and shows what would be copied and deleted without touching disk; \
 RUN SYNC asks for confirmation and then pushes on a background thread. Each sink is handled \
 independently, so one unreachable backup drive does not stop the others, and the main is \
 never changed. To bring changes made inside a sink back to the main, use the Transfer tab's \
@@ -135,7 +135,7 @@ never outside it.
 Save the current rule list as a preset with STORE PRESET, to reuse on any repo; right-click a \
 preset to rename it.
 
-Every destructive command runs behind a PREVIEW and a confirmation dialog, on a background \
+Every destructive command runs behind a REVIEW and a confirmation dialog, on a background \
 thread with a CANCEL button.";
 
 const BROWSE: &str = "\

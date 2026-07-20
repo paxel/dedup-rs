@@ -199,7 +199,7 @@ pub fn sort(rows: &mut [ReviewRow], state: &ReviewState) {
 }
 
 /// Render the review board: a summary line (true full counts), an optional
-/// "show unchanged" toggle, a "previewing first N" note when the sample was
+/// "show unchanged" toggle, a "showing first N" note when the sample was
 /// capped, a row count with page controls, then the virtualised, click-to-sort
 /// four-column diff. `totals` is `[added, removed, unchanged]` full counts,
 /// independent of the capped sample.
@@ -251,7 +251,7 @@ pub fn table(
     if full > rows.len() {
         ui.label(
             RichText::new(format!(
-                "previewing the first {} of {full} — refine the filter to see the rest",
+                "showing the first {} of {full} — refine the filter to see the rest",
                 rows.len()
             ))
             .color(theme::TAN)
@@ -339,7 +339,7 @@ pub fn table(
         .header(24.0, |mut header| {
             if interactive {
                 header.col(|ui| {
-                    ui.label(RichText::new("REVIEW").color(theme::TEXT).size(12.0));
+                    ui.label(RichText::new("ACTIONS").color(theme::TEXT).size(12.0));
                 });
             }
             for &(col, title) in cols {

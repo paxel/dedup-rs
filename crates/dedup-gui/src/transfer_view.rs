@@ -160,7 +160,7 @@ enum StartDest {
     },
 }
 
-/// Everything a PREVIEW, its confirmation, and the RUN it authorises need,
+/// Everything a REVIEW, its confirmation, and the RUN it authorises need,
 /// snapshotted at the moment the user asks — so nothing the live controls do
 /// between an async plan landing and PROCEED can change what actually runs.
 /// (Same reasoning as sync_view's `pending_push`.)
@@ -531,7 +531,7 @@ pub struct TransferView {
     preview: Vec<review::ReviewRow>,
     /// DIFF: how the two repos are paired up (by content or by path).
     pairing: DiffPairing,
-    /// DIFF: the rows of the current comparison, empty until PREVIEW.
+    /// DIFF: the rows of the current comparison, empty until REVIEW.
     diff_rows: Vec<RepoDiffRow>,
     /// Sort/paging state of the diff board.
     board_state: crate::diff_board::BoardState,
@@ -741,7 +741,7 @@ impl TransferView {
                 );
                 crate::util::shortcut_bar(
                     ui,
-                    "1 copy · 2 move · 3 sync · 4 mirror · 5 diff · P preview · R run",
+                    "1 copy · 2 move · 3 sync · 4 mirror · 5 diff · P review · R run",
                 );
 
                 self.repo_rows(ui, &mut acts);
@@ -790,7 +790,7 @@ impl TransferView {
                     ui.label(RichText::new(status).color(theme::TAN).size(13.0));
                 }
                 ui.separator();
-                // RUN and PREVIEW are mutually exclusive: while a run is active
+                // RUN and REVIEW are mutually exclusive: while a run is active
                 // or has left a log, show the live run panel; otherwise show the
                 // preview.
                 if self.running || !self.run_log.is_empty() {
@@ -1012,11 +1012,11 @@ impl TransferView {
         }
     }
 
-    /// Whether PREVIEW/RUN can act: a source is picked, the destination is
+    /// Whether REVIEW/RUN can act: a source is picked, the destination is
     /// resolved (a target repo, or a non-blank export folder), and nothing is
     /// already running.
     fn ready(&self) -> bool {
-        // A preview in flight disables PREVIEW/RUN too, so a second click cannot
+        // A preview in flight disables REVIEW/RUN too, so a second click cannot
         // launch an overlapping worker.
         if self.running || self.previewing || self.source.is_none() {
             return false;
@@ -1435,21 +1435,21 @@ impl TransferView {
     }
 
     fn action_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "ACTION — PREVIEW & RUN", theme::AMBER, |ui| {
+        crate::lcars::section_lcars(ui, "ACTION — REVIEW & RUN", theme::AMBER, |ui| {
             ui.horizontal(|ui| {
                 let ready = self.ready();
                 if ui
                     .add_enabled(
                         ready,
-                        egui::Button::new(RichText::new("PREVIEW").color(theme::BLACK)),
+                        egui::Button::new(RichText::new("REVIEW").color(theme::BLACK)),
                     )
                     .explain(
                         self.verbosity,
-                        "Preview the first transfers",
-                        "Show the first matching `from → to` transfers (up to a preview \
+                        "Review the first transfers",
+                        "Show the first matching `from → to` transfers (up to a \
                          limit) and a total count, without changing anything on disk. \
-                         PREVIEW and RUN are mutually exclusive — starting a run clears the \
-                         preview.",
+                         REVIEW and RUN are mutually exclusive — starting a run clears the \
+                         review.",
                     )
                     .clicked()
                 {
@@ -1505,7 +1505,7 @@ impl TransferView {
                 ui.add_space(6.0);
                 ui.colored_label(
                     theme::TEXT,
-                    "Pick two repos and press PREVIEW to compare them.",
+                    "Pick two repos and press REVIEW to compare them.",
                 );
                 return;
             }
@@ -1524,7 +1524,7 @@ impl TransferView {
             ui.add_space(6.0);
             ui.colored_label(
                 theme::TEXT,
-                "Pick a source, a target and a command, then press PREVIEW.",
+                "Pick a source, a target and a command, then press REVIEW.",
             );
             return;
         }
@@ -1822,7 +1822,7 @@ impl TransferView {
         let Some(source) = self.source.clone() else {
             return;
         };
-        // PREVIEW and RUN are mutually exclusive: previewing drops any run log.
+        // REVIEW and RUN are mutually exclusive: reviewing drops any run log.
         self.reset_run();
         if self.command.is_diff() {
             self.run_preview_diff(store, &source);
@@ -2126,7 +2126,7 @@ impl TransferView {
             self.pending_refresh = true;
             self.reset_run();
         } else {
-            // RUN and PREVIEW are mutually exclusive: starting a run drops the
+            // RUN and REVIEW are mutually exclusive: starting a run drops the
             // stale preview and resets the live run log/counters.
             self.clear_preview();
             self.reset_run();
@@ -2843,8 +2843,8 @@ mod ui_tests {
             "DIFF compares the repos whole, so the filter wizard is hidden"
         );
         assert!(
-            h.query_by_label("PREVIEW").is_some(),
-            "PREVIEW still builds the comparison"
+            h.query_by_label("REVIEW").is_some(),
+            "REVIEW still builds the comparison"
         );
     }
 
@@ -3195,7 +3195,7 @@ mod ui_tests {
     }
 
     /// Pump frames until the DIFF preview worker has delivered its result.
-    /// PREVIEW plans off the UI thread now, so the click's own `run()` returns
+    /// REVIEW plans off the UI thread now, so the click's own `run()` returns
     /// before the rows arrive; the tiny test repos finish near-instantly.
     fn settle_preview(h: &mut Harness<'static, TransferView>) {
         for _ in 0..100 {
@@ -3209,7 +3209,7 @@ mod ui_tests {
         panic!("diff preview did not settle");
     }
 
-    /// PREVIEW on a DIFF command plans on a worker thread and fills the board
+    /// REVIEW on a DIFF command plans on a worker thread and fills the board
     /// once the comparison lands — the UI thread is never blocked on the scan.
     #[test]
     fn diff_preview_runs_off_thread_and_fills_the_board() {
@@ -3234,7 +3234,7 @@ mod ui_tests {
         // Nothing on the board yet — the plan hasn't been asked for.
         assert!(h.state().diff_rows.is_empty(), "board starts empty");
 
-        h.get_by_label("PREVIEW").click();
+        h.get_by_label("REVIEW").click();
         // The result arrives over the channel from a worker thread, never inline
         // on the UI thread; settle pumps frames until it lands.
         settle_preview(&mut h);
@@ -3249,7 +3249,7 @@ mod ui_tests {
         );
     }
 
-    /// PREVIEW on a Copy command plans off-thread and fills the review board
+    /// REVIEW on a Copy command plans off-thread and fills the review board
     /// once the plan lands — end to end through spawn → channel → drain, the
     /// path the review-board tests otherwise inject around.
     #[test]
@@ -3274,7 +3274,7 @@ mod ui_tests {
 
         // The button can be scrolled off the short test window; accesskit clicks
         // reach it regardless.
-        h.get_by_label("PREVIEW").click_accesskit();
+        h.get_by_label("REVIEW").click_accesskit();
         settle_preview(&mut h);
 
         assert!(!h.state().previewing, "preview finished");

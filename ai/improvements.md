@@ -13,7 +13,6 @@
   `store.rs::v1_entries_decode_and_flag_images_stale`).
 
 ## A usability
-- the preview button should be renamed review as it is now a way for the user to review the action
 - for the review pane we need more infos. the filename columns need to contain basically the same infos as the duplicate tabs group items. thumbnail, audio duration, size, etc. extremely nice would be a diff button between both that opens a lightbox diff view
   - for purge no diff button but still the info panel.
   - these type based info panels should be in a way that we can easily extend them in the future
