@@ -209,16 +209,19 @@ pub fn table(
     rows: &mut [ReviewRow],
     totals: [usize; 3],
     source_header: &str,
-    target_header: &str,
+    // `None` is a declared single-sided board (PURGE and the other single-repo
+    // commands): the target columns are left out. A two-sided caller always
+    // passes `Some`, so an empty header string can never silently drop them.
+    target: Option<&str>,
     controls: RowControls,
 ) -> Option<ReviewAction> {
     summary(ui, totals, state.rejected.len());
     let interactive = controls == RowControls::Enabled;
 
-    // No target repo (PURGE and the other single-repo commands): the target
-    // columns would be two empty columns, so they are left out — and the sort
-    // must not sit on one of them.
-    let two_sided = !target_header.is_empty();
+    let two_sided = target.is_some();
+    let target_header = target.unwrap_or("");
+    // A single-sided board has no target columns, so the sort must not sit on
+    // one of them.
     if !two_sided && matches!(state.sort_col, ReviewCol::Target | ReviewCol::TargetStatus) {
         state.sort_col = ReviewCol::Source;
         sort(rows, state);
@@ -540,6 +543,53 @@ mod tests {
     fn is_unchanged_requires_both_sides() {
         assert!(row(SideStatus::Unchanged, SideStatus::Unchanged, "a", "a").is_unchanged());
         assert!(!row(SideStatus::Unchanged, SideStatus::Added, "a", "a").is_unchanged());
+    }
+
+    /// One-sidedness is now a declared mode (`target: None`), not inferred from
+    /// an empty header string. So a two-sided board whose header is momentarily
+    /// empty keeps its target columns and sort, while a declared one-sided board
+    /// resets a target sort onto the source column.
+    #[test]
+    fn one_sided_is_declared_not_inferred_from_an_empty_header() {
+        assert_eq!(
+            sort_col_after_table(Some("")),
+            ReviewCol::Target,
+            "Some(\"\") is two-sided: a target sort survives an empty header"
+        );
+        assert_eq!(
+            sort_col_after_table(None),
+            ReviewCol::Source,
+            "None is one-sided: the target sort is reset onto the source column"
+        );
+    }
+
+    /// Render `table` once with the sort on a target column and return where the
+    /// sort ended up.
+    fn sort_col_after_table(target: Option<&str>) -> ReviewCol {
+        use egui_kittest::Harness;
+        let state = ReviewState {
+            sort_col: ReviewCol::Target,
+            ..Default::default()
+        };
+        let rows = vec![row(SideStatus::Removed, SideStatus::Absent, "a", "")];
+        let target = target.map(str::to_string);
+        let mut harness = Harness::builder().build_ui_state(
+            move |ui, (state, rows): &mut (ReviewState, Vec<ReviewRow>)| {
+                crate::theme::apply(ui.ctx());
+                table(
+                    ui,
+                    state,
+                    rows,
+                    [1, 0, 0],
+                    "SRC",
+                    target.as_deref(),
+                    RowControls::ReadOnly,
+                );
+            },
+            (state, rows),
+        );
+        harness.run();
+        harness.state().0.sort_col
     }
 
     #[test]

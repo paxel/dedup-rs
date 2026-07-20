@@ -1534,7 +1534,8 @@ impl TransferView {
             &mut self.preview,
             self.preview_totals,
             &self.preview_source_header,
-            &self.preview_target_header,
+            // Transfer is always two-sided (source → target/folder).
+            Some(&self.preview_target_header),
             review::RowControls::Enabled,
         ) {
             acts.push(Act::ApplyRow(key));

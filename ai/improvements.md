@@ -66,10 +66,6 @@ Sequence: (1) previewable abstraction + generalise `CompareState`; (2) route DIF
   re-run `collect_source_entries` over its whole index once per sink. Collect the main's
   entries and content-key set once before the loop. Touches the shared `plan_sync`/
   `diff_sync` signatures (also used by Transfer, CLI), so it needs care.
-- **`review::table` single-sided sentinel.** Infers "no target side" from an empty
-  `target_header`; an empty header for a frame silently drops the target columns and
-  rewrites `sort_col`. Model it like `RowControls`: an explicit `Option<&str>` /
-  `BoardSides`.
 - **Sink baked into `ReviewRow.target_path`.** The sync preview stores
   `format!("{sink}: {rel}")`, so sorting by target path sorts by sink name and a rel-path
   containing ": " is ambiguous. Give `ReviewRow` a repo/scope field rendered as its own

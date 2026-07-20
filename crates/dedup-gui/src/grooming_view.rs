@@ -217,11 +217,12 @@ pub struct GroomingView {
     /// Full per-kind counts (indexed by [`review::RowKind::idx`]) for the review
     /// summary; independent of the capped `preview` sample.
     preview_totals: [usize; 3],
-    /// The two review-table column headers (absolute paths). ORGANIZE uses the
-    /// same repo on both sides (old path → new path); the single-repo deletions
-    /// leave the target header empty.
+    /// The review-table column headers (absolute paths). ORGANIZE uses the same
+    /// repo on both sides (old path → new path); the single-repo deletions
+    /// (DEDUPE/PURGE/PRUNE) have no target side, so `preview_target_header` is
+    /// `None` and the board renders one-sided.
     preview_source_header: String,
-    preview_target_header: String,
+    preview_target_header: Option<String>,
     preview_total: usize,
     /// Sort column + direction for the review table.
     review_state: review::ReviewState,
@@ -286,7 +287,7 @@ impl GroomingView {
             preview: Vec::new(),
             preview_totals: [0; 3],
             preview_source_header: String::new(),
-            preview_target_header: String::new(),
+            preview_target_header: None,
             preview_total: 0,
             review_state: review::ReviewState::default(),
             status: None,
@@ -852,7 +853,7 @@ impl GroomingView {
             &mut self.preview,
             self.preview_totals,
             &self.preview_source_header,
-            &self.preview_target_header,
+            self.preview_target_header.as_deref(),
             review::RowControls::Enabled,
         ) {
             acts.push(Act::ApplyRow(key));
@@ -1105,7 +1106,7 @@ impl GroomingView {
         self.preview.clear();
         self.preview_totals = [0; 3];
         self.preview_source_header.clear();
-        self.preview_target_header.clear();
+        self.preview_target_header = None;
         self.preview_total = 0;
         // Rejections are keyed to the preview they were made in.
         self.review_state.rejected.clear();
@@ -1176,7 +1177,7 @@ impl GroomingView {
                 // source side is removed, the target side is absent.
                 self.preview_total = total;
                 self.preview_totals = [0, total, 0];
-                self.preview_target_header.clear();
+                self.preview_target_header = None;
                 let mut rows: Vec<review::ReviewRow> = paths
                     .into_iter()
                     .map(|from| review::ReviewRow {
@@ -1221,7 +1222,7 @@ impl GroomingView {
                 // the new path added — same repo on both sides.
                 let header = Self::repo_header(store, &repo);
                 self.preview_source_header = header.clone();
-                self.preview_target_header = header;
+                self.preview_target_header = Some(header);
                 let mut rows: Vec<review::ReviewRow> = moves
                     .into_iter()
                     .take(PREVIEW_CAP)

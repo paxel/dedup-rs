@@ -644,7 +644,8 @@ impl SyncView {
             &mut self.preview,
             self.preview_totals,
             &self.preview_main_header,
-            &self.preview_sink_header,
+            // A group push is always two-sided (main → sinks).
+            Some(&self.preview_sink_header),
             review::RowControls::ReadOnly,
         );
     }
