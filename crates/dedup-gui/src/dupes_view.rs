@@ -516,9 +516,12 @@ impl DupesView {
     pub fn sync_repos(&mut self, store: &Store) {
         match store.list_repos() {
             Ok(list) => {
+                // Sinks are searched through their group's main, not directly.
+                let sinks = store.sink_repo_names().unwrap_or_default();
                 let prev = std::mem::take(&mut self.repos);
                 self.repos = list
                     .into_iter()
+                    .filter(|(name, _, _)| !sinks.contains(name))
                     .map(|(name, _, _)| {
                         let old = prev.iter().find(|r| r.name == name);
                         RepoSel {

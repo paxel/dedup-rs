@@ -875,7 +875,14 @@ impl TransferView {
     pub fn sync_repos(&mut self, store: &Store) {
         match store.list_repos() {
             Ok(list) => {
-                self.repos = list.into_iter().map(|(n, _, _)| n).collect();
+                // Sinks are managed through their group's main, not operated on
+                // directly, so they are not offered here.
+                let sinks = store.sink_repo_names().unwrap_or_default();
+                self.repos = list
+                    .into_iter()
+                    .map(|(n, _, _)| n)
+                    .filter(|n| !sinks.contains(n))
+                    .collect();
                 if let Some(s) = &self.source
                     && !self.repos.contains(s)
                 {
@@ -2414,6 +2421,27 @@ mod ui_tests {
             .create_repo("target", &dst_dir.to_string_lossy())
             .unwrap();
         (tmp, Arc::new(store))
+    }
+
+    /// A sink is managed through its group's main, so it is not offered as a
+    /// source or target here — only the main and ungrouped repos are.
+    #[test]
+    fn a_sink_is_not_offered_as_a_repo() {
+        let (_tmp, store) = sample_store();
+        store.create_sync_group("source", "source").expect("group");
+        store
+            .add_sync_sink("source", "target", dedup_core::store::SyncMode::AddOnly)
+            .expect("sink");
+        let mut view = TransferView::new();
+        view.sync_repos(&store);
+        assert!(
+            view.repos.contains(&"source".to_string()),
+            "the main is offered"
+        );
+        assert!(
+            !view.repos.contains(&"target".to_string()),
+            "the sink is hidden"
+        );
     }
 
     /// Build a headless harness showing the Transfer view over `store`, driven

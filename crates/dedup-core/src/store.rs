@@ -855,6 +855,19 @@ impl Store {
             .find(|(_, group)| group.has_member(repo)))
     }
 
+    /// The names of every repository that is a *sink* of some sync group. The
+    /// operational tabs (Transfer, Grooming, Duplicates, Browse) hide these: a
+    /// sink is acted on through its group's main, not directly.
+    pub fn sink_repo_names(&self) -> Result<std::collections::HashSet<String>, StoreError> {
+        let mut sinks = std::collections::HashSet::new();
+        for (_, group) in self.list_sync_groups()? {
+            for sink in group.sinks {
+                sinks.insert(sink.repo);
+            }
+        }
+        Ok(sinks)
+    }
+
     /// Create a group around `main`. The repo must exist and must not already
     /// belong to another group. A new group has no sinks; each sink's push mode
     /// is chosen when it is added.

@@ -291,7 +291,13 @@ impl BrowseView {
     pub fn sync_repos(&mut self, store: &Store) {
         match store.list_repos() {
             Ok(list) => {
-                self.repos = list.iter().map(|(n, _, _)| n.clone()).collect();
+                // Sinks are browsed through their group's main, not directly.
+                let sinks = store.sink_repo_names().unwrap_or_default();
+                self.repos = list
+                    .iter()
+                    .map(|(n, _, _)| n.clone())
+                    .filter(|n| !sinks.contains(n))
+                    .collect();
                 self.roots = list
                     .into_iter()
                     .map(|(n, meta, _)| (n, meta.abs_path))

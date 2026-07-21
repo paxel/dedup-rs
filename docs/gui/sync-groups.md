@@ -7,6 +7,10 @@ A **sync group** is one **main** repository plus the **sinks** it is pushed to. 
 belongs to at most one group, and while it is in one it cannot be renamed or removed — the
 group would otherwise be left pointing at something that no longer exists.
 
+A sink is managed through its group's main, so the other tabs (Duplicates, Files, Grooming,
+Browse) do not offer sinks in their repo pickers — only mains and ungrouped repositories.
+Groups are created and managed here or on the [Repositories tab](repositories.md#sync-groups).
+
 ## Creating a group
 
 Type a name in **NEW GROUP**, pick the repository that is the group's main, and press

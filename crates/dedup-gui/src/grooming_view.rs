@@ -1520,7 +1520,14 @@ impl GroomingView {
         }
         match store.list_repos() {
             Ok(list) => {
-                self.repos = list.into_iter().map(|(n, _, _)| n).collect();
+                // Sinks are managed through their group's main, not operated on
+                // directly, so they are not offered here.
+                let sinks = store.sink_repo_names().unwrap_or_default();
+                self.repos = list
+                    .into_iter()
+                    .map(|(n, _, _)| n)
+                    .filter(|n| !sinks.contains(n))
+                    .collect();
                 if let Some(s) = &self.source
                     && !self.repos.contains(s)
                 {

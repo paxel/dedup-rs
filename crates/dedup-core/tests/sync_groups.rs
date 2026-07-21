@@ -87,6 +87,22 @@ fn a_group_stores_its_main_and_sinks_with_per_sink_modes() -> TestResult {
 }
 
 #[test]
+fn sink_repo_names_lists_only_sinks() -> TestResult {
+    let sb = Sandbox::new()?;
+    sb.store.create_sync_group("offsite", "MAIN")?;
+    sb.store
+        .add_sync_sink("offsite", "SINK1", SyncMode::AddOnly)?;
+    sb.store
+        .add_sync_sink("offsite", "SINK2", SyncMode::Mirror)?;
+
+    let sinks = sb.store.sink_repo_names()?;
+    assert_eq!(sinks.len(), 2);
+    assert!(sinks.contains("SINK1") && sinks.contains("SINK2"));
+    assert!(!sinks.contains("MAIN"), "a main is not a sink");
+    Ok(())
+}
+
+#[test]
 fn a_repo_belongs_to_at_most_one_group() -> TestResult {
     let sb = Sandbox::new()?;
     sb.store.create_sync_group("offsite", "MAIN")?;

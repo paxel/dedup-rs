@@ -28,9 +28,12 @@
     mode }`, with a version-2 registry migration that gives legacy groups' sinks the old
     group mode). Each sink carries its own MIRROR/ADD ONLY pill on the Repositories tab and
     the Sync Groups tab; the empty-main mirror guard now triggers when any sink mirrors.
+  - **Done (slice 3):** the operational tabs (Transfer, Grooming, Duplicates, Browse)
+    hide sinks from their repo pickers — only mains and ungrouped repos are offered, via
+    `Store::sink_repo_names`. A previously-selected repo that becomes a sink is dropped on
+    the next tab show (each view already validates its selection against its repo list).
+    The Repositories and Sync Groups tabs still show all repos, since they manage groups.
   - **Remaining slices:**
-    - in all transfer / groom / etc views only the main groups are offered (repo pickers
-      hide sinks).
     - group sync becomes repo sync where groups can be synced, but also ALL repos diffed
       vs another (rename the Sync Groups tab, add an all-repos-vs-one diff mode).
 
