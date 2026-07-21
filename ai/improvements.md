@@ -13,9 +13,12 @@
   `store.rs::v1_entries_decode_and_flag_images_stale`).
 
 ## A usability
-- for the review pane we need more infos. the filename columns need to contain basically the same infos as the duplicate tabs group items. thumbnail, audio duration, size, etc. extremely nice would be a diff button between both that opens a lightbox diff view
-  - for purge no diff button but still the info panel.
-  - these type based info panels should be in a way that we can easily extend them in the future
+- **review pane per-row diff button** opening the lightbox diff view (for PURGE
+  no diff button). Deferred to *Unified lightbox & compare* below — it is the same
+  "compare two textures" surface. The rest of this item is done: the review rows now
+  carry a thumbnail + size / dimensions / duration / mtime via the shared
+  `media_cell` widget (also used by the Duplicate cards), so a new file type extends
+  in one place.
 - sync repos. it seems the grouping of repos belongs to the first tab
   - repositories get a "main repo button. if clicked they are converted to repo group. getting an elbow and and an add repo button.
   - the add repo button is for adding new repos. they inherit everything of the main repo but the path

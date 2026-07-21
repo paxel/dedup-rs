@@ -87,8 +87,10 @@ and to both repo indexes immediately — there is no RUN button and no batch con
 ## Review and run
 
 - **REVIEW** shows the first matching `from → to` transfers (up to a limit) and a total
-  count, without touching disk. REVIEW and RUN are mutually exclusive — starting a run
-  clears the review and vice versa.
+  count, without touching disk. Each row carries a thumbnail (image, video still or audio
+  fingerprint) and the file's size, dimensions or duration, and date — the same info as a
+  Duplicate card. REVIEW and RUN are mutually exclusive — starting a run clears the review
+  and vice versa.
 - **RUN** starts the command on a background thread after a confirmation dialog. Live
   progress shows a spinner, the file currently being handled, the last few actions, and a
   running count. **CANCEL** stops the operation — files already transferred or deleted before

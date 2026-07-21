@@ -14,9 +14,11 @@
 
 use crate::filter_ui::FilterBuilder;
 use crate::icon;
+use crate::media_cell::{facts_for, open_facts};
 use crate::review;
 use crate::settings::TooltipVerbosity;
 use crate::theme;
+use crate::thumbs::ThumbCache;
 use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::diff::{
@@ -220,6 +222,10 @@ fn preview_sync(
         config.filter.as_deref(),
     )
     .map_err(|e| e.to_string())?;
+    // Facts come from whichever side holds the file: a copy's source, a
+    // deletion's target.
+    let (src_db, src_base) = open_facts(store, &config.source);
+    let (tgt_db, tgt_base) = open_facts(store, target);
     // A copy: source keeps the file (unchanged), target gains it (added). A
     // delete: the source no longer has it (absent), the target loses it
     // (removed). Capped.
@@ -232,6 +238,8 @@ fn preview_sync(
             target: review::SideStatus::Added,
             source_path: rel.clone(),
             target_path: rel.clone(),
+            source_facts: facts_for(src_db.as_deref(), src_base.as_deref(), rel),
+            target_facts: None,
         })
         .collect();
     for rel in plan
@@ -244,6 +252,8 @@ fn preview_sync(
             target: review::SideStatus::Removed,
             source_path: String::new(),
             target_path: rel.clone(),
+            source_facts: None,
+            target_facts: facts_for(tgt_db.as_deref(), tgt_base.as_deref(), rel),
         });
     }
     let verb = config.command.label();
@@ -286,6 +296,9 @@ fn preview_repo(
     } else {
         review::SideStatus::Unchanged
     };
+    // The source holds every New/Equal file; the target holds the Equal ones.
+    let (src_db, src_base) = open_facts(store, &config.source);
+    let (tgt_db, tgt_base) = open_facts(store, target);
     let mut acted = 0usize;
     let mut unchanged = 0usize;
     let mut rows: Vec<review::ReviewRow> = Vec::new();
@@ -304,6 +317,8 @@ fn preview_repo(
                         target: review::SideStatus::Added,
                         source_path: rel_path.clone(),
                         target_path: to,
+                        source_facts: facts_for(src_db.as_deref(), src_base.as_deref(), rel_path),
+                        target_facts: None,
                     });
                 }
             }
@@ -315,6 +330,8 @@ fn preview_repo(
                         target: review::SideStatus::Unchanged,
                         source_path: rel_path.clone(),
                         target_path: rel_path.clone(),
+                        source_facts: facts_for(src_db.as_deref(), src_base.as_deref(), rel_path),
+                        target_facts: facts_for(tgt_db.as_deref(), tgt_base.as_deref(), rel_path),
                     });
                 }
             }
@@ -367,6 +384,9 @@ fn preview_folder(
     } else {
         review::SideStatus::Unchanged
     };
+    // The exported files live in the source repo; the target is a plain folder,
+    // not a repo, so the added side has no index facts.
+    let (src_db, src_base) = open_facts(store, &config.source);
     let rows: Vec<review::ReviewRow> = rels
         .iter()
         .take(PREVIEW_CAP)
@@ -375,6 +395,8 @@ fn preview_folder(
             target: review::SideStatus::Added,
             source_path: rel.clone(),
             target_path: rel.clone(),
+            source_facts: facts_for(src_db.as_deref(), src_base.as_deref(), rel),
+            target_facts: None,
         })
         .collect();
     let preview_totals = if config.move_files {
@@ -577,6 +599,8 @@ pub struct TransferView {
     /// Tooltip wording for this frame, set at the top of [`Self::show`] from
     /// the app-wide setting (not persisted here; `app.rs` owns that).
     verbosity: TooltipVerbosity,
+    /// Decodes the review board's row thumbnails; polled once per frame.
+    thumbs: ThumbCache,
 }
 
 enum Act {
@@ -650,6 +674,7 @@ impl TransferView {
             tx,
             rx,
             verbosity: TooltipVerbosity::default(),
+            thumbs: ThumbCache::new(3),
         }
     }
 
@@ -672,6 +697,9 @@ impl TransferView {
         frame: Option<&eframe::Frame>,
     ) {
         self.verbosity = verbosity;
+        if self.thumbs.poll(ui.ctx()) {
+            ui.ctx().request_repaint();
+        }
         self.drain(ui);
         // A finished single-row APPLY refreshes the preview, so the board
         // reflects the applied action instead of dropping to the run log.
@@ -1532,11 +1560,14 @@ impl TransferView {
             ui,
             &mut self.review_state,
             &mut self.preview,
-            self.preview_totals,
-            &self.preview_source_header,
-            // Transfer is always two-sided (source → target/folder).
-            Some(&self.preview_target_header),
-            review::RowControls::Enabled,
+            review::BoardView {
+                totals: self.preview_totals,
+                source_header: &self.preview_source_header,
+                // Transfer is always two-sided (source → target/folder).
+                target: Some(&self.preview_target_header),
+                controls: review::RowControls::Enabled,
+            },
+            &mut self.thumbs,
         ) {
             acts.push(Act::ApplyRow(key));
         }
@@ -2733,6 +2764,8 @@ mod ui_tests {
                 target: review::SideStatus::Added,
                 source_path: "holiday.jpg".to_string(),
                 target_path: "holiday.jpg".to_string(),
+                source_facts: None,
+                target_facts: None,
             },
             // Unchanged on both sides (hidden until the toggle is on).
             review::ReviewRow {
@@ -2740,6 +2773,8 @@ mod ui_tests {
                 target: review::SideStatus::Unchanged,
                 source_path: "notes.txt".to_string(),
                 target_path: "notes.txt".to_string(),
+                source_facts: None,
+                target_facts: None,
             },
         ];
         view.preview_totals = [1, 0, 1];
@@ -3170,18 +3205,24 @@ mod ui_tests {
                     target: review::SideStatus::Added,
                     source_path: "holiday.jpg".to_string(),
                     target_path: "holiday.jpg".to_string(),
+                    source_facts: None,
+                    target_facts: None,
                 },
                 review::ReviewRow {
                     source: review::SideStatus::Removed,
                     target: review::SideStatus::Absent,
                     source_path: "old.tmp".to_string(),
                     target_path: String::new(),
+                    source_facts: None,
+                    target_facts: None,
                 },
                 review::ReviewRow {
                     source: review::SideStatus::Unchanged,
                     target: review::SideStatus::Unchanged,
                     source_path: "notes.txt".to_string(),
                     target_path: "notes.txt".to_string(),
+                    source_facts: None,
+                    target_facts: None,
                 },
             ];
             review::sort(&mut v.preview, &v.review_state);

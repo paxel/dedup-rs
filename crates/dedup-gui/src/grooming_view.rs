@@ -18,9 +18,11 @@
 
 use crate::filter_ui::FilterBuilder;
 use crate::icon;
+use crate::media_cell::{facts_for, open_facts};
 use crate::review;
 use crate::settings::TooltipVerbosity;
 use crate::theme;
+use crate::thumbs::ThumbCache;
 use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::diff::{DiffAction, DiffEvent, DiffProgress, DiffRun, diff_delete};
@@ -245,6 +247,8 @@ pub struct GroomingView {
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     verbosity: TooltipVerbosity,
+    /// Decodes the review board's row thumbnails; polled once per frame.
+    thumbs: ThumbCache,
 }
 
 enum Act {
@@ -305,11 +309,15 @@ impl GroomingView {
             tx,
             rx,
             verbosity: TooltipVerbosity::default(),
+            thumbs: ThumbCache::new(3),
         }
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, verbosity: TooltipVerbosity) {
         self.verbosity = verbosity;
+        if self.thumbs.poll(ui.ctx()) {
+            ui.ctx().request_repaint();
+        }
         self.drain();
         // A finished single-row APPLY refreshes the preview, so the board
         // reflects the applied action instead of dropping to the run log.
@@ -851,10 +859,13 @@ impl GroomingView {
             ui,
             &mut self.review_state,
             &mut self.preview,
-            self.preview_totals,
-            &self.preview_source_header,
-            self.preview_target_header.as_deref(),
-            review::RowControls::Enabled,
+            review::BoardView {
+                totals: self.preview_totals,
+                source_header: &self.preview_source_header,
+                target: self.preview_target_header.as_deref(),
+                controls: review::RowControls::Enabled,
+            },
+            &mut self.thumbs,
         ) {
             acts.push(Act::ApplyRow(key));
         }
@@ -1124,11 +1135,16 @@ impl GroomingView {
     fn run_preview(&mut self, store: &Store) {
         self.reset_run();
         let filter = self.filter_string();
+        // The single repo these files live in, for their thumbnails + facts.
+        // Set by every command that reaches the row-building block below;
+        // ORGANIZE and EMPTY DIRS return earlier.
+        let facts_repo: String;
         let result = match self.command {
             Command::Dedupe => {
                 let Some(source) = self.source.clone() else {
                     return;
                 };
+                facts_repo = source.clone();
                 self.preview_source_header = Self::repo_header(store, &source);
                 let pool = self.pool.clone();
                 let ref_slice: Vec<&str> = pool.iter().map(String::as_str).collect();
@@ -1153,6 +1169,7 @@ impl GroomingView {
                 let Some(repo) = self.repo.clone() else {
                     return;
                 };
+                facts_repo = repo.clone();
                 self.preview_source_header = Self::repo_header(store, &repo);
                 preview_by_filter(store, &repo, filter.as_deref(), PREVIEW_CAP)
                     .map_err(|e| e.to_string())
@@ -1161,6 +1178,7 @@ impl GroomingView {
                 let Some(repo) = self.repo.clone() else {
                     return;
                 };
+                facts_repo = repo.clone();
                 self.preview_source_header = Self::repo_header(store, &repo);
                 preview_prune(store, &repo, PREVIEW_CAP).map_err(|e| e.to_string())
             }
@@ -1178,13 +1196,16 @@ impl GroomingView {
                 self.preview_total = total;
                 self.preview_totals = [0, total, 0];
                 self.preview_target_header = None;
+                let (db, base) = open_facts(store, &facts_repo);
                 let mut rows: Vec<review::ReviewRow> = paths
                     .into_iter()
                     .map(|from| review::ReviewRow {
+                        source_facts: facts_for(db.as_deref(), base.as_deref(), &from),
                         source: review::SideStatus::Removed,
                         target: review::SideStatus::Absent,
                         source_path: from,
                         target_path: String::new(),
+                        target_facts: None,
                     })
                     .collect();
                 review::sort(&mut rows, &self.review_state);
@@ -1223,14 +1244,19 @@ impl GroomingView {
                 let header = Self::repo_header(store, &repo);
                 self.preview_source_header = header.clone();
                 self.preview_target_header = Some(header);
+                // The file is still at its old path until the move runs, so its
+                // facts come from the removed (source) side.
+                let (db, base) = open_facts(store, &repo);
                 let mut rows: Vec<review::ReviewRow> = moves
                     .into_iter()
                     .take(PREVIEW_CAP)
                     .map(|(from, to)| review::ReviewRow {
+                        source_facts: facts_for(db.as_deref(), base.as_deref(), &from),
                         source: review::SideStatus::Removed,
                         target: review::SideStatus::Added,
                         source_path: from,
                         target_path: to,
+                        target_facts: None,
                     })
                     .collect();
                 review::sort(&mut rows, &self.review_state);
@@ -1846,12 +1872,16 @@ mod ui_tests {
                     target: review::SideStatus::Absent,
                     source_path: "a.tmp".to_string(),
                     target_path: String::new(),
+                    source_facts: None,
+                    target_facts: None,
                 },
                 review::ReviewRow {
                     source: review::SideStatus::Removed,
                     target: review::SideStatus::Absent,
                     source_path: "b.tmp".to_string(),
                     target_path: String::new(),
+                    source_facts: None,
+                    target_facts: None,
                 },
             ];
             v.preview_totals = [0, 2, 0];
@@ -1890,12 +1920,16 @@ mod ui_tests {
                     target: review::SideStatus::Absent,
                     source_path: "a.tmp".to_string(),
                     target_path: String::new(),
+                    source_facts: None,
+                    target_facts: None,
                 },
                 review::ReviewRow {
                     source: review::SideStatus::Removed,
                     target: review::SideStatus::Absent,
                     source_path: "b.tmp".to_string(),
                     target_path: String::new(),
+                    source_facts: None,
+                    target_facts: None,
                 },
             ];
             v.preview_totals = [0, 2, 0];
@@ -1944,6 +1978,8 @@ mod ui_tests {
                     target: review::SideStatus::Absent,
                     source_path: (*p).to_string(),
                     target_path: String::new(),
+                    source_facts: None,
+                    target_facts: None,
                 })
                 .collect();
             v.preview_totals = [0, 2, 0];
@@ -1992,6 +2028,8 @@ mod ui_tests {
                     target: review::SideStatus::Absent,
                     source_path: format!("f{i:04}.tmp"),
                     target_path: String::new(),
+                    source_facts: None,
+                    target_facts: None,
                 })
                 .collect();
             v.preview_totals = [0, 501, 0];
@@ -2062,6 +2100,8 @@ mod ui_tests {
                     target: review::SideStatus::Absent,
                     source_path: format!("cache/file{i}.db"),
                     target_path: String::new(),
+                    source_facts: None,
+                    target_facts: None,
                 })
                 .collect();
             v.preview_totals = [0, 6, 0];

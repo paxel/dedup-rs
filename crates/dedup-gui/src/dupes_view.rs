@@ -7,6 +7,7 @@ use crate::icon;
 use crate::id3tags::{self, Tags};
 use crate::imgedit::{self, Orient};
 use crate::lightbox::{CompareState, FullResCache, LightboxState};
+use crate::media_cell::{FileFacts, MediaStyle, VIDEO_STRIP, fmt_ms, media_cell};
 use crate::player::Player;
 use crate::settings::TooltipVerbosity;
 use crate::theme;
@@ -30,10 +31,6 @@ use std::sync::Arc;
 const PAGE_SIZE: usize = 50;
 /// Load groups from the DB in batches of this many during auto-resolve.
 const AUTO_BATCH: usize = 128;
-/// Evenly spaced stills sampled per video: the lightbox filmstrip's cells, and
-/// the grid the card preview samples from (frame `VIDEO_STRIP / 2`), so the
-/// card's still is reused by the filmstrip instead of extracted twice.
-const VIDEO_STRIP: usize = 10;
 /// Longest edge for the lightbox edit preview (matches the full-res decoder).
 const EDIT_MAX_EDGE: u32 = 8192;
 
@@ -136,53 +133,6 @@ fn key(file: &DupeFile) -> FileKey {
 }
 
 /// Format milliseconds as `m:ss` (or `h:mm:ss` past an hour) for the seek bar.
-fn fmt_ms(ms: u64) -> String {
-    let secs = ms / 1000;
-    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    if h > 0 {
-        format!("{h}:{m:02}:{s:02}")
-    } else {
-        format!("{m}:{s:02}")
-    }
-}
-
-/// Paint a deterministic "fingerprint" glyph for an audio file: a waveform whose
-/// bar heights and accent colour come from the audio chunk hash. Every bar is an
-/// independent hash byte (no forced mirror symmetry, which would make different
-/// files look alike to the eye). Identical content yields an identical glyph —
-/// BLAKE3's avalanche means it signals *identity*, not gradations of similarity.
-/// It replaces the generic broken-image placeholder so audio cards read as audio.
-fn paint_audio_glyph(painter: &egui::Painter, rect: egui::Rect, fp: &dedup_core::store::AudioFp) {
-    let seed = fp.chunk_hashes.first().copied().unwrap_or([0u8; 32]);
-    let palette = [
-        theme::AMBER,
-        theme::TAN,
-        theme::LILAC,
-        theme::BLUE,
-        theme::ORANGE,
-    ];
-    let accent = palette[seed[0] as usize % palette.len()];
-    let bars = 15usize;
-    let gap = 3.0;
-    let bar_w = ((rect.width() - gap * (bars as f32 - 1.0)) / bars as f32).max(1.0);
-    let mid_y = rect.center().y;
-    let max_amp = rect.height() * 0.45;
-    for i in 0..bars {
-        // Each bar is its own hash byte — no mirror — so distinct audio yields
-        // visibly distinct glyphs instead of similar symmetric ones.
-        let amp = (0.15 + (seed[i % seed.len()] as f32 / 255.0) * 0.85) * max_amp;
-        let x = rect.left() + i as f32 * (bar_w + gap);
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(x, mid_y - amp),
-                egui::pos2(x + bar_w, mid_y + amp),
-            ),
-            1.0,
-            accent,
-        );
-    }
-}
-
 /// One-line `path · size · WxH · mtime` description used by the lightbox.
 fn lightbox_meta(file: &DupeFile) -> String {
     format!(
@@ -1374,111 +1324,32 @@ impl DupesView {
         file: &DupeFile,
         acts: &mut Vec<Act>,
     ) {
-        let mime = file.entry.mime.as_deref();
-        let is_image = mime.is_some_and(|m| m.starts_with("image/"));
-        let is_video = mime.is_some_and(|m| m.starts_with("video/"));
-        let is_audio = mime.is_some_and(dedup_core::fingerprint::is_audio_mime);
-        if is_image || is_video {
-            // Only fetch a texture for on-screen cards. The results list is not
-            // virtualized, so a page can lay out far more thumbnails than the GPU
-            // texture cache holds; requesting every one each frame thrashes the
-            // LRU (evict → re-decode → repaint), which spikes CPU and makes the
-            // images flicker. Off-screen cards fall through to the placeholder.
-            let thumb_rect =
-                egui::Rect::from_min_size(ui.next_widget_position(), egui::vec2(160.0, 120.0));
-            if ui.is_rect_visible(thumb_rect) {
-                let hex = hash_hex(&file.entry.hash);
-                let source = file.absolute_path();
-                // Videos show a mid-timeline still (ffmpeg-extracted, cached);
-                // absent ffmpeg the request fails and the placeholder shows.
-                // Sampling on the same grid as the lightbox filmstrip means
-                // the card's frame is reused there instead of extracted twice.
-                let tex = if is_video {
-                    self.thumbs
-                        .get_video(&hex, &source, VIDEO_STRIP / 2, VIDEO_STRIP)
-                } else {
-                    self.thumbs.get(&hex, &source)
-                };
-                if let Some(tex) = tex {
-                    let resp = ui
-                        .add(
-                            egui::Image::new(egui::load::SizedTexture::from_handle(&tex))
-                                .max_height(120.0)
-                                .corner_radius(6)
-                                .sense(egui::Sense::click()),
-                        )
-                        .explain(
-                            self.verbosity,
-                            "Click to open the lightbox",
-                            "Click to open the full-window lightbox: zoom, pan, step through \
-                             this group's copies, and (for images) A/B compare against the \
-                             best copy.",
-                        );
-                    // Hairline so dark photos stand off the dark panel.
-                    ui.painter().rect_stroke(
-                        resp.rect,
-                        6,
-                        egui::Stroke::new(1.0, theme::HAIRLINE),
-                        egui::StrokeKind::Inside,
-                    );
-                    if resp.clicked() {
-                        acts.push(Act::OpenLightbox(gi, fi));
-                    }
-                    return;
-                }
-            }
-        }
-        // Audio: a deterministic fingerprint glyph + duration, so cards read as
-        // audio instead of a broken image and identical content shows the same
-        // glyph. Clicking it opens the audio lightbox (waveform comparison).
-        if is_audio && let Some(fp) = file.entry.audio.as_ref() {
-            let (rect, resp) =
-                ui.allocate_exact_size(egui::vec2(160.0, 112.0), egui::Sense::click());
-            let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, 6.0, theme::PANEL);
-            painter.rect_stroke(
-                rect,
-                6.0,
-                egui::Stroke::new(1.0, theme::HAIRLINE),
-                egui::StrokeKind::Inside,
-            );
-            let glyph = egui::Rect::from_min_max(
-                rect.min + egui::vec2(8.0, 8.0),
-                egui::pos2(rect.max.x - 8.0, rect.max.y - 24.0),
-            );
-            paint_audio_glyph(&painter, glyph, fp);
-            painter.text(
-                egui::pos2(rect.center().x, rect.max.y - 13.0),
-                egui::Align2::CENTER_CENTER,
-                fmt_ms(fp.duration_ms as u64),
-                egui::FontId::proportional(12.0),
-                theme::TAN,
-            );
-            let resp = resp.explain(
+        // The shared media cell draws the image / video still / audio glyph /
+        // placeholder; the card keeps the click meaning (open the lightbox) and
+        // its own tooltip. A placeholder or not-yet-decoded thumbnail returns
+        // `None`, so there is nothing to open.
+        let facts = FileFacts::from_entry(&file.entry, file.absolute_path());
+        let Some(resp) = media_cell(ui, &mut self.thumbs, &facts, MediaStyle::card()) else {
+            return;
+        };
+        let resp = if facts.is_audio() {
+            resp.explain(
                 self.verbosity,
                 "Open the audio lightbox",
                 "Open the full-window audio view: compare this group's copies as waveforms and \
                  switch playback between them without losing your place in the track.",
-            );
-            if resp.clicked() {
-                acts.push(Act::OpenLightbox(gi, fi));
-            }
-            return;
+            )
+        } else {
+            resp.explain(
+                self.verbosity,
+                "Click to open the lightbox",
+                "Click to open the full-window lightbox: zoom, pan, step through this group's \
+                 copies, and (for images) A/B compare against the best copy.",
+            )
+        };
+        if resp.clicked() {
+            acts.push(Act::OpenLightbox(gi, fi));
         }
-
-        // Placeholder for non-images or not-yet-ready thumbnails.
-        let label = file.entry.mime.clone().unwrap_or_else(|| "file".into());
-        egui::Frame::new()
-            .fill(theme::PANEL)
-            .corner_radius(6)
-            .inner_margin(18.0)
-            .show(ui, |ui| {
-                ui.set_width(160.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(RichText::new(icon::IMAGE).color(theme::LILAC).size(28.0));
-                    ui.label(RichText::new(label).color(theme::LILAC).size(11.0));
-                });
-            });
     }
 
     /// Full-resolution texture for a file (thumbnail upscaled while decoding),

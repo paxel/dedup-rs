@@ -24,9 +24,17 @@
 //! deletion and then make it anyway.
 
 use crate::icon;
+use crate::media_cell::{FileFacts, MediaStyle, media_cell};
 use crate::theme;
+use crate::thumbs::ThumbCache;
+use crate::util::{format_mtime, format_size};
 use egui::{Align, Layout, RichText};
 use egui_extras::{Column, TableBuilder};
+
+/// Longest edge of a review row's thumbnail cell.
+const ROW_THUMB: f32 = 48.0;
+/// Row height: tall enough for the thumbnail plus the path + facts lines.
+const ROW_HEIGHT: f32 = 56.0;
 
 /// Safety cap on how many rows a preview materialises in memory. The summary
 /// counts stay the true totals regardless; past the cap the table tells the
@@ -96,6 +104,12 @@ pub struct ReviewRow {
     pub target: SideStatus,
     pub source_path: String,
     pub target_path: String,
+    /// Display facts for whichever side the file exists on: a copy carries
+    /// `source_facts`; a sync/mirror deletion (absent source) carries
+    /// `target_facts`; an unchanged row carries both. `None` renders no
+    /// thumbnail or facts (an absent side, or an added target not yet copied).
+    pub source_facts: Option<FileFacts>,
+    pub target_facts: Option<FileFacts>,
 }
 
 impl ReviewRow {
@@ -198,23 +212,37 @@ pub fn sort(rows: &mut [ReviewRow], state: &ReviewState) {
     });
 }
 
+/// The board's shape and headers, independent of the per-frame render state —
+/// bundled so [`table`] keeps a small argument list.
+pub struct BoardView<'a> {
+    /// `[added, removed, unchanged]` full counts, independent of the capped sample.
+    pub totals: [usize; 3],
+    pub source_header: &'a str,
+    /// `None` is a declared single-sided board (PURGE and the other single-repo
+    /// commands): the target columns are left out. A two-sided caller always
+    /// passes `Some`, so an empty header string can never silently drop them.
+    pub target: Option<&'a str>,
+    pub controls: RowControls,
+}
+
 /// Render the review board: a summary line (true full counts), an optional
 /// "show unchanged" toggle, a "showing first N" note when the sample was
 /// capped, a row count with page controls, then the virtualised, click-to-sort
-/// four-column diff. `totals` is `[added, removed, unchanged]` full counts,
-/// independent of the capped sample.
+/// four-column diff. `thumbs` draws each row's thumbnail (display only); it is
+/// owned by the caller so its background decodes persist across frames.
 pub fn table(
     ui: &mut egui::Ui,
     state: &mut ReviewState,
     rows: &mut [ReviewRow],
-    totals: [usize; 3],
-    source_header: &str,
-    // `None` is a declared single-sided board (PURGE and the other single-repo
-    // commands): the target columns are left out. A two-sided caller always
-    // passes `Some`, so an empty header string can never silently drop them.
-    target: Option<&str>,
-    controls: RowControls,
+    view: BoardView,
+    thumbs: &mut ThumbCache,
 ) -> Option<ReviewAction> {
+    let BoardView {
+        totals,
+        source_header,
+        target,
+        controls,
+    } = view;
     summary(ui, totals, state.rejected.len());
     let interactive = controls == RowControls::Enabled;
 
@@ -351,8 +379,9 @@ pub fn table(
             }
         })
         .body(|body| {
-            // Tall enough for the row's action buttons to fit uncut.
-            body.rows(26.0, page_rows.len(), |mut row| {
+            // Tall enough for the thumbnail plus the path + facts lines (and the
+            // row's action buttons).
+            body.rows(ROW_HEIGHT, page_rows.len(), |mut row| {
                 let r = &rows[page_rows[row.index()]];
                 let key = r.key();
                 let rejected = interactive && state.rejected.contains(&key);
@@ -402,9 +431,27 @@ pub fn table(
                     });
                 }
                 row.col(|ui| status_cell(ui, r.source, rejected));
-                row.col(|ui| path_cell(ui, r.source, &r.source_path, rejected));
+                row.col(|ui| {
+                    side_cell(
+                        ui,
+                        thumbs,
+                        r.source,
+                        &r.source_path,
+                        r.source_facts.as_ref(),
+                        rejected,
+                    )
+                });
                 if two_sided {
-                    row.col(|ui| path_cell(ui, r.target, &r.target_path, rejected));
+                    row.col(|ui| {
+                        side_cell(
+                            ui,
+                            thumbs,
+                            r.target,
+                            &r.target_path,
+                            r.target_facts.as_ref(),
+                            rejected,
+                        )
+                    });
                     row.col(|ui| status_cell(ui, r.target, rejected));
                 }
             });
@@ -447,22 +494,67 @@ fn status_cell(ui: &mut egui::Ui, status: SideStatus, rejected: bool) {
     }
 }
 
-/// One side's path cell: the relative path coloured by that side's status.
-/// Absent sides (or empty paths) render nothing; a rejected row's path is
-/// dimmed and struck through.
-fn path_cell(ui: &mut egui::Ui, status: SideStatus, path: &str, rejected: bool) {
+/// One side's cell: a thumbnail (when the file exists on this side), then the
+/// relative path coloured by that side's status, and a compact facts line
+/// (size · dimensions-or-duration · mtime, plus provenance). Absent sides (or
+/// empty paths) render nothing; a rejected row's path is dimmed and struck
+/// through. The thumbnail is display only.
+fn side_cell(
+    ui: &mut egui::Ui,
+    thumbs: &mut ThumbCache,
+    status: SideStatus,
+    path: &str,
+    facts: Option<&FileFacts>,
+    rejected: bool,
+) {
     if status == SideStatus::Absent || path.is_empty() {
         return;
     }
-    let mut text = RichText::new(path).color(if rejected {
-        theme::HAIRLINE
-    } else {
-        status.color()
+    ui.horizontal(|ui| {
+        if let Some(f) = facts {
+            let _ = media_cell(ui, thumbs, f, MediaStyle::row(ROW_THUMB));
+        }
+        ui.vertical(|ui| {
+            let mut text = RichText::new(path).size(12.0).color(if rejected {
+                theme::HAIRLINE
+            } else {
+                status.color()
+            });
+            if rejected {
+                text = text.strikethrough();
+            }
+            ui.add(egui::Label::new(text).truncate());
+            if let Some(f) = facts {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(facts_line(f))
+                            .color(if rejected {
+                                theme::HAIRLINE
+                            } else {
+                                theme::TAN
+                            })
+                            .size(10.5),
+                    )
+                    .truncate(),
+                );
+            }
+        });
     });
-    if rejected {
-        text = text.strikethrough();
+}
+
+/// The compact one-line facts summary shown under a side's path: `size ·
+/// dimensions-or-duration · mtime`, with provenance appended when known.
+fn facts_line(f: &FileFacts) -> String {
+    let mut line = format!(
+        "{} · {} · {}",
+        format_size(f.size),
+        f.dims_or_duration(),
+        format_mtime(f.modified_ms)
+    );
+    if let Some(origin) = &f.origin {
+        line.push_str(&format!(" · from {origin}"));
     }
-    ui.add(egui::Label::new(text).truncate());
+    line
 }
 
 /// The summary line: `«icon» «count» «label»` for each non-zero status, in its
@@ -506,6 +598,8 @@ mod tests {
             target,
             source_path: sp.to_string(),
             target_path: tp.to_string(),
+            source_facts: None,
+            target_facts: None,
         }
     }
 
@@ -574,19 +668,22 @@ mod tests {
         let rows = vec![row(SideStatus::Removed, SideStatus::Absent, "a", "")];
         let target = target.map(str::to_string);
         let mut harness = Harness::builder().build_ui_state(
-            move |ui, (state, rows): &mut (ReviewState, Vec<ReviewRow>)| {
+            move |ui, (state, rows, thumbs): &mut (ReviewState, Vec<ReviewRow>, ThumbCache)| {
                 crate::theme::apply(ui.ctx());
                 table(
                     ui,
                     state,
                     rows,
-                    [1, 0, 0],
-                    "SRC",
-                    target.as_deref(),
-                    RowControls::ReadOnly,
+                    BoardView {
+                        totals: [1, 0, 0],
+                        source_header: "SRC",
+                        target: target.as_deref(),
+                        controls: RowControls::ReadOnly,
+                    },
+                    thumbs,
                 );
             },
-            (state, rows),
+            (state, rows, ThumbCache::new(1)),
         );
         harness.run();
         harness.state().0.sort_col
@@ -627,5 +724,55 @@ mod tests {
         sort(&mut rows, &state);
         assert_eq!(rows[0].source_path, "alpha");
         assert_eq!(rows[1].source_path, "zeta");
+    }
+
+    /// A side carrying [`FileFacts`] renders its size and dimensions under the
+    /// path, so the review board carries the same file info as a Duplicate card.
+    #[test]
+    fn a_side_with_facts_shows_its_size_and_dimensions() {
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::Queryable;
+        let facts = FileFacts {
+            size: 5 * 1024 * 1024,
+            modified_ms: 0,
+            mime: Some("image/jpeg".to_string()),
+            img_size: Some((4032, 3024)),
+            audio_ms: None,
+            audio_seed: None,
+            hash_hex: "deadbeef".to_string(),
+            // No real file, so the thumbnail stays a placeholder; the facts line
+            // is what we assert on.
+            abs_path: std::path::PathBuf::from("/nonexistent.jpg"),
+            origin: None,
+        };
+        let mut r = row(SideStatus::Unchanged, SideStatus::Added, "a.jpg", "a.jpg");
+        r.source_facts = Some(facts);
+        let mut harness = Harness::builder().build_ui_state(
+            move |ui, (state, rows, thumbs): &mut (ReviewState, Vec<ReviewRow>, ThumbCache)| {
+                crate::theme::apply(ui.ctx());
+                table(
+                    ui,
+                    state,
+                    rows,
+                    BoardView {
+                        totals: [1, 0, 0],
+                        source_header: "SRC",
+                        target: Some("TGT"),
+                        controls: RowControls::ReadOnly,
+                    },
+                    thumbs,
+                );
+            },
+            (ReviewState::default(), vec![r], ThumbCache::new(1)),
+        );
+        harness.run();
+        assert!(
+            harness.query_by_label_contains("4032×3024").is_some(),
+            "the facts line shows the image dimensions"
+        );
+        assert!(
+            harness.query_by_label_contains("5.00 MB").is_some(),
+            "the facts line shows the human-readable size"
+        );
     }
 }

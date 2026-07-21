@@ -46,6 +46,7 @@ the sink under a different name is not copied again.
 - **REVIEW** (`P`) plans every sink and shows the result in the shared review board: each
   row is a file to copy into a sink (marked *added*) or, in MIRROR mode, to delete from it
   (marked *removed*), with the sink named in the path so several sinks read as one list.
+  Each row carries a thumbnail and the file's size, dimensions or duration, and date.
   Nothing on disk is touched.
 - **RUN SYNC** (`R`) plans the push, then asks for confirmation stating how many files it
   will copy and — in MIRROR mode — how many it will delete, naming any sink the push would

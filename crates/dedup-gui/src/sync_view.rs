@@ -10,10 +10,12 @@
 //! REVIEW plans every sink and renders the result in the shared review board,
 //! RUN asks before touching anything and then pushes on a worker thread.
 
+use crate::media_cell::{facts_for, open_facts};
 use crate::review;
 use crate::review::PREVIEW_CAP;
 use crate::settings::TooltipVerbosity;
 use crate::theme;
+use crate::thumbs::ThumbCache;
 use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::diff::{DiffEvent, DiffProgress, DiffRun};
@@ -66,6 +68,8 @@ fn build_preview(
     let mut rows = Vec::new();
     let (mut added, mut removed) = (0usize, 0usize);
     let mut wholesale_sinks = Vec::new();
+    // Copies carry the main's file, so their facts come from the main index.
+    let (main_db, main_base) = open_facts(store, &group.main);
     for (sink, plan) in &plans {
         // A plan that deletes everything the sink holds today is a wholesale
         // replacement, not an incremental sync — worth naming before proceeding.
@@ -76,6 +80,8 @@ fn build_preview(
         if live > 0 && plan.deletes.len() as u64 >= live {
             wholesale_sinks.push((sink.clone(), live));
         }
+        // Deletions carry the sink's file, so their facts come from the sink index.
+        let (sink_db, sink_base) = open_facts(store, sink);
         // Counts cover the whole plan; the board rows are a capped sample, like
         // the Transfer tab's — an initial whole-disk push would otherwise build
         // one row per file.
@@ -87,6 +93,8 @@ fn build_preview(
                     target: review::SideStatus::Added,
                     source_path: rel.clone(),
                     target_path: format!("{sink}: {rel}"),
+                    source_facts: facts_for(main_db.as_deref(), main_base.as_deref(), rel),
+                    target_facts: None,
                 });
             }
         }
@@ -98,6 +106,8 @@ fn build_preview(
                     target: review::SideStatus::Removed,
                     source_path: String::new(),
                     target_path: format!("{sink}: {rel}"),
+                    source_facts: None,
+                    target_facts: facts_for(sink_db.as_deref(), sink_base.as_deref(), rel),
                 });
             }
         }
@@ -190,6 +200,8 @@ pub struct SyncView {
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     verbosity: TooltipVerbosity,
+    /// Decodes the review board's row thumbnails; polled once per frame.
+    thumbs: ThumbCache,
 }
 
 enum Act {
@@ -241,6 +253,7 @@ impl SyncView {
             tx,
             rx,
             verbosity: TooltipVerbosity::default(),
+            thumbs: ThumbCache::new(3),
         }
     }
 
@@ -283,6 +296,9 @@ impl SyncView {
 
     pub fn show(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, verbosity: TooltipVerbosity) {
         self.verbosity = verbosity;
+        if self.thumbs.poll(ui.ctx()) {
+            ui.ctx().request_repaint();
+        }
         self.drain(ui);
         if !self.loaded {
             self.sync_repos(store);
@@ -662,11 +678,14 @@ impl SyncView {
             ui,
             &mut self.review_state,
             &mut self.preview,
-            self.preview_totals,
-            &self.preview_main_header,
-            // A group push is always two-sided (main → sinks).
-            Some(&self.preview_sink_header),
-            review::RowControls::ReadOnly,
+            review::BoardView {
+                totals: self.preview_totals,
+                source_header: &self.preview_main_header,
+                // A group push is always two-sided (main → sinks).
+                target: Some(&self.preview_sink_header),
+                controls: review::RowControls::ReadOnly,
+            },
+            &mut self.thumbs,
         );
     }
 
