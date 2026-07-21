@@ -68,12 +68,19 @@ target (right) repo, with each side's path, size and modification date in sortab
   content is *equal*; same path with different content is a conflict, offering **COMPARE**,
   **OVERWRITE** (replace the other side's file with this one) and **DELETE** per side.
 
-**COMPARE** opens the two versions side by side over the whole window: each side shows a
-preview appropriate to the file (image, or a still for video), the repo it lives in, and its
-size, modification date and type — with the larger size and the newer date highlighted, so
-which is which is obvious at a glance. The same OVERWRITE OTHER / DELETE actions are
-available per side inside the comparison, so the decision is made where it is being judged.
-`Esc` or **CLOSE** leaves without changing anything.
+**COMPARE** opens the two versions side by side over the whole window, using the same viewer
+as the Duplicates lightbox: each side shows a preview appropriate to the file (image, or a
+still for video), the repo it lives in, and its size, modification date and type — with the
+larger size and the newer date highlighted, so which is which is obvious at a glance. When
+both sides have a picture you can **wheel to zoom**, **drag to pan**, and press **Space** to
+flicker one over the other (Space again swaps which side is shown) — the surest way to spot a
+subtle edit. A side with nothing to show (a document, audio, or a type that can't be
+previewed) says so and disables the flicker compare for that pair. The same OVERWRITE OTHER /
+DELETE actions are available per side inside the comparison, so the decision is made where it
+is being judged. `Esc` steps back out of flicker, then closes; **CLOSE** leaves without
+changing anything.
+
+![DIFF compare — two versions of the same path side by side](../screenshots/diff_compare.png)
 
 When one side holds the same content under several names, that side is narrowed down first:
 **DELETE ALL** drops every copy (after confirming) and **KEEP 1** asks which copy to keep and

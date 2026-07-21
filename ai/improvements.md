@@ -78,8 +78,22 @@ usize` is now `CompareState.b: FileFacts` — the abstract B *rendering* source.
 Duplicate image + audio lightboxes resolve B's texture from those facts and re-find B's
 group member (for this tab's mark actions) by on-disk path; when a later slice points B
 outside the group, no member matches and the caller supplies the actions. Behaviour is
-unchanged. Still to do: slices 2–4 (route DIFF + delete `diff_inspect`; fold in audio;
-video/cross-type), and the deferred review-pane per-row diff button rides on slice 2.
+unchanged.
+
+**Done (slice 2):** DIFF COMPARE (the Transfer tab's BY PATH conflict inspector) now renders
+through the shared `lightbox::draw_compare` + `CompareState` primitives — the same
+zoom/pan/flicker the Duplicate lightbox has — instead of its own hand-rolled two-pane preview.
+`diff_inspect.rs` is **deleted**. The DIFF caller (`transfer_view::DiffCompare`) keeps its own
+off-thread decode (which handles **both** images and video stills, so no video regression — it
+does *not* route through the image-only `full_texture`), holds the two sides as
+`FileFacts` + `repo`/`rel_path` (action identity), and maps CLOSE/OVERWRITE/DELETE onto the
+same `BoardAction`s the row offers. Flicker/zoom compare turns on only once *both* sides
+have actually decoded a texture; a side that yields none — a non-previewable type, or a
+decode that came back empty (e.g. video with no ffmpeg) — settles to a "no preview" note and
+keeps compare disabled ("if a side has no visual, compare disables itself"), so a failed
+decode never spins "decoding…" forever. Still to do: slice 3 (fold in `audio_lightbox`) and
+slice 4 (video / cross-type compare). **The deferred review-pane per-row diff button is the immediate
+follow-on** (it opens this same DIFF compare surface from a review row).
 
 ## Engineering backlog
 - **Per-sink main re-read.** `plan_group_sync`/`run_group_sync` re-open the main and

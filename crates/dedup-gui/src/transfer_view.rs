@@ -14,12 +14,13 @@
 
 use crate::filter_ui::FilterBuilder;
 use crate::icon;
-use crate::media_cell::{facts_for, open_facts};
+use crate::lightbox::{ComparePointer, CompareState, compare_split, draw_compare, draw_in_pane};
+use crate::media_cell::{FileFacts, facts_for, open_facts};
 use crate::review;
 use crate::settings::TooltipVerbosity;
 use crate::theme;
 use crate::thumbs::ThumbCache;
-use crate::util::ExplainExt;
+use crate::util::{ExplainExt, format_mtime, format_size};
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::diff::{
     CopyDest, DiffAction, DiffEvent, DiffItem, DiffPairing, DiffProgress, DiffRun, FolderMode,
@@ -28,7 +29,10 @@ use dedup_core::diff::{
 };
 use dedup_core::store::Store;
 use dedup_core::update::CancellationToken;
-use egui::{Id, RichText};
+use egui::{
+    Align, Align2, Color32, ColorImage, Context, FontId, Id, Layout, Rect, RichText, TextureHandle,
+    TextureOptions, UiBuilder, Vec2,
+};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,6 +41,11 @@ use crate::review::PREVIEW_CAP;
 
 /// How many recent actions the running panel keeps in its scrolling log.
 const RUN_LOG_LIMIT: usize = 10;
+
+/// Longest texture edge uploaded to the GPU for a DIFF preview, matching the
+/// lightbox's limit; larger images are downscaled by the decoder to stay within
+/// driver limits.
+const MAX_TEXTURE_EDGE: u32 = 8192;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Command {
@@ -558,7 +567,7 @@ pub struct TransferView {
     /// Sort/paging state of the diff board.
     board_state: crate::diff_board::BoardState,
     /// The open side-by-side comparison of one conflicting row, if any.
-    inspect: Option<crate::diff_inspect::Inspect>,
+    inspect: Option<DiffCompare>,
     /// Full per-kind counts (indexed by [`review::RowKind::idx`]) for the review
     /// summary; independent of the capped `preview` sample.
     preview_totals: [usize; 3],
@@ -834,23 +843,22 @@ impl TransferView {
         // The comparison sits above everything, and its buttons feed the same
         // row actions the board offers.
         if let Some(inspect) = self.inspect.as_mut()
-            && let Some(outcome) = inspect.view(&ui.ctx().clone(), verbosity)
+            && let Some(pick) = inspect.view(&ui.ctx().clone(), verbosity)
         {
-            use crate::diff_inspect::InspectOutcome;
             let (left_rel, right_rel) = (
                 inspect.left.rel_path.clone(),
                 inspect.right.rel_path.clone(),
             );
             self.inspect = None;
-            match outcome {
-                InspectOutcome::Close => {}
-                InspectOutcome::Delete { on_left } => {
+            match pick {
+                DiffPick::Close => {}
+                DiffPick::Delete { on_left } => {
                     acts.push(Act::Board(crate::diff_board::BoardAction::Delete {
                         on_left,
                         rel_path: if on_left { left_rel } else { right_rel },
                     }));
                 }
-                InspectOutcome::Overwrite { from_left } => {
+                DiffPick::Overwrite { from_left } => {
                     acts.push(Act::Board(crate::diff_board::BoardAction::Overwrite {
                         from_left,
                         from_rel: if from_left {
@@ -2035,22 +2043,19 @@ impl TransferView {
         let (Some(source), Some(target)) = (self.source.clone(), self.target.clone()) else {
             return;
         };
-        let side = |repo: &str, rel: &str| -> Option<crate::diff_inspect::InspectSide> {
+        let side = |repo: &str, rel: &str| -> Option<DiffSide> {
             let meta = store.get_repo(repo).ok()?;
             let entry = store.get_file_entry(repo, rel).ok().flatten()?;
-            Some(crate::diff_inspect::InspectSide {
+            let abs_path = PathBuf::from(&meta.abs_path).join(rel);
+            Some(DiffSide {
                 repo: repo.to_string(),
                 rel_path: rel.to_string(),
-                abs_path: PathBuf::from(&meta.abs_path).join(rel),
-                size: entry.size,
-                modified_ms: entry.modified_ms,
-                mime: entry.mime.clone(),
-                hash_hex: dedup_core::thumbnail::hash_hex(&entry.hash),
+                facts: FileFacts::from_entry(&entry, abs_path),
             })
         };
         match (side(&source, left_rel), side(&target, right_rel)) {
             (Some(left), Some(right)) => {
-                self.inspect = Some(crate::diff_inspect::Inspect::new(left, right));
+                self.inspect = Some(DiffCompare::new(left, right));
                 self.error = None;
             }
             _ => self.error = Some("Could not read both versions of that file.".to_string()),
@@ -2394,6 +2399,461 @@ impl TransferView {
     }
 }
 
+/// One side of a DIFF comparison: its action identity (`repo` + `rel_path`, which
+/// the resulting [`crate::diff_board::BoardAction`] needs) alongside the
+/// viewer-agnostic [`FileFacts`] used to preview and describe it.
+struct DiffSide {
+    repo: String,
+    rel_path: String,
+    facts: FileFacts,
+}
+
+impl DiffSide {
+    /// Whether this side can produce a visual to compare (image or video still).
+    /// Text / binary / audio cannot, so compare disables itself for the pair.
+    fn previewable(&self) -> bool {
+        self.facts.is_image() || self.facts.is_video()
+    }
+
+    /// What to say when there is no picture to show.
+    fn placeholder(&self) -> String {
+        match self.facts.mime.as_deref() {
+            Some(mime) => format!("no preview for {mime}"),
+            None => "no preview for this file type".to_string(),
+        }
+    }
+}
+
+/// The user's decision in the DIFF comparison, mapped by the caller onto the same
+/// `BoardAction`s the diff board row offers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DiffPick {
+    /// Delete this side's file.
+    Delete { on_left: bool },
+    /// Replace the other side's file with this side's content.
+    Overwrite { from_left: bool },
+    /// Leave both alone.
+    Close,
+}
+
+/// A decoded preview arriving from a worker thread.
+struct DiffLoaded {
+    left: bool,
+    image: Option<ColorImage>,
+}
+
+/// What one side's preview pane should draw this frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SlotState {
+    /// The decoded image (or video still) is ready.
+    Image,
+    /// The decode is still in flight.
+    Decoding,
+    /// Settled with nothing to show — a non-previewable type, or a decode that
+    /// came back empty (e.g. video with no ffmpeg).
+    NoPreview,
+}
+
+/// The open side-by-side comparison of one BY PATH conflict — two versions of the
+/// same path in two repos — rendered through the shared lightbox viewer
+/// ([`draw_compare`]): the same zoom / pan / flicker the Duplicate lightbox has,
+/// with DIFF's own per-side actions. Previews decode off the UI thread (a large
+/// photo must never freeze the window) and handle both images and video stills;
+/// a side that can produce no visual keeps a "no preview" note and disables
+/// compare (roadmap: "if a side has no visual, compare disables itself").
+struct DiffCompare {
+    left: DiffSide,
+    right: DiffSide,
+    /// Shared A/B view transform (zoom / pan / flicker). Its `b` carries the right
+    /// side's facts, though [`draw_compare`] reads only the transform.
+    compare: CompareState,
+    tex: [Option<TextureHandle>; 2],
+    /// Whether that side's decode has come back (successfully or not).
+    settled: [bool; 2],
+    tx: Sender<DiffLoaded>,
+    rx: Receiver<DiffLoaded>,
+    started: bool,
+}
+
+impl DiffCompare {
+    fn new(left: DiffSide, right: DiffSide) -> Self {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let compare = CompareState::new(right.facts.clone());
+        Self {
+            left,
+            right,
+            compare,
+            tex: [None, None],
+            settled: [false, false],
+            tx,
+            rx,
+            started: false,
+        }
+    }
+
+    /// What one side's pane should draw right now: its decoded image, an
+    /// in-flight "decoding…" note, or a settled "no preview" note. A side is
+    /// `NoPreview` both when it can never have a visual (a document) and when its
+    /// decode came back empty (e.g. a video with no ffmpeg) — settled with no
+    /// texture. This is what keeps a failed decode from spinning "decoding…"
+    /// forever (the distinction the old two-pane `settled[]` flags carried).
+    fn slot_state(&self, slot: usize) -> SlotState {
+        if self.tex[slot].is_some() {
+            SlotState::Image
+        } else if self.settled[slot] {
+            SlotState::NoPreview
+        } else {
+            SlotState::Decoding
+        }
+    }
+
+    /// A/B compare (zoom / pan / flicker) is available only once *both* sides
+    /// have actually produced a texture — before then, or if either failed,
+    /// there is nothing to compare, so the panes stay static.
+    fn compare_ready(&self) -> bool {
+        matches!(
+            (self.slot_state(0), self.slot_state(1)),
+            (SlotState::Image, SlotState::Image)
+        )
+    }
+
+    /// Kick off both decodes once, off the UI thread. A non-previewable side is
+    /// settled immediately with no decode.
+    fn start(&mut self, ctx: &Context) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        for (is_left, side) in [(true, &self.left), (false, &self.right)] {
+            let slot = usize::from(!is_left);
+            if !side.previewable() {
+                self.settled[slot] = true;
+                continue;
+            }
+            let tx = self.tx.clone();
+            let ctx = ctx.clone();
+            let path = side.facts.abs_path.clone();
+            let hex = side.facts.hash_hex.clone();
+            let video = side.facts.is_video();
+            std::thread::spawn(move || {
+                let decoded = if video {
+                    // One still is enough to tell two clips apart at a glance.
+                    dedup_core::thumbnail::video_frame_rgba(&path, &hex, 0, 1).ok()
+                } else {
+                    dedup_core::thumbnail::load_full_rgba(&path, MAX_TEXTURE_EDGE).ok()
+                };
+                let image = decoded.map(|(w, h, rgba)| {
+                    ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba)
+                });
+                let _ = tx.send(DiffLoaded {
+                    left: is_left,
+                    image,
+                });
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    /// Upload any freshly decoded previews.
+    fn poll(&mut self, ctx: &Context) {
+        while let Ok(loaded) = self.rx.try_recv() {
+            let slot = usize::from(!loaded.left);
+            self.settled[slot] = true;
+            if let Some(image) = loaded.image {
+                let name = if loaded.left {
+                    "diff-compare-left"
+                } else {
+                    "diff-compare-right"
+                };
+                self.tex[slot] = Some(ctx.load_texture(name, image, TextureOptions::LINEAR));
+            }
+        }
+    }
+
+    /// `(texture, pixel-size)` for one side, in the shape [`draw_compare`] wants.
+    /// The size comes from the indexed image dimensions, else the decoded texture
+    /// (video stills carry no stored dimensions), else a 1×1 fallback while pending.
+    fn sized(&self, slot: usize) -> (Option<TextureHandle>, Vec2) {
+        let tex = self.tex[slot].clone();
+        let facts = if slot == 0 {
+            &self.left.facts
+        } else {
+            &self.right.facts
+        };
+        let img = facts
+            .img_size
+            .map(|(w, h)| egui::vec2(w as f32, h as f32))
+            .or_else(|| tex.as_ref().map(|t| t.size_vec2()))
+            .unwrap_or(egui::vec2(1.0, 1.0));
+        (tex, img)
+    }
+
+    /// Draw the comparison over the whole window. Returns the user's decision, or
+    /// `None` while they are still looking.
+    fn view(&mut self, ctx: &Context, verbosity: TooltipVerbosity) -> Option<DiffPick> {
+        self.start(ctx);
+        self.poll(ctx);
+
+        let ready = self.compare_ready();
+        // Esc steps back (flicker → side-by-side → closed); Space drives flicker
+        // (enter it, then swap A/B), both only once both sides have decoded.
+        let (esc, space) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::Space),
+            )
+        });
+        if esc {
+            if ready && self.compare.flicker {
+                self.compare.flicker = false;
+            } else {
+                return Some(DiffPick::Close);
+            }
+        }
+        if space && ready {
+            if self.compare.flicker {
+                self.compare.show_b = !self.compare.show_b;
+            } else {
+                self.compare.flicker = true;
+            }
+        }
+
+        egui::Area::new(Id::new("diff-compare"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                let screen = ctx.content_rect();
+                let bg = ui.allocate_rect(screen, egui::Sense::click_and_drag());
+                // Nearly opaque: this is a judgement call about two files, so the
+                // board behind must not compete for attention.
+                ui.painter()
+                    .rect_filled(screen, 0.0, Color32::from_black_alpha(252));
+                let inner = screen.shrink(12.0);
+                let mut pick = None;
+
+                // Title + CLOSE.
+                let top =
+                    Rect::from_min_max(inner.min, egui::pos2(inner.max.x, inner.min.y + 26.0));
+                let close = ui
+                    .scope_builder(
+                        UiBuilder::new()
+                            .max_rect(top)
+                            .layout(Layout::left_to_right(Align::Center)),
+                        |ui| {
+                            ui.label(
+                                RichText::new("COMPARE — SAME PATH, DIFFERENT CONTENT")
+                                    .color(theme::TAN)
+                                    .size(16.0)
+                                    .strong(),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.button(RichText::new("CLOSE").color(theme::BLACK))
+                                    .explain(
+                                        verbosity,
+                                        "Close the comparison",
+                                        "Close this view and go back to the diff board. Nothing \
+                                         is changed.",
+                                    )
+                                    .clicked()
+                            })
+                            .inner
+                        },
+                    )
+                    .inner;
+                if close {
+                    pick = Some(DiffPick::Close);
+                }
+
+                // Preview viewport on top, facts / action strip along the bottom.
+                // Guard the viewport bottom so a very short window never inverts
+                // the rect (a full-window modal, but cheap to keep well-formed).
+                const STRIP_H: f32 = 150.0;
+                let viewport = Rect::from_min_max(
+                    egui::pos2(inner.min.x, inner.min.y + 32.0),
+                    egui::pos2(
+                        inner.max.x,
+                        (inner.max.y - STRIP_H).max(inner.min.y + 112.0),
+                    ),
+                );
+                if ready {
+                    // Both sides decoded: the shared A/B viewer — zoom / pan /
+                    // flicker across both panes.
+                    let (a_tex, a_img) = self.sized(0);
+                    let (b_tex, b_img) = self.sized(1);
+                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                    draw_compare(
+                        ui,
+                        &mut self.compare,
+                        viewport,
+                        (&a_tex, a_img),
+                        (&b_tex, b_img),
+                        ComparePointer {
+                            drag: bg.dragged().then(|| bg.drag_delta()),
+                            scroll,
+                            cursor: ctx.pointer_hover_pos(),
+                        },
+                    );
+                    ui.painter().text(
+                        egui::pos2(inner.min.x + 4.0, viewport.max.y + 2.0),
+                        Align2::LEFT_TOP,
+                        "wheel: zoom · drag: pan · Space flicker/swap · Esc close",
+                        FontId::proportional(11.0),
+                        theme::HAIRLINE,
+                    );
+                } else {
+                    // Not both decoded yet (or one produced no visual): static
+                    // side-by-side, each pane its image, an in-flight "decoding…"
+                    // note, or a settled "no preview" note. Compare stays disabled
+                    // until both sides yield a texture.
+                    let (left_pane, right_pane) = compare_split(viewport);
+                    for (slot, pane) in [(0usize, left_pane), (1usize, right_pane)] {
+                        match self.slot_state(slot) {
+                            SlotState::Image => {
+                                let (tex, img) = self.sized(slot);
+                                let rect = crate::lightbox::fit_rect(pane, img);
+                                draw_in_pane(ui, pane, rect, &tex);
+                            }
+                            note => {
+                                let side = if slot == 0 { &self.left } else { &self.right };
+                                let text = if note == SlotState::Decoding {
+                                    "decoding…".to_string()
+                                } else {
+                                    side.placeholder()
+                                };
+                                ui.painter().text(
+                                    pane.center(),
+                                    Align2::CENTER_CENTER,
+                                    text,
+                                    FontId::proportional(14.0),
+                                    theme::TAN,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Facts + actions: two columns below the preview.
+                let strip = Rect::from_min_max(
+                    egui::pos2(inner.min.x, inner.max.y - STRIP_H + 10.0),
+                    inner.max,
+                );
+                let col_w = (strip.width() - 16.0) * 0.5;
+                ui.scope_builder(
+                    UiBuilder::new()
+                        .max_rect(strip)
+                        .layout(Layout::left_to_right(Align::Min)),
+                    |ui| {
+                        for is_left in [true, false] {
+                            let (side, other) = if is_left {
+                                (&self.left, &self.right)
+                            } else {
+                                (&self.right, &self.left)
+                            };
+                            let picked = ui
+                                .allocate_ui(egui::vec2(col_w, strip.height()), |ui| {
+                                    side_strip(ui, side, other, is_left, verbosity)
+                                })
+                                .inner;
+                            if picked.is_some() {
+                                pick = picked;
+                            }
+                            ui.add_space(16.0);
+                        }
+                    },
+                );
+                pick
+            })
+            .inner
+    }
+}
+
+/// One side's facts (repo, path, size / date / type with the bigger-or-newer
+/// value highlighted so the difference reads without comparing both numbers) and
+/// its OVERWRITE / DELETE actions. Returns the chosen action, if any.
+fn side_strip(
+    ui: &mut egui::Ui,
+    side: &DiffSide,
+    other: &DiffSide,
+    is_left: bool,
+    verbosity: TooltipVerbosity,
+) -> Option<DiffPick> {
+    let mut pick = None;
+    ui.vertical(|ui| {
+        ui.label(
+            RichText::new(&side.repo)
+                .color(if is_left { theme::ORANGE } else { theme::BLUE })
+                .size(14.0)
+                .strong(),
+        );
+        ui.label(RichText::new(&side.rel_path).color(theme::TEXT).size(12.0));
+        let size_color = if side.facts.size > other.facts.size {
+            theme::GREEN
+        } else {
+            theme::TEXT
+        };
+        let date_color = if side.facts.modified_ms > other.facts.modified_ms {
+            theme::GREEN
+        } else {
+            theme::TEXT
+        };
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format_size(side.facts.size))
+                .color(size_color)
+                .size(13.0)
+                .strong(),
+        );
+        ui.label(
+            RichText::new(format_mtime(side.facts.modified_ms))
+                .color(date_color)
+                .size(13.0),
+        );
+        ui.label(
+            RichText::new(
+                side.facts
+                    .mime
+                    .clone()
+                    .unwrap_or_else(|| "unknown type".into()),
+            )
+            .color(theme::GREY)
+            .size(12.0),
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("OVERWRITE OTHER").color(theme::BLACK))
+                        .fill(theme::TAN),
+                )
+                .explain(
+                    verbosity,
+                    "Replace the other side with this version",
+                    "Copy this version over the other repository's file, so both repositories \
+                     hold this one. The other version is gone afterwards.",
+                )
+                .clicked()
+            {
+                pick = Some(DiffPick::Overwrite { from_left: is_left });
+            }
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("DELETE").color(theme::BLACK)).fill(theme::RED),
+                )
+                .explain(
+                    verbosity,
+                    "Delete this version",
+                    "Delete this file from this repository. The other repository's version is \
+                     left alone. This cannot be undone.",
+                )
+                .clicked()
+            {
+                pick = Some(DiffPick::Delete { on_left: is_left });
+            }
+        });
+    });
+    pick
+}
+
 /// Kittest UI tests for the Transfer view. Mirrors the harness pattern
 /// established in `dupes_view.rs`'s `ui_tests` module.
 #[cfg(test)]
@@ -2401,6 +2861,60 @@ mod ui_tests {
     use super::*;
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
+
+    /// A DIFF side carrying just a mime, for the previewability unit test.
+    fn diff_side(mime: Option<&str>) -> DiffSide {
+        DiffSide {
+            repo: "r".into(),
+            rel_path: "a.bin".into(),
+            facts: FileFacts {
+                size: 1,
+                modified_ms: 1,
+                mime: mime.map(str::to_string),
+                img_size: None,
+                audio_ms: None,
+                audio_seed: None,
+                hash_hex: "deadbeef".into(),
+                abs_path: PathBuf::from("/tmp/a.bin"),
+                origin: None,
+            },
+        }
+    }
+
+    /// A side with a visual (image / video) is compared through the shared
+    /// viewer; one without (a document) shows a "no preview" note naming the type
+    /// — not a stuck "decoding…" — and disables compare for the pair.
+    #[test]
+    fn diff_previewability_follows_mime_and_placeholder_names_the_type() {
+        assert!(diff_side(Some("image/jpeg")).previewable());
+        assert!(diff_side(Some("video/mp4")).previewable());
+        let doc = diff_side(Some("application/pdf"));
+        assert!(!doc.previewable(), "a document has no visual to compare");
+        assert!(
+            doc.placeholder().contains("application/pdf"),
+            "the pane names the type it cannot preview"
+        );
+        assert!(diff_side(None).placeholder().contains("file type"));
+    }
+
+    /// A previewable pair whose decode came back empty (e.g. two videos with no
+    /// ffmpeg) settles to "no preview" and keeps compare disabled — it must not
+    /// spin "decoding…" forever, and CLAUDE.md promises video degrades gracefully.
+    #[test]
+    fn a_failed_decode_settles_to_no_preview_not_a_stuck_decode() {
+        let mut dc = DiffCompare::new(diff_side(Some("video/mp4")), diff_side(Some("video/mp4")));
+        // Before decode: both in flight, compare not yet available.
+        assert_eq!(dc.slot_state(0), SlotState::Decoding);
+        assert!(!dc.compare_ready());
+        // Decode came back with no texture on both sides.
+        dc.settled = [true, true];
+        assert_eq!(dc.slot_state(0), SlotState::NoPreview);
+        assert_eq!(dc.slot_state(1), SlotState::NoPreview);
+        assert!(
+            !dc.compare_ready(),
+            "no textures ⇒ compare stays disabled, panes show 'no preview'"
+        );
+    }
 
     /// A temp store with a `source` and `target` repo, `source` holding a
     /// couple of files so the filter builder and preview have something real
@@ -3152,6 +3666,81 @@ mod ui_tests {
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/transfer_compare.png");
         let img = h.render().expect("wgpu render failed");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Doc screenshot of the DIFF side-by-side compare, with two genuinely
+    /// different (decodable) images at the same path, to
+    /// `docs/screenshots/diff_compare.png`. Run with `--ignored`.
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_diff_compare() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        // The same relative path in both repos, different image content: a BY
+        // PATH conflict the compare can really show side by side.
+        for (repo, tint) in [("source", 40u8), ("target", 200u8)] {
+            let root = tmp.path().join(repo);
+            std::fs::create_dir_all(&root).unwrap();
+            image::RgbImage::from_fn(640, 480, |x, y| image::Rgb([x as u8, y as u8, tint]))
+                .save(root.join("holiday.png"))
+                .unwrap();
+            store.create_repo(repo, &root.to_string_lossy()).unwrap();
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &dedup_core::update::CancellationToken::new(),
+            )
+            .expect("scan test repo");
+        }
+
+        let mut view = TransferView::new();
+        view.loaded = true;
+        view.repos = vec!["source".to_string(), "target".to_string()];
+        view.source = Some("source".to_string());
+        view.target = Some("target".to_string());
+        view.command = Command::Diff;
+        view.pairing = dedup_core::diff::DiffPairing::ByPath;
+        view.diff_rows = dedup_core::diff::plan_repo_diff(
+            &store,
+            "source",
+            "target",
+            dedup_core::diff::DiffPairing::ByPath,
+        )
+        .expect("plan diff");
+
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 820.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut TransferView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), None);
+                },
+                view,
+            );
+        harness.run();
+        harness.get_by_label("COMPARE").click();
+        // Both previews decode on worker threads; run a few frames so the
+        // side-by-side A/B compare is populated before the shot.
+        for _ in 0..12 {
+            harness.run();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        harness.run();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("diff_compare.png");
+        let img = harness.render().expect("wgpu render failed");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }

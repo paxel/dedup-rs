@@ -1714,61 +1714,18 @@ impl DupesView {
                         );
                     }
                 } else if let Some(cmp) = state.compare.as_mut() {
-                    // Shared zoom/pan across both panes.
-                    if bg.dragged() {
-                        cmp.pan_by(bg.drag_delta());
-                    }
-                    if scroll != 0.0
-                        && cursor.is_some_and(|c| viewport.contains(c))
-                    {
-                        cmp.zoom_by((scroll * 0.005).exp());
-                    }
-                    if cmp.flicker {
-                        // Overlay: show A or B in the whole viewport.
-                        let (tex, img) = if cmp.show_b {
-                            (&b_tex, b_img.unwrap_or(a_img))
-                        } else {
-                            (&a_tex, a_img)
-                        };
-                        let rect = cmp.pane_rect(viewport, img);
-                        draw(ui, rect, viewport, tex);
-                        let tag = if cmp.show_b { "B" } else { "A" };
-                        ui.painter().text(
-                            viewport.min + egui::vec2(6.0, 6.0),
-                            egui::Align2::LEFT_TOP,
-                            tag,
-                            egui::FontId::proportional(18.0),
-                            theme::AMBER,
-                        );
-                    } else {
-                        // Side by side.
-                        let gap = 6.0;
-                        let half = (viewport.width() - gap) / 2.0;
-                        let left = egui::Rect::from_min_size(
-                            viewport.min,
-                            egui::vec2(half, viewport.height()),
-                        );
-                        let right = egui::Rect::from_min_size(
-                            egui::pos2(viewport.min.x + half + gap, viewport.min.y),
-                            egui::vec2(half, viewport.height()),
-                        );
-                        draw(ui, cmp.pane_rect(left, a_img), left, &a_tex);
-                        draw(
-                            ui,
-                            cmp.pane_rect(right, b_img.unwrap_or(a_img)),
-                            right,
-                            &b_tex,
-                        );
-                        for (pane, tag) in [(left, "A"), (right, "B")] {
-                            ui.painter().text(
-                                pane.min + egui::vec2(6.0, 6.0),
-                                egui::Align2::LEFT_TOP,
-                                tag,
-                                egui::FontId::proportional(18.0),
-                                theme::AMBER,
-                            );
-                        }
-                    }
+                    crate::lightbox::draw_compare(
+                        ui,
+                        cmp,
+                        viewport,
+                        (&a_tex, a_img),
+                        (&b_tex, b_img.unwrap_or(a_img)),
+                        crate::lightbox::ComparePointer {
+                            drag: bg.dragged().then(|| bg.drag_delta()),
+                            scroll,
+                            cursor,
+                        },
+                    );
                 } else {
                     // Single image: wheel zoom around cursor, drag pan.
                     if bg.dragged() {

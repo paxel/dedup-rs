@@ -4,7 +4,6 @@
 mod app;
 mod browse_view;
 mod diff_board;
-mod diff_inspect;
 mod dupes_view;
 mod external;
 mod filter_ui;

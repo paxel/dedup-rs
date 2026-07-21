@@ -202,6 +202,78 @@ pub fn full_texture(
     (tex, img)
 }
 
+/// Split `viewport` into the two equal panes of a side-by-side compare, with a
+/// fixed gutter between them. Pure geometry, so the layout is unit-testable and
+/// shared by every caller of [`draw_compare`].
+pub fn compare_split(viewport: Rect) -> (Rect, Rect) {
+    const GAP: f32 = 6.0;
+    let half = (viewport.width() - GAP) / 2.0;
+    let left = Rect::from_min_size(viewport.min, egui::vec2(half, viewport.height()));
+    let right = Rect::from_min_size(
+        egui::pos2(viewport.min.x + half + GAP, viewport.min.y),
+        egui::vec2(half, viewport.height()),
+    );
+    (left, right)
+}
+
+/// One frame's pointer input over the compare viewport, so [`draw_compare`]
+/// stays a handful of arguments: the background drag delta (`None` when not
+/// dragging), the smooth scroll amount, and the hover position.
+pub struct ComparePointer {
+    pub drag: Option<Vec2>,
+    pub scroll: f32,
+    pub cursor: Option<egui::Pos2>,
+}
+
+/// Render an A/B compare into `viewport`: in flicker mode one side fills the
+/// whole viewport (A or B per `state.show_b`), otherwise the two panes sit side
+/// by side. Applies the shared drag-pan and cursor-anchored scroll-zoom so both
+/// panes track together, then labels each pane. `a`/`b` are each a
+/// `(texture, pixel-size)`. The viewer mechanics only — the caller owns the
+/// surrounding chrome and the action strip.
+pub fn draw_compare(
+    ui: &egui::Ui,
+    state: &mut CompareState,
+    viewport: Rect,
+    a: (&Option<TextureHandle>, Vec2),
+    b: (&Option<TextureHandle>, Vec2),
+    input: ComparePointer,
+) {
+    let (a_tex, a_img) = a;
+    let (b_tex, b_img) = b;
+    if let Some(delta) = input.drag {
+        state.pan_by(delta);
+    }
+    if input.scroll != 0.0 && input.cursor.is_some_and(|c| viewport.contains(c)) {
+        state.zoom_by((input.scroll * 0.005).exp());
+    }
+    let tag = |ui: &egui::Ui, pane: Rect, text: &str| {
+        ui.painter().text(
+            pane.min + egui::vec2(6.0, 6.0),
+            egui::Align2::LEFT_TOP,
+            text,
+            egui::FontId::proportional(18.0),
+            theme::AMBER,
+        );
+    };
+    if state.flicker {
+        // Overlay: show A or B in the whole viewport.
+        let (tex, img) = if state.show_b {
+            (b_tex, b_img)
+        } else {
+            (a_tex, a_img)
+        };
+        draw_in_pane(ui, viewport, state.pane_rect(viewport, img), tex);
+        tag(ui, viewport, if state.show_b { "B" } else { "A" });
+    } else {
+        let (left, right) = compare_split(viewport);
+        draw_in_pane(ui, left, state.pane_rect(left, a_img), a_tex);
+        draw_in_pane(ui, right, state.pane_rect(right, b_img), b_tex);
+        tag(ui, left, "A");
+        tag(ui, right, "B");
+    }
+}
+
 /// Draw `tex` stretched to `rect`, clipped to `pane` — or a "decoding…" note
 /// while the texture is still being produced.
 pub fn draw_in_pane(ui: &egui::Ui, pane: Rect, rect: Rect, tex: &Option<TextureHandle>) {
