@@ -7,6 +7,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 const SCHEMA_VERSION: u8 = 1;
+/// Version byte of serialized [`SyncGroup`] values. v1 stored a single
+/// group-wide `mode`; v2 moved the mode onto each sink ([`SyncSink`]). v1 values
+/// decode with every sink inheriting the old group mode. Scoped to sync groups
+/// so it can advance independently of [`SCHEMA_VERSION`] (which still governs
+/// `RepoMeta` in the same registry).
+const SYNC_GROUP_VERSION: u8 = 2;
 /// Version byte of serialized [`FileEntry`] values. v2 grew the image
 /// fingerprint from a 64-bit dHash to the 512-bit [`ImgHash`] (v1 entries decode
 /// but drop the fingerprint and are flagged stale for re-hashing); v3 added
@@ -156,7 +162,8 @@ pub struct RepoMeta {
     pub schema_ver: u8,
 }
 
-/// How a sync group pushes its main repo out to its sinks.
+/// How the main is pushed to one sink. Chosen per sink, so a group can mirror
+/// some backups and only-add to others.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyncMode {
     /// Copy content the sink lacks; never delete anything in the sink.
@@ -167,23 +174,66 @@ pub enum SyncMode {
     Mirror,
 }
 
+/// One sink of a group: the backup repository and how the main is pushed to it.
+/// The mode is per sink, so a group can mirror some backups and only-add to others.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SyncSink {
+    pub repo: String,
+    pub mode: SyncMode,
+}
+
 /// One backup group: a **main** repository plus the remote **sinks** it is
 /// pushed to. A repository belongs to at most one group.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct SyncGroup {
     pub main: String,
-    pub sinks: Vec<String>,
-    pub mode: SyncMode,
+    pub sinks: Vec<SyncSink>,
 }
 
 impl SyncGroup {
-    /// The main repo and its sinks, in display order.
+    /// The main repo and its sinks' repos, in display order.
     pub fn members(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.main.as_str()).chain(self.sinks.iter().map(String::as_str))
+        std::iter::once(self.main.as_str()).chain(self.sinks.iter().map(|s| s.repo.as_str()))
     }
 
     pub fn has_member(&self, repo: &str) -> bool {
         self.members().any(|m| m == repo)
+    }
+}
+
+/// Version-1 [`SyncGroup`] layout: a single group-wide `mode`. Kept so
+/// pre-upgrade groups stay readable; see [`decode_sync_group`].
+#[derive(Serialize, Deserialize)]
+struct SyncGroupV1 {
+    main: String,
+    sinks: Vec<String>,
+    mode: SyncMode,
+}
+
+/// Decode a stored [`SyncGroup`], migrating a version-1 (group-wide mode) value
+/// so every sink inherits that mode. Re-saving writes it back as the current
+/// [`SYNC_GROUP_VERSION`].
+fn decode_sync_group(bytes: &[u8]) -> Result<SyncGroup, StoreError> {
+    match bytes.first() {
+        Some(&SYNC_GROUP_VERSION) => deserialize_value(SYNC_GROUP_VERSION, bytes),
+        Some(&SCHEMA_VERSION) => {
+            let v1: SyncGroupV1 = deserialize_value(SCHEMA_VERSION, bytes)?;
+            Ok(SyncGroup {
+                main: v1.main,
+                sinks: v1
+                    .sinks
+                    .into_iter()
+                    .map(|repo| SyncSink {
+                        repo,
+                        mode: v1.mode,
+                    })
+                    .collect(),
+            })
+        }
+        other => Err(StoreError::SchemaVersionMismatch {
+            expected: SYNC_GROUP_VERSION,
+            found: other.copied().unwrap_or(0),
+        }),
     }
 }
 
@@ -773,7 +823,7 @@ impl Store {
         let mut groups = Vec::new();
         for item in table.iter()? {
             let (name_guard, val_guard) = item?;
-            let group: SyncGroup = deserialize_value(SCHEMA_VERSION, val_guard.value())?;
+            let group = decode_sync_group(val_guard.value())?;
             groups.push((name_guard.value().to_string(), group));
         }
         Ok(groups)
@@ -791,7 +841,7 @@ impl Store {
         };
         // A keyed lookup, not a scan of every group: the name is the table key.
         match table.get(name)? {
-            Some(guard) => deserialize_value(SCHEMA_VERSION, guard.value()),
+            Some(guard) => decode_sync_group(guard.value()),
             None => Err(StoreError::GroupNotFound(name.to_string())),
         }
     }
@@ -806,13 +856,9 @@ impl Store {
     }
 
     /// Create a group around `main`. The repo must exist and must not already
-    /// belong to another group.
-    pub fn create_sync_group(
-        &self,
-        name: &str,
-        main: &str,
-        mode: SyncMode,
-    ) -> Result<(), StoreError> {
+    /// belong to another group. A new group has no sinks; each sink's push mode
+    /// is chosen when it is added.
+    pub fn create_sync_group(&self, name: &str, main: &str) -> Result<(), StoreError> {
         // Keyed existence check rather than a scan of every group.
         match self.get_sync_group(name) {
             Ok(_) => return Err(StoreError::GroupExists(name.to_string())),
@@ -826,7 +872,6 @@ impl Store {
             &SyncGroup {
                 main: main.to_string(),
                 sinks: Vec::new(),
-                mode,
             },
         )
     }
@@ -843,12 +888,20 @@ impl Store {
         Ok(())
     }
 
-    /// Add an existing repository to a group as a sink.
-    pub fn add_sync_sink(&self, group_name: &str, repo: &str) -> Result<(), StoreError> {
+    /// Add an existing repository to a group as a sink, pushed in `mode`.
+    pub fn add_sync_sink(
+        &self,
+        group_name: &str,
+        repo: &str,
+        mode: SyncMode,
+    ) -> Result<(), StoreError> {
         let mut group = self.get_sync_group(group_name)?;
         self.get_repo(repo)?;
         self.reject_if_grouped(repo)?;
-        group.sinks.push(repo.to_string());
+        group.sinks.push(SyncSink {
+            repo: repo.to_string(),
+            mode,
+        });
         self.put_sync_group(group_name, &group)
     }
 
@@ -856,13 +909,13 @@ impl Store {
     /// promote another member first, or delete the group.
     pub fn remove_sync_sink(&self, group_name: &str, repo: &str) -> Result<(), StoreError> {
         let mut group = self.get_sync_group(group_name)?;
-        if group.main == repo || !group.sinks.iter().any(|s| s == repo) {
+        if group.main == repo || !group.sinks.iter().any(|s| s.repo == repo) {
             return Err(StoreError::NotInGroup {
                 repo: repo.to_string(),
                 group: group_name.to_string(),
             });
         }
-        group.sinks.retain(|s| s != repo);
+        group.sinks.retain(|s| s.repo != repo);
         self.put_sync_group(group_name, &group)
     }
 
@@ -873,22 +926,40 @@ impl Store {
         if group.main == repo {
             return Ok(());
         }
-        if !group.sinks.iter().any(|s| s == repo) {
+        if !group.sinks.iter().any(|s| s.repo == repo) {
             return Err(StoreError::NotInGroup {
                 repo: repo.to_string(),
                 group: group_name.to_string(),
             });
         }
-        group.sinks.retain(|s| s != repo);
-        group
-            .sinks
-            .push(std::mem::replace(&mut group.main, repo.to_string()));
+        // The promoted sink becomes the main (mains have no mode); the old main
+        // becomes a sink in the default (ADD ONLY) mode.
+        group.sinks.retain(|s| s.repo != repo);
+        let old_main = std::mem::replace(&mut group.main, repo.to_string());
+        group.sinks.push(SyncSink {
+            repo: old_main,
+            mode: SyncMode::default(),
+        });
         self.put_sync_group(group_name, &group)
     }
 
-    pub fn set_sync_mode(&self, group_name: &str, mode: SyncMode) -> Result<(), StoreError> {
+    /// Set the push mode of one sink in a group.
+    pub fn set_sink_mode(
+        &self,
+        group_name: &str,
+        sink: &str,
+        mode: SyncMode,
+    ) -> Result<(), StoreError> {
         let mut group = self.get_sync_group(group_name)?;
-        group.mode = mode;
+        match group.sinks.iter_mut().find(|s| s.repo == sink) {
+            Some(s) => s.mode = mode,
+            None => {
+                return Err(StoreError::NotInGroup {
+                    repo: sink.to_string(),
+                    group: group_name.to_string(),
+                });
+            }
+        }
         self.put_sync_group(group_name, &group)
     }
 
@@ -904,7 +975,7 @@ impl Store {
     }
 
     fn put_sync_group(&self, name: &str, group: &SyncGroup) -> Result<(), StoreError> {
-        let bytes = serialize_value(SCHEMA_VERSION, group)?;
+        let bytes = serialize_value(SYNC_GROUP_VERSION, group)?;
         let write_txn = self.registry.begin_write()?;
         {
             let mut table = write_txn.open_table(SYNC_GROUPS)?;
@@ -1686,6 +1757,44 @@ pub fn read_scan_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A version-1 sync group stored one group-wide mode. Decoding it now must
+    /// give every sink that same mode (the standing rule that store-format
+    /// changes ship with a legacy-decode test).
+    #[test]
+    fn v1_sync_group_decodes_with_each_sink_inheriting_the_group_mode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Encode exactly as the old code did: the shared version byte + a
+        // postcard `SyncGroupV1`.
+        let v1 = SyncGroupV1 {
+            main: "MAIN".to_string(),
+            sinks: vec!["SINK1".to_string(), "SINK2".to_string()],
+            mode: SyncMode::Mirror,
+        };
+        let bytes = serialize_value(SCHEMA_VERSION, &v1)?;
+
+        let group = decode_sync_group(&bytes)?;
+        assert_eq!(group.main, "MAIN");
+        assert_eq!(
+            group.sinks,
+            vec![
+                SyncSink {
+                    repo: "SINK1".to_string(),
+                    mode: SyncMode::Mirror,
+                },
+                SyncSink {
+                    repo: "SINK2".to_string(),
+                    mode: SyncMode::Mirror,
+                },
+            ],
+            "every legacy sink inherits the old group-wide mode"
+        );
+
+        // A current (v2) value round-trips unchanged.
+        let bytes2 = serialize_value(SYNC_GROUP_VERSION, &group)?;
+        assert_eq!(decode_sync_group(&bytes2)?, group);
+        Ok(())
+    }
 
     #[test]
     fn annotations_round_trip_dedup_and_clear() -> Result<(), Box<dyn std::error::Error>> {

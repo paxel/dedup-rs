@@ -25,18 +25,19 @@ The selected group shows its **MAIN** and each **SINK**:
 
 ## Mode
 
-The mode is configured **per group** and decides what a push does:
+Each **sink** has its own mode (a pill next to it), so a group can mirror some backups and
+only-add to others:
 
-- **ADD ONLY** — copy content a sink lacks, and never delete anything from it. A sink may
+- **ADD ONLY** — copy content that sink lacks, and never delete anything from it. It may
   keep files the main no longer has.
-- **MIRROR** — also delete sink content the main does not have, so each sink ends up holding
+- **MIRROR** — also delete sink content the main does not have, so that sink ends up holding
   exactly the main's content. Those deletions cannot be undone.
 
 Because MIRROR deletes whatever the main lacks, a main that holds *nothing* would mean
 "delete everything". A push is therefore refused outright when the main has no indexed
-files — most often a main that was never scanned, or one whose drive failed to mount and
-so scanned as an empty directory. Scan the main and try again. ADD ONLY never deletes and
-is never refused.
+files *and any sink is set to MIRROR* — most often a main that was never scanned, or one
+whose drive failed to mount and so scanned as an empty directory. Scan the main and try
+again. A group whose sinks are all ADD ONLY never deletes and is never refused.
 
 Content is compared by size + BLAKE3 hash, never by path, so a file that already exists in
 the sink under a different name is not copied again.

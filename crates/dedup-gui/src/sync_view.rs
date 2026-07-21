@@ -1,8 +1,8 @@
 //! The Sync Groups tab: keep one **main** repository backed up to one or more
 //! remote **sinks**, instead of the manual duplicate → relocate → rescan dance.
 //!
-//! A group names a main repo, its sinks, and how it is pushed:
-//! **ADD ONLY** copies what a sink lacks and never deletes; **MIRROR** also
+//! A group names a main repo and its sinks; each sink has its own push mode:
+//! **ADD ONLY** copies what that sink lacks and never deletes; **MIRROR** also
 //! removes sink content the main no longer has, so the sink converges on
 //! exactly the main's content.
 //!
@@ -212,7 +212,7 @@ enum Act {
     AddSink(String, String),
     RemoveSink(String, String),
     MakeMain(String, String),
-    SetMode(String, SyncMode),
+    SetSinkMode(String, String, SyncMode),
     Preview,
     Ask,
     Confirm,
@@ -460,8 +460,8 @@ impl SyncView {
         );
     }
 
-    /// The selected group: its main, its sinks (each removable / promotable),
-    /// the repos it can still take in, and its mode.
+    /// The selected group: its main, its sinks (each with its own push mode,
+    /// removable / promotable), and the repos it can still take in.
     fn members_section(
         &mut self,
         ui: &mut egui::Ui,
@@ -469,133 +469,116 @@ impl SyncView {
         group: &SyncGroup,
         acts: &mut Vec<Act>,
     ) {
-        crate::lcars::section_lcars(
-            ui,
-            &format!("{name} — MAIN, SINKS & MODE"),
-            theme::BLUE,
-            |ui| {
+        crate::lcars::section_lcars(ui, &format!("{name} — MAIN & SINKS"), theme::BLUE, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("MAIN").color(theme::TEXT).size(12.0));
+                let chip = crate::repo_chip::repo_chip(ui, &group.main, true, theme::ORANGE, None);
+                chip.name.on_hover_text("The repository that is pushed out");
+            });
+
+            // Sinks: each has its own push mode and can be promoted or taken out.
+            for sink in &group.sinks {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("MAIN").color(theme::TEXT).size(12.0));
+                    ui.label(RichText::new("SINK").color(theme::TEXT).size(12.0));
                     let chip =
-                        crate::repo_chip::repo_chip(ui, &group.main, true, theme::ORANGE, None);
-                    chip.name.on_hover_text("The repository that is pushed out");
-                });
-
-                // Sinks: each can be promoted to main or taken out.
-                for sink in &group.sinks {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("SINK").color(theme::TEXT).size(12.0));
-                        let chip = crate::repo_chip::repo_chip(ui, sink, false, theme::BLUE, None);
-                        chip.name
-                            .on_hover_text("A repository the main is pushed to");
-                        if crate::lcars::action_button(ui, "MAKE MAIN", true, theme::ORANGE)
-                            .explain(
-                                self.verbosity,
-                                "Push from this one instead",
-                                "Make this repository the group's main; the current main \
-                                 becomes a sink, so nothing leaves the group.",
-                            )
-                            .clicked()
-                        {
-                            acts.push(Act::MakeMain(name.to_string(), sink.clone()));
-                        }
-                        if crate::lcars::action_button(ui, "TAKE OUT", true, theme::RED)
-                            .explain(
-                                self.verbosity,
-                                "Remove this sink from the group",
-                                "Take this repository out of the group. Its files are left \
-                                 exactly as they are — only the grouping changes.",
-                            )
-                            .clicked()
-                        {
-                            acts.push(Act::RemoveSink(name.to_string(), sink.clone()));
-                        }
-                    });
-                }
-
-                // Repos that are still free can be taken in as sinks.
-                let candidates = self.ungrouped();
-                if !candidates.is_empty() {
-                    crate::repo_chip::chip_row(
-                        ui,
-                        "sync_add_sink",
-                        "ADD SINK",
-                        candidates.len(),
-                        |ui, i| {
-                            let repo = &candidates[i];
-                            let chip =
-                                crate::repo_chip::repo_chip(ui, repo, false, theme::BLUE, None);
-                            if chip
-                                .name
-                                .explain(
-                                    self.verbosity,
-                                    "Add as a sink",
-                                    "Add this repository to the group as a sink: the main's \
-                                     content is pushed to it on every sync.",
-                                )
-                                .clicked()
-                            {
-                                acts.push(Act::AddSink(name.to_string(), repo.clone()));
-                            }
-                            chip.outer
-                        },
-                    );
-                }
-
-                ui.horizontal(|ui| {
-                    for (mode, label, short, verbose) in [
-                        (
-                            SyncMode::AddOnly,
-                            "ADD ONLY",
-                            "Only copy, never delete",
-                            "Copy content the sink lacks and never delete anything from it. \
-                             A sink may keep files the main no longer has.",
-                        ),
-                        (
-                            SyncMode::Mirror,
-                            "MIRROR",
-                            "Make the sinks match the main exactly",
-                            "Copy content the sink lacks AND delete sink content the main \
-                             does not have, so each sink ends up holding exactly the main's \
-                             content. Deletions cannot be undone.",
-                        ),
-                    ] {
-                        let selected = group.mode == mode;
-                        let accent = if mode == SyncMode::Mirror {
-                            theme::RED
-                        } else {
-                            theme::GREEN
-                        };
-                        if crate::lcars::toggle_button(ui, label, selected, accent)
-                            .explain(self.verbosity, short, verbose)
-                            .clicked()
-                        {
-                            acts.push(Act::SetMode(name.to_string(), mode));
-                        }
-                    }
-                    if crate::lcars::action_button(ui, "DELETE GROUP", true, theme::RED)
+                        crate::repo_chip::repo_chip(ui, &sink.repo, false, theme::BLUE, None);
+                    chip.name
+                        .on_hover_text("A repository the main is pushed to");
+                    let is_mirror = sink.mode == SyncMode::Mirror;
+                    let mode_label = if is_mirror { "MIRROR" } else { "ADD ONLY" };
+                    let accent = if is_mirror { theme::RED } else { theme::GREEN };
+                    if crate::lcars::toggle_button(ui, mode_label, is_mirror, accent)
                         .explain(
                             self.verbosity,
-                            "Delete this group",
-                            "Delete the group. Every repository in it stays exactly as it \
-                             is — only the grouping is forgotten.",
+                            "How this sink is pushed — click to flip",
+                            "ADD ONLY copies what this sink lacks; MIRROR also deletes \
+                                 from it what the main no longer has. Click to flip.",
                         )
                         .clicked()
                     {
-                        acts.push(Act::DeleteGroup(name.to_string()));
+                        let mode = if is_mirror {
+                            SyncMode::AddOnly
+                        } else {
+                            SyncMode::Mirror
+                        };
+                        acts.push(Act::SetSinkMode(name.to_string(), sink.repo.clone(), mode));
+                    }
+                    if crate::lcars::action_button(ui, "MAKE MAIN", true, theme::ORANGE)
+                        .explain(
+                            self.verbosity,
+                            "Push from this one instead",
+                            "Make this repository the group's main; the current main \
+                                 becomes a sink, so nothing leaves the group.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::MakeMain(name.to_string(), sink.repo.clone()));
+                    }
+                    if crate::lcars::action_button(ui, "TAKE OUT", true, theme::RED)
+                        .explain(
+                            self.verbosity,
+                            "Remove this sink from the group",
+                            "Take this repository out of the group. Its files are left \
+                                 exactly as they are — only the grouping changes.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::RemoveSink(name.to_string(), sink.repo.clone()));
                     }
                 });
-                if group.sinks.is_empty() {
-                    ui.label(
-                        RichText::new(
-                            "Add at least one sink — a group with no sink has nothing to push to.",
-                        )
-                        .color(theme::TAN)
-                        .size(11.0),
-                    );
+            }
+
+            // Repos that are still free can be taken in as sinks.
+            let candidates = self.ungrouped();
+            if !candidates.is_empty() {
+                crate::repo_chip::chip_row(
+                    ui,
+                    "sync_add_sink",
+                    "ADD SINK",
+                    candidates.len(),
+                    |ui, i| {
+                        let repo = &candidates[i];
+                        let chip = crate::repo_chip::repo_chip(ui, repo, false, theme::BLUE, None);
+                        if chip
+                            .name
+                            .explain(
+                                self.verbosity,
+                                "Add as a sink",
+                                "Add this repository to the group as a sink: the main's \
+                                     content is pushed to it on every sync.",
+                            )
+                            .clicked()
+                        {
+                            acts.push(Act::AddSink(name.to_string(), repo.clone()));
+                        }
+                        chip.outer
+                    },
+                );
+            }
+
+            ui.horizontal(|ui| {
+                if crate::lcars::action_button(ui, "DELETE GROUP", true, theme::RED)
+                    .explain(
+                        self.verbosity,
+                        "Delete this group",
+                        "Delete the group. Every repository in it stays exactly as it \
+                             is — only the grouping is forgotten.",
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::DeleteGroup(name.to_string()));
                 }
-            },
-        );
+            });
+            if group.sinks.is_empty() {
+                ui.label(
+                    RichText::new(
+                        "Add at least one sink — a group with no sink has nothing to push to.",
+                    )
+                    .color(theme::TAN)
+                    .size(11.0),
+                );
+            }
+        });
     }
 
     fn action_section(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
@@ -704,7 +687,7 @@ impl SyncView {
             ui.horizontal(|ui| {
                 let mirror = self
                     .selected_group()
-                    .is_some_and(|(_, g)| g.mode == SyncMode::Mirror);
+                    .is_some_and(|(_, g)| g.sinks.iter().any(|s| s.mode == SyncMode::Mirror));
                 let fill = if mirror { theme::RED } else { theme::AMBER };
                 if ui
                     .add(egui::Button::new(RichText::new("PROCEED").color(theme::BLACK)).fill(fill))
@@ -733,74 +716,77 @@ impl SyncView {
                 | Act::AddSink(..)
                 | Act::RemoveSink(..)
                 | Act::MakeMain(..)
-                | Act::SetMode(..)
+                | Act::SetSinkMode(..)
         );
-        let result = match act {
-            Act::Select(name) => {
-                self.selected = Some(name);
-                self.clear_preview();
-                Ok(())
-            }
-            Act::SetNewMain(repo) => {
-                self.new_main = Some(repo);
-                Ok(())
-            }
-            Act::CreateGroup => {
-                let name = self.new_name.trim().to_string();
-                match self.new_main.clone() {
-                    Some(main) => store
-                        .create_sync_group(&name, &main, SyncMode::AddOnly)
-                        .map(|()| {
+        let result =
+            match act {
+                Act::Select(name) => {
+                    self.selected = Some(name);
+                    self.clear_preview();
+                    Ok(())
+                }
+                Act::SetNewMain(repo) => {
+                    self.new_main = Some(repo);
+                    Ok(())
+                }
+                Act::CreateGroup => {
+                    let name = self.new_name.trim().to_string();
+                    match self.new_main.clone() {
+                        Some(main) => store.create_sync_group(&name, &main).map(|()| {
                             self.new_name.clear();
                             self.new_main = None;
                             self.selected = Some(name);
                         }),
-                    None => Ok(()),
+                        None => Ok(()),
+                    }
                 }
-            }
-            Act::DeleteGroup(name) => store.delete_sync_group(&name).map(|()| {
-                self.selected = None;
-                self.clear_preview();
-            }),
-            Act::AddSink(group, repo) => store.add_sync_sink(&group, &repo).map(|()| {
-                self.clear_preview();
-            }),
-            Act::RemoveSink(group, repo) => store.remove_sync_sink(&group, &repo).map(|()| {
-                self.clear_preview();
-            }),
-            Act::MakeMain(group, repo) => store.set_sync_main(&group, &repo).map(|()| {
-                self.clear_preview();
-            }),
-            Act::SetMode(group, mode) => store.set_sync_mode(&group, mode).map(|()| {
-                self.clear_preview();
-            }),
-            Act::Preview => {
-                self.spawn_preview(store, false);
-                Ok(())
-            }
-            Act::Ask => {
-                // Plan on a worker thread, then raise the confirmation when it
-                // lands (the `confirm` flag rides through). A refused or failing
-                // plan — an empty MIRROR main, say — surfaces as an error and
-                // never reaches the dialog.
-                self.spawn_preview(store, true);
-                Ok(())
-            }
-            Act::CancelConfirm => {
-                self.confirm = None;
-                self.pending_push = None;
-                Ok(())
-            }
-            Act::Confirm => {
-                self.confirm = None;
-                self.start(store);
-                Ok(())
-            }
-            Act::CancelRun => {
-                self.cancel.cancel();
-                Ok(())
-            }
-        };
+                Act::DeleteGroup(name) => store.delete_sync_group(&name).map(|()| {
+                    self.selected = None;
+                    self.clear_preview();
+                }),
+                Act::AddSink(group, repo) => store
+                    .add_sync_sink(&group, &repo, SyncMode::AddOnly)
+                    .map(|()| {
+                        self.clear_preview();
+                    }),
+                Act::RemoveSink(group, repo) => store.remove_sync_sink(&group, &repo).map(|()| {
+                    self.clear_preview();
+                }),
+                Act::MakeMain(group, repo) => store.set_sync_main(&group, &repo).map(|()| {
+                    self.clear_preview();
+                }),
+                Act::SetSinkMode(group, repo, mode) => {
+                    store.set_sink_mode(&group, &repo, mode).map(|()| {
+                        self.clear_preview();
+                    })
+                }
+                Act::Preview => {
+                    self.spawn_preview(store, false);
+                    Ok(())
+                }
+                Act::Ask => {
+                    // Plan on a worker thread, then raise the confirmation when it
+                    // lands (the `confirm` flag rides through). A refused or failing
+                    // plan — an empty MIRROR main, say — surfaces as an error and
+                    // never reaches the dialog.
+                    self.spawn_preview(store, true);
+                    Ok(())
+                }
+                Act::CancelConfirm => {
+                    self.confirm = None;
+                    self.pending_push = None;
+                    Ok(())
+                }
+                Act::Confirm => {
+                    self.confirm = None;
+                    self.start(store);
+                    Ok(())
+                }
+                Act::CancelRun => {
+                    self.cancel.cancel();
+                    Ok(())
+                }
+            };
         match result {
             // Membership changed under us? Re-read, so the UI always shows
             // what the registry actually holds.
@@ -877,9 +863,9 @@ impl SyncView {
             group.main,
             group.sinks.len()
         );
-        if group.mode == SyncMode::Mirror {
+        if group.sinks.iter().any(|s| s.mode == SyncMode::Mirror) {
             prompt.push_str(&format!(
-                " and DELETE {deletes} file(s) from the sink(s), which cannot be undone"
+                " and DELETE {deletes} file(s) from the mirror sink(s), which cannot be undone"
             ));
         }
         prompt.push_str(". The main is never changed.");
@@ -1072,9 +1058,9 @@ mod ui_tests {
     }
 
     /// With no groups yet the tab explains itself and offers the NEW GROUP
-    /// form; creating a group selects it and shows its members and mode.
+    /// form; creating a group selects it and asks for its first sink.
     #[test]
-    fn creating_a_group_shows_its_main_sinks_and_mode() {
+    fn creating_a_group_selects_it_and_asks_for_a_sink() {
         let (_tmp, store) = sample_store();
         let mut h = harness(Arc::clone(&store));
         assert!(
@@ -1099,9 +1085,10 @@ mod ui_tests {
             Some("offsite"),
             "the new group is selected"
         );
+        // A fresh group has no sinks yet, so no per-sink mode pill shows.
         assert!(
-            h.query_by_label("ADD ONLY").is_some() && h.query_by_label("MIRROR").is_some(),
-            "the mode toggles show"
+            h.query_by_label("ADD ONLY").is_none() && h.query_by_label("MIRROR").is_none(),
+            "no mode pill until a sink is added"
         );
         assert!(
             h.query_by_label_contains("Add at least one sink").is_some(),
@@ -1109,13 +1096,24 @@ mod ui_tests {
         );
     }
 
-    /// Adding a sink, promoting it, and switching the mode all land in the
-    /// registry — the tab is a view onto the store, not its own state.
+    /// A group's sink repos, in order — dropping their per-sink modes.
+    fn sink_repos(store: &Store, group: &str) -> Vec<String> {
+        store
+            .get_sync_group(group)
+            .expect("group")
+            .sinks
+            .iter()
+            .map(|s| s.repo.clone())
+            .collect()
+    }
+
+    /// Adding a sink, promoting it, and flipping a sink's own mode all land in
+    /// the registry — the tab is a view onto the store, not its own state.
     #[test]
-    fn members_and_mode_changes_are_stored() {
+    fn members_and_per_sink_mode_changes_are_stored() {
         let (_tmp, store) = sample_store();
         store
-            .create_sync_group("offsite", "PRIMARY", SyncMode::AddOnly)
+            .create_sync_group("offsite", "PRIMARY")
             .expect("create group");
         let mut h = harness(Arc::clone(&store));
         h.get_by_label("offsite").click();
@@ -1128,24 +1126,26 @@ mod ui_tests {
             None => panic!("BACKUP1 is not offered as a sink"),
         }
         h.run();
-        assert_eq!(
-            store.get_sync_group("offsite").expect("group").sinks,
-            ["BACKUP1"]
-        );
+        assert_eq!(sink_repos(&store, "offsite"), ["BACKUP1"]);
 
-        h.get_by_label("MIRROR").click();
+        // A new sink defaults to ADD ONLY; clicking its pill flips it to MIRROR.
+        h.get_by_label("ADD ONLY").click();
         h.run();
         assert_eq!(
-            store.get_sync_group("offsite").expect("group").mode,
+            store.get_sync_group("offsite").expect("group").sinks[0].mode,
             SyncMode::Mirror,
-            "the mode is per group and persisted"
+            "the per-sink mode is persisted"
         );
 
         h.get_by_label("MAKE MAIN").click();
         h.run();
         let group = store.get_sync_group("offsite").expect("group");
         assert_eq!(group.main, "BACKUP1");
-        assert_eq!(group.sinks, ["PRIMARY"], "the old main stays as a sink");
+        assert_eq!(
+            sink_repos(&store, "offsite"),
+            ["PRIMARY"],
+            "the old main stays as a sink"
+        );
 
         h.get_by_label("TAKE OUT").click();
         h.run();
@@ -1177,9 +1177,11 @@ mod ui_tests {
             .expect("scan");
         }
         store
-            .create_sync_group("offsite", "PRIMARY", SyncMode::Mirror)
+            .create_sync_group("offsite", "PRIMARY")
             .expect("create group");
-        store.add_sync_sink("offsite", "BACKUP1").expect("add sink");
+        store
+            .add_sync_sink("offsite", "BACKUP1", SyncMode::Mirror)
+            .expect("add sink");
 
         let mut h = harness(Arc::clone(&store));
         h.get_by_label("offsite").click();
@@ -1221,9 +1223,11 @@ mod ui_tests {
             .expect("scan");
         }
         store
-            .create_sync_group("offsite", "PRIMARY", SyncMode::Mirror)
+            .create_sync_group("offsite", "PRIMARY")
             .expect("create group");
-        store.add_sync_sink("offsite", "BACKUP1").expect("add sink");
+        store
+            .add_sync_sink("offsite", "BACKUP1", SyncMode::Mirror)
+            .expect("add sink");
 
         let mut h = harness(Arc::clone(&store));
         h.get_by_label("offsite").click();
@@ -1266,9 +1270,11 @@ mod ui_tests {
             .expect("scan");
         }
         store
-            .create_sync_group("offsite", "PRIMARY", SyncMode::Mirror)
+            .create_sync_group("offsite", "PRIMARY")
             .expect("create group");
-        store.add_sync_sink("offsite", "BACKUP1").expect("add sink");
+        store
+            .add_sync_sink("offsite", "BACKUP1", SyncMode::Mirror)
+            .expect("add sink");
         let mut h = harness(Arc::clone(&store));
         h.get_by_label("offsite").click();
         h.run();
@@ -1314,8 +1320,10 @@ mod ui_tests {
         let mut view = SyncView::new();
         let planned = SyncGroup {
             main: "A_MAIN".to_string(),
-            sinks: vec!["A_SINK".to_string()],
-            mode: SyncMode::AddOnly,
+            sinks: vec![dedup_core::store::SyncSink {
+                repo: "A_SINK".to_string(),
+                mode: SyncMode::AddOnly,
+            }],
         };
         let outcome = PreviewOutcome {
             group_name: "groupA".to_string(),
@@ -1360,9 +1368,11 @@ mod ui_tests {
         )
         .expect("scan");
         store
-            .create_sync_group("offsite", "PRIMARY", SyncMode::Mirror)
+            .create_sync_group("offsite", "PRIMARY")
             .expect("create group");
-        store.add_sync_sink("offsite", "BACKUP1").expect("add sink");
+        store
+            .add_sync_sink("offsite", "BACKUP1", SyncMode::Mirror)
+            .expect("add sink");
         let mut h = harness(Arc::clone(&store));
         h.get_by_label("offsite").click();
         h.run();
@@ -1391,9 +1401,11 @@ mod ui_tests {
     fn render_sync_groups() {
         let (_tmp, store) = sample_store();
         store
-            .create_sync_group("offsite", "PRIMARY", SyncMode::Mirror)
+            .create_sync_group("offsite", "PRIMARY")
             .expect("create group");
-        store.add_sync_sink("offsite", "BACKUP1").expect("add sink");
+        store
+            .add_sync_sink("offsite", "BACKUP1", SyncMode::Mirror)
+            .expect("add sink");
         let mut h = Harness::builder()
             .with_size(egui::vec2(1120.0, 900.0))
             .wgpu()

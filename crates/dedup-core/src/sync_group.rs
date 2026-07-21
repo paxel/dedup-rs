@@ -1,5 +1,5 @@
 //! Pushing a **sync group** out: one main repository copied to each of its
-//! remote sinks, in the group's own mode.
+//! remote sinks, each in its own mode.
 //!
 //! This is the native replacement for the manual "duplicate the repo, relocate
 //! the copy, rescan it" backup dance. The heavy lifting is the existing
@@ -26,14 +26,20 @@ fn delete_mode(mode: SyncMode) -> SyncDelete {
     }
 }
 
-/// Refuse a MIRROR push whose main holds no indexed files.
+/// Refuse the whole push when the main holds no indexed files *and any sink
+/// mirrors*.
 ///
 /// A mirror deletes sink content whose hash the main does not have, so an empty
 /// main means "delete everything". That is almost never what the user wants: it
 /// happens when the main was never scanned, or when its drive failed to mount
-/// and scanned as an empty directory. `AddOnly` never deletes, so it is exempt.
+/// and scanned as an empty directory. A group with no mirror sink is exempt.
+///
+/// This fails safe at the group level: a mixed group with even one mirror sink
+/// refuses the *entire* push (including its add-only sinks) rather than push
+/// some sinks from a main that looks broken. An empty main is a strong "stop and
+/// look" signal, so the whole run waits until the main is scanned.
 fn guard_mirror_source(store: &Store, group: &SyncGroup) -> Result<(), DiffError> {
-    if group.mode != SyncMode::Mirror {
+    if !group.sinks.iter().any(|s| s.mode == SyncMode::Mirror) {
         return Ok(());
     }
     // `file_count` is maintained per live entry, so this is a META read rather
@@ -64,12 +70,12 @@ pub fn plan_group_sync(
         let plan = plan_sync(
             store,
             &group.main,
-            sink,
+            &sink.repo,
             true,
-            delete_mode(group.mode),
+            delete_mode(sink.mode),
             None,
         )?;
-        plans.push((sink.clone(), plan));
+        plans.push((sink.repo.clone(), plan));
     }
     Ok(plans)
 }
@@ -96,14 +102,10 @@ pub fn run_group_sync(
 ) -> Result<Vec<(String, SinkOutcome)>, DiffError> {
     // A group-level refusal is not a per-sink failure: nothing is attempted.
     guard_mirror_source(store, group)?;
-    log::info!(
-        "pushing '{}' to {} sink(s) in {:?} mode",
-        group.main,
-        group.sinks.len(),
-        group.mode
-    );
+    log::info!("pushing '{}' to {} sink(s)", group.main, group.sinks.len(),);
     let mut results = Vec::with_capacity(group.sinks.len());
     for sink in &group.sinks {
+        let repo = sink.repo.as_str();
         // Sinks the cancel cut short are still reported, so the caller can say
         // which backups are now stale instead of silently dropping them.
         let outcome = if run.cancel.is_cancelled() {
@@ -112,15 +114,15 @@ pub fn run_group_sync(
             match diff_sync(
                 store,
                 &group.main,
-                sink,
+                repo,
                 true,
-                delete_mode(group.mode),
+                delete_mode(sink.mode),
                 None,
                 run,
             ) {
                 Ok(stats) => {
                     log::info!(
-                        "sink '{sink}': copied {}, deleted {}, {} error(s){}",
+                        "sink '{repo}': copied {}, deleted {}, {} error(s){}",
                         stats.copied,
                         stats.deleted,
                         stats.errors,
@@ -129,12 +131,12 @@ pub fn run_group_sync(
                     SinkOutcome::Pushed(stats)
                 }
                 Err(e) => {
-                    log::error!("sink '{sink}' failed: {e}");
+                    log::error!("sink '{repo}' failed: {e}");
                     SinkOutcome::Failed(e)
                 }
             }
         };
-        results.push((sink.clone(), outcome));
+        results.push((sink.repo.clone(), outcome));
     }
     Ok(results)
 }

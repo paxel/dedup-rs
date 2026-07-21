@@ -2,10 +2,15 @@
 //! rules, and the guards that keep a group's members from disappearing under
 //! it. A group is one **main** repo plus the remote **sinks** it is pushed to.
 
-use dedup_core::store::{Store, StoreError, SyncMode};
+use dedup_core::store::{Store, StoreError, SyncGroup, SyncMode};
 use std::path::PathBuf;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+/// A group's sink repositories, in order (dropping their per-sink modes).
+fn sink_repos(group: &SyncGroup) -> Vec<&str> {
+    group.sinks.iter().map(|s| s.repo.as_str()).collect()
+}
 
 struct Sandbox {
     _tempdir: tempfile::TempDir,
@@ -33,26 +38,32 @@ impl Sandbox {
 }
 
 #[test]
-fn a_group_stores_its_main_sinks_and_mode() -> TestResult {
+fn a_group_stores_its_main_and_sinks_with_per_sink_modes() -> TestResult {
     let sb = Sandbox::new()?;
+    sb.store.create_sync_group("offsite", "MAIN")?;
     sb.store
-        .create_sync_group("offsite", "MAIN", SyncMode::AddOnly)?;
-    sb.store.add_sync_sink("offsite", "SINK1")?;
-    sb.store.add_sync_sink("offsite", "SINK2")?;
+        .add_sync_sink("offsite", "SINK1", SyncMode::AddOnly)?;
+    sb.store
+        .add_sync_sink("offsite", "SINK2", SyncMode::Mirror)?;
 
     let group = sb.store.get_sync_group("offsite")?;
     assert_eq!(group.main, "MAIN");
-    assert_eq!(group.sinks, ["SINK1", "SINK2"]);
-    assert_eq!(group.mode, SyncMode::AddOnly);
+    assert_eq!(sink_repos(&group), ["SINK1", "SINK2"]);
+    // Each sink keeps its own push mode.
+    assert_eq!(group.sinks[0].mode, SyncMode::AddOnly);
+    assert_eq!(group.sinks[1].mode, SyncMode::Mirror);
     assert_eq!(
         group.members().collect::<Vec<_>>(),
         ["MAIN", "SINK1", "SINK2"],
         "the main leads its sinks"
     );
 
-    // The mode is per group and can be switched.
-    sb.store.set_sync_mode("offsite", SyncMode::Mirror)?;
-    assert_eq!(sb.store.get_sync_group("offsite")?.mode, SyncMode::Mirror);
+    // A sink's mode can be switched without touching the others.
+    sb.store
+        .set_sink_mode("offsite", "SINK1", SyncMode::Mirror)?;
+    let group = sb.store.get_sync_group("offsite")?;
+    assert_eq!(group.sinks[0].mode, SyncMode::Mirror);
+    assert_eq!(group.sinks[1].mode, SyncMode::Mirror);
 
     // Groups survive reopening the store (they live in the registry). The
     // registry file is locked while a store holds it, so close this one first.
@@ -66,30 +77,34 @@ fn a_group_stores_its_main_sinks_and_mode() -> TestResult {
     let listed = reopened.list_sync_groups()?;
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].0, "offsite");
-    assert_eq!(listed[0].1.sinks, ["SINK1", "SINK2"]);
+    assert_eq!(sink_repos(&listed[0].1), ["SINK1", "SINK2"]);
+    assert_eq!(
+        listed[0].1.sinks[1].mode,
+        SyncMode::Mirror,
+        "the per-sink mode round-trips through the registry"
+    );
     Ok(())
 }
 
 #[test]
 fn a_repo_belongs_to_at_most_one_group() -> TestResult {
     let sb = Sandbox::new()?;
+    sb.store.create_sync_group("offsite", "MAIN")?;
     sb.store
-        .create_sync_group("offsite", "MAIN", SyncMode::AddOnly)?;
-    sb.store.add_sync_sink("offsite", "SINK1")?;
-    sb.store
-        .create_sync_group("other", "SINK2", SyncMode::AddOnly)?;
+        .add_sync_sink("offsite", "SINK1", SyncMode::AddOnly)?;
+    sb.store.create_sync_group("other", "SINK2")?;
 
     // Neither as a second group's main…
-    let err = sb
-        .store
-        .create_sync_group("third", "SINK1", SyncMode::AddOnly)
-        .unwrap_err();
+    let err = sb.store.create_sync_group("third", "SINK1").unwrap_err();
     assert!(
         matches!(err, StoreError::AlreadyGrouped { .. }),
         "got {err:?}"
     );
     // …nor as another group's sink.
-    let err = sb.store.add_sync_sink("other", "SINK1").unwrap_err();
+    let err = sb
+        .store
+        .add_sync_sink("other", "SINK1", SyncMode::AddOnly)
+        .unwrap_err();
     assert!(
         matches!(err, StoreError::AlreadyGrouped { .. }),
         "got {err:?}"
@@ -98,7 +113,8 @@ fn a_repo_belongs_to_at_most_one_group() -> TestResult {
     // Once it leaves, it is free again.
     sb.store.remove_sync_sink("offsite", "SINK1")?;
     assert!(sb.store.sync_group_of("SINK1")?.is_none());
-    sb.store.add_sync_sink("other", "SINK1")?;
+    sb.store
+        .add_sync_sink("other", "SINK1", SyncMode::AddOnly)?;
     assert_eq!(
         sb.store.sync_group_of("SINK1")?.map(|(name, _)| name),
         Some("other".to_string())
@@ -109,17 +125,22 @@ fn a_repo_belongs_to_at_most_one_group() -> TestResult {
 #[test]
 fn promoting_a_sink_demotes_the_old_main() -> TestResult {
     let sb = Sandbox::new()?;
+    sb.store.create_sync_group("offsite", "MAIN")?;
     sb.store
-        .create_sync_group("offsite", "MAIN", SyncMode::AddOnly)?;
-    sb.store.add_sync_sink("offsite", "SINK1")?;
+        .add_sync_sink("offsite", "SINK1", SyncMode::AddOnly)?;
 
     sb.store.set_sync_main("offsite", "SINK1")?;
     let group = sb.store.get_sync_group("offsite")?;
     assert_eq!(group.main, "SINK1");
     assert_eq!(
-        group.sinks,
+        sink_repos(&group),
         ["MAIN"],
         "the old main stays in the group as a sink"
+    );
+    assert_eq!(
+        group.sinks[0].mode,
+        SyncMode::AddOnly,
+        "the demoted main defaults to ADD ONLY"
     );
 
     // The main is not a sink, so it cannot be removed as one.
@@ -134,9 +155,9 @@ fn promoting_a_sink_demotes_the_old_main() -> TestResult {
 #[test]
 fn members_cannot_be_renamed_or_removed_out_from_under_their_group() -> TestResult {
     let sb = Sandbox::new()?;
+    sb.store.create_sync_group("offsite", "MAIN")?;
     sb.store
-        .create_sync_group("offsite", "MAIN", SyncMode::AddOnly)?;
-    sb.store.add_sync_sink("offsite", "SINK1")?;
+        .add_sync_sink("offsite", "SINK1", SyncMode::AddOnly)?;
 
     for repo in ["MAIN", "SINK1"] {
         let err = sb.store.remove_repo(repo).unwrap_err();
@@ -163,9 +184,9 @@ fn members_cannot_be_renamed_or_removed_out_from_under_their_group() -> TestResu
 #[test]
 fn deleting_a_group_frees_its_members() -> TestResult {
     let sb = Sandbox::new()?;
+    sb.store.create_sync_group("offsite", "MAIN")?;
     sb.store
-        .create_sync_group("offsite", "MAIN", SyncMode::AddOnly)?;
-    sb.store.add_sync_sink("offsite", "SINK1")?;
+        .add_sync_sink("offsite", "SINK1", SyncMode::AddOnly)?;
 
     sb.store.delete_sync_group("offsite")?;
     assert!(sb.store.list_sync_groups()?.is_empty());
@@ -180,22 +201,21 @@ fn deleting_a_group_frees_its_members() -> TestResult {
 #[test]
 fn duplicate_group_names_and_unknown_repos_are_rejected() -> TestResult {
     let sb = Sandbox::new()?;
-    sb.store
-        .create_sync_group("offsite", "MAIN", SyncMode::AddOnly)?;
+    sb.store.create_sync_group("offsite", "MAIN")?;
 
-    let err = sb
-        .store
-        .create_sync_group("offsite", "SINK1", SyncMode::AddOnly)
-        .unwrap_err();
+    let err = sb.store.create_sync_group("offsite", "SINK1").unwrap_err();
     assert!(matches!(err, StoreError::GroupExists(_)), "got {err:?}");
 
     let err = sb
         .store
-        .create_sync_group("ghost", "NOSUCHREPO", SyncMode::AddOnly)
+        .create_sync_group("ghost", "NOSUCHREPO")
         .unwrap_err();
     assert!(matches!(err, StoreError::NotFound(_)), "got {err:?}");
 
-    let err = sb.store.add_sync_sink("offsite", "NOSUCHREPO").unwrap_err();
+    let err = sb
+        .store
+        .add_sync_sink("offsite", "NOSUCHREPO", SyncMode::AddOnly)
+        .unwrap_err();
     assert!(matches!(err, StoreError::NotFound(_)), "got {err:?}");
     Ok(())
 }
@@ -230,8 +250,8 @@ fn a_pre_sync_group_registry_still_opens_and_has_no_groups() -> TestResult {
     let dir = tempdir.path().join("data");
     std::fs::create_dir_all(&dir)?;
     store.create_repo("MAIN", &dir.to_string_lossy())?;
-    store.create_sync_group("offsite", "MAIN", SyncMode::Mirror)?;
-    assert_eq!(store.get_sync_group("offsite")?.mode, SyncMode::Mirror);
+    store.create_sync_group("offsite", "MAIN")?;
+    assert_eq!(store.get_sync_group("offsite")?.main, "MAIN");
     Ok(())
 }
 
@@ -296,8 +316,8 @@ fn seeded_group(mode: SyncMode) -> Result<Sandbox, Box<dyn std::error::Error>> {
     write(&sb.dir("SINK1"), "a.txt", b"alpha")?;
     write(&sb.dir("SINK1"), "extra.txt", b"only in the sink")?;
     sb.scan(&["MAIN", "SINK1"])?;
-    sb.store.create_sync_group("offsite", "MAIN", mode)?;
-    sb.store.add_sync_sink("offsite", "SINK1")?;
+    sb.store.create_sync_group("offsite", "MAIN")?;
+    sb.store.add_sync_sink("offsite", "SINK1", mode)?;
     Ok(sb)
 }
 
@@ -359,15 +379,52 @@ fn mirror_converges_the_sink_on_the_main() -> TestResult {
     Ok(())
 }
 
+/// The point of per-sink modes: one group, mixed. The MIRROR sink drops what
+/// the main lacks; the ADD ONLY sink keeps its own extra file in the same push.
+#[test]
+fn a_group_can_mirror_one_sink_and_only_add_to_another() -> TestResult {
+    let sb = Sandbox::new()?;
+    write(&sb.dir("MAIN"), "a.txt", b"alpha")?;
+    write(&sb.dir("SINK1"), "a.txt", b"alpha")?;
+    write(&sb.dir("SINK1"), "extra1.txt", b"only in sink1")?;
+    write(&sb.dir("SINK2"), "a.txt", b"alpha")?;
+    write(&sb.dir("SINK2"), "extra2.txt", b"only in sink2")?;
+    sb.scan(&["MAIN", "SINK1", "SINK2"])?;
+    sb.store.create_sync_group("offsite", "MAIN")?;
+    sb.store
+        .add_sync_sink("offsite", "SINK1", SyncMode::Mirror)?;
+    sb.store
+        .add_sync_sink("offsite", "SINK2", SyncMode::AddOnly)?;
+    let group = sb.store.get_sync_group("offsite")?;
+
+    let plans = plan_group_sync(&sb.store, &group)?;
+    assert_eq!(plans.len(), 2);
+    // The MIRROR sink drops the content the main does not have…
+    assert_eq!(plans[0].0, "SINK1");
+    assert_eq!(
+        plans[0].1.deletes,
+        ["extra1.txt"],
+        "the mirror sink drops what the main lacks"
+    );
+    // …while the ADD ONLY sink keeps its own, in the very same push.
+    assert_eq!(plans[1].0, "SINK2");
+    assert!(
+        plans[1].1.deletes.is_empty(),
+        "the add-only sink keeps its extra"
+    );
+    Ok(())
+}
+
 #[test]
 fn every_sink_is_pushed_independently() -> TestResult {
     let sb = Sandbox::new()?;
     write(&sb.dir("MAIN"), "a.txt", b"alpha")?;
     sb.scan(&["MAIN", "SINK1", "SINK2"])?;
+    sb.store.create_sync_group("offsite", "MAIN")?;
     sb.store
-        .create_sync_group("offsite", "MAIN", SyncMode::AddOnly)?;
-    sb.store.add_sync_sink("offsite", "SINK1")?;
-    sb.store.add_sync_sink("offsite", "SINK2")?;
+        .add_sync_sink("offsite", "SINK1", SyncMode::AddOnly)?;
+    sb.store
+        .add_sync_sink("offsite", "SINK2", SyncMode::AddOnly)?;
     let group = sb.store.get_sync_group("offsite")?;
 
     let results = run_group_sync(
@@ -421,9 +478,9 @@ fn mirror_refuses_a_main_that_was_never_scanned() -> TestResult {
     write(&sb.dir("SINK1"), "precious.txt", b"the only copy")?;
     // Only the sink is scanned: the main's index stays empty.
     sb.scan(&["SINK1"])?;
+    sb.store.create_sync_group("offsite", "MAIN")?;
     sb.store
-        .create_sync_group("offsite", "MAIN", SyncMode::Mirror)?;
-    sb.store.add_sync_sink("offsite", "SINK1")?;
+        .add_sync_sink("offsite", "SINK1", SyncMode::Mirror)?;
     let group = sb.store.get_sync_group("offsite")?;
 
     assert!(
@@ -460,9 +517,9 @@ fn add_only_still_runs_with_an_empty_main() -> TestResult {
     let sb = Sandbox::new()?;
     write(&sb.dir("SINK1"), "precious.txt", b"the only copy")?;
     sb.scan(&["SINK1"])?;
+    sb.store.create_sync_group("offsite", "MAIN")?;
     sb.store
-        .create_sync_group("offsite", "MAIN", SyncMode::AddOnly)?;
-    sb.store.add_sync_sink("offsite", "SINK1")?;
+        .add_sync_sink("offsite", "SINK1", SyncMode::AddOnly)?;
     let group = sb.store.get_sync_group("offsite")?;
 
     let plans = plan_group_sync(&sb.store, &group)?;
@@ -528,10 +585,11 @@ fn a_cancelled_push_reports_the_sinks_it_never_reached() -> TestResult {
     let sb = Sandbox::new()?;
     write(&sb.dir("MAIN"), "a.txt", b"alpha")?;
     sb.scan(&["MAIN", "SINK1", "SINK2"])?;
+    sb.store.create_sync_group("offsite", "MAIN")?;
     sb.store
-        .create_sync_group("offsite", "MAIN", SyncMode::AddOnly)?;
-    sb.store.add_sync_sink("offsite", "SINK1")?;
-    sb.store.add_sync_sink("offsite", "SINK2")?;
+        .add_sync_sink("offsite", "SINK1", SyncMode::AddOnly)?;
+    sb.store
+        .add_sync_sink("offsite", "SINK2", SyncMode::AddOnly)?;
     let group = sb.store.get_sync_group("offsite")?;
 
     // Cancelled before anything ran: both sinks are still accounted for.

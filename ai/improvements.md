@@ -24,9 +24,11 @@
     MAKE MAIN (repo → group), SINK INTO an existing group, per-group ADD REPO (clone of
     the main at a new path), UPDATE ALL, UNGROUP, a per-group mode pill, collapsible
     SINK(S), and SINK OUT. Reuses the existing per-group `SyncGroup` model + DUPLICATE flow.
+  - **Done (slice 2):** push mode is now **per sink** (`SyncGroup.mode` → `SyncSink { repo,
+    mode }`, with a version-2 registry migration that gives legacy groups' sinks the old
+    group mode). Each sink carries its own MIRROR/ADD ONLY pill on the Repositories tab and
+    the Sync Groups tab; the empty-main mirror guard now triggers when any sink mirrors.
   - **Remaining slices:**
-    - each sink has a mirror/copy toggle pill — **per-sink** mode (core model change:
-      move `mode` from the group onto each sink, with a redb migration).
     - in all transfer / groom / etc views only the main groups are offered (repo pickers
       hide sinks).
     - group sync becomes repo sync where groups can be synced, but also ALL repos diffed

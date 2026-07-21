@@ -67,14 +67,15 @@ tab drives the same underlying groups):
 - **SINK INTO ▾** (on an ungrouped repo, when a group exists) — add it to an existing group
   as a backup.
 - A main's card gains a **group controls** row:
-  - a **mode pill** — `ADD ONLY` copies what a backup lacks; `MIRROR` also deletes from a
-    backup what the main no longer has. Click to flip.
   - **ADD REPO** — add a *new* backup that starts as a clone of the main's index, pointed at
     a folder you choose (the main is left unchanged).
   - **UPDATE ALL** — queue an UPDATE / SCAN for the main and every backup in the group.
   - **UNGROUP** — disband the group; every repository stays, just unlinked.
 - Sinks are folded under their main behind a **SINK(S) IN '…'** chevron; expand it to manage
-  each sink like any other repository, including **SINK OUT** to take it back out of the group.
+  each sink like any other repository. Each sink card carries its own **mode pill** —
+  `ADD ONLY` copies what that backup lacks; `MIRROR` also deletes from it what the main no
+  longer has (click to flip) — and **SINK OUT** to take it back out of the group. A group can
+  mirror some backups and only-add to others.
 
 ## Add Repository dialog
 

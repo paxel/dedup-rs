@@ -139,9 +139,10 @@ enum Action {
         group: String,
         repo: String,
     },
-    /// Flip a group's push mode (ADD ONLY ↔ MIRROR).
-    SetGroupMode {
+    /// Flip one sink's push mode (ADD ONLY ↔ MIRROR).
+    SetSinkMode {
         group: String,
+        repo: String,
         mode: dedup_core::store::SyncMode,
     },
     /// Queue an UPDATE / SCAN for every member of a group (main + sinks).
@@ -618,16 +619,16 @@ impl DedupApp {
                 // Name the group after its main. Repo names are unique and groups
                 // are a separate keyspace, so this only clashes with a group
                 // already named for another repo — surfaced as an error.
-                if let Err(e) =
-                    self.store
-                        .create_sync_group(&name, &name, dedup_core::store::SyncMode::AddOnly)
-                {
+                if let Err(e) = self.store.create_sync_group(&name, &name) {
                     self.load_error = Some(e.to_string());
                 }
                 self.reload_all();
             }
             Action::SinkInto { repo, group } => {
-                if let Err(e) = self.store.add_sync_sink(&group, &repo) {
+                if let Err(e) =
+                    self.store
+                        .add_sync_sink(&group, &repo, dedup_core::store::SyncMode::AddOnly)
+                {
                     self.load_error = Some(e.to_string());
                 }
                 self.reload_all();
@@ -638,8 +639,8 @@ impl DedupApp {
                 }
                 self.reload_all();
             }
-            Action::SetGroupMode { group, mode } => {
-                if let Err(e) = self.store.set_sync_mode(&group, mode) {
+            Action::SetSinkMode { group, repo, mode } => {
+                if let Err(e) = self.store.set_sink_mode(&group, &repo, mode) {
                     self.load_error = Some(e.to_string());
                 }
                 self.reload_all();
@@ -693,7 +694,11 @@ impl DedupApp {
                 } else {
                     match self.store.duplicate_repo(&main, &dest, &path) {
                         Ok(()) => {
-                            if let Err(e) = self.store.add_sync_sink(&group, &dest) {
+                            if let Err(e) = self.store.add_sync_sink(
+                                &group,
+                                &dest,
+                                dedup_core::store::SyncMode::AddOnly,
+                            ) {
                                 self.load_error = Some(e.to_string());
                             }
                         }
@@ -1241,7 +1246,7 @@ impl DedupApp {
     fn sink_of(&self, repo: &str) -> Option<&(String, dedup_core::store::SyncGroup)> {
         self.groups
             .iter()
-            .find(|(_, g)| g.sinks.iter().any(|s| s == repo))
+            .find(|(_, g)| g.sinks.iter().any(|s| s.repo == repo))
     }
 
     /// After a main's card: a chevron summarising its sinks, and — while
@@ -1266,33 +1271,8 @@ impl DedupApp {
             return;
         };
         let verbosity = self.tooltip_verbosity;
-        let is_mirror = group.mode == dedup_core::store::SyncMode::Mirror;
         ui.horizontal(|ui| {
             ui.add_space(16.0);
-            let mode_label = if is_mirror {
-                "MODE: MIRROR"
-            } else {
-                "MODE: ADD ONLY"
-            };
-            if crate::lcars::toggle_button(ui, mode_label, is_mirror, theme::ORANGE)
-                .explain(
-                    verbosity,
-                    "How this group is pushed — click to flip",
-                    "How this group is pushed. ADD ONLY copies what a backup lacks; MIRROR \
-                     also deletes from a backup what the main no longer has. Click to flip.",
-                )
-                .clicked()
-            {
-                let mode = if is_mirror {
-                    dedup_core::store::SyncMode::AddOnly
-                } else {
-                    dedup_core::store::SyncMode::Mirror
-                };
-                actions.push(Action::SetGroupMode {
-                    group: group_name.clone(),
-                    mode,
-                });
-            }
             if crate::lcars::action_button(
                 ui,
                 &format!("{} ADD REPO", icon::PLUS),
@@ -1372,7 +1352,7 @@ impl DedupApp {
             return;
         }
         for sink in &group.sinks {
-            if let Some(row) = rows.iter().find(|r| &r.name == sink) {
+            if let Some(row) = rows.iter().find(|r| r.name == sink.repo) {
                 self.repo_card(ui, row, actions);
             }
         }
@@ -1927,6 +1907,10 @@ impl DedupApp {
         // button here.
         let is_main = self.groups.iter().any(|(_, g)| g.main == row.name);
         let sink_group = self.sink_of(&row.name).map(|(n, _)| n.clone());
+        // This repo's own push mode when it is a sink, for its mode pill.
+        let sink_mode = self
+            .sink_of(&row.name)
+            .and_then(|(_, g)| g.sinks.iter().find(|s| s.repo == row.name).map(|s| s.mode));
         // Every group as (group name, main), to offer as SINK INTO targets.
         let group_targets: Vec<(String, String)> = self
             .groups
@@ -1937,6 +1921,34 @@ impl DedupApp {
         if !is_main {
             ui.horizontal(|ui| {
                 if let Some(group) = &sink_group {
+                    // This backup's own push mode — MIRROR deletes what the main
+                    // dropped; ADD ONLY only copies. Click to flip.
+                    let is_mirror = sink_mode == Some(dedup_core::store::SyncMode::Mirror);
+                    let mode_label = if is_mirror {
+                        "MODE: MIRROR"
+                    } else {
+                        "MODE: ADD ONLY"
+                    };
+                    if crate::lcars::toggle_button(ui, mode_label, is_mirror, theme::ORANGE)
+                        .explain(
+                            verbosity,
+                            "How this backup is pushed — click to flip",
+                            "How this backup is pushed. ADD ONLY copies what it lacks; MIRROR \
+                             also deletes from it what the main no longer has. Click to flip.",
+                        )
+                        .clicked()
+                    {
+                        let mode = if is_mirror {
+                            dedup_core::store::SyncMode::AddOnly
+                        } else {
+                            dedup_core::store::SyncMode::Mirror
+                        };
+                        actions.push(Action::SetSinkMode {
+                            group: group.clone(),
+                            repo: row.name.clone(),
+                            mode,
+                        });
+                    }
                     if ui
                         .button(RichText::new(format!("{} SINK OUT", icon::X)).color(theme::BLACK))
                         .explain(
@@ -2713,6 +2725,7 @@ mod tests {
 #[cfg(test)]
 mod ui_tests {
     use super::*;
+    use dedup_core::store::SyncMode;
     use dedup_core::update::{NoProgress, update_repo};
     use egui_kittest::Harness;
 
@@ -2740,14 +2753,10 @@ mod ui_tests {
         use egui_kittest::kittest::Queryable;
         let (_tmp, mut app) = sample_app();
         app.store
-            .create_sync_group(
-                "offsite",
-                "Automatic Upload",
-                dedup_core::store::SyncMode::AddOnly,
-            )
+            .create_sync_group("offsite", "Automatic Upload")
             .expect("create group");
         app.store
-            .add_sync_sink("offsite", "Videos")
+            .add_sync_sink("offsite", "Videos", SyncMode::AddOnly)
             .expect("add sink");
         app.reload_all();
 
@@ -2834,29 +2843,21 @@ mod ui_tests {
         );
     }
 
-    /// A group's main shows the group controls (mode pill + UNGROUP) even before
-    /// it has sinks; its sink offers SINK OUT (once expanded) and never MAKE MAIN.
+    /// A group's main shows the group controls (UNGROUP) and never MAKE MAIN;
+    /// its sink carries its own mode pill and SINK OUT (once expanded).
     #[test]
-    fn group_main_shows_controls_and_sink_shows_sink_out() {
+    fn group_main_shows_controls_and_sink_shows_mode_and_sink_out() {
         use egui_kittest::kittest::Queryable;
         let (_tmp, mut app) = sample_app();
         app.store
-            .create_sync_group(
-                "Automatic Upload",
-                "Automatic Upload",
-                dedup_core::store::SyncMode::AddOnly,
-            )
+            .create_sync_group("Automatic Upload", "Automatic Upload")
             .expect("create group");
         app.store
-            .add_sync_sink("Automatic Upload", "Videos")
+            .add_sync_sink("Automatic Upload", "Videos", SyncMode::AddOnly)
             .expect("add sink");
         app.reload_all();
         let mut harness = render_repos(app);
 
-        assert!(
-            harness.query_by_label_contains("MODE: ADD ONLY").is_some(),
-            "the main shows its per-group mode pill"
-        );
         assert!(
             harness.query_by_label_contains("UNGROUP").is_some(),
             "the main shows the UNGROUP control"
@@ -2876,25 +2877,32 @@ mod ui_tests {
             harness.query_by_label_contains("SINK OUT").is_some(),
             "the expanded sink offers SINK OUT"
         );
+        assert!(
+            harness.query_by_label_contains("MODE: ADD ONLY").is_some(),
+            "the sink carries its own mode pill"
+        );
     }
 
-    /// The mode pill reflects the group's stored mode.
+    /// A sink's mode pill reflects its own stored mode.
     #[test]
-    fn mode_pill_shows_mirror_for_a_mirror_group() {
+    fn a_mirror_sink_shows_a_mirror_pill() {
         use egui_kittest::kittest::Queryable;
         let (_tmp, mut app) = sample_app();
         app.store
-            .create_sync_group(
-                "Automatic Upload",
-                "Automatic Upload",
-                dedup_core::store::SyncMode::Mirror,
-            )
+            .create_sync_group("Automatic Upload", "Automatic Upload")
             .expect("create group");
+        app.store
+            .add_sync_sink("Automatic Upload", "Videos", SyncMode::Mirror)
+            .expect("add sink");
         app.reload_all();
-        let harness = render_repos(app);
+        let mut harness = render_repos(app);
+        harness
+            .get_by_label_contains("SINK(S) IN 'Automatic Upload'")
+            .click();
+        harness.run();
         assert!(
             harness.query_by_label_contains("MODE: MIRROR").is_some(),
-            "a MIRROR group's pill reads MIRROR"
+            "a MIRROR sink's pill reads MIRROR"
         );
     }
 
