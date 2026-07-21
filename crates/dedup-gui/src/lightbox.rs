@@ -9,8 +9,10 @@
 //! scaled up.
 
 use crate::icon;
+use crate::media_cell::FileFacts;
 use crate::settings::TooltipVerbosity;
 use crate::theme;
+use crate::thumbs::ThumbCache;
 use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
 use egui::{ColorImage, Context, Rect, TextureHandle, TextureOptions, Vec2};
@@ -27,11 +29,15 @@ const FULL_CACHE_CAP: usize = 3;
 const MIN_SCALE: f32 = 0.02;
 const MAX_SCALE: f32 = 32.0;
 
-/// A/B compare overlaid on the lightbox: `other` is the B member's index in the
-/// same group (A is the lightbox's current `index`). Zoom/pan are shared by both
-/// panes and normalized to each image's fit, so differing resolutions line up.
+/// A/B compare overlaid on the lightbox. `b` is the abstract B side — the
+/// *rendering source* it compares A against, as viewer-agnostic [`FileFacts`]
+/// (A is the lightbox's current `index`). Today the Duplicate lightbox points it
+/// at another group member; generalising it off the group index lets a later
+/// slice point B at a file in another repo (DIFF / cross-type compare). Zoom/pan
+/// are shared by both panes and normalized to each image's fit, so differing
+/// resolutions line up.
 pub struct CompareState {
-    pub other: usize,
+    pub b: FileFacts,
     pub flicker: bool,
     /// In flicker mode, whether B (rather than A) is currently shown.
     pub show_b: bool,
@@ -40,9 +46,9 @@ pub struct CompareState {
 }
 
 impl CompareState {
-    pub fn new(other: usize) -> Self {
+    pub fn new(b: FileFacts) -> Self {
         Self {
-            other,
+            b,
             flicker: false,
             show_b: false,
             zoom: 1.0,
@@ -172,6 +178,28 @@ impl LightboxState {
             self.fit = false;
         }
     }
+}
+
+/// Resolve a previewable file's full-resolution image texture (upscaled thumbnail
+/// while the full decode is in flight) and its pixel size, from the shared
+/// caches. The viewer-agnostic generalisation of the Duplicate tab's
+/// `lightbox_texture`: it takes [`FileFacts`] rather than a `DupeFile`, so any
+/// side — a duplicate, a DIFF file, a cross-repo file — resolves the same way.
+pub fn full_texture(
+    facts: &FileFacts,
+    full: &mut FullResCache,
+    thumbs: &mut ThumbCache,
+) -> (Option<TextureHandle>, Vec2) {
+    let source = facts.abs_path.as_path();
+    let tex = full
+        .get(&facts.hash_hex, source)
+        .or_else(|| thumbs.get(&facts.hash_hex, source));
+    let img = facts
+        .img_size
+        .map(|(w, h)| egui::vec2(w as f32, h as f32))
+        .or_else(|| tex.as_ref().map(|t| t.size_vec2()))
+        .unwrap_or(egui::vec2(1.0, 1.0));
+    (tex, img)
 }
 
 /// Draw `tex` stretched to `rect`, clipped to `pane` — or a "decoding…" note

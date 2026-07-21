@@ -1359,17 +1359,8 @@ impl DupesView {
     /// with the image's true pixel size (from the index, falling back to the
     /// texture) so transforms stay stable across the thumb→full-res swap.
     fn lightbox_texture(&mut self, file: &DupeFile) -> (Option<egui::TextureHandle>, egui::Vec2) {
-        let hex = hash_hex(&file.entry.hash);
-        let source = file.absolute_path();
-        let full = self.full_res.get(&hex, &source);
-        let tex = full.or_else(|| self.thumbs.get(&hex, &source));
-        let img = file
-            .entry
-            .img_size
-            .map(|(w, h)| egui::vec2(w as f32, h as f32))
-            .or_else(|| tex.as_ref().map(|t| t.size_vec2()))
-            .unwrap_or(egui::vec2(1.0, 1.0));
-        (tex, img)
+        let facts = FileFacts::from_entry(&file.entry, file.absolute_path());
+        crate::lightbox::full_texture(&facts, &mut self.full_res, &mut self.thumbs)
     }
 
     /// Apply a rotate/flip `op` to the lightbox's current image, decoding the
@@ -1517,12 +1508,17 @@ impl DupesView {
         let (a_tex, a_img) = self.lightbox_texture(&a);
         let a_meta = lightbox_meta(&a);
 
-        // The B file (compare target), if comparing.
-        let b = state
-            .compare
-            .as_ref()
-            .map(|c| c.other.min(count - 1))
-            .map(|bi| group[bi].clone());
+        // The B file (compare target), if comparing. B is a viewer-agnostic
+        // rendering source ([`FileFacts`]); its group member — for this tab's
+        // mark actions — is the one at its on-disk path. (A later slice points B
+        // outside the group, where no member matches and the caller supplies the
+        // actions instead.)
+        let b = state.compare.as_ref().and_then(|c| {
+            group
+                .iter()
+                .find(|f| f.absolute_path() == c.b.abs_path)
+                .cloned()
+        });
         let b_bundle = b.as_ref().map(|b| {
             let b_key = key(b);
             let b_markable = !self.repo_is_ro(&b.repo) || self.unlocked.contains(&b_key);
@@ -2132,7 +2128,9 @@ impl DupesView {
                 state.reset_view();
             } else if count >= 2 {
                 let b_idx = if idx == 0 { 1 } else { 0 };
-                state.compare = Some(CompareState::new(b_idx));
+                let b_facts =
+                    FileFacts::from_entry(&group[b_idx].entry, group[b_idx].absolute_path());
+                state.compare = Some(CompareState::new(b_facts));
             }
         }
         if toggle_flicker && let Some(cmp) = state.compare.as_mut() {
@@ -2305,10 +2303,12 @@ impl DupesView {
         let a = group[idx].clone();
         let (a_hex, a_path, _a_total) = params(&a);
         let a_viz = self.waves.get(&a_hex, &a_path);
-        let b_file = state
-            .compare
-            .as_ref()
-            .map(|c| group[c.other.min(count - 1)].clone());
+        let b_file = state.compare.as_ref().and_then(|c| {
+            group
+                .iter()
+                .find(|f| f.absolute_path() == c.b.abs_path)
+                .cloned()
+        });
         let (b_hex, b_viz) = match &b_file {
             Some(f) => {
                 let (h, p, _t) = params(f);
@@ -2387,7 +2387,10 @@ impl DupesView {
         // exact-duplicate copies share a content hash, so the hash alone can't
         // say which row is playing.
         let snap = self.player.snapshot();
-        let b_idx = state.compare.as_ref().map(|c| c.other.min(count - 1));
+        let b_idx = state
+            .compare
+            .as_ref()
+            .and_then(|c| group.iter().position(|f| f.absolute_path() == c.b.abs_path));
         // Adopt an already-playing copy (e.g. started from a card) on open.
         if state.audio_active.is_none()
             && snap.loaded
@@ -3012,7 +3015,9 @@ impl DupesView {
                 state.compare = None;
             } else if count >= 2 {
                 let other = if idx == 0 { 1 } else { 0 };
-                state.compare = Some(CompareState::new(other));
+                let b_facts =
+                    FileFacts::from_entry(&group[other].entry, group[other].absolute_path());
+                state.compare = Some(CompareState::new(b_facts));
             }
         }
         if toggle_flicker && let Some(c) = state.compare.as_mut() {
@@ -6013,6 +6018,7 @@ mod ui_tests {
             }
         };
         let group: DupeGroup = vec![wav(0, true), wav(1, false)];
+        let b_facts = FileFacts::from_entry(&group[1].entry, group[1].absolute_path());
 
         let mut view = DupesView::new();
         view.repos_loaded = true;
@@ -6040,7 +6046,7 @@ mod ui_tests {
         harness.step();
         {
             let lb = harness.state_mut().lightbox.as_mut().unwrap();
-            lb.compare = Some(CompareState::new(1));
+            lb.compare = Some(CompareState::new(b_facts));
             lb.spectrogram = true;
         }
         // Give the background workers time to decode both WAVs into spectrograms.
@@ -6126,6 +6132,83 @@ mod ui_tests {
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 
+    /// Pressing `C` in an image group's lightbox enters compare with B pointed
+    /// at the other member — carried as an abstract [`FileFacts`] rendering
+    /// source (the generalisation of the old group-index B), which is the seam
+    /// later slices reuse to point B outside the group.
+    #[test]
+    fn pressing_c_enters_compare_with_b_as_the_other_member() {
+        use egui_kittest::Harness;
+        let mut group: DupeGroup = Vec::new();
+        for i in 0..2u8 {
+            let mut hash = [0u8; 32];
+            hash[0] = i;
+            group.push(DupeFile {
+                repo: "r".into(),
+                repo_root: "/tmp/r".into(),
+                rel_path: format!("photo{i}.png"),
+                entry: dedup_core::store::FileEntry {
+                    size: 1000,
+                    hash,
+                    modified_ms: 0,
+                    missing: false,
+                    mime: Some("image/png".into()),
+                    img_fingerprint: None,
+                    video_hash: None,
+                    pdf_hash: None,
+                    audio: None,
+                    img_size: Some((640, 480)),
+                    origin: None,
+                    exif: None,
+                },
+            });
+        }
+        let b_path = group[1].absolute_path();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+        view.lightbox = Some(LightboxState::new(0, 0));
+
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 720.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        assert!(
+            harness.state().lightbox.as_ref().unwrap().compare.is_none(),
+            "not comparing until C is pressed"
+        );
+
+        harness.key_press(egui::Key::C);
+        harness.run();
+        let cmp = harness
+            .state()
+            .lightbox
+            .as_ref()
+            .unwrap()
+            .compare
+            .as_ref()
+            .expect("C entered compare");
+        assert_eq!(
+            cmp.b.abs_path, b_path,
+            "B is the other member, carried as an abstract FileFacts source"
+        );
+    }
+
     /// Renders the open lightbox over a real on-disk image to
     /// `target/lightbox.png` for manual inspection. `--ignored` (needs wgpu).
     #[test]
@@ -6168,11 +6251,12 @@ mod ui_tests {
             });
         }
 
+        let b_facts = FileFacts::from_entry(&group[1].entry, group[1].absolute_path());
         let mut view = DupesView::new();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
         let mut lb = LightboxState::new(0, 0);
-        lb.compare = Some(CompareState::new(1)); // render A/B side-by-side
+        lb.compare = Some(CompareState::new(b_facts)); // render A/B side-by-side
         view.lightbox = Some(lb);
 
         let tmp = tempfile::tempdir().unwrap();
@@ -6380,11 +6464,12 @@ mod ui_tests {
             });
         }
 
+        let b_facts = FileFacts::from_entry(&group[1].entry, group[1].absolute_path());
         let mut view = DupesView::new();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
         let mut lb = LightboxState::new(0, 0);
-        lb.compare = Some(CompareState::new(1));
+        lb.compare = Some(CompareState::new(b_facts));
         view.lightbox = Some(lb);
 
         let tmp = tempfile::tempdir().unwrap();

@@ -72,6 +72,15 @@ Work:
 Sequence: (1) previewable abstraction + generalise `CompareState`; (2) route DIFF, delete
 `diff_inspect`; (3) fold in audio; (4) enable video/cross-type compare.
 
+**Done (slice 1):** `lightbox::full_texture(&FileFacts, …)` is the viewer-agnostic
+texture resolver (generalising `dupes_view::lightbox_texture`), and `CompareState.other:
+usize` is now `CompareState.b: FileFacts` — the abstract B *rendering* source. The
+Duplicate image + audio lightboxes resolve B's texture from those facts and re-find B's
+group member (for this tab's mark actions) by on-disk path; when a later slice points B
+outside the group, no member matches and the caller supplies the actions. Behaviour is
+unchanged. Still to do: slices 2–4 (route DIFF + delete `diff_inspect`; fold in audio;
+video/cross-type), and the deferred review-pane per-row diff button rides on slice 2.
+
 ## Engineering backlog
 - **Per-sink main re-read.** `plan_group_sync`/`run_group_sync` re-open the main and
   re-run `collect_source_entries` over its whole index once per sink. Collect the main's
