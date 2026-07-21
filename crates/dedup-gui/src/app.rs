@@ -73,6 +73,9 @@ enum FolderTarget {
     Relocate,
     /// The inline duplicate editor's path buffer.
     Duplicate,
+    /// The inline "add a sink to a group" editor's path buffer (a duplicate of
+    /// the group's main pointed at a new path).
+    AddSink,
 }
 
 /// In-progress inline edit for a repo row.
@@ -87,6 +90,14 @@ enum Edit {
     },
     Duplicate {
         name: String,
+        dest: String,
+        path: String,
+    },
+    /// Add a new sink to `group`: a clone of its `main` pointed at a new path.
+    /// `main` is the row the inline editor renders under.
+    AddSink {
+        main: String,
+        group: String,
         dest: String,
         path: String,
     },
@@ -116,6 +127,39 @@ enum Action {
     },
     CommitDelete(String),
     CancelEdit,
+    /// Turn an ungrouped repo into a sync-group main (a group named after it).
+    MakeMain(String),
+    /// Add an ungrouped repo to an existing group as a sink.
+    SinkInto {
+        repo: String,
+        group: String,
+    },
+    /// Take a sink back out of its group.
+    RemoveSink {
+        group: String,
+        repo: String,
+    },
+    /// Flip a group's push mode (ADD ONLY ↔ MIRROR).
+    SetGroupMode {
+        group: String,
+        mode: dedup_core::store::SyncMode,
+    },
+    /// Queue an UPDATE / SCAN for every member of a group (main + sinks).
+    UpdateGroup(String),
+    /// Disband a group (its repos stay, just ungrouped).
+    Ungroup(String),
+    /// Open the inline "add a sink" editor on the group's main card.
+    BeginAddSink {
+        group: String,
+        main: String,
+    },
+    /// Clone `main` into a new repo at `path` and add it to `group` as a sink.
+    CommitAddSink {
+        group: String,
+        main: String,
+        dest: String,
+        path: String,
+    },
     OpenAdd,
     CloseAdd,
     ChooseFolder(FolderTarget),
@@ -485,6 +529,17 @@ impl DedupApp {
                     *path = picked;
                 }
             }
+            // Add-sink editor: same behaviour as the duplicate editor.
+            FolderTarget::AddSink => {
+                if let Some(Edit::AddSink { dest, path, .. }) = &mut self.edit {
+                    if dest.trim().is_empty()
+                        && let Some(base) = dir.file_name()
+                    {
+                        *dest = base.to_string_lossy().into_owned();
+                    }
+                    *path = picked;
+                }
+            }
         }
     }
 
@@ -559,6 +614,94 @@ impl DedupApp {
             }
             Action::BeginDelete(name) => self.edit = Some(Edit::ConfirmDelete { name }),
             Action::CancelEdit => self.edit = None,
+            Action::MakeMain(name) => {
+                // Name the group after its main. Repo names are unique and groups
+                // are a separate keyspace, so this only clashes with a group
+                // already named for another repo — surfaced as an error.
+                if let Err(e) =
+                    self.store
+                        .create_sync_group(&name, &name, dedup_core::store::SyncMode::AddOnly)
+                {
+                    self.load_error = Some(e.to_string());
+                }
+                self.reload_all();
+            }
+            Action::SinkInto { repo, group } => {
+                if let Err(e) = self.store.add_sync_sink(&group, &repo) {
+                    self.load_error = Some(e.to_string());
+                }
+                self.reload_all();
+            }
+            Action::RemoveSink { group, repo } => {
+                if let Err(e) = self.store.remove_sync_sink(&group, &repo) {
+                    self.load_error = Some(e.to_string());
+                }
+                self.reload_all();
+            }
+            Action::SetGroupMode { group, mode } => {
+                if let Err(e) = self.store.set_sync_mode(&group, mode) {
+                    self.load_error = Some(e.to_string());
+                }
+                self.reload_all();
+            }
+            Action::UpdateGroup(group) => {
+                // Queue every member (main + sinks). enqueue takes names only, so
+                // collect first to avoid borrowing `self.groups` across the call.
+                let members: Vec<String> = self
+                    .groups
+                    .iter()
+                    .find(|(n, _)| *n == group)
+                    .map(|(_, g)| g.members().map(str::to_string).collect())
+                    .unwrap_or_default();
+                // Skip known-unreachable members, like UPDATE ALL — a backup on an
+                // unplugged drive would otherwise hang a worker. Not-yet-probed
+                // (Unknown) members are still included.
+                for member in members {
+                    let reachable = self
+                        .repos
+                        .iter()
+                        .find(|r| r.name == member)
+                        .is_none_or(|r| r.location.is_none_or(|l| l.reachable()));
+                    if reachable {
+                        self.enqueue(member, JobKind::Update);
+                    }
+                }
+            }
+            Action::Ungroup(group) => {
+                if let Err(e) = self.store.delete_sync_group(&group) {
+                    self.load_error = Some(e.to_string());
+                }
+                self.reload_all();
+            }
+            Action::BeginAddSink { group, main } => {
+                self.edit = Some(Edit::AddSink {
+                    main,
+                    group,
+                    dest: String::new(),
+                    path: String::new(),
+                });
+            }
+            Action::CommitAddSink {
+                group,
+                main,
+                dest,
+                path,
+            } => {
+                self.edit = None;
+                if dest.is_empty() || path.is_empty() {
+                    self.load_error = Some("Add repo needs a new name and path.".into());
+                } else {
+                    match self.store.duplicate_repo(&main, &dest, &path) {
+                        Ok(()) => {
+                            if let Err(e) = self.store.add_sync_sink(&group, &dest) {
+                                self.load_error = Some(e.to_string());
+                            }
+                        }
+                        Err(e) => self.load_error = Some(e.to_string()),
+                    }
+                    self.reload_all();
+                }
+            }
             Action::CommitRename(name, new_name) => {
                 self.edit = None;
                 if !new_name.is_empty() && new_name != name {
@@ -1089,7 +1232,7 @@ impl DedupApp {
                         continue;
                     }
                     self.repo_card(ui, row, actions);
-                    self.sink_rows(ui, &row.name, &rows, actions);
+                    self.group_section(ui, &row.name, &rows, actions);
                 }
             });
     }
@@ -1104,7 +1247,10 @@ impl DedupApp {
     /// After a main's card: a chevron summarising its sinks, and — while
     /// expanded — the sinks' own cards. Collapsed by default, so a group reads
     /// as one repository with backups rather than several unrelated repos.
-    fn sink_rows(
+    /// A main repo's group section: a controls row (mode pill, ADD REPO, UPDATE
+    /// ALL, UNGROUP) shown for any group main — even one with no sinks yet — then,
+    /// when the group has sinks, a collapsible chevron and the sinks' own cards.
+    fn group_section(
         &mut self,
         ui: &mut egui::Ui,
         main: &str,
@@ -1119,6 +1265,80 @@ impl DedupApp {
         else {
             return;
         };
+        let verbosity = self.tooltip_verbosity;
+        let is_mirror = group.mode == dedup_core::store::SyncMode::Mirror;
+        ui.horizontal(|ui| {
+            ui.add_space(16.0);
+            let mode_label = if is_mirror {
+                "MODE: MIRROR"
+            } else {
+                "MODE: ADD ONLY"
+            };
+            if crate::lcars::toggle_button(ui, mode_label, is_mirror, theme::ORANGE)
+                .explain(
+                    verbosity,
+                    "How this group is pushed — click to flip",
+                    "How this group is pushed. ADD ONLY copies what a backup lacks; MIRROR \
+                     also deletes from a backup what the main no longer has. Click to flip.",
+                )
+                .clicked()
+            {
+                let mode = if is_mirror {
+                    dedup_core::store::SyncMode::AddOnly
+                } else {
+                    dedup_core::store::SyncMode::Mirror
+                };
+                actions.push(Action::SetGroupMode {
+                    group: group_name.clone(),
+                    mode,
+                });
+            }
+            if crate::lcars::action_button(
+                ui,
+                &format!("{} ADD REPO", icon::PLUS),
+                true,
+                theme::BLUE,
+            )
+            .explain(
+                verbosity,
+                "Add a backup repository to this group",
+                "Add a backup to this group: a clone of the main's index, pointed at a new \
+                 folder.",
+            )
+            .clicked()
+            {
+                actions.push(Action::BeginAddSink {
+                    group: group_name.clone(),
+                    main: main.to_string(),
+                });
+            }
+            if crate::lcars::action_button(
+                ui,
+                &format!("{} UPDATE ALL", icon::REFRESH),
+                true,
+                theme::AMBER,
+            )
+            .explain(
+                verbosity,
+                "Scan the whole group",
+                "Queue an UPDATE / SCAN for the main and every backup in this group.",
+            )
+            .clicked()
+            {
+                actions.push(Action::UpdateGroup(group_name.clone()));
+            }
+            if crate::lcars::action_button(ui, "UNGROUP", true, theme::LILAC)
+                .explain(
+                    verbosity,
+                    "Disband this group",
+                    "Disband this group. Every repository stays; they are just no longer \
+                     linked as main and backups.",
+                )
+                .clicked()
+            {
+                actions.push(Action::Ungroup(group_name.clone()));
+            }
+        });
         if group.sinks.is_empty() {
             return;
         }
@@ -1503,6 +1723,76 @@ impl DedupApp {
                 });
                 return;
             }
+            Some(Edit::AddSink {
+                main,
+                group,
+                dest,
+                path,
+            }) if *main == row.name => {
+                let verbosity = self.tooltip_verbosity;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("ADD SINK → NAME").color(theme::GREEN));
+                    ui.add(egui::TextEdit::singleline(dest).desired_width(140.0))
+                        .explain(
+                            verbosity,
+                            "New repository's name",
+                            "Name for the new backup repository. It starts as a copy of this \
+                             group's main index, pointed at the folder you choose.",
+                        );
+                    ui.label(RichText::new("PATH").color(theme::GREEN));
+                    if ui
+                        .button(
+                            RichText::new(format!("{} CHOOSE…", icon::FOLDER_OPEN))
+                                .color(theme::BLACK),
+                        )
+                        .explain(
+                            verbosity,
+                            "Pick a folder",
+                            "Open a native folder picker to choose where the new backup \
+                             repository's files live.",
+                        )
+                        .clicked()
+                    {
+                        actions.push(Action::ChooseFolder(FolderTarget::AddSink));
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(path)
+                            .desired_width(240.0)
+                            .hint_text("/backup/repo/path"),
+                    )
+                    .explain(
+                        verbosity,
+                        "New repository's folder",
+                        "On-disk folder the new backup repository will point at. The main \
+                         is left completely unchanged.",
+                    );
+                    if ui
+                        .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::BLACK))
+                        .explain(
+                            verbosity,
+                            "Add this backup",
+                            "Clone the main's index into the new repository at the chosen \
+                             path and add it to this group as a sink.",
+                        )
+                        .clicked()
+                    {
+                        actions.push(Action::CommitAddSink {
+                            group: group.clone(),
+                            main: main.clone(),
+                            dest: dest.trim().to_string(),
+                            path: path.trim().to_string(),
+                        });
+                    }
+                    if ui
+                        .button(RichText::new(icon::X).color(theme::BLACK))
+                        .explain(verbosity, "Cancel", "Discard and close the editor.")
+                        .clicked()
+                    {
+                        actions.push(Action::CancelEdit);
+                    }
+                });
+                return;
+            }
             Some(Edit::ConfirmDelete { name }) if *name == row.name => {
                 let verbosity = self.tooltip_verbosity;
                 ui.horizontal(|ui| {
@@ -1631,6 +1921,83 @@ impl DedupApp {
                 actions.push(Action::BeginDelete(row.name.clone()));
             }
         });
+
+        // Sync-group membership actions. A main's group controls live on its
+        // group section (below the card), so only sinks and ungrouped repos get a
+        // button here.
+        let is_main = self.groups.iter().any(|(_, g)| g.main == row.name);
+        let sink_group = self.sink_of(&row.name).map(|(n, _)| n.clone());
+        // Every group as (group name, main), to offer as SINK INTO targets.
+        let group_targets: Vec<(String, String)> = self
+            .groups
+            .iter()
+            .map(|(n, g)| (n.clone(), g.main.clone()))
+            .collect();
+        let verbosity = self.tooltip_verbosity;
+        if !is_main {
+            ui.horizontal(|ui| {
+                if let Some(group) = &sink_group {
+                    if ui
+                        .button(RichText::new(format!("{} SINK OUT", icon::X)).color(theme::BLACK))
+                        .explain(
+                            verbosity,
+                            "Take this backup out of its group",
+                            "Remove this repository from its sync group. Both repositories \
+                             stay; they are just no longer linked as main and backup.",
+                        )
+                        .clicked()
+                    {
+                        actions.push(Action::RemoveSink {
+                            group: group.clone(),
+                            repo: row.name.clone(),
+                        });
+                    }
+                } else {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(format!("{} MAKE MAIN", icon::STAR))
+                                    .color(theme::BLACK),
+                            )
+                            .fill(theme::GREEN),
+                        )
+                        .explain(
+                            verbosity,
+                            "Make this repository a sync-group main",
+                            "Turn this repository into the main of a new sync group. You can \
+                             then add backup repositories (sinks) that it is pushed to.",
+                        )
+                        .clicked()
+                    {
+                        actions.push(Action::MakeMain(row.name.clone()));
+                    }
+                    if !group_targets.is_empty() {
+                        ui.menu_button(
+                            RichText::new(format!("{} SINK INTO", icon::ARROW_RIGHT))
+                                .color(theme::TEXT),
+                            |ui| {
+                                for (group, main) in &group_targets {
+                                    if ui.button(format!("{} {main}", icon::STAR)).clicked() {
+                                        actions.push(Action::SinkInto {
+                                            repo: row.name.clone(),
+                                            group: group.clone(),
+                                        });
+                                        ui.close();
+                                    }
+                                }
+                            },
+                        )
+                        .response
+                        .explain(
+                            verbosity,
+                            "Add this repository to a group as a backup",
+                            "Add this repository to an existing sync group as a backup (sink) \
+                             of that group's main.",
+                        );
+                    }
+                }
+            });
+        }
     }
 
     fn add_modal(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
@@ -2424,6 +2791,110 @@ mod ui_tests {
         assert!(
             harness.query_all_by_label_contains("Videos").count() > 0,
             "expanding shows the sink's own card"
+        );
+    }
+
+    /// Render the Repositories tab and run a frame. The harness collects (and
+    /// discards) the deferred `Action`s, so this asserts on what is *shown* for a
+    /// given store state, which is the group-management UI's real surface.
+    fn render_repos(app: DedupApp) -> Harness<'static, DedupApp> {
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 1000.0))
+            .build_ui_state(
+                move |ui, app: &mut DedupApp| {
+                    if !init {
+                        icon::install(ui.ctx());
+                        theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let mut actions = Vec::new();
+                    app.repositories_view(ui, &mut actions);
+                },
+                app,
+            );
+        harness.run();
+        harness
+    }
+
+    /// An ungrouped repo offers MAKE MAIN; with no groups yet, no group controls
+    /// (UNGROUP / MODE pill) are shown anywhere.
+    #[test]
+    fn ungrouped_repos_offer_make_main_and_no_group_controls() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, app) = sample_app();
+        let harness = render_repos(app);
+        assert!(
+            harness.query_all_by_label_contains("MAKE MAIN").count() >= 1,
+            "an ungrouped repo can be made a group main"
+        );
+        assert!(
+            harness.query_by_label_contains("UNGROUP").is_none(),
+            "no group controls without a group"
+        );
+    }
+
+    /// A group's main shows the group controls (mode pill + UNGROUP) even before
+    /// it has sinks; its sink offers SINK OUT (once expanded) and never MAKE MAIN.
+    #[test]
+    fn group_main_shows_controls_and_sink_shows_sink_out() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, mut app) = sample_app();
+        app.store
+            .create_sync_group(
+                "Automatic Upload",
+                "Automatic Upload",
+                dedup_core::store::SyncMode::AddOnly,
+            )
+            .expect("create group");
+        app.store
+            .add_sync_sink("Automatic Upload", "Videos")
+            .expect("add sink");
+        app.reload_all();
+        let mut harness = render_repos(app);
+
+        assert!(
+            harness.query_by_label_contains("MODE: ADD ONLY").is_some(),
+            "the main shows its per-group mode pill"
+        );
+        assert!(
+            harness.query_by_label_contains("UNGROUP").is_some(),
+            "the main shows the UNGROUP control"
+        );
+        // Both repos are grouped, so nothing offers MAKE MAIN.
+        assert!(
+            harness.query_by_label_contains("MAKE MAIN").is_none(),
+            "a grouped repo is not offered as a new main"
+        );
+
+        // The sink is folded away; expand it to reach its card.
+        harness
+            .get_by_label_contains("SINK(S) IN 'Automatic Upload'")
+            .click();
+        harness.run();
+        assert!(
+            harness.query_by_label_contains("SINK OUT").is_some(),
+            "the expanded sink offers SINK OUT"
+        );
+    }
+
+    /// The mode pill reflects the group's stored mode.
+    #[test]
+    fn mode_pill_shows_mirror_for_a_mirror_group() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, mut app) = sample_app();
+        app.store
+            .create_sync_group(
+                "Automatic Upload",
+                "Automatic Upload",
+                dedup_core::store::SyncMode::Mirror,
+            )
+            .expect("create group");
+        app.reload_all();
+        let harness = render_repos(app);
+        assert!(
+            harness.query_by_label_contains("MODE: MIRROR").is_some(),
+            "a MIRROR group's pill reads MIRROR"
         );
     }
 

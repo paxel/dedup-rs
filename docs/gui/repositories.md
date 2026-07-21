@@ -57,6 +57,25 @@ A repository mid-scan or mid-check shows a spinner, live progress (a bar with pe
 for hashing, a file/dir count while scanning), and a CANCEL button — cancelling a scan keeps
 whatever was already hashed committed to the index.
 
+## Sync groups
+
+A **sync group** links one **main** repository to one or more **backup** repositories
+(**sinks**). Groups are managed right here on the repo cards (the [Sync Groups](sync-groups.md)
+tab drives the same underlying groups):
+
+- **MAKE MAIN** (on an ungrouped repo) — turn the repository into the main of a new group.
+- **SINK INTO ▾** (on an ungrouped repo, when a group exists) — add it to an existing group
+  as a backup.
+- A main's card gains a **group controls** row:
+  - a **mode pill** — `ADD ONLY` copies what a backup lacks; `MIRROR` also deletes from a
+    backup what the main no longer has. Click to flip.
+  - **ADD REPO** — add a *new* backup that starts as a clone of the main's index, pointed at
+    a folder you choose (the main is left unchanged).
+  - **UPDATE ALL** — queue an UPDATE / SCAN for the main and every backup in the group.
+  - **UNGROUP** — disband the group; every repository stays, just unlinked.
+- Sinks are folded under their main behind a **SINK(S) IN '…'** chevron; expand it to manage
+  each sink like any other repository, including **SINK OUT** to take it back out of the group.
+
 ## Add Repository dialog
 
 - **FOLDER** — type a path, or **CHOOSE…** to open a native folder picker.

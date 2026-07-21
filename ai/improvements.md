@@ -20,14 +20,17 @@
   `media_cell` widget (also used by the Duplicate cards), so a new file type extends
   in one place.
 - sync repos. it seems the grouping of repos belongs to the first tab
-  - repositories get a "main repo button. if clicked they are converted to repo group. getting an elbow and and an add repo button.
-  - the add repo button is for adding new repos. they inherit everything of the main repo but the path
-  - existing repos get a "sink" button. which when clicked offers existing groups to be added to
-  - the main group gets a sub elbow sinks, that can be colapsed
-  - the main group gets a update all button that updates all repos of the group
-  - each sink has a toggle pill mirror to select if the repo should be mirrored or just copied to
-  - in all transfer groom etc views only the main groups are offered
-  - group sync becomes repo sync where groups can be synced, but also ALL repos diffed vs another
+  - **Done (slice 1):** group management now lives on the Repositories-tab repo cards —
+    MAKE MAIN (repo → group), SINK INTO an existing group, per-group ADD REPO (clone of
+    the main at a new path), UPDATE ALL, UNGROUP, a per-group mode pill, collapsible
+    SINK(S), and SINK OUT. Reuses the existing per-group `SyncGroup` model + DUPLICATE flow.
+  - **Remaining slices:**
+    - each sink has a mirror/copy toggle pill — **per-sink** mode (core model change:
+      move `mode` from the group onto each sink, with a redb migration).
+    - in all transfer / groom / etc views only the main groups are offered (repo pickers
+      hide sinks).
+    - group sync becomes repo sync where groups can be synced, but also ALL repos diffed
+      vs another (rename the Sync Groups tab, add an all-repos-vs-one diff mode).
 
 ## Unified lightbox & compare
 
