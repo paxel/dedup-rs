@@ -2236,6 +2236,31 @@ impl DupesView {
         tex
     }
 
+    /// The viewer-agnostic texture for any *previewable* file, dispatched by
+    /// kind: an image or video still via [`crate::lightbox::full_texture`], an
+    /// audio file via its spectrogram (`waves` → [`Self::spec_texture`]), and
+    /// text / binary via `None`. This is the "previewable" abstraction the
+    /// roadmap asks for — `draw_compare` (and slice-4 cross-type compare) consume
+    /// its `(texture, pixel-size)`, and it is what lets an audio file be compared
+    /// against an image. `None` while an async decode is still in flight.
+    fn previewable_texture(
+        &mut self,
+        ctx: &egui::Context,
+        facts: &FileFacts,
+    ) -> (Option<egui::TextureHandle>, egui::Vec2) {
+        if facts.is_image() || facts.is_video() {
+            return crate::lightbox::full_texture(facts, &mut self.full_res, &mut self.thumbs);
+        }
+        if facts.is_audio()
+            && let Some(viz) = self.waves.get(&facts.hash_hex, &facts.abs_path)
+        {
+            let tex = self.spec_texture(ctx, &facts.hash_hex, &viz);
+            let size = egui::vec2(viz.spec_w as f32, viz.spec_h as f32);
+            return (Some(tex), size);
+        }
+        (None, egui::vec2(1.0, 1.0))
+    }
+
     fn audio_lightbox(
         &mut self,
         ctx: &egui::Context,
@@ -2277,14 +2302,20 @@ impl DupesView {
         let comparing = b_file.is_some();
         let flicker = state.compare.as_ref().is_some_and(|c| c.flicker);
         let spectrogram = state.spectrogram;
-        // Build/fetch spectrogram textures (only needed in spectrogram view).
+        // Build/fetch spectrogram textures (only needed in spectrogram view), via
+        // the shared previewable resolver so audio yields a texture the same way
+        // images do — the seam slice 4's cross-type compare reuses.
         let a_tex = if spectrogram {
-            a_viz.clone().map(|v| self.spec_texture(ctx, &a_hex, &v))
+            self.previewable_texture(ctx, &FileFacts::from_entry(&a.entry, a.absolute_path()))
+                .0
         } else {
             None
         };
-        let b_tex = match (spectrogram, b_hex.as_ref(), b_viz.clone()) {
-            (true, Some(h), Some(v)) => Some(self.spec_texture(ctx, h, &v)),
+        let b_tex = match (spectrogram, b_file.as_ref()) {
+            (true, Some(f)) => {
+                self.previewable_texture(ctx, &FileFacts::from_entry(&f.entry, f.absolute_path()))
+                    .0
+            }
             _ => None,
         };
 
@@ -4491,6 +4522,64 @@ mod ui_tests {
                 exif: None,
             },
         }
+    }
+
+    /// The shared previewable resolver's discriminating behaviours: a document
+    /// yields no texture ("text/binary → None"), and an image resolves through
+    /// the full-res path with its size taken from the index before the decode
+    /// lands. (Which mime counts as audio is covered by
+    /// `media_cell::tests::kind_helpers_classify_by_mime`; the audio *arm* itself
+    /// needs a decoded spectrogram, which no headless fixture supplies, so it is
+    /// only checked here to not panic / not fabricate a texture without a viz.)
+    #[test]
+    fn previewable_texture_dispatches_by_kind() {
+        let base = |mime: &str| FileFacts {
+            size: 1,
+            modified_ms: 0,
+            mime: Some(mime.to_string()),
+            img_size: None,
+            audio_ms: None,
+            audio_seed: None,
+            hash_hex: "deadbeef".to_string(),
+            abs_path: std::path::PathBuf::from("/nonexistent-dedup-test/x"),
+            origin: None,
+        };
+        let ctx = egui::Context::default();
+        let mut view = DupesView::new();
+
+        // A document has no visual to compare.
+        assert!(
+            view.previewable_texture(&ctx, &base("text/plain"))
+                .0
+                .is_none(),
+            "text/binary yields no texture"
+        );
+
+        // An image dispatches to the full-res path: no texture until the async
+        // decode lands, but the size comes straight from the index so transforms
+        // stay stable across the thumb→full swap.
+        let img = FileFacts {
+            img_size: Some((640, 480)),
+            ..base("image/png")
+        };
+        let (tex, size) = view.previewable_texture(&ctx, &img);
+        assert!(tex.is_none(), "no texture until the decode lands");
+        assert_eq!(
+            size,
+            egui::vec2(640.0, 480.0),
+            "image size comes from the index"
+        );
+
+        // Audio is handled without panicking and fabricates no texture when there
+        // is no decoded viz (the fixture file has none). This does not, on its
+        // own, prove audio took the spectrogram arm — an absent-file audio and a
+        // document both fall through to the same empty result.
+        assert!(
+            view.previewable_texture(&ctx, &base("audio/mpeg"))
+                .0
+                .is_none(),
+            "audio without a decoded viz yields no texture"
+        );
     }
 
     /// Audio cards show a PLAY control; clicking it loads that file into the

@@ -92,7 +92,23 @@ have actually decoded a texture; a side that yields none — a non-previewable t
 decode that came back empty (e.g. video with no ffmpeg) — settles to a "no preview" note and
 keeps compare disabled ("if a side has no visual, compare disables itself"), so a failed
 decode never spins "decoding…" forever. Still to do: slice 3 (fold in `audio_lightbox`) and
-slice 4 (video / cross-type compare). **The deferred review-pane per-row diff button is the immediate
+slice 4 (video / cross-type compare).
+
+**Done (slice 3):** audio is now a texture-yielding *previewable*. A single resolver,
+`dupes_view::previewable_texture(&FileFacts)`, dispatches by kind — image/video via
+`lightbox::full_texture`, audio via its spectrogram (`waves` → `spec_texture`), text/binary →
+`None` — and the audio lightbox builds its spectrogram texture through it, so an audio file
+yields a `(texture, size)` the same way an image does. (That audio→texture production is
+verified by code inspection + the unchanged `spec_texture`/`spec_image` path and the manual run
+step, not by the suite: no headless fixture supplies a decodable audio file, so the resolver's
+audio arm has no automated production test — only its dispatch is unit-tested, and the
+image-size assertion is the one that discriminates.) Per the user's "texture-enable, keep
+compare" decision, audio's own compare *rendering* is deliberately unchanged: the two waveforms
+still stack vertically on a shared time axis, drawn full-width with the click-to-seek cursor and
+ID3 tag panels — `draw_compare`'s horizontal, letterbox-fit, zoom/pan geometry would degrade
+that, so audio was **not** routed through it. `waveform::wave_image()` (amplitude envelope → a
+texture) is unneeded under this decision and was not added. Still to do: slice 4 (video /
+cross-type image↔audio compare), which consumes `previewable_texture`. **The deferred review-pane per-row diff button is the immediate
 follow-on** (it opens this same DIFF compare surface from a review row).
 
 ## Engineering backlog
