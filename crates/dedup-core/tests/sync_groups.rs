@@ -274,7 +274,7 @@ fn a_pre_sync_group_registry_still_opens_and_has_no_groups() -> TestResult {
 // --- pushing a group out ---------------------------------------------------
 
 use dedup_core::diff::{DiffRun, NoDiffProgress};
-use dedup_core::sync_group::{SinkOutcome, plan_group_sync, run_group_sync};
+use dedup_core::sync_group::{SinkOutcome, diff_overview, plan_group_sync, run_group_sync};
 use dedup_core::update::{CancellationToken, NoProgress, update_repo};
 use std::path::Path;
 
@@ -632,5 +632,44 @@ fn a_cancelled_push_reports_the_sinks_it_never_reached() -> TestResult {
         live_paths(&sb.store, "SINK1")?.is_empty(),
         "and nothing was actually pushed"
     );
+    Ok(())
+}
+
+/// The Repo Sync tab's overview: every repo diffed against one reference by
+/// content. `unique` = content only that repo has, `shared` = in both,
+/// `missing` = reference content that repo lacks. The reference is skipped.
+#[test]
+fn diff_overview_counts_unique_shared_and_missing_per_repo() -> TestResult {
+    let sb = Sandbox::new()?;
+    // MAIN (the reference) holds a shared file and one only it has.
+    write(&sb.dir("MAIN"), "shared.txt", b"both have this")?;
+    write(&sb.dir("MAIN"), "ref_only.txt", b"only the reference")?;
+    // SINK1 shares one, has one of its own, and lacks the reference's other.
+    write(&sb.dir("SINK1"), "shared.txt", b"both have this")?;
+    write(&sb.dir("SINK1"), "sink_only.txt", b"only the sink")?;
+    sb.scan(&["MAIN", "SINK1", "SINK2"])?;
+
+    let repos = vec!["MAIN".to_string(), "SINK1".to_string(), "SINK2".to_string()];
+    let overview = diff_overview(&sb.store, "MAIN", &repos)?;
+
+    // The reference itself is not in the overview.
+    assert!(
+        !overview.iter().any(|o| o.repo == "MAIN"),
+        "the reference is skipped"
+    );
+    let sink1 = overview
+        .iter()
+        .find(|o| o.repo == "SINK1")
+        .ok_or("SINK1 missing")?;
+    assert_eq!(sink1.unique, 1, "sink_only.txt is content MAIN lacks");
+    assert_eq!(sink1.shared, 1, "shared.txt is in both");
+    assert_eq!(sink1.missing, 1, "ref_only.txt is MAIN content SINK1 lacks");
+
+    // An empty repo shares nothing and is missing everything the reference has.
+    let sink2 = overview
+        .iter()
+        .find(|o| o.repo == "SINK2")
+        .ok_or("SINK2 missing")?;
+    assert_eq!((sink2.unique, sink2.shared, sink2.missing), (0, 0, 2));
     Ok(())
 }

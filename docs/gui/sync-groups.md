@@ -1,4 +1,9 @@
-# Sync Groups tab
+# Repo Sync tab
+
+Two panes, switched at the top: **GROUPS** (keep repositories backed up to one another) and
+**COMPARE** (diff every repo against one reference).
+
+## Groups
 
 Keep one repository backed up to one or more others, without the manual "duplicate the repo,
 relocate the copy, rescan it" dance.
@@ -64,3 +69,16 @@ the sink under a different name is not copied again.
 The main is never changed by a push. To bring a change that was made *inside a sink* back to
 the main, use the [Files tab's](files.md#diff-board) **DIFF** command with the sink and the
 main — its per-row COPY resolves exactly that.
+
+## Compare
+
+The **COMPARE** pane diffs every repository against one you choose, by content (paths never
+matter). Pick a **REFERENCE** repository and press **DIFF ALL**; each other repo then shows:
+
+- **UNIQUE** — content only that repo has (the reference lacks it).
+- **SHARED** — content both it and the reference hold.
+- **MISSING** — reference content that repo does not have.
+
+This is read-only — an overview to see at a glance which repos are ahead of, behind, or
+overlap the reference. Nothing is changed; to act on a difference, use the [Files tab's](files.md#diff-board)
+**DIFF** command on the pair.

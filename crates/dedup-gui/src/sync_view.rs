@@ -1,14 +1,15 @@
-//! The Sync Groups tab: keep one **main** repository backed up to one or more
-//! remote **sinks**, instead of the manual duplicate → relocate → rescan dance.
+//! The Repo Sync tab. Two panes:
 //!
-//! A group names a main repo and its sinks; each sink has its own push mode:
-//! **ADD ONLY** copies what that sink lacks and never deletes; **MIRROR** also
-//! removes sink content the main no longer has, so the sink converges on
-//! exactly the main's content.
-//!
-//! The tab follows the same REVIEW → confirm → RUN shape as the Transfer tab:
-//! REVIEW plans every sink and renders the result in the shared review board,
-//! RUN asks before touching anything and then pushes on a worker thread.
+//! - **GROUPS** — keep one **main** repository backed up to one or more remote
+//!   **sinks**, instead of the manual duplicate → relocate → rescan dance. A
+//!   group names a main and its sinks; each sink has its own push mode:
+//!   **ADD ONLY** copies what that sink lacks and never deletes; **MIRROR** also
+//!   removes sink content the main no longer has. The pane follows the same
+//!   REVIEW → confirm → RUN shape as the Transfer tab: REVIEW plans every sink
+//!   into the shared review board, RUN pushes on a worker thread.
+//! - **COMPARE** — pick one reference repository and see, for every other repo,
+//!   how much content it has that the reference lacks (unique), shares, or is
+//!   missing. Read-only: an overview, computed off-thread, not a sync.
 
 use crate::media_cell::{facts_for, open_facts};
 use crate::review;
@@ -20,7 +21,9 @@ use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::diff::{DiffEvent, DiffProgress, DiffRun};
 use dedup_core::store::{Store, SyncGroup, SyncMode};
-use dedup_core::sync_group::{SinkOutcome, plan_group_sync, run_group_sync};
+use dedup_core::sync_group::{
+    RepoOverview, SinkOutcome, diff_overview, plan_group_sync, run_group_sync,
+};
 use dedup_core::update::CancellationToken;
 use egui::{Id, RichText};
 use std::sync::{Arc, Mutex};
@@ -36,6 +39,17 @@ enum Msg {
         result: Result<PreviewOutcome, String>,
         confirm: bool,
     },
+    /// A finished COMPARE: every repo's content overlap with the reference.
+    Compared(Result<Vec<RepoOverview>, String>),
+}
+
+/// Which pane of the Repo Sync tab is shown.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pane {
+    /// Manage and push sync groups (the original tab).
+    Groups,
+    /// Diff every repo against one chosen reference.
+    Compare,
 }
 
 /// The result of planning a group push, built off the UI thread. The board rows
@@ -202,6 +216,13 @@ pub struct SyncView {
     verbosity: TooltipVerbosity,
     /// Decodes the review board's row thumbnails; polled once per frame.
     thumbs: ThumbCache,
+    /// Which pane is shown: group management or the compare overview.
+    pane: Pane,
+    /// COMPARE pane: the chosen reference repo, the last overview, and whether
+    /// one is being computed off-thread.
+    diff_ref: Option<String>,
+    diff_rows: Vec<RepoOverview>,
+    comparing: bool,
 }
 
 enum Act {
@@ -218,6 +239,12 @@ enum Act {
     Confirm,
     CancelConfirm,
     CancelRun,
+    /// Switch between the group-management and compare panes.
+    SetPane(Pane),
+    /// Pick the reference repo the compare pane diffs everything against.
+    PickDiffRef(String),
+    /// Compute the compare overview for the chosen reference.
+    Compare,
 }
 
 impl Default for SyncView {
@@ -254,6 +281,10 @@ impl SyncView {
             rx,
             verbosity: TooltipVerbosity::default(),
             thumbs: ThumbCache::new(3),
+            pane: Pane::Groups,
+            diff_ref: None,
+            diff_rows: Vec::new(),
+            comparing: false,
         }
     }
 
@@ -269,6 +300,13 @@ impl SyncView {
                 {
                     self.selected = None;
                     self.clear_preview();
+                }
+                // A compare reference that vanished invalidates the overview.
+                if let Some(r) = &self.diff_ref
+                    && !self.repos.contains(r)
+                {
+                    self.diff_ref = None;
+                    self.diff_rows.clear();
                 }
                 self.loaded = true;
                 self.error = None;
@@ -310,31 +348,46 @@ impl SyncView {
             .show(ui, |ui| {
                 ui.add_space(6.0);
                 ui.label(
-                    RichText::new("SYNC GROUPS")
+                    RichText::new("REPO SYNC")
                         .color(theme::GREEN)
                         .size(18.0)
                         .strong(),
                 );
-                crate::util::shortcut_bar(ui, "P review · R run sync");
+                // Pane switch: manage/push groups, or diff every repo vs one.
+                ui.horizontal(|ui| {
+                    for (pane, label) in [(Pane::Groups, "GROUPS"), (Pane::Compare, "COMPARE")] {
+                        if crate::lcars::toggle_button(ui, label, self.pane == pane, theme::GREEN)
+                            .clicked()
+                        {
+                            acts.push(Act::SetPane(pane));
+                        }
+                    }
+                });
 
-                self.groups_section(ui, &mut acts);
-                self.new_group_section(ui, &mut acts);
-                if let Some((name, group)) = self.selected_group() {
-                    self.members_section(ui, &name, &group, &mut acts);
-                    self.action_section(ui, &mut acts);
+                match self.pane {
+                    Pane::Groups => {
+                        crate::util::shortcut_bar(ui, "P review · R run sync");
+                        self.groups_section(ui, &mut acts);
+                        self.new_group_section(ui, &mut acts);
+                        if let Some((name, group)) = self.selected_group() {
+                            self.members_section(ui, &name, &group, &mut acts);
+                            self.action_section(ui, &mut acts);
+                        }
+                        if let Some(err) = &self.error {
+                            ui.colored_label(theme::RED, err);
+                        }
+                        if let Some(status) = &self.status {
+                            ui.label(RichText::new(status).color(theme::TAN).size(13.0));
+                        }
+                        ui.separator();
+                        self.preview_panel(ui);
+                    }
+                    Pane::Compare => self.compare_pane(ui, &mut acts),
                 }
-
-                if let Some(err) = &self.error {
-                    ui.colored_label(theme::RED, err);
-                }
-                if let Some(status) = &self.status {
-                    ui.label(RichText::new(status).color(theme::TAN).size(13.0));
-                }
-                ui.separator();
-                self.preview_panel(ui);
             });
 
-        if self.confirm.is_none()
+        if self.pane == Pane::Groups
+            && self.confirm.is_none()
             && !self.result.is_open()
             && !self.running
             && !self.previewing
@@ -672,6 +725,109 @@ impl SyncView {
         );
     }
 
+    /// The COMPARE pane: pick a reference repo, then see how every other repo
+    /// overlaps with it by content. Read-only — an overview, not a sync.
+    fn compare_pane(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        let verbosity = self.verbosity;
+        crate::lcars::section_lcars(
+            ui,
+            "COMPARE — DIFF EVERY REPO VS ONE REFERENCE",
+            theme::LILAC,
+            |ui| {
+                let repos = self.repos.clone();
+                let selected = self.diff_ref.clone();
+                if repos.is_empty() {
+                    ui.colored_label(theme::TEXT, "No repositories to compare.");
+                    return;
+                }
+                crate::repo_chip::chip_row(ui, "diff_ref", "REFERENCE", repos.len(), |ui, i| {
+                    let name = &repos[i];
+                    let is_sel = selected.as_deref() == Some(name.as_str());
+                    let chip = crate::repo_chip::repo_chip(ui, name, is_sel, theme::ORANGE, None);
+                    if chip
+                        .name
+                        .explain(
+                            verbosity,
+                            "Compare every other repo against this one",
+                            "Use this repository as the reference: every other repo is diffed \
+                             against it by content, so you can see what each one has that this \
+                             reference lacks (unique), shares, or is missing.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::PickDiffRef(name.clone()));
+                    }
+                    chip.outer
+                });
+                ui.horizontal(|ui| {
+                    let ready = self.diff_ref.is_some() && !self.comparing;
+                    if ui
+                        .add_enabled(
+                            ready,
+                            egui::Button::new(RichText::new("DIFF ALL").color(theme::BLACK))
+                                .fill(theme::LILAC),
+                        )
+                        .explain(
+                            verbosity,
+                            "Diff every repo against the reference",
+                            "Compare each repository against the chosen reference by content \
+                             (no files are changed).",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::Compare);
+                    }
+                    if self.comparing {
+                        ui.add(egui::Spinner::new().color(theme::AMBER));
+                        ui.label(RichText::new("comparing…").color(theme::TAN).size(12.0));
+                    }
+                });
+            },
+        );
+
+        if self.diff_rows.is_empty() {
+            return;
+        }
+        let refname = self.diff_ref.clone().unwrap_or_default();
+        crate::lcars::section_lcars(ui, &format!("OVERLAP VS '{refname}'"), theme::BLUE, |ui| {
+            use egui_extras::{Column, TableBuilder};
+            let head = |ui: &mut egui::Ui, text: &str| {
+                ui.label(RichText::new(text).color(theme::TEXT).size(12.0).strong());
+            };
+            TableBuilder::new(ui)
+                .striped(true)
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::remainder().at_least(120.0).clip(true))
+                .column(Column::exact(80.0))
+                .column(Column::exact(80.0))
+                .column(Column::exact(80.0))
+                .header(22.0, |mut h| {
+                    h.col(|ui| head(ui, "REPO"));
+                    h.col(|ui| head(ui, "UNIQUE"));
+                    h.col(|ui| head(ui, "SHARED"));
+                    h.col(|ui| head(ui, "MISSING"));
+                })
+                .body(|mut body| {
+                    for row in &self.diff_rows {
+                        body.row(22.0, |mut r| {
+                            r.col(|ui| {
+                                ui.add(egui::Label::new(&row.repo).truncate());
+                            });
+                            r.col(|ui| {
+                                ui.colored_label(theme::GREEN, row.unique.to_string());
+                            });
+                            r.col(|ui| {
+                                ui.colored_label(theme::TAN, row.shared.to_string());
+                            });
+                            r.col(|ui| {
+                                ui.colored_label(theme::RED, row.missing.to_string());
+                            });
+                        });
+                    }
+                });
+        });
+    }
+
     fn confirm_modal(&mut self, ui: &mut egui::Ui, prompt: &str, acts: &mut Vec<Act>) {
         egui::Modal::new(Id::new("sync-confirm")).show(&ui.ctx().clone(), |ui| {
             ui.set_width(420.0);
@@ -786,6 +942,20 @@ impl SyncView {
                     self.cancel.cancel();
                     Ok(())
                 }
+                Act::SetPane(pane) => {
+                    self.pane = pane;
+                    Ok(())
+                }
+                Act::PickDiffRef(repo) => {
+                    // Picking a new reference invalidates the old overview.
+                    self.diff_ref = Some(repo);
+                    self.diff_rows.clear();
+                    Ok(())
+                }
+                Act::Compare => {
+                    self.spawn_compare(store);
+                    Ok(())
+                }
             };
         match result {
             // Membership changed under us? Re-read, so the UI always shows
@@ -821,6 +991,22 @@ impl SyncView {
         std::thread::spawn(move || {
             let result = build_preview(&store, &name, &group);
             let _ = tx.send(Msg::Preview { result, confirm });
+        });
+    }
+
+    /// Diff every repo against the chosen reference on a worker thread — one
+    /// content scan per repo, so it runs off the UI thread.
+    fn spawn_compare(&mut self, store: &Arc<Store>) {
+        let Some(reference) = self.diff_ref.clone() else {
+            return;
+        };
+        let repos = self.repos.clone();
+        let store = Arc::clone(store);
+        let tx = self.tx.clone();
+        self.comparing = true;
+        std::thread::spawn(move || {
+            let result = diff_overview(&store, &reference, &repos).map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Compared(result));
         });
     }
 
@@ -992,9 +1178,22 @@ impl SyncView {
                     log::error!("sync group push: {e}");
                     self.error = Some(e);
                 }
+                Msg::Compared(result) => {
+                    self.comparing = false;
+                    match result {
+                        Ok(rows) => {
+                            self.diff_rows = rows;
+                            self.error = None;
+                        }
+                        Err(e) => {
+                            log::error!("repo compare: {e}");
+                            self.error = Some(e);
+                        }
+                    }
+                }
             }
         }
-        if got || self.running || self.previewing {
+        if got || self.running || self.previewing || self.comparing {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -1055,6 +1254,57 @@ mod ui_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!("worker thread did not settle");
+    }
+
+    /// The COMPARE pane diffs every repo against a chosen reference by content.
+    #[test]
+    fn compare_pane_diffs_repos_against_a_reference() {
+        let (tmp, store) = sample_store();
+        // PRIMARY holds one file; BACKUP1 shares it and has one of its own;
+        // BACKUP2 is empty.
+        std::fs::write(tmp.path().join("PRIMARY/shared.txt"), b"x").expect("write");
+        std::fs::write(tmp.path().join("BACKUP1/shared.txt"), b"x").expect("write");
+        std::fs::write(tmp.path().join("BACKUP1/own.txt"), b"y").expect("write");
+        for repo in ["PRIMARY", "BACKUP1", "BACKUP2"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .expect("scan");
+        }
+
+        let mut h = harness(Arc::clone(&store));
+        assert!(
+            h.query_by_label_contains("REPO SYNC").is_some(),
+            "the tab is now Repo Sync"
+        );
+
+        h.get_by_label("COMPARE").click(); // switch to the compare pane
+        h.run();
+        h.get_by_label("PRIMARY").click(); // pick the reference
+        h.run();
+        h.get_by_label("DIFF ALL").click(); // run the overview
+        for _ in 0..100 {
+            h.run();
+            if !h.state().comparing {
+                h.run();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let rows = &h.state().diff_rows;
+        assert!(
+            !rows.iter().any(|o| o.repo == "PRIMARY"),
+            "the reference is not compared against itself"
+        );
+        let b1 = rows.iter().find(|o| o.repo == "BACKUP1").expect("BACKUP1");
+        assert_eq!((b1.unique, b1.shared, b1.missing), (1, 1, 0));
+        let b2 = rows.iter().find(|o| o.repo == "BACKUP2").expect("BACKUP2");
+        assert_eq!((b2.unique, b2.shared, b2.missing), (0, 0, 1));
     }
 
     /// With no groups yet the tab explains itself and offers the NEW GROUP

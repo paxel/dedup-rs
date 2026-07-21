@@ -14,8 +14,64 @@
 //! Sinks are pushed in order and independently: one unreachable sink does not
 //! stop the others, and every sink's outcome is reported.
 
-use crate::diff::{DiffError, DiffRun, SyncDelete, SyncPlan, SyncStats, diff_sync, plan_sync};
+use crate::diff::{
+    DiffError, DiffItem, DiffRun, SyncDelete, SyncPlan, SyncStats, diff_print, diff_sync, plan_sync,
+};
 use crate::store::{Store, SyncGroup, SyncMode};
+
+/// One repository's content overlap with a reference repository, compared by
+/// content (paths ignored). Powers the Repo Sync tab's "diff every repo against
+/// one" overview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoOverview {
+    pub repo: String,
+    /// Content only this repo has (the reference lacks it).
+    pub unique: usize,
+    /// Content both this repo and the reference have.
+    pub shared: usize,
+    /// Reference content this repo lacks.
+    pub missing: usize,
+}
+
+/// Compare every repo in `repos` against `reference` by content; `reference`
+/// itself is skipped. A repo with many `unique` files holds a lot the reference
+/// lacks; many `missing` means it is behind the reference.
+pub fn diff_overview(
+    store: &Store,
+    reference: &str,
+    repos: &[String],
+) -> Result<Vec<RepoOverview>, DiffError> {
+    let mut out = Vec::new();
+    for repo in repos {
+        if repo == reference {
+            continue;
+        }
+        // Diffing the repo against the reference classifies the repo's own files:
+        // New = content the reference lacks (unique), Equal = shared.
+        let (mut unique, mut shared) = (0usize, 0usize);
+        for item in diff_print(store, repo, &[reference], None)? {
+            match item {
+                DiffItem::New { .. } => unique += 1,
+                DiffItem::Equal { .. } => shared += 1,
+                // The reference has this content but only as missing entries; not
+                // a "shared" hit and not what `missing` (below) measures.
+                DiffItem::DeletedInReference { .. } => {}
+            }
+        }
+        // Reference content the repo lacks is the *reverse* diff's New count.
+        let missing = diff_print(store, reference, &[repo.as_str()], None)?
+            .iter()
+            .filter(|i| matches!(i, DiffItem::New { .. }))
+            .count();
+        out.push(RepoOverview {
+            repo: repo.clone(),
+            unique,
+            shared,
+            missing,
+        });
+    }
+    Ok(out)
+}
 
 /// The delete policy a group's mode implies for each sink.
 fn delete_mode(mode: SyncMode) -> SyncDelete {

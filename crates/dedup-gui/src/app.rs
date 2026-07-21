@@ -1111,7 +1111,7 @@ impl DedupApp {
                                         ui,
                                         &mut self.tab,
                                         Tab::SyncGroups,
-                                        "SYNC GROUPS",
+                                        "REPO SYNC",
                                         theme::GREEN,
                                         self.tooltip_verbosity,
                                         "Keep a repository backed up to one or more remote copies",
@@ -2321,7 +2321,7 @@ impl DedupApp {
             Tab::Duplicates => "DUPLICATES",
             Tab::Transfer => "TRANSFER",
             Tab::Grooming => "GROOMING",
-            Tab::SyncGroups => "SYNC GROUPS",
+            Tab::SyncGroups => "REPO SYNC",
             Tab::Browse => "BROWSE",
         };
         let text = crate::help_content::help_text(self.tab);

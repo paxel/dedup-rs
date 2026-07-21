@@ -33,9 +33,10 @@
     `Store::sink_repo_names`. A previously-selected repo that becomes a sink is dropped on
     the next tab show (each view already validates its selection against its repo list).
     The Repositories and Sync Groups tabs still show all repos, since they manage groups.
-  - **Remaining slices:**
-    - group sync becomes repo sync where groups can be synced, but also ALL repos diffed
-      vs another (rename the Sync Groups tab, add an all-repos-vs-one diff mode).
+  - **Done (slice 4, final):** the tab is renamed **Repo Sync** with two panes — GROUPS
+    (unchanged group push) and COMPARE, a read-only overview that diffs every repo against a
+    chosen reference (unique / shared / missing content counts, via `sync_group::diff_overview`
+    off-thread). **A#3 is complete.**
 
 ## Unified lightbox & compare
 
