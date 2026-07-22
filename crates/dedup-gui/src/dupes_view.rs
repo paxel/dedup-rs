@@ -6717,4 +6717,102 @@ mod ui_tests {
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
+
+    /// Doc screenshot: two clips A/B compared with the shared frame scrubber, to
+    /// `docs/screenshots/video_compare.png`. Builds real clips with ffmpeg and
+    /// extracts their stills, so it needs ffmpeg on PATH. Run with `--ignored`.
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu + ffmpeg)"]
+    fn doc_screenshot_video_compare() {
+        let dir = tempfile::tempdir().unwrap();
+        dedup_core::thumbnail::set_cache_dir(dir.path().join("thumbs"));
+
+        // Two short, animated test-pattern clips (a near-duplicate feel), created
+        // with ffmpeg's lavfi sources.
+        let make = |rel: &str, src: &str| {
+            let out = dir.path().join(rel);
+            let status = std::process::Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    src,
+                    "-pix_fmt",
+                    "yuv420p",
+                    out.to_str().unwrap(),
+                ])
+                .status()
+                .expect("run ffmpeg");
+            assert!(status.success(), "ffmpeg failed to build {rel}");
+        };
+        make("clip0.mp4", "testsrc=duration=1:size=480x360:rate=8");
+        make("clip1.mp4", "testsrc2=duration=1:size=480x360:rate=8");
+
+        let mut group: DupeGroup = Vec::new();
+        for (i, rel) in ["clip0.mp4", "clip1.mp4"].iter().enumerate() {
+            let mut hash = [0u8; 32];
+            hash[0] = i as u8;
+            group.push(DupeFile {
+                repo: "r".into(),
+                repo_root: dir.path().to_string_lossy().into_owned(),
+                rel_path: rel.to_string(),
+                entry: dedup_core::store::FileEntry {
+                    size: 1000,
+                    hash,
+                    modified_ms: 0,
+                    missing: false,
+                    mime: Some("video/mp4".into()),
+                    img_fingerprint: None,
+                    video_hash: None,
+                    pdf_hash: None,
+                    audio: None,
+                    img_size: None,
+                    origin: None,
+                    exif: None,
+                },
+            });
+        }
+
+        let b_facts = FileFacts::from_entry(&group[1].entry, group[1].absolute_path());
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+        let mut lb = LightboxState::new(0, 0);
+        lb.compare = Some(CompareState::new(b_facts));
+        view.lightbox = Some(lb);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 760.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = (&tmp, &dir);
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        // Stills extract on worker threads (an ffmpeg call each), so step and wait
+        // until both panes and the filmstrip have filled in. A video view repaints
+        // continuously, so step frames rather than running to a settled state.
+        for _ in 0..120 {
+            harness.step();
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        harness.step();
+        let img = harness.render().expect("wgpu render failed");
+        let out = doc_screenshot_path("video_compare.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
 }

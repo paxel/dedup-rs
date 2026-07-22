@@ -92,6 +92,8 @@ the shown copy against the group's best copy, with a shared, resolution-independ
   (the compare candidate) while comparing.
 - **EXIT COMPARE** (or `C` again) returns to the single view.
 
+![Two clips in A/B compare with the shared frame scrubber](../screenshots/video_compare.png)
+
 Groups with nothing to show (duplicate PDFs, text, or other non-visual files) have no compare —
 `C` does nothing there.
 
