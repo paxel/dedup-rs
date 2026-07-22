@@ -147,6 +147,54 @@ fn lightbox_meta(file: &DupeFile) -> String {
     )
 }
 
+/// Draw a video filmstrip: `frames.len()` cells across `strip`, each showing a
+/// still (once extracted), the pinned (`scrub`) cell outlined amber and every
+/// cell a click target. Returns the clicked frame index, if any. Shared by the
+/// single-video view and the scrubbable video A/B compare so both read and drive
+/// the one `LightboxState::video_frame`.
+fn draw_filmstrip(
+    ui: &mut egui::Ui,
+    strip: egui::Rect,
+    frames: &[Option<egui::TextureHandle>],
+    scrub: usize,
+) -> Option<usize> {
+    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    let n = frames.len().max(1);
+    let cell_w = strip.width() / n as f32;
+    let mut clicked = None;
+    for (i, f) in frames.iter().enumerate() {
+        let cell = egui::Rect::from_min_size(
+            egui::pos2(strip.left() + i as f32 * cell_w + 1.0, strip.top()),
+            egui::vec2(cell_w - 2.0, strip.height()),
+        );
+        let cell_resp = ui
+            .allocate_rect(cell, egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if cell_resp.clicked() {
+            clicked = Some(i);
+        }
+        if let Some(t) = f {
+            let r = crate::lightbox::fit_rect(cell, t.size_vec2());
+            ui.painter_at(cell)
+                .image(t.id(), r, uv, egui::Color32::WHITE);
+        }
+        let (col, w) = if i == scrub {
+            (theme::AMBER, 2.0)
+        } else if cell_resp.hovered() {
+            (theme::TAN, 1.5)
+        } else {
+            (theme::HAIRLINE, 1.0)
+        };
+        ui.painter().rect_stroke(
+            cell,
+            0.0,
+            egui::Stroke::new(w, col),
+            egui::StrokeKind::Inside,
+        );
+    }
+    clicked
+}
+
 /// Deferred UI actions, applied after rendering to avoid double borrows.
 enum Act {
     ToggleInclude(usize),
@@ -1355,14 +1403,6 @@ impl DupesView {
         }
     }
 
-    /// Full-resolution texture for a file (thumbnail upscaled while decoding),
-    /// with the image's true pixel size (from the index, falling back to the
-    /// texture) so transforms stay stable across the thumb→full-res swap.
-    fn lightbox_texture(&mut self, file: &DupeFile) -> (Option<egui::TextureHandle>, egui::Vec2) {
-        let facts = FileFacts::from_entry(&file.entry, file.absolute_path());
-        crate::lightbox::full_texture(&facts, &mut self.full_res, &mut self.thumbs)
-    }
-
     /// Apply a rotate/flip `op` to the lightbox's current image, decoding the
     /// base pixels on first use, and refresh the live preview texture.
     fn edit_apply(&mut self, ctx: &egui::Context, hex: &str, path: &Path, op: Orient) {
@@ -1443,6 +1483,9 @@ impl DupesView {
         let (mut toggle_compare, mut toggle_flicker, mut swap) = (false, false, false);
         let (mut esc, mut space) = (false, false);
         let (mut edit_op, mut reset_edit, mut open_save) = (None::<Orient>, false, false);
+        // Deferred like the flags above: a filmstrip click in video compare sets
+        // the shared scrub frame after drawing (state is borrowed during draw).
+        let mut new_video_frame: Option<usize> = None;
         ctx.input(|i| {
             if i.key_pressed(egui::Key::Escape) {
                 esc = true;
@@ -1505,7 +1548,21 @@ impl DupesView {
         let a_key = key(&a);
         let a_markable = !self.repo_is_ro(&a.repo) || self.unlocked.contains(&a_key);
         let a_marked = self.marked.contains(&a_key);
-        let (a_tex, a_img) = self.lightbox_texture(&a);
+        let a_hex = hash_hex(&a.entry.hash);
+        let mime_is = |m: &str| a.entry.mime.as_deref().is_some_and(|x| x.starts_with(m));
+        let a_is_video = mime_is("video/");
+        let a_is_image = mime_is("image/");
+        // Shared video scrub frame: both compare panes read this one index, so
+        // scrubbing the filmstrip moves them together. Defaults to the middle still.
+        let scrub = state
+            .video_frame
+            .unwrap_or(VIDEO_STRIP / 2)
+            .min(VIDEO_STRIP - 1);
+        // A's texture via the shared previewable resolver: a video resolves the
+        // frame at the shared `scrub` index (so compare is scrubbable in sync),
+        // an image its full-res decode, audio its spectrogram.
+        let a_facts = FileFacts::from_entry(&a.entry, a.absolute_path());
+        let (a_tex, a_img) = self.previewable_texture(ctx, &a_facts, a_is_video.then_some(scrub));
         let a_meta = lightbox_meta(&a);
 
         // The B file (compare target), if comparing. B is a viewer-agnostic
@@ -1523,7 +1580,9 @@ impl DupesView {
             let b_key = key(b);
             let b_markable = !self.repo_is_ro(&b.repo) || self.unlocked.contains(&b_key);
             let b_marked = self.marked.contains(&b_key);
-            let (b_tex, b_img) = self.lightbox_texture(b);
+            let b_facts = FileFacts::from_entry(&b.entry, b.absolute_path());
+            let (b_tex, b_img) =
+                self.previewable_texture(ctx, &b_facts, a_is_video.then_some(scrub));
             (b.clone(), b_key, b_markable, b_marked, b_tex, b_img)
         });
 
@@ -1574,23 +1633,8 @@ impl DupesView {
         let strip_h = if state.compare.is_some() { 74.0 } else { 50.0 };
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
 
-        // Video preview: a scrubbable filmstrip instead of a zoomable image.
-        // Frames are extracted lazily by the thumb pool and fill in as they
-        // land; the frame under the cursor's x fraction is shown enlarged.
-        let a_is_video = a
-            .entry
-            .mime
-            .as_deref()
-            .is_some_and(|m| m.starts_with("video/"));
-
         // Rotate/flip editing applies only to a single, non-video image. Drop a
         // stale edit (and any open save modal) when we navigate to another image.
-        let a_hex = hash_hex(&a.entry.hash);
-        let a_is_image = a
-            .entry
-            .mime
-            .as_deref()
-            .is_some_and(|m| m.starts_with("image/"));
         if self.edit.as_ref().is_some_and(|e| e.hex != a_hex) {
             self.edit = None;
             self.edit_save = false;
@@ -1633,6 +1677,17 @@ impl DupesView {
         let video_pending = video
             .as_ref()
             .is_some_and(|(_, _, _, b, f)| b.is_none() || f.iter().any(Option::is_none));
+
+        // Video A/B compare gets a shared scrubber: precompute A's filmstrip
+        // frames (B follows at the same index), extracted off-thread like the
+        // single view. Only A's strip is needed — B renders only the current frame.
+        let cmp_frames: Option<Vec<Option<egui::TextureHandle>>> =
+            (a_is_video && state.compare.is_some()).then(|| {
+                let srca = a.absolute_path();
+                (0..VIDEO_STRIP)
+                    .map(|i| self.thumbs.get_video(&a_hex, &srca, i, VIDEO_STRIP))
+                    .collect()
+            });
 
         egui::Area::new(Id::new("lightbox"))
             .order(egui::Order::Foreground)
@@ -1680,52 +1735,51 @@ impl DupesView {
                         egui::FontId::proportional(14.0),
                         theme::AMBER,
                     );
-                    // Filmstrip of stills; the pinned one is outlined. Each cell
-                    // is a click target that pins that frame in the big view.
-                    let n = frames.len().max(1);
-                    let cell_w = strip.width() / n as f32;
-                    for (i, f) in frames.iter().enumerate() {
-                        let cell = egui::Rect::from_min_size(
-                            egui::pos2(strip.left() + i as f32 * cell_w + 1.0, strip.top()),
-                            egui::vec2(cell_w - 2.0, strip.height()),
-                        );
-                        let cell_resp = ui
-                            .allocate_rect(cell, egui::Sense::click())
-                            .on_hover_cursor(egui::CursorIcon::PointingHand);
-                        if cell_resp.clicked() {
-                            state.video_frame = Some(i);
-                        }
-                        if let Some(t) = f {
-                            let r = fit(cell, t.size_vec2());
-                            ui.painter_at(cell).image(t.id(), r, uv, egui::Color32::WHITE);
-                        }
-                        let (col, w) = if i == *scrub {
-                            (theme::AMBER, 2.0)
-                        } else if cell_resp.hovered() {
-                            (theme::TAN, 1.5)
-                        } else {
-                            (theme::HAIRLINE, 1.0)
-                        };
-                        ui.painter().rect_stroke(
-                            cell,
-                            0.0,
-                            egui::Stroke::new(w, col),
-                            egui::StrokeKind::Inside,
-                        );
+                    // Filmstrip of stills; the pinned one is outlined. A click
+                    // pins that frame in the big view.
+                    if let Some(i) = draw_filmstrip(ui, *strip, frames, *scrub) {
+                        state.video_frame = Some(i);
                     }
                 } else if let Some(cmp) = state.compare.as_mut() {
-                    crate::lightbox::draw_compare(
-                        ui,
-                        cmp,
-                        viewport,
-                        (&a_tex, a_img),
-                        (&b_tex, b_img.unwrap_or(a_img)),
-                        crate::lightbox::ComparePointer {
-                            drag: bg.dragged().then(|| bg.drag_delta()),
-                            scroll,
-                            cursor,
-                        },
-                    );
+                    let pointer = crate::lightbox::ComparePointer {
+                        drag: bg.dragged().then(|| bg.drag_delta()),
+                        scroll,
+                        cursor,
+                    };
+                    if let Some(frames) = &cmp_frames {
+                        // Video A/B compare: the two panes on top, a shared
+                        // scrubber filmstrip below — a click moves both panes to
+                        // that frame (same time-fraction on the fixed grid).
+                        let strip_h = 92.0;
+                        let panes = egui::Rect::from_min_max(
+                            viewport.min,
+                            egui::pos2(viewport.max.x, viewport.max.y - strip_h - 6.0),
+                        );
+                        let strip = egui::Rect::from_min_max(
+                            egui::pos2(viewport.min.x, viewport.max.y - strip_h),
+                            viewport.max,
+                        );
+                        crate::lightbox::draw_compare(
+                            ui,
+                            cmp,
+                            panes,
+                            (&a_tex, a_img),
+                            (&b_tex, b_img.unwrap_or(a_img)),
+                            pointer,
+                        );
+                        if let Some(i) = draw_filmstrip(ui, strip, frames, scrub) {
+                            new_video_frame = Some(i);
+                        }
+                    } else {
+                        crate::lightbox::draw_compare(
+                            ui,
+                            cmp,
+                            viewport,
+                            (&a_tex, a_img),
+                            (&b_tex, b_img.unwrap_or(a_img)),
+                            pointer,
+                        );
+                    }
                 } else {
                     // Single image: wheel zoom around cursor, drag pan.
                     if bg.dragged() {
@@ -2053,18 +2107,18 @@ impl DupesView {
                             ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
                         } else {
                             ui.label(RichText::new(&a_meta).color(theme::TEXT).size(13.0));
+                            let (l, r) = (icon::CARET_LEFT, icon::CARET_RIGHT);
                             let hint = if a_is_video {
                                 format!(
-                                    "click a still to view · {}/{} copy · Del/K mark · Esc close",
-                                    icon::CARET_LEFT,
-                                    icon::CARET_RIGHT,
+                                    "click a still to view · {l}/{r} copy · Del/K mark · C compare · Esc close"
+                                )
+                            } else if a_is_image {
+                                format!(
+                                    "wheel: zoom · drag: pan · F fit · 1 100% · {l}/{r} step · Del/K mark · C compare · Esc close"
                                 )
                             } else {
-                                format!(
-                                    "wheel: zoom · drag: pan · F fit · 1 100% · {}/{} step · Del/K mark · C compare · Esc close",
-                                    icon::CARET_LEFT,
-                                    icon::CARET_RIGHT,
-                                )
+                                // No visual to zoom or compare — offer only what works.
+                                format!("{l}/{r} copy · Del/K mark · Esc close")
                             };
                             ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
                         }
@@ -2079,11 +2133,17 @@ impl DupesView {
         if do_one {
             state.one_to_one();
         }
+        if let Some(f) = new_video_frame {
+            state.video_frame = Some(f);
+        }
         if toggle_compare {
             if state.compare.is_some() {
                 state.compare = None;
                 state.reset_view();
-            } else if count >= 2 {
+            } else if count >= 2 && (a_is_image || a_is_video) {
+                // Compare needs a visual on both sides; in a dup group B is the
+                // same type as A, so A's kind decides. A non-previewable group
+                // (duplicate PDFs / text) has nothing to compare, so C is inert.
                 let b_idx = if idx == 0 { 1 } else { 0 };
                 let b_facts =
                     FileFacts::from_entry(&group[b_idx].entry, group[b_idx].absolute_path());
@@ -2237,18 +2297,31 @@ impl DupesView {
     }
 
     /// The viewer-agnostic texture for any *previewable* file, dispatched by
-    /// kind: an image or video still via [`crate::lightbox::full_texture`], an
-    /// audio file via its spectrogram (`waves` → [`Self::spec_texture`]), and
-    /// text / binary via `None`. This is the "previewable" abstraction the
-    /// roadmap asks for — `draw_compare` (and slice-4 cross-type compare) consume
-    /// its `(texture, pixel-size)`, and it is what lets an audio file be compared
-    /// against an image. `None` while an async decode is still in flight.
+    /// kind: a **video** frame via `thumbs.get_video` (the `video_frame` index on
+    /// the fixed `VIDEO_STRIP` grid, defaulting to the middle — this is what lets
+    /// two clips be scrubbed in sync), an **image** via
+    /// [`crate::lightbox::full_texture`], an **audio** file via its spectrogram
+    /// (`waves` → [`Self::spec_texture`]), and text / binary via `None`. This is
+    /// the "previewable" abstraction the roadmap asks for — `draw_compare`
+    /// consumes its `(texture, pixel-size)`, so any two visual sides compare.
+    /// `None` while an async decode/extraction is still in flight.
     fn previewable_texture(
         &mut self,
         ctx: &egui::Context,
         facts: &FileFacts,
+        video_frame: Option<usize>,
     ) -> (Option<egui::TextureHandle>, egui::Vec2) {
-        if facts.is_image() || facts.is_video() {
+        if facts.is_video() {
+            let tex = self.thumbs.get_video(
+                &facts.hash_hex,
+                &facts.abs_path,
+                video_frame.unwrap_or(VIDEO_STRIP / 2),
+                VIDEO_STRIP,
+            );
+            let size = tex.as_ref().map_or(egui::vec2(1.0, 1.0), |t| t.size_vec2());
+            return (tex, size);
+        }
+        if facts.is_image() {
             return crate::lightbox::full_texture(facts, &mut self.full_res, &mut self.thumbs);
         }
         if facts.is_audio()
@@ -2306,15 +2379,23 @@ impl DupesView {
         // the shared previewable resolver so audio yields a texture the same way
         // images do — the seam slice 4's cross-type compare reuses.
         let a_tex = if spectrogram {
-            self.previewable_texture(ctx, &FileFacts::from_entry(&a.entry, a.absolute_path()))
-                .0
+            self.previewable_texture(
+                ctx,
+                &FileFacts::from_entry(&a.entry, a.absolute_path()),
+                None,
+            )
+            .0
         } else {
             None
         };
         let b_tex = match (spectrogram, b_file.as_ref()) {
             (true, Some(f)) => {
-                self.previewable_texture(ctx, &FileFacts::from_entry(&f.entry, f.absolute_path()))
-                    .0
+                self.previewable_texture(
+                    ctx,
+                    &FileFacts::from_entry(&f.entry, f.absolute_path()),
+                    None,
+                )
+                .0
             }
             _ => None,
         };
@@ -4549,7 +4630,7 @@ mod ui_tests {
 
         // A document has no visual to compare.
         assert!(
-            view.previewable_texture(&ctx, &base("text/plain"))
+            view.previewable_texture(&ctx, &base("text/plain"), None)
                 .0
                 .is_none(),
             "text/binary yields no texture"
@@ -4562,7 +4643,7 @@ mod ui_tests {
             img_size: Some((640, 480)),
             ..base("image/png")
         };
-        let (tex, size) = view.previewable_texture(&ctx, &img);
+        let (tex, size) = view.previewable_texture(&ctx, &img, None);
         assert!(tex.is_none(), "no texture until the decode lands");
         assert_eq!(
             size,
@@ -4570,15 +4651,25 @@ mod ui_tests {
             "image size comes from the index"
         );
 
-        // Audio is handled without panicking and fabricates no texture when there
-        // is no decoded viz (the fixture file has none). This does not, on its
-        // own, prove audio took the spectrogram arm — an absent-file audio and a
-        // document both fall through to the same empty result.
+        // Audio and video are handled without panicking and fabricate no texture
+        // when there is no decoded viz / extractable frame (the fixture files have
+        // none). This does not, on its own, prove they took their spectrogram /
+        // frame arm — an absent-file medium and a document both fall through to the
+        // same empty result. Which mime is audio/video is covered by
+        // `media_cell::tests::kind_helpers_classify_by_mime`; that the video arm
+        // routes to `get_video` (not image decode) is inspection-only — no headless
+        // fixture can extract a real frame to discriminate it.
         assert!(
-            view.previewable_texture(&ctx, &base("audio/mpeg"))
+            view.previewable_texture(&ctx, &base("audio/mpeg"), None)
                 .0
                 .is_none(),
             "audio without a decoded viz yields no texture"
+        );
+        assert!(
+            view.previewable_texture(&ctx, &base("video/mp4"), Some(0))
+                .0
+                .is_none(),
+            "video without an extractable frame yields no texture"
         );
     }
 
@@ -6252,6 +6343,86 @@ mod ui_tests {
         assert_eq!(
             cmp.b.abs_path, b_path,
             "B is the other member, carried as an abstract FileFacts source"
+        );
+    }
+
+    /// Compare entry is gated on the group having a visual: `C` on a **video**
+    /// dup group turns compare on (and the scrubbable video-compare branch lays
+    /// out — viewport split + filmstrip + `draw_compare` — without panicking),
+    /// while `C` on a non-visual group (duplicate PDFs) is inert. This is the
+    /// "if a side has no visual, compare disables itself" rule.
+    #[test]
+    fn video_group_compares_but_non_visual_group_does_not() {
+        use egui_kittest::Harness;
+
+        let typed = |i: u8, mime: &str| DupeFile {
+            repo: "r".into(),
+            repo_root: "/nonexistent-dedup-test".into(),
+            rel_path: format!("f{i}"),
+            entry: dedup_core::store::FileEntry {
+                size: 1000,
+                hash: {
+                    let mut h = [0u8; 32];
+                    h[0] = i;
+                    h
+                },
+                modified_ms: 0,
+                missing: false,
+                mime: Some(mime.to_string()),
+                img_fingerprint: None,
+                video_hash: None,
+                pdf_hash: None,
+                audio: None,
+                img_size: None,
+                origin: None,
+                exif: None,
+            },
+        };
+
+        // Open a group's lightbox, press C, run a frame (laying out whatever
+        // branch C selects), and report whether compare turned on.
+        let comparing_after_c = |group: DupeGroup| -> bool {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+            let mut view = DupesView::new();
+            view.repos_loaded = true;
+            view.results = Some(Results::Similar(vec![group]));
+            view.lightbox = Some(LightboxState::new(0, 0));
+            let mut init = false;
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(1000.0, 720.0))
+                .build_ui_state(
+                    move |ui, view: &mut DupesView| {
+                        if !init {
+                            crate::icon::install(ui.ctx());
+                            crate::theme::apply(ui.ctx());
+                            init = true;
+                        }
+                        let _ = &tmp;
+                        view.show(ui, &store, TooltipVerbosity::default());
+                    },
+                    view,
+                );
+            // A video view repaints continuously while frames extract, so step a
+            // fixed number of frames rather than running to a settled state.
+            harness.step();
+            harness.step();
+            harness.key_press(egui::Key::C);
+            harness.step();
+            harness.step();
+            harness.state().lightbox.as_ref().unwrap().compare.is_some()
+        };
+
+        let videos: DupeGroup = (0..2).map(|i| typed(i, "video/mp4")).collect();
+        assert!(
+            comparing_after_c(videos),
+            "C on a video dup group enters (scrubbable) compare"
+        );
+
+        let docs: DupeGroup = (0..2).map(|i| typed(i, "application/pdf")).collect();
+        assert!(
+            !comparing_after_c(docs),
+            "C on a non-visual dup group is inert — nothing to compare"
         );
     }
 

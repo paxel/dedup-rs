@@ -107,9 +107,32 @@ compare" decision, audio's own compare *rendering* is deliberately unchanged: th
 still stack vertically on a shared time axis, drawn full-width with the click-to-seek cursor and
 ID3 tag panels — `draw_compare`'s horizontal, letterbox-fit, zoom/pan geometry would degrade
 that, so audio was **not** routed through it. `waveform::wave_image()` (amplitude envelope → a
-texture) is unneeded under this decision and was not added. Still to do: slice 4 (video /
-cross-type image↔audio compare), which consumes `previewable_texture`. **The deferred review-pane per-row diff button is the immediate
-follow-on** (it opens this same DIFF compare surface from a review row).
+texture) is unneeded under this decision and was not added.
+
+**Done (slice 4, final — epic complete):** video dup groups now A/B compare, **scrubbable in
+sync**. `previewable_texture` gained a `video_frame: Option<usize>` param and a correct video arm
+(`thumbs.get_video` — the slice-3 doc wrongly routed video through image-only `full_texture`);
+the image lightbox's `a_tex`/`b_tex` resolve through it, a video at the shared `scrub` index. A
+shared filmstrip (extracted into `draw_filmstrip`, reused by the single-video view) sits below
+the two compare panes; clicking a still sets the one `LightboxState::video_frame`, so both sides
+move to the same fixed-grid fraction (not the same absolute timestamp when durations differ).
+Compare *entry* is gated on mime-previewability (`a_is_image || a_is_video`) — video turns on,
+non-visual dup groups (duplicate PDFs/text) turn off ("if a side has no visual, compare disables
+itself"), and the single-view hint drops zoom/compare for those. Per the user's "scrubbable in
+sync" choice (over the simpler single-frame option). Automated coverage is the compare-entry gate
++ the video-compare branch laying out without panic; actual frame *production* needs ffmpeg + a
+real file, so it is inspection + the manual step, not suite-verified — the scrubbable video
+compare has not itself been run (headless has no ffmpeg; the manual pass is its acceptance test).
+
+On "cross-type": the *resolver* (`previewable_texture`) is type-agnostic, so the machinery for
+comparing two different-typed visuals exists — but **no surface actually does it**. Dup groups
+are same-kind; DIFF (slice 2) uses its own decode and shows a placeholder for a non-visual side
+rather than comparing image-vs-spectrogram. So "epic complete" means the four unification slices
+landed and video A/B compare works — not that cross-type visual compare is a reachable feature
+(it has no caller). **The *Unified lightbox & compare* epic is complete** in that sense.
+
+**The deferred review-pane per-row diff button is the immediate follow-on** (it opens the
+slice-2 DIFF compare surface from a review row).
 
 ## Engineering backlog
 - **Per-sink main re-read.** `plan_group_sync`/`run_group_sync` re-open the main and

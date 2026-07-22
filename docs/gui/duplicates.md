@@ -76,17 +76,24 @@ OPEN (external app) path.
 
 ### A/B compare
 
-Press `C` (or the COMPARE button; images only, needs ≥2 copies in the group) to pit the shown
-copy against the group's best copy, with a shared, resolution-independent zoom/pan:
+Press `C` (needs ≥2 copies in the group, and a group with a visual — images or videos) to pit
+the shown copy against the group's best copy, with a shared, resolution-independent zoom/pan:
 
 - **SIDE BY SIDE** (default) — both panes at once, each labeled A/B.
 - **FLICKER** — one full-window pane; `space` swaps between A and B in place, the fastest way
   to spot compression artifacts.
+- **Videos compare scrubbed in sync**: a shared filmstrip sits below the two panes, and
+  clicking a still moves **both** sides to that frame — the same position on each clip's
+  ten-still grid (the same time-*fraction*, not the same absolute timestamp if their durations
+  differ) — so you can line up the same moment and spot a re-encode or crop.
 - The bottom metadata strip shows both files' size and dimensions, with the larger value
   highlighted.
 - **MARK A** / **MARK B** toggle either copy's deletion mark independently; `Del`/`K` marks B
   (the compare candidate) while comparing.
-- **EXIT COMPARE** (or `C` again) returns to the single-image view.
+- **EXIT COMPARE** (or `C` again) returns to the single view.
+
+Groups with nothing to show (duplicate PDFs, text, or other non-visual files) have no compare —
+`C` does nothing there.
 
 ## Audio preview
 
