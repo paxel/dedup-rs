@@ -1,5 +1,8 @@
 # dedup-rs — Improvement Roadmap
 
+> [!NOTE]
+> A detailed, refined TODO roadmap synthesizing all QA findings, bug fixes, UI tab overhauls, and engineering backlog items is available in [`ai/roadmap.md`](file:///home/axel/develop/dedup-rs/ai/roadmap.md).
+
 ## Remaining / deferred work
 
 - **Light theme toggle** (deferred by decision 2026-07-08): requires converting
@@ -19,24 +22,6 @@
   carry a thumbnail + size / dimensions / duration / mtime via the shared
   `media_cell` widget (also used by the Duplicate cards), so a new file type extends
   in one place.
-- sync repos. it seems the grouping of repos belongs to the first tab
-  - **Done (slice 1):** group management now lives on the Repositories-tab repo cards —
-    MAKE MAIN (repo → group), SINK INTO an existing group, per-group ADD REPO (clone of
-    the main at a new path), UPDATE ALL, UNGROUP, a per-group mode pill, collapsible
-    SINK(S), and SINK OUT. Reuses the existing per-group `SyncGroup` model + DUPLICATE flow.
-  - **Done (slice 2):** push mode is now **per sink** (`SyncGroup.mode` → `SyncSink { repo,
-    mode }`, with a version-2 registry migration that gives legacy groups' sinks the old
-    group mode). Each sink carries its own MIRROR/ADD ONLY pill on the Repositories tab and
-    the Sync Groups tab; the empty-main mirror guard now triggers when any sink mirrors.
-  - **Done (slice 3):** the operational tabs (Transfer, Grooming, Duplicates, Browse)
-    hide sinks from their repo pickers — only mains and ungrouped repos are offered, via
-    `Store::sink_repo_names`. A previously-selected repo that becomes a sink is dropped on
-    the next tab show (each view already validates its selection against its repo list).
-    The Repositories and Sync Groups tabs still show all repos, since they manage groups.
-  - **Done (slice 4, final):** the tab is renamed **Repo Sync** with two panes — GROUPS
-    (unchanged group push) and COMPARE, a read-only overview that diffs every repo against a
-    chosen reference (unique / shared / missing content counts, via `sync_group::diff_overview`
-    off-thread). **A#3 is complete.**
 
 ## Unified lightbox & compare
 
@@ -72,57 +57,6 @@ Work:
 Sequence: (1) previewable abstraction + generalise `CompareState`; (2) route DIFF, delete
 `diff_inspect`; (3) fold in audio; (4) enable video/cross-type compare.
 
-**Done (slice 1):** `lightbox::full_texture(&FileFacts, …)` is the viewer-agnostic
-texture resolver (generalising `dupes_view::lightbox_texture`), and `CompareState.other:
-usize` is now `CompareState.b: FileFacts` — the abstract B *rendering* source. The
-Duplicate image + audio lightboxes resolve B's texture from those facts and re-find B's
-group member (for this tab's mark actions) by on-disk path; when a later slice points B
-outside the group, no member matches and the caller supplies the actions. Behaviour is
-unchanged.
-
-**Done (slice 2):** DIFF COMPARE (the Transfer tab's BY PATH conflict inspector) now renders
-through the shared `lightbox::draw_compare` + `CompareState` primitives — the same
-zoom/pan/flicker the Duplicate lightbox has — instead of its own hand-rolled two-pane preview.
-`diff_inspect.rs` is **deleted**. The DIFF caller (`transfer_view::DiffCompare`) keeps its own
-off-thread decode (which handles **both** images and video stills, so no video regression — it
-does *not* route through the image-only `full_texture`), holds the two sides as
-`FileFacts` + `repo`/`rel_path` (action identity), and maps CLOSE/OVERWRITE/DELETE onto the
-same `BoardAction`s the row offers. Flicker/zoom compare turns on only once *both* sides
-have actually decoded a texture; a side that yields none — a non-previewable type, or a
-decode that came back empty (e.g. video with no ffmpeg) — settles to a "no preview" note and
-keeps compare disabled ("if a side has no visual, compare disables itself"), so a failed
-decode never spins "decoding…" forever. Still to do: slice 3 (fold in `audio_lightbox`) and
-slice 4 (video / cross-type compare).
-
-**Done (slice 3):** audio is now a texture-yielding *previewable*. A single resolver,
-`dupes_view::previewable_texture(&FileFacts)`, dispatches by kind — image/video via
-`lightbox::full_texture`, audio via its spectrogram (`waves` → `spec_texture`), text/binary →
-`None` — and the audio lightbox builds its spectrogram texture through it, so an audio file
-yields a `(texture, size)` the same way an image does. (That audio→texture production is
-verified by code inspection + the unchanged `spec_texture`/`spec_image` path and the manual run
-step, not by the suite: no headless fixture supplies a decodable audio file, so the resolver's
-audio arm has no automated production test — only its dispatch is unit-tested, and the
-image-size assertion is the one that discriminates.) Per the user's "texture-enable, keep
-compare" decision, audio's own compare *rendering* is deliberately unchanged: the two waveforms
-still stack vertically on a shared time axis, drawn full-width with the click-to-seek cursor and
-ID3 tag panels — `draw_compare`'s horizontal, letterbox-fit, zoom/pan geometry would degrade
-that, so audio was **not** routed through it. `waveform::wave_image()` (amplitude envelope → a
-texture) is unneeded under this decision and was not added.
-
-**Done (slice 4, final — epic complete):** video dup groups now A/B compare, **scrubbable in
-sync**. `previewable_texture` gained a `video_frame: Option<usize>` param and a correct video arm
-(`thumbs.get_video` — the slice-3 doc wrongly routed video through image-only `full_texture`);
-the image lightbox's `a_tex`/`b_tex` resolve through it, a video at the shared `scrub` index. A
-shared filmstrip (extracted into `draw_filmstrip`, reused by the single-video view) sits below
-the two compare panes; clicking a still sets the one `LightboxState::video_frame`, so both sides
-move to the same fixed-grid fraction (not the same absolute timestamp when durations differ).
-Compare *entry* is gated on mime-previewability (`a_is_image || a_is_video`) — video turns on,
-non-visual dup groups (duplicate PDFs/text) turn off ("if a side has no visual, compare disables
-itself"), and the single-view hint drops zoom/compare for those. Per the user's "scrubbable in
-sync" choice (over the simpler single-frame option). Automated coverage is the compare-entry gate
-+ the video-compare branch laying out without panic; actual frame *production* needs ffmpeg + a
-real file, so it is inspection + the manual step, not suite-verified — the scrubbable video
-compare has not itself been run (headless has no ffmpeg; the manual pass is its acceptance test).
 
 On "cross-type": the *resolver* (`previewable_texture`) is type-agnostic, so the machinery for
 comparing two different-typed visuals exists — but **no surface actually does it**. Dup groups
@@ -150,6 +84,89 @@ slice-2 DIFF compare surface from a review row).
   some marks everything missing (a legitimate emptying must still propagate). If the index
   loss proves annoying, add a confirmation (GUI) / `--force` (CLI) before a scan may mark
   *every* entry missing.
+- Some clarifications. What I thought of how comparing lightbox should work:
+  - We define a series of interfaces that the lightbox display can call on a instance
+  - eg
+    - get image representation (including interface for saving changes, which might or might not be allowed for this kind of media)
+    - get audio representation
+    - get meta data representation (e.g. idv3 including the saving changes)
+    - get mark interface to read and set the mark status
+    - get the dedup data, aka, last modified, mime, current repo, path
+    - get textual representation
+    - get video representation
+  - when two files are lightboxed, the top tab shows the available represntations of at least 1 of A and B
+  - when selected only the sides that have a represntation are shown, and can be compared against each other. ALL are shown left and right. no top and bottom
+  - when both sides exist a compare button is presented that goes in the comparison mode where audio can be played gapless on change, curves can be overlayed and spectograms are shown, or for images the zoom, and rotate and such
+  - we might introduce and improve the comparisons later and adapt the interface
+  - so the first step of comparison, the one with the tab on top should always be the intro to comparison. and it should be very light, it basically should only ask the file representation for its dedup/compare features and paint them. and offer selection for the two columns in case of more than three files. the comparable data is handed off to the compare fw, and if modification is allowed the modified data is handed back to the file to save it. with the "overwrite or create new" solved already. the file defines if overwrite is possible and if create new is possible, if neither no safe or save as is offered in the ui.
+  - for every feature that we current offer we might need to invent a interface on the data representation.
+- the repo sync page:
+  - no group generation exists here. you only can select left and right repo and then compare them. and for that we show the compare pane that is currently in transfer. and this compare pane shuld look like in the dedup review, including the compare button for 2 files with same path but different hash
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 ## Recognition & extensibility  *(far future)*
 - Face recognition and object recognition for photos/images.
