@@ -15,7 +15,7 @@ use crate::theme;
 use crate::thumbs::ThumbCache;
 use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
-use egui::{ColorImage, Context, Rect, TextureHandle, TextureOptions, Vec2};
+use egui::{ColorImage, Context, Rect, RichText, TextureHandle, TextureOptions, Vec2};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -28,6 +28,408 @@ const FULL_CACHE_CAP: usize = 3;
 
 const MIN_SCALE: f32 = 0.02;
 const MAX_SCALE: f32 = 32.0;
+
+/// Classification of file representation tabs available in the Lightbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum RepresentationKind {
+    Overview,
+    Metadata,
+    Image,
+    Audio,
+    Video,
+    Text,
+}
+
+impl RepresentationKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Metadata => "Metadata",
+            Self::Image => "Image",
+            Self::Audio => "Audio",
+            Self::Video => "Video",
+            Self::Text => "Text",
+        }
+    }
+
+    pub fn icon(&self) -> &'static str {
+        match self {
+            Self::Overview => icon::STAR,
+            Self::Metadata => icon::PENCIL,
+            Self::Image => icon::IMAGE,
+            Self::Audio => icon::LIGHTNING,
+            Self::Video => icon::IMAGE,
+            Self::Text => icon::SEARCH,
+        }
+    }
+}
+
+/// Base deduplication metadata representation of a file instance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DedupDataRepresentation {
+    pub rel_path: String,
+    pub repo_name: String,
+    pub size: u64,
+    pub modified_ms: i64,
+    pub mime: Option<String>,
+    pub read_only: bool,
+    pub hash_hex: String,
+    pub abs_path: PathBuf,
+}
+
+/// Image media representation facts and capability flags.
+#[derive(Clone)]
+pub struct ImageRepresentation {
+    pub dimensions: Option<(u32, u32)>,
+    pub texture: Option<TextureHandle>,
+    pub supports_flicker: bool,
+    pub can_rotate: bool,
+    pub can_crop: bool,
+    pub can_save: bool,
+}
+
+impl std::fmt::Debug for ImageRepresentation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageRepresentation")
+            .field("dimensions", &self.dimensions)
+            .field("has_texture", &self.texture.is_some())
+            .field("supports_flicker", &self.supports_flicker)
+            .field("can_rotate", &self.can_rotate)
+            .field("can_crop", &self.can_crop)
+            .field("can_save", &self.can_save)
+            .finish()
+    }
+}
+
+/// Audio media representation facts and capability flags.
+#[derive(Clone)]
+pub struct AudioRepresentation {
+    pub duration_ms: Option<u32>,
+    pub spectrogram_texture: Option<TextureHandle>,
+    pub is_playing: bool,
+    pub seek_position_ms: u32,
+    pub can_play: bool,
+}
+
+impl std::fmt::Debug for AudioRepresentation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudioRepresentation")
+            .field("duration_ms", &self.duration_ms)
+            .field("has_spectrogram", &self.spectrogram_texture.is_some())
+            .field("is_playing", &self.is_playing)
+            .field("seek_position_ms", &self.seek_position_ms)
+            .field("can_play", &self.can_play)
+            .finish()
+    }
+}
+
+/// Metadata (ID3/EXIF) representation facts and edit capabilities.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MetadataRepresentation {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub year: Option<u32>,
+    pub track: Option<u32>,
+    pub comment: Option<String>,
+    pub can_save: bool,
+}
+
+/// Video media representation facts and capability flags.
+#[derive(Clone)]
+pub struct VideoRepresentation {
+    pub duration_ms: Option<u32>,
+    pub dimensions: Option<(u32, u32)>,
+    pub filmstrip_textures: Vec<TextureHandle>,
+    pub selected_frame: Option<usize>,
+    pub is_playing: bool,
+}
+
+impl std::fmt::Debug for VideoRepresentation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VideoRepresentation")
+            .field("duration_ms", &self.duration_ms)
+            .field("dimensions", &self.dimensions)
+            .field("filmstrip_count", &self.filmstrip_textures.len())
+            .field("selected_frame", &self.selected_frame)
+            .field("is_playing", &self.is_playing)
+            .finish()
+    }
+}
+
+/// Text or raw binary preview representation facts.
+#[derive(Clone, Debug)]
+pub struct TextBinaryRepresentation {
+    pub text_preview: Option<String>,
+    pub hex_dump: Option<String>,
+    pub is_text: bool,
+}
+
+/// Deletion mark state for a file in a duplicate group or comparison.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkState {
+    Unmarked,
+    Delete,
+    DeleteA,
+    DeleteB,
+    Protected,
+}
+
+impl MarkState {
+    pub fn is_protected(&self) -> bool {
+        matches!(self, Self::Protected)
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Unmarked => "UNMARKED",
+            Self::Delete => "DELETE",
+            Self::DeleteA => "DELETE A",
+            Self::DeleteB => "DELETE B",
+            Self::Protected => "DELETE (Protected)",
+        }
+    }
+}
+
+/// Aggregated representations for a single file instance.
+#[derive(Clone, Debug)]
+pub struct FileRepresentations {
+    pub dedup: DedupDataRepresentation,
+    pub image: Option<ImageRepresentation>,
+    pub audio: Option<AudioRepresentation>,
+    pub metadata: Option<MetadataRepresentation>,
+    pub video: Option<VideoRepresentation>,
+    pub text: Option<TextBinaryRepresentation>,
+    pub mark: MarkState,
+}
+
+impl FileRepresentations {
+    /// Construct representations from generic [`FileFacts`].
+    pub fn from_facts(
+        facts: &FileFacts,
+        repo_name: String,
+        read_only: bool,
+        mark: MarkState,
+    ) -> Self {
+        let is_img = facts.is_image();
+        let is_aud = facts.is_audio();
+        let is_vid = facts.is_video();
+        let can_write = !read_only;
+
+        let image = if is_img {
+            Some(ImageRepresentation {
+                dimensions: facts.img_size,
+                texture: None,
+                supports_flicker: true,
+                can_rotate: can_write,
+                can_crop: can_write,
+                can_save: can_write,
+            })
+        } else {
+            None
+        };
+
+        let audio = if is_aud {
+            Some(AudioRepresentation {
+                duration_ms: facts.audio_ms,
+                spectrogram_texture: None,
+                is_playing: false,
+                seek_position_ms: 0,
+                can_play: true,
+            })
+        } else {
+            None
+        };
+
+        let video = if is_vid {
+            Some(VideoRepresentation {
+                duration_ms: facts.audio_ms,
+                dimensions: facts.img_size,
+                filmstrip_textures: Vec::new(),
+                selected_frame: None,
+                is_playing: false,
+            })
+        } else {
+            None
+        };
+
+        let metadata = if is_aud || is_img {
+            Some(MetadataRepresentation {
+                title: None,
+                artist: None,
+                album: None,
+                year: None,
+                track: None,
+                comment: None,
+                can_save: can_write,
+            })
+        } else {
+            None
+        };
+
+        let text = if !is_img && !is_aud && !is_vid {
+            Some(TextBinaryRepresentation {
+                text_preview: None,
+                hex_dump: None,
+                is_text: true,
+            })
+        } else {
+            None
+        };
+
+        Self {
+            dedup: DedupDataRepresentation {
+                rel_path: facts
+                    .abs_path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                repo_name,
+                size: facts.size,
+                modified_ms: facts.modified_ms,
+                mime: facts.mime.clone(),
+                read_only,
+                hash_hex: facts.hash_hex.clone(),
+                abs_path: facts.abs_path.clone(),
+            },
+            image,
+            audio,
+            metadata,
+            video,
+            text,
+            mark,
+        }
+    }
+
+    /// List representation kinds supported by this file instance.
+    pub fn available_kinds(&self) -> Vec<RepresentationKind> {
+        let mut kinds = vec![RepresentationKind::Overview];
+        if self.metadata.is_some() {
+            kinds.push(RepresentationKind::Metadata);
+        }
+        if self.image.is_some() {
+            kinds.push(RepresentationKind::Image);
+        }
+        if self.audio.is_some() {
+            kinds.push(RepresentationKind::Audio);
+        }
+        if self.video.is_some() {
+            kinds.push(RepresentationKind::Video);
+        }
+        if self.text.is_some() {
+            kinds.push(RepresentationKind::Text);
+        }
+        kinds
+    }
+
+    pub fn mark_state(&self) -> MarkState {
+        self.mark
+    }
+
+    pub fn dedup_data(&self) -> &DedupDataRepresentation {
+        &self.dedup
+    }
+}
+
+/// Given total group members $N$ and the left file index `left_idx` ($0 \le \text{left\_idx} < N$),
+/// return the list of valid "other" member indices (length $N - 1$).
+pub fn other_member_indices(total_group_len: usize, left_idx: usize) -> Vec<usize> {
+    (0..total_group_len).filter(|&i| i != left_idx).collect()
+}
+
+/// Format the Right-side switcher label for `other_sel` index within `others` list.
+/// Returns `<current / total_others>` e.g. `<1 / 3>` for a 4-file group with 3 other files.
+pub fn format_other_switcher_label(other_sel: usize, total_others: usize) -> String {
+    if total_others == 0 {
+        "0/0".to_string()
+    } else {
+        let current = (other_sel % total_others) + 1;
+        format!("<{current} / {total_others}>")
+    }
+}
+
+/// Draw the top tab bar displaying representation tabs available across Left (A) and Right (B).
+pub fn draw_tab_bar(
+    ui: &mut egui::Ui,
+    state: &mut LightboxState,
+    left_reps: &FileRepresentations,
+    right_reps: &FileRepresentations,
+) {
+    let left_kinds = left_reps.available_kinds();
+    let right_kinds = right_reps.available_kinds();
+    let mut all_kinds = left_kinds;
+    for k in right_kinds {
+        if !all_kinds.contains(&k) {
+            all_kinds.push(k);
+        }
+    }
+    all_kinds.sort();
+
+    ui.horizontal(|ui| {
+        for kind in all_kinds {
+            let label = format!("{} {}", kind.icon(), kind.name());
+            let selected = state.active_tab == kind;
+            let fill = if selected { theme::AMBER } else { theme::PANEL };
+            let text_color = if selected { theme::BLACK } else { theme::TEXT };
+
+            if ui
+                .add(egui::Button::new(RichText::new(label).color(text_color)).fill(fill))
+                .clicked()
+            {
+                state.active_tab = kind;
+            }
+        }
+    });
+}
+
+/// Render the Overview tab side-by-side view for Left and Right [`FileRepresentations`].
+pub fn draw_overview_mode(
+    ui: &mut egui::Ui,
+    left_reps: &FileRepresentations,
+    right_reps: &FileRepresentations,
+    other_sel: usize,
+    total_others: usize,
+) -> Option<RepresentationKind> {
+    let mut switch_to_kind = None;
+    let (left_pane, right_pane) = compare_split(ui.available_rect_before_wrap());
+
+    // Left Column
+    ui.scope_builder(egui::UiBuilder::new().max_rect(left_pane), |ui| {
+        ui.heading(&left_reps.dedup_data().rel_path);
+        ui.label(format!("Repo: {}", left_reps.dedup_data().repo_name));
+        ui.label(format!("Size: {} bytes", left_reps.dedup_data().size));
+        ui.label(format!("Mark: {}", left_reps.mark_state().label()));
+    });
+
+    // Right Column
+    ui.scope_builder(egui::UiBuilder::new().max_rect(right_pane), |ui| {
+        ui.heading(&right_reps.dedup_data().rel_path);
+        ui.label(format!("Repo: {}", right_reps.dedup_data().repo_name));
+        ui.label(format!("Size: {} bytes", right_reps.dedup_data().size));
+        ui.label(format!("Mark: {}", right_reps.mark_state().label()));
+
+        if total_others > 0 {
+            ui.label(format_other_switcher_label(other_sel, total_others));
+        }
+    });
+
+    // If both Left and Right support a media representation (Image, Audio, etc.), render a Compare button
+    let common_kinds: Vec<RepresentationKind> = left_reps
+        .available_kinds()
+        .into_iter()
+        .filter(|k| *k != RepresentationKind::Overview && right_reps.available_kinds().contains(k))
+        .collect();
+
+    if let Some(&first_kind) = common_kinds.first()
+        && ui
+            .button(format!("Compare {}", first_kind.name()))
+            .clicked()
+    {
+        switch_to_kind = Some(first_kind);
+    }
+
+    switch_to_kind
+}
 
 /// A/B compare overlaid on the lightbox. `b` is the abstract B side — the
 /// *rendering source* it compares A against, as viewer-agnostic [`FileFacts`]
@@ -80,6 +482,7 @@ impl CompareState {
 pub struct LightboxState {
     pub group: usize,
     pub index: usize,
+    pub active_tab: RepresentationKind,
     scale: f32,
     pan: Vec2,
     fit: bool,
@@ -102,6 +505,7 @@ impl LightboxState {
         Self {
             group,
             index,
+            active_tab: RepresentationKind::Overview,
             scale: 1.0,
             pan: Vec2::ZERO,
             fit: true,
@@ -553,5 +957,50 @@ impl FullResCache {
             let old = self.order.remove(0);
             self.textures.remove(&old);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_other_member_indices() {
+        let others = other_member_indices(4, 2);
+        assert_eq!(others, vec![0, 1, 3]);
+        assert_eq!(others.len(), 3);
+
+        let label1 = format_other_switcher_label(0, others.len());
+        assert_eq!(label1, "<1 / 3>");
+
+        let label2 = format_other_switcher_label(2, others.len());
+        assert_eq!(label2, "<3 / 3>");
+    }
+
+    #[test]
+    fn test_file_representations_available_kinds() {
+        let facts = FileFacts {
+            size: 1024,
+            modified_ms: 1000,
+            mime: Some("image/png".to_string()),
+            img_size: Some((800, 600)),
+            audio_ms: None,
+            audio_seed: None,
+            hash_hex: "abcd".to_string(),
+            abs_path: PathBuf::from("/tmp/test.png"),
+            origin: None,
+        };
+
+        let reps = FileRepresentations::from_facts(
+            &facts,
+            "MainRepo".to_string(),
+            false,
+            MarkState::Unmarked,
+        );
+        let kinds = reps.available_kinds();
+        assert!(kinds.contains(&RepresentationKind::Overview));
+        assert!(kinds.contains(&RepresentationKind::Image));
+        assert!(kinds.contains(&RepresentationKind::Metadata));
+        assert!(!kinds.contains(&RepresentationKind::Audio));
     }
 }

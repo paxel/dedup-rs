@@ -4,7 +4,7 @@ This document serves as the master implementation specification for upcoming fea
 
 ---
 
-## 1. Lightbox Architecture: Data Representation Interfaces
+## 1. Lightbox Architecture: Data Representation Interfaces [COMPLETED]
 
 ### 1.1 Context & Problem Statement
 Currently, preview and comparison logic is fragmented across `dupes_view.rs`, `lightbox.rs`, and `transfer_view.rs`. Visual comparison, audio waveforms, spectrograms, and ID3 tag editing are handled through ad-hoc conditional branches. 
