@@ -63,7 +63,8 @@ Target Files: [`crates/dedup-gui/src/dupes_view.rs`](file:///home/axel/develop/d
 - [ ] **Play/Pause State Retention**: When clicking "Next MP3" or switching items in Lightbox, check the active `Player` state. If currently paused, keep paused. Do NOT auto-resume playback unless it was already playing.
 - [ ] **Switcher Freeze (> 2 Audio Files)**: Fix event handling lockup when flipping through audio files after pressing "Compare" in groups with > 2 files. Ensure channel signals and UI repaints do not block the main loop.
 - [ ] **ID3 Tag Sync Glitch**: Fix state indexing bug where ID3 tag modifications were applied to wrong file indices due to 1..4 iterating over a size-2 array.
-- [ ] **Audio Compare Mark Buttons**: Add `DELETE A` and `DELETE B` mark pills directly into the Audio comparison view header.
+- [ ] **Audio Compare Mark Buttons**: Add `DELETE A` and `DELETE B` mark pills directly into the Audio comparison view header. *(The stashed attempt was removed because it referenced image-lightbox bindings that don't exist in `audio_lightbox` and had no deferred-action channel there; re-add during the audio re-home with proper audio-scope mark bindings.)*
+- [ ] **Preserve the Gapless A/B Flip (regression watch)**: The stashed audio-nav rewrite (switching copies while comparing) replaced the **gapless** A/B swap — `Player::flip()` on a pre-loaded *paired* stream — with a plain `Player::play()` re-seek from disk, which reintroduces an audible gap/restart. The audio re-home MUST **restore the gapless paired-flip path** (keep both A and B loaded, flip the audible channel without re-decoding) rather than replay. Guarded by `dupes_view::ui_tests::audio_lightbox_opens_compares_plays_and_escapes`, which asserts `snap.paired` and the gap-free flip. This regression currently sits in the working tree (tests still pass, so it is a behaviour regression, not a test failure) and must be reconciled, not blessed.
 
 ---
 

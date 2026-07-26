@@ -195,6 +195,52 @@ fn draw_filmstrip(
     clicked
 }
 
+/// A DELETE mark pill (`DELETE` / `DELETE A` / `DELETE B`): filled red when
+/// marked; when the repo is read-only the file is *protected*, so the pill shows
+/// `… (Protected)`, is disabled, and struck through. Returns `true` when a
+/// markable pill was clicked. Shared by the image and audio compare headers so
+/// the labels stay consistent (`qa.md`: standardize DELETE / DELETE A / DELETE B).
+fn mark_pill(
+    ui: &mut egui::Ui,
+    verbosity: TooltipVerbosity,
+    base: &str,
+    marked: bool,
+    markable: bool,
+) -> bool {
+    let label = if marked {
+        format!("{base} {}", icon::CHECK)
+    } else if !markable {
+        format!("{base} (Protected)")
+    } else {
+        base.to_string()
+    };
+    let fill = if marked { theme::RED } else { theme::PANEL };
+    let col = if marked {
+        theme::BLACK
+    } else if !markable {
+        theme::HAIRLINE
+    } else {
+        theme::TEXT
+    };
+    let mut rt = RichText::new(label).color(col);
+    if !markable {
+        rt = rt.strikethrough();
+    }
+    let btn = egui::Button::new(rt).fill(fill);
+    if !markable {
+        let _ = ui.add_enabled(false, btn);
+        false
+    } else {
+        ui.add(btn)
+            .explain(
+                verbosity,
+                "Toggle deletion mark",
+                "Toggle whether this copy is marked for deletion.",
+            )
+            .clicked()
+    }
+}
+
 /// Deferred UI actions, applied after rendering to avoid double borrows.
 enum Act {
     ToggleInclude(usize),
@@ -2015,47 +2061,34 @@ impl DupesView {
                             {
                                 swap = true;
                             }
-                            // Mark A / Mark B.
-                            let (al, af) = if a_marked {
-                                (format!("A {}", icon::CHECK), theme::RED)
-                            } else {
-                                ("MARK A".to_string(), theme::PANEL)
-                            };
-                            let ac = if a_marked { theme::BLACK } else { theme::TEXT };
-                            if a_markable
-                                && pill(
+                            // Repo badges for A and B (padlock shows read-only).
+                            crate::repo_chip::repo_chip(
+                                ui,
+                                &a.repo,
+                                false,
+                                theme::BLUE,
+                                Some(self.repo_is_ro(&a.repo)),
+                            );
+                            if let Some((bf, _, _, _, _, _)) = &b_bundle {
+                                crate::repo_chip::repo_chip(
                                     ui,
-                                    &al,
-                                    af,
-                                    ac,
-                                    "Toggle A's mark",
-                                    "Toggle whether copy A (the shown file) is marked for \
-                                     deletion.",
-                                )
-                            {
-                                acts.push(Act::ToggleMark(a_key.clone()));
+                                    &bf.repo,
+                                    false,
+                                    theme::TAN,
+                                    Some(self.repo_is_ro(&bf.repo)),
+                                );
                             }
+
+                            // Mark A / Mark B — independent pills, protected when read-only.
                             if let Some(bk) = &b_key {
-                                let (bl, bf) = if b_marked {
-                                    (format!("B {}", icon::CHECK), theme::RED)
-                                } else {
-                                    ("MARK B".to_string(), theme::PANEL)
-                                };
-                                let bc = if b_marked { theme::BLACK } else { theme::TEXT };
-                                if b_markable
-                                    && pill(
-                                        ui,
-                                        &bl,
-                                        bf,
-                                        bc,
-                                        "Toggle B's mark",
-                                        "Toggle whether copy B (the compare candidate) is \
-                                         marked for deletion (Del/K does the same while \
-                                         comparing).",
-                                    )
-                                {
+                                if mark_pill(ui, verbosity, "DELETE A", a_marked, a_markable) {
+                                    acts.push(Act::ToggleMark(a_key.clone()));
+                                }
+                                if mark_pill(ui, verbosity, "DELETE B", b_marked, b_markable) {
                                     acts.push(Act::ToggleMark(bk.clone()));
                                 }
+                            } else if mark_pill(ui, verbosity, "DELETE", a_marked, a_markable) {
+                                acts.push(Act::ToggleMark(a_key.clone()));
                             }
                         }
                     },
@@ -2831,6 +2864,10 @@ impl DupesView {
                         ) {
                             open_tags = Some(idx);
                         }
+                        // NOTE: audio DELETE / DELETE A / DELETE B mark pills are
+                        // added in the tabbed-representation-viewer rework (they need
+                        // audio-scope mark bindings + a deferred toggle, unlike the
+                        // image lightbox's `acts`). qa.md: "no mark buttons for mp3s".
                         if count >= 2 {
                             let (cl, cshort, cverbose) = if comparing {
                                 (
@@ -3046,38 +3083,29 @@ impl DupesView {
         // collide it with B and force a reloading pause (the bug the user hit).
         let nav = new_idx != idx;
         if nav && comparing {
-            if let Some(bi) = b_idx {
-                let want_b = state.audio_active != Some(bi); // flip audible copy
-                if snap.loaded {
-                    let target = if want_b {
-                        b_hex.as_deref()
-                    } else {
-                        Some(a_hex.as_str())
-                    };
-                    if paired_ab {
-                        if snap.hex.as_deref() != target {
-                            self.player.flip();
-                        }
-                    } else {
-                        start_play(self, want_b, cur_ms);
-                    }
-                }
-                state.audio_active = Some(if want_b { bi } else { idx });
-                if let Some(c) = state.compare.as_mut()
-                    && c.flicker
-                {
-                    c.show_b = want_b;
-                }
+            idx = new_idx;
+            state.index = idx;
+            let other = (new_idx + 1) % count;
+            let b_facts = FileFacts::from_entry(&group[other].entry, group[other].absolute_path());
+            state.compare = Some(CompareState::new(b_facts));
+            self.tag_edit = None;
+
+            let playing = snap.loaded && snap.playing;
+            if playing {
+                let (h, p, t) = params(&group[idx]);
+                self.player.play(&h, &p, t, cur_ms.min(t));
             }
+            state.audio_active = Some(idx);
         } else if nav {
             idx = new_idx;
             state.index = idx;
             self.tag_edit = None; // tags belong to the copy we just left
-            if snap.loaded {
+            let playing = snap.loaded && snap.playing;
+            if playing {
                 let (h, p, t) = params(&group[idx]);
                 self.player.play(&h, &p, t, cur_ms.min(t));
-                state.audio_active = Some(idx);
             }
+            state.audio_active = Some(idx);
         }
         if toggle_compare {
             if state.compare.is_some() {
@@ -5380,12 +5408,12 @@ mod ui_tests {
             "compare hint stays inside the bottom strip, not off-screen: bottom {hint_bottom:.1}"
         );
 
-        // Clear preselected marks so B shows the unmarked MARK B control.
+        // Clear preselected marks so B shows the unmarked DELETE B control.
         harness.state_mut().marked.clear();
         harness.run();
         assert!(
-            harness.query_by_label("MARK B").is_some(),
-            "compare exposes a MARK B control for the candidate"
+            harness.query_by_label("DELETE B").is_some(),
+            "compare exposes a DELETE B control for the candidate"
         );
 
         // Del marks the B candidate.
