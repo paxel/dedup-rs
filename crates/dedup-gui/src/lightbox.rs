@@ -253,29 +253,13 @@ impl FileRepresentations {
             None
         };
 
-        let metadata = if is_aud || is_img {
-            Some(MetadataRepresentation {
-                title: None,
-                artist: None,
-                album: None,
-                year: None,
-                track: None,
-                comment: None,
-                can_save: can_write,
-            })
-        } else {
-            None
-        };
-
-        let text = if !is_img && !is_aud && !is_vid {
-            Some(TextBinaryRepresentation {
-                text_preview: None,
-                hex_dump: None,
-                is_text: true,
-            })
-        } else {
-            None
-        };
+        // Metadata (EXIF for images) and Text/hex-dump have no renderer yet — an
+        // `available_kinds()` tab with nothing behind it is worse than no tab, so
+        // don't advertise them. Audio's ID3 editing already exists (a TAGS
+        // popup), not yet as a Metadata tab; wire this up when that lands
+        // (tracked in `ai/roadmap.md` §1).
+        let metadata = None;
+        let text = None;
 
         Self {
             dedup: DedupDataRepresentation {
@@ -382,55 +366,6 @@ pub fn draw_tab_bar(
     });
 }
 
-/// Render the Overview tab side-by-side view for Left and Right [`FileRepresentations`].
-pub fn draw_overview_mode(
-    ui: &mut egui::Ui,
-    left_reps: &FileRepresentations,
-    right_reps: &FileRepresentations,
-    other_sel: usize,
-    total_others: usize,
-) -> Option<RepresentationKind> {
-    let mut switch_to_kind = None;
-    let (left_pane, right_pane) = compare_split(ui.available_rect_before_wrap());
-
-    // Left Column
-    ui.scope_builder(egui::UiBuilder::new().max_rect(left_pane), |ui| {
-        ui.heading(&left_reps.dedup_data().rel_path);
-        ui.label(format!("Repo: {}", left_reps.dedup_data().repo_name));
-        ui.label(format!("Size: {} bytes", left_reps.dedup_data().size));
-        ui.label(format!("Mark: {}", left_reps.mark_state().label()));
-    });
-
-    // Right Column
-    ui.scope_builder(egui::UiBuilder::new().max_rect(right_pane), |ui| {
-        ui.heading(&right_reps.dedup_data().rel_path);
-        ui.label(format!("Repo: {}", right_reps.dedup_data().repo_name));
-        ui.label(format!("Size: {} bytes", right_reps.dedup_data().size));
-        ui.label(format!("Mark: {}", right_reps.mark_state().label()));
-
-        if total_others > 0 {
-            ui.label(format_other_switcher_label(other_sel, total_others));
-        }
-    });
-
-    // If both Left and Right support a media representation (Image, Audio, etc.), render a Compare button
-    let common_kinds: Vec<RepresentationKind> = left_reps
-        .available_kinds()
-        .into_iter()
-        .filter(|k| *k != RepresentationKind::Overview && right_reps.available_kinds().contains(k))
-        .collect();
-
-    if let Some(&first_kind) = common_kinds.first()
-        && ui
-            .button(format!("Compare {}", first_kind.name()))
-            .clicked()
-    {
-        switch_to_kind = Some(first_kind);
-    }
-
-    switch_to_kind
-}
-
 /// A/B compare overlaid on the lightbox. `b` is the abstract B side — the
 /// *rendering source* it compares A against, as viewer-agnostic [`FileFacts`]
 /// (A is the lightbox's current `index`). Today the Duplicate lightbox points it
@@ -505,6 +440,10 @@ impl LightboxState {
         Self {
             group,
             index,
+            // Overview is the intro: a freshly-opened lightbox shows facts +
+            // repo + mark pill first, not native content straight away
+            // (improvements.md: "the tab on top should always be the intro to
+            // comparison").
             active_tab: RepresentationKind::Overview,
             scale: 1.0,
             pan: Vec2::ZERO,
@@ -1000,7 +939,9 @@ mod tests {
         let kinds = reps.available_kinds();
         assert!(kinds.contains(&RepresentationKind::Overview));
         assert!(kinds.contains(&RepresentationKind::Image));
-        assert!(kinds.contains(&RepresentationKind::Metadata));
         assert!(!kinds.contains(&RepresentationKind::Audio));
+        // Metadata (EXIF) has no renderer yet — a tab that opens to nothing is
+        // worse than no tab, so it must not be advertised until one exists.
+        assert!(!kinds.contains(&RepresentationKind::Metadata));
     }
 }

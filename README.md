@@ -23,9 +23,8 @@ at runtime and degrades gracefully when they are absent.
 
 - **Repositories** — register directories, scan and hash them on background threads, track per-repo stats.
 - **Duplicates** — find exact or perceptually-similar files across repos and delete the worse copies.
-- **Transfer / DIFF** — copy, move, sync or mirror content between repos, or reconcile two repos side by side.
+- **Transfer / DIFF** — copy, move, sync or mirror content between repos, reconcile two repos side by side, or push a backup group's main to its sinks (each ADD ONLY or MIRROR).
 - **Grooming** — dedupe, purge by filter, prune missing records, reorganize by path templates.
-- **Repo Sync** — keep a main repo backed up to one or more sinks (each ADD ONLY or MIRROR), and diff every repo against a chosen reference.
 
 The same operations are available headless via `dedup <command>`.
 

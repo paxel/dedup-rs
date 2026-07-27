@@ -32,7 +32,6 @@ pub(crate) enum Tab {
     Duplicates,
     Transfer,
     Grooming,
-    SyncGroups,
     Browse,
 }
 
@@ -205,7 +204,6 @@ pub struct DedupApp {
     dupes: DupesView,
     transfer: TransferView,
     grooming: GroomingView,
-    sync_groups: crate::sync_view::SyncView,
     /// Sync groups as of the last reload: the Repositories list collapses a
     /// group's sinks under its main.
     groups: Vec<(String, dedup_core::store::SyncGroup)>,
@@ -251,7 +249,6 @@ impl DedupApp {
             dupes: DupesView::new(),
             transfer: TransferView::new(),
             grooming: GroomingView::new(),
-            sync_groups: crate::sync_view::SyncView::new(),
             groups: Vec::new(),
             expanded_mains: std::collections::HashSet::new(),
             browse: crate::browse_view::BrowseView::new(),
@@ -920,7 +917,6 @@ impl eframe::App for DedupApp {
                 Tab::Duplicates => self.dupes.sync_repos(&self.store),
                 Tab::Transfer => self.transfer.sync_repos(&self.store),
                 Tab::Grooming => self.grooming.sync_repos(&self.store),
-                Tab::SyncGroups => self.sync_groups.sync_repos(&self.store),
                 Tab::Browse => self.browse.sync_repos(&self.store),
             }
             self.synced_tab = Some(self.tab);
@@ -933,9 +929,6 @@ impl eframe::App for DedupApp {
                     .show(ui, &self.store, self.tooltip_verbosity, Some(frame))
             }
             Tab::Grooming => self.grooming.show(ui, &self.store, self.tooltip_verbosity),
-            Tab::SyncGroups => self
-                .sync_groups
-                .show(ui, &self.store, self.tooltip_verbosity),
             Tab::Browse => self.browse.show(ui, &self.store, self.tooltip_verbosity),
         });
         if self.show_settings {
@@ -1096,7 +1089,8 @@ impl DedupApp {
                                         "TRANSFER",
                                         theme::BLUE,
                                         self.tooltip_verbosity,
-                                        "Copy or move files between repositories by content",
+                                        "Copy, move, sync or push a backup group between \
+                                         repositories by content",
                                     );
                                     tab_button(
                                         ui,
@@ -1106,15 +1100,6 @@ impl DedupApp {
                                         theme::TAN,
                                         self.tooltip_verbosity,
                                         "Prune and reorganize repositories (coming soon)",
-                                    );
-                                    tab_button(
-                                        ui,
-                                        &mut self.tab,
-                                        Tab::SyncGroups,
-                                        "REPO SYNC",
-                                        theme::GREEN,
-                                        self.tooltip_verbosity,
-                                        "Keep a repository backed up to one or more remote copies",
                                     );
                                     tab_button(
                                         ui,
@@ -2321,7 +2306,6 @@ impl DedupApp {
             Tab::Duplicates => "DUPLICATES",
             Tab::Transfer => "TRANSFER",
             Tab::Grooming => "GROOMING",
-            Tab::SyncGroups => "REPO SYNC",
             Tab::Browse => "BROWSE",
         };
         let text = crate::help_content::help_text(self.tab);

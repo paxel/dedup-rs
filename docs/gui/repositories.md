@@ -60,8 +60,9 @@ whatever was already hashed committed to the index.
 ## Sync groups
 
 A **sync group** links one **main** repository to one or more **backup** repositories
-(**sinks**). Groups are managed right here on the repo cards (the [Repo Sync](sync-groups.md)
-tab drives the same underlying groups):
+(**sinks**). Groups are managed right here on the repo cards; pushing one is done from the
+[Files tab](files.md#group-sync)'s **GROUP SYNC** command, offered whenever the selected
+source is a group's main:
 
 - **MAKE MAIN** (on an ungrouped repo) — turn the repository into the main of a new group.
 - **SINK INTO ▾** (on an ungrouped repo, when a group exists) — add it to an existing group

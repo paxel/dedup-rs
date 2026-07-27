@@ -6,7 +6,10 @@ use crate::filter_ui::FilterBuilder;
 use crate::icon;
 use crate::id3tags::{self, Tags};
 use crate::imgedit::{self, Orient};
-use crate::lightbox::{CompareState, FullResCache, LightboxState};
+use crate::lightbox::{
+    CompareState, FileRepresentations, FullResCache, LightboxState, MarkState, RepresentationKind,
+    draw_tab_bar, format_other_switcher_label, other_member_indices,
+};
 use crate::media_cell::{FileFacts, MediaStyle, VIDEO_STRIP, fmt_ms, media_cell};
 use crate::player::Player;
 use crate::settings::TooltipVerbosity;
@@ -145,6 +148,98 @@ fn lightbox_meta(file: &DupeFile) -> String {
             .unwrap_or_else(|| "—".into()),
         format_mtime(file.entry.modified_ms),
     )
+}
+
+/// The default B when entering compare with no explicit choice: the group's
+/// other member when there are exactly two, else index 1 (or 0, if A is 1) —
+/// matching what `C` has always defaulted to. Shared by the image, audio, and
+/// Overview compare-entry points so the default stays one rule, not three.
+fn default_other_index(idx: usize) -> usize {
+    if idx == 0 { 1 } else { 0 }
+}
+
+/// Map a mark's (marked, markable) pair onto the Overview's descriptive
+/// [`MarkState`] (`DeleteA`/`DeleteB` are reserved for a future per-side-aware
+/// caller; today's Overview only needs the generic distinction).
+fn mark_state_for(marked: bool, markable: bool) -> MarkState {
+    if !markable {
+        MarkState::Protected
+    } else if marked {
+        MarkState::Delete
+    } else {
+        MarkState::Unmarked
+    }
+}
+
+/// The single non-Overview tab a file's native content lives under, used to
+/// jump straight there when the Overview screen starts a compare. Any
+/// non-Overview value works for `lightbox_modal`'s own dispatch (it decides
+/// audio vs. image/video from the file's mime, not from `active_tab`) — this
+/// only makes the tab bar highlight the right label.
+fn native_kind(file: &DupeFile) -> RepresentationKind {
+    let mime = file.entry.mime.as_deref();
+    if mime.is_some_and(dedup_core::fingerprint::is_audio_mime) {
+        RepresentationKind::Audio
+    } else if mime.is_some_and(|m| m.starts_with("video/")) {
+        RepresentationKind::Video
+    } else {
+        RepresentationKind::Image
+    }
+}
+
+/// One Overview column's content, bundled so [`draw_overview_column`] stays a
+/// handful of arguments.
+struct OverviewSide<'a> {
+    file: &'a DupeFile,
+    facts: &'a FileFacts,
+    accent: egui::Color32,
+    read_only: bool,
+    mark_label: &'a str,
+    marked: bool,
+    markable: bool,
+}
+
+/// One Overview column: repo badge (padlock when the repo is read-only),
+/// thumbnail, path, size/dims-or-duration/mtime, mime, and a mark pill.
+/// Returns `true` when the mark pill was clicked. A free function (not a
+/// closure) so both columns can call it without fighting the borrow checker
+/// over a shared `&mut ThumbCache`.
+fn draw_overview_column(
+    ui: &mut egui::Ui,
+    thumbs: &mut ThumbCache,
+    verbosity: TooltipVerbosity,
+    side: OverviewSide,
+) -> bool {
+    crate::repo_chip::repo_chip(
+        ui,
+        &side.file.repo,
+        false,
+        side.accent,
+        Some(side.read_only),
+    );
+    ui.add_space(4.0);
+    media_cell(ui, thumbs, side.facts, MediaStyle::card());
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(&side.file.rel_path)
+            .color(theme::TEXT)
+            .size(13.0),
+    );
+    ui.label(
+        RichText::new(format!(
+            "{} · {} · {}",
+            format_size(side.facts.size),
+            side.facts.dims_or_duration(),
+            format_mtime(side.facts.modified_ms),
+        ))
+        .color(theme::LILAC)
+        .size(11.0),
+    );
+    if let Some(mime) = &side.facts.mime {
+        ui.label(RichText::new(mime).color(theme::GREY).size(11.0));
+    }
+    ui.add_space(4.0);
+    mark_pill(ui, verbosity, side.mark_label, side.marked, side.markable)
 }
 
 /// Draw a video filmstrip: `frames.len()` cells across `strip`, each showing a
@@ -1484,6 +1579,236 @@ impl DupesView {
         }
     }
 
+    /// The Lightbox's `Overview` tab: a lightweight facts + mark + compare-entry
+    /// screen, reached via the tab bar (or `I`) from the native Image/Audio/Video
+    /// view. Shows A — and B, with a `<i / N>` cycler through every *other* group
+    /// member, while comparing — via a repo badge, thumbnail, and facts, so
+    /// "which files are being compared" is never in doubt (qa.md: "it is
+    /// completely unclear to me which files are chosen for comparison"; "you
+    /// should never see `<3/4>` in the selector"). Returns `true` when CLOSE/Esc
+    /// was pressed.
+    fn draw_lightbox_overview(
+        &mut self,
+        ctx: &egui::Context,
+        state: &mut LightboxState,
+        group: &DupeGroup,
+        idx: usize,
+        acts: &mut Vec<Act>,
+    ) -> bool {
+        let verbosity = self.verbosity;
+        let count = group.len();
+        let a = &group[idx];
+        let a_key = key(a);
+        let a_ro = self.repo_is_ro(&a.repo);
+        let a_markable = !a_ro || self.unlocked.contains(&a_key);
+        let a_marked = self.marked.contains(&a_key);
+        let a_facts = FileFacts::from_entry(&a.entry, a.absolute_path());
+        let a_reps = FileRepresentations::from_facts(
+            &a_facts,
+            a.repo.clone(),
+            a_ro,
+            mark_state_for(a_marked, a_markable),
+        );
+
+        // B — and everything about it, including every `self.*` fact — resolved
+        // once here, before the closure below. `self.repo_is_ro`/`self.marked`/
+        // `self.unlocked` are reads through `self`, which would otherwise
+        // conflict with the `&mut self.thumbs` the closure needs for the
+        // thumbnails; precomputing avoids overlapping borrows of `self`.
+        let others = other_member_indices(count, idx);
+        let b_pos = state
+            .compare
+            .as_ref()
+            .and_then(|c| group.iter().position(|f| f.absolute_path() == c.b.abs_path));
+        let other_sel = b_pos.and_then(|bp| others.iter().position(|&i| i == bp));
+        let b_info = b_pos.map(|bp| {
+            let bf = &group[bp];
+            let bk = key(bf);
+            let b_ro = self.repo_is_ro(&bf.repo);
+            let b_markable = !b_ro || self.unlocked.contains(&bk);
+            let b_marked = self.marked.contains(&bk);
+            let b_facts = FileFacts::from_entry(&bf.entry, bf.absolute_path());
+            let b_reps = FileRepresentations::from_facts(
+                &b_facts,
+                bf.repo.clone(),
+                b_ro,
+                mark_state_for(b_marked, b_markable),
+            );
+            (bf, bk, b_ro, b_markable, b_marked, b_facts, b_reps)
+        });
+
+        let mut close = false;
+        let mut enter_compare = false;
+        let mut exit_compare = false;
+        let mut toggle_a_mark = false;
+        let mut toggle_b_mark = false;
+        let mut cycle: Option<isize> = None; // -1 prev, +1 next among `others`
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::Escape) {
+                close = true;
+            }
+        });
+
+        egui::Area::new(Id::new("lightbox-overview"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                let screen = ctx.content_rect();
+                ui.allocate_rect(screen, egui::Sense::click());
+                ui.painter()
+                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(238));
+                let inner = screen.shrink(12.0);
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(inner)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                let ui = &mut child;
+
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(RichText::new(format!("{} CLOSE", icon::CHECK)).color(theme::BLACK))
+                        .explain(
+                            verbosity,
+                            "Close the lightbox",
+                            "Close the lightbox and return to the group list (Esc does the same).",
+                        )
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                    ui.add_space(8.0);
+                    let b_reps = b_info.as_ref().map(|(.., reps)| reps);
+                    draw_tab_bar(ui, state, &a_reps, b_reps.unwrap_or(&a_reps));
+                });
+                ui.add_space(6.0);
+
+                // Two independently-flowing top-down columns, sized and placed
+                // by `horizontal_top`'s own cursor (not an absolute rect), so
+                // it properly advances by the taller column's height and the
+                // controls drawn afterwards (COMPARE, or the cycler + EXIT
+                // COMPARE) land below both columns rather than racing them for
+                // the same row. Deliberately not `ui.columns`: that hardcodes
+                // `top_down_justified`, which stretches every child widget
+                // (including the thumbnail's hairline-stroked rect) to the
+                // full column width instead of its natural size.
+                let col_w = (ui.available_width() - 16.0) / 2.0;
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(col_w, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            let side = OverviewSide {
+                                file: a,
+                                facts: &a_facts,
+                                accent: theme::BLUE,
+                                read_only: a_ro,
+                                mark_label: if b_info.is_some() {
+                                    "DELETE A"
+                                } else {
+                                    "DELETE"
+                                },
+                                marked: a_marked,
+                                markable: a_markable,
+                            };
+                            if draw_overview_column(ui, &mut self.thumbs, verbosity, side) {
+                                toggle_a_mark = true;
+                            }
+                        },
+                    );
+                    ui.add_space(16.0);
+
+                    if let Some((bf, _, b_ro, b_markable, b_marked, b_facts, _)) = &b_info {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(col_w, 0.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                let side = OverviewSide {
+                                    file: bf,
+                                    facts: b_facts,
+                                    accent: theme::TAN,
+                                    read_only: *b_ro,
+                                    mark_label: "DELETE B",
+                                    marked: *b_marked,
+                                    markable: *b_markable,
+                                };
+                                if draw_overview_column(ui, &mut self.thumbs, verbosity, side) {
+                                    toggle_b_mark = true;
+                                }
+                            },
+                        );
+                    }
+                });
+                ui.add_space(8.0);
+
+                if b_info.is_some() {
+                    if others.len() > 1 {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(format!("{} PREV OTHER", icon::CARET_LEFT))
+                                .clicked()
+                            {
+                                cycle = Some(-1);
+                            }
+                            ui.label(
+                                RichText::new(format_other_switcher_label(
+                                    other_sel.unwrap_or(0),
+                                    others.len(),
+                                ))
+                                .color(theme::TAN),
+                            );
+                            if ui
+                                .button(format!("{} NEXT OTHER", icon::CARET_RIGHT))
+                                .clicked()
+                            {
+                                cycle = Some(1);
+                            }
+                        });
+                    }
+                    if ui.button("EXIT COMPARE").clicked() {
+                        exit_compare = true;
+                    }
+                } else {
+                    let previewable =
+                        a_facts.is_image() || a_facts.is_video() || a_facts.is_audio();
+                    if count >= 2 && previewable && ui.button("COMPARE").clicked() {
+                        enter_compare = true;
+                    }
+                }
+            });
+
+        if close {
+            return true;
+        }
+        if toggle_a_mark {
+            acts.push(Act::ToggleMark(a_key));
+        }
+        if toggle_b_mark && let Some((.., bk, _, _, _, _, _)) = &b_info {
+            acts.push(Act::ToggleMark(bk.clone()));
+        }
+        if exit_compare {
+            state.compare = None;
+        }
+        if enter_compare {
+            let b_idx = default_other_index(idx);
+            let b_facts = FileFacts::from_entry(&group[b_idx].entry, group[b_idx].absolute_path());
+            state.compare = Some(CompareState::new(b_facts));
+            // Jump straight to the native view so Compare is immediately visible.
+            state.active_tab = native_kind(a);
+        }
+        if let Some(dir) = cycle
+            && !others.is_empty()
+        {
+            let cur = other_sel.unwrap_or(0) as isize;
+            let n = others.len() as isize;
+            let next = ((cur + dir).rem_euclid(n)) as usize;
+            let bi = others[next];
+            let b_facts = FileFacts::from_entry(&group[bi].entry, group[bi].absolute_path());
+            state.compare = Some(CompareState::new(b_facts));
+        }
+        false
+    }
+
     /// Full-window image lightbox: wheel zoom (around cursor), drag pan, `F`
     /// fit / `1` 1:1, `←`/`→` step the group, `Del`/`K` toggle the mark, `C`
     /// A/B compare against the best copy (`space` enters flicker, then swaps
@@ -1509,6 +1834,17 @@ impl DupesView {
         let count = group.len();
         let mut idx = state.index.min(count - 1);
 
+        // The Overview tab intercepts before the audio/image dispatch: it's a
+        // lightweight facts/mark/compare-entry screen shared by every file kind,
+        // reached via the tab bar (or `I`) from either native view below.
+        if state.active_tab == RepresentationKind::Overview {
+            let closed = self.draw_lightbox_overview(ctx, &mut state, &group, idx, acts);
+            if !closed {
+                self.lightbox = Some(state);
+            }
+            return;
+        }
+
         // Audio files get a dedicated waveform lightbox, not the image viewer.
         if group[idx]
             .entry
@@ -1532,6 +1868,7 @@ impl DupesView {
         // Deferred like the flags above: a filmstrip click in video compare sets
         // the shared scrub frame after drawing (state is borrowed during draw).
         let mut new_video_frame: Option<usize> = None;
+        let mut switch_overview = false;
         ctx.input(|i| {
             if i.key_pressed(egui::Key::Escape) {
                 esc = true;
@@ -1556,6 +1893,9 @@ impl DupesView {
             }
             if i.key_pressed(egui::Key::Space) {
                 space = true;
+            }
+            if i.key_pressed(egui::Key::I) {
+                switch_overview = true;
             }
         });
         // Escape is a universal "back": it pops one view level instead of
@@ -1873,6 +2213,18 @@ impl DupesView {
                         }
                         if pill(
                             ui,
+                            "OVERVIEW",
+                            theme::PANEL,
+                            theme::TEXT,
+                            "Facts, repo, and mark",
+                            "Switch to the Overview tab: repo, size, dimensions, and the mark \
+                             control for the copy (and the compare candidate, if comparing) — \
+                             I does the same.",
+                        ) {
+                            switch_overview = true;
+                        }
+                        if pill(
+                            ui,
                             icon::CARET_LEFT,
                             theme::PANEL,
                             theme::TEXT,
@@ -2169,6 +2521,9 @@ impl DupesView {
         if let Some(f) = new_video_frame {
             state.video_frame = Some(f);
         }
+        if switch_overview {
+            state.active_tab = RepresentationKind::Overview;
+        }
         if toggle_compare {
             if state.compare.is_some() {
                 state.compare = None;
@@ -2177,7 +2532,7 @@ impl DupesView {
                 // Compare needs a visual on both sides; in a dup group B is the
                 // same type as A, so A's kind decides. A non-previewable group
                 // (duplicate PDFs / text) has nothing to compare, so C is inert.
-                let b_idx = if idx == 0 { 1 } else { 0 };
+                let b_idx = default_other_index(idx);
                 let b_facts =
                     FileFacts::from_entry(&group[b_idx].entry, group[b_idx].absolute_path());
                 state.compare = Some(CompareState::new(b_facts));
@@ -2457,6 +2812,7 @@ impl DupesView {
             (false, false, false, false);
         // Which copy's tag editor to open (its group index), if any.
         let mut open_tags: Option<usize> = None;
+        let mut switch_overview = false;
         ctx.input(|i| {
             if i.key_pressed(egui::Key::Escape) {
                 esc = true;
@@ -2481,6 +2837,9 @@ impl DupesView {
             }
             if i.key_pressed(egui::Key::C) {
                 toggle_compare = true;
+            }
+            if i.key_pressed(egui::Key::I) {
+                switch_overview = true;
             }
         });
 
@@ -2793,6 +3152,18 @@ impl DupesView {
                         }
                         if pill(
                             ui,
+                            "OVERVIEW",
+                            theme::PANEL,
+                            theme::TEXT,
+                            "Facts, repo, and mark",
+                            "Switch to the Overview tab: repo, size, duration, and the mark \
+                             control for the copy (and the compare candidate, if comparing) — \
+                             I does the same.",
+                        ) {
+                            switch_overview = true;
+                        }
+                        if pill(
+                            ui,
                             icon::CARET_LEFT,
                             theme::PANEL,
                             theme::TEXT,
@@ -3081,21 +3452,33 @@ impl DupesView {
         // compare, *flip which copy is audible* instead — gap-free via the loaded
         // pair — and move the cursor with it. Re-indexing A while comparing would
         // collide it with B and force a reloading pause (the bug the user hit).
+        // (B itself is fixed once compare is entered; cycling B through the other
+        // group members is a separate control on the Overview tab, not arrow-nav.)
         let nav = new_idx != idx;
         if nav && comparing {
-            idx = new_idx;
-            state.index = idx;
-            let other = (new_idx + 1) % count;
-            let b_facts = FileFacts::from_entry(&group[other].entry, group[other].absolute_path());
-            state.compare = Some(CompareState::new(b_facts));
-            self.tag_edit = None;
-
-            let playing = snap.loaded && snap.playing;
-            if playing {
-                let (h, p, t) = params(&group[idx]);
-                self.player.play(&h, &p, t, cur_ms.min(t));
+            if let Some(bi) = b_idx {
+                let want_b = state.audio_active != Some(bi); // flip audible copy
+                if snap.loaded {
+                    let target = if want_b {
+                        b_hex.as_deref()
+                    } else {
+                        Some(a_hex.as_str())
+                    };
+                    if paired_ab {
+                        if snap.hex.as_deref() != target {
+                            self.player.flip();
+                        }
+                    } else {
+                        start_play(self, want_b, cur_ms);
+                    }
+                }
+                state.audio_active = Some(if want_b { bi } else { idx });
+                if let Some(c) = state.compare.as_mut()
+                    && c.flicker
+                {
+                    c.show_b = want_b;
+                }
             }
-            state.audio_active = Some(idx);
         } else if nav {
             idx = new_idx;
             state.index = idx;
@@ -3107,11 +3490,14 @@ impl DupesView {
             }
             state.audio_active = Some(idx);
         }
+        if switch_overview {
+            state.active_tab = RepresentationKind::Overview;
+        }
         if toggle_compare {
             if state.compare.is_some() {
                 state.compare = None;
             } else if count >= 2 {
-                let other = if idx == 0 { 1 } else { 0 };
+                let other = default_other_index(idx);
                 let b_facts =
                     FileFacts::from_entry(&group[other].entry, group[other].absolute_path());
                 state.compare = Some(CompareState::new(b_facts));
@@ -4560,8 +4946,10 @@ mod ui_tests {
             );
         harness.run();
 
-        // Open the lightbox on the first (best) member.
-        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        // Open the lightbox on the first (best) member, native (image) view.
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Image;
+        harness.state_mut().lightbox = Some(lb);
         harness.run();
         assert!(
             harness.query_by_label("1 / 3").is_some(),
@@ -4864,7 +5252,9 @@ mod ui_tests {
                 view,
             );
         harness.run();
-        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Audio;
+        harness.state_mut().lightbox = Some(lb);
         harness.run();
 
         // The audio lightbox shows its own controls (CLOSE + COMPARE are unique
@@ -4920,6 +5310,43 @@ mod ui_tests {
         assert!(
             harness.state().player.snapshot().paired,
             "side-by-side compare keeps the A/B pair loaded"
+        );
+
+        // Regression guard: arrow keys while comparing flip which copy is
+        // audible — a gap-free `Player::flip()` on the already-loaded pair, not
+        // a reload. A prior rewrite replaced this with `state.compare =
+        // Some(CompareState::new(..))` + `player.play()` (a fresh decode/seek,
+        // audibly gapped) — assert the pair stays loaded and the swap is instant.
+        harness.key_press(egui::Key::ArrowRight);
+        harness.step();
+        harness.step();
+        let snap = harness.state().player.snapshot();
+        assert!(
+            snap.paired,
+            "→ while comparing keeps the loaded pair (no reload)"
+        );
+        assert_eq!(
+            snap.hex.as_deref(),
+            Some(b_hex.as_str()),
+            "→ flips the audible copy to B"
+        );
+        assert_eq!(
+            harness.state().lightbox.as_ref().unwrap().index,
+            0,
+            "arrow-nav while comparing does not renumber A"
+        );
+        harness.key_press(egui::Key::ArrowLeft);
+        harness.step();
+        harness.step();
+        let snap = harness.state().player.snapshot();
+        assert!(
+            snap.paired,
+            "← while comparing keeps the loaded pair (no reload)"
+        );
+        assert_eq!(
+            snap.hex.as_deref(),
+            Some(a_hex.as_str()),
+            "← flips the audible copy back to A"
         );
 
         harness.key_press(egui::Key::Space);
@@ -5061,7 +5488,9 @@ mod ui_tests {
                 view,
             );
         harness.run();
-        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Audio;
+        harness.state_mut().lightbox = Some(lb);
         harness.run();
 
         // T opens the editor, pre-filled from the file.
@@ -5128,7 +5557,9 @@ mod ui_tests {
                 view,
             );
         harness.run();
-        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Audio;
+        harness.state_mut().lightbox = Some(lb);
         harness.run();
 
         // Enter compare, then play → the synced pair loads (A audible).
@@ -5171,6 +5602,137 @@ mod ui_tests {
             harness.state().player.snapshot().hex.as_deref(),
             Some(a_hex.as_str()),
             "→ flips back to A"
+        );
+    }
+
+    /// A freshly-opened lightbox on an audio group defaults to Overview (no
+    /// native player controls yet); clicking the "Audio" tab switches to the
+    /// native audio view (PLAY control present). Regression coverage for the
+    /// Overview-first default flip: an audio group dispatches through a
+    /// *different* function (`audio_lightbox`, not `lightbox_modal`) once past
+    /// Overview, so the image-only round-trip test doesn't exercise this path.
+    #[test]
+    fn overview_audio_tab_switches_to_native_player() {
+        let group: DupeGroup = (0..2).map(audio_file).collect();
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        // `LightboxState::new` defaults to Overview.
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.run();
+        assert!(
+            harness.query_by_label("SPECTROGRAM").is_none(),
+            "a freshly-opened audio lightbox shows Overview, not native player controls"
+        );
+        assert!(
+            harness.query_all_by_label("DELETE").count() > 0,
+            "Overview shows a mark pill for the audio file"
+        );
+
+        harness.get_by_label_contains("Audio").click();
+        harness.run();
+        assert!(
+            harness.query_by_label("SPECTROGRAM").is_some(),
+            "clicking the native tab switches an audio group to the native player"
+        );
+    }
+
+    /// Regression coverage for entering compare *from Overview's COMPARE
+    /// button* specifically (as opposed to native `C`), since that is a
+    /// separate code path (`draw_lightbox_overview`'s `enter_compare` sets
+    /// `state.compare` directly, bypassing `audio_lightbox`'s own `toggle_compare`
+    /// branch) and the gapless-flip fix landed while testing only the `C` path.
+    /// Confirms the paired stream still loads and `→` still flips gap-free.
+    #[test]
+    fn overview_compare_button_enters_audio_compare_with_gapless_flip() {
+        let group: DupeGroup = (0..2).map(audio_file).collect();
+        let a_hex = hash_hex(&group[0].entry.hash);
+        let b_hex = hash_hex(&group[1].entry.hash);
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        harness.run();
+
+        // Enter compare via Overview's COMPARE button, not native `C`.
+        harness.get_by_label_contains("COMPARE").click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .lightbox
+                .as_ref()
+                .and_then(|lb| lb.compare.as_ref())
+                .is_some(),
+            "Overview's COMPARE button enters compare"
+        );
+        assert!(
+            harness.query_by_label("SPECTROGRAM").is_some(),
+            "COMPARE also jumps straight to the native audio view"
+        );
+
+        harness.key_press(egui::Key::P);
+        harness.step();
+        harness.step();
+        let snap = harness.state().player.snapshot();
+        assert!(
+            snap.paired,
+            "compare entered via Overview still loads the synced pair on play"
+        );
+        assert_eq!(snap.hex.as_deref(), Some(a_hex.as_str()), "A audible first");
+
+        harness.key_press(egui::Key::ArrowRight);
+        harness.step();
+        harness.step();
+        let snap = harness.state().player.snapshot();
+        assert_eq!(
+            snap.hex.as_deref(),
+            Some(b_hex.as_str()),
+            "→ flips audible to B"
+        );
+        assert!(
+            snap.paired,
+            "still paired — no reload, no gap, even via the Overview entry path"
         );
     }
 
@@ -5238,7 +5800,9 @@ mod ui_tests {
                 view,
             );
         harness.run();
-        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Audio;
+        harness.state_mut().lightbox = Some(lb);
         harness.run();
         harness.key_press(egui::Key::C);
         harness.run();
@@ -5324,7 +5888,9 @@ mod ui_tests {
                 view,
             );
         harness.run();
-        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Audio;
+        harness.state_mut().lightbox = Some(lb);
         harness.run();
         harness.key_press(egui::Key::T);
         harness.run();
@@ -5374,7 +5940,9 @@ mod ui_tests {
                 view,
             );
         harness.run();
-        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Image;
+        harness.state_mut().lightbox = Some(lb);
         harness.run();
 
         // Enter compare (applied after the frame; drawn on the next).
@@ -5462,7 +6030,9 @@ mod ui_tests {
                 view,
             );
         harness.run();
-        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Image;
+        harness.state_mut().lightbox = Some(lb);
         harness.run();
 
         // Enter compare — starts in side-by-side (not flicker).
@@ -5601,7 +6171,9 @@ mod ui_tests {
                 view,
             );
         harness.run();
-        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Image;
+        harness.state_mut().lightbox = Some(lb);
         harness.run();
 
         // Rotate clockwise → the preview's dimensions swap (40×20 → 20×40).
@@ -5958,7 +6530,9 @@ mod ui_tests {
                 view,
             );
         harness.run();
-        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Audio;
+        harness.state_mut().lightbox = Some(lb);
         harness.run();
         // Side-by-side compare → the read-only id3 diff table on the right.
         harness.key_press(egui::Key::C);
@@ -6025,7 +6599,9 @@ mod ui_tests {
                 view,
             );
         harness.run();
-        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Image;
+        harness.state_mut().lightbox = Some(lb);
         harness.run();
         harness.get_by_label("ROT R").click();
         harness.run();
@@ -6207,7 +6783,9 @@ mod ui_tests {
                 view,
             );
         harness.run();
-        harness.state_mut().lightbox = Some(LightboxState::new(0, 0));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Audio;
+        harness.state_mut().lightbox = Some(lb);
         harness.step();
         {
             let lb = harness.state_mut().lightbox.as_mut().unwrap();
@@ -6335,7 +6913,9 @@ mod ui_tests {
         let mut view = DupesView::new();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
-        view.lightbox = Some(LightboxState::new(0, 0));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Image;
+        view.lightbox = Some(lb);
 
         let mut init = false;
         let mut harness = Harness::builder()
@@ -6371,6 +6951,270 @@ mod ui_tests {
         assert_eq!(
             cmp.b.abs_path, b_path,
             "B is the other member, carried as an abstract FileFacts source"
+        );
+    }
+
+    /// A freshly-opened lightbox shows the Overview tab first — repo badge,
+    /// path, facts, mark pill (improvements.md: "the tab on top should always
+    /// be the intro to comparison"). Clicking the native tab in Overview's tab
+    /// bar switches to native content; `I` (or the OVERVIEW pill) switches back.
+    #[test]
+    fn overview_tab_shows_facts_and_switches_back_to_native() {
+        use egui_kittest::Harness;
+        let group: DupeGroup = (0..2u8)
+            .map(|i| {
+                let mut hash = [0u8; 32];
+                hash[0] = i;
+                DupeFile {
+                    repo: "r".into(),
+                    repo_root: "/tmp/r".into(),
+                    rel_path: format!("photo{i}.png"),
+                    entry: dedup_core::store::FileEntry {
+                        size: 1000,
+                        hash,
+                        modified_ms: 0,
+                        missing: false,
+                        mime: Some("image/png".into()),
+                        img_fingerprint: None,
+                        video_hash: None,
+                        pdf_hash: None,
+                        audio: None,
+                        img_size: Some((640, 480)),
+                        origin: None,
+                        exif: None,
+                    },
+                }
+            })
+            .collect();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+        view.lightbox = Some(LightboxState::new(0, 0));
+
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 720.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        assert!(
+            harness.query_by_label("FIT").is_none(),
+            "a freshly-opened lightbox shows Overview, not the native viewport"
+        );
+        // The card grid behind the modal overlay shares some of this text (repo
+        // chip, path), so tolerate more than one match — kittest's tree includes
+        // occluded nodes.
+        assert!(
+            harness.query_all_by_label("r").count() > 0,
+            "Overview shows A's repo badge"
+        );
+        assert!(
+            harness.query_all_by_label_contains("photo0.png").count() > 0,
+            "Overview shows A's path"
+        );
+        assert!(
+            harness.query_all_by_label("DELETE").count() > 0,
+            "Overview offers a mark pill (not comparing, so a plain DELETE)"
+        );
+
+        harness.get_by_label_contains("Image").click();
+        harness.run();
+        assert!(
+            harness.query_by_label("FIT").is_some(),
+            "clicking the native tab in Overview switches to the image view"
+        );
+
+        harness.key_press(egui::Key::I);
+        harness.run();
+        assert!(
+            harness.query_by_label("FIT").is_none(),
+            "I switches back to Overview from the native viewport"
+        );
+    }
+
+    /// qa.md: "it is completely unclear to me which files are chosen for
+    /// comparison... you should never see `<3/4>` in the selector." With a
+    /// 4-member group, Overview's PREV/NEXT OTHER cycles B through every member
+    /// other than A, with a label that always reads `<i / 3>` (three *others*,
+    /// never the impossible `<3/4>`), wrapping correctly in both directions.
+    #[test]
+    fn overview_cycles_b_through_others_with_correct_label() {
+        use egui_kittest::Harness;
+        let group: DupeGroup = (0..4u8)
+            .map(|i| {
+                let mut hash = [0u8; 32];
+                hash[0] = i;
+                DupeFile {
+                    repo: "r".into(),
+                    repo_root: "/tmp/r".into(),
+                    rel_path: format!("photo{i}.png"),
+                    entry: dedup_core::store::FileEntry {
+                        size: 1000,
+                        hash,
+                        modified_ms: 0,
+                        missing: false,
+                        mime: Some("image/png".into()),
+                        img_fingerprint: None,
+                        video_hash: None,
+                        pdf_hash: None,
+                        audio: None,
+                        img_size: Some((640, 480)),
+                        origin: None,
+                        exif: None,
+                    },
+                }
+            })
+            .collect();
+        let paths: Vec<_> = group.iter().map(DupeFile::absolute_path).collect();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Image;
+        view.lightbox = Some(lb);
+
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 720.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        harness.key_press(egui::Key::C); // A = index 0, B defaults to index 1
+        harness.run();
+        harness.key_press(egui::Key::I);
+        harness.run();
+        assert!(
+            harness.query_all_by_label("<1 / 3>").count() > 0,
+            "B (index 1) is the first of 3 others"
+        );
+
+        harness.get_by_label_contains("NEXT OTHER").click();
+        harness.run();
+        assert!(harness.query_all_by_label("<2 / 3>").count() > 0);
+        assert_eq!(
+            harness
+                .state()
+                .lightbox
+                .as_ref()
+                .unwrap()
+                .compare
+                .as_ref()
+                .unwrap()
+                .b
+                .abs_path,
+            paths[2],
+            "NEXT OTHER moved B to group member 2"
+        );
+
+        harness.get_by_label_contains("NEXT OTHER").click();
+        harness.run();
+        assert!(harness.query_all_by_label("<3 / 3>").count() > 0);
+        assert_eq!(
+            harness
+                .state()
+                .lightbox
+                .as_ref()
+                .unwrap()
+                .compare
+                .as_ref()
+                .unwrap()
+                .b
+                .abs_path,
+            paths[3],
+            "NEXT OTHER moved B to group member 3"
+        );
+
+        // One more NEXT wraps back to the first other — never an impossible
+        // count past the true number of others.
+        harness.get_by_label_contains("NEXT OTHER").click();
+        harness.run();
+        assert!(
+            harness.query_all_by_label("<1 / 3>").count() > 0,
+            "NEXT OTHER wraps back to the first other, not <4/3> or similar"
+        );
+        assert_eq!(
+            harness
+                .state()
+                .lightbox
+                .as_ref()
+                .unwrap()
+                .compare
+                .as_ref()
+                .unwrap()
+                .b
+                .abs_path,
+            paths[1]
+        );
+    }
+
+    /// Overview's mark pill reuses the same protected/disabled/strikethrough
+    /// rendering as the native lightboxes for a read-only repo (no dedicated
+    /// coverage existed for that rendering before this — closing the gap).
+    #[test]
+    fn overview_mark_pill_is_protected_for_a_read_only_repo() {
+        use egui_kittest::Harness;
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.repos = vec![RepoSel {
+            name: "ro".into(),
+            included: true,
+            read_only: true,
+        }];
+        view.results = Some(Results::Similar(vec![vec![
+            dfile("ro", "best.png"),
+            dfile("ro", "worse.png"),
+        ]]));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Overview;
+        view.lightbox = Some(lb);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 720.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        assert!(
+            harness.query_by_label("DELETE (Protected)").is_some(),
+            "a read-only repo's file shows the protected mark label in Overview"
         );
     }
 
@@ -6412,10 +7256,13 @@ mod ui_tests {
         let comparing_after_c = |group: DupeGroup| -> bool {
             let tmp = tempfile::tempdir().unwrap();
             let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+            let kind = native_kind(&group[0]);
             let mut view = DupesView::new();
             view.repos_loaded = true;
             view.results = Some(Results::Similar(vec![group]));
-            view.lightbox = Some(LightboxState::new(0, 0));
+            let mut lb = LightboxState::new(0, 0);
+            lb.active_tab = kind;
+            view.lightbox = Some(lb);
             let mut init = false;
             let mut harness = Harness::builder()
                 .with_size(egui::vec2(1000.0, 720.0))
@@ -6501,6 +7348,7 @@ mod ui_tests {
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
         let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Image;
         lb.compare = Some(CompareState::new(b_facts)); // render A/B side-by-side
         view.lightbox = Some(lb);
 
@@ -6586,7 +7434,9 @@ mod ui_tests {
         let mut view = DupesView::new();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![vec![file]]));
-        view.lightbox = Some(LightboxState::new(0, 0));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Video;
+        view.lightbox = Some(lb);
 
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
@@ -6714,6 +7564,7 @@ mod ui_tests {
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
         let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Image;
         lb.compare = Some(CompareState::new(b_facts));
         view.lightbox = Some(lb);
 
@@ -6809,6 +7660,7 @@ mod ui_tests {
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
         let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Video;
         lb.compare = Some(CompareState::new(b_facts));
         view.lightbox = Some(lb);
 
@@ -6840,6 +7692,114 @@ mod ui_tests {
         harness.step();
         let img = harness.render().expect("wgpu render failed");
         let out = doc_screenshot_path("video_compare.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Doc screenshot: the lightbox Overview tab — both the single-file intro
+    /// (one column + COMPARE) and, side-loaded into the same run, the
+    /// entered-compare state (two columns + `<i / N>` cycler + EXIT COMPARE) —
+    /// to `docs/screenshots/lightbox_overview.png` and
+    /// `docs/screenshots/lightbox_overview_compare.png`. This is the first time
+    /// the Overview layout is actually rendered rather than only checked via
+    /// label queries, so it also stands as a visual regression check on
+    /// `compare_split`'s absolute-rect panes sharing a frame with the
+    /// flow-laid cycler/EXIT controls beneath them. Run with `--ignored`.
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_lightbox_overview() {
+        let dir = tempfile::tempdir().unwrap();
+        dedup_core::thumbnail::set_cache_dir(dir.path().join("thumbs"));
+        let mut group: DupeGroup = Vec::new();
+        for i in 0..4u8 {
+            let rel = format!("photo{i}.png");
+            let path = dir.path().join(&rel);
+            image::RgbImage::from_fn(640, 480, |x, y| {
+                image::Rgb([x as u8, y as u8, (i as u32 * 60) as u8])
+            })
+            .save(&path)
+            .unwrap();
+            let mut hash = [0u8; 32];
+            hash[0] = i;
+            group.push(DupeFile {
+                repo: "r".into(),
+                repo_root: dir.path().to_string_lossy().into_owned(),
+                rel_path: rel,
+                entry: dedup_core::store::FileEntry {
+                    size: 1000,
+                    hash,
+                    modified_ms: 0,
+                    missing: false,
+                    mime: Some("image/png".into()),
+                    img_fingerprint: None,
+                    video_hash: None,
+                    pdf_hash: None,
+                    audio: None,
+                    img_size: Some((640, 480)),
+                    origin: None,
+                    exif: None,
+                },
+            });
+        }
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Overview;
+        view.lightbox = Some(lb);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 720.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = (&tmp, &dir);
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        for _ in 0..12 {
+            harness.run();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        harness.run();
+        let img = harness.render().expect("wgpu render failed");
+        let out = doc_screenshot_path("lightbox_overview.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+
+        // Overview's own COMPARE button hands off straight to native compare
+        // (per improvements.md: compare mode is where zoom/rotate/gapless
+        // playback happen, not a second Overview state) — so to capture
+        // Overview's *own* two-column comparing layout (cycler + EXIT
+        // COMPARE), enter compare from the native tab, then switch back to
+        // Overview via its tab-bar pill.
+        harness.get_by_label_contains("Image").click();
+        for _ in 0..6 {
+            harness.step();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        harness.key_press(egui::Key::C);
+        for _ in 0..6 {
+            harness.step();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        harness.get_by_label_contains("OVERVIEW").click();
+        for _ in 0..6 {
+            harness.step();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        let img = harness.render().expect("wgpu render failed");
+        let out = doc_screenshot_path("lightbox_overview_compare.png");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }

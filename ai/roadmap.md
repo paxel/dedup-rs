@@ -4,7 +4,58 @@ This document serves as the master implementation specification for upcoming fea
 
 ---
 
-## 1. Lightbox Architecture: Data Representation Interfaces [COMPLETED]
+## 1. Lightbox Architecture: Data Representation Interfaces [IN PROGRESS]
+
+**Status (2026-07-26):** The representation scaffolding (§1.2 structs/enums) was built but never
+wired into any view — the `[COMPLETED]` tag above was premature. Since then:
+- **Overview screen (§1.3.3) is now built and wired into `lightbox_modal`** as
+  `DupesView::draw_lightbox_overview`, gated on `state.active_tab == RepresentationKind::Overview`.
+  Verified by rendering it (not just label-querying it) via
+  `dupes_view::ui_tests::doc_screenshot_lightbox_overview` →
+  `docs/screenshots/lightbox_overview.png` (single file, not comparing) and
+  `lightbox_overview_compare.png` (A/B comparing). That render caught a real layout bug: the two
+  columns used `compare_split` (absolute rects) inside a flow-based `horizontal_top`, so column B's
+  content overlapped column A's and the cycler/EXIT COMPARE controls landed under B instead of
+  below both columns. Fixed by using flow-based `allocate_ui_with_layout` per column (not
+  `compare_split`, and not `ui.columns` either — that hardcodes `top_down_justified`, which
+  stretches child widgets, e.g. the thumbnail's hairline-stroked rect, to the full column width).
+  **Lesson for any further tab work in this file: a label-query-only kittest test does not catch
+  layout/overlap bugs — render it.**
+- §1.3.4's selector-label and index-mapping fixes are in via `other_member_indices`/
+  `format_other_switcher_label`, directly verified both by unit tests and by the cycler shown in
+  `lightbox_overview_compare.png` (`<1/3>` for a 4-file group, not `<3/4>`).
+- **Still open:** the tab bar can navigate Overview ↔ the *native* view of A's own kind, but
+  clicking a tab for a genuinely different representation than what's currently showing does
+  nothing beyond flip `active_tab` — there's no actual per-kind content switch/renderer dispatch
+  yet (§1.3.1–1.3.2). Metadata/Text tabs remain unadvertised (no renderer exists).
+- **Overview is now the default tab** (§1.3.3: "the tab on top should always be the intro to
+  comparison"). `LightboxState::new` sets `active_tab: RepresentationKind::Overview`; the earlier
+  native-first default was a staging compromise while the screen was being built, now reverted.
+  Updated the ~20 test call sites that constructed `LightboxState::new(...)` and depended on
+  native-first (they now explicitly set `.active_tab` to the kind they're actually testing);
+  rewrote `overview_tab_shows_facts_and_switches_back_to_native` (Overview-first is now the
+  asserted behaviour, not something reached via `I`) and the setup half of
+  `overview_cycles_b_through_others_with_correct_label`. All three doc-screenshot/render tests
+  that build a `.compare` state directly (`doc_screenshot_lightbox_compare`,
+  `doc_screenshot_video_compare`, `render_lightbox`) also needed an explicit native `.active_tab`,
+  otherwise they'd now render Overview's two-column facts view instead of the full native
+  side-by-side compare they're named for and documented from.
+- **Audio-specific coverage of the new default**, added after review flagged that all six
+  pre-existing audio tests bypass Overview by setting `.active_tab = Audio` directly, meaning the
+  real "open an mp3 group → land on Overview → click Audio" path had never been rendered or
+  tested — and audio dispatches through a genuinely different function (`audio_lightbox`, not
+  `lightbox_modal`) once past Overview, so the image-only round-trip test didn't cover it:
+  - `overview_audio_tab_switches_to_native_player`: Overview shows no native player controls by
+    default on an audio group; clicking "Audio" switches to it (marker: the `SPECTROGRAM` toggle,
+    which is unique to the native player — a plain `PLAY` query is ambiguous because the
+    background dupe cards also carry their own inline play button).
+  - `overview_compare_button_enters_audio_compare_with_gapless_flip`: entering compare via
+    Overview's `COMPARE` button (as opposed to native `C`) is a different code path —
+    `draw_lightbox_overview`'s `enter_compare` sets `state.compare` directly, bypassing
+    `audio_lightbox`'s own `toggle_compare` branch — so the existing gapless-flip regression test
+    (which only enters via `C`) didn't prove the Overview entry stays gap-free. It does: the
+    paired-stream load in `audio_lightbox` is driven generically by `comparing` on the next play
+    action, not by which branch set `state.compare`. Verified empirically, not just by reading.
 
 ### 1.1 Context & Problem Statement
 Currently, preview and comparison logic is fragmented across `dupes_view.rs`, `lightbox.rs`, and `transfer_view.rs`. Visual comparison, audio waveforms, spectrograms, and ID3 tag editing are handled through ad-hoc conditional branches. 
@@ -63,33 +114,59 @@ Target Files: [`crates/dedup-gui/src/dupes_view.rs`](file:///home/axel/develop/d
 - [ ] **Play/Pause State Retention**: When clicking "Next MP3" or switching items in Lightbox, check the active `Player` state. If currently paused, keep paused. Do NOT auto-resume playback unless it was already playing.
 - [ ] **Switcher Freeze (> 2 Audio Files)**: Fix event handling lockup when flipping through audio files after pressing "Compare" in groups with > 2 files. Ensure channel signals and UI repaints do not block the main loop.
 - [ ] **ID3 Tag Sync Glitch**: Fix state indexing bug where ID3 tag modifications were applied to wrong file indices due to 1..4 iterating over a size-2 array.
-- [ ] **Audio Compare Mark Buttons**: Add `DELETE A` and `DELETE B` mark pills directly into the Audio comparison view header. *(The stashed attempt was removed because it referenced image-lightbox bindings that don't exist in `audio_lightbox` and had no deferred-action channel there; re-add during the audio re-home with proper audio-scope mark bindings.)*
-- [ ] **Preserve the Gapless A/B Flip (regression watch)**: The stashed audio-nav rewrite (switching copies while comparing) replaced the **gapless** A/B swap — `Player::flip()` on a pre-loaded *paired* stream — with a plain `Player::play()` re-seek from disk, which reintroduces an audible gap/restart. The audio re-home MUST **restore the gapless paired-flip path** (keep both A and B loaded, flip the audible channel without re-decoding) rather than replay. Guarded by `dupes_view::ui_tests::audio_lightbox_opens_compares_plays_and_escapes`, which asserts `snap.paired` and the gap-free flip. This regression currently sits in the working tree (tests still pass, so it is a behaviour regression, not a test failure) and must be reconciled, not blessed.
+- [x] **Audio Compare Mark Buttons**: the audio compare header itself still has no inline `DELETE A`/`DELETE B` pills, but the Overview screen (§1.3.3, now built) provides marking for both A and B before/after entering native compare, which covers the same need. Leave this line item open only if inline header pills (as opposed to Overview-based marking) are still wanted — ask before building both.
+- [x] **Preserve the Gapless A/B Flip**: restored — the nav-while-comparing branch in `audio_lightbox` calls `Player::flip()` on the pre-loaded paired stream instead of re-seeking from disk. Guarded by the extended `dupes_view::ui_tests::audio_lightbox_opens_compares_plays_and_escapes`, which asserts `snap.paired` stays true and the audible hex flips between A/B on ArrowRight/ArrowLeft while comparing.
+- [ ] **Not yet verified** (no regression test written this pass, so "gapless restored" does not imply these are closed): *Switcher Freeze (> 2 Audio Files)* and *ID3 Tag Sync Glitch* above. The Overview cycler is the likely path to files 3+ now, which plausibly fixes both, but neither has been run/tested.
 
 ---
 
-## 3. Repo Sync Tab Architecture & Transfer View Overhaul
+## 3. Repo Sync Tab Removal & GROUP SYNC in Transfer [DONE, superseding this section's original plan]
 
-Target Files: [`crates/dedup-gui/src/sync_view.rs`](file:///home/axel/develop/dedup-rs/crates/dedup-gui/src/sync_view.rs), [`crates/dedup-gui/src/transfer_view.rs`](file:///home/axel/develop/dedup-rs/crates/dedup-gui/src/transfer_view.rs)
+**Status (2026-07-27):** This section originally planned a 1:1 compare pane living *inside*
+Repo Sync. Mid-session the user reconsidered the tab split itself: group *membership*
+(create/add-sink/remove-sink/mode) already lives on the Repositories tab, and pairwise
+same-path/different-hash compare is already Transfer's DIFF (BY PATH) mode + `diff_board`'s
+COMPARE button — Repo Sync's only genuinely unique capability was *pushing* a group (there was
+no other GUI path to run `plan_group_sync`/`run_group_sync`). Decision: **delete the Repo Sync
+tab entirely** and add pushing as a new **GROUP SYNC** command on the Transfer tab.
 
-### 3.1 Move Transfer Compare to Repo Sync
-- [ ] **Remove Group Compare in Transfer Tab**: Remove the legacy multi-repo grouped comparison with score numbers from `transfer_view.rs`.
-- [ ] **Integrate 1-to-1 Compare in Repo Sync**: In `sync_view.rs`, allow selecting a **Left Repo** and **Right Repo**. Render the 1-to-1 diff table directly in Repo Sync.
-- [ ] **Unified Lightbox Modal in Sync**: For rows with matching relative paths but differing content hashes, clicking "Compare" MUST open the unified Lightbox representation viewer.
+Landed:
+- `sync_view.rs` deleted; `Tab::SyncGroups` removed from `app.rs`; `docs/gui/sync-groups.md`
+  removed, folded into `docs/gui/files.md#group-sync`; `help_content.rs` updated.
+- `Command::GroupSync` in `transfer_view.rs`: only offered when SOURCE is a sync group's main
+  (`TransferView::current_group`, refreshed on source change / repo reload). Hides the single
+  TARGET picker; shows a new SINKS multiselect panel (`group_sinks_bar`), defaulting to every
+  sink, each showing its own stored ADD ONLY/MIRROR mode (not editable here). FILTER and
+  REVIEW/RUN behave like every other command.
+- Built as its **own lane** (own `Msg::GroupPreview`/`GroupDone`, `spawn_group_preview` /
+  `apply_group_preview` / `raise_group_confirm` / `start_group_sync`), not forced into the
+  generic `RunConfig`/`StartDest` pipeline — that pipeline's `StartDest` variants are all
+  single-target, and a multi-sink push doesn't fit without contaminating the simple cases.
+  Mirrors the file's existing DIFF-is-a-separate-lane precedent.
+- Calls `plan_sync`/`diff_sync` **directly** per selected sink (not
+  `dedup_core::sync_group::plan_group_sync`/`run_group_sync`), because those two don't accept
+  a filter and GROUP SYNC's FILTER panel needed to actually narrow the plan, not just be
+  visible-but-inert. `guard_mirror_source`/`delete_mode` were made `pub` in `sync_group.rs` so
+  the empty-main-mirror refusal survives the bypass — called explicitly at both plan time and
+  run time (state can change between REVIEW and RUN).
+  `plan_group_sync`/`run_group_sync`/`diff_overview`/`RepoOverview` are now GUI-orphaned
+  (dedup-core library API with real tests, no live caller) — left in place, not deleted; the
+  user asked to delete the *tab*, not the underlying capability.
+- 8 new tests: gating (offered only for a group's main), TARGET-hidden/SINKS-shown +
+  default-all-selected, REVIEW counts, an actual end-to-end RUN that lands a real file in the
+  sink on disk, the empty-mirror-main refusal surviving the `plan_sync`/`diff_sync` bypass,
+  sink deselection narrowing the plan, and the FILTER actually narrowing it (not just visible).
+- Doc screenshot `docs/screenshots/transfer_group_sync.png` (`doc_screenshot_transfer_group_sync`)
+  — rendered and visually checked per the Overview-screen lesson above: a label-query suite
+  alone would not have caught a layout regression here either.
 
-### 3.2 Sync Table Layout & UX Improvements
-- [ ] **Column Width Optimization**: Remove excessive empty horizontal padding. Auto-fit columns to content size and increase row height/font size for improved legibility.
-- [ ] **Media Cell Thumbnails**: Embed [`media_cell`](file:///home/axel/develop/dedup-rs/crates/dedup-gui/src/media_cell.rs) thumbnail previews directly inside the Left and Right file columns of the Sync table.
-- [ ] **Dedicated Compare Column**: Place a dedicated **Compare** button column between Left Path and Right Path columns.
-- [ ] **Button Text Truncation Fix**: Enable multiline text wrapping or min-width constraints for action buttons so labels are never cut off.
-
-### 3.3 Diff Highlighting & Batch Actions
-- [ ] **Filename Diff Highlighting**: Highlight character-level differences in file names (e.g. blue background for divergent characters) when comparing Left and Right paths.
-- [ ] **Batch Action Buttons**: Add header batch action buttons for large result sets (> 1000 items):
-  - `Rename All Left` / `Rename All Right`
-  - `Delete All Left` / `Delete All Right`
-  - `Copy Missing Left -> Right` / `Copy Missing Right -> Left`
-- [ ] **Cross-Type Audio/Media Sync Compare**: Re-use the unified Lightbox component so comparing audio files or cross-type media in Repo Sync works seamlessly without placeholders or broken renders.
+**Not done, out of scope for this pass** (were §3.2/3.3 subtasks of the original plan, about
+`diff_board`'s general BY PATH conflict rows, not GROUP SYNC specifically): `diff_board`'s
+cells are still plain text (`paths_cell`/`sizes_cell`/`dates_cell`), not `media_cell`
+thumbnails like the review board; no dedicated COMPARE column; no filename-level diff
+highlighting; no batch rename/delete-all/copy-missing header actions. These would need
+`RepoDiffRow`/`DiffFile` to carry `FileFacts` (currently they don't), which touches
+`plan_repo_diff` and its dedup-core tests — a separate, larger change if still wanted.
 
 ---
 

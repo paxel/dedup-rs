@@ -635,9 +635,9 @@ fn a_cancelled_push_reports_the_sinks_it_never_reached() -> TestResult {
     Ok(())
 }
 
-/// The Repo Sync tab's overview: every repo diffed against one reference by
-/// content. `unique` = content only that repo has, `shared` = in both,
-/// `missing` = reference content that repo lacks. The reference is skipped.
+/// `diff_overview`: every repo diffed against one reference by content.
+/// `unique` = content only that repo has, `shared` = in both, `missing` =
+/// reference content that repo lacks. The reference is skipped.
 #[test]
 fn diff_overview_counts_unique_shared_and_missing_per_repo() -> TestResult {
     let sb = Sandbox::new()?;

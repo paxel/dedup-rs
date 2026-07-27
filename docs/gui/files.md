@@ -21,9 +21,15 @@ equivalent of [`diff cp`/`mv`/`rm`](../cli.md#diff).
 - **COPY** — copy source files the target (and ALSO REF repos) doesn't have into the target
   repo. Source files are left in place.
 - **MOVE** — same, but marks the source entries missing afterward.
-- **DELETE** — delete source files whose content the target (or an ALSO REF repo) already
-  has; nothing is written to the target.
-
+- **SYNC** — copy source content the target lacks into it at the same relative path; turn on
+  **DELETE MISSING** to also delete target files whose content the source has since lost. The
+  source is never changed.
+- **MIRROR** — copy source content the target lacks *and* delete everything in the target the
+  source does not have, so the target ends up holding exactly the source's content. Deletions
+  cannot be undone.
+- **GROUP SYNC** — push a backup group's main to some or all of its sinks, each in its own
+  stored mode. Only offered when SOURCE is a group's main; see [Group sync](#group-sync)
+  below.
 - **DIFF** — compare the two repos side by side and resolve the differences yourself, one
   row at a time (see [Diff board](#diff-board) below). Nothing runs as a batch.
 
@@ -90,6 +96,33 @@ reflect the current state.
 
 Equal rows are hidden until **SHOW EQUAL** is pressed, and each action is applied to disk
 and to both repo indexes immediately — there is no RUN button and no batch confirmation.
+
+## Group sync
+
+Keep a repository backed up to one or more others, without the manual "duplicate the repo,
+relocate the copy, rescan it" dance. Groups themselves (creating one, adding/removing sinks,
+setting each sink's mode) are managed on the [Repositories tab](repositories.md#sync-groups);
+this tab is where a group is actually *pushed*.
+
+![GROUP SYNC selected: TARGET hidden, SINKS shown](../screenshots/transfer_group_sync.png)
+
+Pick the group's main as **SOURCE** and the **GROUP SYNC** command appears. Selecting it
+replaces the single **TARGET** picker with a **SINKS** panel — every sink of that main's
+group, defaulting to all selected; **ALL**/**NONE** toggle the whole set, or click a sink to
+include or exclude it. Each sink chip names its stored mode: **ADD ONLY** copies content it
+lacks and never deletes, so a sink may keep files the main no longer has; **MIRROR** also
+deletes sink content the main does not have, so it ends up holding exactly the main's
+content — those deletions cannot be undone.
+
+**REVIEW** and **RUN** work as they do for every other command: REVIEW plans every selected
+sink and shows what would be copied and deleted, without touching disk; RUN asks for
+confirmation — naming the sink count and, for a MIRROR push, any sink it would empty
+entirely — then pushes on a background thread. Sinks are handled independently, so one
+unreachable backup drive does not stop the others, and the main is never changed. The FILTER
+wizard applies here too, narrowing which files count for every selected sink.
+
+To bring a change made *inside* a sink back to the main, use **DIFF** with the sink as
+SOURCE and the main as TARGET.
 
 ## Review and run
 

@@ -1,8 +1,9 @@
 # GUI guide
 
 `dedup` with no arguments opens the desktop app: a single window with tabs for
-[Repositories](repositories.md), [Duplicates](duplicates.md), [Files](files.md) and
-[Repo Sync](sync-groups.md) — plus a settings cog and an about button in the top-right.
+[Repositories](repositories.md), [Duplicates](duplicates.md), and [Files](files.md) (which
+also pushes a backup group's main to its sinks — see [Group sync](files.md#group-sync)) —
+plus a settings cog and an about button in the top-right.
 
 Launch with `--ui-scale <0.5–3.0>` to scale the whole interface, e.g. `dedup --ui-scale 1.25`
 for a HiDPI display or a projector.

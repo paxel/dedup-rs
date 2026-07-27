@@ -87,11 +87,6 @@ impl RunReport {
         self.total_problems()
     }
 
-    /// The failures themselves, for the session log.
-    pub fn problem_lines(&self) -> impl Iterator<Item = &str> {
-        self.problems.iter().map(String::as_str)
-    }
-
     fn total_problems(&self) -> u64 {
         self.problems.len() as u64 + self.problems_dropped
     }
@@ -139,10 +134,6 @@ pub struct ResultModal {
 impl ResultModal {
     pub fn open(&mut self, report: RunReport) {
         self.report = Some(report);
-    }
-
-    pub fn is_open(&self) -> bool {
-        self.report.is_some()
     }
 
     pub fn close(&mut self) {
@@ -292,11 +283,11 @@ mod tests {
     #[test]
     fn the_modal_holds_a_report_until_dismissed() {
         let mut modal = ResultModal::default();
-        assert!(!modal.is_open());
+        assert!(modal.report.is_none());
         modal.open(RunReport::new("Grooming").count("moved", 2));
-        assert!(modal.is_open());
+        assert!(modal.report.is_some());
         modal.close();
-        assert!(!modal.is_open());
+        assert!(modal.report.is_none());
     }
 
     /// The panel actually lays out and shows each failure on its own line — a

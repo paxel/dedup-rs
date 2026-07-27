@@ -27,7 +27,8 @@ use dedup_core::diff::{
     RepoDiffRow, SyncDelete, copy_file_between, delete_file, diff_copy, diff_print, diff_sync,
     export_to_folder, overwrite_file, plan_folder_export, plan_repo_diff, plan_sync, rename_file,
 };
-use dedup_core::store::Store;
+use dedup_core::store::{Store, SyncGroup, SyncMode};
+use dedup_core::sync_group::{delete_mode, guard_mirror_source};
 use dedup_core::update::CancellationToken;
 use egui::{
     Align, Align2, Color32, ColorImage, Context, FontId, Id, Layout, Rect, RichText, TextureHandle,
@@ -53,6 +54,9 @@ enum Command {
     Move,
     Sync,
     Mirror,
+    /// Push the source (a sync group's main) to some or all of its sinks, each
+    /// in its own stored mode. Only offered when the source is a group's main.
+    GroupSync,
     Diff,
 }
 
@@ -63,20 +67,27 @@ impl Command {
             Command::Move => "MOVE",
             Command::Sync => "SYNC",
             Command::Mirror => "MIRROR",
+            Command::GroupSync => "GROUP SYNC",
             Command::Diff => "DIFF",
         }
     }
     /// Whether the command is inherently destructive to on-disk data by itself.
     /// SYNC is additive by default (it only *copies* into the target); its
     /// optional DELETE MISSING toggle makes a given run destructive — see
-    /// [`TransferView::destructive_run`]. MIRROR always deletes.
+    /// [`TransferView::destructive_run`]. MIRROR always deletes. GROUP SYNC's
+    /// destructiveness depends on the selected sinks' own modes, so it is not
+    /// statically destructive either — see `destructive_run`.
     fn destructive(self) -> bool {
         matches!(self, Command::Move | Command::Mirror)
     }
     /// Whether the command runs repo→repo at the same relative path (SYNC /
-    /// MIRROR), which hides the DEST / subdir / folder / dupe-pool controls.
+    /// MIRROR / GROUP SYNC), which hides the DEST / subdir / folder / dupe-pool
+    /// controls.
     fn repo_to_repo(self) -> bool {
-        matches!(self, Command::Sync | Command::Mirror | Command::Diff)
+        matches!(
+            self,
+            Command::Sync | Command::Mirror | Command::GroupSync | Command::Diff
+        )
     }
     /// DIFF is a manual side-by-side view rather than a batch run: it has no
     /// filter, no RUN button and no confirmation — every change is made by
@@ -110,6 +121,12 @@ impl Command {
                 "Copy source content the target lacks AND delete everything in the target \
                  the source does not have, so the target ends up holding exactly the \
                  source's content. Deletions cannot be undone. The source is never changed.",
+            ),
+            Command::GroupSync => (
+                "Push this group's main to its sinks",
+                "Push the source (this group's main) to the selected sinks below, each in \
+                 its own stored mode — ADD ONLY copies and never deletes, MIRROR also \
+                 deletes what the main no longer has. The main is never changed.",
             ),
             Command::Diff => (
                 "Compare the two repos side by side",
@@ -174,7 +191,7 @@ enum StartDest {
 /// Everything a REVIEW, its confirmation, and the RUN it authorises need,
 /// snapshotted at the moment the user asks — so nothing the live controls do
 /// between an async plan landing and PROCEED can change what actually runs.
-/// (Same reasoning as sync_view's `pending_push`.)
+/// (Same reasoning as `pending_group_confirm` for GROUP SYNC.)
 #[derive(Clone)]
 struct RunConfig {
     source: String,
@@ -214,6 +231,82 @@ fn build_review_preview(store: &Store, config: &RunConfig) -> Result<ReviewPrevi
             invert,
         } => preview_folder(store, config, references, dir, *mode, *invert),
     }
+}
+
+/// Plan a GROUP SYNC push for `group` (already filtered to the selected
+/// sinks), off the UI thread — the full index scan runs per sink, so a large
+/// group must not block the window. Calls `plan_sync` directly (not
+/// [`dedup_core::sync_group::plan_group_sync`]) so `filter` can be threaded
+/// through, which that function does not accept; `guard_mirror_source` is
+/// called explicitly to keep its empty-main-mirror refusal.
+fn build_group_preview(
+    store: &Store,
+    group: &SyncGroup,
+    filter: Option<&str>,
+) -> Result<GroupPreviewData, String> {
+    guard_mirror_source(store, group).map_err(|e| e.to_string())?;
+    let mut rows = Vec::new();
+    let (mut added, mut removed) = (0usize, 0usize);
+    let mut wholesale_sinks = Vec::new();
+    // Copies carry the main's file, so their facts come from the main index.
+    let (main_db, main_base) = open_facts(store, &group.main);
+    for sink in &group.sinks {
+        let plan = plan_sync(
+            store,
+            &group.main,
+            &sink.repo,
+            true,
+            delete_mode(sink.mode),
+            filter,
+        )
+        .map_err(|e| e.to_string())?;
+        // A plan that deletes everything the sink holds today is a wholesale
+        // replacement, not an incremental sync — worth naming before proceeding.
+        let live = store
+            .get_repo_stats(&sink.repo)
+            .map(|s| s.file_count)
+            .unwrap_or(0);
+        if live > 0 && plan.deletes.len() as u64 >= live {
+            wholesale_sinks.push((sink.repo.clone(), live));
+        }
+        // Deletions carry the sink's file, so their facts come from the sink index.
+        let (sink_db, sink_base) = open_facts(store, &sink.repo);
+        for rel in &plan.copies {
+            added += 1;
+            if rows.len() < PREVIEW_CAP {
+                rows.push(review::ReviewRow {
+                    source: review::SideStatus::Unchanged,
+                    target: review::SideStatus::Added,
+                    source_path: rel.clone(),
+                    target_path: format!("{}: {rel}", sink.repo),
+                    source_facts: facts_for(main_db.as_deref(), main_base.as_deref(), rel),
+                    target_facts: None,
+                });
+            }
+        }
+        for rel in &plan.deletes {
+            removed += 1;
+            if rows.len() < PREVIEW_CAP {
+                rows.push(review::ReviewRow {
+                    source: review::SideStatus::Absent,
+                    target: review::SideStatus::Removed,
+                    source_path: String::new(),
+                    target_path: format!("{}: {rel}", sink.repo),
+                    source_facts: None,
+                    target_facts: facts_for(sink_db.as_deref(), sink_base.as_deref(), rel),
+                });
+            }
+        }
+    }
+    let sink_count = group.sinks.len();
+    Ok(GroupPreviewData {
+        group: group.clone(),
+        rows,
+        added,
+        removed,
+        sink_count,
+        wholesale_sinks,
+    })
 }
 
 fn preview_sync(
@@ -466,8 +559,11 @@ fn prompt_for(config: &RunConfig, copies: usize, deletes: usize) -> Option<Strin
              {deletes} file(s) the source does not have, so the target ends up holding exactly \
              the source's content. Deletions cannot be undone. The source is not changed."
         ),
-        // DIFF never runs as a batch: its rows are applied one by one.
-        Command::Diff => return None,
+        // DIFF never runs as a batch: its rows are applied one by one. GROUP
+        // SYNC never reaches here either — it has its own confirm text (see
+        // `TransferView::raise_group_confirm`), built from a `SyncGroup`, not
+        // a `RunConfig` (`capture_run_config` returns `None` for it).
+        Command::Diff | Command::GroupSync => return None,
     })
 }
 
@@ -509,6 +605,44 @@ enum Msg {
         result: Result<ReviewPreviewData, String>,
         confirm: Option<Box<RunConfig>>,
     },
+    /// A finished GROUP SYNC plan, built off the UI thread. `confirm`, when
+    /// set, raises the RUN confirmation once the plan lands with real counts —
+    /// the deferred half of a RUN click.
+    GroupPreview {
+        result: Result<GroupPreviewData, String>,
+        confirm: bool,
+    },
+    /// A finished GROUP SYNC push, aggregated across every sink pushed.
+    GroupDone(Result<GroupSyncResult, String>),
+}
+
+/// The result of planning a GROUP SYNC push, built off the UI thread. `group`
+/// is already filtered to the sinks that were selected when the plan started.
+struct GroupPreviewData {
+    group: SyncGroup,
+    rows: Vec<review::ReviewRow>,
+    added: usize,
+    removed: usize,
+    sink_count: usize,
+    /// Sinks the plan would empty of their current contents, `(sink, live)`.
+    wholesale_sinks: Vec<(String, u64)>,
+}
+
+/// The aggregated outcome of a GROUP SYNC push across every sink pushed.
+/// Per-file problems are not carried here — they arrive as `Msg::Progress`
+/// events and accumulate in `TransferView::run_problems` like every other
+/// command's, so `drain` folds them in when this message lands.
+struct GroupSyncResult {
+    main: String,
+    copied: u64,
+    deleted: u64,
+    errors: u64,
+    cancelled: bool,
+    /// Sinks that failed outright, as ready-to-display `"sink: error"` lines.
+    failures: Vec<String>,
+    /// Sinks a cancel cut short before they were reached — still worth naming,
+    /// since their backups are now stale.
+    skipped: Vec<String>,
 }
 
 /// The result of a DIFF preview: the paired rows and each side's header.
@@ -539,6 +673,21 @@ pub struct TransferView {
     /// when neither the target nor any of these already has its content.
     extra_refs: Vec<String>,
     command: Command,
+    /// GROUP SYNC: the sync group whose main is the current source, if any —
+    /// refreshed whenever the source or the repo list changes. `None` hides
+    /// the GROUP SYNC command entirely.
+    current_group: Option<SyncGroup>,
+    /// GROUP SYNC: which of `current_group`'s sinks the next push includes.
+    /// Reset to every sink whenever `current_group` changes.
+    selected_sinks: Vec<String>,
+    /// GROUP SYNC preview: sinks the plan would empty of their current
+    /// contents, `(sink, files it holds now)` — mirrors MIRROR's warning, but
+    /// per sink since a group push can span several.
+    wholesale_sinks: Vec<(String, u64)>,
+    /// GROUP SYNC: the group (already filtered to the selected sinks) a raised
+    /// confirmation authorises, captured when its plan landed. PROCEED pushes
+    /// *this*, not whatever is selected when the button is clicked.
+    pending_group_confirm: Option<SyncGroup>,
     /// Whether COPY/MOVE goes into a repo or a picked folder.
     destination: Destination,
     /// Absolute path of the export folder (Destination::Folder).
@@ -635,6 +784,10 @@ enum Act {
     SetPairing(DiffPairing),
     /// Execute a single DIFF board row action.
     Board(crate::diff_board::BoardAction),
+    /// GROUP SYNC: toggle one sink's inclusion in the next push.
+    ToggleSink(String),
+    SelectAllSinks,
+    SelectNoSinks,
 }
 
 impl TransferView {
@@ -647,6 +800,10 @@ impl TransferView {
             target: None,
             extra_refs: Vec::new(),
             command: Command::Copy,
+            current_group: None,
+            selected_sinks: Vec::new(),
+            wholesale_sinks: Vec::new(),
+            pending_group_confirm: None,
             destination: Destination::Repo,
             folder: String::new(),
             select_mode: SelectMode::Exact,
@@ -791,6 +948,7 @@ impl TransferView {
                     Command::Diff => self.pairing_bar(ui, &mut acts),
                     Command::Sync => self.sync_bar(ui, &mut acts),
                     Command::Mirror => self.mirror_bar(ui),
+                    Command::GroupSync => self.group_sinks_bar(ui, &mut acts),
                     _ => {
                         self.dest_bar(ui, &mut acts);
                         match self.destination {
@@ -904,8 +1062,32 @@ impl TransferView {
                 self.extra_refs.retain(|r| self.repos.contains(r));
                 self.loaded = true;
                 self.error = None;
+                self.refresh_group(store);
             }
             Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    /// Re-resolve GROUP SYNC's group from the current source: the sync group
+    /// (if any) whose main *is* the source, and every one of its sinks
+    /// selected by default. Falls back off GROUP SYNC when the source no
+    /// longer names a group's main (e.g. the group was disbanded elsewhere).
+    fn refresh_group(&mut self, store: &Store) {
+        self.current_group = self.source.as_deref().and_then(|src| {
+            store
+                .list_sync_groups()
+                .ok()?
+                .into_iter()
+                .map(|(_, group)| group)
+                .find(|group| group.main == src)
+        });
+        self.selected_sinks = self
+            .current_group
+            .as_ref()
+            .map(|g| g.sinks.iter().map(|s| s.repo.clone()).collect())
+            .unwrap_or_default();
+        if self.command == Command::GroupSync && self.current_group.is_none() {
+            self.command = Command::Copy;
         }
     }
 
@@ -934,8 +1116,8 @@ impl TransferView {
             });
 
             // TARGET (only when copying/moving into a repo — a folder export has
-            // no target): the repos that aren't the source, blue when picked.
-            if self.destination == Destination::Repo {
+            // no target, and GROUP SYNC's targets are the SINKS panel below).
+            if self.destination == Destination::Repo && self.command != Command::GroupSync {
                 let tgt: Vec<String> = self
                     .repos
                     .iter()
@@ -1056,13 +1238,16 @@ impl TransferView {
     }
 
     /// Whether REVIEW/RUN can act: a source is picked, the destination is
-    /// resolved (a target repo, or a non-blank export folder), and nothing is
-    /// already running.
+    /// resolved (a target repo, a non-blank export folder, or — for GROUP
+    /// SYNC — at least one sink selected), and nothing is already running.
     fn ready(&self) -> bool {
         // A preview in flight disables REVIEW/RUN too, so a second click cannot
         // launch an overlapping worker.
         if self.running || self.previewing || self.source.is_none() {
             return false;
+        }
+        if self.command == Command::GroupSync {
+            return self.current_group.is_some() && !self.selected_sinks.is_empty();
         }
         match self.destination {
             Destination::Repo => self.target.is_some(),
@@ -1071,44 +1256,44 @@ impl TransferView {
     }
 
     fn command_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(
-            ui,
-            "COMMAND — COPY, MOVE, SYNC, MIRROR OR DIFF",
-            theme::ORANGE,
-            |ui| {
-                ui.horizontal(|ui| {
-                    for cmd in [
-                        Command::Copy,
-                        Command::Move,
-                        Command::Sync,
-                        Command::Mirror,
-                        Command::Diff,
-                    ] {
-                        let sel = self.command == cmd;
-                        let accent = if cmd.destructive() {
-                            theme::RED
-                        } else {
-                            theme::AMBER
-                        };
-                        let fill = if sel { accent } else { theme::PANEL };
-                        // Unselected pills sit on the dark panel — black text would
-                        // vanish there, so they carry their accent color instead.
-                        let col = if sel { theme::BLACK } else { accent };
-                        let (short, verbose) = cmd.tooltip();
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new(cmd.label()).color(col)).fill(fill),
-                            )
-                            .explain(self.verbosity, short, verbose)
-                            .clicked()
-                        {
-                            acts.push(Act::SetCommand(cmd));
-                        }
+        let has_group = self.current_group.is_some();
+        let title = if has_group {
+            "COMMAND — COPY, MOVE, SYNC, MIRROR, GROUP SYNC OR DIFF"
+        } else {
+            "COMMAND — COPY, MOVE, SYNC, MIRROR OR DIFF"
+        };
+        crate::lcars::section_lcars(ui, title, theme::ORANGE, |ui| {
+            ui.horizontal(|ui| {
+                let mut cmds = vec![Command::Copy, Command::Move, Command::Sync, Command::Mirror];
+                // Only offered when the source is a sync group's main —
+                // GROUP SYNC has nothing to push otherwise.
+                if has_group {
+                    cmds.push(Command::GroupSync);
+                }
+                cmds.push(Command::Diff);
+                for cmd in cmds {
+                    let sel = self.command == cmd;
+                    let accent = if cmd.destructive() {
+                        theme::RED
+                    } else {
+                        theme::AMBER
+                    };
+                    let fill = if sel { accent } else { theme::PANEL };
+                    // Unselected pills sit on the dark panel — black text would
+                    // vanish there, so they carry their accent color instead.
+                    let col = if sel { theme::BLACK } else { accent };
+                    let (short, verbose) = cmd.tooltip();
+                    if ui
+                        .add(egui::Button::new(RichText::new(cmd.label()).color(col)).fill(fill))
+                        .explain(self.verbosity, short, verbose)
+                        .clicked()
+                    {
+                        acts.push(Act::SetCommand(cmd));
                     }
-                });
-                self.hint(ui);
-            },
-        );
+                }
+            });
+            self.hint(ui);
+        });
     }
 
     fn subdir_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
@@ -1343,6 +1528,10 @@ impl TransferView {
                 "Make the target an exact copy of the source: copy what it lacks and delete \
                  everything the source does not have."
             }
+            Command::GroupSync => {
+                "Push the source (this group's main) to the sinks selected below, each in its \
+                 own stored mode."
+            }
             Command::Diff => {
                 "Compare the two repos side by side and resolve each difference yourself — \
                  copy, delete, rename or overwrite, one row at a time."
@@ -1370,6 +1559,84 @@ impl TransferView {
                 );
             },
         );
+    }
+
+    /// GROUP SYNC's option bar: which of the group's sinks the next push
+    /// includes, defaulting to all of them. Each sink shows its own stored
+    /// push mode (set on the Repositories tab, not editable here) so the
+    /// selection reads honestly — this panel picks *which* sinks, not *how*.
+    fn group_sinks_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        crate::lcars::section_lcars(ui, "SINKS — WHERE THE MAIN IS PUSHED", theme::BLUE, |ui| {
+            let Some(group) = self.current_group.clone() else {
+                return;
+            };
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("SINKS").color(theme::TEXT).size(12.0));
+                if crate::repo_chip::small_button(ui, "ALL", theme::BLUE)
+                    .explain(
+                        self.verbosity,
+                        "Include every sink",
+                        "Include every sink of this group in the next push.",
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::SelectAllSinks);
+                }
+                if crate::repo_chip::small_button(ui, "NONE", theme::BLUE)
+                    .explain(
+                        self.verbosity,
+                        "Clear the sink selection",
+                        "Deselect every sink (REVIEW/RUN are disabled until at least one is \
+                         picked).",
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::SelectNoSinks);
+                }
+            });
+            crate::repo_chip::chip_row(ui, "xfer_sinks", "", group.sinks.len(), |ui, i| {
+                let sink = &group.sinks[i];
+                let mode = match sink.mode {
+                    SyncMode::AddOnly => "ADD ONLY",
+                    SyncMode::Mirror => "MIRROR",
+                };
+                let sel = self.selected_sinks.iter().any(|s| s == &sink.repo);
+                let accent = if sink.mode == SyncMode::Mirror {
+                    theme::RED
+                } else {
+                    theme::BLUE
+                };
+                let chip = crate::repo_chip::repo_chip(
+                    ui,
+                    &format!("{} · {mode}", sink.repo),
+                    sel,
+                    accent,
+                    None,
+                );
+                if chip
+                    .name
+                    .explain(
+                        self.verbosity,
+                        "Include this sink in the push",
+                        "Toggle whether this sink is included when GROUP SYNC runs. Its mode \
+                         (ADD ONLY / MIRROR) is set on the Repositories tab.",
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::ToggleSink(sink.repo.clone()));
+                }
+                chip.outer
+            });
+            ui.label(
+                RichText::new(
+                    "Each selected sink pushes in its own stored mode: ADD ONLY copies and \
+                     never deletes; MIRROR also deletes what the main no longer has. The main \
+                     is never changed.",
+                )
+                .color(theme::LILAC)
+                .size(11.0),
+            );
+        });
     }
 
     /// The delete policy the current command runs with: MIRROR always deletes
@@ -1474,7 +1741,14 @@ impl TransferView {
     /// always do, and SYNC does only when DELETE MISSING is on. Drives the red
     /// accent on the confirm dialog.
     fn destructive_run(&self) -> bool {
-        self.command.destructive() || (self.command == Command::Sync && self.sync_delete_missing)
+        self.command.destructive()
+            || (self.command == Command::Sync && self.sync_delete_missing)
+            || (self.command == Command::GroupSync
+                && self.current_group.as_ref().is_some_and(|g| {
+                    g.sinks.iter().any(|s| {
+                        self.selected_sinks.contains(&s.repo) && s.mode == SyncMode::Mirror
+                    })
+                }))
     }
 
     fn action_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
@@ -1565,12 +1839,22 @@ impl TransferView {
         }
         if self.preview.is_empty() {
             ui.add_space(6.0);
-            ui.colored_label(
-                theme::TEXT,
-                "Pick a source, a target and a command, then press REVIEW.",
-            );
+            let hint = if self.command == Command::GroupSync {
+                "Pick at least one sink above, then press REVIEW."
+            } else {
+                "Pick a source, a target and a command, then press REVIEW."
+            };
+            ui.colored_label(theme::TEXT, hint);
             return;
         }
+        // GROUP SYNC's rows span several sinks pushed as one run, not one
+        // target `start` can re-run for a single key — read-only, like the
+        // DIFF board (which offers its own, different, per-row actions).
+        let controls = if self.command == Command::GroupSync {
+            review::RowControls::ReadOnly
+        } else {
+            review::RowControls::Enabled
+        };
         if let Some(review::ReviewAction::Apply(key)) = review::table(
             ui,
             &mut self.review_state,
@@ -1580,7 +1864,7 @@ impl TransferView {
                 source_header: &self.preview_source_header,
                 // Transfer is always two-sided (source → target/folder).
                 target: Some(&self.preview_target_header),
-                controls: review::RowControls::Enabled,
+                controls,
             },
             &mut self.thumbs,
         ) {
@@ -1687,6 +1971,7 @@ impl TransferView {
                 }
                 self.extra_refs.retain(|r| r != &name);
                 self.source = Some(name);
+                self.refresh_group(store);
                 self.clear_preview();
             }
             Act::PickTarget(name) => {
@@ -1745,7 +2030,9 @@ impl TransferView {
                 // captured config) once the plan lands with real counts. DIFF
                 // has no batch RUN, so it never reaches here.
                 self.reset_run();
-                if let Some(config) = self.capture_run_config() {
+                if self.command == Command::GroupSync {
+                    self.spawn_group_preview(store, true);
+                } else if let Some(config) = self.capture_run_config() {
                     let confirm = Box::new(config.clone());
                     self.spawn_review_preview(store, config, Some(confirm));
                 }
@@ -1753,11 +2040,15 @@ impl TransferView {
             Act::CancelConfirm => {
                 self.confirm = None;
                 self.pending_confirm = None;
+                self.pending_group_confirm = None;
             }
             Act::Confirm => {
                 self.confirm = None;
-                // Run the config the confirmation was built for, not live state.
-                if let Some(config) = self.pending_confirm.take() {
+                // Run the config/group the confirmation was built for, not
+                // live state.
+                if let Some(group) = self.pending_group_confirm.take() {
+                    self.start_group_sync(store, group);
+                } else if let Some(config) = self.pending_confirm.take() {
                     self.start(store, *config, None);
                 }
             }
@@ -1778,11 +2069,33 @@ impl TransferView {
             }) => self.open_inspect(store, &left_rel, &right_rel),
             Act::Board(action) => self.start_board_action(store, action),
             Act::CancelRun => self.cancel.cancel(),
+            Act::ToggleSink(name) => {
+                if let Some(pos) = self.selected_sinks.iter().position(|s| s == &name) {
+                    self.selected_sinks.remove(pos);
+                } else {
+                    self.selected_sinks.push(name);
+                }
+                self.clear_preview();
+            }
+            Act::SelectAllSinks => {
+                self.selected_sinks = self
+                    .current_group
+                    .as_ref()
+                    .map(|g| g.sinks.iter().map(|s| s.repo.clone()).collect())
+                    .unwrap_or_default();
+                self.clear_preview();
+            }
+            Act::SelectNoSinks => {
+                self.selected_sinks.clear();
+                self.clear_preview();
+            }
         }
     }
 
     fn clear_preview(&mut self) {
         self.pending_confirm = None;
+        self.pending_group_confirm = None;
+        self.wholesale_sinks.clear();
         self.preview.clear();
         self.diff_rows.clear();
         self.board_state.page = 0;
@@ -1874,6 +2187,10 @@ impl TransferView {
             self.run_preview_diff(store, &source);
             return;
         }
+        if self.command == Command::GroupSync {
+            self.spawn_group_preview(store, false);
+            return;
+        }
         // Every other command feeds the review board. Plan off the UI thread.
         if let Some(config) = self.capture_run_config() {
             self.spawn_review_preview(store, config, None);
@@ -1887,7 +2204,9 @@ impl TransferView {
         // DIFF has no batch run — it is applied row by row. `Command::Diff` is
         // in `repo_to_repo()`, so without this it would build a bogus Sync
         // config (reachable via the R shortcut, which fires regardless of mode).
-        if self.command.is_diff() {
+        // GROUP SYNC has its own plan/run pipeline (`spawn_group_preview` /
+        // `start_group_sync`) since it targets several sinks, not one target.
+        if self.command.is_diff() || self.command == Command::GroupSync {
             return None;
         }
         let source = self.source.clone()?;
@@ -1934,6 +2253,168 @@ impl TransferView {
     /// Plan a review-board preview on a worker thread. `confirm`, when set,
     /// rides through to the result: the RUN confirmation is raised (for that
     /// captured config) once the plan lands with real counts.
+    /// Plan a GROUP SYNC push on a worker thread: every sink currently
+    /// selected, filtered from the full group. `confirm` carries through to
+    /// the result — when set, the RUN confirmation is raised once the plan
+    /// lands with real counts.
+    fn spawn_group_preview(&mut self, store: &Arc<Store>, confirm: bool) {
+        let Some(group) = self.current_group.clone() else {
+            return;
+        };
+        let group = SyncGroup {
+            main: group.main,
+            sinks: group
+                .sinks
+                .into_iter()
+                .filter(|s| self.selected_sinks.contains(&s.repo))
+                .collect(),
+        };
+        if group.sinks.is_empty() {
+            return;
+        }
+        let filter = self.filter_string();
+        let store = Arc::clone(store);
+        let tx = self.tx.clone();
+        self.previewing = true;
+        self.status = Some("planning…".to_string());
+        std::thread::spawn(move || {
+            let result = build_group_preview(&store, &group, filter.as_deref());
+            let _ = tx.send(Msg::GroupPreview { result, confirm });
+        });
+    }
+
+    /// Fold a finished GROUP SYNC plan into the board and, if this plan was
+    /// for a RUN click, raise the confirmation now that the real counts are
+    /// known.
+    fn apply_group_preview(&mut self, result: Result<GroupPreviewData, String>, confirm: bool) {
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
+        };
+        self.preview_totals = [outcome.added, outcome.removed, 0];
+        self.preview_source_header = outcome.group.main.clone();
+        self.preview_target_header = "SINKS".to_string();
+        self.wholesale_sinks = outcome.wholesale_sinks;
+        let mut rows = outcome.rows;
+        review::sort(&mut rows, &self.review_state);
+        self.preview = rows;
+        self.status = Some(format!(
+            "{} file(s) to copy, {} to delete across {} sink(s).",
+            outcome.added, outcome.removed, outcome.sink_count
+        ));
+        self.error = None;
+        if confirm {
+            // Confirm and push the group that was *planned*, captured here —
+            // the selection may have changed while the scan ran.
+            self.raise_group_confirm(&outcome.group);
+            self.pending_group_confirm = Some(outcome.group);
+        }
+    }
+
+    /// Build the GROUP SYNC RUN confirmation from the plan just applied. A
+    /// confirmation that cannot say how much it deletes is not one the user
+    /// can weigh.
+    fn raise_group_confirm(&mut self, group: &SyncGroup) {
+        let [copies, deletes, _] = self.preview_totals;
+        let mut prompt = format!(
+            "Push '{}' to {} sink(s): copy {copies} file(s)",
+            group.main,
+            group.sinks.len()
+        );
+        if group.sinks.iter().any(|s| s.mode == SyncMode::Mirror) {
+            prompt.push_str(&format!(
+                " and DELETE {deletes} file(s) from the mirror sink(s), which cannot be undone"
+            ));
+        }
+        prompt.push_str(". The main is never changed.");
+        if !self.wholesale_sinks.is_empty() {
+            // Say what actually happens: nothing the sink holds today
+            // survives, and the main's content takes its place. It is not
+            // left empty — claiming that would be false, and a confirmation
+            // nobody trusts is worse than none.
+            let listed: Vec<String> = self
+                .wholesale_sinks
+                .iter()
+                .map(|(sink, live)| format!("{sink} (all {live} of its files)"))
+                .collect();
+            prompt.push_str(&format!(
+                "\n\nWARNING: this replaces the entire current contents of {} with the main's \
+                 content — nothing they hold today survives. If that is not what you expect, \
+                 check the main is complete first.",
+                listed.join(", ")
+            ));
+        }
+        self.confirm = Some(prompt);
+    }
+
+    /// Push `group` (already filtered to the sinks that were selected when it
+    /// was planned) to every one of its sinks, off the UI thread. Live
+    /// progress flows through the same `ChannelDiffProgress` → `run_problems`
+    /// path every other command uses; only the terminal aggregation across
+    /// sinks is GROUP SYNC's own.
+    fn start_group_sync(&mut self, store: &Arc<Store>, group: SyncGroup) {
+        let filter = self.filter_string();
+        let store = Arc::clone(store);
+        let tx = self.tx.clone();
+        self.cancel = CancellationToken::new();
+        let cancel = self.cancel.clone();
+        self.running = true;
+        self.status = Some(format!("syncing '{}'…", group.main));
+        self.clear_preview();
+        self.reset_run();
+
+        std::thread::spawn(move || {
+            // Re-checked here, not just at plan time: the main could have
+            // been rescanned to empty in the gap between REVIEW and RUN.
+            if let Err(e) = guard_mirror_source(&store, &group) {
+                let _ = tx.send(Msg::GroupDone(Err(e.to_string())));
+                return;
+            }
+            let progress = ChannelDiffProgress { tx: tx.clone() };
+            let run = DiffRun::new(&progress, &cancel);
+            let (mut copied, mut deleted, mut errors) = (0u64, 0u64, 0u64);
+            let mut failures = Vec::new();
+            let mut skipped = Vec::new();
+            let mut cancelled = false;
+            for sink in &group.sinks {
+                if run.cancel.is_cancelled() {
+                    cancelled = true;
+                    skipped.push(sink.repo.clone());
+                    continue;
+                }
+                match diff_sync(
+                    &store,
+                    &group.main,
+                    &sink.repo,
+                    true,
+                    delete_mode(sink.mode),
+                    filter.as_deref(),
+                    &run,
+                ) {
+                    Ok(stats) => {
+                        copied += stats.copied;
+                        deleted += stats.deleted;
+                        errors += stats.errors;
+                        cancelled |= stats.cancelled;
+                    }
+                    Err(e) => failures.push(format!("{}: {e}", sink.repo)),
+                }
+            }
+            let _ = tx.send(Msg::GroupDone(Ok(GroupSyncResult {
+                main: group.main,
+                copied,
+                deleted,
+                errors,
+                cancelled,
+                failures,
+                skipped,
+            })));
+        });
+    }
+
     fn spawn_review_preview(
         &mut self,
         store: &Arc<Store>,
@@ -2338,6 +2819,43 @@ impl TransferView {
                 Msg::ReviewPreview { result, confirm } => {
                     self.previewing = false;
                     self.apply_review_preview(result, confirm);
+                }
+                Msg::GroupPreview { result, confirm } => {
+                    self.previewing = false;
+                    self.apply_group_preview(result, confirm);
+                }
+                Msg::GroupDone(result) => {
+                    self.running = false;
+                    log::info!("group sync finished: {}", result.is_ok());
+                    match result {
+                        Ok(r) => {
+                            let mut report = crate::run_result::RunReport::new(format!(
+                                "Sync group '{}'",
+                                r.main
+                            ))
+                            .count("copied", r.copied)
+                            .count("deleted", r.deleted)
+                            .cancelled(r.cancelled)
+                            .problems(std::mem::take(&mut self.run_problems))
+                            .problems(r.failures);
+                            if !r.skipped.is_empty() {
+                                report = report.note(format!(
+                                    "{} sink(s) were never pushed and are now stale: {}",
+                                    r.skipped.len(),
+                                    r.skipped.join(", ")
+                                ));
+                            }
+                            // `errors` counts failures the capped list may not
+                            // hold all of; keep the true count visible.
+                            if r.errors > report.problem_count() {
+                                report = report.count("files that failed to copy", r.errors);
+                            }
+                            self.status = Some(report.headline());
+                            self.error = None;
+                            self.result.open(report);
+                        }
+                        Err(e) => self.error = Some(e),
+                    }
                 }
                 Msg::Done(result) => {
                     self.running = false;
@@ -2958,6 +3476,288 @@ mod ui_tests {
         );
     }
 
+    /// GROUP SYNC is only offered when the source names a sync group's main.
+    #[test]
+    fn group_sync_only_offered_when_source_is_a_group_main() {
+        let (_tmp, store) = sample_store();
+        store.create_sync_group("grp", "source").expect("group");
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::AddOnly)
+            .expect("sink");
+        let store2 = Arc::clone(&store);
+        let h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+        });
+        assert!(
+            h.query_by_label("GROUP SYNC").is_some(),
+            "GROUP SYNC is offered when the source is a group's main"
+        );
+    }
+
+    #[test]
+    fn group_sync_hidden_when_the_source_has_no_group() {
+        let (_tmp, store) = sample_store();
+        let store2 = Arc::clone(&store);
+        let h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+        });
+        assert!(
+            h.query_by_label("GROUP SYNC").is_none(),
+            "GROUP SYNC is hidden when the source has no group"
+        );
+    }
+
+    /// Entering GROUP SYNC hides the single TARGET picker (it has several
+    /// targets, one per sink) and shows a SINKS panel instead, defaulting to
+    /// every sink selected.
+    #[test]
+    fn group_sync_hides_target_and_shows_sinks() {
+        let (_tmp, store) = sample_store();
+        store.create_sync_group("grp", "source").expect("group");
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::Mirror)
+            .expect("sink");
+        let store2 = Arc::clone(&store);
+        let h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+            v.command = Command::GroupSync;
+        });
+        assert!(
+            h.query_by_label("TARGET").is_none(),
+            "the single TARGET picker is hidden in GROUP SYNC"
+        );
+        assert!(
+            h.query_by_label("SINKS").is_some(),
+            "the SINKS panel is shown"
+        );
+        assert!(
+            h.query_by_label_contains("target · MIRROR").is_some(),
+            "the sink chip names the sink and its stored mode"
+        );
+        assert_eq!(
+            h.state().selected_sinks,
+            vec!["target".to_string()],
+            "every sink is selected by default"
+        );
+    }
+
+    /// REVIEW plans every selected sink and folds the result into the shared
+    /// review board, exactly like every other command's preview.
+    #[test]
+    fn group_sync_review_shows_planned_copies() {
+        let (_tmp, store) = sample_store();
+        store.create_sync_group("grp", "source").expect("group");
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::AddOnly)
+            .expect("sink");
+        for repo in ["source", "target"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .expect("scan");
+        }
+        let store2 = Arc::clone(&store);
+        let mut h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+            v.command = Command::GroupSync;
+        });
+        h.get_by_label("REVIEW").click_accesskit();
+        settle_preview(&mut h);
+        assert_eq!(
+            h.state().preview_totals[0],
+            2,
+            "both source files are new to the empty sink"
+        );
+        assert!(
+            h.state()
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("1 sink"),
+            "status names the sink count: {:?}",
+            h.state().status
+        );
+    }
+
+    /// RUN plans, confirms (naming the sink count), and on PROCEED actually
+    /// pushes the main's content into the sink on a background thread.
+    #[test]
+    fn group_sync_run_pushes_to_the_sink() {
+        let (tmp, store) = sample_store();
+        store.create_sync_group("grp", "source").expect("group");
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::AddOnly)
+            .expect("sink");
+        for repo in ["source", "target"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .expect("scan");
+        }
+        let store2 = Arc::clone(&store);
+        let mut h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+            v.command = Command::GroupSync;
+        });
+        h.get_by_label("RUN").click_accesskit();
+        settle_preview(&mut h);
+        assert!(
+            h.state().confirm.is_some(),
+            "RUN raises a confirmation once the plan lands"
+        );
+        assert!(
+            h.state()
+                .confirm
+                .as_deref()
+                .unwrap_or_default()
+                .contains("1 sink"),
+            "the confirmation names the sink count: {:?}",
+            h.state().confirm
+        );
+        h.get_by_label("PROCEED").click_accesskit();
+        // The running spinner keeps requesting repaints, so `run` (step-capped)
+        // would overflow — step manually until the push finishes.
+        for _ in 0..100 {
+            h.step();
+            if !h.state().running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!h.state().running, "the push finished");
+        assert!(
+            tmp.path().join("target").join("holiday.jpg").exists(),
+            "the file actually landed in the sink"
+        );
+    }
+
+    /// The empty-main-mirror refusal (`guard_mirror_source`) survives bypassing
+    /// `plan_group_sync`/`run_group_sync` to call `plan_sync`/`diff_sync`
+    /// directly (done so the filter can be threaded through).
+    #[test]
+    fn group_sync_refuses_to_mirror_from_an_empty_main() {
+        let (_tmp, store) = sample_store();
+        store.create_sync_group("grp", "source").expect("group");
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::Mirror)
+            .expect("sink");
+        // The sink is scanned; the main ("source") never is — an empty main.
+        dedup_core::update::update_repo(
+            &store,
+            "target",
+            1,
+            &dedup_core::update::NoProgress,
+            &CancellationToken::new(),
+        )
+        .expect("scan");
+        let store2 = Arc::clone(&store);
+        let mut h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+            v.command = Command::GroupSync;
+        });
+        h.get_by_label("REVIEW").click_accesskit();
+        settle_preview(&mut h);
+        assert!(
+            h.state().error.is_some(),
+            "an empty MIRROR main is refused, not silently pushed"
+        );
+        assert!(h.state().preview.is_empty(), "nothing is planned");
+    }
+
+    /// Deselecting a sink narrows the plan to the sinks still selected — the
+    /// SINKS panel actually filters what GROUP SYNC pushes to.
+    #[test]
+    fn group_sync_deselecting_a_sink_narrows_the_plan() {
+        let (_tmp, store) = sample_store();
+        store.create_sync_group("grp", "source").expect("group");
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::AddOnly)
+            .expect("sink");
+        let other_dir = _tmp.path().join("other_sink");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        store
+            .create_repo("other_sink", &other_dir.to_string_lossy())
+            .unwrap();
+        store
+            .add_sync_sink("grp", "other_sink", dedup_core::store::SyncMode::AddOnly)
+            .expect("sink");
+        for repo in ["source", "target", "other_sink"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .expect("scan");
+        }
+        let store2 = Arc::clone(&store);
+        let mut h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+            v.command = Command::GroupSync;
+            v.selected_sinks = vec!["target".to_string()];
+        });
+        h.get_by_label("REVIEW").click_accesskit();
+        settle_preview(&mut h);
+        assert!(
+            h.state()
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("1 sink"),
+            "only the selected sink is planned: {:?}",
+            h.state().status
+        );
+    }
+
+    /// The FILTER wizard actually narrows a GROUP SYNC plan, not just the
+    /// generic COPY/MOVE/SYNC/MIRROR path — it would be worse to show a
+    /// working-looking filter panel that GROUP SYNC silently ignored.
+    #[test]
+    fn group_sync_filter_narrows_the_plan() {
+        let (_tmp, store) = sample_store();
+        store.create_sync_group("grp", "source").expect("group");
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::AddOnly)
+            .expect("sink");
+        for repo in ["source", "target"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .expect("scan");
+        }
+        let store2 = Arc::clone(&store);
+        let mut h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+            v.command = Command::GroupSync;
+        });
+        h.state_mut().filter.set_expression("name:holiday");
+        // The FILTER's live match-count keeps requesting repaints, so `run`
+        // (step-capped) would overflow — step manually past the debounce.
+        for _ in 0..5 {
+            h.step();
+        }
+        h.get_by_label("REVIEW").click_accesskit();
+        settle_preview(&mut h);
+        assert_eq!(
+            h.state().preview_totals[0],
+            1,
+            "only the filter-matching file is planned, not both source files"
+        );
+    }
+
     /// Build a headless harness showing the Transfer view over `store`, driven
     /// by the given `setup` (which runs once, before the first frame, to select
     /// repos / destination / etc.).
@@ -3200,6 +4000,61 @@ mod ui_tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("files_tab.png");
+        let img = harness.render().expect("wgpu render failed");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Doc screenshot: GROUP SYNC selected on a group's main, with the TARGET
+    /// picker hidden and the SINKS multiselect (one ADD ONLY, one MIRROR sink)
+    /// shown instead, to `docs/screenshots/transfer_group_sync.png`. First
+    /// render of this layout — the Overview-screen work this session found a
+    /// real layout bug that only showed up once actually rendered, not from
+    /// label-query tests alone, so this is checked visually before shipping.
+    /// Run with `--ignored`.
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_transfer_group_sync() {
+        let (_tmp, store) = sample_store();
+        store.create_sync_group("grp", "source").expect("group");
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::AddOnly)
+            .expect("sink");
+        let other_dir = _tmp.path().join("archive");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        store
+            .create_repo("archive", &other_dir.to_string_lossy())
+            .unwrap();
+        store
+            .add_sync_sink("grp", "archive", dedup_core::store::SyncMode::Mirror)
+            .expect("sink");
+
+        let mut view = TransferView::new();
+        view.sync_repos(&store);
+        view.source = Some("source".to_string());
+        view.refresh_group(&store);
+        view.command = Command::GroupSync;
+
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 620.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut TransferView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), None);
+                },
+                view,
+            );
+        harness.run();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("transfer_group_sync.png");
         let img = harness.render().expect("wgpu render failed");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());

@@ -20,8 +20,8 @@ use crate::diff::{
 use crate::store::{Store, SyncGroup, SyncMode};
 
 /// One repository's content overlap with a reference repository, compared by
-/// content (paths ignored). Powers the Repo Sync tab's "diff every repo against
-/// one" overview.
+/// content (paths ignored). No current GUI caller (the many-repo overview it
+/// powered was removed with the Repo Sync tab); kept as tested library API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoOverview {
     pub repo: String,
@@ -74,7 +74,7 @@ pub fn diff_overview(
 }
 
 /// The delete policy a group's mode implies for each sink.
-fn delete_mode(mode: SyncMode) -> SyncDelete {
+pub fn delete_mode(mode: SyncMode) -> SyncDelete {
     match mode {
         SyncMode::AddOnly => SyncDelete::None,
         // A content mirror: whatever the main does not have goes.
@@ -94,7 +94,11 @@ fn delete_mode(mode: SyncMode) -> SyncDelete {
 /// refuses the *entire* push (including its add-only sinks) rather than push
 /// some sinks from a main that looks broken. An empty main is a strong "stop and
 /// look" signal, so the whole run waits until the main is scanned.
-fn guard_mirror_source(store: &Store, group: &SyncGroup) -> Result<(), DiffError> {
+///
+/// Public so a caller that plans/pushes a *subset* of a group's sinks directly
+/// (bypassing [`plan_group_sync`]/[`run_group_sync`], e.g. to thread through a
+/// filter those two don't accept) can still not lose this refusal.
+pub fn guard_mirror_source(store: &Store, group: &SyncGroup) -> Result<(), DiffError> {
     if !group.sinks.iter().any(|s| s.mode == SyncMode::Mirror) {
         return Ok(());
     }
