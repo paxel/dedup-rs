@@ -14,6 +14,14 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   bare cards. The section header folds the whole group away, replacing the separate
   `SINK(S) IN '…'` chevron.
 
+### Removed
+
+- The GUI pixel-diff snapshot test (`dupes_view_snapshot`). Its baseline directory was
+  gitignored, so no baseline was ever committed and the test could not pass on any machine
+  but the one that last generated it; being `#[ignore]`d, the drift went unnoticed.
+  Rendering is still verified by the `doc_screenshot_*` / `render_*` tests plus geometric
+  layout asserts.
+
 ### Fixed
 
 - The **GROUP SYNC** sink chips drew the wrong identicon: the push mode was folded into the

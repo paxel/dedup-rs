@@ -11,9 +11,12 @@
   diff's merged content index are fine at ~10⁵ files; revisit content-index memory
   (`HashMap<(u64,[u8;32]), _>` across all references) and timeline streaming at 10⁷.
 - **Testing discipline** (standing practice): every GUI feature ships with kittest
-  geometric tests + an `--ignored` render snapshot; every core feature with temp-repo
-  integration tests; store format changes must include a legacy-decode test (pattern:
-  `store.rs::v1_entries_decode_and_flag_images_stale`).
+  geometric tests + an `--ignored` render test that writes a PNG to look at; every core
+  feature with temp-repo integration tests; store format changes must include a
+  legacy-decode test (pattern: `store.rs::v1_entries_decode_and_flag_images_stale`).
+  The pixel-diff snapshot test was removed on 2026-07-28: its baseline was gitignored and
+  so never committed, making it unpassable on any machine but the one that last generated
+  it — and being `#[ignore]`d, the drift went unnoticed for 22 days.
 
 ## A usability
 - **review pane per-row diff button** opening the lightbox diff view (for PURGE

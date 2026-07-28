@@ -6737,33 +6737,6 @@ mod ui_tests {
         );
     }
 
-    /// Image-diff regression test against `tests/snapshots/dupes_view.png`.
-    /// Rendered with wgpu (lavapipe headless). Regenerate the baseline after an
-    /// intentional visual change with:
-    ///   UPDATE_SNAPSHOTS=1 cargo test -p dedup-gui dupes_view_snapshot -- --ignored
-    /// Ignored by default because the baseline is renderer-specific (commit the
-    /// baseline produced on your machine).
-    #[test]
-    #[ignore = "renderer-specific image snapshot; run explicitly"]
-    fn dupes_view_snapshot() {
-        let (_tmp, store) = sample_store(&SAMPLE_REPOS);
-        let mut view = DupesView::new();
-        let mut init = false;
-        let mut harness = Harness::builder()
-            .with_size(egui::vec2(1120.0, 260.0))
-            .wgpu()
-            .build_ui(move |ui| {
-                if !init {
-                    crate::icon::install(ui.ctx());
-                    crate::theme::apply(ui.ctx());
-                    init = true;
-                }
-                view.show(ui, &store, TooltipVerbosity::default());
-            });
-        harness.run();
-        harness.snapshot("dupes_view");
-    }
-
     /// Renders the audio lightbox's ID3 tag editor to `target/dupes_tags.png`.
     #[test]
     #[ignore = "renders a PNG for manual inspection"]
