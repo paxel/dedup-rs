@@ -149,6 +149,9 @@ struct FileRow {
 
 pub struct BrowseView {
     repos: Vec<String>,
+    /// Repos that are the main of a sync group, for the chip badge. Refreshed
+    /// with `repos` whenever the tab is shown.
+    mains: std::collections::HashSet<String>,
     /// Repo name → its absolute root, so a selected file's on-disk path can be
     /// resolved (`root/rel`) only when the preview dock actually needs it.
     roots: HashMap<String, String>,
@@ -245,6 +248,7 @@ impl BrowseView {
     pub fn new() -> Self {
         Self {
             repos: Vec::new(),
+            mains: std::collections::HashSet::new(),
             roots: HashMap::new(),
             loaded: false,
             repo: None,
@@ -293,6 +297,7 @@ impl BrowseView {
             Ok(list) => {
                 // Sinks are browsed through their group's main, not directly.
                 let sinks = store.sink_repo_names().unwrap_or_default();
+                self.mains = store.main_repo_names().unwrap_or_default();
                 self.repos = list
                     .iter()
                     .map(|(n, _, _)| n.clone())
@@ -524,6 +529,7 @@ impl BrowseView {
 
         // Repo picker (single repo), amber when selected.
         let repos = self.repos.clone();
+        let mains = self.mains.clone();
         let mut picked: Option<String> = None;
         crate::lcars::section_lcars(
             ui,
@@ -533,7 +539,14 @@ impl BrowseView {
                 crate::repo_chip::chip_row(ui, "browse_repo", "", repos.len(), |ui, i| {
                     let name = &repos[i];
                     let sel = self.repo.as_deref() == Some(name.as_str());
-                    let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::AMBER, None);
+                    let chip = crate::repo_chip::repo_chip(
+                        ui,
+                        name,
+                        sel,
+                        theme::AMBER,
+                        mains.contains(name),
+                        None,
+                    );
                     if chip
                         .name
                         .explain(

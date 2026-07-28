@@ -1,8 +1,9 @@
 //! The shared repo chip: a per-repo identicon + name grouped in a bordered
 //! pill, accent-filled when selected. Every tab's repo selector renders repos
-//! with this one widget, so a repo looks and reads the same everywhere. The
-//! Duplicates tab passes a lock state, which adds a padlock as a third grouped
-//! item; every other tab shows just the identicon + name.
+//! with this one widget, so a repo looks and reads the same everywhere. A repo
+//! that is the main of a sync group carries a star badge; the Duplicates tab
+//! additionally passes a lock state, which adds a padlock as a further grouped
+//! item.
 
 use crate::icon;
 use crate::theme;
@@ -65,13 +66,18 @@ pub struct RepoChipResponse {
 
 /// Render a repo chip for `name`. When `selected`, the pill is filled with
 /// `accent` and black text; otherwise it's a dark panel with an `accent`
-/// outline and `accent` text. `lock: Some(read_only)` adds a padlock toggle as
-/// a third grouped item (Duplicates only).
+/// outline and `accent` text. `main` adds the sync-group main badge;
+/// `lock: Some(read_only)` adds a padlock toggle (Duplicates only).
+///
+/// `name` must be the repo's registry name and nothing else — the identicon is
+/// hashed from it, so decorating the string (a mode, a count) silently gives the
+/// same repo a different glyph here than on every other tab.
 pub fn repo_chip(
     ui: &mut egui::Ui,
     name: &str,
     selected: bool,
     accent: Color32,
+    main: bool,
     lock: Option<bool>,
 ) -> RepoChipResponse {
     let (fill, fg) = if selected {
@@ -110,6 +116,9 @@ pub fn repo_chip(
                 resp.widget_info(|| {
                     egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, name)
                 });
+                if main {
+                    main_badge(ui);
+                }
                 if let Some(read_only) = lock {
                     lock_resp = Some(lock_button(ui, read_only));
                 }
@@ -208,6 +217,33 @@ pub fn small_button(ui: &mut egui::Ui, label: &str, accent: Color32) -> egui::Re
     )
 }
 
+/// The "this repo is the main of a sync group" badge: a star on a filled amber
+/// tile. Not interactive — it reports state, it does not change it.
+///
+/// Colored independently of the chip accent (like the padlock) so a main always
+/// reads the same whether or not the chip is selected. The vendored Phosphor
+/// subset carries a single star codepoint, so filled-vs-outline is not available
+/// to separate this from the MAKE MAIN *action* button; the filled tile behind
+/// the glyph is what distinguishes them.
+///
+/// Announced as "MAIN" rather than as the raw glyph, so tests and screen readers
+/// get a word.
+fn main_badge(ui: &mut egui::Ui) -> egui::Response {
+    let pad = Vec2::new(5.0, 2.0);
+    let galley = ui.painter().layout_no_wrap(
+        icon::STAR.to_owned(),
+        egui::FontId::proportional(13.0),
+        theme::BLACK,
+    );
+    let (rect, resp) = ui.allocate_exact_size(galley.size() + pad * 2.0, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        ui.painter().rect_filled(rect, 4.0, theme::AMBER);
+        ui.painter().galley(rect.min + pad, galley, theme::BLACK);
+    }
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "MAIN"));
+    resp
+}
+
 /// The padlock toggle inside a Duplicates chip. Closed blue padlock = read-only
 /// (protected); open padlock = deletable. Colored independently of the chip
 /// accent so "locked" always reads the same.
@@ -260,7 +296,7 @@ mod tests {
                         crate::theme::apply(ui.ctx());
                         init = true;
                     }
-                    let r = repo_chip(ui, "Photos", true, theme::ORANGE, Some(true));
+                    let r = repo_chip(ui, "Photos", true, theme::ORANGE, false, Some(true));
                     if r.name.clicked() {
                         *clicked = true;
                     }
@@ -290,10 +326,84 @@ mod tests {
                     crate::theme::apply(ui.ctx());
                     init = true;
                 }
-                let r = repo_chip(ui, "Videos", false, theme::BLUE, None);
+                let r = repo_chip(ui, "Videos", false, theme::BLUE, false, None);
                 assert!(r.lock.is_none(), "no lock response when lock is None");
             });
         harness.run();
         assert!(harness.query_by_label("Videos").is_some());
+        assert!(
+            harness.query_by_label("MAIN").is_none(),
+            "an ordinary repo carries no main badge"
+        );
+    }
+
+    /// A sync-group main is badged, and the badge sits inside the chip frame
+    /// rather than spilling past it — a geometric check, because a label query
+    /// alone passes even when the glyph is painted outside its parent.
+    #[test]
+    fn main_chip_shows_a_badge_inside_the_frame() {
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(300.0, 80.0))
+            .build_ui(move |ui| {
+                if !init {
+                    crate::icon::install(ui.ctx());
+                    crate::theme::apply(ui.ctx());
+                    init = true;
+                }
+                let r = repo_chip(ui, "Photos", false, theme::ORANGE, true, None);
+                let outer = r.outer.rect;
+                ui.ctx()
+                    .memory_mut(|m| m.data.insert_temp("outer".into(), outer));
+            });
+        harness.run();
+
+        let badge = harness.get_by_label("MAIN").rect();
+        let outer: egui::Rect = harness
+            .ctx
+            .memory(|m| m.data.get_temp("outer".into()))
+            .expect("chip frame rect recorded");
+        assert!(
+            outer.contains_rect(badge),
+            "badge {badge:?} must sit inside the chip frame {outer:?}"
+        );
+        assert!(
+            harness.query_by_label("Photos").is_some(),
+            "the name still renders alongside the badge"
+        );
+    }
+
+    /// The badge widens the chip instead of overlapping the name — `chip_row`
+    /// packs rows from the measured frame width, so a badge that did not claim
+    /// space would make chips overlap when a row wraps.
+    #[test]
+    fn main_badge_widens_the_chip() {
+        fn width(main: bool) -> f32 {
+            let mut init = false;
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(300.0, 80.0))
+                .build_ui_state(
+                    move |ui, w: &mut f32| {
+                        if !init {
+                            crate::icon::install(ui.ctx());
+                            crate::theme::apply(ui.ctx());
+                            init = true;
+                        }
+                        *w = repo_chip(ui, "Photos", false, theme::ORANGE, main, None)
+                            .outer
+                            .rect
+                            .width();
+                    },
+                    0.0,
+                );
+            harness.run();
+            *harness.state()
+        }
+        let plain = width(false);
+        let badged = width(true);
+        assert!(
+            badged > plain + 8.0,
+            "badged chip ({badged}) must claim more width than plain ({plain})"
+        );
     }
 }

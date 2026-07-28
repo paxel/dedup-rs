@@ -106,10 +106,11 @@ this tab is where a group is actually *pushed*.
 
 ![GROUP SYNC selected: TARGET hidden, SINKS shown](../screenshots/transfer_group_sync.png)
 
-Pick the group's main as **SOURCE** and the **GROUP SYNC** command appears. Selecting it
-replaces the single **TARGET** picker with a **SINKS** panel — every sink of that main's
-group, defaulting to all selected; **ALL**/**NONE** toggle the whole set, or click a sink to
-include or exclude it. Each sink chip names its stored mode: **ADD ONLY** copies content it
+Pick the group's main as **SOURCE** — its chip carries the **★ MAIN** badge — and the
+**GROUP SYNC** command appears. Selecting it replaces the single **TARGET** picker with a
+**SINKS** panel — every sink of that main's group, defaulting to all selected; **ALL**/**NONE**
+toggle the whole set, or click a sink to include or exclude it. Each sink chip is followed by
+its stored mode as **MODE: …** — **ADD ONLY** copies content it
 lacks and never deletes, so a sink may keep files the main no longer has; **MIRROR** also
 deletes sink content the main does not have, so it ends up holding exactly the main's
 content — those deletions cannot be undone.

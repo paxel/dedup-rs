@@ -204,11 +204,9 @@ pub struct DedupApp {
     dupes: DupesView,
     transfer: TransferView,
     grooming: GroomingView,
-    /// Sync groups as of the last reload: the Repositories list collapses a
-    /// group's sinks under its main.
+    /// Sync groups as of the last reload: the Repositories list frames each
+    /// group — its main and that main's sinks — in one LCARS section.
     groups: Vec<(String, dedup_core::store::SyncGroup)>,
-    /// Mains whose sinks are currently expanded in the repo list.
-    expanded_mains: std::collections::HashSet<String>,
     browse: crate::browse_view::BrowseView,
     /// Last settings written to disk, to avoid rewriting an unchanged file.
     saved_settings: crate::settings::Settings,
@@ -250,7 +248,6 @@ impl DedupApp {
             transfer: TransferView::new(),
             grooming: GroomingView::new(),
             groups: Vec::new(),
-            expanded_mains: std::collections::HashSet::new(),
             browse: crate::browse_view::BrowseView::new(),
             saved_settings: crate::settings::Settings::default(),
             window_size: None,
@@ -1217,12 +1214,24 @@ impl DedupApp {
                     ui.colored_label(theme::TEXT, "No repositories yet — use ADD REPOSITORY.");
                 }
                 for row in &rows {
-                    // A sink is shown under its main, not as a top-level repo.
+                    // A sink is shown inside its group's section, not as a
+                    // top-level repo.
                     if self.sink_of(&row.name).is_some() {
                         continue;
                     }
-                    self.repo_card(ui, row, actions);
-                    self.group_section(ui, &row.name, &rows, actions);
+                    // A group main and its sinks are framed together by one LCARS
+                    // elbow rail, so a group reads as a single block and an
+                    // ungrouped repo as a bare card.
+                    match self.group_of_main(&row.name) {
+                        Some(group_name) => {
+                            let name = group_name.clone();
+                            crate::lcars::section_lcars(ui, &name, theme::GREEN, |ui| {
+                                self.repo_card(ui, row, actions);
+                                self.group_section(ui, &row.name, &rows, actions);
+                            });
+                        }
+                        None => self.repo_card(ui, row, actions),
+                    }
                 }
             });
     }
@@ -1234,12 +1243,21 @@ impl DedupApp {
             .find(|(_, g)| g.sinks.iter().any(|s| s.repo == repo))
     }
 
-    /// After a main's card: a chevron summarising its sinks, and — while
-    /// expanded — the sinks' own cards. Collapsed by default, so a group reads
-    /// as one repository with backups rather than several unrelated repos.
-    /// A main repo's group section: a controls row (mode pill, ADD REPO, UPDATE
-    /// ALL, UNGROUP) shown for any group main — even one with no sinks yet — then,
-    /// when the group has sinks, a collapsible chevron and the sinks' own cards.
+    /// The name of the group `repo` is the *main* of, if any — the title of the
+    /// LCARS section that frames the group.
+    fn group_of_main(&self, repo: &str) -> Option<&String> {
+        self.groups
+            .iter()
+            .find(|(_, g)| g.main == repo)
+            .map(|(n, _)| n)
+    }
+
+    /// The body of a group's LCARS section, drawn under its main's card: the
+    /// group controls (ADD REPO, UPDATE ALL, UNGROUP), shown for any main — even
+    /// one with no sinks yet — then each sink's own card.
+    ///
+    /// There is no chevron here: the enclosing section's caret is the single
+    /// control that folds the whole group away.
     fn group_section(
         &mut self,
         ui: &mut egui::Ui,
@@ -1307,35 +1325,8 @@ impl DedupApp {
         if group.sinks.is_empty() {
             return;
         }
-        let expanded = self.expanded_mains.contains(main);
-        let chevron = if expanded {
-            icon::CARET_DOWN
-        } else {
-            icon::CARET_RIGHT
-        };
-        let label = format!("{chevron} {} SINK(S) IN '{group_name}'", group.sinks.len());
-        ui.horizontal(|ui| {
-            ui.add_space(16.0);
-            if crate::lcars::action_button(ui, &label, true, theme::GREEN)
-                .explain(
-                    self.tooltip_verbosity,
-                    "Show the repositories this one is backed up to",
-                    "This repository is the main of a sync group. Its sinks — the copies it \
-                     is pushed to — are folded away here so the list stays about your \
-                     originals; expand to manage them like any other repository.",
-                )
-                .clicked()
-            {
-                if expanded {
-                    self.expanded_mains.remove(main);
-                } else {
-                    self.expanded_mains.insert(main.to_string());
-                }
-            }
-        });
-        if !expanded {
-            return;
-        }
+        // No chevron here: the enclosing LCARS section's own caret folds the
+        // whole group away, and two competing collapse controls read as a bug.
         for sink in &group.sinks {
             if let Some(row) = rows.iter().find(|r| r.name == sink.repo) {
                 self.repo_card(ui, row, actions);
@@ -1375,6 +1366,11 @@ impl DedupApp {
                             .size(17.0)
                             .strong(),
                     );
+                    // Inside a group section both the main and its sinks are
+                    // cards; the badge is what tells them apart.
+                    if self.group_of_main(&row.name).is_some() {
+                        main_pill(ui, self.tooltip_verbosity);
+                    }
                     status_pills(ui, row, self.tooltip_verbosity);
                     // MIME breakdown, share-sorted, pinned to the top-right. It is
                     // reserved first (right-to-left) so the path — added inside,
@@ -2374,6 +2370,24 @@ fn pill(ui: &mut egui::Ui, text: &str, fill: Color32) -> egui::Response {
         .inner
 }
 
+/// The "main of a sync group" pill next to a repo's name on its card. Matches
+/// the star badge the shared repo chip draws on every other tab, so a main is
+/// recognisable in one glance wherever it appears.
+fn main_pill(ui: &mut egui::Ui, verbosity: TooltipVerbosity) {
+    // Built from the shared `pill` helper, like every other pill on this card,
+    // rather than a second hand-rolled one.
+    let resp = pill(ui, &format!("{} MAIN", icon::STAR), theme::AMBER);
+    // Announced as the bare word, not glyph-plus-word, so it reads the same as
+    // the chip badge everywhere else.
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "MAIN"));
+    resp.explain(
+        verbosity,
+        "The original this group is backed up from",
+        "This repository is the main of a sync group: the original that GROUP SYNC pushes \
+         out to the backup repositories listed under it.",
+    );
+}
+
 /// Render a repo's location + freshness as chips next to its name. Anything
 /// still `Unknown` (not yet probed/checked) draws nothing.
 fn status_pills(ui: &mut egui::Ui, row: &RepoRow, verbosity: TooltipVerbosity) {
@@ -2730,10 +2744,11 @@ mod ui_tests {
         (tmp, DedupApp::new(store))
     }
 
-    /// A sync group's sinks are folded away under their main in the repo list —
-    /// the list is about your originals — and the chevron brings them back.
+    /// A sync group is framed by one LCARS section titled with the group name,
+    /// holding its main and its sinks; the section's own caret folds the whole
+    /// group away. Ungrouped repos stay bare cards outside any section.
     #[test]
-    fn sink_repos_are_collapsed_under_their_main() {
+    fn a_group_is_framed_by_one_section_that_folds_it_away() {
         use egui_kittest::kittest::Queryable;
         let (_tmp, mut app) = sample_app();
         app.store
@@ -2767,23 +2782,48 @@ mod ui_tests {
             "the main is listed"
         );
         assert!(
-            harness.query_all_by_label_contains("Videos").count() == 0,
-            "its sink is folded away"
+            harness.query_by_label_contains("offsite").is_some(),
+            "the group's section is titled with the group name"
         );
-        assert!(
-            harness
-                .query_by_label_contains("SINK(S) IN 'offsite'")
-                .is_some(),
-            "a chevron summarises the folded sinks"
-        );
-
-        harness
-            .get_by_label_contains("SINK(S) IN 'offsite'")
-            .click();
-        harness.run();
         assert!(
             harness.query_all_by_label_contains("Videos").count() > 0,
-            "expanding shows the sink's own card"
+            "the group starts open, so its sink's card is on screen"
+        );
+        assert!(
+            harness.query_by_label("MAIN").is_some(),
+            "the main is badged so it is distinguishable from its sinks"
+        );
+        // The section's caret is the one collapse control: no second chevron.
+        assert!(
+            harness.query_by_label_contains("SINK(S) IN").is_none(),
+            "the old sink-count chevron is gone — one collapse affordance only"
+        );
+
+        // Folding the section takes the whole group — main and sinks — away.
+        harness.get_by_label_contains("offsite").click();
+        harness.run();
+        harness.run();
+        assert!(
+            harness.query_all_by_label_contains("Videos").count() == 0,
+            "collapsing the section hides the group's sinks"
+        );
+    }
+
+    /// A repo that belongs to no group is a bare card: no section rail, no badge.
+    #[test]
+    fn an_ungrouped_repo_has_no_section_and_no_badge() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, app) = sample_app();
+        let harness = render_repos(app);
+        assert!(
+            harness
+                .query_by_label_contains("Automatic Upload")
+                .is_some(),
+            "the repo is listed"
+        );
+        assert!(
+            harness.query_by_label("MAIN").is_none(),
+            "an ungrouped repo carries no MAIN badge"
         );
     }
 
@@ -2840,7 +2880,7 @@ mod ui_tests {
             .add_sync_sink("Automatic Upload", "Videos", SyncMode::AddOnly)
             .expect("add sink");
         app.reload_all();
-        let mut harness = render_repos(app);
+        let harness = render_repos(app);
 
         assert!(
             harness.query_by_label_contains("UNGROUP").is_some(),
@@ -2852,11 +2892,7 @@ mod ui_tests {
             "a grouped repo is not offered as a new main"
         );
 
-        // The sink is folded away; expand it to reach its card.
-        harness
-            .get_by_label_contains("SINK(S) IN 'Automatic Upload'")
-            .click();
-        harness.run();
+        // The group section starts open, so the sink's card is already drawn.
         assert!(
             harness.query_by_label_contains("SINK OUT").is_some(),
             "the expanded sink offers SINK OUT"
@@ -2879,11 +2915,7 @@ mod ui_tests {
             .add_sync_sink("Automatic Upload", "Videos", SyncMode::Mirror)
             .expect("add sink");
         app.reload_all();
-        let mut harness = render_repos(app);
-        harness
-            .get_by_label_contains("SINK(S) IN 'Automatic Upload'")
-            .click();
-        harness.run();
+        let harness = render_repos(app);
         assert!(
             harness.query_by_label_contains("MODE: MIRROR").is_some(),
             "a MIRROR sink's pill reads MIRROR"
@@ -3152,6 +3184,61 @@ mod ui_tests {
         harness.run();
         let img = harness.render().expect("wgpu render failed");
         let out = doc_screenshot_path("repositories_tab.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Doc screenshot: a sync group framed by its LCARS elbow section — the
+    /// badged main and its sink inside one rail, an ungrouped repo as a bare
+    /// card outside it. Rendered rather than label-queried, because a label
+    /// query passes even when the rail overlaps the cards it is meant to frame.
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_repo_group_section() {
+        let (tmp, mut app) = sample_app();
+        app.store
+            .create_sync_group("offsite", "Automatic Upload")
+            .expect("create group");
+        app.store
+            .add_sync_sink("offsite", "Videos", SyncMode::Mirror)
+            .expect("add sink");
+        // A third, ungrouped repo: the point of the shot is the contrast between
+        // a framed group and a bare card.
+        let scratch = tmp.path().join("Scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("f0.bin"), "scratch").unwrap();
+        app.store
+            .create_repo("Scratch", &scratch.to_string_lossy())
+            .unwrap();
+        update_repo(
+            &app.store,
+            "Scratch",
+            1,
+            &NoProgress,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        app.reload_all();
+        let _tmp = tmp;
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 760.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, app: &mut DedupApp| {
+                    if !init {
+                        icon::install(ui.ctx());
+                        theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let mut actions = Vec::new();
+                    app.repositories_view(ui, &mut actions);
+                },
+                app,
+            );
+        harness.run();
+        let img = harness.render().expect("wgpu render failed");
+        let out = doc_screenshot_path("repo_group_section.png");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }

@@ -2,6 +2,25 @@
 
 All notable changes to the `dedup-rs` project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Sync-group **mains are badged**: a **★ MAIN** pill on the repository card and a star badge on
+  the shared repo chip, so an original is distinguishable from its backups on every tab —
+  Repositories, Files, Grooming, Duplicates, Browse and the lightbox.
+- On the **Repositories** tab a sync group is now framed by its own **LCARS elbow section**,
+  titled with the group name and holding the main and its sinks; ungrouped repositories stay
+  bare cards. The section header folds the whole group away, replacing the separate
+  `SINK(S) IN '…'` chevron.
+
+### Fixed
+
+- The **GROUP SYNC** sink chips drew the wrong identicon: the push mode was folded into the
+  repo name, and the identicon is hashed from that name, so a sink showed a different glyph
+  there than on every other tab. The mode is now rendered beside the chip as `MODE: …`,
+  matching the sink's own pill on the Repositories tab.
+
 ## [0.1.0] - 2026-07-20
 
 ### Added

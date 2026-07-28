@@ -100,6 +100,8 @@ struct RepoSel {
     included: bool,
     /// Read-only repos are never selected for deletion.
     read_only: bool,
+    /// This repo is the main of a sync group — badged wherever it is named.
+    is_main: bool,
 }
 
 /// How long a press must be held (mouse or touch) to count as a long-press.
@@ -251,6 +253,8 @@ struct SideInfo {
     name: String,
     repo: String,
     read_only: bool,
+    /// This side's repo is the main of a sync group.
+    is_main: bool,
     facts: FileFacts,
     reps: FileRepresentations,
 }
@@ -287,6 +291,8 @@ struct OverviewSide<'a> {
     facts: &'a FileFacts,
     accent: egui::Color32,
     read_only: bool,
+    /// This side's repo is a sync-group main.
+    is_main: bool,
     mark_label: &'a str,
     marked: bool,
     markable: bool,
@@ -308,6 +314,7 @@ fn draw_overview_column(
         &side.file.repo,
         false,
         side.accent,
+        side.is_main,
         Some(side.read_only),
     );
     ui.add_space(4.0);
@@ -804,6 +811,7 @@ impl DupesView {
             Ok(list) => {
                 // Sinks are searched through their group's main, not directly.
                 let sinks = store.sink_repo_names().unwrap_or_default();
+                let mains = store.main_repo_names().unwrap_or_default();
                 let prev = std::mem::take(&mut self.repos);
                 self.repos = list
                     .into_iter()
@@ -813,6 +821,7 @@ impl DupesView {
                         RepoSel {
                             included: old.map(|r| r.included).unwrap_or(false),
                             read_only: old.map(|r| r.read_only).unwrap_or(true),
+                            is_main: mains.contains(&name),
                             name,
                         }
                     })
@@ -873,6 +882,7 @@ impl DupesView {
             &repo.name,
             repo.included,
             theme::ORANGE,
+            repo.is_main,
             Some(repo.read_only),
         );
         if chip
@@ -1722,6 +1732,7 @@ impl DupesView {
         let a = &group[idx];
         let a_key = key(a);
         let a_ro = self.repo_is_ro(&a.repo);
+        let a_is_main = self.repo_is_main(&a.repo);
         let a_markable = !a_ro || self.unlocked.contains(&a_key);
         let a_marked = self.marked.contains(&a_key);
         let a_facts = FileFacts::from_entry(&a.entry, a.absolute_path());
@@ -1743,6 +1754,9 @@ impl DupesView {
             .as_ref()
             .and_then(|c| group.iter().position(|f| f.absolute_path() == c.b.abs_path));
         let other_sel = b_pos.and_then(|bp| others.iter().position(|&i| i == bp));
+        // Resolved here, like every other `self.*` fact about B, because the
+        // Overview closures below hold `&mut self.thumbs`.
+        let b_is_main = b_pos.is_some_and(|bp| self.repo_is_main(&group[bp].repo));
         let b_info = b_pos.map(|bp| {
             let bf = &group[bp];
             let bk = key(bf);
@@ -1787,6 +1801,7 @@ impl DupesView {
                             facts: &a_facts,
                             accent: theme::BLUE,
                             read_only: a_ro,
+                            is_main: a_is_main,
                             mark_label: if b_info.is_some() {
                                 "DELETE A"
                             } else {
@@ -1806,6 +1821,7 @@ impl DupesView {
                             facts: b_facts,
                             accent: theme::TAN,
                             read_only: *b_ro,
+                            is_main: b_is_main,
                             mark_label: "DELETE B",
                             marked: *b_marked,
                             markable: *b_markable,
@@ -1910,6 +1926,7 @@ impl DupesView {
             name: f.rel_path.clone(),
             repo: f.repo.clone(),
             read_only,
+            is_main: self.repo_is_main(&f.repo),
             facts,
             reps,
         }
@@ -2048,6 +2065,7 @@ impl DupesView {
                                 repo: &a.repo,
                                 accent: theme::BLUE,
                                 read_only: a.read_only,
+                                is_main: a.is_main,
                                 source: &a.path,
                             },
                             meta_body(&a, a_tags.as_ref(), te),
@@ -2065,6 +2083,7 @@ impl DupesView {
                                 repo: &s.repo,
                                 accent: theme::TAN,
                                 read_only: s.read_only,
+                                is_main: s.is_main,
                                 source: &s.path,
                             },
                             meta_body(s, tags.as_ref(), te),
@@ -2153,6 +2172,7 @@ impl DupesView {
                                     repo: &s.repo,
                                     accent,
                                     read_only: s.read_only,
+                                    is_main: s.is_main,
                                     source: &s.path,
                                 },
                                 prev,
@@ -2813,6 +2833,7 @@ impl DupesView {
                                 &a.repo,
                                 false,
                                 theme::BLUE,
+                                self.repo_is_main(&a.repo),
                                 Some(self.repo_is_ro(&a.repo)),
                             );
                             if let Some((bf, _, _, _, _, _)) = &b_bundle {
@@ -2821,6 +2842,7 @@ impl DupesView {
                                     &bf.repo,
                                     false,
                                     theme::TAN,
+                                    self.repo_is_main(&bf.repo),
                                     Some(self.repo_is_ro(&bf.repo)),
                                 );
                             }
@@ -4292,6 +4314,11 @@ impl DupesView {
     fn repo_is_ro(&self, name: &str) -> bool {
         self.repos.iter().any(|r| r.name == name && r.read_only)
     }
+
+    /// Whether `name` is the main of a sync group, for its chip badge.
+    fn repo_is_main(&self, name: &str) -> bool {
+        self.repos.iter().any(|r| r.name == name && r.is_main)
+    }
 }
 
 #[cfg(test)]
@@ -4921,11 +4948,13 @@ mod ui_tests {
                 name: "w".into(),
                 included: true,
                 read_only: false,
+                is_main: false,
             },
             RepoSel {
                 name: "ro".into(),
                 included: true,
                 read_only: true,
+                is_main: false,
             },
         ];
         view.results = Some(Results::Similar(vec![
@@ -4958,11 +4987,13 @@ mod ui_tests {
                 name: "w".into(),
                 included: true,
                 read_only: false,
+                is_main: false,
             },
             RepoSel {
                 name: "ro".into(),
                 included: true,
                 read_only: true,
+                is_main: false,
             },
         ];
         view.results = Some(Results::Similar(vec![vec![
@@ -5033,6 +5064,7 @@ mod ui_tests {
             name: "ro".into(),
             included: true,
             read_only: true,
+            is_main: false,
         }];
         view.results = Some(Results::Similar(vec![vec![
             dfile("ro", "best"),
@@ -5099,11 +5131,13 @@ mod ui_tests {
                 name: "w".into(),
                 included: true,
                 read_only: false,
+                is_main: false,
             },
             RepoSel {
                 name: "ro".into(),
                 included: true,
                 read_only: true,
+                is_main: false,
             },
         ];
         view.results = Some(Results::Similar(vec![vec![
@@ -6557,6 +6591,7 @@ mod ui_tests {
             name: "r".into(),
             included: true,
             read_only: false,
+            is_main: false,
         }];
         view.unlocked.insert(k.clone());
         view.apply(&ctx, &store, Act::ToggleRo(0));
@@ -6656,6 +6691,7 @@ mod ui_tests {
             name: "repo".into(),
             included: true,
             read_only: false,
+            is_main: false,
         }];
         view.result_names = vec!["repo".to_string()];
         view.results = Some(Results::Exact(plan));
@@ -7123,6 +7159,7 @@ mod ui_tests {
             name: "repo".into(),
             included: true,
             read_only: false,
+            is_main: false,
         }];
         view.result_names = vec!["repo".to_string()];
         view.results = Some(Results::Exact(plan));
@@ -7462,6 +7499,7 @@ mod ui_tests {
             name: "ro".into(),
             included: true,
             read_only: true,
+            is_main: false,
         }];
         view.results = Some(Results::Similar(vec![vec![
             dfile("ro", "best.png"),
@@ -7769,6 +7807,7 @@ mod ui_tests {
             name: "repo".into(),
             included: true,
             read_only: false,
+            is_main: false,
         }];
         view.result_names = vec!["repo".to_string()];
         view.results = Some(Results::Exact(plan));
@@ -8348,6 +8387,7 @@ mod ui_tests {
             name: "r".into(),
             included: true,
             read_only: true,
+            is_main: false,
         }];
         view.results = Some(Results::Similar(vec![group]));
         let mut lb = LightboxState::new(0, 0);

@@ -103,6 +103,44 @@ fn sink_repo_names_lists_only_sinks() -> TestResult {
 }
 
 #[test]
+fn main_repo_names_lists_only_mains() -> TestResult {
+    let sb = Sandbox::new()?;
+    sb.store.create_sync_group("offsite", "MAIN")?;
+    sb.store
+        .add_sync_sink("offsite", "SINK1", SyncMode::AddOnly)?;
+    // A second group with no sinks yet: its main still counts as a main, which
+    // is what the MAIN badge keys off.
+    sb.store.create_sync_group("local", "SINK2")?;
+
+    let mains = sb.store.main_repo_names()?;
+    assert_eq!(mains.len(), 2);
+    assert!(mains.contains("MAIN"));
+    assert!(
+        mains.contains("SINK2"),
+        "a group with no sinks still has a main"
+    );
+    assert!(!mains.contains("SINK1"), "a sink is not a main");
+    Ok(())
+}
+
+/// Promoting a sink swaps which repo the badge is drawn on: the old main
+/// becomes an ordinary sink and drops out of the set.
+#[test]
+fn main_repo_names_follows_set_sync_main() -> TestResult {
+    let sb = Sandbox::new()?;
+    sb.store.create_sync_group("offsite", "MAIN")?;
+    sb.store
+        .add_sync_sink("offsite", "SINK1", SyncMode::AddOnly)?;
+
+    sb.store.set_sync_main("offsite", "SINK1")?;
+
+    let mains = sb.store.main_repo_names()?;
+    assert!(mains.contains("SINK1"), "the promoted sink is now the main");
+    assert!(!mains.contains("MAIN"), "the demoted main is now a sink");
+    Ok(())
+}
+
+#[test]
 fn a_repo_belongs_to_at_most_one_group() -> TestResult {
     let sb = Sandbox::new()?;
     sb.store.create_sync_group("offsite", "MAIN")?;

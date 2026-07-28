@@ -193,6 +193,9 @@ impl DiffProgress for ChannelDiffProgress {
 
 pub struct GroomingView {
     repos: Vec<String>,
+    /// Repos that are the main of a sync group, for the chip badge. Refreshed
+    /// with `repos` whenever the tab is shown.
+    mains: std::collections::HashSet<String>,
     loaded: bool,
     command: Command,
     /// DEDUPE: the repo whose duplicates are deleted.
@@ -276,6 +279,7 @@ impl GroomingView {
         let (tx, rx) = crossbeam_channel::unbounded();
         Self {
             repos: Vec::new(),
+            mains: std::collections::HashSet::new(),
             loaded: false,
             command: Command::Dedupe,
             source: None,
@@ -457,10 +461,18 @@ impl GroomingView {
         crate::lcars::section_lcars(ui, "REPOS — SOURCE & DUPE POOL", theme::LILAC, |ui| {
             // SOURCE: the repo duplicates are deleted from, orange when picked.
             let src = self.repos.clone();
+            let mains = self.mains.clone();
             crate::repo_chip::chip_row(ui, "groom_source", "SOURCE", src.len(), |ui, i| {
                 let name = &src[i];
                 let sel = self.source.as_deref() == Some(name.as_str());
-                let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::ORANGE, None);
+                let chip = crate::repo_chip::repo_chip(
+                    ui,
+                    name,
+                    sel,
+                    theme::ORANGE,
+                    mains.contains(name),
+                    None,
+                );
                 if chip
                     .name
                     .explain(
@@ -505,10 +517,18 @@ impl GroomingView {
                     self.pool.clear();
                 }
             });
+            let mains = self.mains.clone();
             crate::repo_chip::chip_row(ui, "groom_pool", "", pool.len(), |ui, i| {
                 let name = &pool[i];
                 let sel = self.pool.iter().any(|r| r == name);
-                let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::LILAC, None);
+                let chip = crate::repo_chip::repo_chip(
+                    ui,
+                    name,
+                    sel,
+                    theme::LILAC,
+                    mains.contains(name),
+                    None,
+                );
                 if chip
                     .name
                     .explain(
@@ -772,10 +792,18 @@ impl GroomingView {
             theme::LILAC,
             |ui| {
                 let repos = self.repos.clone();
+                let mains = self.mains.clone();
                 crate::repo_chip::chip_row(ui, "groom_repo", "", repos.len(), |ui, i| {
                     let name = &repos[i];
                     let sel = self.repo.as_deref() == Some(name.as_str());
-                    let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::ORANGE, None);
+                    let chip = crate::repo_chip::repo_chip(
+                        ui,
+                        name,
+                        sel,
+                        theme::ORANGE,
+                        mains.contains(name),
+                        None,
+                    );
                     if chip
                         .name
                         .explain(self.verbosity, "Pick the repo to act on", hint)
@@ -1523,6 +1551,7 @@ impl GroomingView {
                 // Sinks are managed through their group's main, not operated on
                 // directly, so they are not offered here.
                 let sinks = store.sink_repo_names().unwrap_or_default();
+                self.mains = store.main_repo_names().unwrap_or_default();
                 self.repos = list
                     .into_iter()
                     .map(|(n, _, _)| n)

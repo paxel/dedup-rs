@@ -666,6 +666,9 @@ impl DiffProgress for ChannelDiffProgress {
 
 pub struct TransferView {
     repos: Vec<String>,
+    /// Repos that are the main of a sync group, for the chip badge. Refreshed
+    /// with `repos` whenever the tab is shown.
+    mains: std::collections::HashSet<String>,
     loaded: bool,
     source: Option<String>,
     target: Option<String>,
@@ -795,6 +798,7 @@ impl TransferView {
         let (tx, rx) = crossbeam_channel::unbounded();
         Self {
             repos: Vec::new(),
+            mains: std::collections::HashSet::new(),
             loaded: false,
             source: None,
             target: None,
@@ -1044,6 +1048,7 @@ impl TransferView {
                 // Sinks are managed through their group's main, not operated on
                 // directly, so they are not offered here.
                 let sinks = store.sink_repo_names().unwrap_or_default();
+                self.mains = store.main_repo_names().unwrap_or_default();
                 self.repos = list
                     .into_iter()
                     .map(|(n, _, _)| n)
@@ -1095,10 +1100,18 @@ impl TransferView {
         crate::lcars::section_lcars(ui, "REPOS — PICK SOURCE & TARGET", theme::LILAC, |ui| {
             // SOURCE: every repo, orange when picked.
             let src = self.repos.clone();
+            let mains = self.mains.clone();
             crate::repo_chip::chip_row(ui, "xfer_source", "SOURCE", src.len(), |ui, i| {
                 let name = &src[i];
                 let sel = self.source.as_deref() == Some(name.as_str());
-                let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::ORANGE, None);
+                let chip = crate::repo_chip::repo_chip(
+                    ui,
+                    name,
+                    sel,
+                    theme::ORANGE,
+                    mains.contains(name),
+                    None,
+                );
                 if chip
                     .name
                     .explain(
@@ -1124,10 +1137,18 @@ impl TransferView {
                     .filter(|n| self.source.as_deref() != Some(n.as_str()))
                     .cloned()
                     .collect();
+                let mains = self.mains.clone();
                 crate::repo_chip::chip_row(ui, "xfer_target", "TARGET", tgt.len(), |ui, i| {
                     let name = &tgt[i];
                     let sel = self.target.as_deref() == Some(name.as_str());
-                    let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::BLUE, None);
+                    let chip = crate::repo_chip::repo_chip(
+                        ui,
+                        name,
+                        sel,
+                        theme::BLUE,
+                        mains.contains(name),
+                        None,
+                    );
                     if chip
                         .name
                         .explain(
@@ -1184,10 +1205,18 @@ impl TransferView {
                         self.extra_refs.clear();
                     }
                 });
+                let mains = self.mains.clone();
                 crate::repo_chip::chip_row(ui, "xfer_pool", "", eligible.len(), |ui, i| {
                     let name = &eligible[i];
                     let sel = self.extra_refs.iter().any(|r| r == name);
-                    let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::LILAC, None);
+                    let chip = crate::repo_chip::repo_chip(
+                        ui,
+                        name,
+                        sel,
+                        theme::LILAC,
+                        mains.contains(name),
+                        None,
+                    );
                     if chip
                         .name
                         .explain(
@@ -1606,14 +1635,28 @@ impl TransferView {
                 } else {
                     theme::BLUE
                 };
-                let chip = crate::repo_chip::repo_chip(
-                    ui,
-                    &format!("{} · {mode}", sink.repo),
-                    sel,
-                    accent,
-                    None,
-                );
-                if chip
+                // The chip gets the bare repo name: the identicon is hashed from
+                // whatever string it is handed, so folding the mode into the name
+                // gave this sink a different glyph here than on every other tab.
+                // The mode rides alongside as its own label instead.
+                //
+                // Chip and label are wrapped together, and the *wrapper's*
+                // response is what this closure returns: `chip_row` packs rows
+                // from that rect, so a label drawn outside it would never be
+                // budgeted and the row would overrun the available width.
+                let row = ui.horizontal(|ui| {
+                    let chip =
+                        crate::repo_chip::repo_chip(ui, &sink.repo, sel, accent, false, None);
+                    // Same wording as the sink's mode pill on the Repositories tab.
+                    ui.label(
+                        RichText::new(format!("MODE: {mode}"))
+                            .color(accent)
+                            .size(10.0),
+                    );
+                    chip
+                });
+                if row
+                    .inner
                     .name
                     .explain(
                         self.verbosity,
@@ -1625,7 +1668,7 @@ impl TransferView {
                 {
                     acts.push(Act::ToggleSink(sink.repo.clone()));
                 }
-                chip.outer
+                row.response
             });
             ui.label(
                 RichText::new(
@@ -3477,6 +3520,79 @@ mod ui_tests {
         );
     }
 
+    /// Every sink's chip **and its MODE label** must stay inside the window.
+    ///
+    /// `chip_row` wraps by greedy-packing each chip against the width the
+    /// closure's returned response reports. The MODE label is drawn after the
+    /// chip in the same row, so if it is not part of that measured response its
+    /// width is never budgeted and the row overruns the available width — a
+    /// layout bug a `query_by_label("MODE: …")` assertion cannot see, which is
+    /// why this asserts geometry instead.
+    #[test]
+    fn group_sync_sink_chips_and_modes_stay_inside_the_window() {
+        let (tmp, store) = sample_store();
+        store.create_sync_group("grp", "source").expect("group");
+        // Long names, so the row is forced to wrap rather than fitting by luck.
+        for name in [
+            "offsite-archive-north",
+            "offsite-archive-south",
+            "nas-cold-storage-two",
+            "usb-rotation-drive-c",
+        ] {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            store.create_repo(name, &dir.to_string_lossy()).unwrap();
+            store
+                .add_sync_sink("grp", name, dedup_core::store::SyncMode::Mirror)
+                .expect("sink");
+        }
+        let store2 = Arc::clone(&store);
+        let width = 900.0;
+        let mut view = TransferView::new();
+        view.loaded = true;
+        view.source = Some("source".to_string());
+        view.sync_repos(&store2);
+        view.command = Command::GroupSync;
+
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(width, 800.0))
+            .build_ui_state(
+                move |ui, view: &mut TransferView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), None);
+                },
+                view,
+            );
+        // Two frames: chip_row packs from sizes measured the previous frame.
+        h.run();
+        h.run();
+
+        for label in ["MODE: MIRROR"] {
+            for node in h.query_all_by_label(label) {
+                let r = node.rect();
+                assert!(
+                    r.right() <= width,
+                    "a sink's {label} runs off the window: right {:.1} > {width}",
+                    r.right()
+                );
+            }
+        }
+        for name in ["offsite-archive-north", "usb-rotation-drive-c"] {
+            let r = h.get_by_label(name).rect();
+            assert!(
+                r.right() <= width,
+                "sink chip {name} runs off the window: right {:.1} > {width}",
+                r.right()
+            );
+        }
+    }
+
     /// GROUP SYNC is only offered when the source names a sync group's main.
     #[test]
     fn group_sync_only_offered_when_source_is_a_group_main() {
@@ -3531,9 +3647,25 @@ mod ui_tests {
             h.query_by_label("SINKS").is_some(),
             "the SINKS panel is shown"
         );
+        // The SOURCE chip badges the group's main. This is the only test of the
+        // whole chain — `Store::main_repo_names` -> `TransferView::mains` ->
+        // chip badge — the rest is covered widget-side in `repo_chip`.
+        // Exact label: the section header "SINKS — WHERE THE MAIN IS PUSHED"
+        // makes a `contains` query ambiguous.
         assert!(
-            h.query_by_label_contains("target · MIRROR").is_some(),
-            "the sink chip names the sink and its stored mode"
+            h.query_by_label("MAIN").is_some(),
+            "the source chip badges the group's main"
+        );
+        // The chip carries the bare repo name — the identicon is hashed from it,
+        // so decorating the name gave this sink a different glyph here than on
+        // every other tab. The mode rides alongside as its own label.
+        assert!(
+            h.query_by_label("target").is_some(),
+            "the sink chip names the sink, undecorated"
+        );
+        assert!(
+            h.query_by_label("MODE: MIRROR").is_some(),
+            "the sink's stored mode is shown next to its chip"
         );
         assert_eq!(
             h.state().selected_sinks,

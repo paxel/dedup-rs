@@ -472,6 +472,8 @@ pub struct ColumnHead<'a> {
     pub repo: &'a str,
     pub accent: egui::Color32,
     pub read_only: bool,
+    /// This column's repo is the main of a sync group.
+    pub is_main: bool,
     /// The file's absolute path — the column's identity for per-side widget
     /// state. Not the name or the hash: duplicates routinely share both, and
     /// two columns under one id share scroll position.
@@ -480,7 +482,14 @@ pub struct ColumnHead<'a> {
 
 impl ColumnHead<'_> {
     fn draw(&self, ui: &mut egui::Ui) {
-        crate::repo_chip::repo_chip(ui, self.repo, false, self.accent, Some(self.read_only));
+        crate::repo_chip::repo_chip(
+            ui,
+            self.repo,
+            false,
+            self.accent,
+            self.is_main,
+            Some(self.read_only),
+        );
         ui.add_space(4.0);
         ui.label(RichText::new(self.file_name).color(theme::TEXT).size(13.0));
         ui.add_space(4.0);
@@ -1514,6 +1523,7 @@ mod tests {
             repo: "r",
             accent: theme::BLUE,
             read_only: false,
+            is_main: false,
             source: Path::new("/tmp/r/long.txt"),
         };
 

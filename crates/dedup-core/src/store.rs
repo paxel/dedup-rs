@@ -868,6 +868,18 @@ impl Store {
         Ok(sinks)
     }
 
+    /// The names of every repository that is the *main* of some sync group —
+    /// including a group that has no sinks yet. The GUI marks these with a badge
+    /// so a main is recognisable wherever a repo is named, rather than only by
+    /// the group controls that appear under its card.
+    pub fn main_repo_names(&self) -> Result<std::collections::HashSet<String>, StoreError> {
+        Ok(self
+            .list_sync_groups()?
+            .into_iter()
+            .map(|(_, group)| group.main)
+            .collect())
+    }
+
     /// Create a group around `main`. The repo must exist and must not already
     /// belong to another group. A new group has no sinks; each sink's push mode
     /// is chosen when it is added.
