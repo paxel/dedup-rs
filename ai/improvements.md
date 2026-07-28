@@ -68,6 +68,15 @@ landed and video A/B compare works — not that cross-type visual compare is a r
 **The deferred review-pane per-row diff button is the immediate follow-on** (it opens the
 slice-2 DIFF compare surface from a review row).
 
+**Tabbed representations (2026-07-28).** The lightbox now dispatches on the selected
+representation rather than the file's mime: `Metadata` (ID3 editing for MP3/WAV/AIFF, EXIF
+capture facts read-only for images) and `Text` (64 KB head as text or hex for non-media
+duplicates) are real tabs with renderers, only the columns that support the selected
+representation are drawn, and a representation the pair no longer offers falls back to
+Overview. The ID3 editor modal that lived inside the audio view is gone — the Metadata tab is
+the single editor, opened by the TAGS pill or `T`. See `ai/roadmap.md` §1 for the detail and
+what stayed out (PDF/office text *extraction*, EXIF writing, the ID3 `comment` field).
+
 ## Engineering backlog
 - **Per-sink main re-read.** `plan_group_sync`/`run_group_sync` re-open the main and
   re-run `collect_source_entries` over its whole index once per sink. Collect the main's

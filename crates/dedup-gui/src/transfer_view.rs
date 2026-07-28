@@ -3395,6 +3395,7 @@ mod ui_tests {
                 hash_hex: "deadbeef".into(),
                 abs_path: PathBuf::from("/tmp/a.bin"),
                 origin: None,
+                exif: None,
             },
         }
     }

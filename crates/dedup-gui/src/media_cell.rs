@@ -12,7 +12,7 @@
 use crate::icon;
 use crate::theme;
 use crate::thumbs::ThumbCache;
-use dedup_core::store::{FileEntry, Store};
+use dedup_core::store::{ExifInfo, FileEntry, Store};
 use dedup_core::thumbnail::hash_hex;
 use egui::{Response, RichText};
 use std::path::PathBuf;
@@ -51,6 +51,9 @@ pub struct FileFacts {
     /// On-disk source, the thumbnail generator's input.
     pub abs_path: PathBuf,
     pub origin: Option<String>,
+    /// Capture metadata for images, carried along so the lightbox's Metadata
+    /// tab can show it without re-reading the file.
+    pub exif: Option<ExifInfo>,
 }
 
 impl FileFacts {
@@ -69,6 +72,7 @@ impl FileFacts {
             hash_hex: hash_hex(&entry.hash),
             abs_path,
             origin: entry.origin.clone(),
+            exif: entry.exif.clone(),
         }
     }
 
@@ -310,6 +314,7 @@ mod tests {
             hash_hex: "deadbeef".to_string(),
             abs_path: PathBuf::from("/x"),
             origin: None,
+            exif: None,
         }
     }
 

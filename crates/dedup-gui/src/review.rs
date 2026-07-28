@@ -744,6 +744,7 @@ mod tests {
             // is what we assert on.
             abs_path: std::path::PathBuf::from("/nonexistent.jpg"),
             origin: None,
+            exif: None,
         };
         let mut r = row(SideStatus::Unchanged, SideStatus::Added, "a.jpg", "a.jpg");
         r.source_facts = Some(facts);

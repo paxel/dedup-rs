@@ -50,7 +50,10 @@ best copy is starred. AUTO-RESOLVE REST marks every non-best copy at once. DELET
 runs the batch behind a confirmation — or turn on QUICK DELETE to skip confirmation per \
 group.
 
-Click a thumbnail to open the lightbox (zoom, A/B compare, audio/video preview). Right-click \
+Click a thumbnail to open the lightbox. It opens on Overview — both files' facts, repos and \
+mark pills side by side — and its tabs offer whatever the two files can show: Image, Video \
+or Audio for zoom, filmstrip and A/B compare; Metadata for ID3 tags and EXIF capture facts; \
+Text for a text or hex preview of documents and anything else without a picture. Right-click \
 a card for OPEN and SHOW IN FOLDER.";
 
 const TRANSFER: &str = "\

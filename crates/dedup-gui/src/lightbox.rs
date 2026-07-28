@@ -124,6 +124,12 @@ impl std::fmt::Debug for AudioRepresentation {
 }
 
 /// Metadata (ID3/EXIF) representation facts and edit capabilities.
+///
+/// The ID3 text fields stay `None` here: reading them is disk I/O and
+/// [`FileRepresentations::from_facts`] runs every frame, so the tab loads (and
+/// caches) them lazily — this struct only says *that* a file has an editable
+/// tag surface. The EXIF fields come straight from the index entry, so they are
+/// populated eagerly.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MetadataRepresentation {
     pub title: Option<String>,
@@ -132,6 +138,10 @@ pub struct MetadataRepresentation {
     pub year: Option<u32>,
     pub track: Option<u32>,
     pub comment: Option<String>,
+    /// EXIF camera make/model (images).
+    pub camera: Option<String>,
+    /// EXIF capture time, naive-local epoch milliseconds (images).
+    pub taken_ms: Option<i64>,
     pub can_save: bool,
 }
 
@@ -203,6 +213,14 @@ pub struct FileRepresentations {
     pub mark: MarkState,
 }
 
+/// Whether a file falls back to the Text/hex representation — everything that
+/// is not image, audio or video. Public because the Duplicate cards need the
+/// same rule to decide whether a placeholder (a file with no thumbnail) is
+/// still worth opening the lightbox for.
+pub fn has_text_representation(facts: &FileFacts) -> bool {
+    !facts.is_image() && !facts.is_audio() && !facts.is_video()
+}
+
 impl FileRepresentations {
     /// Construct representations from generic [`FileFacts`].
     pub fn from_facts(
@@ -253,13 +271,42 @@ impl FileRepresentations {
             None
         };
 
-        // Metadata (EXIF for images) and Text/hex-dump have no renderer yet — an
-        // `available_kinds()` tab with nothing behind it is worse than no tab, so
-        // don't advertise them. Audio's ID3 editing already exists (a TAGS
-        // popup), not yet as a Metadata tab; wire this up when that lands
-        // (tracked in `ai/roadmap.md` §1).
-        let metadata = None;
-        let text = None;
+        // Metadata: an editable ID3 surface for the containers the tag writer
+        // supports, or read-only EXIF capture facts for an image that has them.
+        // Decided from the mime and the index entry only — no disk I/O here.
+        let metadata = if is_aud && crate::id3tags::container_supported(facts.mime.as_deref()) {
+            Some(MetadataRepresentation {
+                can_save: can_write,
+                ..Default::default()
+            })
+        } else if let (true, Some(ex)) = (is_img, facts.exif.as_ref()) {
+            Some(MetadataRepresentation {
+                camera: ex.camera.clone(),
+                taken_ms: ex.taken_ms,
+                // EXIF is shown, never rewritten — we have no EXIF writer.
+                can_save: false,
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+
+        // Text/hex: the fallback representation for everything that is not
+        // image/audio/video. The preview itself is read lazily by the tab (I/O),
+        // so only the capability is decided here; `is_text` is the mime's claim,
+        // which the loader confirms or falls back to a hex dump.
+        let text = if !has_text_representation(facts) {
+            None
+        } else {
+            Some(TextBinaryRepresentation {
+                text_preview: None,
+                hex_dump: None,
+                is_text: facts
+                    .mime
+                    .as_deref()
+                    .is_some_and(|m| m.starts_with("text/")),
+            })
+        };
 
         Self {
             dedup: DedupDataRepresentation {
@@ -332,6 +379,23 @@ pub fn format_other_switcher_label(other_sel: usize, total_others: usize) -> Str
     }
 }
 
+/// The representation kinds offered for a Left/Right pair: every kind at least
+/// one side supports (§1.3.1). Also the set the viewer dispatches over, so a tab
+/// can never be selected without a column behind it.
+pub fn tab_kinds(
+    left_reps: &FileRepresentations,
+    right_reps: Option<&FileRepresentations>,
+) -> Vec<RepresentationKind> {
+    let mut all_kinds = left_reps.available_kinds();
+    for k in right_reps.map(|r| r.available_kinds()).unwrap_or_default() {
+        if !all_kinds.contains(&k) {
+            all_kinds.push(k);
+        }
+    }
+    all_kinds.sort();
+    all_kinds
+}
+
 /// Draw the top tab bar displaying representation tabs available across Left (A) and Right (B).
 pub fn draw_tab_bar(
     ui: &mut egui::Ui,
@@ -339,18 +403,8 @@ pub fn draw_tab_bar(
     left_reps: &FileRepresentations,
     right_reps: &FileRepresentations,
 ) {
-    let left_kinds = left_reps.available_kinds();
-    let right_kinds = right_reps.available_kinds();
-    let mut all_kinds = left_kinds;
-    for k in right_kinds {
-        if !all_kinds.contains(&k) {
-            all_kinds.push(k);
-        }
-    }
-    all_kinds.sort();
-
     ui.horizontal(|ui| {
-        for kind in all_kinds {
+        for kind in tab_kinds(left_reps, Some(right_reps)) {
             let label = format!("{} {}", kind.icon(), kind.name());
             let selected = state.active_tab == kind;
             let fill = if selected { theme::AMBER } else { theme::PANEL };
@@ -364,6 +418,383 @@ pub fn draw_tab_bar(
             }
         }
     });
+}
+
+/// Gap between the lightbox's Left and Right columns.
+const COLUMN_GAP: f32 = 16.0;
+/// How much of a file's head the Text tab reads.
+const TEXT_PREVIEW_BYTES: usize = 64 * 1024;
+/// How many bytes a hex dump shows (a wall of hex helps nobody).
+const HEX_DUMP_BYTES: usize = 2048;
+
+/// One column's drawing callback: it gets the column's `Ui` and the shared
+/// state [`draw_columns`] hands round (a cache, the open editor, or `()`).
+pub type ColumnFn<'a, T> = Box<dyn FnOnce(&mut egui::Ui, &mut T) + 'a>;
+
+/// Lay out the lightbox's columns side by side — strictly Left vs. Right, never
+/// stacked (§1.3.2) — sizing each from the parent's own cursor. One entry draws
+/// a single full-width column, which is what a representation only one side
+/// supports must look like (§1.3.1).
+///
+/// Deliberately not `ui.columns`: that hardcodes `top_down_justified`, which
+/// stretches every child widget to the column width instead of its natural size.
+/// Equally not an absolute-rect split, which would overlap the columns inside a
+/// flow layout and let later controls race them for the same row.
+///
+/// `shared` is handed to each column in turn — a cache both sides draw from
+/// (thumbnails, previews) can only be borrowed by one column at a time, so it
+/// travels as an argument rather than being captured twice. Pass `&mut ()` when
+/// there is nothing to share.
+pub fn draw_columns<T>(ui: &mut egui::Ui, shared: &mut T, cols: Vec<ColumnFn<'_, T>>) {
+    let n = cols.len();
+    if n == 0 {
+        return;
+    }
+    let col_w = (ui.available_width() - COLUMN_GAP * (n as f32 - 1.0)) / n as f32;
+    ui.horizontal_top(|ui| {
+        for (i, col) in cols.into_iter().enumerate() {
+            if i > 0 {
+                ui.add_space(COLUMN_GAP);
+            }
+            ui.allocate_ui_with_layout(
+                egui::vec2(col_w, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| col(ui, shared),
+            );
+        }
+    });
+}
+
+/// Identifying header of one lightbox column: which file, in which repo, and
+/// whether that repo is read-only.
+pub struct ColumnHead<'a> {
+    pub file_name: &'a str,
+    pub repo: &'a str,
+    pub accent: egui::Color32,
+    pub read_only: bool,
+    /// The file's absolute path — the column's identity for per-side widget
+    /// state. Not the name or the hash: duplicates routinely share both, and
+    /// two columns under one id share scroll position.
+    pub source: &'a Path,
+}
+
+impl ColumnHead<'_> {
+    fn draw(&self, ui: &mut egui::Ui) {
+        crate::repo_chip::repo_chip(ui, self.repo, false, self.accent, Some(self.read_only));
+        ui.add_space(4.0);
+        ui.label(RichText::new(self.file_name).color(theme::TEXT).size(13.0));
+        ui.add_space(4.0);
+    }
+}
+
+/// What a Metadata column's controls asked the caller to do. The caller owns the
+/// tag state and the disk write, so the column only reports the intent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetaAction {
+    None,
+    Edit,
+    Save,
+    Cancel,
+}
+
+/// The body of one Metadata column: an open ID3 editor, a file's stored tags, or
+/// an image's EXIF capture facts.
+pub enum MetaBody<'a> {
+    /// The working copy of the tags being edited, plus the distinct values the
+    /// other copies in the group offer per field (Title/Artist/Album/Year/Track/
+    /// Genre) so the best one can be adopted.
+    Editing {
+        tags: &'a mut crate::id3tags::Tags,
+        options: &'a [Vec<String>; 6],
+    },
+    /// The file's tags as stored (`None` when it carries none), read-only.
+    /// `can_edit` is false for a read-only repo, which hides the EDIT button
+    /// rather than offering a save that cannot land (§1.3.5).
+    Stored {
+        tags: Option<&'a crate::id3tags::Tags>,
+        can_edit: bool,
+    },
+    /// Read-only EXIF capture facts (images have no tag writer here).
+    Exif {
+        camera: Option<&'a str>,
+        taken: Option<String>,
+    },
+}
+
+/// One column of the Metadata tab: repo badge + file name, then the file's tag
+/// surface — the ID3 editor for the copy being edited, the stored tags for every
+/// other copy, or an image's EXIF facts.
+pub fn draw_metadata_column(
+    ui: &mut egui::Ui,
+    head: &ColumnHead<'_>,
+    body: MetaBody<'_>,
+) -> MetaAction {
+    head.draw(ui);
+    let mut action = MetaAction::None;
+    match body {
+        MetaBody::Editing { tags, options } => {
+            let fields: [(&str, &mut String); 6] = [
+                ("Title", &mut tags.title),
+                ("Artist", &mut tags.artist),
+                ("Album", &mut tags.album),
+                ("Year", &mut tags.year),
+                ("Track", &mut tags.track),
+                ("Genre", &mut tags.genre),
+            ];
+            for (i, (label, val)) in fields.into_iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [56.0, 18.0],
+                        egui::Label::new(RichText::new(label).color(theme::TAN).size(12.0)),
+                    );
+                    let w = (ui.available_width() - 32.0).max(80.0);
+                    ui.add(egui::TextEdit::singleline(val).desired_width(w));
+                    // Adopt a value from another copy in the group.
+                    if !options[i].is_empty() {
+                        ui.menu_button(icon::CARET_RIGHT, |ui| {
+                            for o in &options[i] {
+                                if ui.button(RichText::new(o).color(theme::TEXT)).clicked() {
+                                    *val = o.clone();
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text("Pick a value from another copy in this group");
+                    }
+                });
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("SAVE TAGS").color(theme::BLACK))
+                            .fill(theme::AMBER),
+                    )
+                    .clicked()
+                {
+                    action = MetaAction::Save;
+                }
+                if ui
+                    .button(RichText::new("CANCEL").color(theme::TEXT))
+                    .clicked()
+                {
+                    action = MetaAction::Cancel;
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "Saving writes the tags to the file on disk; the audio is unchanged.",
+                )
+                .color(theme::LILAC)
+                .size(11.0),
+            );
+        }
+        MetaBody::Stored { tags, can_edit } => {
+            match tags {
+                Some(t) => {
+                    let rows: [(&str, &str); 6] = [
+                        ("Title", &t.title),
+                        ("Artist", &t.artist),
+                        ("Album", &t.album),
+                        ("Year", &t.year),
+                        ("Track", &t.track),
+                        ("Genre", &t.genre),
+                    ];
+                    for (label, val) in rows {
+                        fact_row(ui, label, if val.is_empty() { "—" } else { val });
+                    }
+                }
+                None => {
+                    ui.label(
+                        RichText::new("No ID3 tags in this file")
+                            .color(theme::GREY)
+                            .size(12.0),
+                    );
+                }
+            }
+            ui.add_space(8.0);
+            if can_edit {
+                if ui
+                    .button(RichText::new(format!("{} EDIT TAGS", icon::PENCIL)).color(theme::TEXT))
+                    .clicked()
+                {
+                    action = MetaAction::Edit;
+                }
+            } else {
+                ui.label(
+                    RichText::new("Read-only repository — tags cannot be changed")
+                        .color(theme::GREY)
+                        .size(11.0),
+                );
+            }
+        }
+        MetaBody::Exif { camera, taken } => {
+            fact_row(ui, "Camera", camera.unwrap_or("—"));
+            fact_row(ui, "Taken", taken.as_deref().unwrap_or("—"));
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("Capture metadata is shown as recorded and is not edited here.")
+                    .color(theme::GREY)
+                    .size(11.0),
+            );
+        }
+    }
+    action
+}
+
+/// A `Label   value` row, the read-only counterpart of the editor's fields.
+fn fact_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [56.0, 18.0],
+            egui::Label::new(RichText::new(label).color(theme::TAN).size(12.0)),
+        );
+        ui.label(RichText::new(value).color(theme::TEXT).size(12.0));
+    });
+}
+
+/// A file's head, rendered as text when it decodes as UTF-8 and as a hex dump
+/// when it does not — the Text/binary representation's content, loaded on
+/// demand (this is disk I/O; callers cache it by content hash).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextPreview {
+    pub body: String,
+    /// Whether `body` is the file's text (rather than a hex dump).
+    pub is_text: bool,
+    /// The file is longer than what `body` shows.
+    pub truncated: bool,
+    /// Why nothing could be read, when that is the case.
+    pub error: Option<String>,
+}
+
+/// Read at most [`TEXT_PREVIEW_BYTES`] from `path` and render it as text, or as
+/// a hex dump of the first [`HEX_DUMP_BYTES`] when it is not valid UTF-8.
+pub fn load_text_preview(path: &Path) -> TextPreview {
+    use std::io::Read;
+
+    let mut buf = Vec::new();
+    let read = std::fs::File::open(path)
+        .and_then(|f| f.take(TEXT_PREVIEW_BYTES as u64 + 1).read_to_end(&mut buf));
+    if let Err(e) = read {
+        return TextPreview {
+            body: String::new(),
+            is_text: false,
+            truncated: false,
+            error: Some(e.to_string()),
+        };
+    }
+    let truncated = buf.len() > TEXT_PREVIEW_BYTES;
+    buf.truncate(TEXT_PREVIEW_BYTES);
+
+    // A NUL byte means binary even when the sample happens to decode: office
+    // and archive containers are full of decodable runs, and rendering those as
+    // "text" hides what the file actually is.
+    match std::str::from_utf8(&buf)
+        .map_err(|_| ())
+        .and_then(|s| if buf.contains(&0) { Err(()) } else { Ok(s) })
+    {
+        Ok(s) => TextPreview {
+            body: s.to_string(),
+            is_text: true,
+            truncated,
+            error: None,
+        },
+        Err(_) => {
+            let shown = buf.len().min(HEX_DUMP_BYTES);
+            TextPreview {
+                body: hex_dump(&buf[..shown]),
+                is_text: false,
+                truncated: truncated || shown < buf.len(),
+                error: None,
+            }
+        }
+    }
+}
+
+/// Classic `offset  16 hex bytes  |ascii|` dump.
+fn hex_dump(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for (i, chunk) in bytes.chunks(16).enumerate() {
+        out.push_str(&format!("{:08x}  ", i * 16));
+        for (j, b) in chunk.iter().enumerate() {
+            out.push_str(&format!("{b:02x} "));
+            if j == 7 {
+                out.push(' ');
+            }
+        }
+        for j in chunk.len()..16 {
+            out.push_str("   ");
+            if j == 7 {
+                out.push(' ');
+            }
+        }
+        out.push_str(" |");
+        for b in chunk {
+            out.push(if b.is_ascii_graphic() || *b == b' ' {
+                *b as char
+            } else {
+                '.'
+            });
+        }
+        out.push_str("|\n");
+    }
+    out
+}
+
+/// One column of the Text tab: repo badge + file name, then the file's head as
+/// monospaced text or a hex dump, in its own scroll area. Returns the viewport
+/// the preview was drawn into — exactly `height` tall however long the file is,
+/// because a file longer than the window has to scroll, not overflow it.
+pub fn draw_text_column(
+    ui: &mut egui::Ui,
+    head: &ColumnHead<'_>,
+    preview: &TextPreview,
+    height: f32,
+) -> egui::Rect {
+    head.draw(ui);
+    let note = match (&preview.error, preview.is_text, preview.truncated) {
+        (Some(e), _, _) => format!("Could not read this file: {e}"),
+        (None, true, true) => "First 64 KB, as text".to_string(),
+        (None, true, false) => "Full contents, as text".to_string(),
+        (None, false, _) => "Not text — showing the first bytes as hex".to_string(),
+    };
+    ui.label(RichText::new(note).color(theme::LILAC).size(11.0));
+    ui.add_space(4.0);
+    // The column itself is laid out top-down from a zero-height cursor, so the
+    // scroll viewport has to be given its size explicitly — left to
+    // `available_height` it would collapse to a couple of lines.
+    let viewport = egui::Rect::from_min_size(
+        ui.next_widget_position(),
+        egui::vec2(ui.available_width(), height),
+    );
+    ui.allocate_rect(viewport, egui::Sense::hover());
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(viewport)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    {
+        let ui = &mut child;
+        egui::ScrollArea::both()
+            .id_salt(head.source)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let text = RichText::new(&preview.body)
+                    .color(theme::TEXT)
+                    .monospace()
+                    .size(12.0);
+                // Prose wraps to the column; a hex dump must not — its columns only
+                // line up if long lines scroll sideways instead of folding.
+                let label = egui::Label::new(text).wrap_mode(if preview.is_text {
+                    egui::TextWrapMode::Wrap
+                } else {
+                    egui::TextWrapMode::Extend
+                });
+                ui.add(label);
+            });
+    }
+    viewport
 }
 
 /// A/B compare overlaid on the lightbox. `b` is the abstract B side — the
@@ -928,6 +1359,7 @@ mod tests {
             hash_hex: "abcd".to_string(),
             abs_path: PathBuf::from("/tmp/test.png"),
             origin: None,
+            exif: None,
         };
 
         let reps = FileRepresentations::from_facts(
@@ -940,8 +1372,170 @@ mod tests {
         assert!(kinds.contains(&RepresentationKind::Overview));
         assert!(kinds.contains(&RepresentationKind::Image));
         assert!(!kinds.contains(&RepresentationKind::Audio));
-        // Metadata (EXIF) has no renderer yet — a tab that opens to nothing is
-        // worse than no tab, so it must not be advertised until one exists.
+        // An image without EXIF has nothing to put on a Metadata tab, and a
+        // visual is never offered as text.
         assert!(!kinds.contains(&RepresentationKind::Metadata));
+        assert!(!kinds.contains(&RepresentationKind::Text));
+
+        // The same image *with* EXIF does offer Metadata — read-only, since
+        // there is no EXIF writer.
+        let with_exif = FileFacts {
+            exif: Some(dedup_core::store::ExifInfo {
+                taken_ms: Some(1_600_000_000_000),
+                camera: Some("Canon EOS 5D".into()),
+            }),
+            ..facts.clone()
+        };
+        let reps = FileRepresentations::from_facts(
+            &with_exif,
+            "MainRepo".into(),
+            false,
+            MarkState::Unmarked,
+        );
+        assert!(
+            reps.available_kinds()
+                .contains(&RepresentationKind::Metadata)
+        );
+        assert_eq!(
+            reps.metadata.as_ref().map(|m| m.can_save),
+            Some(false),
+            "EXIF is shown, never written"
+        );
+    }
+
+    #[test]
+    fn metadata_is_offered_for_id3_containers_only() {
+        let audio = |mime: &str| FileFacts {
+            size: 417,
+            modified_ms: 0,
+            mime: Some(mime.to_string()),
+            img_size: None,
+            audio_ms: Some(1000),
+            audio_seed: None,
+            hash_hex: "abcd".to_string(),
+            abs_path: PathBuf::from("/tmp/song"),
+            origin: None,
+            exif: None,
+        };
+
+        let mp3 = FileRepresentations::from_facts(
+            &audio("audio/mpeg"),
+            "r".into(),
+            false,
+            MarkState::Unmarked,
+        );
+        assert!(
+            mp3.available_kinds()
+                .contains(&RepresentationKind::Metadata)
+        );
+        assert_eq!(
+            mp3.metadata.as_ref().map(|m| m.can_save),
+            Some(true),
+            "a writable repo can save tags"
+        );
+
+        // A read-only repo still shows the tab, but not as a savable one.
+        let ro = FileRepresentations::from_facts(
+            &audio("audio/mpeg"),
+            "r".into(),
+            true,
+            MarkState::Unmarked,
+        );
+        assert_eq!(ro.metadata.as_ref().map(|m| m.can_save), Some(false));
+
+        // FLAC/OGG carry no ID3 tag the writer understands.
+        let flac = FileRepresentations::from_facts(
+            &audio("audio/flac"),
+            "r".into(),
+            false,
+            MarkState::Unmarked,
+        );
+        assert!(
+            !flac
+                .available_kinds()
+                .contains(&RepresentationKind::Metadata)
+        );
+    }
+
+    #[test]
+    fn text_preview_reads_text_and_falls_back_to_hex() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let txt = dir.path().join("notes.txt");
+        std::fs::write(&txt, "hello alpha\n").unwrap();
+        let prev = load_text_preview(&txt);
+        assert!(prev.is_text, "valid UTF-8 is shown as text");
+        assert_eq!(prev.body, "hello alpha\n");
+        assert!(!prev.truncated);
+        assert!(prev.error.is_none());
+
+        // Decodable but binary: a NUL byte alone forces the hex view.
+        let nul = dir.path().join("blob.dat");
+        std::fs::write(&nul, b"%PDF-1.4\x00\x01stream").unwrap();
+        assert!(
+            !load_text_preview(&nul).is_text,
+            "a NUL byte marks the file binary even though it decodes"
+        );
+
+        let bin = dir.path().join("blob.bin");
+        std::fs::write(&bin, [0xff, 0xfe, 0x00, 0x41]).unwrap();
+        let prev = load_text_preview(&bin);
+        assert!(!prev.is_text, "invalid UTF-8 falls back to a hex dump");
+        assert!(
+            prev.body.starts_with("00000000  ff fe 00 41"),
+            "dump starts at offset 0 with the file's bytes: {:?}",
+            prev.body
+        );
+        assert!(prev.body.contains("|...A|"), "and carries an ASCII gutter");
+
+        // Longer than the window: the body is capped and flagged.
+        let big = dir.path().join("big.txt");
+        std::fs::write(&big, "x".repeat(TEXT_PREVIEW_BYTES + 10)).unwrap();
+        let prev = load_text_preview(&big);
+        assert_eq!(prev.body.len(), TEXT_PREVIEW_BYTES);
+        assert!(prev.truncated, "the user is told there is more");
+
+        let prev = load_text_preview(&dir.path().join("nope.txt"));
+        assert!(prev.error.is_some(), "an unreadable file reports why");
+    }
+
+    /// A file far longer than its column scrolls inside the viewport it was
+    /// given instead of pushing the rest of the screen down.
+    #[test]
+    fn text_column_scrolls_rather_than_overflowing() {
+        let preview = TextPreview {
+            body: (0..400).map(|i| format!("line {i}\n")).collect(),
+            is_text: true,
+            truncated: false,
+            error: None,
+        };
+        let head = ColumnHead {
+            file_name: "long.txt",
+            repo: "r",
+            accent: theme::BLUE,
+            read_only: false,
+            source: Path::new("/tmp/r/long.txt"),
+        };
+
+        let mut viewport = None;
+        {
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(600.0, 400.0))
+                .build_ui(|ui| {
+                    viewport = Some(draw_text_column(ui, &head, &preview, 300.0));
+                });
+            harness.run();
+        }
+
+        let viewport = viewport.expect("column drawn");
+        assert_eq!(
+            viewport.height(),
+            300.0,
+            "the preview takes the height it was given, not the file's length"
+        );
+        assert!(
+            viewport.bottom() <= 400.0,
+            "and stays inside the window: {viewport:?}"
+        );
     }
 }

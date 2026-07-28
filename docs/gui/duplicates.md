@@ -57,9 +57,41 @@ size, reclaimable bytes) and one card per file:
 
 ## Lightbox
 
-Click any image or video thumbnail to open the full-window lightbox.
+Click any thumbnail to open the full-window lightbox — including the typed placeholder a
+document, archive or other non-visual duplicate shows instead of a picture, which opens on
+its [Text](#representation-tabs) preview.
 
 ![Lightbox in A/B compare mode](../screenshots/lightbox_compare.png)
+
+### Representation tabs
+
+A file can be looked at in more than one way, so the lightbox is tabbed by *representation*.
+The tab bar offers every representation at least one of the two compared files has —
+**Overview**, **Image**, **Video**, **Audio**, **Metadata**, **Text** — and nothing else: a
+photo has no Audio tab, an untagged FLAC no Metadata tab. Selecting a tab draws only the
+column(s) whose file supports it, always left (A) against right (B), never stacked. If you
+step to a copy that lacks the current representation, the lightbox drops back to Overview.
+
+**Overview** is where a lightbox opens: repo badge, thumbnail, path, size/dimensions/duration,
+mtime and mime for each side, the DELETE / DELETE A / DELETE B mark pill, and the COMPARE
+button that hands off to the native view. While comparing, `< i / N >` cycles B through every
+*other* copy in the group.
+
+**Metadata** shows the file's tags. For MP3/WAV/AIFF that is the ID3 editor: EDIT TAGS opens
+Title/Artist/Album/Year/Track/Genre for that copy, the `>` beside a field offers the value any
+other copy in the group carries (adopt the best one), and SAVE TAGS writes only the tags — the
+audio itself is untouched. `T` from the audio view jumps straight here. A file in a read-only
+repository is shown but never editable. For images the tab shows the EXIF capture facts
+(camera, taken) as recorded; they are not edited here.
+
+![The Metadata tab, editing one copy's ID3 tags against another's](../screenshots/lightbox_metadata.png)
+
+**Text** is the representation for everything that is not image, video or audio — documents,
+archives, anything a thumbnail cannot describe. It shows the head of each file (the first
+64 KB) as text, or as an offset/hex/ASCII dump when the file is not text, so two same-sized
+"duplicates" can still be told apart by eye. Long files scroll inside their column.
+
+![The Text tab, a markdown file beside a binary one](../screenshots/lightbox_text.png)
 
 **Images**: mouse-wheel zooms around the cursor, drag pans. `F` fits to window / `1` shows
 true pixels (100%, one screen pixel per image pixel). `←`/`→` step through the group's other

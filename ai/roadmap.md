@@ -4,7 +4,41 @@ This document serves as the master implementation specification for upcoming fea
 
 ---
 
-## 1. Lightbox Architecture: Data Representation Interfaces [IN PROGRESS]
+## 1. Lightbox Architecture: Data Representation Interfaces [DONE]
+
+**Status (2026-07-28):** The last open piece — per-kind renderer dispatch (§1.3.1–1.3.2) and the
+two unbuilt representations — is in. `lightbox_modal` now matches on `state.active_tab` instead
+of sniffing the file's mime, so a tab selects the renderer:
+
+- **`Metadata` tab.** Advertised for ID3-capable containers (`id3tags::container_supported`:
+  MP3/WAV/AIFF) and for images that carry EXIF. It *is* the ID3 editor now — the parallel
+  `egui::Modal` inside `audio_lightbox` is deleted, and the TAGS pill / `T` open the tab
+  instead (one editor, per `ui-consistency: one app`). `open_tag_editor`/`save_tag_edit` are
+  the shared open/write helpers. Read-only repos get no EDIT TAGS button at all (§1.3.5);
+  images show EXIF camera/taken read-only, since there is no EXIF writer.
+- **`Text` tab.** The representation for everything that is not image/audio/video: the head of
+  the file (64 KB) as text, or an offset/hex/ASCII dump when it does not decode — a NUL byte
+  counts as binary even if the sample decodes. Cached per content hash (`text_cache`), like
+  thumbnails. PDF/office *text extraction* is deliberately not done here (that needs
+  dedup-core's extractor and likely worker plumbing) — this is a head-read, not extraction.
+- **Only supporting columns are drawn** (§1.3.1): an untagged FLAC as B leaves A alone on
+  screen rather than an empty half. `tab_kinds()` is the one place the offered set is computed,
+  used by both the tab bar and the dispatch.
+- **A tab the pair no longer offers falls back to Overview**, so arrow-nav onto a member
+  without the current representation can't strand the user on a blank overlay.
+- **`draw_columns` + `lightbox_shell`** are now shared by Overview, Metadata and Text (flow
+  layout per column, never `ui.columns`, never absolute rects — the trap §1's earlier note
+  documents). Overview was moved onto them; its rendered layout is unchanged
+  (`lightbox_overview_compare.png` re-rendered and checked).
+- **Verified by rendering**, per this section's own lesson: `doc_screenshot_lightbox_metadata_and_text`
+  writes `docs/screenshots/lightbox_metadata.png` / `lightbox_text.png`, plus geometric asserts
+  that the two columns do not overlap and stay inside the window, a click-the-tab (not
+  set-the-field) editor round-trip that writes real ID3 to disk, and a scroll test proving a
+  400-line file stays inside its viewport.
+
+**Not done here:** `FileFacts` gained `exif`, but EXIF is display-only; ID3 `comment` is still
+not among the edited fields (`id3tags::Tags` has genre, not comment); cross-type compare still
+has no caller.
 
 **Status (2026-07-26):** The representation scaffolding (§1.2 structs/enums) was built but never
 wired into any view — the `[COMPLETED]` tag above was premature. Since then:
@@ -24,10 +58,10 @@ wired into any view — the `[COMPLETED]` tag above was premature. Since then:
 - §1.3.4's selector-label and index-mapping fixes are in via `other_member_indices`/
   `format_other_switcher_label`, directly verified both by unit tests and by the cycler shown in
   `lightbox_overview_compare.png` (`<1/3>` for a 4-file group, not `<3/4>`).
-- **Still open:** the tab bar can navigate Overview ↔ the *native* view of A's own kind, but
-  clicking a tab for a genuinely different representation than what's currently showing does
-  nothing beyond flip `active_tab` — there's no actual per-kind content switch/renderer dispatch
-  yet (§1.3.1–1.3.2). Metadata/Text tabs remain unadvertised (no renderer exists).
+- **Was still open, closed on 2026-07-28 (see the status note above):** the tab bar could
+  navigate Overview ↔ the *native* view of A's own kind, but clicking a tab for a genuinely
+  different representation did nothing beyond flip `active_tab` — there was no per-kind
+  renderer dispatch (§1.3.1–1.3.2), and Metadata/Text were unadvertised for want of a renderer.
 - **Overview is now the default tab** (§1.3.3: "the tab on top should always be the intro to
   comparison"). `LightboxState::new` sets `active_tab: RepresentationKind::Overview`; the earlier
   native-first default was a staging compromise while the screen was being built, now reverted.

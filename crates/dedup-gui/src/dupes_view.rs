@@ -7,8 +7,10 @@ use crate::icon;
 use crate::id3tags::{self, Tags};
 use crate::imgedit::{self, Orient};
 use crate::lightbox::{
-    CompareState, FileRepresentations, FullResCache, LightboxState, MarkState, RepresentationKind,
-    draw_tab_bar, format_other_switcher_label, other_member_indices,
+    ColumnFn, ColumnHead, CompareState, FileRepresentations, FullResCache, LightboxState,
+    MarkState, MetaAction, MetaBody, RepresentationKind, TextPreview, draw_columns,
+    draw_metadata_column, draw_tab_bar, draw_text_column, format_other_switcher_label,
+    has_text_representation, load_text_preview, other_member_indices, tab_kinds,
 };
 use crate::media_cell::{FileFacts, MediaStyle, VIDEO_STRIP, fmt_ms, media_cell};
 use crate::player::Player;
@@ -172,10 +174,9 @@ fn mark_state_for(marked: bool, markable: bool) -> MarkState {
 }
 
 /// The single non-Overview tab a file's native content lives under, used to
-/// jump straight there when the Overview screen starts a compare. Any
-/// non-Overview value works for `lightbox_modal`'s own dispatch (it decides
-/// audio vs. image/video from the file's mime, not from `active_tab`) — this
-/// only makes the tab bar highlight the right label.
+/// jump straight there when the Overview screen starts a compare. It must match
+/// what `from_facts` offers for the file: `lightbox_modal` dispatches on
+/// `active_tab`, and a kind the pair does not offer falls back to Overview.
 fn native_kind(file: &DupeFile) -> RepresentationKind {
     let mime = file.entry.mime.as_deref();
     if mime.is_some_and(dedup_core::fingerprint::is_audio_mime) {
@@ -184,6 +185,98 @@ fn native_kind(file: &DupeFile) -> RepresentationKind {
         RepresentationKind::Video
     } else {
         RepresentationKind::Image
+    }
+}
+
+/// The full-window chrome every tabbed lightbox screen shares: a dimming
+/// backdrop, the CLOSE button, and the representation tab bar built from A's and
+/// B's available kinds. `body` draws the screen's own content underneath.
+/// Returns `true` when CLOSE was clicked.
+///
+/// A free function taking `state` (rather than a `DupesView` method) so `body`
+/// can borrow `&mut self` for the caches it needs while drawing.
+fn lightbox_shell(
+    ctx: &egui::Context,
+    id: &'static str,
+    state: &mut LightboxState,
+    verbosity: TooltipVerbosity,
+    a_reps: &FileRepresentations,
+    b_reps: Option<&FileRepresentations>,
+    body: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let mut close = false;
+    egui::Area::new(Id::new(id))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let screen = ctx.content_rect();
+            ui.allocate_rect(screen, egui::Sense::click());
+            ui.painter()
+                .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(238));
+            let inner = screen.shrink(12.0);
+            let mut child = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(inner)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            let ui = &mut child;
+
+            ui.horizontal(|ui| {
+                if ui
+                    .button(RichText::new(format!("{} CLOSE", icon::CHECK)).color(theme::BLACK))
+                    .explain(
+                        verbosity,
+                        "Close the lightbox",
+                        "Close the lightbox and return to the group list (Esc does the same).",
+                    )
+                    .clicked()
+                {
+                    close = true;
+                }
+                ui.add_space(8.0);
+                draw_tab_bar(ui, state, a_reps, b_reps.unwrap_or(a_reps));
+            });
+            ui.add_space(6.0);
+            body(ui);
+        });
+    close
+}
+
+/// One side of a tabbed lightbox screen: who the group member is, where it
+/// lives, and what representations it offers. Resolved once per frame so the
+/// column closures never have to borrow the view again.
+struct SideInfo {
+    hex: String,
+    path: PathBuf,
+    name: String,
+    repo: String,
+    read_only: bool,
+    facts: FileFacts,
+    reps: FileRepresentations,
+}
+
+/// Pick what one Metadata column shows: the open editor when this side is the
+/// copy being edited, else its stored ID3 tags (audio) or its EXIF capture facts
+/// (images).
+fn meta_body<'a>(
+    s: &'a SideInfo,
+    stored: Option<&'a Tags>,
+    tag_edit: &'a mut Option<TagEdit>,
+) -> MetaBody<'a> {
+    match tag_edit {
+        Some(TagEdit {
+            hex, tags, options, ..
+        }) if *hex == s.hex => MetaBody::Editing { tags, options },
+        _ if s.facts.is_audio() => MetaBody::Stored {
+            tags: stored,
+            can_edit: !s.read_only,
+        },
+        _ => {
+            let (camera, taken) = s.reps.metadata.as_ref().map_or((None, None), |m| {
+                (m.camera.as_deref(), m.taken_ms.map(format_mtime))
+            });
+            MetaBody::Exif { camera, taken }
+        }
     }
 }
 
@@ -426,8 +519,11 @@ pub struct DupesView {
     edit_save: bool,
     /// Cached ID3 tags per audio file (hex → tags, or `None` if none/unsupported).
     tags_cache: HashMap<String, Option<Tags>>,
-    /// The ID3 tag editor (audio lightbox), if open.
+    /// The ID3 tag editor (Metadata tab), if open.
     tag_edit: Option<TagEdit>,
+    /// Cached text/hex previews per non-media file (hex → head of the file),
+    /// backing the lightbox's Text tab.
+    text_cache: HashMap<String, TextPreview>,
     /// Tooltip wording for this frame, set at the top of [`Self::show`] from
     /// the app-wide setting (not persisted here; `app.rs` owns that).
     verbosity: TooltipVerbosity,
@@ -498,6 +594,7 @@ impl DupesView {
             edit_save: false,
             tags_cache: HashMap::new(),
             tag_edit: None,
+            text_cache: HashMap::new(),
             verbosity: TooltipVerbosity::default(),
             filter: FilterBuilder::new(),
         }
@@ -1519,10 +1616,35 @@ impl DupesView {
         // The shared media cell draws the image / video still / audio glyph /
         // placeholder; the card keeps the click meaning (open the lightbox) and
         // its own tooltip. A placeholder or not-yet-decoded thumbnail returns
-        // `None`, so there is nothing to open.
+        // `None` — but a *typed* placeholder (a document, an archive) still has
+        // a Text representation to open, so the card makes the placeholder
+        // itself the click target rather than leaving those groups with no way
+        // into the lightbox at all.
         let facts = FileFacts::from_entry(&file.entry, file.absolute_path());
-        let Some(resp) = media_cell(ui, &mut self.thumbs, &facts, MediaStyle::card()) else {
-            return;
+        let thumbs = &mut self.thumbs;
+        let cell = ui.scope(|ui| media_cell(ui, thumbs, &facts, MediaStyle::card()));
+        let resp = match cell.inner {
+            Some(resp) => resp,
+            None if has_text_representation(&facts) => {
+                let hit = ui.interact(
+                    cell.response.rect,
+                    ui.id().with(("dupe-open", gi, fi)),
+                    egui::Sense::click(),
+                );
+                // The placeholder is a picture of nothing, so name the target —
+                // otherwise this click area has no accessible label at all.
+                hit.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "OPEN PREVIEW")
+                });
+                hit.on_hover_cursor(egui::CursorIcon::PointingHand).explain(
+                    self.verbosity,
+                    "Open the text preview",
+                    "Open the full-window lightbox: this file has no picture, so its Text tab \
+                     shows the start of its contents — as text, or as hex when it is not text \
+                     — beside the copy you compare it with.",
+                )
+            }
+            None => return,
         };
         let resp = if facts.is_audio() {
             resp.explain(
@@ -1649,96 +1771,51 @@ impl DupesView {
             }
         });
 
-        egui::Area::new(Id::new("lightbox-overview"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(egui::Pos2::ZERO)
-            .show(ctx, |ui| {
-                let screen = ctx.content_rect();
-                ui.allocate_rect(screen, egui::Sense::click());
-                ui.painter()
-                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(238));
-                let inner = screen.shrink(12.0);
-                let mut child = ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(inner)
-                        .layout(egui::Layout::top_down(egui::Align::Min)),
-                );
-                let ui = &mut child;
-
-                ui.horizontal(|ui| {
-                    if ui
-                        .button(RichText::new(format!("{} CLOSE", icon::CHECK)).color(theme::BLACK))
-                        .explain(
-                            verbosity,
-                            "Close the lightbox",
-                            "Close the lightbox and return to the group list (Esc does the same).",
-                        )
-                        .clicked()
-                    {
-                        close = true;
-                    }
-                    ui.add_space(8.0);
-                    let b_reps = b_info.as_ref().map(|(.., reps)| reps);
-                    draw_tab_bar(ui, state, &a_reps, b_reps.unwrap_or(&a_reps));
-                });
-                ui.add_space(6.0);
-
-                // Two independently-flowing top-down columns, sized and placed
-                // by `horizontal_top`'s own cursor (not an absolute rect), so
-                // it properly advances by the taller column's height and the
-                // controls drawn afterwards (COMPARE, or the cycler + EXIT
-                // COMPARE) land below both columns rather than racing them for
-                // the same row. Deliberately not `ui.columns`: that hardcodes
-                // `top_down_justified`, which stretches every child widget
-                // (including the thumbnail's hairline-stroked rect) to the
-                // full column width instead of its natural size.
-                let col_w = (ui.available_width() - 16.0) / 2.0;
-                ui.horizontal_top(|ui| {
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(col_w, 0.0),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            let side = OverviewSide {
-                                file: a,
-                                facts: &a_facts,
-                                accent: theme::BLUE,
-                                read_only: a_ro,
-                                mark_label: if b_info.is_some() {
-                                    "DELETE A"
-                                } else {
-                                    "DELETE"
-                                },
-                                marked: a_marked,
-                                markable: a_markable,
-                            };
-                            if draw_overview_column(ui, &mut self.thumbs, verbosity, side) {
-                                toggle_a_mark = true;
-                            }
-                        },
-                    );
-                    ui.add_space(16.0);
-
-                    if let Some((bf, _, b_ro, b_markable, b_marked, b_facts, _)) = &b_info {
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(col_w, 0.0),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                let side = OverviewSide {
-                                    file: bf,
-                                    facts: b_facts,
-                                    accent: theme::TAN,
-                                    read_only: *b_ro,
-                                    mark_label: "DELETE B",
-                                    marked: *b_marked,
-                                    markable: *b_markable,
-                                };
-                                if draw_overview_column(ui, &mut self.thumbs, verbosity, side) {
-                                    toggle_b_mark = true;
-                                }
+        let thumbs = &mut self.thumbs;
+        if lightbox_shell(
+            ctx,
+            "lightbox-overview",
+            state,
+            verbosity,
+            &a_reps,
+            b_info.as_ref().map(|(.., reps)| reps),
+            |ui| {
+                let mut cols: Vec<ColumnFn<'_, ThumbCache>> =
+                    vec![Box::new(|ui: &mut egui::Ui, thumbs: &mut ThumbCache| {
+                        let side = OverviewSide {
+                            file: a,
+                            facts: &a_facts,
+                            accent: theme::BLUE,
+                            read_only: a_ro,
+                            mark_label: if b_info.is_some() {
+                                "DELETE A"
+                            } else {
+                                "DELETE"
                             },
-                        );
-                    }
-                });
+                            marked: a_marked,
+                            markable: a_markable,
+                        };
+                        if draw_overview_column(ui, thumbs, verbosity, side) {
+                            toggle_a_mark = true;
+                        }
+                    })];
+                if let Some((bf, _, b_ro, b_markable, b_marked, b_facts, _)) = &b_info {
+                    cols.push(Box::new(|ui: &mut egui::Ui, thumbs: &mut ThumbCache| {
+                        let side = OverviewSide {
+                            file: bf,
+                            facts: b_facts,
+                            accent: theme::TAN,
+                            read_only: *b_ro,
+                            mark_label: "DELETE B",
+                            marked: *b_marked,
+                            markable: *b_markable,
+                        };
+                        if draw_overview_column(ui, thumbs, verbosity, side) {
+                            toggle_b_mark = true;
+                        }
+                    }));
+                }
+                draw_columns(ui, thumbs, cols);
                 ui.add_space(8.0);
 
                 if b_info.is_some() {
@@ -1775,7 +1852,10 @@ impl DupesView {
                         enter_compare = true;
                     }
                 }
-            });
+            },
+        ) {
+            close = true;
+        }
 
         if close {
             return true;
@@ -1809,6 +1889,284 @@ impl DupesView {
         false
     }
 
+    /// The (file, key, read-only, facts, representations) bundle every tabbed
+    /// screen needs about one group member, resolved through `self` up front so
+    /// the drawing closures below don't have to borrow it again.
+    fn side_of(&self, group: &DupeGroup, gi: usize) -> SideInfo {
+        let f = &group[gi];
+        let facts = FileFacts::from_entry(&f.entry, f.absolute_path());
+        let read_only = self.repo_is_ro(&f.repo);
+        let k = key(f);
+        let markable = !read_only || self.unlocked.contains(&k);
+        let reps = FileRepresentations::from_facts(
+            &facts,
+            f.repo.clone(),
+            read_only,
+            mark_state_for(self.marked.contains(&k), markable),
+        );
+        SideInfo {
+            hex: hash_hex(&f.entry.hash),
+            path: f.absolute_path(),
+            name: f.rel_path.clone(),
+            repo: f.repo.clone(),
+            read_only,
+            facts,
+            reps,
+        }
+    }
+
+    /// The group index of the compare target (B), when comparing.
+    fn compare_index(state: &LightboxState, group: &DupeGroup) -> Option<usize> {
+        state
+            .compare
+            .as_ref()
+            .and_then(|c| group.iter().position(|f| f.absolute_path() == c.b.abs_path))
+    }
+
+    /// Drop what a closed lightbox was holding: the tag editor's unsaved working
+    /// copy (so reopening a file never resurrects abandoned edits) and the Text
+    /// tab's file previews (64 KB each, and stale the moment the file changes).
+    fn release_lightbox(&mut self) {
+        self.tag_edit = None;
+        self.text_cache.clear();
+    }
+
+    /// Open the ID3 editor on group member `gi`: its current tags as the working
+    /// copy, plus the distinct value each field takes across every copy in the
+    /// group, so the best one can be adopted. Shared by the audio view's TAGS
+    /// pill and the Metadata tab's EDIT TAGS button.
+    fn open_tag_editor(&mut self, group: &DupeGroup, gi: usize) {
+        let Some(f) = group.get(gi) else {
+            return;
+        };
+        let (hex, path) = (hash_hex(&f.entry.hash), f.absolute_path());
+        let tags = self
+            .tags_cache
+            .entry(hex.clone())
+            .or_insert_with(|| id3tags::read(&path))
+            .clone();
+        let mut options: [Vec<String>; 6] = std::array::from_fn(|_| Vec::new());
+        for gf in group {
+            let (gh, gp) = (hash_hex(&gf.entry.hash), gf.absolute_path());
+            if let Some(t) = self
+                .tags_cache
+                .entry(gh)
+                .or_insert_with(|| id3tags::read(&gp))
+                .clone()
+            {
+                let vals = [&t.title, &t.artist, &t.album, &t.year, &t.track, &t.genre];
+                for (i, v) in vals.into_iter().enumerate() {
+                    if !v.is_empty() && !options[i].iter().any(|o| o == v) {
+                        options[i].push(v.clone());
+                    }
+                }
+            }
+        }
+        self.tag_edit = Some(TagEdit {
+            hex,
+            path,
+            tags: tags.unwrap_or_default(),
+            options,
+        });
+    }
+
+    /// Write the open editor's tags to disk (tags only — the audio is untouched)
+    /// and close it, refreshing the cached values on success.
+    fn save_tag_edit(&mut self) {
+        let Some(te) = self.tag_edit.take() else {
+            return;
+        };
+        match id3tags::write(&te.path, &te.tags) {
+            Ok(()) => {
+                self.status = Some("Tags saved".into());
+                self.error = None;
+                self.tags_cache.insert(te.hex, Some(te.tags));
+            }
+            Err(e) => self.error = Some(format!("Tag save failed: {e}")),
+        }
+    }
+
+    /// The Lightbox's `Metadata` tab: each side's tag surface — the ID3 editor
+    /// for the copy being edited, the stored tags (read-only) for the others,
+    /// and an image's EXIF capture facts. Only the column(s) whose file actually
+    /// carries metadata are drawn (§1.3.1), so an untagged B leaves A alone on
+    /// screen. Read-only repos get no edit affordance at all (§1.3.5). Returns
+    /// `true` when CLOSE/Esc was pressed.
+    fn draw_lightbox_metadata(
+        &mut self,
+        ctx: &egui::Context,
+        state: &mut LightboxState,
+        group: &DupeGroup,
+        idx: usize,
+    ) -> bool {
+        let verbosity = self.verbosity;
+        let a = self.side_of(group, idx);
+        let b_pos = Self::compare_index(state, group);
+        let b = b_pos.map(|bi| self.side_of(group, bi));
+
+        // Tag reads are file I/O: do them once here (cached by content hash),
+        // before the drawing closures borrow anything.
+        let stored = |me: &mut Self, s: &SideInfo| -> Option<Tags> {
+            if s.facts.is_audio() {
+                me.tags_cache
+                    .entry(s.hex.clone())
+                    .or_insert_with(|| id3tags::read(&s.path))
+                    .clone()
+            } else {
+                None
+            }
+        };
+        let a_tags = stored(self, &a);
+        let b_tags = b.as_ref().map(|s| stored(self, s));
+
+        // The editor state travels out of `self` for the frame so the column
+        // closures can bind text fields to it.
+        let mut tag_edit = self.tag_edit.take();
+        let (mut a_action, mut b_action) = (MetaAction::None, MetaAction::None);
+        let mut esc = false;
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::Escape) {
+                esc = true;
+            }
+        });
+
+        let close = lightbox_shell(
+            ctx,
+            "lightbox-metadata",
+            state,
+            verbosity,
+            &a.reps,
+            b.as_ref().map(|s| &s.reps),
+            |ui| {
+                let mut cols: Vec<ColumnFn<'_, Option<TagEdit>>> = Vec::new();
+                if a.reps.metadata.is_some() {
+                    cols.push(Box::new(|ui: &mut egui::Ui, te: &mut Option<TagEdit>| {
+                        a_action = draw_metadata_column(
+                            ui,
+                            &ColumnHead {
+                                file_name: &a.name,
+                                repo: &a.repo,
+                                accent: theme::BLUE,
+                                read_only: a.read_only,
+                                source: &a.path,
+                            },
+                            meta_body(&a, a_tags.as_ref(), te),
+                        );
+                    }));
+                }
+                if let (Some(s), Some(tags)) = (b.as_ref(), b_tags.as_ref())
+                    && s.reps.metadata.is_some()
+                {
+                    cols.push(Box::new(|ui: &mut egui::Ui, te: &mut Option<TagEdit>| {
+                        b_action = draw_metadata_column(
+                            ui,
+                            &ColumnHead {
+                                file_name: &s.name,
+                                repo: &s.repo,
+                                accent: theme::TAN,
+                                read_only: s.read_only,
+                                source: &s.path,
+                            },
+                            meta_body(s, tags.as_ref(), te),
+                        );
+                    }));
+                }
+                draw_columns(ui, &mut tag_edit, cols);
+            },
+        );
+        self.tag_edit = tag_edit;
+
+        // Esc backs out of an open editor first, then closes the lightbox.
+        if esc && self.tag_edit.is_some() {
+            self.tag_edit = None;
+            return false;
+        }
+        match (a_action, b_action) {
+            (MetaAction::Edit, _) => self.open_tag_editor(group, idx),
+            (_, MetaAction::Edit) => {
+                if let Some(bi) = b_pos {
+                    self.open_tag_editor(group, bi);
+                }
+            }
+            (MetaAction::Save, _) | (_, MetaAction::Save) => self.save_tag_edit(),
+            (MetaAction::Cancel, _) | (_, MetaAction::Cancel) => self.tag_edit = None,
+            (MetaAction::None, MetaAction::None) => {}
+        }
+        close || esc
+    }
+
+    /// The Lightbox's `Text` tab: the head of each non-media file as text, or as
+    /// a hex dump when it does not decode — the representation that gives PDFs,
+    /// documents and archives a lightbox surface at all. Returns `true` when
+    /// CLOSE/Esc was pressed.
+    fn draw_lightbox_text(
+        &mut self,
+        ctx: &egui::Context,
+        state: &mut LightboxState,
+        group: &DupeGroup,
+        idx: usize,
+    ) -> bool {
+        let verbosity = self.verbosity;
+        let screen_h = ctx.content_rect().height();
+        let a = self.side_of(group, idx);
+        let b = Self::compare_index(state, group).map(|bi| self.side_of(group, bi));
+
+        // Reading the file is I/O: cached by content hash, like the thumbnails.
+        for s in [Some(&a), b.as_ref()].into_iter().flatten() {
+            if s.reps.text.is_some() && !self.text_cache.contains_key(&s.hex) {
+                self.text_cache
+                    .insert(s.hex.clone(), load_text_preview(&s.path));
+            }
+        }
+        let previews = &self.text_cache;
+
+        let mut esc = false;
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::Escape) {
+                esc = true;
+            }
+        });
+
+        let close = lightbox_shell(
+            ctx,
+            "lightbox-text",
+            state,
+            verbosity,
+            &a.reps,
+            b.as_ref().map(|s| &s.reps),
+            |ui| {
+                // Sized from the window, not from `available_height`: inside the
+                // overlay Area the latter is the auto-sized cursor's remainder,
+                // which collapses the preview to a few lines.
+                let height = (screen_h - 140.0).max(160.0);
+                let mut cols: Vec<ColumnFn<'_, ()>> = Vec::new();
+                for (s, accent) in [(Some(&a), theme::BLUE), (b.as_ref(), theme::TAN)]
+                    .into_iter()
+                    .filter_map(|(s, c)| s.map(|s| (s, c)))
+                {
+                    if let (true, Some(prev)) = (s.reps.text.is_some(), previews.get(&s.hex)) {
+                        cols.push(Box::new(move |ui: &mut egui::Ui, _: &mut ()| {
+                            draw_text_column(
+                                ui,
+                                &ColumnHead {
+                                    file_name: &s.name,
+                                    repo: &s.repo,
+                                    accent,
+                                    read_only: s.read_only,
+                                    source: &s.path,
+                                },
+                                prev,
+                                height,
+                            );
+                        }));
+                    }
+                }
+                draw_columns(ui, &mut (), cols);
+            },
+        );
+        close || esc
+    }
+
     /// Full-window image lightbox: wheel zoom (around cursor), drag pan, `F`
     /// fit / `1` 1:1, `←`/`→` step the group, `Del`/`K` toggle the mark, `C`
     /// A/B compare against the best copy (`space` enters flicker, then swaps
@@ -1829,31 +2187,66 @@ impl DupesView {
             .filter(|g| !g.is_empty())
             .cloned()
         else {
-            return; // group gone (page changed / resolved) → stay closed
+            // Group gone (page changed / resolved): the lightbox stays closed,
+            // so release what its tabs held exactly as an explicit close does.
+            self.release_lightbox();
+            return;
         };
         let count = group.len();
         let mut idx = state.index.min(count - 1);
 
-        // The Overview tab intercepts before the audio/image dispatch: it's a
-        // lightweight facts/mark/compare-entry screen shared by every file kind,
-        // reached via the tab bar (or `I`) from either native view below.
-        if state.active_tab == RepresentationKind::Overview {
-            let closed = self.draw_lightbox_overview(ctx, &mut state, &group, idx, acts);
-            if !closed {
-                self.lightbox = Some(state);
-            }
-            return;
+        // Dispatch on the selected tab, not on the file's mime: the tab bar can
+        // offer any representation either side supports, so the renderer has to
+        // follow the tab (§1.3.1). Arrow-nav can land on a member that lacks the
+        // current representation — an mp3 among tagless copies, say — so a tab
+        // the pair no longer offers falls back to Overview, which every file has,
+        // rather than leaving a blank full-screen overlay.
+        let offered = {
+            let a = self.side_of(&group, idx);
+            let b = Self::compare_index(&state, &group).map(|bi| self.side_of(&group, bi));
+            tab_kinds(&a.reps, b.as_ref().map(|s| &s.reps))
+        };
+        if !offered.contains(&state.active_tab) {
+            state.active_tab = RepresentationKind::Overview;
         }
-
-        // Audio files get a dedicated waveform lightbox, not the image viewer.
-        if group[idx]
-            .entry
-            .mime
-            .as_deref()
-            .is_some_and(dedup_core::fingerprint::is_audio_mime)
-        {
-            self.audio_lightbox(ctx, state, group, idx);
-            return;
+        match state.active_tab {
+            // The Overview tab: a lightweight facts/mark/compare-entry screen
+            // shared by every file kind, reached via the tab bar (or `I`).
+            RepresentationKind::Overview => {
+                let closed = self.draw_lightbox_overview(ctx, &mut state, &group, idx, acts);
+                if closed {
+                    self.release_lightbox();
+                } else {
+                    self.lightbox = Some(state);
+                }
+                return;
+            }
+            RepresentationKind::Metadata => {
+                let closed = self.draw_lightbox_metadata(ctx, &mut state, &group, idx);
+                if closed {
+                    self.release_lightbox();
+                } else {
+                    self.lightbox = Some(state);
+                }
+                return;
+            }
+            RepresentationKind::Text => {
+                let closed = self.draw_lightbox_text(ctx, &mut state, &group, idx);
+                if closed {
+                    self.release_lightbox();
+                } else {
+                    self.lightbox = Some(state);
+                }
+                return;
+            }
+            // Audio's own waveform/spectrogram viewer, not the image one.
+            RepresentationKind::Audio => {
+                self.audio_lightbox(ctx, state, group, idx);
+                return;
+            }
+            // Image and Video share the zoom/pan viewer below (video adds a
+            // filmstrip); both are drawn from the same texture pipeline.
+            RepresentationKind::Image | RepresentationKind::Video => {}
         }
 
         // Keyboard: navigation, view modes, mark, compare, close. Mode changes
@@ -1920,6 +2313,7 @@ impl DupesView {
         if close {
             self.edit = None;
             self.edit_save = false;
+            self.release_lightbox();
             return; // dropped state = closed
         }
         if new_idx != idx {
@@ -3229,9 +3623,8 @@ impl DupesView {
                             theme::PANEL,
                             theme::TEXT,
                             "Edit ID3 tags",
-                            "Open the ID3 tag editor for the current copy — the panels on the \
-                             right show them read-only; saving writes only the tags, the audio \
-                             is untouched (T does the same).",
+                            "Open this copy's tags on the Metadata tab, ready to edit — saving \
+                             writes only the tags, the audio is untouched (T does the same).",
                         ) {
                             open_tags = Some(idx);
                         }
@@ -3357,11 +3750,8 @@ impl DupesView {
         // Apply deferred actions now that drawing is done. Esc and space mirror
         // the image lightbox: Esc steps back one level (flicker → side-by-side →
         // single → closed); space enters flicker from side-by-side, then swaps.
-        // Esc closes the tag editor first (if open), else backs out a level.
-        if esc && self.tag_edit.is_some() {
-            self.tag_edit = None;
-            esc = false;
-        }
+        // Esc backs out a level (the tag editor is its own tab now, and handles
+        // its own Esc).
         if esc {
             match state.compare.as_ref() {
                 Some(c) if c.flicker => toggle_flicker = true,
@@ -3379,48 +3769,16 @@ impl DupesView {
         if close {
             self.player.stop();
             self.spec_tex.clear();
-            self.tag_edit = None;
+            self.release_lightbox();
             return; // dropped state = closed
         }
-        // A tag EDIT button (or `T`) opens the editor for that copy; clicking it
-        // again for the copy already open closes it (a toggle).
+        // The TAGS pill (or `T`) opens that copy's tags on the Metadata tab —
+        // the one place tags are shown and edited, rather than a second editor
+        // layered over this view.
         if let Some(ei) = open_tags {
-            let f = group[ei.min(count - 1)].clone();
-            let (h, p, _t) = params(&f);
-            if self.tag_edit.as_ref().map(|t| t.hex.as_str()) == Some(h.as_str()) {
-                self.tag_edit = None;
-            } else {
-                let tags = self
-                    .tags_cache
-                    .entry(h.clone())
-                    .or_insert_with(|| id3tags::read(&p))
-                    .clone();
-                // Collect the distinct value seen for each field across every
-                // copy in the group, so the editor can offer them as options.
-                let mut options: [Vec<String>; 6] = std::array::from_fn(|_| Vec::new());
-                for gf in &group {
-                    let (gh, gp, _) = params(gf);
-                    if let Some(t) = self
-                        .tags_cache
-                        .entry(gh)
-                        .or_insert_with(|| id3tags::read(&gp))
-                        .clone()
-                    {
-                        let vals = [&t.title, &t.artist, &t.album, &t.year, &t.track, &t.genre];
-                        for (i, v) in vals.into_iter().enumerate() {
-                            if !v.is_empty() && !options[i].iter().any(|o| o == v) {
-                                options[i].push(v.clone());
-                            }
-                        }
-                    }
-                }
-                self.tag_edit = Some(TagEdit {
-                    hex: h,
-                    path: p,
-                    tags: tags.unwrap_or_default(),
-                    options,
-                });
-            }
+            let ei = ei.min(count - 1);
+            self.open_tag_editor(&group, ei);
+            state.active_tab = RepresentationKind::Metadata;
         }
         if toggle_spec {
             state.spectrogram = !state.spectrogram;
@@ -3573,88 +3931,6 @@ impl DupesView {
                 && c.flicker
             {
                 c.show_b = want_b;
-            }
-        }
-
-        // ID3 tag editor modal (Phase 6.5). Fields bind to the working copy;
-        // SAVE writes tags only (audio untouched) and keeps the lightbox open.
-        if self.tag_edit.is_some() {
-            let (mut save, mut cancel) = (false, false);
-            egui::Modal::new(Id::new("id3-edit")).show(&ctx.clone(), |ui| {
-                let te = self.tag_edit.as_mut().unwrap();
-                ui.set_width(440.0);
-                ui.label(
-                    RichText::new("EDIT ID3 TAGS")
-                        .color(theme::AMBER)
-                        .size(16.0)
-                        .strong(),
-                );
-                ui.add_space(8.0);
-                let field = |ui: &mut egui::Ui, label: &str, val: &mut String, opts: &[String]| {
-                    ui.horizontal(|ui| {
-                        ui.add_sized(
-                            [56.0, 18.0],
-                            egui::Label::new(RichText::new(label).color(theme::TAN).size(12.0)),
-                        );
-                        ui.add(egui::TextEdit::singleline(val).desired_width(300.0));
-                        // Adopt a value from another copy in the group.
-                        if !opts.is_empty() {
-                            ui.menu_button(icon::CARET_RIGHT, |ui| {
-                                for o in opts {
-                                    if ui.button(RichText::new(o).color(theme::TEXT)).clicked() {
-                                        *val = o.clone();
-                                    }
-                                }
-                            })
-                            .response
-                            .on_hover_text("Pick a value from another copy in this group");
-                        }
-                    });
-                };
-                field(ui, "Title", &mut te.tags.title, &te.options[0]);
-                field(ui, "Artist", &mut te.tags.artist, &te.options[1]);
-                field(ui, "Album", &mut te.tags.album, &te.options[2]);
-                field(ui, "Year", &mut te.tags.year, &te.options[3]);
-                field(ui, "Track", &mut te.tags.track, &te.options[4]);
-                field(ui, "Genre", &mut te.tags.genre, &te.options[5]);
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("SAVE TAGS").color(theme::BLACK))
-                                .fill(theme::AMBER),
-                        )
-                        .clicked()
-                    {
-                        save = true;
-                    }
-                    if ui
-                        .button(RichText::new("CANCEL").color(theme::TEXT))
-                        .clicked()
-                    {
-                        cancel = true;
-                    }
-                });
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(
-                        "Saving writes the tags to the file on disk; the audio is unchanged.",
-                    )
-                    .color(theme::LILAC)
-                    .size(11.0),
-                );
-            });
-            if cancel {
-                self.tag_edit = None;
-            } else if save && let Some(te) = self.tag_edit.take() {
-                match id3tags::write(&te.path, &te.tags) {
-                    Ok(()) => {
-                        self.status = Some("Tags saved".into());
-                        self.error = None;
-                        self.tags_cache.insert(te.hex, Some(te.tags));
-                    }
-                    Err(e) => self.error = Some(format!("Tag save failed: {e}")),
-                }
             }
         }
 
@@ -5040,6 +5316,7 @@ mod ui_tests {
             hash_hex: "deadbeef".to_string(),
             abs_path: std::path::PathBuf::from("/nonexistent-dedup-test/x"),
             origin: None,
+            exif: None,
         };
         let ctx = egui::Context::default();
         let mut view = DupesView::new();
@@ -7800,6 +8077,543 @@ mod ui_tests {
         }
         let img = harness.render().expect("wgpu render failed");
         let out = doc_screenshot_path("lightbox_overview_compare.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    // ---- Metadata and Text tabs (roadmap §1.3.1–1.3.2: the viewer dispatches
+    // on the selected representation, not on the file's mime) -----------------
+
+    /// A harness over `view` with its own throwaway store, the setup every
+    /// lightbox test repeats.
+    fn lightbox_harness(
+        view: DupesView,
+        size: egui::Vec2,
+    ) -> egui_kittest::Harness<'static, DupesView> {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        egui_kittest::Harness::builder()
+            .with_size(size)
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            )
+    }
+
+    /// A real (tiny) MP3 at `dir/rel` carrying `title`, plus the `DupeFile` that
+    /// addresses it.
+    fn tagged_mp3(dir: &Path, rel: &str, i: u8, title: &str) -> DupeFile {
+        let path = dir.join(rel);
+        crate::id3tags::write_bare_mp3(&path);
+        crate::id3tags::write(
+            &path,
+            &Tags {
+                title: title.into(),
+                artist: "Cohen".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut hash = [0u8; 32];
+        hash[0] = i;
+        DupeFile {
+            repo: "r".into(),
+            repo_root: dir.to_string_lossy().into_owned(),
+            rel_path: rel.into(),
+            entry: dedup_core::store::FileEntry {
+                size: 417,
+                hash,
+                modified_ms: 0,
+                missing: false,
+                mime: Some("audio/mpeg".into()),
+                img_fingerprint: None,
+                video_hash: None,
+                pdf_hash: None,
+                audio: Some(dedup_core::store::AudioFp {
+                    duration_ms: 1000,
+                    chunk_hashes: Vec::new(),
+                }),
+                img_size: None,
+                origin: None,
+                exif: None,
+            },
+        }
+    }
+
+    /// A file of `bytes` at `dir/rel` with `mime`, plus its `DupeFile`.
+    fn plain_file(dir: &Path, rel: &str, i: u8, mime: &str, bytes: &[u8]) -> DupeFile {
+        std::fs::write(dir.join(rel), bytes).unwrap();
+        let mut hash = [0u8; 32];
+        hash[0] = i;
+        DupeFile {
+            repo: "r".into(),
+            repo_root: dir.to_string_lossy().into_owned(),
+            rel_path: rel.into(),
+            entry: dedup_core::store::FileEntry {
+                size: bytes.len() as u64,
+                hash,
+                modified_ms: 0,
+                missing: false,
+                mime: Some(mime.into()),
+                img_fingerprint: None,
+                video_hash: None,
+                pdf_hash: None,
+                audio: None,
+                img_size: None,
+                origin: None,
+                exif: None,
+            },
+        }
+    }
+
+    /// Reaching the tag editor the way a user does — Overview → the `Metadata`
+    /// tab → EDIT TAGS → SAVE — writes the file. The tab is *clicked*, not set
+    /// on the state, so this covers the dispatch as well as the screen.
+    #[test]
+    fn metadata_tab_is_clicked_into_and_saves_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let group: DupeGroup = vec![
+            tagged_mp3(dir.path(), "a.mp3", 1, "Old"),
+            tagged_mp3(dir.path(), "b.mp3", 2, "Other"),
+        ];
+        let mp3 = dir.path().join("a.mp3");
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+        view.lightbox = Some(LightboxState::new(0, 0)); // Overview
+        let mut harness = lightbox_harness(view, egui::vec2(1000.0, 720.0));
+        harness.run();
+
+        harness.get_by_label_contains("Metadata").click();
+        harness.run();
+        assert_eq!(
+            harness.state().lightbox.as_ref().map(|l| l.active_tab),
+            Some(RepresentationKind::Metadata),
+            "clicking the Metadata tab selects it"
+        );
+        assert!(
+            harness.query_all_by_label("Old").count() > 0,
+            "the tab shows the stored title before any editing"
+        );
+
+        harness.get_by_label_contains("EDIT TAGS").click();
+        harness.run();
+        assert!(
+            harness.state().tag_edit.is_some(),
+            "EDIT TAGS opens the editor on this copy"
+        );
+        harness.state_mut().tag_edit.as_mut().unwrap().tags.title = "New Title".into();
+        harness.run();
+        harness.get_by_label("SAVE TAGS").click();
+        harness.run();
+
+        let saved = crate::id3tags::read(&mp3).expect("tags still readable");
+        assert_eq!(saved.title, "New Title", "the edit is written to disk");
+        assert_eq!(saved.artist, "Cohen", "other tags are preserved");
+        assert!(
+            harness.state().tag_edit.is_none(),
+            "the editor closes on save"
+        );
+        assert!(
+            harness.state().lightbox.is_some(),
+            "saving keeps the lightbox open"
+        );
+    }
+
+    /// Closing the lightbox drops what its tabs were holding: an abandoned tag
+    /// edit must not come back pre-filled next time the file is opened, and the
+    /// Text tab's file previews must not accumulate.
+    #[test]
+    fn closing_the_lightbox_drops_the_tag_edit_and_previews() {
+        let dir = tempfile::tempdir().unwrap();
+        let group: DupeGroup = vec![
+            tagged_mp3(dir.path(), "a.mp3", 1, "Alpha"),
+            plain_file(dir.path(), "notes.txt", 2, "text/plain", b"hello"),
+        ];
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Metadata;
+        view.lightbox = Some(lb);
+        let mut harness = lightbox_harness(view, egui::vec2(1000.0, 720.0));
+        harness.run();
+
+        harness.get_by_label_contains("EDIT TAGS").click();
+        harness.run();
+        harness.state_mut().tag_edit.as_mut().unwrap().tags.title = "Never saved".into();
+        // Read the second copy through the Text tab, filling its cache.
+        harness.state_mut().lightbox.as_mut().unwrap().index = 1;
+        harness.state_mut().lightbox.as_mut().unwrap().active_tab = RepresentationKind::Text;
+        harness.run();
+        assert!(
+            !harness.state().text_cache.is_empty(),
+            "the Text tab caches what it read"
+        );
+
+        harness.get_by_label_contains("CLOSE").click();
+        harness.run();
+        assert!(harness.state().lightbox.is_none(), "the lightbox closed");
+        assert!(
+            harness.state().tag_edit.is_none(),
+            "the unsaved tag edit is dropped, not resurrected on reopen"
+        );
+        assert!(
+            harness.state().text_cache.is_empty(),
+            "and the previews are released"
+        );
+    }
+
+    /// §1.3.1: only the column(s) that support the representation are drawn.
+    /// Two ID3 containers give two side-by-side (non-overlapping) columns; an
+    /// untagged FLAC as B leaves A alone on screen instead of an empty half.
+    #[test]
+    fn metadata_tab_draws_only_the_sides_that_have_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Both sides ID3-capable → two columns, laid out left | right.
+        let group: DupeGroup = vec![
+            tagged_mp3(dir.path(), "a.mp3", 1, "Alpha"),
+            tagged_mp3(dir.path(), "b.mp3", 2, "Beta"),
+        ];
+        let b_facts = FileFacts::from_entry(&group[1].entry, group[1].absolute_path());
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Metadata;
+        lb.compare = Some(CompareState::new(b_facts));
+        view.lightbox = Some(lb);
+        let mut harness = lightbox_harness(view, egui::vec2(1000.0, 720.0));
+        harness.run();
+
+        let rects: Vec<egui::Rect> = harness
+            .query_all_by_label_contains("EDIT TAGS")
+            .map(|n| n.rect())
+            .collect();
+        assert_eq!(rects.len(), 2, "both tagged sides get their own column");
+        let (left, right) = if rects[0].left() <= rects[1].left() {
+            (rects[0], rects[1])
+        } else {
+            (rects[1], rects[0])
+        };
+        assert!(
+            left.right() <= right.left(),
+            "columns sit side by side without overlapping: {left:?} vs {right:?}"
+        );
+        assert!(
+            right.right() <= 1000.0,
+            "the right column stays inside the window: {right:?}"
+        );
+
+        // B is a FLAC: no ID3 container, so no B column at all.
+        let flac = plain_file(dir.path(), "b.flac", 3, "audio/flac", b"fLaC\0\0\0\0");
+        let group: DupeGroup = vec![tagged_mp3(dir.path(), "a.mp3", 1, "Alpha"), flac];
+        let b_facts = FileFacts::from_entry(&group[1].entry, group[1].absolute_path());
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Metadata;
+        lb.compare = Some(CompareState::new(b_facts));
+        view.lightbox = Some(lb);
+        let mut harness = lightbox_harness(view, egui::vec2(1000.0, 720.0));
+        harness.run();
+        assert_eq!(
+            harness.query_all_by_label_contains("EDIT TAGS").count(),
+            1,
+            "a side without metadata contributes no column"
+        );
+    }
+
+    /// A read-only repo gets no edit affordance on the Metadata tab (§1.3.5):
+    /// no EDIT TAGS button, and the reason is spelled out instead.
+    #[test]
+    fn metadata_tab_offers_no_editing_in_a_read_only_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let group: DupeGroup = vec![tagged_mp3(dir.path(), "a.mp3", 1, "Alpha")];
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.repos = vec![RepoSel {
+            name: "r".into(),
+            included: true,
+            read_only: true,
+        }];
+        view.results = Some(Results::Similar(vec![group]));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Metadata;
+        view.lightbox = Some(lb);
+        let mut harness = lightbox_harness(view, egui::vec2(1000.0, 720.0));
+        harness.run();
+
+        assert_eq!(
+            harness.query_all_by_label_contains("EDIT TAGS").count(),
+            0,
+            "a read-only repo offers no tag editing"
+        );
+        assert!(
+            harness
+                .query_all_by_label_contains("Read-only repository")
+                .count()
+                > 0,
+            "and says why"
+        );
+    }
+
+    /// Non-media duplicates (documents, archives) reach a Text tab — the
+    /// representation that gives them a lightbox at all — with each side's head
+    /// in its own column: decoded text where it decodes, a hex dump where it
+    /// does not.
+    #[test]
+    fn text_tab_previews_both_sides_as_text_or_hex() {
+        let dir = tempfile::tempdir().unwrap();
+        let group: DupeGroup = vec![
+            plain_file(dir.path(), "notes.txt", 1, "text/plain", b"hello alpha"),
+            plain_file(
+                dir.path(),
+                "doc.pdf",
+                2,
+                "application/pdf",
+                &[0x25, 0x50, 0x44, 0x46, 0xff, 0xfe, 0x00, 0x01],
+            ),
+        ];
+        let b_facts = FileFacts::from_entry(&group[1].entry, group[1].absolute_path());
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+        view.lightbox = Some(LightboxState::new(0, 0)); // Overview
+        let mut harness = lightbox_harness(view, egui::vec2(1000.0, 720.0));
+        harness.run();
+
+        harness.get_by_label_contains("Text").click();
+        harness.run();
+        assert!(
+            harness.query_all_by_label_contains("hello alpha").count() > 0,
+            "A's text is previewed"
+        );
+
+        // With B in compare, the binary side shows a hex dump beside it.
+        harness.state_mut().lightbox.as_mut().unwrap().compare = Some(CompareState::new(b_facts));
+        harness.run();
+        let notes = harness
+            .query_all_by_label_contains("Full contents, as text")
+            .count();
+        assert!(notes > 0, "the text side is labelled as text");
+        assert!(
+            harness
+                .query_all_by_label_contains("showing the first bytes as hex")
+                .count()
+                > 0,
+            "the binary side falls back to a hex dump"
+        );
+    }
+
+    /// A group of documents has no thumbnail to click, so the card's typed
+    /// placeholder is the way in: clicking it opens the lightbox, which offers
+    /// the Text tab. Without this the Text representation would have no entry
+    /// point at all.
+    #[test]
+    fn a_document_cards_placeholder_opens_the_lightbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let group: DupeGroup = vec![
+            plain_file(
+                dir.path(),
+                "a.pdf",
+                1,
+                "application/pdf",
+                b"%PDF-1.4\x00 one",
+            ),
+            plain_file(
+                dir.path(),
+                "b.pdf",
+                2,
+                "application/pdf",
+                b"%PDF-1.4\x00 two",
+            ),
+        ];
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+        let mut harness = lightbox_harness(view, egui::vec2(1000.0, 720.0));
+        harness.run();
+        assert!(
+            harness.state().lightbox.is_none(),
+            "no lightbox open to start with"
+        );
+
+        // Both copies offer one; the first is A's card.
+        let open_a = harness
+            .query_all_by_label_contains("OPEN PREVIEW")
+            .next()
+            .expect("a document card offers a way into the lightbox");
+        open_a.click();
+        harness.run();
+        assert!(
+            harness.state().lightbox.is_some(),
+            "clicking a document's placeholder opens the lightbox"
+        );
+
+        harness.get_by_label_contains("Text").click();
+        harness.run();
+        assert_eq!(
+            harness.state().lightbox.as_ref().map(|l| l.active_tab),
+            Some(RepresentationKind::Text),
+            "and the Text tab is offered there"
+        );
+        assert!(
+            harness.query_all_by_label_contains("25 50 44 46").count() > 0,
+            "showing the file's head — as hex, since a PDF is not text"
+        );
+    }
+
+    /// Arrow-nav (or a changed compare target) can leave the selected tab with
+    /// no file behind it. Rather than a blank overlay, the viewer falls back to
+    /// Overview, which every file supports.
+    #[test]
+    fn an_unsupported_tab_falls_back_to_overview() {
+        let group: DupeGroup = (0..2u8)
+            .map(|i| {
+                let mut f = dfile("r", &format!("photo{i}.png"));
+                f.entry.hash[0] = i;
+                f.entry.mime = Some("image/png".into());
+                f.entry.img_size = Some((640, 480));
+                f
+            })
+            .collect();
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Text; // images have no Text column
+        view.lightbox = Some(lb);
+        let mut harness = lightbox_harness(view, egui::vec2(1000.0, 720.0));
+        harness.run();
+
+        assert_eq!(
+            harness.state().lightbox.as_ref().map(|l| l.active_tab),
+            Some(RepresentationKind::Overview),
+            "a tab the pair does not offer falls back to Overview"
+        );
+    }
+
+    /// Doc screenshots of the two new tabs — rendered, not just label-queried,
+    /// because a label query cannot see a column overlapping its neighbour.
+    /// Run with `--ignored`.
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_lightbox_metadata_and_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let group: DupeGroup = vec![
+            tagged_mp3(dir.path(), "chelsea-1974.mp3", 1, "Chelsea Hotel"),
+            tagged_mp3(dir.path(), "chelsea-remaster.mp3", 2, "Chelsea Hotel #2"),
+        ];
+        let b_facts = FileFacts::from_entry(&group[1].entry, group[1].absolute_path());
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Metadata;
+        lb.compare = Some(CompareState::new(b_facts));
+        view.lightbox = Some(lb);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 720.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        for _ in 0..6 {
+            harness.run();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        // With one side's editor open, so the screenshot shows both the
+        // read-only and the editable state of the same tab (both columns offer
+        // EDIT TAGS; the first is A's).
+        if let Some(edit_a) = harness.query_all_by_label_contains("EDIT TAGS").next() {
+            edit_a.click();
+        }
+        for _ in 0..6 {
+            harness.step();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        let img = harness.render().expect("wgpu render failed");
+        let out = doc_screenshot_path("lightbox_metadata.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+
+        // The Text tab, on a text/binary pair.
+        let text_dir = tempfile::tempdir().unwrap();
+        let group: DupeGroup = vec![
+            plain_file(
+                text_dir.path(),
+                "readme.md",
+                1,
+                "text/markdown",
+                b"# Inheritance notes\n\nTwo copies of this file were found.\n",
+            ),
+            plain_file(
+                text_dir.path(),
+                "scan.pdf",
+                2,
+                "application/pdf",
+                b"%PDF-1.4\x00\x01\x02 stream ... binary payload ...",
+            ),
+        ];
+        let b_facts = FileFacts::from_entry(&group[1].entry, group[1].absolute_path());
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Text;
+        lb.compare = Some(CompareState::new(b_facts));
+        view.lightbox = Some(lb);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 720.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = (&tmp, &text_dir);
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        for _ in 0..6 {
+            harness.run();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        let img = harness.render().expect("wgpu render failed");
+        let out = doc_screenshot_path("lightbox_text.png");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
