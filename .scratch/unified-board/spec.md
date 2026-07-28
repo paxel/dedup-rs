@@ -107,16 +107,16 @@ the same structures are already being rewritten: `is_main` travelling beside `re
 data clump across four structs (`RepoSel`, `SideInfo`, `OverviewSide`, `ColumnHead`), and
 `repo_chip`'s two adjacent unnamed booleans (`…, main, lock`) at 13 call sites.
 
-**Two open questions for the user:**
+**Both open questions resolved by the user (2026-07-28):**
 
-1. **Section title casing.** The title renders the group name verbatim (`offsite`), so it is
-   lowercase where every other LCARS section title is caps. Left as user data rather than
-   force-uppercased — confirm which is wanted.
-2. **Groups now start open, where sinks used to start folded.** `section_lcars` starts open, and
-   the spec said "groups start open", but the old chevron defaulted to *collapsed* with a stated
-   rationale ("the list stays about your originals"). With 5 groups × 3 sinks the tab now loads
-   20 cards instead of 5. One-argument switch if you want the old default back:
-   `section_lcars_collapsible(ui, &name, theme::GREEN, false, …)` in `app.rs`.
+1. **Section title casing — no change; question withdrawn.** It was posed on a false premise:
+   nothing in `CLAUDE.md`, `AGENTS.md` or the docs mandates uppercase, and there is no
+   `to_uppercase` anywhere in the GUI. The all-caps look is just what previous authors typed
+   into literal strings. The group name renders verbatim, which is correct.
+2. **Groups start folded.** Restored to the pre-existing default via
+   `section_lcars_collapsible(ui, &name, theme::GREEN, false, …)` — the repo list stays about
+   your originals. Three tests and the doc screenshot now expand the section before asserting
+   on its contents.
 
 ### Original plan
 
@@ -160,7 +160,50 @@ Touches: `repo_chip.rs`, `app.rs` (`repo_card`, `group_section`, the top-level l
 
 ---
 
-## Slice 2 — the unified board
+## Slice 2 — the unified board  [IN PROGRESS — widget built, no surface routed]
+
+**Done (2026-07-28):** `crates/dedup-gui/src/board.rs` — the widget itself, complete against
+every decision in §2.1–2.8 and covered by 20 tests including geometric asserts at 900 / 1280 /
+1920 px and a rendered doc screenshot (`docs/screenshots/board.png`,
+`board::tests::doc_screenshot_board`, `--ignored`).
+
+Built: `Status` (the four-colour vocabulary), `Cmd` (15 commands with labels, colours and
+end-user hints), `RowMeta` (the cheap sort/filter/measure model), `RowBody` (the deferred
+per-visible-row content), `BoardState` (sort key + side + direction, show-unchanged, hidden
+set), `Index` (the prefix-sum virtualisation), the LCARS sort bar, the role + chip + elided-path
+headers, the three-region geometry with the narrow-window rule, and the multi-name row shape.
+
+**Two layout bugs found by rendering, both of which the geometric tests had missed:**
+
+1. An eight-command row drew only six commands. `RowMeta::height` and the flow-laid-out grid
+   disagreed — measured against `BTN_H = 20` + `CMD_GAP = 5`, egui actually drew 24 px buttons
+   with a 7 px gap. **The first geometric test did not catch this**: it asserted horizontal
+   containment, and a clipped widget is still in the accessibility tree with a plausible rect.
+   Fixed by placing the command grid at **explicit rects** on a `CMD_W × CMD_H` lattice, so
+   measured and drawn are the same number by construction. Pinned by
+   `a_rows_commands_stay_inside_that_row` (every command of row 0 sits above row 1) and
+   `all_of_a_rows_commands_are_drawn`.
+2. `ROW_PAD` was applied with `ui.add_space` inside a left-to-right row, which spent it
+   sideways; the vertical padding it was supposed to provide never existed. Now an inset on the
+   row's content rect.
+
+**Not started — the whole of the routing work:**
+
+- Grooming's two preview builders → `RowMeta` + `RowBody`, and its one `review::table` call site.
+- Transfer's four preview builders, GROUP SYNC's lane, and its `review::table` call site.
+- DIFF: `RepoDiffRow` → `RowMeta`, the lazy `open_facts`/`facts_for` body resolver (§2.7), the
+  `BoardAction` → `Act::Board` mapping, `start_board_action`, `open_inspect`, and re-homing the
+  three modals (`ConfirmDeleteAll` / `KeepOne` / `PickName`).
+- Renaming `rejected` → `hidden` at the six sites that honour it when RUN builds its skip set
+  (`grooming_view.rs:1127-1151,1354-1376` and Transfer's equivalents).
+- Deleting `review.rs` and `diff_board.rs` and migrating their tests.
+- Fixing the two dangling `review::RowKind` doc links.
+- Docs: `README.md`, `CHANGELOG.md`, `ai/improvements.md`, `ai/roadmap.md`, `docs/gui/files.md`.
+
+`board` is declared `pub mod` in `lib.rs` purely so the unrouted module is not dead code —
+`AGENTS.md` forbids `#[allow(...)]`. **Make it private again as soon as a view renders it.**
+
+### Original plan
 
 One new widget replaces **both** `review::table` and `diff_board::board`, used by Grooming
 (all commands), Transfer COPY / MOVE / SYNC, GROUP SYNC, and DIFF. Same column geometry in all
@@ -195,7 +238,16 @@ Rows live in an `egui::ScrollArea`. Sorting, striping and virtualization are los
 ### 2.2 Row shape — height follows content
 
 Only the commands that **apply to that row** are rendered, and the row height follows. A
-2-command row is short; an 8-command row is tall. Densest board, most rows on screen.
+2-command row is short; an 8-command row is tall.
+
+**Command placement mirrors the regions (added 2026-07-28).** The centre grid has a left and a
+right slot: a command acting on the left file sits in the left slot, one acting on the right in
+the right slot, and a command and its mirror image share a line — `COPY >` beside `< COPY`,
+`DELETE L` beside `DELETE R`. A command acting on the row as a whole (`COMPARE`, `APPLY`,
+`HIDE`) is centred across both. Pairing is by *kind*, not by position in the caller's list, so a
+caller listing its commands in any order still gets the pairs aligned. A half-pair keeps its own
+side's column rather than sliding across, so a right-only command never appears under the left
+region. Densest board, most rows on screen.
 
 Consequence, accepted: rows are ragged, and virtualization needs a prefix-sum height index
 rather than a uniform row height.

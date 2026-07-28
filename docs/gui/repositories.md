@@ -71,7 +71,8 @@ source is a group's main:
   as a backup.
 - A group is framed by its own **LCARS section**, titled with the group name: the main's card
   and every sink's card sit inside one rail, so a group reads as a single block and an
-  ungrouped repository as a bare card. Clicking the section header folds the whole group away.
+  ungrouped repository as a bare card. Groups start **folded** — the list stays about your
+  originals — and clicking the section header opens one.
 - The main carries a **★ MAIN** badge. The same badge appears on the repo chip wherever the
   repository is named — Files, Grooming, Duplicates, Browse and the lightbox — so an original
   is never mistaken for a backup.

@@ -1225,10 +1225,19 @@ impl DedupApp {
                     match self.group_of_main(&row.name) {
                         Some(group_name) => {
                             let name = group_name.clone();
-                            crate::lcars::section_lcars(ui, &name, theme::GREEN, |ui| {
-                                self.repo_card(ui, row, actions);
-                                self.group_section(ui, &row.name, &rows, actions);
-                            });
+                            // Folded by default: the repo list is about your
+                            // originals, so a group's backups stay out of the way
+                            // until you ask for them.
+                            crate::lcars::section_lcars_collapsible(
+                                ui,
+                                &name,
+                                theme::GREEN,
+                                false,
+                                |ui| {
+                                    self.repo_card(ui, row, actions);
+                                    self.group_section(ui, &row.name, &rows, actions);
+                                },
+                            );
                         }
                         None => self.repo_card(ui, row, actions),
                     }
@@ -2775,23 +2784,15 @@ mod ui_tests {
                 app,
             );
         harness.run();
-        assert!(
-            harness
-                .query_by_label_contains("Automatic Upload")
-                .is_some(),
-            "the main is listed"
-        );
+        // Folded by default: the group's title bar is all that shows, so the
+        // repo list stays about your originals.
         assert!(
             harness.query_by_label_contains("offsite").is_some(),
             "the group's section is titled with the group name"
         );
         assert!(
-            harness.query_all_by_label_contains("Videos").count() > 0,
-            "the group starts open, so its sink's card is on screen"
-        );
-        assert!(
-            harness.query_by_label("MAIN").is_some(),
-            "the main is badged so it is distinguishable from its sinks"
+            harness.query_all_by_label_contains("Videos").count() == 0,
+            "a folded group hides its sinks"
         );
         // The section's caret is the one collapse control: no second chevron.
         assert!(
@@ -2799,13 +2800,23 @@ mod ui_tests {
             "the old sink-count chevron is gone — one collapse affordance only"
         );
 
-        // Folding the section takes the whole group — main and sinks — away.
+        // Expanding it brings the whole group — main and sinks — into view.
         harness.get_by_label_contains("offsite").click();
         harness.run();
         harness.run();
         assert!(
-            harness.query_all_by_label_contains("Videos").count() == 0,
-            "collapsing the section hides the group's sinks"
+            harness
+                .query_by_label_contains("Automatic Upload")
+                .is_some(),
+            "expanding shows the main's card"
+        );
+        assert!(
+            harness.query_all_by_label_contains("Videos").count() > 0,
+            "expanding shows the sink's card"
+        );
+        assert!(
+            harness.query_by_label("MAIN").is_some(),
+            "the main is badged so it is distinguishable from its sinks"
         );
     }
 
@@ -2880,7 +2891,11 @@ mod ui_tests {
             .add_sync_sink("Automatic Upload", "Videos", SyncMode::AddOnly)
             .expect("add sink");
         app.reload_all();
-        let harness = render_repos(app);
+        let mut harness = render_repos(app);
+        // Groups are folded by default; open this one to reach its contents.
+        harness.get_by_label_contains("Automatic Upload").click();
+        harness.run();
+        harness.run();
 
         assert!(
             harness.query_by_label_contains("UNGROUP").is_some(),
@@ -2915,7 +2930,11 @@ mod ui_tests {
             .add_sync_sink("Automatic Upload", "Videos", SyncMode::Mirror)
             .expect("add sink");
         app.reload_all();
-        let harness = render_repos(app);
+        let mut harness = render_repos(app);
+        // Groups are folded by default; open this one to reach its contents.
+        harness.get_by_label_contains("Automatic Upload").click();
+        harness.run();
+        harness.run();
         assert!(
             harness.query_by_label_contains("MODE: MIRROR").is_some(),
             "a MIRROR sink's pill reads MIRROR"
@@ -3236,6 +3255,14 @@ mod ui_tests {
                 },
                 app,
             );
+        harness.run();
+        // Groups fold by default; the point of the shot is what a group holds,
+        // so open it.
+        {
+            use egui_kittest::kittest::Queryable;
+            harness.get_by_label_contains("offsite").click();
+        }
+        harness.run();
         harness.run();
         let img = harness.render().expect("wgpu render failed");
         let out = doc_screenshot_path("repo_group_section.png");

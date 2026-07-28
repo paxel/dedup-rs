@@ -11,7 +11,7 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   Repositories, Files, Grooming, Duplicates, Browse and the lightbox.
 - On the **Repositories** tab a sync group is now framed by its own **LCARS elbow section**,
   titled with the group name and holding the main and its sinks; ungrouped repositories stay
-  bare cards. The section header folds the whole group away, replacing the separate
+  bare cards. Groups start folded and the section header opens one, replacing the separate
   `SINK(S) IN '…'` chevron.
 
 ### Removed
