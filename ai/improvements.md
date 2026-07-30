@@ -1,184 +1,93 @@
 # dedup-rs — Improvement Roadmap
 
-> [!NOTE]
-> A detailed, refined TODO roadmap synthesizing all QA findings, bug fixes, UI tab overhauls, and engineering backlog items is available in [`ai/roadmap.md`](file:///home/axel/develop/dedup-rs/ai/roadmap.md).
+Consolidated 2026-07-30 from `ai/improvements.md` + `ai/roadmap.md` + `ai/qa.md` (now
+deleted — this is the one file). Every item below was verified against current source,
+not just against the old docs: several previously-`[ ]` items in `ai/roadmap.md` turned
+out to already be implemented and are dropped rather than carried forward. See the chat
+history / `git log` for the removed content if you need the "why" behind a closed item.
 
-## Remaining / deferred work
+## Active batch
+
+Eleven of the items below are specced and ticketed in
+[`.scratch/backlog-clearance/`](../.scratch/backlog-clearance/spec.md) — one sequential
+agent, fixed order, tickets `01`–`11`. Light theme and performance-at-scale are the only
+open items deliberately left out.
+
+## Decisions resolved (2026-07-30/31)
+
+- **Audio comparison is spectrogram-only.** The amplitude waveform is painter-drawn rather
+  than a texture, and compare works on textures. No `waveform::wave_image()` will be added;
+  amplitude stays available in the native audio view with its existing toggle. Accepted
+  consequence: entering compare from the amplitude view changes the visual.
+- **The native audio compare header gains inline `DELETE A`/`DELETE B` pills**, in addition
+  to Overview-based marking — chosen so marking does not differ by media type, matching the
+  image compare header. Ticket `06`.
+- **A scan that would mark every indexed entry missing must be authorised**: confirmation in
+  the GUI, `--force` on the CLI. The existing warning stays but is no longer the only
+  defence. Ticket `07`.
+- **DIFF compare is routed through the shared lightbox** and `DiffCompare` is deleted, rather
+  than bolting a spectrogram onto the second compare surface. Ticket `11`.
+
+## Open work (verified against source, 2026-07-30)
 
 - **Light theme toggle** (deferred by decision 2026-07-08): requires converting
   `theme.rs` constants to a runtime palette across all views. Still dark-only.
 - **Performance at scale**: banded grouping, staged pipelines, and the multi-reference
   diff's merged content index are fine at ~10⁵ files; revisit content-index memory
   (`HashMap<(u64,[u8;32]), _>` across all references) and timeline streaming at 10⁷.
-- **Testing discipline** (standing practice): every GUI feature ships with kittest
-  geometric tests + an `--ignored` render test that writes a PNG to look at; every core
-  feature with temp-repo integration tests; store format changes must include a
-  legacy-decode test (pattern: `store.rs::v1_entries_decode_and_flag_images_stale`).
-  The pixel-diff snapshot test was removed on 2026-07-28: its baseline was gitignored and
-  so never committed, making it unpassable on any machine but the one that last generated
-  it — and being `#[ignore]`d, the drift went unnoticed for 22 days.
+- **Review-pane per-row compare button.** Grooming board rows (`grooming_view.rs`) only
+  ever get `Cmd::Apply`/`Cmd::Hide` — there is still no way to open a compare/diff view
+  from a PURGE/DEDUPE/ORGANIZE row, unlike DIFF rows which get `Cmd::Compare`. This is
+  the direct follow-on now that the unified board (below) has landed.
+- **Per-sink main re-read.** `plan_group_sync`/`run_group_sync` (`sync_group.rs`) still
+  call `plan_sync` once per sink, each of which re-collects the main repo's entries from
+  scratch. Collect the main's entries and content-key set once before the loop. Touches
+  the shared `plan_sync`/`diff_sync` signatures (also used by Transfer, CLI), so it needs
+  care.
+- **Filter negation (`!pattern`)**: `dedup_core::filter::FileFilter` has no negation
+  support. Add syntax (e.g. `!*.mp3`, `!/cache/`) plus a "Negate (NOT)" checkbox in
+  `filter_ui.rs`.
+- **Filter case-sensitivity toggle**: no `case_sensitive` field on `FileFilter` yet. Add
+  the field and an `Aa` toggle in `filter_ui.rs`.
+- **Auto-refresh repo stats on tab switch**: `app.rs`'s `Tab::Repositories` match arm is
+  still empty on tab-switch — navigating to Repositories after a delete does not refresh
+  counts/free space from `redb` until a manual reload.
+- **DIFF filename-level diff highlighting**: BY HASH's differing-name list has no
+  character-level highlight of what differs between names.
+- **DIFF board batch header actions**: no "rename all remaining / delete all remaining /
+  copy all missing" bulk actions for large DIFF row counts.
+- **Audio: Play/Pause state retention.** No code checks whether playback was paused
+  before switching to "Next" — playback state is not preserved across a file switch.
+- **Audio: switcher freeze (>2 files) — needs a regression test.** `other_member_indices`/
+  `format_other_switcher_label` (added for the Overview cycler) plausibly already fix
+  this, but per the prior pass's own note, neither this nor the item below has actually
+  been run/tested since.
+- **Audio: ID3 tag sync glitch — needs a regression test.** Same caveat: the index-mapping
+  fix likely already covers "tag shown every second file," but it's unverified.
+- **Transfer DIFF compare is a second, weaker compare surface.** *Corrected 2026-07-31 — the
+  previous entry here understated this, and the old roadmap's "Unified lightbox & compare
+  epic is complete" claim was wrong.* `diff_inspect.rs` was deleted, but its logic was
+  re-created as `DiffCompare` in `transfer_view.rs:3426`. `DiffSide::previewable()` is
+  literally `is_image() || is_video()` (`transfer_view.rs:3376`), so comparing two MP3s from
+  a DIFF row yields `no preview for audio/mpeg`. It has its own decode threads and texture
+  slots, and no tabs, metadata, text, spectrogram or gapless flip. The QA complaint ("compare
+  of two audio is completely broken… obviously not reused from duplicates view") is still
+  literally true. Fixed by ticket `11`, which deletes `DiffCompare`.
+
+## Standing practice
+
+- **Testing discipline**: every GUI feature ships with kittest geometric tests + an
+  `--ignored` render test that writes a PNG to look at; every core feature with temp-repo
+  integration tests; store format changes must include a legacy-decode test (pattern:
+  `store.rs::v1_entries_decode_and_flag_images_stale`). The pixel-diff snapshot test was
+  removed on 2026-07-28: its baseline was gitignored and so never committed, making it
+  unpassable on any machine but the one that last generated it — and being `#[ignore]`d,
+  the drift went unnoticed for 22 days. Lesson carried forward from the lightbox/board
+  work: **a label-query-only kittest test does not catch layout/overlap bugs — render
+  it.**
+
+## Recognition & extensibility *(far future)*
 
-## A usability
-- **review pane per-row diff button** opening the lightbox diff view (for PURGE
-  no diff button). Deferred to *Unified lightbox & compare* below — it is the same
-  "compare two textures" surface. The rest of this item is done: the review rows now
-  carry a thumbnail + size / dimensions / duration / mtime via the shared
-  `media_cell` widget (also used by the Duplicate cards), so a new file type extends
-  in one place.
-
-## Unified lightbox & compare
-
-Today there are four overlapping preview/compare surfaces: the Duplicate tab image/video
-lightbox (`dupes_view` + `lightbox.rs`), a *separate* `dupes_view::audio_lightbox`,
-`diff_inspect.rs` (a weaker static two-pane for DIFF conflicts — no zoom/pan/flicker/
-waveform), and the `browse_view` preview dock. Collapse them into one lightbox.
-
-Guiding principle: we are not judges, we provide flexible tools. Any two sides that can
-produce *an image* — a photo, a video frame, a spectrogram — can be compared side by side
-and flicker-swapped, regardless of mimetype. If a side has no visual, compare disables
-itself.
-
-The enabler is already in place: every visual reduces to a `ColorImage`/`TextureHandle`
-(image decode, video frame extraction, `waveform::spec_image`). Compare is then just
-"compare two textures."
-
-Work:
-- Define a "previewable" abstraction: yields an optional texture + facts (+ the caller's
-  own per-item actions). Image / video-frame / audio-viz implement it; text/binary yields
-  `None`.
-- Generalise `CompareState.other: usize` (a duplicate-group index) into an abstract B
-  source, so the two sides can be different repos or types (what DIFF and cross-type
-  compare need).
-- Gate compare on `both sides yield a texture` — nothing to compare ⇒ features disabled.
-- Keep the action strip caller-supplied: Duplicate marks-for-deletion/best, DIFF does
-  copy/rename/overwrite/delete, Browse does tags. Unify the viewer, not the actions.
-- Route DIFF COMPARE through it and delete `diff_inspect.rs`; fold in `audio_lightbox`.
-  Video and cross-type compare (currently absent) then fall out for free.
-- Decide the amplitude waveform: it is painter-drawn, not a texture (only the spectrogram
-  is). Add a `waveform::wave_image()` renderer, or always compare audio as spectrograms.
-
-Sequence: (1) previewable abstraction + generalise `CompareState`; (2) route DIFF, delete
-`diff_inspect`; (3) fold in audio; (4) enable video/cross-type compare.
-
-
-On "cross-type": the *resolver* (`previewable_texture`) is type-agnostic, so the machinery for
-comparing two different-typed visuals exists — but **no surface actually does it**. Dup groups
-are same-kind; DIFF (slice 2) uses its own decode and shows a placeholder for a non-visual side
-rather than comparing image-vs-spectrogram. So "epic complete" means the four unification slices
-landed and video A/B compare works — not that cross-type visual compare is a reachable feature
-(it has no caller). **The *Unified lightbox & compare* epic is complete** in that sense.
-
-**The deferred review-pane per-row diff button is the immediate follow-on** (it opens the
-slice-2 DIFF compare surface from a review row).
-
-**Tabbed representations (2026-07-28).** The lightbox now dispatches on the selected
-representation rather than the file's mime: `Metadata` (ID3 editing for MP3/WAV/AIFF, EXIF
-capture facts read-only for images) and `Text` (64 KB head as text or hex for non-media
-duplicates) are real tabs with renderers, only the columns that support the selected
-representation are drawn, and a representation the pair no longer offers falls back to
-Overview. The ID3 editor modal that lived inside the audio view is gone — the Metadata tab is
-the single editor, opened by the TAGS pill or `T`. See `ai/roadmap.md` §1 for the detail and
-what stayed out (PDF/office text *extraction*, EXIF writing, the ID3 `comment` field).
-
-## Engineering backlog
-- **Per-sink main re-read.** `plan_group_sync`/`run_group_sync` re-open the main and
-  re-run `collect_source_entries` over its whole index once per sink. Collect the main's
-  entries and content-key set once before the loop. Touches the shared `plan_sync`/
-  `diff_sync` signatures (also used by Transfer, CLI), so it needs care.
-- ~~**Sink baked into `ReviewRow.target_path`.**~~ Done 2026-07-30: the unified board gives
-  each GROUP SYNC row its own repo chip, and the path is a clean rel-path again.
-- ~~**`diff_board` micro-efficiency.**~~ Moot as of 2026-07-30: DIFF renders on the shared
-  board, whose sort works on cheap `RowMeta` values; `diff_board`'s table, paging strip and
-  comparator are gone, and `review.rs` with them.
-- **Empty-walk on scan is warn-only.** A scan that finds no files where the index held
-  some marks everything missing (a legitimate emptying must still propagate). If the index
-  loss proves annoying, add a confirmation (GUI) / `--force` (CLI) before a scan may mark
-  *every* entry missing.
-- Some clarifications. What I thought of how comparing lightbox should work:
-  - We define a series of interfaces that the lightbox display can call on a instance
-  - eg
-    - get image representation (including interface for saving changes, which might or might not be allowed for this kind of media)
-    - get audio representation
-    - get meta data representation (e.g. idv3 including the saving changes)
-    - get mark interface to read and set the mark status
-    - get the dedup data, aka, last modified, mime, current repo, path
-    - get textual representation
-    - get video representation
-  - when two files are lightboxed, the top tab shows the available represntations of at least 1 of A and B
-  - when selected only the sides that have a represntation are shown, and can be compared against each other. ALL are shown left and right. no top and bottom
-  - when both sides exist a compare button is presented that goes in the comparison mode where audio can be played gapless on change, curves can be overlayed and spectograms are shown, or for images the zoom, and rotate and such
-  - we might introduce and improve the comparisons later and adapt the interface
-  - so the first step of comparison, the one with the tab on top should always be the intro to comparison. and it should be very light, it basically should only ask the file representation for its dedup/compare features and paint them. and offer selection for the two columns in case of more than three files. the comparable data is handed off to the compare fw, and if modification is allowed the modified data is handed back to the file to save it. with the "overwrite or create new" solved already. the file defines if overwrite is possible and if create new is possible, if neither no safe or save as is offered in the ui.
-  - for every feature that we current offer we might need to invent a interface on the data representation.
-- the repo sync page:
-  - no group generation exists here. you only can select left and right repo and then compare them. and for that we show the compare pane that is currently in transfer. and this compare pane shuld look like in the dedup review, including the compare button for 2 files with same path but different hash
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-## Recognition & extensibility  *(far future)*
 - Face recognition and object recognition for photos/images.
 - VLA tagging of files to topics; word clouds for documents.
 - MP3 tag handling; metadata extraction for all known formats.
