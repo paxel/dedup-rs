@@ -910,6 +910,7 @@ impl GroomingView {
                     }),
                 totals: self.preview_totals,
                 full_len: self.preview_total,
+                hide_skips_run: true,
             },
             &mut self.thumbs,
             &mut |i| bodies.get(i).cloned().unwrap_or_default(),

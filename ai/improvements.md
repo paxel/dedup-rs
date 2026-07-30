@@ -85,13 +85,11 @@ what stayed out (PDF/office text *extraction*, EXIF writing, the ID3 `comment` f
   re-run `collect_source_entries` over its whole index once per sink. Collect the main's
   entries and content-key set once before the loop. Touches the shared `plan_sync`/
   `diff_sync` signatures (also used by Transfer, CLI), so it needs care.
-- **Sink baked into `ReviewRow.target_path`.** The sync preview stores
-  `format!("{sink}: {rel}")`, so sorting by target path sorts by sink name and a rel-path
-  containing ": " is ambiguous. Give `ReviewRow` a repo/scope field rendered as its own
-  column.
-- **`diff_board` micro-efficiency:** `totals(rows)` computed twice per frame; the paging
-  strip duplicates `review.rs`'s; `sort`'s comparator clones a whole `DiffFile` per
-  comparison to read one field. Cosmetic at current scale.
+- ~~**Sink baked into `ReviewRow.target_path`.**~~ Done 2026-07-30: the unified board gives
+  each GROUP SYNC row its own repo chip, and the path is a clean rel-path again.
+- ~~**`diff_board` micro-efficiency.**~~ Moot as of 2026-07-30: DIFF renders on the shared
+  board, whose sort works on cheap `RowMeta` values; `diff_board`'s table, paging strip and
+  comparator are gone, and `review.rs` with them.
 - **Empty-walk on scan is warn-only.** A scan that finds no files where the index held
   some marks everything missing (a legitimate emptying must still propagate). If the index
   loss proves annoying, add a confirmation (GUI) / `--force` (CLI) before a scan may mark

@@ -160,7 +160,7 @@ Touches: `repo_chip.rs`, `app.rs` (`repo_card`, `group_section`, the top-level l
 
 ---
 
-## Slice 2 — the unified board  [IN PROGRESS — widget built, Grooming routed]
+## Slice 2 — the unified board  [DONE 2026-07-30]
 
 **Grooming is on the new board (2026-07-29).** `GroomingView` now holds `preview:
 Vec<board::RowMeta>` plus a parallel `preview_bodies: Vec<board::RowBody>`, and
@@ -187,18 +187,41 @@ Three design corrections fell out of routing a real surface:
 **Paging is gone, replaced by virtualisation.** The old boards paged at 500 rows with
 PREV/PAGE/NEXT; the prefix-sum index makes that unnecessary, and the row count is still shown.
 
-**Still to route:** Transfer's four preview builders and GROUP SYNC's lane; DIFF (the
-`RepoDiffRow` → `RowMeta` conversion, the lazy `open_facts`/`facts_for` body resolver, the
-`BoardAction` → `Act::Board` mapping, `start_board_action`, `open_inspect`, and the three
-modals). Then delete `review.rs` and `diff_board.rs`, migrate their tests, fix the two dangling
-`review::RowKind` doc links, and make `board` a private `mod` again.
+**Transfer is on the new board (2026-07-30), and `review.rs` is deleted.** All four preview
+builders and GROUP SYNC's lane emit `RowMeta` + `RowBody` through a shared `board_row` helper;
+`rejected` became `hidden` including in `DiffRun::with_selection`. `board` is a private `mod`
+again.
 
-**Unrelated pre-existing flake, seen while verifying:**
-`transfer_view::ui_tests::run_asks_then_copies_on_proceed` polls at most 200 × 10 ms = **2 s**
-for a background copy thread (`transfer_view.rs:4974-4980`). It fails intermittently in
-`cargo test --workspace` runs (more parallel load) and never in six consecutive `-p dedup-gui`
-runs. Nothing in this work touches Transfer's copy path. A larger budget, or waiting on state
-rather than sleeping, would settle it.
+**DIFF is on it too, and `diff_board.rs` is down to what still has callers** — its action
+types, `Popup`/`PopupKind` and the three modals. Its table, cells, sorting, paging and summary
+are gone. `diff_metas` / `diff_totals` / `diff_action` in `transfer_view.rs` convert
+`RepoDiffRow` into board rows and translate a clicked command back into a file operation; facts
+are looked up per visible row via `open_facts`/`facts_for`, so **dedup-core is untouched**, as
+§2.7 predicted.
+
+Four things the DIFF routing turned up:
+
+1. **`OpenPopup` had to be intercepted.** The old `board()` swallowed it into its own state;
+   now it flows out as an action, and `start_board_action` treats it as a no-op — so the modal
+   never opened until `Act::Board` learned to route it.
+2. **The row model is authoritative for size and date, not the index.** Showing the indexed
+   facts lost the size a `DiffFile` already carries when the file is not in the index. The
+   facts now contribute only what the row cannot know (dimensions/duration, provenance).
+3. **GROUP SYNC rows carry no commands.** `start_group_sync` builds a `DiffRun` with no
+   selection, so a HIDE there would promise a skip it cannot deliver — the same reason the old
+   board made it `RowControls::ReadOnly`.
+4. **DIFF's commands needed their side in the name** (`COPY >`, `DELETE L`), which also
+   removes the old collision between a row's `COPY` and the COPY command in the bar above.
+
+**Left over:** the two dangling `review::RowKind` doc links went with `review.rs`; nothing else
+from slice 2 remains.
+
+**Fixed a pre-existing test flake that was blocking verification.**
+`run_asks_then_copies_on_proceed` polled at most 200 × 10 ms = 2 s for a background copy
+thread, and failed in 3 of 5 full-workspace runs — the run itself was healthy (`running=true`,
+no error), it just had not finished inside the budget under parallel load. It now waits for the
+worker to actually finish, with a 30 s ceiling. 0 failures in 5 subsequent full runs. The same
+pattern was applied to the DIFF copy test.
 
 **Done (2026-07-28):** `crates/dedup-gui/src/board.rs` — the widget itself, complete against
 every decision in §2.1–2.8 and covered by 20 tests including geometric asserts at 900 / 1280 /

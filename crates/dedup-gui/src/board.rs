@@ -240,7 +240,12 @@ impl Cmd {
                 theme::RED
             }
             Cmd::Compare => theme::LILAC,
-            _ => theme::TAN,
+            Cmd::OverwriteRight
+            | Cmd::OverwriteLeft
+            | Cmd::RenameLeft
+            | Cmd::RenameRight
+            | Cmd::KeepOneLeft
+            | Cmd::KeepOneRight => theme::TAN,
         }
     }
 
@@ -282,10 +287,15 @@ impl Cmd {
     }
 
     /// End-user copy. Never mentions how the board is built.
-    fn hint(self) -> &'static str {
+    ///
+    /// `hide_skips_run` distinguishes a planned preview, where hiding a row also
+    /// excludes it from RUN, from DIFF, which executes each command as it is
+    /// clicked and has no RUN to skip.
+    fn hint(self, hide_skips_run: bool) -> &'static str {
         match self {
             Cmd::Apply => "Apply only this action, immediately",
-            Cmd::Hide => "Remove this row — RUN skips it",
+            Cmd::Hide if hide_skips_run => "Remove this row — RUN will skip it",
+            Cmd::Hide => "Remove this row from the board",
             Cmd::CopyRight => "Copy this file into the right-hand repository",
             Cmd::CopyLeft => "Copy this file into the left-hand repository",
             Cmd::DeleteLeft => "Delete this file from the left-hand repository",
@@ -427,7 +437,12 @@ pub struct BoardView<'a> {
     /// `[will-delete, only-here, differs, same]`.
     pub totals: [usize; 4],
     /// Rows the caller holds in total, so the board can say when it capped.
+    /// Must count everything the plan found, not just the actionable part —
+    /// otherwise the "showing the first N" notice never fires.
     pub full_len: usize,
+    /// Whether hiding a row also excludes it from a later RUN. False on DIFF,
+    /// which runs each command as it is clicked. Only affects HIDE's tooltip.
+    pub hide_skips_run: bool,
 }
 
 /// The right region's header, present on a two-sided board.
@@ -626,6 +641,13 @@ pub fn board(
         egui::Sense::hover(),
     );
     let (side, centre) = regions(rect.width(), centre, two_sided);
+    let geom = RowGeom {
+        side,
+        centre,
+        two_sided,
+        multi_repo: view.right.as_ref().is_some_and(|r| r.multi_repo),
+        hide_skips_run: view.hide_skips_run,
+    };
     let clip = ui.clip_rect();
     let visible = index.range(
         (clip.top() - rect.top()).max(0.0),
@@ -650,16 +672,7 @@ pub fn board(
                 .max_rect(row_rect.shrink2(egui::vec2(0.0, ROW_PAD)))
                 .layout(Layout::left_to_right(Align::Min)),
         );
-        if let Some(cmd) = draw_row(
-            &mut row_ui,
-            thumbs,
-            &metas[i],
-            &body(i),
-            side,
-            centre,
-            two_sided,
-            view.right.as_ref().is_some_and(|r| r.multi_repo),
-        ) {
+        if let Some(cmd) = draw_row(&mut row_ui, thumbs, &metas[i], &body(i), geom) {
             action = Some(BoardAction { row: i, cmd });
         }
     }
@@ -674,37 +687,82 @@ pub fn board(
     action
 }
 
+/// One side of a row as the board draws it: what the row model knows about that
+/// side, plus the body resolved for it. Bundled because these always travel
+/// together — passing them individually pushed `side_cell` past the argument
+/// limit and would have needed a lint exemption.
+struct SideView<'a> {
+    status: Status,
+    paths: &'a [String],
+    body: &'a SideBody,
+    /// From the row model, which is authoritative — see [`facts_line`].
+    size: u64,
+    modified: i64,
+    /// Draw this side's own repo chip (the board's right side spans several
+    /// repos, as GROUP SYNC's sinks do).
+    multi_repo: bool,
+}
+
+/// The per-board constants every row is drawn against. One value, computed
+/// once, so a row can never disagree with its neighbours about where the
+/// regions are.
+#[derive(Clone, Copy)]
+struct RowGeom {
+    side: f32,
+    centre: f32,
+    two_sided: bool,
+    /// The right side spans several repos, so each row names its own.
+    multi_repo: bool,
+    hide_skips_run: bool,
+}
+
 /// One row: left mini-overview, centre command grid, right mini-overview.
-#[allow(clippy::too_many_arguments)]
+///
+/// All three are placed at **explicit rects** carved out of the row. Letting any
+/// of them flow would add `item_spacing` between the regions that the offsets
+/// don't know about, and the right-hand side would land past the window edge.
 fn draw_row(
     ui: &mut egui::Ui,
     thumbs: &mut ThumbCache,
     meta: &RowMeta,
     body: &RowBody,
-    side: f32,
-    centre: f32,
-    two_sided: bool,
-    multi_repo: bool,
+    geom: RowGeom,
 ) -> Option<Cmd> {
+    let RowGeom {
+        side,
+        centre,
+        two_sided,
+        multi_repo,
+        hide_skips_run,
+    } = geom;
     let mut clicked = None;
+    let row = ui.max_rect();
+    let region = |x: f32, w: f32| {
+        egui::Rect::from_min_size(egui::pos2(x, row.top()), egui::vec2(w, row.height()))
+    };
+
     side_cell(
         ui,
         thumbs,
-        side,
-        meta.left_status,
-        &meta.left_paths,
-        &body.left,
-        false,
+        region(row.left(), side),
+        SideView {
+            status: meta.left_status,
+            paths: &meta.left_paths,
+            body: &body.left,
+            size: meta.left_size,
+            modified: meta.left_modified,
+            multi_repo: false,
+        },
     );
-    // The command grid is placed at explicit rects on a CMD_W × CMD_H lattice,
-    // so the row draws exactly the height `RowMeta::height` reserved for it.
-    let grid = ui.max_rect();
-    let grid_left = grid.left() + side;
+
+    // The command grid sits on a CMD_W × CMD_H lattice, so the row draws exactly
+    // the height `RowMeta::height` reserved for it.
+    let grid_left = row.left() + side;
     let slot = |col: usize, line: usize| {
         egui::Rect::from_min_size(
             egui::pos2(
                 grid_left + 4.0 + col as f32 * CMD_W,
-                grid.top() + line as f32 * CMD_H,
+                row.top() + line as f32 * CMD_H,
             ),
             egui::vec2(CMD_W - 8.0, BTN_H),
         )
@@ -716,7 +774,7 @@ fn draw_row(
                 // right-hand command still draws it on the right.
                 for (col, maybe) in [(0, left_cmd), (1, right_cmd)] {
                     if let Some(cmd) = maybe
-                        && cmd_button(ui, slot(col, n), cmd).clicked()
+                        && cmd_button(ui, slot(col, n), cmd, hide_skips_run).clicked()
                     {
                         clicked = Some(cmd);
                     }
@@ -726,7 +784,7 @@ fn draw_row(
                 // Two row-level commands fill the two columns.
                 Some(other) => {
                     for (col, cmd) in [(0, first), (1, other)] {
-                        if cmd_button(ui, slot(col, n), cmd).clicked() {
+                        if cmd_button(ui, slot(col, n), cmd, hide_skips_run).clicked() {
                             clicked = Some(cmd);
                         }
                     }
@@ -734,26 +792,27 @@ fn draw_row(
                 // A lone one is centred across them.
                 None => {
                     let at = slot(0, n).translate(egui::vec2(CMD_W / 2.0, 0.0));
-                    if cmd_button(ui, at, first).clicked() {
+                    if cmd_button(ui, at, first, hide_skips_run).clicked() {
                         clicked = Some(first);
                     }
                 }
             },
         }
     }
-    ui.advance_cursor_after_rect(egui::Rect::from_min_size(
-        egui::pos2(grid_left, grid.top()),
-        egui::vec2(centre, 0.0),
-    ));
+
     if two_sided {
         side_cell(
             ui,
             thumbs,
-            side,
-            meta.right_status,
-            &meta.right_paths,
-            &body.right,
-            multi_repo,
+            region(grid_left + centre, side),
+            SideView {
+                status: meta.right_status,
+                paths: &meta.right_paths,
+                body: &body.right,
+                size: meta.right_size,
+                modified: meta.right_modified,
+                multi_repo,
+            },
         );
     }
     clicked
@@ -761,80 +820,90 @@ fn draw_row(
 
 /// A command button. Fixed width, so the grid lines up down the column and a
 /// label never truncates.
-fn cmd_button(ui: &mut egui::Ui, at: egui::Rect, cmd: Cmd) -> egui::Response {
+fn cmd_button(ui: &mut egui::Ui, at: egui::Rect, cmd: Cmd, hide_skips_run: bool) -> egui::Response {
     let resp = ui.put(
         at,
         egui::Button::new(RichText::new(cmd.label()).color(cmd.color()).size(10.0))
             .fill(theme::PANEL)
             .stroke(egui::Stroke::new(1.0, cmd.color())),
     );
-    resp.on_hover_text(cmd.hint())
+    resp.on_hover_text(cmd.hint(hide_skips_run))
 }
 
-/// One side's mini-overview: an optional repo chip, the thumbnail, every path
-/// this side holds, and a compact facts line. An absent side renders nothing but
-/// still claims its width, so the centre column stays put.
-fn side_cell(
-    ui: &mut egui::Ui,
-    thumbs: &mut ThumbCache,
-    width: f32,
-    status: Status,
-    paths: &[String],
-    body: &SideBody,
-    multi_repo: bool,
-) {
-    ui.allocate_ui_with_layout(
-        egui::vec2(width, ui.available_height()),
-        Layout::left_to_right(Align::Min),
-        |ui| {
-            ui.set_width(width);
-            if status == Status::Absent || paths.is_empty() {
-                return;
-            }
-            if let Some(f) = &body.facts {
-                let _ = media_cell(ui, thumbs, f, MediaStyle::row(THUMB));
-            }
-            ui.vertical(|ui| {
-                if multi_repo && let Some(repo) = &body.repo {
-                    crate::repo_chip::repo_chip(
-                        ui,
-                        repo,
-                        false,
-                        theme::BLUE,
-                        body.repo_is_main,
-                        None,
-                    );
-                }
-                for path in paths {
-                    ui.add(
-                        egui::Label::new(RichText::new(path).size(12.0).color(status.color()))
-                            .truncate(),
-                    )
-                    .on_hover_text(path);
-                }
-                if let Some(f) = &body.facts {
-                    ui.add(
-                        egui::Label::new(RichText::new(facts_line(f)).color(theme::TAN).size(10.5))
-                            .truncate(),
-                    );
-                }
-            });
-        },
+/// One side's mini-overview, drawn into `rect`: an optional repo chip, the
+/// thumbnail, every path this side holds, and a compact facts line. An absent
+/// side renders nothing but still claims its rect, so the centre column stays
+/// put.
+fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view: SideView) {
+    if view.status == Status::Absent || view.paths.is_empty() {
+        return;
+    }
+    let mut cell = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(Layout::left_to_right(Align::Min)),
     );
+    let cell = &mut cell;
+    let mut text_width = rect.width();
+    if let Some(f) = &view.body.facts {
+        let _ = media_cell(cell, thumbs, f, MediaStyle::row(THUMB));
+        text_width -= THUMB + cell.spacing().item_spacing.x;
+    }
+    cell.vertical(|ui| {
+        ui.set_max_width(text_width.max(0.0));
+        if view.multi_repo
+            && let Some(repo) = &view.body.repo
+        {
+            crate::repo_chip::repo_chip(ui, repo, false, theme::BLUE, view.body.repo_is_main, None);
+        }
+        for path in view.paths {
+            // Elided from the left, so the distinguishing tail survives — two
+            // files under a long shared prefix would otherwise clip to the same
+            // text. `truncate` is the backstop when the estimate runs long.
+            ui.add(
+                egui::Label::new(
+                    RichText::new(elide_left(path, chars_that_fit(text_width, 12.0)))
+                        .size(12.0)
+                        .color(view.status.color()),
+                )
+                .truncate(),
+            )
+            .on_hover_text(path);
+        }
+        if let Some(line) = facts_line(view.size, view.modified, view.body.facts.as_ref()) {
+            ui.add(egui::Label::new(RichText::new(line).color(theme::TAN).size(10.5)).truncate());
+        }
+    });
+}
+
+/// Roughly how many characters of `pt`-sized proportional text fit in `width`.
+/// Only used to choose where to elide, so an estimate is enough — the label's
+/// own `truncate` catches any overshoot.
+fn chars_that_fit(width: f32, pt: f32) -> usize {
+    ((width / (pt * 0.52)).floor().max(8.0)) as usize
 }
 
 /// `size · dimensions-or-duration · mtime`, with provenance when known.
-fn facts_line(f: &FileFacts) -> String {
-    let mut line = format!(
-        "{} · {} · {}",
-        format_size(f.size),
-        f.dims_or_duration(),
-        format_mtime(f.modified_ms)
-    );
-    if let Some(origin) = &f.origin {
+///
+/// Size and date come from the **row model**, not from the indexed facts: the
+/// row is what the operation was planned against, and on a DIFF the two can
+/// legitimately disagree when the index is behind the disk. The facts add only
+/// what the row cannot know — dimensions or duration, and where a file came
+/// from. `None` when there is nothing to say.
+fn facts_line(size: u64, modified: i64, facts: Option<&FileFacts>) -> Option<String> {
+    if size == 0 && modified == 0 && facts.is_none() {
+        return None;
+    }
+    let mut parts = vec![format_size(size)];
+    if let Some(dims) = facts.map(|f| f.dims_or_duration()).filter(|d| d != "—") {
+        parts.push(dims);
+    }
+    parts.push(format_mtime(modified));
+    let mut line = parts.join(" · ");
+    if let Some(origin) = facts.and_then(|f| f.origin.as_ref()) {
         line.push_str(&format!(" · from {origin}"));
     }
-    line
+    Some(line)
 }
 
 /// The SHOW UNCHANGED toggle and the sort bar. With no column headers to click,
@@ -1285,6 +1354,7 @@ mod tests {
                             }),
                             totals: [0, 3, 0, 0],
                             full_len: 3,
+                            hide_skips_run: true,
                         },
                         &mut thumbs,
                         &mut |_| RowBody::default(),
@@ -1445,6 +1515,167 @@ mod tests {
         }
     }
 
+    /// **Nothing may cross the window's right edge**, at any width. The row
+    /// regions are placed at computed offsets, so an unaccounted `item_spacing`
+    /// between them pushes the right-hand side out of the window — invisibly,
+    /// because a widget past the edge still reports a plausible rect.
+    #[test]
+    fn no_content_runs_past_the_window_edge() {
+        use egui_kittest::kittest::Queryable;
+        // Only above `W_min`. Below it the sides have stopped shrinking and the
+        // board is *meant* to overrun and be clipped — see the next test.
+        for width in [700.0_f32, 1280.0, 1920.0] {
+            let harness = render(width, vec![diff_row("one")]);
+            for label in ["a/b/one.jpg", "COPY >", "< COPY", "HIDE", "COMPARE"] {
+                for node in harness.query_all_by_label(label) {
+                    let r = node.rect();
+                    assert!(
+                        r.right() <= width + 0.5,
+                        "at {width}px, {label} crosses the right edge: {:.1} > {width}",
+                        r.right()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The narrow-window rule: below `W_min` the commands and thumbnails keep
+    /// their full size and the board clips at the window edge, rather than the
+    /// centre column being squeezed. Paths are what give way, elided from the
+    /// left so the distinguishing tail survives.
+    #[test]
+    fn below_the_minimum_width_the_commands_keep_their_size() {
+        use egui_kittest::kittest::Queryable;
+        let w_min = SIDE_MIN * 2.0 + CMD_W * 2.0 + 8.0;
+        let narrow = w_min - 120.0;
+        let wide = render(1280.0, vec![diff_row("one")]);
+        let tight = render(narrow, vec![diff_row("one")]);
+        for label in ["COPY >", "COMPARE", "HIDE"] {
+            let a = wide.get_by_label(label).rect();
+            let b = tight.get_by_label(label).rect();
+            assert!(
+                (a.width() - b.width()).abs() < 0.5,
+                "{label} was squeezed at {narrow:.0}px: {:.1} vs {:.1}",
+                b.width(),
+                a.width()
+            );
+        }
+        // And the side never shrinks past its floor.
+        let (side, _) = regions(narrow, CMD_W * 2.0 + 8.0, true);
+        assert_eq!(side, SIDE_MIN);
+    }
+
+    /// Clicking the sort bar must change the **order rows are drawn in**, not
+    /// merely the flag. DIFF's old header sort flipped its arrow and reordered
+    /// nothing until the diff was re-planned; asserting on state alone would
+    /// not have noticed.
+    #[test]
+    fn the_sort_bar_reorders_the_rows_on_screen() {
+        use egui_kittest::kittest::Queryable;
+        let mut zeta = diff_row("zeta");
+        zeta.left_paths = vec!["zeta.jpg".into()];
+        zeta.right_paths = vec!["zeta.jpg".into()];
+        let mut alpha = diff_row("alpha");
+        alpha.left_paths = vec!["alpha.jpg".into()];
+        alpha.right_paths = vec!["alpha.jpg".into()];
+        let mut harness = render(1280.0, vec![zeta, alpha]);
+
+        let top = |h: &egui_kittest::Harness<'static, BoardState>, label: &str| {
+            h.get_all_by_label(label)
+                .map(|n| n.rect().top())
+                .fold(f32::INFINITY, f32::min)
+        };
+        assert!(
+            top(&harness, "alpha.jpg") < top(&harness, "zeta.jpg"),
+            "ascending by path puts alpha first"
+        );
+
+        harness.get_by_label("▲").click();
+        harness.run();
+        harness.run();
+        assert!(
+            top(&harness, "zeta.jpg") < top(&harness, "alpha.jpg"),
+            "reversing the direction actually reorders the rows, not just the arrow"
+        );
+    }
+
+    /// When the right side spans several repos, each row names its own — the
+    /// GROUP SYNC case, which is the only reason `multi_repo` exists.
+    #[test]
+    fn a_multi_repo_right_side_names_the_repo_on_every_row() {
+        use egui_kittest::kittest::Queryable;
+        let mut a = diff_row("one");
+        a.cmds = vec![Cmd::Hide];
+        let mut b = diff_row("two");
+        b.cmds = vec![Cmd::Hide];
+        let metas = vec![a, b];
+        let bodies = [("backup-nas", "backup-nas"), ("backup-usb", "backup-usb")];
+        let mut init = false;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1280.0, 700.0))
+            .build_ui_state(
+                move |ui, state: &mut BoardState| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let mut thumbs = ThumbCache::new(4);
+                    board(
+                        ui,
+                        state,
+                        &metas,
+                        BoardView {
+                            left_role: "MAIN",
+                            left_repo: "photos",
+                            left_is_main: true,
+                            left_path: "/mnt/photos",
+                            right: Some(RightHeader {
+                                role: "SINKS",
+                                repo: "",
+                                is_main: false,
+                                path: "2 sink(s) selected",
+                                multi_repo: true,
+                            }),
+                            totals: [0, 2, 0, 0],
+                            full_len: 2,
+                            hide_skips_run: true,
+                        },
+                        &mut thumbs,
+                        &mut |i| RowBody {
+                            left: SideBody::default(),
+                            right: SideBody {
+                                facts: None,
+                                repo: Some(bodies[i].1.to_string()),
+                                repo_is_main: false,
+                            },
+                        },
+                    );
+                },
+                BoardState::default(),
+            );
+        harness.run();
+        harness.run();
+        for (_, repo) in bodies {
+            assert!(
+                harness.query_by_label(repo).is_some(),
+                "each row names the repo its right-hand side belongs to ({repo})"
+            );
+        }
+    }
+
+    /// A path too long for its cell keeps its tail, so two files under one long
+    /// shared prefix stay distinguishable.
+    #[test]
+    fn a_row_path_too_long_for_its_cell_keeps_its_tail() {
+        let budget = chars_that_fit(120.0, 12.0);
+        let a = elide_left("archive/2024/holidays/spain/IMG_0001.jpg", budget);
+        let b = elide_left("archive/2024/holidays/spain/IMG_0002.jpg", budget);
+        assert_ne!(a, b, "the tails differ, so the rows are distinguishable");
+        assert!(a.ends_with("0001.jpg") && b.ends_with("0002.jpg"));
+        assert!(a.starts_with('…'), "elided from the left");
+    }
+
     /// The three regions must not overlap: left ends before the centre starts,
     /// the centre before the right. Checked through real rects, by comparing a
     /// left-side path, a centre command and a right-side path on one row.
@@ -1577,6 +1808,7 @@ mod tests {
                             }),
                             totals: [0, 1, 2, 0],
                             full_len: 3,
+                            hide_skips_run: false,
                         },
                         &mut thumbs,
                         &mut |_| RowBody::default(),

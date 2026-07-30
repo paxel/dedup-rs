@@ -194,13 +194,12 @@ Landed:
   — rendered and visually checked per the Overview-screen lesson above: a label-query suite
   alone would not have caught a layout regression here either.
 
-**Not done, out of scope for this pass** (were §3.2/3.3 subtasks of the original plan, about
-`diff_board`'s general BY PATH conflict rows, not GROUP SYNC specifically): `diff_board`'s
-cells are still plain text (`paths_cell`/`sizes_cell`/`dates_cell`), not `media_cell`
-thumbnails like the review board; no dedicated COMPARE column; no filename-level diff
-highlighting; no batch rename/delete-all/copy-missing header actions. These would need
-`RepoDiffRow`/`DiffFile` to carry `FileFacts` (currently they don't), which touches
-`plan_repo_diff` and its dedup-core tests — a separate, larger change if still wanted.
+**Superseded 2026-07-30 by the unified board** (`.scratch/unified-board/spec.md`): DIFF now
+renders on the same board as every other preview, with `media_cell` thumbnails on both sides.
+It did **not** need `RepoDiffRow`/`DiffFile` to carry `FileFacts` as predicted here —
+`media_cell::open_facts`/`facts_for` resolve them per *visible* row in the GUI, so
+`plan_repo_diff` and dedup-core were untouched. Still open from this list: filename-level diff
+highlighting, and batch rename/delete-all/copy-missing header actions.
 
 ---
 

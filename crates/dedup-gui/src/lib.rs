@@ -2,9 +2,7 @@
 //! LCARS-themed eframe/egui desktop shell for dedup.
 
 mod app;
-// Public while its callers are migrated: the widget is complete and tested, but
-// no view renders it yet, so it would otherwise read as dead code.
-pub mod board;
+mod board;
 mod browse_view;
 mod diff_board;
 mod dupes_view;
@@ -20,7 +18,6 @@ pub mod lightbox;
 mod media_cell;
 mod player;
 mod repo_chip;
-mod review;
 mod run_result;
 mod settings;
 mod status;

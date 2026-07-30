@@ -16,7 +16,6 @@ use crate::filter_ui::FilterBuilder;
 use crate::icon;
 use crate::lightbox::{ComparePointer, CompareState, compare_split, draw_compare, draw_in_pane};
 use crate::media_cell::{FileFacts, facts_for, open_facts};
-use crate::review;
 use crate::settings::TooltipVerbosity;
 use crate::theme;
 use crate::thumbs::ThumbCache;
@@ -38,7 +37,8 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::review::PREVIEW_CAP;
+use crate::board;
+use crate::board::PREVIEW_CAP;
 
 /// How many recent actions the running panel keeps in its scrolling log.
 const RUN_LOG_LIMIT: usize = 10;
@@ -201,16 +201,260 @@ struct RunConfig {
     move_files: bool,
 }
 
-/// The result of a review-board preview (Copy/Move/Sync/folder), built off the
-/// UI thread. Rows come back unsorted; the board sorts them when applied.
+/// The result of a board preview (Copy/Move/Sync/folder), built off the UI
+/// thread. Rows come back unsorted; the board sorts them when applied.
 struct ReviewPreviewData {
-    rows: Vec<review::ReviewRow>,
+    rows: Vec<board::RowMeta>,
+    bodies: Vec<board::RowBody>,
     preview_total: usize,
     sync_delete_total: usize,
-    preview_totals: [usize; 3],
+    /// `[to-delete, only-here, differing, unchanged]`.
+    preview_totals: [usize; 4],
     source_header: String,
     target_header: String,
     status: String,
+}
+
+/// One side of a board row, as a preview builder describes it.
+#[derive(Default)]
+struct SideSpec {
+    status: Option<board::Status>,
+    path: Option<String>,
+    facts: Option<FileFacts>,
+    /// Only set when the board's side spans several repos (GROUP SYNC's sinks),
+    /// where each row names its own.
+    repo: Option<String>,
+}
+
+impl SideSpec {
+    fn absent() -> Self {
+        Self::default()
+    }
+    fn at(status: board::Status, path: &str, facts: Option<FileFacts>) -> Self {
+        Self {
+            status: Some(status),
+            path: Some(path.to_string()),
+            facts,
+            repo: None,
+        }
+    }
+    fn in_repo(mut self, repo: &str) -> Self {
+        self.repo = Some(repo.to_string());
+        self
+    }
+}
+
+/// Assemble one board row and its body from the two side descriptions, keeping
+/// the two collections the board takes index-aligned.
+///
+/// `key` namespaces the row the way the core ops do (see `dedup_core::diff`):
+/// the source path for source-side actions, the target path for rows that only
+/// exist on the target (a sync deletion).
+fn board_row(
+    left: SideSpec,
+    right: SideSpec,
+    unchanged: bool,
+    cmds: Vec<board::Cmd>,
+) -> (board::RowMeta, board::RowBody) {
+    let key = match (&left.path, &right.path) {
+        (Some(p), _) => dedup_core::diff::source_key(p),
+        (None, Some(p)) => dedup_core::diff::target_key(p),
+        (None, None) => String::new(),
+    };
+    let meta = board::RowMeta {
+        key,
+        left_status: left.status.unwrap_or(board::Status::Absent),
+        right_status: right.status.unwrap_or(board::Status::Absent),
+        left_size: left.facts.as_ref().map(|f| f.size).unwrap_or(0),
+        right_size: right.facts.as_ref().map(|f| f.size).unwrap_or(0),
+        left_modified: left.facts.as_ref().map(|f| f.modified_ms).unwrap_or(0),
+        right_modified: right.facts.as_ref().map(|f| f.modified_ms).unwrap_or(0),
+        left_paths: left.path.into_iter().collect(),
+        right_paths: right.path.into_iter().collect(),
+        unchanged,
+        cmds,
+    };
+    let body = board::RowBody {
+        left: board::SideBody {
+            facts: left.facts,
+            repo: left.repo,
+            repo_is_main: false,
+        },
+        right: board::SideBody {
+            facts: right.facts,
+            repo: right.repo,
+            repo_is_main: false,
+        },
+    };
+    (meta, body)
+}
+
+/// The commands a planned preview offers per row: run this one now, or drop it
+/// from the board and from what RUN will do.
+fn planned_cmds() -> Vec<board::Cmd> {
+    vec![board::Cmd::Apply, board::Cmd::Hide]
+}
+
+/// DIFF's rows as the board's cheap model. What a row offers depends on what
+/// its two sides say about each other; a side holding the same content under
+/// several names is narrowed down first, so only 1:1 rows offer RENAME.
+fn diff_metas(rows: &[RepoDiffRow]) -> Vec<board::RowMeta> {
+    use board::{Cmd, Status};
+    use dedup_core::diff::DiffRelation as R;
+    rows.iter()
+        .map(|row| {
+            let paths = |files: &[dedup_core::diff::DiffFile]| -> Vec<String> {
+                files.iter().map(|f| f.rel_path.clone()).collect()
+            };
+            let (left_status, right_status, mut cmds) = match row.relation {
+                R::Equal => (Status::Same, Status::Same, Vec::new()),
+                R::OnlyLeft => (
+                    Status::OnlyHere,
+                    Status::Absent,
+                    vec![Cmd::CopyRight, Cmd::DeleteLeft],
+                ),
+                R::OnlyRight => (
+                    Status::Absent,
+                    Status::OnlyHere,
+                    vec![Cmd::CopyLeft, Cmd::DeleteRight],
+                ),
+                R::Renamed => {
+                    let mut c = Vec::new();
+                    if row.left.len() > 1 {
+                        c.push(Cmd::DeleteAllLeft);
+                        c.push(Cmd::KeepOneLeft);
+                    } else if !row.left.is_empty() {
+                        c.push(Cmd::RenameLeft);
+                    }
+                    if row.right.len() > 1 {
+                        c.push(Cmd::DeleteAllRight);
+                        c.push(Cmd::KeepOneRight);
+                    } else if !row.right.is_empty() {
+                        c.push(Cmd::RenameRight);
+                    }
+                    (Status::Differs, Status::Differs, c)
+                }
+                R::Conflict => (
+                    Status::Differs,
+                    Status::Differs,
+                    vec![
+                        Cmd::Compare,
+                        Cmd::OverwriteRight,
+                        Cmd::OverwriteLeft,
+                        Cmd::DeleteLeft,
+                        Cmd::DeleteRight,
+                    ],
+                ),
+            };
+            cmds.push(Cmd::Hide);
+            let first = |files: &[dedup_core::diff::DiffFile]| files.first().cloned();
+            board::RowMeta {
+                key: format!(
+                    "{}|{}",
+                    row.left.first().map(|f| f.rel_path.as_str()).unwrap_or(""),
+                    row.right.first().map(|f| f.rel_path.as_str()).unwrap_or(""),
+                ),
+                left_status,
+                right_status,
+                left_size: first(&row.left).map(|f| f.size).unwrap_or(0),
+                right_size: first(&row.right).map(|f| f.size).unwrap_or(0),
+                left_modified: first(&row.left).map(|f| f.modified_ms).unwrap_or(0),
+                right_modified: first(&row.right).map(|f| f.modified_ms).unwrap_or(0),
+                left_paths: paths(&row.left),
+                right_paths: paths(&row.right),
+                unchanged: row.relation == R::Equal,
+                cmds,
+            }
+        })
+        .collect()
+}
+
+/// DIFF's summary counts in the board's `[to-delete, only-here, differing,
+/// unchanged]` order. A diff plans nothing, so nothing is "to delete".
+fn diff_totals(rows: &[RepoDiffRow]) -> [usize; 4] {
+    use dedup_core::diff::DiffRelation as R;
+    let mut totals = [0usize; 4];
+    for row in rows {
+        match row.relation {
+            R::Equal => totals[3] += 1,
+            R::OnlyLeft | R::OnlyRight => totals[1] += 1,
+            R::Renamed | R::Conflict => totals[2] += 1,
+        }
+    }
+    totals
+}
+
+/// Translate a board command on DIFF row `i` into the file operation the caller
+/// executes. Returns `None` when the row cannot supply what the command needs.
+fn diff_action(
+    rows: &[RepoDiffRow],
+    i: usize,
+    cmd: board::Cmd,
+) -> Option<crate::diff_board::BoardAction> {
+    use crate::diff_board::{BoardAction, PopupKind};
+    use board::Cmd;
+    let row = rows.get(i)?;
+    let left = row.left.first().map(|f| f.rel_path.clone());
+    let right = row.right.first().map(|f| f.rel_path.clone());
+    let popup = |kind, on_left| {
+        Some(BoardAction::OpenPopup {
+            row: i,
+            on_left,
+            kind,
+        })
+    };
+    match cmd {
+        Cmd::CopyRight => Some(BoardAction::Copy {
+            from_left: true,
+            rel_path: left?,
+        }),
+        Cmd::CopyLeft => Some(BoardAction::Copy {
+            from_left: false,
+            rel_path: right?,
+        }),
+        Cmd::DeleteLeft => Some(BoardAction::Delete {
+            on_left: true,
+            rel_path: left?,
+        }),
+        Cmd::DeleteRight => Some(BoardAction::Delete {
+            on_left: false,
+            rel_path: right?,
+        }),
+        Cmd::Compare => Some(BoardAction::Inspect {
+            left_rel: left?,
+            right_rel: right?,
+        }),
+        Cmd::OverwriteRight => Some(BoardAction::Overwrite {
+            from_left: true,
+            from_rel: left?,
+            to_rel: right?,
+        }),
+        Cmd::OverwriteLeft => Some(BoardAction::Overwrite {
+            from_left: false,
+            from_rel: right?,
+            to_rel: left?,
+        }),
+        // Renaming to one of several names on the other side needs an answer
+        // first; a 1:1 pair can be renamed outright.
+        Cmd::RenameLeft if row.right.len() > 1 => popup(PopupKind::PickName, true),
+        Cmd::RenameLeft => Some(BoardAction::Rename {
+            on_left: true,
+            from: left?,
+            to: right?,
+        }),
+        Cmd::RenameRight if row.left.len() > 1 => popup(PopupKind::PickName, false),
+        Cmd::RenameRight => Some(BoardAction::Rename {
+            on_left: false,
+            from: right?,
+            to: left?,
+        }),
+        Cmd::KeepOneLeft => popup(PopupKind::KeepOne, true),
+        Cmd::KeepOneRight => popup(PopupKind::KeepOne, false),
+        Cmd::DeleteAllLeft => popup(PopupKind::ConfirmDeleteAll, true),
+        Cmd::DeleteAllRight => popup(PopupKind::ConfirmDeleteAll, false),
+        // The board handles HIDE itself; APPLY belongs to a planned preview.
+        Cmd::Hide | Cmd::Apply => None,
+    }
 }
 
 /// Plan a review-board preview for `config`, off the UI thread. Dispatches on
@@ -246,6 +490,7 @@ fn build_group_preview(
 ) -> Result<GroupPreviewData, String> {
     guard_mirror_source(store, group).map_err(|e| e.to_string())?;
     let mut rows = Vec::new();
+    let mut bodies = Vec::new();
     let (mut added, mut removed) = (0usize, 0usize);
     let mut wholesale_sinks = Vec::new();
     // Copies carry the main's file, so their facts come from the main index.
@@ -271,37 +516,55 @@ fn build_group_preview(
         }
         // Deletions carry the sink's file, so their facts come from the sink index.
         let (sink_db, sink_base) = open_facts(store, &sink.repo);
+        // The sink rides in the row's own repo chip rather than being folded
+        // into the path — `format!("{sink}: {rel}")` made sorting by path sort
+        // by sink name, and a rel-path containing ": " was ambiguous.
+        //
+        // No per-row commands: this run is all-or-nothing (`start_group_sync`
+        // builds a `DiffRun` with no selection), so offering HIDE would promise
+        // to skip a deletion and then make it anyway.
         for rel in &plan.copies {
             added += 1;
             if rows.len() < PREVIEW_CAP {
-                rows.push(review::ReviewRow {
-                    source: review::SideStatus::Unchanged,
-                    target: review::SideStatus::Added,
-                    source_path: rel.clone(),
-                    target_path: format!("{}: {rel}", sink.repo),
-                    source_facts: facts_for(main_db.as_deref(), main_base.as_deref(), rel),
-                    target_facts: None,
-                });
+                let (meta, body) = board_row(
+                    SideSpec::at(
+                        board::Status::Same,
+                        rel,
+                        facts_for(main_db.as_deref(), main_base.as_deref(), rel),
+                    ),
+                    SideSpec::at(board::Status::OnlyHere, rel, None).in_repo(&sink.repo),
+                    false,
+                    Vec::new(),
+                );
+                rows.push(meta);
+                bodies.push(body);
             }
         }
         for rel in &plan.deletes {
             removed += 1;
             if rows.len() < PREVIEW_CAP {
-                rows.push(review::ReviewRow {
-                    source: review::SideStatus::Absent,
-                    target: review::SideStatus::Removed,
-                    source_path: String::new(),
-                    target_path: format!("{}: {rel}", sink.repo),
-                    source_facts: None,
-                    target_facts: facts_for(sink_db.as_deref(), sink_base.as_deref(), rel),
-                });
+                let (meta, body) = board_row(
+                    SideSpec::absent(),
+                    SideSpec::at(
+                        board::Status::WillDelete,
+                        rel,
+                        facts_for(sink_db.as_deref(), sink_base.as_deref(), rel),
+                    )
+                    .in_repo(&sink.repo),
+                    false,
+                    Vec::new(),
+                );
+                rows.push(meta);
+                bodies.push(body);
             }
         }
     }
     let sink_count = group.sinks.len();
     Ok(GroupPreviewData {
         group: group.clone(),
+        main_header: TransferView::repo_header(store, &group.main),
         rows,
+        bodies,
         added,
         removed,
         sink_count,
@@ -331,32 +594,40 @@ fn preview_sync(
     // A copy: source keeps the file (unchanged), target gains it (added). A
     // delete: the source no longer has it (absent), the target loses it
     // (removed). Capped.
-    let mut rows: Vec<review::ReviewRow> = plan
+    let (mut rows, mut bodies): (Vec<_>, Vec<_>) = plan
         .copies
         .iter()
         .take(PREVIEW_CAP)
-        .map(|rel| review::ReviewRow {
-            source: review::SideStatus::Unchanged,
-            target: review::SideStatus::Added,
-            source_path: rel.clone(),
-            target_path: rel.clone(),
-            source_facts: facts_for(src_db.as_deref(), src_base.as_deref(), rel),
-            target_facts: None,
+        .map(|rel| {
+            board_row(
+                SideSpec::at(
+                    board::Status::Same,
+                    rel,
+                    facts_for(src_db.as_deref(), src_base.as_deref(), rel),
+                ),
+                SideSpec::at(board::Status::OnlyHere, rel, None),
+                false,
+                planned_cmds(),
+            )
         })
-        .collect();
+        .unzip();
     for rel in plan
         .deletes
         .iter()
         .take(PREVIEW_CAP.saturating_sub(rows.len()))
     {
-        rows.push(review::ReviewRow {
-            source: review::SideStatus::Absent,
-            target: review::SideStatus::Removed,
-            source_path: String::new(),
-            target_path: rel.clone(),
-            source_facts: None,
-            target_facts: facts_for(tgt_db.as_deref(), tgt_base.as_deref(), rel),
-        });
+        let (meta, body) = board_row(
+            SideSpec::absent(),
+            SideSpec::at(
+                board::Status::WillDelete,
+                rel,
+                facts_for(tgt_db.as_deref(), tgt_base.as_deref(), rel),
+            ),
+            false,
+            planned_cmds(),
+        );
+        rows.push(meta);
+        bodies.push(body);
     }
     let verb = config.command.label();
     let status = if delete == SyncDelete::None {
@@ -370,9 +641,10 @@ fn preview_sync(
     };
     Ok(ReviewPreviewData {
         rows,
+        bodies,
         preview_total: plan.copies.len(),
         sync_delete_total: plan.deletes.len(),
-        preview_totals: [plan.copies.len(), plan.deletes.len(), 0],
+        preview_totals: [plan.deletes.len(), plan.copies.len(), 0, 0],
         source_header: TransferView::repo_header(store, &config.source),
         target_header: TransferView::repo_header(store, target),
         status,
@@ -394,16 +666,17 @@ fn preview_repo(
     // already has (Equal) are unchanged on both sides. DeletedInReference isn't
     // part of a transfer.
     let source_state = if config.move_files {
-        review::SideStatus::Removed
+        board::Status::WillDelete
     } else {
-        review::SideStatus::Unchanged
+        board::Status::Same
     };
     // The source holds every New/Equal file; the target holds the Equal ones.
     let (src_db, src_base) = open_facts(store, &config.source);
     let (tgt_db, tgt_base) = open_facts(store, target);
     let mut acted = 0usize;
     let mut unchanged = 0usize;
-    let mut rows: Vec<review::ReviewRow> = Vec::new();
+    let mut rows: Vec<board::RowMeta> = Vec::new();
+    let mut bodies: Vec<board::RowBody> = Vec::new();
     for item in &items {
         match item {
             DiffItem::New { rel_path } => {
@@ -414,41 +687,54 @@ fn preview_repo(
                     } else {
                         format!("{subdir}/{rel_path}")
                     };
-                    rows.push(review::ReviewRow {
-                        source: source_state,
-                        target: review::SideStatus::Added,
-                        source_path: rel_path.clone(),
-                        target_path: to,
-                        source_facts: facts_for(src_db.as_deref(), src_base.as_deref(), rel_path),
-                        target_facts: None,
-                    });
+                    let (meta, body) = board_row(
+                        SideSpec::at(
+                            source_state,
+                            rel_path,
+                            facts_for(src_db.as_deref(), src_base.as_deref(), rel_path),
+                        ),
+                        SideSpec::at(board::Status::OnlyHere, &to, None),
+                        false,
+                        planned_cmds(),
+                    );
+                    rows.push(meta);
+                    bodies.push(body);
                 }
             }
             DiffItem::Equal { rel_path, .. } => {
                 unchanged += 1;
                 if rows.len() < PREVIEW_CAP {
-                    rows.push(review::ReviewRow {
-                        source: review::SideStatus::Unchanged,
-                        target: review::SideStatus::Unchanged,
-                        source_path: rel_path.clone(),
-                        target_path: rel_path.clone(),
-                        source_facts: facts_for(src_db.as_deref(), src_base.as_deref(), rel_path),
-                        target_facts: facts_for(tgt_db.as_deref(), tgt_base.as_deref(), rel_path),
-                    });
+                    let (meta, body) = board_row(
+                        SideSpec::at(
+                            board::Status::Same,
+                            rel_path,
+                            facts_for(src_db.as_deref(), src_base.as_deref(), rel_path),
+                        ),
+                        SideSpec::at(
+                            board::Status::Same,
+                            rel_path,
+                            facts_for(tgt_db.as_deref(), tgt_base.as_deref(), rel_path),
+                        ),
+                        true,
+                        planned_cmds(),
+                    );
+                    rows.push(meta);
+                    bodies.push(body);
                 }
             }
             DiffItem::DeletedInReference { .. } => {}
         }
     }
     // A move both removes from source and adds to target; a copy only adds.
-    // Totals are [added, removed, unchanged].
+    // Totals are [to-delete, only-here, differing, unchanged].
     let preview_totals = if config.move_files {
-        [acted, acted, unchanged]
+        [acted, acted, 0, unchanged]
     } else {
-        [acted, 0, unchanged]
+        [0, acted, 0, unchanged]
     };
     Ok(ReviewPreviewData {
         rows,
+        bodies,
         preview_total: acted,
         sync_delete_total: 0,
         preview_totals,
@@ -482,33 +768,38 @@ fn preview_folder(
     // Exporting adds each file into the folder; a MOVE also removes it from the
     // source repo, a COPY leaves the source unchanged.
     let source_state = if config.move_files {
-        review::SideStatus::Removed
+        board::Status::WillDelete
     } else {
-        review::SideStatus::Unchanged
+        board::Status::Same
     };
     // The exported files live in the source repo; the target is a plain folder,
     // not a repo, so the added side has no index facts.
     let (src_db, src_base) = open_facts(store, &config.source);
-    let rows: Vec<review::ReviewRow> = rels
+    let (rows, bodies): (Vec<_>, Vec<_>) = rels
         .iter()
         .take(PREVIEW_CAP)
-        .map(|rel| review::ReviewRow {
-            source: source_state,
-            target: review::SideStatus::Added,
-            source_path: rel.clone(),
-            target_path: rel.clone(),
-            source_facts: facts_for(src_db.as_deref(), src_base.as_deref(), rel),
-            target_facts: None,
+        .map(|rel| {
+            board_row(
+                SideSpec::at(
+                    source_state,
+                    rel,
+                    facts_for(src_db.as_deref(), src_base.as_deref(), rel),
+                ),
+                SideSpec::at(board::Status::OnlyHere, rel, None),
+                false,
+                planned_cmds(),
+            )
         })
-        .collect();
+        .unzip();
     let preview_totals = if config.move_files {
-        [rels.len(), rels.len(), 0]
+        [rels.len(), rels.len(), 0, 0]
     } else {
-        [rels.len(), 0, 0]
+        [0, rels.len(), 0, 0]
     };
     let what = if invert { "redundant" } else { "unique" };
     Ok(ReviewPreviewData {
         rows,
+        bodies,
         preview_total: rels.len(),
         sync_delete_total: 0,
         preview_totals,
@@ -620,7 +911,11 @@ enum Msg {
 /// is already filtered to the sinks that were selected when the plan started.
 struct GroupPreviewData {
     group: SyncGroup,
-    rows: Vec<review::ReviewRow>,
+    /// The main's absolute path, resolved where the store is at hand, so the
+    /// header names it the same way every other surface does.
+    main_header: String,
+    rows: Vec<board::RowMeta>,
+    bodies: Vec<board::RowBody>,
     added: usize,
     removed: usize,
     sink_count: usize,
@@ -711,24 +1006,29 @@ pub struct TransferView {
     subdir: String,
     /// The shared FILTER wizard (conditions, presets, suggestions, live count).
     filter: FilterBuilder,
-    preview: Vec<review::ReviewRow>,
+    preview: Vec<board::RowMeta>,
+    /// Thumbnails and facts for `preview`, kept index-aligned with it: the board
+    /// resolves a row's body only for the rows actually on screen.
+    preview_bodies: Vec<board::RowBody>,
     /// DIFF: how the two repos are paired up (by content or by path).
     pairing: DiffPairing,
     /// DIFF: the rows of the current comparison, empty until REVIEW.
     diff_rows: Vec<RepoDiffRow>,
-    /// Sort/paging state of the diff board.
+    /// DIFF's open follow-up question, if any. Everything else about the diff
+    /// board moved to `preview_board` when DIFF was routed onto the shared board.
     board_state: crate::diff_board::BoardState,
     /// The open side-by-side comparison of one conflicting row, if any.
     inspect: Option<DiffCompare>,
-    /// Full per-kind counts (indexed by [`review::RowKind::idx`]) for the review
+    /// Full counts `[to-delete, only-here, differing, unchanged]` for the board
     /// summary; independent of the capped `preview` sample.
-    preview_totals: [usize; 3],
-    /// The two review-table column headers: the source and target absolute paths.
+    preview_totals: [usize; 4],
+    /// The two board region headers: the source and target absolute paths.
     preview_source_header: String,
     preview_target_header: String,
     preview_total: usize,
-    /// Sort column + direction for the review table.
-    review_state: review::ReviewState,
+    /// Sort key, side, direction and hidden rows for the board — shared by the
+    /// planned previews and by DIFF, which are mutually exclusive commands.
+    preview_board: board::BoardState,
     status: Option<String>,
     error: Option<String>,
     confirm: Option<String>,
@@ -822,11 +1122,12 @@ impl TransferView {
             diff_rows: Vec::new(),
             board_state: crate::diff_board::BoardState::default(),
             inspect: None,
-            preview_totals: [0; 3],
+            preview_totals: [0; 4],
             preview_source_header: String::new(),
             preview_target_header: String::new(),
             preview_total: 0,
-            review_state: review::ReviewState::default(),
+            preview_bodies: Vec::new(),
+            preview_board: board::BoardState::default(),
             status: None,
             error: None,
             confirm: None,
@@ -995,7 +1296,7 @@ impl TransferView {
                 if self.running || !self.run_log.is_empty() {
                     self.run_panel(ui);
                 } else {
-                    self.preview_panel(ui, &mut acts);
+                    self.preview_panel(ui, store, &mut acts);
                 }
             });
 
@@ -1859,7 +2160,7 @@ impl TransferView {
         });
     }
 
-    fn preview_panel(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+    fn preview_panel(&mut self, ui: &mut egui::Ui, store: &Store, acts: &mut Vec<Act>) {
         if self.command.is_diff() {
             if self.diff_rows.is_empty() {
                 ui.add_space(6.0);
@@ -1869,14 +2170,72 @@ impl TransferView {
                 );
                 return;
             }
-            if let Some(action) = crate::diff_board::board(
+            let metas = diff_metas(&self.diff_rows);
+            // Facts are looked up per visible row rather than carried on the
+            // rows: `DiffFile` has only a path, size and date, and the board
+            // asks for a body only for what is on screen.
+            let (ldb, lbase) = self
+                .source
+                .as_deref()
+                .map(|r| open_facts(store, r))
+                .unwrap_or((None, None));
+            let (rdb, rbase) = self
+                .target
+                .as_deref()
+                .map(|r| open_facts(store, r))
+                .unwrap_or((None, None));
+            let rows = &self.diff_rows;
+            let action = board::board(
                 ui,
-                &mut self.board_state,
-                &self.diff_rows,
-                &self.preview_source_header,
-                &self.preview_target_header,
-            ) {
-                acts.push(Act::Board(action));
+                &mut self.preview_board,
+                &metas,
+                board::BoardView {
+                    left_role: "LEFT",
+                    left_repo: self.source.as_deref().unwrap_or(""),
+                    left_is_main: false,
+                    left_path: &self.preview_source_header,
+                    right: Some(board::RightHeader {
+                        role: "RIGHT",
+                        repo: self.target.as_deref().unwrap_or(""),
+                        is_main: false,
+                        path: &self.preview_target_header,
+                        multi_repo: false,
+                    }),
+                    totals: diff_totals(rows),
+                    full_len: rows.len(),
+                    // DIFF runs each command as it is clicked; there is no RUN
+                    // for a hidden row to be skipped by.
+                    hide_skips_run: false,
+                },
+                &mut self.thumbs,
+                &mut |i| {
+                    let row = &rows[i];
+                    let side = |files: &[dedup_core::diff::DiffFile],
+                                db: Option<&redb::Database>,
+                                base: Option<&str>| {
+                        board::SideBody {
+                            facts: files.first().and_then(|f| facts_for(db, base, &f.rel_path)),
+                            repo: None,
+                            repo_is_main: false,
+                        }
+                    };
+                    board::RowBody {
+                        left: side(&row.left, ldb.as_deref(), lbase.as_deref()),
+                        right: side(&row.right, rdb.as_deref(), rbase.as_deref()),
+                    }
+                },
+            );
+            if let Some(a) = action
+                && let Some(mapped) = diff_action(&self.diff_rows, a.row, a.cmd)
+            {
+                acts.push(Act::Board(mapped));
+            }
+            // The three follow-up modals (delete-all, keep-one, pick-a-name)
+            // still belong to the diff board's own state.
+            if let Some(answer) =
+                crate::diff_board::popup(ui, &mut self.board_state, &self.diff_rows)
+            {
+                acts.push(Act::Board(answer));
             }
             return;
         }
@@ -1890,28 +2249,54 @@ impl TransferView {
             ui.colored_label(theme::TEXT, hint);
             return;
         }
-        // GROUP SYNC's rows span several sinks pushed as one run, not one
-        // target `start` can re-run for a single key — read-only, like the
-        // DIFF board (which offers its own, different, per-row actions).
-        let controls = if self.command == Command::GroupSync {
-            review::RowControls::ReadOnly
+        // GROUP SYNC pushes several sinks as one all-or-nothing run, so each
+        // row names its own sink and offers no commands (the rows themselves
+        // carry an empty command set).
+        let group_sync = self.command == Command::GroupSync;
+        let (left_role, right_role) = if group_sync {
+            ("MAIN", "SINKS")
         } else {
-            review::RowControls::Enabled
+            ("SOURCE", "TARGET")
         };
-        if let Some(review::ReviewAction::Apply(key)) = review::table(
+        let bodies = std::mem::take(&mut self.preview_bodies);
+        let action = board::board(
             ui,
-            &mut self.review_state,
-            &mut self.preview,
-            review::BoardView {
+            &mut self.preview_board,
+            &self.preview,
+            board::BoardView {
+                left_role,
+                left_repo: self.source.as_deref().unwrap_or(""),
+                left_is_main: group_sync,
+                left_path: &self.preview_source_header,
+                // Transfer is always two-sided (source → target/folder/sinks).
+                right: Some(board::RightHeader {
+                    role: right_role,
+                    // GROUP SYNC's right side spans several repos, so the
+                    // header names none of them — each row carries its own chip.
+                    repo: if group_sync {
+                        ""
+                    } else {
+                        self.target.as_deref().unwrap_or("")
+                    },
+                    is_main: false,
+                    path: &self.preview_target_header,
+                    multi_repo: group_sync,
+                }),
                 totals: self.preview_totals,
-                source_header: &self.preview_source_header,
-                // Transfer is always two-sided (source → target/folder).
-                target: Some(&self.preview_target_header),
-                controls,
+                // Every row the plan produced, not just the actionable ones —
+                // the cap notice compares this against what was materialised.
+                full_len: self.preview_totals.iter().sum(),
+                hide_skips_run: true,
             },
             &mut self.thumbs,
-        ) {
-            acts.push(Act::ApplyRow(key));
+            &mut |i| bodies.get(i).cloned().unwrap_or_default(),
+        );
+        self.preview_bodies = bodies;
+        if let Some(a) = action
+            && a.cmd == board::Cmd::Apply
+            && let Some(meta) = self.preview.get(a.row)
+        {
+            acts.push(Act::ApplyRow(meta.key.clone()));
         }
     }
 
@@ -2110,7 +2495,15 @@ impl TransferView {
                 left_rel,
                 right_rel,
             }) => self.open_inspect(store, &left_rel, &right_rel),
-            Act::Board(action) => self.start_board_action(store, action),
+            // A follow-up question is board state, not a file operation: it
+            // opens the modal rather than running anything.
+            Act::Board(crate::diff_board::BoardAction::OpenPopup { row, on_left, kind }) => {
+                self.board_state.popup = Some(crate::diff_board::Popup { row, on_left, kind });
+            }
+            Act::Board(action) => {
+                self.board_state.popup = None;
+                self.start_board_action(store, action)
+            }
             Act::CancelRun => self.cancel.cancel(),
             Act::ToggleSink(name) => {
                 if let Some(pos) = self.selected_sinks.iter().position(|s| s == &name) {
@@ -2141,18 +2534,18 @@ impl TransferView {
         self.wholesale_sinks.clear();
         self.preview.clear();
         self.diff_rows.clear();
-        self.board_state.page = 0;
         // A popup (and an open comparison) belongs to the rows it was opened
         // from.
         self.board_state.popup = None;
         self.inspect = None;
-        self.preview_totals = [0; 3];
+        self.preview_totals = [0; 4];
         self.preview_source_header.clear();
         self.preview_target_header.clear();
         self.preview_total = 0;
         self.sync_delete_total = 0;
-        // Rejections are keyed to the preview they were made in.
-        self.review_state.rejected.clear();
+        self.preview_bodies.clear();
+        // Hidden rows are keyed to the preview they were hidden in.
+        self.preview_board.hidden.clear();
     }
 
     /// The subdir trimmed of surrounding whitespace and slashes; empty means
@@ -2337,13 +2730,25 @@ impl TransferView {
                 return;
             }
         };
-        self.preview_totals = [outcome.added, outcome.removed, 0];
-        self.preview_source_header = outcome.group.main.clone();
-        self.preview_target_header = "SINKS".to_string();
+        self.preview_totals = [outcome.removed, outcome.added, 0, 0];
+        self.preview_total = outcome.added + outcome.removed;
+        // The left header names the main like every other surface does — by its
+        // path, not its bare name. The right one says how many sinks the push
+        // covers; each row names the sink it belongs to with its own chip.
+        self.preview_source_header = outcome.main_header.clone();
+        self.preview_target_header = format!(
+            "{} sink(s) selected",
+            outcome
+                .group
+                .sinks
+                .len()
+                .min(self.selected_sinks.len().max(1))
+        );
         self.wholesale_sinks = outcome.wholesale_sinks;
-        let mut rows = outcome.rows;
-        review::sort(&mut rows, &self.review_state);
-        self.preview = rows;
+        // The board sorts through its own index; the caller just hands over the
+        // rows and their bodies, index-aligned.
+        self.preview = outcome.rows;
+        self.preview_bodies = outcome.bodies;
         self.status = Some(format!(
             "{} file(s) to copy, {} to delete across {} sink(s).",
             outcome.added, outcome.removed, outcome.sink_count
@@ -2361,7 +2766,7 @@ impl TransferView {
     /// confirmation that cannot say how much it deletes is not one the user
     /// can weigh.
     fn raise_group_confirm(&mut self, group: &SyncGroup) {
-        let [copies, deletes, _] = self.preview_totals;
+        let [deletes, copies, _, _] = self.preview_totals;
         let mut prompt = format!(
             "Push '{}' to {} sink(s): copy {copies} file(s)",
             group.main,
@@ -2493,9 +2898,8 @@ impl TransferView {
         self.preview_totals = data.preview_totals;
         self.preview_source_header = data.source_header;
         self.preview_target_header = data.target_header;
-        let mut rows = data.rows;
-        review::sort(&mut rows, &self.review_state);
-        self.preview = rows;
+        self.preview = data.rows;
+        self.preview_bodies = data.bodies;
         self.status = Some(data.status);
         self.error = None;
         if let Some(config) = confirm {
@@ -2504,9 +2908,9 @@ impl TransferView {
             if let Some(mut prompt) =
                 prompt_for(&config, data.preview_total, data.sync_delete_total)
             {
-                let rejected = self.review_state.rejected.len();
-                if rejected > 0 {
-                    prompt.push_str(&format!(" {rejected} rejected row(s) will be skipped."));
+                let hidden = self.preview_board.hidden.len();
+                if hidden > 0 {
+                    prompt.push_str(&format!(" {hidden} hidden row(s) will be skipped."));
                 }
                 self.confirm = Some(prompt);
                 self.pending_confirm = Some(config);
@@ -2544,8 +2948,7 @@ impl TransferView {
     fn apply_diff_preview(&mut self, result: Result<DiffPreviewData, String>) {
         match result {
             Ok(data) => {
-                let mut rows = data.rows;
-                crate::diff_board::sort(&mut rows, &self.board_state);
+                let rows = data.rows;
                 let differing = rows
                     .iter()
                     .filter(|r| r.relation != dedup_core::diff::DiffRelation::Equal)
@@ -2680,7 +3083,7 @@ impl TransferView {
             filter,
             move_files,
         } = config;
-        let rejected: std::collections::HashSet<String> = self.review_state.rejected.clone();
+        let hidden: std::collections::HashSet<String> = self.preview_board.hidden.clone();
         let store = Arc::clone(store);
         let tx = self.tx.clone();
         self.cancel = CancellationToken::new();
@@ -2703,10 +3106,8 @@ impl TransferView {
             let progress = ChannelDiffProgress { tx: tx.clone() };
             let only_set: Option<std::collections::HashSet<String>> =
                 only.map(|k| std::collections::HashSet::from([k]));
-            let run = DiffRun::new(&progress, &cancel).with_selection(
-                (!rejected.is_empty()).then_some(&rejected),
-                only_set.as_ref(),
-            );
+            let run = DiffRun::new(&progress, &cancel)
+                .with_selection((!hidden.is_empty()).then_some(&hidden), only_set.as_ref());
             // Copy/Move (repo or folder) both yield CopyStats → Copied; Sync
             // yields SyncStats → Synced. Map each to its OpResult in place.
             let copied_result = |stats: Result<dedup_core::diff::CopyStats, String>| match stats {
@@ -3419,6 +3820,165 @@ fn side_strip(
 /// established in `dupes_view.rs`'s `ui_tests` module.
 #[cfg(test)]
 mod ui_tests {
+    use dedup_core::diff::{DiffFile, DiffRelation};
+
+    fn dfile(rel: &str, size: u64, ms: i64) -> DiffFile {
+        DiffFile {
+            rel_path: rel.to_string(),
+            size,
+            modified_ms: ms,
+        }
+    }
+
+    fn drow(relation: DiffRelation, left: Vec<DiffFile>, right: Vec<DiffFile>) -> RepoDiffRow {
+        RepoDiffRow {
+            relation,
+            left,
+            right,
+        }
+    }
+
+    /// A row's sort keys come from the first file on each side, so a side
+    /// holding several names still sorts by one value.
+    #[test]
+    fn diff_metas_take_their_sort_keys_from_the_first_file() {
+        let rows = vec![drow(
+            DiffRelation::Renamed,
+            vec![dfile("b.jpg", 500, 20), dfile("a.jpg", 900, 10)],
+            vec![dfile("c.jpg", 700, 30)],
+        )];
+        let metas = diff_metas(&rows);
+        assert_eq!(metas[0].left_size, 500, "the first left file's size");
+        assert_eq!(metas[0].left_modified, 20);
+        assert_eq!(metas[0].right_size, 700);
+        assert_eq!(
+            metas[0].left_paths,
+            vec!["b.jpg".to_string(), "a.jpg".to_string()],
+            "every name on the side is listed, so the row grows to fit them"
+        );
+    }
+
+    /// Each relation lands in the right summary bucket. A diff plans nothing,
+    /// so nothing is ever counted as "to delete".
+    #[test]
+    fn diff_totals_bucket_each_relation() {
+        let rows = vec![
+            drow(
+                DiffRelation::Equal,
+                vec![dfile("a", 1, 0)],
+                vec![dfile("a", 1, 0)],
+            ),
+            drow(DiffRelation::OnlyLeft, vec![dfile("b", 1, 0)], vec![]),
+            drow(DiffRelation::OnlyRight, vec![], vec![dfile("c", 1, 0)]),
+            drow(
+                DiffRelation::Conflict,
+                vec![dfile("d", 1, 0)],
+                vec![dfile("d", 2, 0)],
+            ),
+            drow(
+                DiffRelation::Renamed,
+                vec![dfile("e", 1, 0)],
+                vec![dfile("f", 1, 0)],
+            ),
+        ];
+        assert_eq!(diff_totals(&rows), [0, 2, 2, 1]);
+    }
+
+    /// What a row offers follows what its two sides say about each other.
+    #[test]
+    fn diff_rows_offer_the_commands_their_relation_allows() {
+        use board::Cmd;
+        let only_left = diff_metas(&[drow(DiffRelation::OnlyLeft, vec![dfile("a", 1, 0)], vec![])]);
+        assert_eq!(
+            only_left[0].cmds,
+            vec![Cmd::CopyRight, Cmd::DeleteLeft, Cmd::Hide]
+        );
+
+        let conflict = diff_metas(&[drow(
+            DiffRelation::Conflict,
+            vec![dfile("a", 1, 0)],
+            vec![dfile("a", 2, 0)],
+        )]);
+        assert!(conflict[0].cmds.contains(&Cmd::Compare));
+        assert!(conflict[0].cmds.contains(&Cmd::OverwriteRight));
+
+        // A side holding several names is narrowed down before it can be
+        // renamed, so that side offers KEEP 1 / DEL ALL instead of RENAME.
+        let multi = diff_metas(&[drow(
+            DiffRelation::Renamed,
+            vec![dfile("a", 1, 0), dfile("b", 1, 0)],
+            vec![dfile("c", 1, 0)],
+        )]);
+        assert!(multi[0].cmds.contains(&Cmd::KeepOneLeft));
+        assert!(!multi[0].cmds.contains(&Cmd::RenameLeft));
+        assert!(
+            multi[0].cmds.contains(&Cmd::RenameRight),
+            "the 1:1 side can still be renamed"
+        );
+
+        // Equal rows are unchanged and offer nothing but HIDE.
+        let equal = diff_metas(&[drow(
+            DiffRelation::Equal,
+            vec![dfile("a", 1, 0)],
+            vec![dfile("a", 1, 0)],
+        )]);
+        assert!(equal[0].unchanged);
+        assert_eq!(equal[0].cmds, vec![Cmd::Hide]);
+    }
+
+    /// A command becomes the file operation the caller executes — and a rename
+    /// against several candidate names asks first instead of picking one.
+    #[test]
+    fn diff_commands_map_to_file_operations() {
+        use crate::diff_board::{BoardAction, PopupKind};
+        use board::Cmd;
+        let rows = vec![
+            drow(DiffRelation::OnlyLeft, vec![dfile("a", 1, 0)], vec![]),
+            drow(
+                DiffRelation::Renamed,
+                vec![dfile("x", 1, 0)],
+                vec![dfile("y", 1, 0), dfile("z", 1, 0)],
+            ),
+        ];
+        assert_eq!(
+            diff_action(&rows, 0, Cmd::CopyRight),
+            Some(BoardAction::Copy {
+                from_left: true,
+                rel_path: "a".to_string()
+            })
+        );
+        assert_eq!(
+            diff_action(&rows, 0, Cmd::DeleteLeft),
+            Some(BoardAction::Delete {
+                on_left: true,
+                rel_path: "a".to_string()
+            })
+        );
+        assert_eq!(
+            diff_action(&rows, 1, Cmd::RenameLeft),
+            Some(BoardAction::OpenPopup {
+                row: 1,
+                on_left: true,
+                kind: PopupKind::PickName
+            }),
+            "several names on the other side means asking which one"
+        );
+        assert_eq!(
+            diff_action(&rows, 1, Cmd::RenameRight),
+            Some(BoardAction::Rename {
+                on_left: false,
+                from: "y".to_string(),
+                to: "x".to_string()
+            }),
+            "the 1:1 direction renames outright"
+        );
+        assert_eq!(
+            diff_action(&rows, 0, Cmd::Hide),
+            None,
+            "HIDE is the board's own business"
+        );
+    }
+
     use super::*;
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
@@ -3701,7 +4261,7 @@ mod ui_tests {
         h.get_by_label("REVIEW").click_accesskit();
         settle_preview(&mut h);
         assert_eq!(
-            h.state().preview_totals[0],
+            h.state().preview_totals[1],
             2,
             "both source files are new to the empty sink"
         );
@@ -3885,7 +4445,7 @@ mod ui_tests {
         h.get_by_label("REVIEW").click_accesskit();
         settle_preview(&mut h);
         assert_eq!(
-            h.state().preview_totals[0],
+            h.state().preview_totals[1],
             1,
             "only the filter-matching file is planned, not both source files"
         );
@@ -4287,28 +4847,28 @@ mod ui_tests {
         view.target = Some("target".to_string());
         view.preview_source_header = "/repos/source".to_string();
         view.preview_target_header = "/repos/target".to_string();
-        view.preview = vec![
-            // A copy: source unchanged (grey ✓), target added (green +).
-            review::ReviewRow {
-                source: review::SideStatus::Unchanged,
-                target: review::SideStatus::Added,
-                source_path: "holiday.jpg".to_string(),
-                target_path: "holiday.jpg".to_string(),
-                source_facts: None,
-                target_facts: None,
-            },
+        let (metas, bodies): (Vec<_>, Vec<_>) = [
+            // A copy: the source keeps it, the target gains it.
+            board_row(
+                SideSpec::at(board::Status::Same, "holiday.jpg", None),
+                SideSpec::at(board::Status::OnlyHere, "holiday.jpg", None),
+                false,
+                planned_cmds(),
+            ),
             // Unchanged on both sides (hidden until the toggle is on).
-            review::ReviewRow {
-                source: review::SideStatus::Unchanged,
-                target: review::SideStatus::Unchanged,
-                source_path: "notes.txt".to_string(),
-                target_path: "notes.txt".to_string(),
-                source_facts: None,
-                target_facts: None,
-            },
-        ];
-        view.preview_totals = [1, 0, 1];
-        review::sort(&mut view.preview, &view.review_state);
+            board_row(
+                SideSpec::at(board::Status::Same, "notes.txt", None),
+                SideSpec::at(board::Status::Same, "notes.txt", None),
+                true,
+                planned_cmds(),
+            ),
+        ]
+        .into_iter()
+        .unzip();
+        view.preview = metas;
+        view.preview_bodies = bodies;
+        view.preview_total = 2;
+        view.preview_totals = [0, 1, 0, 1];
 
         let mut init = false;
         let mut harness = Harness::builder()
@@ -4427,26 +4987,30 @@ mod ui_tests {
             0,
             "equal rows are hidden by default"
         );
-        // A one-sided row offers COPY on the side that lacks it and DELETE on
-        // the side that has it; a rename offers RENAME on both sides.
+        // A one-sided row offers a copy across and a delete here; the command
+        // names its direction, so it never collides with the COPY command in
+        // the bar above.
         assert_eq!(
-            h.get_all_by_label("COPY").count(),
-            2,
-            "the COPY command button plus the row's copy-across action"
+            h.get_all_by_label("COPY >").count(),
+            1,
+            "the row offers to copy the left-only file across"
         );
-        assert!(h.query_by_label("DELETE").is_some(), "or delete it here");
-        assert_eq!(
-            h.get_all_by_label("RENAME").count(),
-            2,
-            "a renamed pair can be resolved from either side"
+        assert!(
+            h.query_by_label("DELETE L").is_some(),
+            "or delete it where it is"
         );
-        // Sizes and dates are shown for both sides.
+        assert!(
+            h.query_by_label("RENAME L").is_some() && h.query_by_label("RENAME R").is_some(),
+            "a renamed pair can be resolved from either side, and each command \
+             names the side it acts on"
+        );
+        // Each side's facts line carries its size.
         assert!(
             h.query_by_label_contains("2.00 KB").is_some(),
-            "the size column is filled"
+            "the facts line shows the size"
         );
 
-        h.get_by_label_contains("SHOW EQUAL").click();
+        h.get_by_label_contains("SHOW UNCHANGED").click();
         h.run();
         assert_eq!(
             h.get_all_by_label("notes.txt").count(),
@@ -4473,14 +5037,12 @@ mod ui_tests {
         }
         let target_dir = tmp.path().join("target");
         let mut h = diff_harness_over(Arc::clone(&store));
-        // The board renders below the command bar, so the row's COPY button is
-        // the second one on screen (the first is the COPY command).
-        match h.get_all_by_label("COPY").last() {
-            Some(button) => button.click(),
-            None => panic!("no COPY button on the board"),
-        }
+        // The row's command names its direction, so it is unambiguous against
+        // the COPY command in the bar above.
+        h.get_by_label("COPY >").click();
         // The action runs on a worker thread; pump frames until it lands.
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
             // step(), not run(): the running spinner repaints every frame.
             h.step();
             if target_dir.join("holiday.jpg").exists() {
@@ -4530,7 +5092,7 @@ mod ui_tests {
             .expect("plan diff");
         }
         h.run();
-        h.get_by_label("KEEP 1").click();
+        h.get_by_label("KEEP 1 L").click();
         h.run();
         // The popup lists all three copies; keep b.txt.
         assert!(
@@ -4733,13 +5295,14 @@ mod ui_tests {
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 
-    /// Render snapshot of the DIFF board to `target/transfer_diff.png`.
+    /// Doc screenshot of the DIFF board — a one-sided row and a rename pair —
+    /// to `docs/screenshots/transfer_diff_board.png`.
     #[test]
-    #[ignore = "renders a PNG for manual inspection"]
-    fn render_diff_board() {
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_diff_board() {
         let mut h = diff_harness();
-        let out =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/transfer_diff.png");
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/screenshots/transfer_diff_board.png");
         let img = h.render().expect("wgpu render failed");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
@@ -4752,8 +5315,8 @@ mod ui_tests {
     fn review_board_summarises_hides_unchanged_and_sorts() {
         let mut h = review_harness();
         assert!(
-            h.query_by_label_contains("1 added").is_some(),
-            "summary shows the added count"
+            h.query_by_label_contains("1 only on one side").is_some(),
+            "summary shows the count of files only one side has"
         );
         assert!(
             h.query_by_label_contains("1 unchanged").is_some(),
@@ -4767,7 +5330,7 @@ mod ui_tests {
         // Unchanged rows are hidden by default; the toggle reveals them. (The
         // path appears in both the source and target columns, so use query_all.)
         assert!(
-            !h.state().review_state.show_unchanged,
+            !h.state().preview_board.show_unchanged,
             "unchanged hidden by default"
         );
         assert!(
@@ -4776,65 +5339,71 @@ mod ui_tests {
         );
         h.get_by_label_contains("SHOW UNCHANGED").click();
         h.run();
-        assert!(h.state().review_state.show_unchanged, "toggle turns it on");
+        h.run();
+        assert!(h.state().preview_board.show_unchanged, "toggle turns it on");
         assert!(
             h.query_all_by_label("notes.txt").next().is_some(),
             "the unchanged row appears once shown"
         );
 
-        // Source path is the default sort column; clicking its header (the repo
-        // path) flips direction.
-        assert!(h.state().review_state.sort_asc, "starts ascending");
-        h.get_by_label_contains("/repos/source").click();
+        // Sorting is the explicit bar now, not a header click.
+        assert!(h.state().preview_board.sort_asc, "starts ascending");
+        h.get_by_label("▲").click();
         h.run();
         assert!(
-            !h.state().review_state.sort_asc,
-            "clicking the source header toggles the sort direction"
+            !h.state().preview_board.sort_asc,
+            "the direction toggle reverses the sort"
+        );
+        // Two-sided, so the board offers a side switch its one-sided
+        // counterpart does not.
+        assert!(
+            h.query_by_label("RIGHT").is_some(),
+            "a two-sided board can sort by either side"
         );
     }
 
     /// Renders the review table to a PNG for manual inspection. `--ignored`.
     #[test]
-    #[ignore = "renders a PNG for manual inspection"]
-    fn render_review_table() {
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_transfer_review_board() {
         let mut h = review_harness();
         // Seed one of each status and reveal unchanged, so the PNG shows the full
         // side-by-side vocabulary (added / removed / unchanged / absent).
         {
             let v = h.state_mut();
-            v.review_state.show_unchanged = true;
-            v.preview_totals = [1, 1, 1];
-            v.preview = vec![
-                review::ReviewRow {
-                    source: review::SideStatus::Unchanged,
-                    target: review::SideStatus::Added,
-                    source_path: "holiday.jpg".to_string(),
-                    target_path: "holiday.jpg".to_string(),
-                    source_facts: None,
-                    target_facts: None,
-                },
-                review::ReviewRow {
-                    source: review::SideStatus::Removed,
-                    target: review::SideStatus::Absent,
-                    source_path: "old.tmp".to_string(),
-                    target_path: String::new(),
-                    source_facts: None,
-                    target_facts: None,
-                },
-                review::ReviewRow {
-                    source: review::SideStatus::Unchanged,
-                    target: review::SideStatus::Unchanged,
-                    source_path: "notes.txt".to_string(),
-                    target_path: "notes.txt".to_string(),
-                    source_facts: None,
-                    target_facts: None,
-                },
-            ];
-            review::sort(&mut v.preview, &v.review_state);
+            v.preview_board.show_unchanged = true;
+            v.preview_totals = [1, 1, 0, 1];
+            v.preview_total = 3;
+            let (metas, bodies): (Vec<_>, Vec<_>) = [
+                board_row(
+                    SideSpec::at(board::Status::Same, "holiday.jpg", None),
+                    SideSpec::at(board::Status::OnlyHere, "holiday.jpg", None),
+                    false,
+                    planned_cmds(),
+                ),
+                board_row(
+                    SideSpec::at(board::Status::WillDelete, "old.tmp", None),
+                    SideSpec::absent(),
+                    false,
+                    planned_cmds(),
+                ),
+                board_row(
+                    SideSpec::at(board::Status::Same, "notes.txt", None),
+                    SideSpec::at(board::Status::Same, "notes.txt", None),
+                    true,
+                    planned_cmds(),
+                ),
+            ]
+            .into_iter()
+            .unzip();
+            v.preview = metas;
+            v.preview_bodies = bodies;
         }
         h.run();
-        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/transfer_review.png");
+        h.run();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
+        std::fs::create_dir_all(&dir).expect("screenshot dir");
+        let out = dir.join("transfer_review_board.png");
         let img = h.render().expect("wgpu render failed");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
@@ -4928,7 +5497,7 @@ mod ui_tests {
             h.state()
                 .preview
                 .iter()
-                .any(|r| r.source_path == "holiday.jpg"),
+                .any(|r| r.left_paths.iter().any(|p| p == "holiday.jpg")),
             "the plan landed and filled the review board via the worker channel"
         );
     }
@@ -4971,17 +5540,27 @@ mod ui_tests {
         );
 
         h.get_by_label("PROCEED").click_accesskit();
-        for _ in 0..200 {
+        // Wait for the worker to actually finish, not for a fixed number of
+        // ticks: the copy runs on a background thread, and a wall-clock budget
+        // sized for an idle machine fails intermittently under a loaded test
+        // run even though the run itself is healthy.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
             h.step();
-            if target_dir.join("holiday.jpg").exists() {
+            if !h.state().running && h.state().error.is_none() {
+                break;
+            }
+            if target_dir.join("holiday.jpg").exists() && target_dir.join("notes.txt").exists() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(
             target_dir.join("holiday.jpg").exists() && target_dir.join("notes.txt").exists(),
-            "PROCEED copied the planned files: {:?}",
-            h.state().error
+            "PROCEED copied the planned files: err={:?} running={} status={:?}",
+            h.state().error,
+            h.state().running,
+            h.state().status
         );
     }
 
@@ -5004,9 +5583,10 @@ mod ui_tests {
         };
         let data = ReviewPreviewData {
             rows: Vec::new(),
+            bodies: Vec::new(),
             preview_total: 5,
             sync_delete_total: 0,
-            preview_totals: [5, 0, 0],
+            preview_totals: [0, 5, 0, 0],
             source_header: "SRC".to_string(),
             target_header: "DEST_A".to_string(),
             status: String::new(),

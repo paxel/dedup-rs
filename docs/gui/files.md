@@ -61,18 +61,23 @@ machines.
 
 ## Diff board
 
-**DIFF** replaces the review board with a two-sided comparison of the source (left) and
-target (right) repo, with each side's path, size and modification date in sortable columns.
+![The DIFF board](../screenshots/transfer_diff_board.png)
+
+**DIFF** compares the source (left) and target (right) repo on the same
+[review board](index.md#the-review-board) every other preview uses: each side's paths, size
+and date, with the commands between them.
 
 **PAIR BY** decides what counts as one row:
 
 - **BY HASH** — files are matched by content, so the same photo under two names is a single
   row. Same content at the same path is *equal*; same content under different names offers
-  **RENAME** on either side (renaming that side to the other's name); content only one side
-  has offers **COPY** on the side that lacks it and **DELETE** on the side that has it.
+  **RENAME L** / **RENAME R** (renaming that side to the other's name); content only one side
+  has offers **COPY >** / **< COPY** to send it across and **DELETE L** / **DELETE R** to drop
+  it where it is.
 - **BY PATH** — files are matched by their path inside the repo. Same path with the same
   content is *equal*; same path with different content is a conflict, offering **COMPARE**,
-  **OVERWRITE** (replace the other side's file with this one) and **DELETE** per side.
+  **OVERWRITE >** / **< OVERWRITE** (replace the other side's file with this one) and
+  **DELETE L** / **DELETE R**.
 
 **COMPARE** opens the two versions side by side over the whole window, using the same viewer
 as the Duplicates lightbox: each side shows a preview appropriate to the file (image, or a
@@ -89,13 +94,14 @@ changing anything.
 ![DIFF compare — two versions of the same path side by side](../screenshots/diff_compare.png)
 
 When one side holds the same content under several names, that side is narrowed down first:
-**DELETE ALL** drops every copy (after confirming) and **KEEP 1** asks which copy to keep and
-deletes the others. When the *other* side offers several names, **RENAME** asks which name to
-take. After every action the board re-compares the two repos, so the row's buttons always
-reflect the current state.
+**DEL ALL L** / **DEL ALL R** drops every copy on that side (after confirming) and
+**KEEP 1 L** / **KEEP 1 R** asks which copy to keep and deletes the others. When the *other*
+side offers several names, RENAME asks which name to take. After every action the board
+re-compares the two repos, so the row's commands always reflect the current state.
 
-Equal rows are hidden until **SHOW EQUAL** is pressed, and each action is applied to disk
+Equal rows are hidden until **SHOW UNCHANGED** is pressed, and each action is applied to disk
 and to both repo indexes immediately — there is no RUN button and no batch confirmation.
+**HIDE** parks a row you have decided to leave alone; it comes back on the next REVIEW.
 
 ## Group sync
 
@@ -116,7 +122,8 @@ deletes sink content the main does not have, so it ends up holding exactly the m
 content — those deletions cannot be undone.
 
 **REVIEW** and **RUN** work as they do for every other command: REVIEW plans every selected
-sink and shows what would be copied and deleted, without touching disk; RUN asks for
+sink and shows what would be copied and deleted, without touching disk — each row naming the
+sink it belongs to. A group push is all-or-nothing, so these rows carry no per-row commands; RUN asks for
 confirmation — naming the sink count and, for a MIRROR push, any sink it would empty
 entirely — then pushes on a background thread. Sinks are handled independently, so one
 unreachable backup drive does not stop the others, and the main is never changed. The FILTER
@@ -127,11 +134,12 @@ SOURCE and the main as TARGET.
 
 ## Review and run
 
-- **REVIEW** shows the first matching `from → to` transfers (up to a limit) and a total
-  count, without touching disk. Each row carries a thumbnail (image, video still or audio
-  fingerprint) and the file's size, dimensions or duration, and date — the same info as a
-  Duplicate card. REVIEW and RUN are mutually exclusive — starting a run clears the review
-  and vice versa.
+- **REVIEW** shows the first matching transfers (up to a limit) and a total count, without
+  touching disk, on the shared [review board](index.md#the-review-board). Each side carries a
+  thumbnail (image, video still or audio fingerprint) and the file's size, dimensions or
+  duration, and date — the same info as a Duplicate card. Per row, **APPLY** runs just that
+  transfer now and **HIDE** drops it from the board and from what RUN will do. REVIEW and RUN
+  are mutually exclusive — starting a run clears the review and vice versa.
 - **RUN** starts the command on a background thread after a confirmation dialog. Live
   progress shows a spinner, the file currently being handled, the last few actions, and a
   running count. **CANCEL** stops the operation — files already transferred or deleted before
