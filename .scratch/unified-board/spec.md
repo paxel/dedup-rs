@@ -160,7 +160,45 @@ Touches: `repo_chip.rs`, `app.rs` (`repo_card`, `group_section`, the top-level l
 
 ---
 
-## Slice 2 — the unified board  [IN PROGRESS — widget built, no surface routed]
+## Slice 2 — the unified board  [IN PROGRESS — widget built, Grooming routed]
+
+**Grooming is on the new board (2026-07-29).** `GroomingView` now holds `preview:
+Vec<board::RowMeta>` plus a parallel `preview_bodies: Vec<board::RowBody>`, and
+`board_state: board::BoardState` in place of `review_state`. Both preview builders
+(DEDUPE/PURGE/PRUNE and ORGANIZE) emit `RowMeta` + `RowBody`; `rejected` became `hidden`
+throughout, including the `DiffRun::with_selection` skip set that makes RUN honour it. Its four
+board tests were rewritten and a doc screenshot added
+(`docs/screenshots/groom_purge_board.png`).
+
+Three design corrections fell out of routing a real surface:
+
+1. **The board must not own a `ScrollArea`.** Its callers already wrap the whole tab in one, and
+   a scroll area nested in a scroll area gets a viewport that is not the band the user can see —
+   which showed up as only the first row of a preview ever being drawn. The board now claims its
+   full height and culls to `ui.clip_rect()`, which is what the old table did
+   (`grooming_view.rs:373-379` documents the single-outer-scrollbar intent).
+2. **Row-level commands share a line.** `APPLY` and `HIDE` are both `Side::Neither`, so each was
+   getting its own centred line and every planned-preview row was twice as tall as it needed to
+   be. `Line::Centre` now carries up to two commands.
+3. **A one-sided board gives its single side the whole width.** `regions()` was splitting
+   `(W - C)/2` even with no right region, stranding PURGE's commands mid-screen beside dead
+   space.
+
+**Paging is gone, replaced by virtualisation.** The old boards paged at 500 rows with
+PREV/PAGE/NEXT; the prefix-sum index makes that unnecessary, and the row count is still shown.
+
+**Still to route:** Transfer's four preview builders and GROUP SYNC's lane; DIFF (the
+`RepoDiffRow` → `RowMeta` conversion, the lazy `open_facts`/`facts_for` body resolver, the
+`BoardAction` → `Act::Board` mapping, `start_board_action`, `open_inspect`, and the three
+modals). Then delete `review.rs` and `diff_board.rs`, migrate their tests, fix the two dangling
+`review::RowKind` doc links, and make `board` a private `mod` again.
+
+**Unrelated pre-existing flake, seen while verifying:**
+`transfer_view::ui_tests::run_asks_then_copies_on_proceed` polls at most 200 × 10 ms = **2 s**
+for a background copy thread (`transfer_view.rs:4974-4980`). It fails intermittently in
+`cargo test --workspace` runs (more parallel load) and never in six consecutive `-p dedup-gui`
+runs. Nothing in this work touches Transfer's copy path. A larger budget, or waiting on state
+rather than sleeping, would settle it.
 
 **Done (2026-07-28):** `crates/dedup-gui/src/board.rs` — the widget itself, complete against
 every decision in §2.1–2.8 and covered by 20 tests including geometric asserts at 900 / 1280 /

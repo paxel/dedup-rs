@@ -133,8 +133,11 @@ enum Line {
     /// `DELETE L` with no `DELETE R` — and the surviving half keeps its own
     /// side's column rather than sliding across.
     Sides(Option<Cmd>, Option<Cmd>),
-    /// A command belonging to neither side, centred across both columns.
-    Centre(Cmd),
+    /// One or two commands belonging to neither side, filling the line as a
+    /// group. Two fit side by side — `APPLY` and `HIDE` are both row-level, and
+    /// giving each its own line made every planned-preview row twice as tall as
+    /// it needed to be.
+    Centre(Cmd, Option<Cmd>),
 }
 
 /// Arrange a row's commands into grid lines: one line per kind, left command in
@@ -144,10 +147,14 @@ enum Line {
 /// commands in a different order still gets `COPY >` and `< COPY` on one line
 /// rather than whatever happened to be at the same index.
 fn layout(cmds: &[Cmd]) -> Vec<Line> {
-    let mut kinds: Vec<Kind> = cmds.iter().map(|c| c.kind()).collect();
+    let mut kinds: Vec<Kind> = cmds
+        .iter()
+        .filter(|c| c.side() != Side::Neither)
+        .map(|c| c.kind())
+        .collect();
     kinds.sort();
     kinds.dedup();
-    kinds
+    let mut lines: Vec<Line> = kinds
         .into_iter()
         .map(|kind| {
             let of = |side: Side| {
@@ -155,12 +162,23 @@ fn layout(cmds: &[Cmd]) -> Vec<Line> {
                     .copied()
                     .find(|c| c.kind() == kind && c.side() == side)
             };
-            match of(Side::Neither) {
-                Some(c) => Line::Centre(c),
-                None => Line::Sides(of(Side::Left), of(Side::Right)),
-            }
+            Line::Sides(of(Side::Left), of(Side::Right))
         })
-        .collect()
+        .collect();
+    // Row-level commands come last, two to a line, in declaration order.
+    let mut whole: Vec<Cmd> = cmds
+        .iter()
+        .copied()
+        .filter(|c| c.side() == Side::Neither)
+        .collect();
+    whole.sort_by_key(|c| c.kind());
+    whole.dedup();
+    lines.extend(
+        whole
+            .chunks(2)
+            .map(|pair| Line::Centre(pair[0], pair.get(1).copied())),
+    );
+    lines
 }
 
 /// A command offered on a row. `on_left` / direction is baked into the variant,
@@ -534,9 +552,9 @@ fn centre_width(metas: &[RowMeta]) -> f32 {
     // Two columns as soon as any row pairs a left and a right command; a board
     // whose commands all act on the row as a whole needs only one.
     let paired = metas.iter().any(|m| {
-        layout(&m.cmds)
-            .iter()
-            .any(|l| matches!(l, Line::Sides(Some(_), Some(_))))
+        layout(&m.cmds).iter().any(|l| {
+            matches!(l, Line::Sides(Some(_), Some(_))) || matches!(l, Line::Centre(_, Some(_)))
+        })
     });
     CMD_W * if paired { 2.0 } else { 1.0 } + 8.0
 }
@@ -547,8 +565,12 @@ fn centre_width(metas: &[RowMeta]) -> f32 {
 /// when the window is too narrow the sides stop at [`SIDE_MIN`] and the board
 /// clips at the window edge rather than deforming. Path text truncates from the
 /// left inside whatever the side gets, so the distinguishing tail survives.
-fn regions(avail: f32, centre: f32) -> (f32, f32) {
-    let side = ((avail - centre) / 2.0).max(SIDE_MIN);
+/// A one-sided board has no right region to balance, so its single side takes
+/// everything the centre leaves rather than half of it — otherwise a PURGE
+/// preview strands its commands mid-screen with dead space beside them.
+fn regions(avail: f32, centre: f32, two_sided: bool) -> (f32, f32) {
+    let sides = if two_sided { 2.0 } else { 1.0 };
+    let side = ((avail - centre) / sides).max(SIDE_MIN);
     (side, centre)
 }
 
@@ -593,48 +615,54 @@ pub fn board(
 
     let centre = centre_width(metas);
     let mut action = None;
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show_viewport(ui, |ui, viewport| {
-            let (side, centre) = regions(ui.available_width(), centre);
-            ui.set_height(index.total_height());
-            let range = index.range(viewport.min.y, viewport.max.y);
-            let top = ui.min_rect().top();
-            for vis in range {
-                let i = index.order[vis];
-                let y = top + index.offsets[vis];
-                let h = metas[i].height();
-                let rect = egui::Rect::from_min_size(
-                    egui::pos2(ui.min_rect().left(), y),
-                    egui::vec2(ui.available_width(), h),
-                );
-                // Striping, which TableBuilder used to provide.
-                if vis % 2 == 1 {
-                    ui.painter().rect_filled(rect, 0.0, theme::PANEL);
-                }
-                // The row's vertical padding is an inset on the content rect.
-                // Adding it with `add_space` inside a left-to-right row would
-                // have spent it sideways instead, leaving the content taller
-                // than the height that was measured for it.
-                let mut row_ui = ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(rect.shrink2(egui::vec2(0.0, ROW_PAD)))
-                        .layout(Layout::left_to_right(Align::Min)),
-                );
-                if let Some(cmd) = draw_row(
-                    &mut row_ui,
-                    thumbs,
-                    &metas[i],
-                    &body(i),
-                    side,
-                    centre,
-                    two_sided,
-                    view.right.as_ref().is_some_and(|r| r.multi_repo),
-                ) {
-                    action = Some(BoardAction { row: i, cmd });
-                }
-            }
-        });
+
+    // The board claims its full height and culls to `ui.clip_rect()` rather than
+    // owning a `ScrollArea`. Its callers already wrap their whole tab in one, and
+    // a scroll area nested in a scroll area gives the inner one a viewport that
+    // is not the band the user can actually see — which showed up as only the
+    // first row of a preview ever being drawn.
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), index.total_height()),
+        egui::Sense::hover(),
+    );
+    let (side, centre) = regions(rect.width(), centre, two_sided);
+    let clip = ui.clip_rect();
+    let visible = index.range(
+        (clip.top() - rect.top()).max(0.0),
+        (clip.bottom() - rect.top()).max(0.0),
+    );
+    for vis in visible {
+        let i = index.order[vis];
+        let h = metas[i].height();
+        let row_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), rect.top() + index.offsets[vis]),
+            egui::vec2(rect.width(), h),
+        );
+        // Striping, which TableBuilder used to provide.
+        if vis % 2 == 1 {
+            ui.painter().rect_filled(row_rect, 0.0, theme::PANEL);
+        }
+        // The row's vertical padding is an inset on the content rect. Adding it
+        // with `add_space` inside a left-to-right row would have spent it
+        // sideways instead, leaving the content taller than its measured height.
+        let mut row_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(row_rect.shrink2(egui::vec2(0.0, ROW_PAD)))
+                .layout(Layout::left_to_right(Align::Min)),
+        );
+        if let Some(cmd) = draw_row(
+            &mut row_ui,
+            thumbs,
+            &metas[i],
+            &body(i),
+            side,
+            centre,
+            two_sided,
+            view.right.as_ref().is_some_and(|r| r.multi_repo),
+        ) {
+            action = Some(BoardAction { row: i, cmd });
+        }
+    }
 
     // HIDE is the board's own business: it never reaches the caller.
     if let Some(a) = &action
@@ -694,12 +722,23 @@ fn draw_row(
                     }
                 }
             }
-            Line::Centre(cmd) => {
-                let at = slot(0, n).translate(egui::vec2(CMD_W / 2.0, 0.0));
-                if cmd_button(ui, at, cmd).clicked() {
-                    clicked = Some(cmd);
+            Line::Centre(first, second) => match second {
+                // Two row-level commands fill the two columns.
+                Some(other) => {
+                    for (col, cmd) in [(0, first), (1, other)] {
+                        if cmd_button(ui, slot(col, n), cmd).clicked() {
+                            clicked = Some(cmd);
+                        }
+                    }
                 }
-            }
+                // A lone one is centred across them.
+                None => {
+                    let at = slot(0, n).translate(egui::vec2(CMD_W / 2.0, 0.0));
+                    if cmd_button(ui, at, first).clicked() {
+                        clicked = Some(first);
+                    }
+                }
+            },
         }
     }
     ui.advance_cursor_after_rect(egui::Rect::from_min_size(
@@ -843,7 +882,7 @@ fn controls_bar(ui: &mut egui::Ui, state: &mut BoardState, two_sided: bool, any_
 /// and the absolute path truncated from the left.
 fn headers(ui: &mut egui::Ui, view: &BoardView, metas: &[RowMeta]) {
     let centre = centre_width(metas);
-    let (side, centre) = regions(ui.available_width(), centre);
+    let (side, centre) = regions(ui.available_width(), centre, view.right.is_some());
     ui.horizontal_top(|ui| {
         header_cell(
             ui,
@@ -1116,8 +1155,8 @@ mod tests {
     #[test]
     fn the_centre_column_never_shrinks() {
         let centre = 216.0;
-        let (wide, c_wide) = regions(1600.0, centre);
-        let (narrow, c_narrow) = regions(600.0, centre);
+        let (wide, c_wide) = regions(1600.0, centre, true);
+        let (narrow, c_narrow) = regions(600.0, centre, true);
         assert_eq!(c_wide, centre, "centre is constant when wide");
         assert_eq!(c_narrow, centre, "centre is constant when narrow");
         assert!(wide > narrow, "the sides absorb the difference");
@@ -1136,13 +1175,22 @@ mod tests {
             (c - (CMD_W * 2.0 + 8.0)).abs() < 0.01,
             "two columns when paired"
         );
-        // APPLY and HIDE act on the row as a whole, so a planned board never
-        // pairs and needs only one column.
+        // A planned board pairs APPLY with HIDE on one line, so it is two
+        // columns wide too — the row stays one line tall rather than two.
         let mut planned = meta("a", 0, 1);
         planned.cmds = vec![Cmd::Apply, Cmd::Hide];
+        assert!((centre_width(&[planned.clone()]) - c).abs() < 0.01);
+        assert_eq!(
+            layout(&planned.cmds),
+            vec![Line::Centre(Cmd::Apply, Some(Cmd::Hide))],
+            "APPLY and HIDE share one line"
+        );
+        // Only a board whose rows offer a single command can be narrower.
+        let mut lone = meta("a", 0, 1);
+        lone.cmds = vec![Cmd::Hide];
         assert!(
-            centre_width(&[planned]) < c,
-            "a board with no left/right pair needs a narrower centre"
+            centre_width(&[lone]) < c,
+            "one command per row needs only one column"
         );
     }
 
@@ -1166,8 +1214,7 @@ mod tests {
                 Line::Sides(Some(Cmd::CopyRight), Some(Cmd::CopyLeft)),
                 Line::Sides(Some(Cmd::OverwriteRight), Some(Cmd::OverwriteLeft)),
                 Line::Sides(Some(Cmd::DeleteLeft), Some(Cmd::DeleteRight)),
-                Line::Centre(Cmd::Compare),
-                Line::Centre(Cmd::Hide),
+                Line::Centre(Cmd::Compare, Some(Cmd::Hide)),
             ]
         );
     }

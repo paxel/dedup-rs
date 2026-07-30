@@ -35,6 +35,28 @@ Session logs live separately under `$XDG_STATE_HOME/dedup/logs` (default
 deliberately **not** persisted — every repo re-locks on launch as a safety default, since
 unlocking for deletion should be a fresh, conscious choice each session.
 
+## The review board
+
+Every preview and reconcile view renders on one shared board, so it reads the same wherever it
+appears.
+
+![A PURGE preview on the review board](../screenshots/groom_purge_board.png)
+
+- **Three regions.** A mini-overview of the left-hand file, a centre column of commands, and —
+  when there is one — the right-hand file. The left and right stay pinned to the window edges.
+- **Commands act where they point.** A command for the left-hand file sits in the left slot,
+  one for the right in the right slot, and a command and its mirror share a line, so
+  `COPY >` sits beside `< COPY` and `DELETE L` beside `DELETE R`. Commands that act on the row
+  as a whole — `COMPARE`, `APPLY`, `HIDE` — are centred. Only the commands that apply to a row
+  are drawn, and a row is as tall as its content needs.
+- **Path colour says what will happen.** Grey means unchanged or equal on both sides, green
+  exists only on this side (or will be added), red will be deleted, amber differs — the same
+  path with different content, or the same content under a different name.
+- **HIDE** removes a row from the board, and on a preview also from what RUN will do. It is
+  one-way: press REVIEW again to start over.
+- **Sorting** is the bar above the board — which side to read, then the key (path, size, date
+  or status), then the direction. Large previews scroll rather than paging.
+
 ## What's not here
 
 The important-file scanner (`dedup scan`) and the triage report (`dedup report`) are

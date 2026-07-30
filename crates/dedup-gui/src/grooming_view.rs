@@ -16,10 +16,10 @@
 //! All destructive runs go through a confirmation modal and execute on a
 //! background thread, reusing the same `DiffEvent` progress plumbing as Transfer.
 
+use crate::board;
 use crate::filter_ui::FilterBuilder;
 use crate::icon;
 use crate::media_cell::{facts_for, open_facts};
-use crate::review;
 use crate::settings::TooltipVerbosity;
 use crate::theme;
 use crate::thumbs::ThumbCache;
@@ -36,7 +36,7 @@ use egui::{Id, RichText};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::review::PREVIEW_CAP;
+use crate::board::PREVIEW_CAP;
 
 const RUN_LOG_LIMIT: usize = 10;
 
@@ -218,19 +218,23 @@ pub struct GroomingView {
     /// ORGANIZE: set for one frame when a rename just started, so its text
     /// field can grab keyboard focus.
     focus_rename_pending: bool,
-    preview: Vec<review::ReviewRow>,
-    /// Full per-kind counts (indexed by [`review::RowKind::idx`]) for the review
+    /// The board's cheap per-row model, and the thumbnails/facts that go with
+    /// it — kept parallel, indexed alike, because the board resolves a row's
+    /// body only for the rows actually on screen.
+    preview: Vec<board::RowMeta>,
+    preview_bodies: Vec<board::RowBody>,
+    /// Full counts `[to-delete, only-here, differing, unchanged]` for the board
     /// summary; independent of the capped `preview` sample.
-    preview_totals: [usize; 3],
-    /// The review-table column headers (absolute paths). ORGANIZE uses the same
+    preview_totals: [usize; 4],
+    /// The board's region headers (absolute paths). ORGANIZE uses the same
     /// repo on both sides (old path → new path); the single-repo deletions
     /// (DEDUPE/PURGE/PRUNE) have no target side, so `preview_target_header` is
     /// `None` and the board renders one-sided.
     preview_source_header: String,
     preview_target_header: Option<String>,
     preview_total: usize,
-    /// Sort column + direction for the review table.
-    review_state: review::ReviewState,
+    /// Sort key, side, direction and the hidden-row set for the board.
+    board_state: board::BoardState,
     status: Option<String>,
     error: Option<String>,
     confirm: Option<String>,
@@ -293,11 +297,12 @@ impl GroomingView {
             rename_buf: String::new(),
             focus_rename_pending: false,
             preview: Vec::new(),
-            preview_totals: [0; 3],
+            preview_bodies: Vec::new(),
+            preview_totals: [0; 4],
             preview_source_header: String::new(),
             preview_target_header: None,
             preview_total: 0,
-            review_state: review::ReviewState::default(),
+            board_state: board::BoardState::default(),
             status: None,
             error: None,
             confirm: None,
@@ -883,19 +888,38 @@ impl GroomingView {
             ui.colored_label(theme::TEXT, "Pick a repo and command, then press REVIEW.");
             return;
         }
-        if let Some(review::ReviewAction::Apply(key)) = review::table(
+        let bodies = std::mem::take(&mut self.preview_bodies);
+        let action = board::board(
             ui,
-            &mut self.review_state,
-            &mut self.preview,
-            review::BoardView {
+            &mut self.board_state,
+            &self.preview,
+            board::BoardView {
+                left_role: "SOURCE",
+                left_repo: "",
+                left_is_main: false,
+                left_path: &self.preview_source_header,
+                right: self
+                    .preview_target_header
+                    .as_deref()
+                    .map(|path| board::RightHeader {
+                        role: "TARGET",
+                        repo: "",
+                        is_main: false,
+                        path,
+                        multi_repo: false,
+                    }),
                 totals: self.preview_totals,
-                source_header: &self.preview_source_header,
-                target: self.preview_target_header.as_deref(),
-                controls: review::RowControls::Enabled,
+                full_len: self.preview_total,
             },
             &mut self.thumbs,
-        ) {
-            acts.push(Act::ApplyRow(key));
+            &mut |i| bodies.get(i).cloned().unwrap_or_default(),
+        );
+        self.preview_bodies = bodies;
+        if let Some(a) = action
+            && a.cmd == board::Cmd::Apply
+            && let Some(meta) = self.preview.get(a.row)
+        {
+            acts.push(Act::ApplyRow(meta.key.clone()));
         }
     }
 
@@ -1124,9 +1148,9 @@ impl GroomingView {
             Act::Preview => self.run_preview(store),
             Act::Ask => {
                 if let Some(mut prompt) = self.build_prompt(store) {
-                    let rejected = self.review_state.rejected.len();
-                    if rejected > 0 {
-                        prompt.push_str(&format!(" {rejected} rejected row(s) will be skipped."));
+                    let hidden = self.board_state.hidden.len();
+                    if hidden > 0 {
+                        prompt.push_str(&format!(" {hidden} hidden row(s) will be skipped."));
                     }
                     self.confirm = Some(prompt);
                 }
@@ -1143,12 +1167,13 @@ impl GroomingView {
 
     fn clear_preview(&mut self) {
         self.preview.clear();
-        self.preview_totals = [0; 3];
+        self.preview_bodies.clear();
+        self.preview_totals = [0; 4];
         self.preview_source_header.clear();
         self.preview_target_header = None;
         self.preview_total = 0;
-        // Rejections are keyed to the preview they were made in.
-        self.review_state.rejected.clear();
+        // Hidden rows are keyed to the preview they were hidden in.
+        self.board_state.hidden.clear();
     }
 
     fn reset_run(&mut self) {
@@ -1222,22 +1247,38 @@ impl GroomingView {
                 // DEDUPE / PURGE / PRUNE all remove files from the one repo: the
                 // source side is removed, the target side is absent.
                 self.preview_total = total;
-                self.preview_totals = [0, total, 0];
+                self.preview_totals = [total, 0, 0, 0];
                 self.preview_target_header = None;
                 let (db, base) = open_facts(store, &facts_repo);
-                let mut rows: Vec<review::ReviewRow> = paths
+                let (metas, bodies) = paths
                     .into_iter()
-                    .map(|from| review::ReviewRow {
-                        source_facts: facts_for(db.as_deref(), base.as_deref(), &from),
-                        source: review::SideStatus::Removed,
-                        target: review::SideStatus::Absent,
-                        source_path: from,
-                        target_path: String::new(),
-                        target_facts: None,
+                    .map(|from| {
+                        let facts = facts_for(db.as_deref(), base.as_deref(), &from);
+                        let meta = board::RowMeta {
+                            key: dedup_core::diff::source_key(&from),
+                            left_status: board::Status::WillDelete,
+                            right_status: board::Status::Absent,
+                            left_size: facts.as_ref().map(|f| f.size).unwrap_or(0),
+                            left_modified: facts.as_ref().map(|f| f.modified_ms).unwrap_or(0),
+                            right_size: 0,
+                            right_modified: 0,
+                            left_paths: vec![from],
+                            right_paths: Vec::new(),
+                            unchanged: false,
+                            cmds: vec![board::Cmd::Apply, board::Cmd::Hide],
+                        };
+                        let body = board::RowBody {
+                            left: board::SideBody {
+                                facts,
+                                ..Default::default()
+                            },
+                            right: board::SideBody::default(),
+                        };
+                        (meta, body)
                     })
-                    .collect();
-                review::sort(&mut rows, &self.review_state);
-                self.preview = rows;
+                    .unzip();
+                self.preview = metas;
+                self.preview_bodies = bodies;
                 self.status = Some(format!("{total} file(s) match."));
                 self.error = None;
             }
@@ -1266,7 +1307,7 @@ impl GroomingView {
             Ok(moves) => {
                 self.preview_total = moves.len();
                 // A relocation both removes the old path and adds the new one.
-                self.preview_totals = [moves.len(), moves.len(), 0];
+                self.preview_totals = [moves.len(), moves.len(), 0, 0];
                 // ORGANIZE relocates within one repo: the old path is removed and
                 // the new path added — same repo on both sides.
                 let header = Self::repo_header(store, &repo);
@@ -1275,20 +1316,36 @@ impl GroomingView {
                 // The file is still at its old path until the move runs, so its
                 // facts come from the removed (source) side.
                 let (db, base) = open_facts(store, &repo);
-                let mut rows: Vec<review::ReviewRow> = moves
+                let (metas, bodies) = moves
                     .into_iter()
                     .take(PREVIEW_CAP)
-                    .map(|(from, to)| review::ReviewRow {
-                        source_facts: facts_for(db.as_deref(), base.as_deref(), &from),
-                        source: review::SideStatus::Removed,
-                        target: review::SideStatus::Added,
-                        source_path: from,
-                        target_path: to,
-                        target_facts: None,
+                    .map(|(from, to)| {
+                        let facts = facts_for(db.as_deref(), base.as_deref(), &from);
+                        let meta = board::RowMeta {
+                            key: dedup_core::diff::source_key(&from),
+                            left_status: board::Status::WillDelete,
+                            right_status: board::Status::OnlyHere,
+                            left_size: facts.as_ref().map(|f| f.size).unwrap_or(0),
+                            left_modified: facts.as_ref().map(|f| f.modified_ms).unwrap_or(0),
+                            right_size: 0,
+                            right_modified: 0,
+                            left_paths: vec![from],
+                            right_paths: vec![to],
+                            unchanged: false,
+                            cmds: vec![board::Cmd::Apply, board::Cmd::Hide],
+                        };
+                        let body = board::RowBody {
+                            left: board::SideBody {
+                                facts,
+                                ..Default::default()
+                            },
+                            right: board::SideBody::default(),
+                        };
+                        (meta, body)
                     })
-                    .collect();
-                review::sort(&mut rows, &self.review_state);
-                self.preview = rows;
+                    .unzip();
+                self.preview = metas;
+                self.preview_bodies = bodies;
                 self.status = Some(format!("{} file(s) would move.", self.preview_total));
                 self.error = None;
             }
@@ -1351,7 +1408,7 @@ impl GroomingView {
         let pool = self.pool.clone();
         let repo = self.repo.clone();
         let rules = self.organize_rules();
-        let rejected: std::collections::HashSet<String> = self.review_state.rejected.clone();
+        let hidden: std::collections::HashSet<String> = self.board_state.hidden.clone();
         let store = Arc::clone(store);
         let tx = self.tx.clone();
         self.cancel = CancellationToken::new();
@@ -1372,10 +1429,8 @@ impl GroomingView {
             let progress = ChannelDiffProgress { tx: tx.clone() };
             let only_set: Option<std::collections::HashSet<String>> =
                 only.map(|k| std::collections::HashSet::from([k]));
-            let run = DiffRun::new(&progress, &cancel).with_selection(
-                (!rejected.is_empty()).then_some(&rejected),
-                only_set.as_ref(),
-            );
+            let run = DiffRun::new(&progress, &cancel)
+                .with_selection((!hidden.is_empty()).then_some(&hidden), only_set.as_ref());
             let result = match command {
                 Command::Dedupe => {
                     let Some(source) = source else { return };
@@ -1629,8 +1684,11 @@ mod ui_tests {
 
         let store_ui = Arc::clone(&store);
         let mut init = false;
+        // Tall enough that a seeded preview has room for several rows: the
+        // board virtualises to the visible band, so a short window legitimately
+        // draws only the first row.
         let mut harness = Harness::builder()
-            .with_size(egui::vec2(1120.0, 620.0))
+            .with_size(egui::vec2(1120.0, 1000.0))
             .build_ui_state(
                 move |ui, view: &mut GroomingView| {
                     if !init {
@@ -1893,198 +1951,154 @@ mod ui_tests {
         );
     }
 
-    /// A seeded PURGE preview renders the review board with a `removed` summary,
-    /// the repo path as the source header, and a click-to-sort FILE header.
+    /// Seed a PURGE-shaped preview: every row is a deletion from one repo.
+    fn seed_purge(v: &mut GroomingView, paths: &[String]) {
+        v.preview_source_header = "/repos/junk".to_string();
+        v.preview_target_header = None;
+        v.preview_total = paths.len();
+        v.preview_totals = [paths.len(), 0, 0, 0];
+        v.preview = paths
+            .iter()
+            .map(|p| board::RowMeta {
+                key: dedup_core::diff::source_key(p),
+                left_status: board::Status::WillDelete,
+                right_status: board::Status::Absent,
+                left_paths: vec![p.clone()],
+                right_paths: Vec::new(),
+                left_size: 0,
+                right_size: 0,
+                left_modified: 0,
+                right_modified: 0,
+                unchanged: false,
+                cmds: vec![board::Cmd::Apply, board::Cmd::Hide],
+            })
+            .collect();
+        v.preview_bodies = vec![board::RowBody::default(); paths.len()];
+    }
+
+    /// A seeded PURGE preview renders the board with a to-delete summary, the
+    /// repo path in the region header, and a sort bar in place of the old
+    /// click-to-sort column headers.
     #[test]
-    fn review_board_shows_removed_and_sorts() {
+    fn purge_preview_shows_the_summary_header_and_sort_bar() {
         let (_tmp, store) = sample_store();
         let mut h = grooming_harness(store, Command::Purge);
-        {
-            let v = h.state_mut();
-            v.preview_source_header = "/repos/junk".to_string();
-            v.preview = vec![
-                review::ReviewRow {
-                    source: review::SideStatus::Removed,
-                    target: review::SideStatus::Absent,
-                    source_path: "a.tmp".to_string(),
-                    target_path: String::new(),
-                    source_facts: None,
-                    target_facts: None,
-                },
-                review::ReviewRow {
-                    source: review::SideStatus::Removed,
-                    target: review::SideStatus::Absent,
-                    source_path: "b.tmp".to_string(),
-                    target_path: String::new(),
-                    source_facts: None,
-                    target_facts: None,
-                },
-            ];
-            v.preview_totals = [0, 2, 0];
-            review::sort(&mut v.preview, &v.review_state);
-        }
+        seed_purge(h.state_mut(), &["a.tmp".to_string(), "b.tmp".to_string()]);
         h.run();
         assert!(
-            h.query_by_label_contains("2 removed").is_some(),
-            "summary shows the removed count"
+            h.query_by_label_contains("2 to delete").is_some(),
+            "summary shows the to-delete count"
         );
         assert!(
             h.query_by_label_contains("/repos/junk").is_some(),
-            "the source column is headed by the repo path"
+            "the left region is headed by the repo path"
         );
-        assert!(h.state().review_state.sort_asc, "starts ascending");
-        h.get_by_label_contains("/repos/junk").click();
+        assert!(h.state().board_state.sort_asc, "starts ascending");
+        // The sort direction is its own control now, not a header click.
+        h.get_by_label("▲").click();
         h.run();
         assert!(
-            !h.state().review_state.sort_asc,
-            "clicking the source header toggles the sort direction"
+            !h.state().board_state.sort_asc,
+            "the direction toggle reverses the sort"
         );
     }
 
-    /// Clicking a row's ✗ rejects it (tracked in state, shown in the summary);
-    /// clicking again restores it.
+    /// PURGE is single-sided, so the board offers no LEFT/RIGHT sort switch —
+    /// there is no right-hand side to sort by.
     #[test]
-    fn review_rows_can_be_rejected_and_restored() {
+    fn a_single_sided_board_offers_no_side_switch() {
         let (_tmp, store) = sample_store();
         let mut h = grooming_harness(store, Command::Purge);
-        {
-            let v = h.state_mut();
-            v.preview_source_header = "/repos/junk".to_string();
-            v.preview = vec![
-                review::ReviewRow {
-                    source: review::SideStatus::Removed,
-                    target: review::SideStatus::Absent,
-                    source_path: "a.tmp".to_string(),
-                    target_path: String::new(),
-                    source_facts: None,
-                    target_facts: None,
-                },
-                review::ReviewRow {
-                    source: review::SideStatus::Removed,
-                    target: review::SideStatus::Absent,
-                    source_path: "b.tmp".to_string(),
-                    target_path: String::new(),
-                    source_facts: None,
-                    target_facts: None,
-                },
-            ];
-            v.preview_totals = [0, 2, 0];
-            review::sort(&mut v.preview, &v.review_state);
-        }
+        seed_purge(h.state_mut(), &["a.tmp".to_string()]);
         h.run();
-        // Each actionable row leads with a ✗ reject toggle; click the first.
-        h.get_all_by_label(icon::X).next().unwrap().click();
+        assert!(
+            h.query_by_label("PATH").is_some(),
+            "the sort keys are offered"
+        );
+        assert!(
+            h.query_by_label("RIGHT").is_none(),
+            "a one-sided board has no right side to sort by"
+        );
+        assert!(
+            h.state().board_state.sort_left,
+            "the sort stays on the left"
+        );
+    }
+
+    /// HIDE drops a row from the board and from what RUN will do. It is
+    /// deliberately one-way: no counter, and no control to bring it back.
+    #[test]
+    fn hide_removes_a_row_from_the_board_and_from_the_run() {
+        let (_tmp, store) = sample_store();
+        let mut h = grooming_harness(store, Command::Purge);
+        seed_purge(h.state_mut(), &["a.tmp".to_string(), "b.tmp".to_string()]);
+        h.run();
+        assert_eq!(h.get_all_by_label("HIDE").count(), 2, "one HIDE per row");
+
+        h.get_all_by_label("HIDE").next().unwrap().click();
+        h.run();
         h.run();
         assert_eq!(
-            h.state().review_state.rejected.len(),
+            h.state().board_state.hidden.len(),
             1,
-            "one row is rejected"
+            "the row is recorded as hidden, which is what RUN skips"
+        );
+        assert_eq!(
+            h.get_all_by_label("HIDE").count(),
+            1,
+            "the hidden row has left the board"
         );
         assert!(
-            h.query_by_label_contains("1 rejected").is_some(),
-            "the summary reports the rejected count"
+            h.query_by_label_contains("hidden").is_none(),
+            "there is deliberately no hidden-row counter"
         );
-        h.get_all_by_label(icon::X).next().unwrap().click();
-        h.run();
         assert!(
-            h.state().review_state.rejected.is_empty(),
-            "clicking the toggle again restores the row"
-        );
-        // The APPLY arrow is present on non-rejected rows (one per row).
-        assert!(
-            h.get_all_by_label(icon::ARROW_RIGHT).next().is_some(),
-            "rows offer an APPLY control"
+            h.query_by_label_contains("UNHIDE").is_none(),
+            "and deliberately no way back"
         );
     }
 
-    /// PURGE acts on a single repo, so the board drops the two target columns,
-    /// spells each status out next to its icon, and gives every row enough
-    /// height that its action buttons are not cut off.
+    /// Every row offers APPLY, and clicking it runs just that row.
     #[test]
-    fn purge_review_board_is_single_sided_with_rows_fitting_their_buttons() {
+    fn a_row_can_be_applied_on_its_own() {
         let (_tmp, store) = sample_store();
         let mut h = grooming_harness(store, Command::Purge);
-        {
-            let v = h.state_mut();
-            v.preview_source_header = "/repos/junk".to_string();
-            v.preview = ["a.tmp", "b.tmp"]
-                .iter()
-                .map(|p| review::ReviewRow {
-                    source: review::SideStatus::Removed,
-                    target: review::SideStatus::Absent,
-                    source_path: (*p).to_string(),
-                    target_path: String::new(),
-                    source_facts: None,
-                    target_facts: None,
-                })
-                .collect();
-            v.preview_totals = [0, 2, 0];
-            review::sort(&mut v.preview, &v.review_state);
-        }
+        seed_purge(h.state_mut(), &["a.tmp".to_string(), "b.tmp".to_string()]);
         h.run();
         assert_eq!(
-            h.get_all_by_label("REMOVED").count(),
+            h.get_all_by_label("APPLY").count(),
             2,
-            "each status cell names the status, not just its icon"
-        );
-        assert_eq!(
-            h.get_all_by_label("STATUS").count(),
-            1,
-            "only the source STATUS column is shown when there is no target repo"
-        );
-
-        // Consecutive rows' reject buttons must not overlap — an overlap is
-        // exactly what clipped the buttons before.
-        let buttons: Vec<egui::Rect> = h
-            .get_all_by_label(icon::X)
-            .map(|n| n.rect())
-            .take(2)
-            .collect();
-        assert_eq!(buttons.len(), 2, "one reject button per row");
-        assert!(
-            buttons[1].top() >= buttons[0].bottom(),
-            "row buttons must fit inside their row: {:?} then {:?}",
-            buttons[0],
-            buttons[1]
+            "each row offers APPLY"
         );
     }
 
-    /// A preview past one page shows the row count plus PREV/PAGE/NEXT
-    /// controls, and NEXT advances the page.
+    /// A preview larger than a screenful is virtualised rather than paged: the
+    /// row count is shown, every row is reachable by scrolling, and the old
+    /// PREV / PAGE / NEXT strip is gone.
     #[test]
-    fn review_preview_pages_past_page_size() {
+    fn a_large_preview_is_virtualised_not_paged() {
         let (_tmp, store) = sample_store();
         let mut h = grooming_harness(store, Command::Purge);
-        {
-            let v = h.state_mut();
-            v.preview_source_header = "/repos/junk".to_string();
-            v.preview = (0..501)
-                .map(|i| review::ReviewRow {
-                    source: review::SideStatus::Removed,
-                    target: review::SideStatus::Absent,
-                    source_path: format!("f{i:04}.tmp"),
-                    target_path: String::new(),
-                    source_facts: None,
-                    target_facts: None,
-                })
-                .collect();
-            v.preview_totals = [0, 501, 0];
-            review::sort(&mut v.preview, &v.review_state);
-        }
+        let paths: Vec<String> = (0..501).map(|i| format!("f{i:04}.tmp")).collect();
+        seed_purge(h.state_mut(), &paths);
         h.run();
         assert!(
             h.query_by_label_contains("501 rows").is_some(),
             "the row count is always shown"
         );
         assert!(
-            h.query_by_label_contains("PAGE 1 / 2").is_some(),
-            "page indicator starts on page 1 of 2"
+            h.query_by_label("NEXT").is_none(),
+            "paging is replaced by scrolling"
         );
-        h.get_by_label("NEXT").click();
-        h.run();
         assert!(
-            h.query_by_label_contains("PAGE 2 / 2").is_some(),
-            "NEXT advances to page 2"
+            h.query_by_label_contains("PAGE 1").is_none(),
+            "no page indicator"
+        );
+        // Virtualised: only the rows near the viewport are built, not all 501.
+        let drawn = h.get_all_by_label("HIDE").count();
+        assert!(
+            drawn > 0 && drawn < 501,
+            "only the visible rows are drawn, got {drawn}"
         );
     }
 
@@ -2120,36 +2134,24 @@ mod ui_tests {
         );
     }
 
-    /// Manual visual check of the review board's reject/apply controls:
-    /// `cargo test -p dedup-gui review_snapshot -- --ignored`.
+    /// Doc screenshot: a one-sided PURGE preview on the unified board, to
+    /// `docs/screenshots/groom_purge_board.png`. Rendered rather than
+    /// label-queried, because a label query cannot see a layout fault.
     #[test]
-    #[ignore = "renders a PNG for manual inspection"]
-    fn render_review_snapshot() {
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_groom_purge_board() {
         let (_tmp, store) = sample_store();
         let mut h = grooming_harness(store, Command::Purge);
         {
-            let v = h.state_mut();
-            v.preview_source_header = "/repos/junk".to_string();
-            v.preview = (0..6)
-                .map(|i| review::ReviewRow {
-                    source: review::SideStatus::Removed,
-                    target: review::SideStatus::Absent,
-                    source_path: format!("cache/file{i}.db"),
-                    target_path: String::new(),
-                    source_facts: None,
-                    target_facts: None,
-                })
-                .collect();
-            v.preview_totals = [0, 6, 0];
-            review::sort(&mut v.preview, &v.review_state);
-            v.review_state
-                .rejected
-                .insert(dedup_core::diff::source_key("cache/file2.db"));
+            let paths: Vec<String> = (0..6).map(|i| format!("cache/file{i}.db")).collect();
+            seed_purge(h.state_mut(), &paths);
         }
         h.run();
+        h.run();
         let img = h.render().expect("wgpu render failed");
-        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/review_snapshot.png");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
+        std::fs::create_dir_all(&dir).expect("screenshot dir");
+        let out = dir.join("groom_purge_board.png");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }

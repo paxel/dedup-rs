@@ -4,6 +4,16 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- The **Grooming** previews now render on the new unified board: a left mini-overview, a centre
+  command column, and (for ORGANIZE) the destination on the right. Commands act where they
+  point — left-hand commands on the left, right-hand on the right, a command and its mirror on
+  the same line — and never truncate. The row's height follows its content. Sorting moved from
+  clickable column headers to an explicit sort bar (side · key · direction), and the per-row
+  `✗` reject toggle became **HIDE**, which drops the row from the board and from what RUN will
+  do. Large previews scroll instead of paging.
+
 ### Added
 
 - Sync-group **mains are badged**: a **★ MAIN** pill on the repository card and a star badge on
