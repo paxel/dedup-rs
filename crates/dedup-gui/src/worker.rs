@@ -16,6 +16,9 @@ use std::time::{Duration, Instant};
 pub enum JobKind {
     /// Full scan: walk, hash new/changed files, write the index.
     Update,
+    /// A scan the user authorised to empty the index, after the confirmation
+    /// that [`JobOutcome::UpdateWouldEmpty`] triggers.
+    UpdateForced,
     /// Dry-run: walk and diff against the index, no hashing or writes.
     Check,
 }
@@ -24,6 +27,9 @@ pub enum JobKind {
 pub enum JobOutcome {
     Update(Result<UpdateStats, String>),
     Check(Result<CheckStats, String>),
+    /// The scan walked empty over an index that still holds `entries`, so it was
+    /// refused and nothing was written. The UI asks whether to scan anyway.
+    UpdateWouldEmpty(u64),
 }
 
 /// A message from a worker thread to the UI.

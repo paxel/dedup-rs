@@ -236,7 +236,7 @@ fn lightbox_shell(
                     close = true;
                 }
                 ui.add_space(8.0);
-                draw_tab_bar(ui, state, a_reps, b_reps.unwrap_or(a_reps));
+                draw_tab_bar(ui, &mut state.active_tab, a_reps, b_reps.unwrap_or(a_reps));
             });
             ui.add_space(6.0);
             body(ui);
@@ -3292,6 +3292,21 @@ impl DupesView {
         // Click on a waveform → play that copy from there. (row_is_b, fraction)
         let mut click_play: Option<(bool, f32)> = None;
 
+        // Mark state for A and B, resolved here rather than inside the closure:
+        // `self.marked` / `self.unlocked` / `self.repo_is_ro` are reads through
+        // `self`, which the drawing closure cannot borrow again.
+        let a_mark_key = key(&group[idx]);
+        let a_markable = !self.repo_is_ro(&group[idx].repo) || self.unlocked.contains(&a_mark_key);
+        let a_marked = self.marked.contains(&a_mark_key);
+        let b_mark = b_idx.map(|bi| {
+            let k = key(&group[bi]);
+            let markable = !self.repo_is_ro(&group[bi].repo) || self.unlocked.contains(&k);
+            let marked = self.marked.contains(&k);
+            (k, marked, markable)
+        });
+        // Collected inside the closure, applied after drawing.
+        let mut toggle_marks: Vec<FileKey> = Vec::new();
+
         egui::Area::new(Id::new("audio-lightbox"))
             .order(egui::Order::Foreground)
             .fixed_pos(egui::Pos2::ZERO)
@@ -3650,10 +3665,26 @@ impl DupesView {
                         ) {
                             open_tags = Some(idx);
                         }
-                        // NOTE: audio DELETE / DELETE A / DELETE B mark pills are
-                        // added in the tabbed-representation-viewer rework (they need
-                        // audio-scope mark bindings + a deferred toggle, unlike the
-                        // image lightbox's `acts`). qa.md: "no mark buttons for mp3s".
+                        // Mark pills, built from the same shared helper the image
+                        // compare header uses, so the labels and the protected
+                        // (disabled + struck-through) state cannot drift apart.
+                        // While comparing there is an independent pill per copy;
+                        // otherwise a single DELETE for the copy on screen.
+                        match &b_mark {
+                            Some((bk, b_marked, b_markable)) if comparing => {
+                                if mark_pill(ui, verbosity, "DELETE A", a_marked, a_markable) {
+                                    toggle_marks.push(a_mark_key.clone());
+                                }
+                                if mark_pill(ui, verbosity, "DELETE B", *b_marked, *b_markable) {
+                                    toggle_marks.push(bk.clone());
+                                }
+                            }
+                            _ => {
+                                if mark_pill(ui, verbosity, "DELETE", a_marked, a_markable) {
+                                    toggle_marks.push(a_mark_key.clone());
+                                }
+                            }
+                        }
                         if count >= 2 {
                             let (cl, cshort, cverbose) = if comparing {
                                 (
@@ -3863,10 +3894,18 @@ impl DupesView {
             idx = new_idx;
             state.index = idx;
             self.tag_edit = None; // tags belong to the copy we just left
-            let playing = snap.loaded && snap.playing;
-            if playing {
+            // Follow the navigation with whatever transport state we were in: a
+            // playing player plays the new copy, a paused one loads it and stays
+            // paused. Loading either way matters — leaving the previous file
+            // loaded would show one copy and resume another.
+            if snap.loaded {
                 let (h, p, t) = params(&group[idx]);
-                self.player.play(&h, &p, t, cur_ms.min(t));
+                let at = cur_ms.min(t);
+                if snap.playing {
+                    self.player.play(&h, &p, t, at);
+                } else {
+                    self.player.load_paused(&h, &p, t, at);
+                }
             }
             state.audio_active = Some(idx);
         }
@@ -3953,6 +3992,12 @@ impl DupesView {
                 && c.flicker
             {
                 c.show_b = want_b;
+            }
+        }
+
+        for k in toggle_marks {
+            if !self.marked.remove(&k) {
+                self.marked.insert(k);
             }
         }
 
@@ -5535,6 +5580,74 @@ mod ui_tests {
     /// Clicking an audio card opens the dedicated audio lightbox (not the image
     /// viewer); `P` plays, `S` toggles the spectrogram, `C` compares, `space`
     /// drives flicker (enter then swap), and `Esc` steps back one level at a time.
+    /// Stepping to another copy while paused must swap which file is loaded and
+    /// stay paused. Before this, a paused nav left the *previous* file loaded, so
+    /// the lightbox showed one copy while play would resume another.
+    #[test]
+    fn stepping_while_paused_loads_the_new_copy_without_resuming() {
+        let group: DupeGroup = (0..3).map(audio_file).collect();
+        let a_hex = hash_hex(&group[0].entry.hash);
+        let b_hex = hash_hex(&group[1].entry.hash);
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Audio;
+        harness.state_mut().lightbox = Some(lb);
+        harness.run();
+
+        // Establish the state the reporter described: a copy loaded and
+        // deliberately paused. Driving this through the player API rather than a
+        // key press keeps it deterministic — the audio thread corrects `playing`
+        // from the real sink, which a headless run does not have.
+        let path = std::path::PathBuf::from("/nonexistent-dedup-test/track0.mp3");
+        harness.state().player.load_paused(&a_hex, &path, 5_000, 0);
+        harness.step();
+        harness.step();
+        let snap = harness.state().player.snapshot();
+        assert!(
+            snap.loaded && !snap.playing,
+            "set up: copy A loaded and paused"
+        );
+        assert_eq!(snap.hex.as_deref(), Some(a_hex.as_str()));
+
+        // Step to the next copy while paused.
+        harness.key_press(egui::Key::ArrowRight);
+        harness.step();
+        harness.step();
+
+        let snap = harness.state().player.snapshot();
+        assert!(
+            !snap.playing,
+            "a deliberate pause survives the step - it must not resume on its own"
+        );
+        assert_eq!(
+            snap.hex.as_deref(),
+            Some(b_hex.as_str()),
+            "the newly shown copy is the one now loaded, so play resumes the right file"
+        );
+    }
+
     #[test]
     fn audio_lightbox_opens_compares_plays_and_escapes() {
         let group: DupeGroup = (0..2).map(audio_file).collect();
@@ -5973,6 +6086,332 @@ mod ui_tests {
     /// separate code path (`draw_lightbox_overview`'s `enter_compare` sets
     /// `state.compare` directly, bypassing `audio_lightbox`'s own `toggle_compare`
     /// branch) and the gapless-flip fix landed while testing only the `C` path.
+    /// A four-copy audio group: stepping the Overview cycler must walk B through
+    /// each of the three *others* in turn. The report was that tags repeated
+    /// every second click, as if four members mapped onto two files.
+    #[test]
+    fn a_four_copy_audio_group_cycles_b_through_three_distinct_others() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |i: u8| -> DupeFile {
+            let name = format!("track{i}.mp3");
+            let path = tmp.path().join(&name);
+            crate::id3tags::write_bare_mp3(&path);
+            crate::id3tags::write(
+                &path,
+                &Tags {
+                    title: format!("Title{i}"),
+                    artist: format!("Artist{i}"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut hash = [0u8; 32];
+            hash[0] = 0xB0 | i;
+            DupeFile {
+                repo: "r".into(),
+                repo_root: tmp.path().to_string_lossy().into_owned(),
+                rel_path: name,
+                entry: dedup_core::store::FileEntry {
+                    size: 417,
+                    hash,
+                    modified_ms: 0,
+                    missing: false,
+                    mime: Some("audio/mpeg".into()),
+                    img_fingerprint: None,
+                    video_hash: None,
+                    pdf_hash: None,
+                    audio: Some(dedup_core::store::AudioFp {
+                        duration_ms: 1000,
+                        chunk_hashes: Vec::new(),
+                    }),
+                    img_size: None,
+                    origin: None,
+                    exif: None,
+                },
+            }
+        };
+        let group: DupeGroup = (0..4u8).map(mk).collect();
+
+        // The index mapping the cycler is built on: with A fixed, there are
+        // exactly three others and none of them is A.
+        for left in 0..4usize {
+            let others = crate::lightbox::other_member_indices(4, left);
+            assert_eq!(others.len(), 3, "a 4-copy group has 3 others of A={left}");
+            assert!(!others.contains(&left), "A is never its own B");
+            let mut seen = others.clone();
+            seen.sort();
+            seen.dedup();
+            assert_eq!(
+                seen.len(),
+                3,
+                "the three others are distinct, not a 1..2 cycle"
+            );
+        }
+
+        // ...and the label never reports the group size where the count of
+        // others belongs: a 4-copy group must never read "/ 4".
+        for sel in 0..3usize {
+            let label = crate::lightbox::format_other_switcher_label(sel, 3);
+            assert_eq!(label, format!("<{} / 3>", sel + 1));
+            assert!(
+                !label.contains("/ 4"),
+                "must never show the member count as the others count: {label}"
+            );
+        }
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 760.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Audio;
+        harness.state_mut().lightbox = Some(lb);
+        harness.run();
+        // The cycler belongs to Overview *while comparing*: C enters compare
+        // (B defaults to index 1), I switches to the Overview tab.
+        harness.key_press(egui::Key::C);
+        harness.run();
+        harness.key_press(egui::Key::I);
+        harness.run();
+
+        // Overview offers the cycler for a group of more than two, counting the
+        // three *others* — never the four members.
+        assert!(
+            harness.query_all_by_label("<1 / 3>").count() > 0,
+            "the switcher counts the three others, not the four members"
+        );
+
+        // Walk it: each step must land on a new label and wrap after the third,
+        // rather than repeating every second click as reported.
+        for expected in ["<2 / 3>", "<3 / 3>", "<1 / 3>"] {
+            harness.get_by_label_contains("NEXT OTHER").click();
+            harness.run();
+            assert!(
+                harness.query_all_by_label(expected).count() > 0,
+                "cycling B should reach {expected}"
+            );
+            assert!(
+                harness.query_all_by_label("<1 / 4>").count() == 0
+                    && harness.query_all_by_label("<4 / 4>").count() == 0,
+                "the member count must never appear in the others slot"
+            );
+        }
+    }
+
+    /// Each copy's own ID3 tags must be the ones shown for it. The report was
+    /// that copies 1 and 3 showed identical tags after editing only one.
+    #[test]
+    fn each_audio_copy_shows_its_own_tags_not_every_second_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |i: u8| -> DupeFile {
+            let name = format!("copy{i}.mp3");
+            let path = tmp.path().join(&name);
+            crate::id3tags::write_bare_mp3(&path);
+            crate::id3tags::write(
+                &path,
+                &Tags {
+                    title: format!("Title{i}"),
+                    artist: format!("Artist{i}"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut hash = [0u8; 32];
+            hash[0] = 0xC0 | i;
+            DupeFile {
+                repo: "r".into(),
+                repo_root: tmp.path().to_string_lossy().into_owned(),
+                rel_path: name,
+                entry: dedup_core::store::FileEntry {
+                    size: 417,
+                    hash,
+                    modified_ms: 0,
+                    missing: false,
+                    mime: Some("audio/mpeg".into()),
+                    img_fingerprint: None,
+                    video_hash: None,
+                    pdf_hash: None,
+                    audio: Some(dedup_core::store::AudioFp {
+                        duration_ms: 1000,
+                        chunk_hashes: Vec::new(),
+                    }),
+                    img_size: None,
+                    origin: None,
+                    exif: None,
+                },
+            }
+        };
+        let group: Vec<DupeFile> = (0..4u8).map(mk).collect();
+
+        // Read back what each copy holds on disk, through the same reader the
+        // lightbox uses. Copy 1 and copy 3 must differ — the exact symptom.
+        let tags: Vec<Tags> = group
+            .iter()
+            .map(|f| crate::id3tags::read(&f.absolute_path()).unwrap_or_default())
+            .collect();
+        for (i, t) in tags.iter().enumerate() {
+            assert_eq!(t.title, format!("Title{i}"), "copy {i} keeps its own title");
+            assert_eq!(
+                t.artist,
+                format!("Artist{i}"),
+                "copy {i} keeps its own artist"
+            );
+        }
+        assert_ne!(
+            tags[1].title, tags[3].title,
+            "copies 1 and 3 must not collapse onto the same tags"
+        );
+    }
+
+    /// The native audio compare header carries its own DELETE A / DELETE B pills,
+    /// so marking does not depend on which media type is being compared (the
+    /// image compare header already had them). qa.md: "no mark buttons for mp3s".
+    #[test]
+    fn audio_compare_header_marks_each_copy_independently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let group: DupeGroup = (0..2).map(audio_file).collect();
+        let a_key = key(&group[0]);
+        let b_key = key(&group[1]);
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Audio;
+        harness.state_mut().lightbox = Some(lb);
+        harness.run();
+
+        // Not comparing: one DELETE for the copy on screen.
+        assert!(
+            harness.query_all_by_label_contains("DELETE").count() > 0,
+            "a single copy offers one DELETE pill"
+        );
+
+        harness.key_press(egui::Key::C);
+        harness.run();
+        harness.run();
+
+        // Comparing: an independent pill per copy.
+        assert!(
+            harness.query_all_by_label_contains("DELETE A").count() > 0,
+            "compare offers DELETE A"
+        );
+        assert!(
+            harness.query_all_by_label_contains("DELETE B").count() > 0,
+            "compare offers DELETE B"
+        );
+
+        // Toggling one pill must move that copy's mark only. Assert the
+        // *transition*, not absolute membership: the Duplicates view auto-marks
+        // the copies it did not pick as best, so B already carries a mark here.
+        let a0 = harness.state().marked.contains(&a_key);
+        let b0 = harness.state().marked.contains(&b_key);
+
+        harness.get_by_label_contains("DELETE A").click();
+        harness.run();
+        assert_eq!(
+            harness.state().marked.contains(&a_key),
+            !a0,
+            "DELETE A toggles A's mark"
+        );
+        assert_eq!(
+            harness.state().marked.contains(&b_key),
+            b0,
+            "DELETE A must leave B's mark exactly as it was"
+        );
+
+        harness.get_by_label_contains("DELETE B").click();
+        harness.run();
+        assert_eq!(
+            harness.state().marked.contains(&b_key),
+            !b0,
+            "DELETE B toggles B's mark"
+        );
+        assert_eq!(
+            harness.state().marked.contains(&a_key),
+            !a0,
+            "and leaves A's mark as the previous click set it"
+        );
+    }
+
+    /// The added pills must not push the header's controls out of the window.
+    /// A label query passes even when a widget is clipped, so assert rectangles.
+    #[test]
+    fn audio_compare_header_controls_stay_inside_a_narrow_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let group: DupeGroup = (0..2).map(audio_file).collect();
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut init = false;
+
+        let width = 900.0;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(width, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    let _ = &tmp;
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        let mut lb = LightboxState::new(0, 0);
+        lb.active_tab = RepresentationKind::Audio;
+        harness.state_mut().lightbox = Some(lb);
+        harness.run();
+        harness.key_press(egui::Key::C);
+        harness.run();
+        harness.run();
+
+        for label in ["DELETE A", "DELETE B", "SPECTROGRAM"] {
+            let rect = harness.get_by_label_contains(label).rect();
+            assert!(
+                rect.max.x <= width,
+                "'{label}' escapes the {width}px window: {rect:?}"
+            );
+            assert!(rect.min.x >= 0.0, "'{label}' starts off-screen: {rect:?}");
+        }
+    }
+
     /// Confirms the paired stream still loads and `→` still flips gap-free.
     #[test]
     fn overview_compare_button_enters_audio_compare_with_gapless_flip() {

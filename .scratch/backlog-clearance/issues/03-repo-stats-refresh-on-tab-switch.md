@@ -1,6 +1,6 @@
 # 03 — Refresh repository statistics when the Repositories tab is shown
 
-Status: ready-for-agent
+Status: resolved
 Spec: ../spec.md
 
 ## Problem
@@ -40,3 +40,32 @@ tests:
 ## Done
 
 Standing gate green. `CHANGELOG.md` and `ai/improvements.md` updated.
+
+## Comments
+
+**Implemented 2026-07-31.** Gate green: fmt clean, clippy clean, `cargo test --workspace`
+24 suites / 0 failures.
+
+The transition hook already existed — `ui()` had a `synced_tab != Some(tab)` block that
+re-syncs the newly-shown view, with `Tab::Repositories => {}` explicitly opted out ("manages
+its own cards"). That opt-out was the bug. Extracted the block into
+`DedupApp::sync_shown_tab` and filled in the Repositories arm.
+
+**Deviation from this ticket's suggested approach, deliberate.** The ticket said to route the
+refresh through the worker channel rather than reading synchronously. I called `reload_all()`
+directly instead, because it is already the app's convention: ~10 existing call sites invoke
+it synchronously after add/scan/delete completions, and its own doc comment states the rule
+("safe only when no update is running; callers gate on that"). Introducing an async path for
+this one caller would add a second mechanism for the same job, against the repo's
+"don't build downgraded per-tab variants" principle. It is gated on
+`worker.active_count() == 0` like every other site; a skipped busy frame is harmless because
+the running job's completion handler reloads.
+
+Extracting the method was needed for testability: `App::ui` takes `&mut eframe::Frame`, which
+a headless kittest harness cannot readily supply, whereas `sync_shown_tab` is the actual unit
+of behaviour and asserts an observable outcome (the rows match the store).
+
+Two tests: `switching_to_the_repositories_tab_refreshes_its_stats` removes an entry behind the
+app's back and asserts the count drops from 5 to 4 after leaving and returning (it would fail
+against the old empty match arm), and `staying_on_the_repositories_tab_does_not_re_read_each_frame`
+pins that the re-read is per transition, not per frame.

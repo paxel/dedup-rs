@@ -12,27 +12,25 @@
 //!   leaves every decision to the user: each row offers copy / delete / rename /
 //!   overwrite per side, applied one click at a time (see `diff_board.rs`).
 
+use crate::compare_view::{DiffCompare, DiffPick, DiffSide};
 use crate::filter_ui::FilterBuilder;
 use crate::icon;
-use crate::lightbox::{ComparePointer, CompareState, compare_split, draw_compare, draw_in_pane};
 use crate::media_cell::{FileFacts, facts_for, open_facts};
 use crate::settings::TooltipVerbosity;
 use crate::theme;
 use crate::thumbs::ThumbCache;
-use crate::util::{ExplainExt, format_mtime, format_size};
+use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::diff::{
-    CopyDest, DiffAction, DiffEvent, DiffItem, DiffPairing, DiffProgress, DiffRun, FolderMode,
-    RepoDiffRow, SyncDelete, copy_file_between, delete_file, diff_copy, diff_print, diff_sync,
-    export_to_folder, overwrite_file, plan_folder_export, plan_repo_diff, plan_sync, rename_file,
+    CopyDest, DiffAction, DiffEvent, DiffItem, DiffPairing, DiffProgress, DiffRelation, DiffRun,
+    FolderMode, RepoDiffRow, SyncDelete, copy_file_between, delete_file, diff_copy, diff_print,
+    diff_sync, export_to_folder, overwrite_file, plan_folder_export, plan_repo_diff, plan_sync,
+    rename_file,
 };
 use dedup_core::store::{Store, SyncGroup, SyncMode};
 use dedup_core::sync_group::{delete_mode, guard_mirror_source};
 use dedup_core::update::CancellationToken;
-use egui::{
-    Align, Align2, Color32, ColorImage, Context, FontId, Id, Layout, Rect, RichText, TextureHandle,
-    TextureOptions, UiBuilder, Vec2,
-};
+use egui::{Id, RichText};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,7 +44,6 @@ const RUN_LOG_LIMIT: usize = 10;
 /// Longest texture edge uploaded to the GPU for a DIFF preview, matching the
 /// lightbox's limit; larger images are downscaled by the decoder to stay within
 /// driver limits.
-const MAX_TEXTURE_EDGE: u32 = 8192;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Command {
@@ -298,6 +295,48 @@ fn planned_cmds() -> Vec<board::Cmd> {
 /// DIFF's rows as the board's cheap model. What a row offers depends on what
 /// its two sides say about each other; a side holding the same content under
 /// several names is narrowed down first, so only 1:1 rows offer RENAME.
+/// A batch operation over every DIFF row currently listed. Offered only when
+/// the listed rows actually contain the relation it acts on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BulkOp {
+    /// Copy everything only the left side has into the right repo.
+    CopyMissingRight,
+    /// Copy everything only the right side has into the left repo.
+    CopyMissingLeft,
+    /// Rename each left file to the name the right side uses.
+    RenameAllLeft,
+    /// Rename each right file to the name the left side uses.
+    RenameAllRight,
+}
+
+impl BulkOp {
+    fn label(self) -> &'static str {
+        match self {
+            BulkOp::CopyMissingRight => "COPY MISSING >",
+            BulkOp::CopyMissingLeft => "< COPY MISSING",
+            BulkOp::RenameAllLeft => "RENAME ALL L",
+            BulkOp::RenameAllRight => "RENAME ALL R",
+        }
+    }
+
+    fn describe(self, n: usize) -> String {
+        match self {
+            BulkOp::CopyMissingRight => {
+                format!("Copy {n} file(s) the right side does not have into it?")
+            }
+            BulkOp::CopyMissingLeft => {
+                format!("Copy {n} file(s) the left side does not have into it?")
+            }
+            BulkOp::RenameAllLeft => {
+                format!("Rename {n} file(s) on the left to the right side's names?")
+            }
+            BulkOp::RenameAllRight => {
+                format!("Rename {n} file(s) on the right to the left side's names?")
+            }
+        }
+    }
+}
+
 fn diff_metas(rows: &[RepoDiffRow]) -> Vec<board::RowMeta> {
     use board::{Cmd, Status};
     use dedup_core::diff::DiffRelation as R;
@@ -1019,6 +1058,9 @@ pub struct TransferView {
     board_state: crate::diff_board::BoardState,
     /// The open side-by-side comparison of one conflicting row, if any.
     inspect: Option<DiffCompare>,
+    /// A bulk action awaiting confirmation: what it is, and every file operation
+    /// it would perform.
+    bulk_confirm: Option<(BulkOp, Vec<crate::diff_board::BoardAction>)>,
     /// Full counts `[to-delete, only-here, differing, unchanged]` for the board
     /// summary; independent of the capped `preview` sample.
     preview_totals: [usize; 4],
@@ -1122,6 +1164,7 @@ impl TransferView {
             diff_rows: Vec::new(),
             board_state: crate::diff_board::BoardState::default(),
             inspect: None,
+            bulk_confirm: None,
             preview_totals: [0; 4],
             preview_source_header: String::new(),
             preview_target_header: String::new(),
@@ -1305,6 +1348,10 @@ impl TransferView {
         }
         // The comparison sits above everything, and its buttons feed the same
         // row actions the board offers.
+        if self.bulk_confirm.is_some() {
+            let store = Arc::clone(store);
+            self.bulk_confirm_modal(&ui.ctx().clone(), &store);
+        }
         if let Some(inspect) = self.inspect.as_mut()
             && let Some(pick) = inspect.view(&ui.ctx().clone(), verbosity)
         {
@@ -2160,6 +2207,90 @@ impl TransferView {
         });
     }
 
+    /// The rows a bulk action would touch: those currently *listed* on the
+    /// board — after the show-unchanged toggle and excluding hidden rows.
+    /// Hiding a row is how the user excludes it from a bulk action.
+    fn listed_diff_rows(&self, metas: &[board::RowMeta]) -> Vec<usize> {
+        metas
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                !self.preview_board.hidden.contains(&m.key)
+                    && (self.preview_board.show_unchanged || !m.unchanged)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The bulk operations worth offering for the rows on screen. A mode that
+    /// cannot produce a relation never offers its bulk action — BY HASH yields
+    /// no `Conflict`, BY PATH no `Renamed`.
+    fn offered_bulk_ops(&self, listed: &[usize]) -> Vec<BulkOp> {
+        let mut ops = Vec::new();
+        let has = |want: DiffRelation| listed.iter().any(|&i| self.diff_rows[i].relation == want);
+        if has(DiffRelation::OnlyLeft) {
+            ops.push(BulkOp::CopyMissingRight);
+        }
+        if has(DiffRelation::OnlyRight) {
+            ops.push(BulkOp::CopyMissingLeft);
+        }
+        if has(DiffRelation::Renamed) {
+            ops.push(BulkOp::RenameAllLeft);
+            ops.push(BulkOp::RenameAllRight);
+        }
+        ops
+    }
+
+    /// Every concrete file operation `op` would perform over `listed`.
+    fn bulk_plan(&self, op: BulkOp, listed: &[usize]) -> Vec<crate::diff_board::BoardAction> {
+        use crate::diff_board::BoardAction;
+        let mut plan = Vec::new();
+        for &i in listed {
+            let row = &self.diff_rows[i];
+            match (op, row.relation) {
+                (BulkOp::CopyMissingRight, DiffRelation::OnlyLeft) => {
+                    for f in &row.left {
+                        plan.push(BoardAction::Copy {
+                            from_left: true,
+                            rel_path: f.rel_path.clone(),
+                        });
+                    }
+                }
+                (BulkOp::CopyMissingLeft, DiffRelation::OnlyRight) => {
+                    for f in &row.right {
+                        plan.push(BoardAction::Copy {
+                            from_left: false,
+                            rel_path: f.rel_path.clone(),
+                        });
+                    }
+                }
+                // Rename this side's file to the name the other side uses. Only
+                // a 1:1 pair is unambiguous; a side holding several names needs
+                // the per-row picker, so it is left out of the batch.
+                (BulkOp::RenameAllLeft, DiffRelation::Renamed) => {
+                    if let ([from], [to]) = (row.left.as_slice(), row.right.as_slice()) {
+                        plan.push(BoardAction::Rename {
+                            on_left: true,
+                            from: from.rel_path.clone(),
+                            to: to.rel_path.clone(),
+                        });
+                    }
+                }
+                (BulkOp::RenameAllRight, DiffRelation::Renamed) => {
+                    if let ([to], [from]) = (row.left.as_slice(), row.right.as_slice()) {
+                        plan.push(BoardAction::Rename {
+                            on_left: false,
+                            from: from.rel_path.clone(),
+                            to: to.rel_path.clone(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        plan
+    }
+
     fn preview_panel(&mut self, ui: &mut egui::Ui, store: &Store, acts: &mut Vec<Act>) {
         if self.command.is_diff() {
             if self.diff_rows.is_empty() {
@@ -2184,6 +2315,49 @@ impl TransferView {
                 .as_deref()
                 .map(|r| open_facts(store, r))
                 .unwrap_or((None, None));
+            // Bulk actions over everything currently listed. Offered above the
+            // board, so it reads as acting on the whole list rather than a row.
+            let listed = self.listed_diff_rows(&metas);
+            let offered = self.offered_bulk_ops(&listed);
+            if !offered.is_empty() {
+                let mut want: Option<BulkOp> = None;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("ALL LISTED")
+                            .color(theme::LILAC)
+                            .size(11.0),
+                    );
+                    for op in &offered {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(op.label()).color(theme::BLACK),
+                                )
+                                .fill(theme::AMBER),
+                            )
+                            .explain(
+                                self.verbosity,
+                                "Apply to every listed row",
+                                "Run this action on every row currently on the board. Rows \
+                                 you have hidden are left alone.",
+                            )
+                            .clicked()
+                        {
+                            want = Some(*op);
+                        }
+                    }
+                });
+                if let Some(op) = want {
+                    let plan = self.bulk_plan(op, &listed);
+                    if plan.is_empty() {
+                        self.status = Some("Nothing listed for that action.".to_string());
+                    } else {
+                        self.bulk_confirm = Some((op, plan));
+                    }
+                }
+                ui.add_space(4.0);
+            }
+
             let rows = &self.diff_rows;
             let action = board::board(
                 ui,
@@ -2991,6 +3165,133 @@ impl TransferView {
 
     /// Execute one DIFF board row action on a worker thread (a single file can
     /// still be large), then re-plan the diff so the row reflects the result.
+    /// Confirm a bulk action before it runs. It is destructive and touches many
+    /// files at once, so the exact count is stated and declining does nothing.
+    fn bulk_confirm_modal(&mut self, ctx: &egui::Context, store: &Arc<Store>) {
+        let Some((op, plan)) = self.bulk_confirm.clone() else {
+            return;
+        };
+        let mut decision: Option<bool> = None;
+        let response = egui::Modal::new(egui::Id::new("diff-bulk-confirm")).show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.label(
+                egui::RichText::new("APPLY TO EVERY LISTED ROW")
+                    .color(theme::AMBER)
+                    .size(16.0)
+                    .strong(),
+            );
+            ui.add_space(8.0);
+            ui.colored_label(theme::TEXT, op.describe(plan.len()));
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Rows you have hidden are not touched.")
+                    .color(theme::TAN)
+                    .size(11.0),
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(egui::RichText::new("APPLY").color(theme::BLACK))
+                            .fill(theme::RED),
+                    )
+                    .clicked()
+                {
+                    decision = Some(true);
+                }
+                if ui
+                    .add(
+                        egui::Button::new(egui::RichText::new("CANCEL").color(theme::TEXT))
+                            .fill(theme::PANEL),
+                    )
+                    .clicked()
+                {
+                    decision = Some(false);
+                }
+            });
+        });
+        if let Some(go) = decision {
+            self.bulk_confirm = None;
+            if go {
+                self.start_bulk(store, plan);
+            }
+        } else if response.should_close() {
+            self.bulk_confirm = None;
+        }
+    }
+
+    /// Run a whole bulk plan on a worker thread, then re-plan the diff.
+    ///
+    /// Every operation is attempted — one failure does not abandon the rest —
+    /// and the summary reports both counts, so a partial failure is visible
+    /// rather than silently swallowed.
+    fn start_bulk(&mut self, store: &Arc<Store>, plan: Vec<crate::diff_board::BoardAction>) {
+        use crate::diff_board::BoardAction;
+        let (Some(source), Some(target)) = (self.source.clone(), self.target.clone()) else {
+            return;
+        };
+        let store = Arc::clone(store);
+        let tx = self.tx.clone();
+        let cancel = self.cancel.clone();
+        self.running = true;
+        self.pending_refresh = true;
+        self.reset_run();
+        self.status = Some(format!("applying {} operation(s)…", plan.len()));
+
+        std::thread::spawn(move || {
+            let side = |on_left: bool| {
+                if on_left {
+                    (source.clone(), target.clone())
+                } else {
+                    (target.clone(), source.clone())
+                }
+            };
+            let (mut done, mut failed) = (0usize, 0usize);
+            let mut cancelled = false;
+            for action in plan {
+                if cancel.is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
+                let outcome = match action {
+                    BoardAction::Copy {
+                        from_left,
+                        rel_path,
+                    } => {
+                        let (from, to) = side(from_left);
+                        copy_file_between(&store, &from, &rel_path, &to, &rel_path)
+                    }
+                    BoardAction::Rename { on_left, from, to } => {
+                        let (repo, _) = side(on_left);
+                        rename_file(&store, &repo, &from, &to)
+                    }
+                    BoardAction::Delete { on_left, rel_path } => {
+                        let (repo, _) = side(on_left);
+                        delete_file(&store, &repo, &rel_path)
+                    }
+                    // Not produced by `bulk_plan`.
+                    _ => Ok(()),
+                };
+                match outcome {
+                    Ok(()) => done += 1,
+                    Err(e) => {
+                        log::warn!("bulk action failed: {e}");
+                        failed += 1;
+                    }
+                }
+            }
+            let mut message = format!("Applied {done} operation(s)");
+            if failed > 0 {
+                message.push_str(&format!(", {failed} failed"));
+            }
+            if cancelled {
+                message.push_str(" (cancelled)");
+            }
+            message.push('.');
+            let _ = tx.send(Msg::Done(OpResult::Applied { message }));
+        });
+    }
+
     fn start_board_action(&mut self, store: &Arc<Store>, action: crate::diff_board::BoardAction) {
         use crate::diff_board::BoardAction;
         let (Some(source), Some(target)) = (self.source.clone(), self.target.clone()) else {
@@ -3361,461 +3662,6 @@ impl TransferView {
     }
 }
 
-/// One side of a DIFF comparison: its action identity (`repo` + `rel_path`, which
-/// the resulting [`crate::diff_board::BoardAction`] needs) alongside the
-/// viewer-agnostic [`FileFacts`] used to preview and describe it.
-struct DiffSide {
-    repo: String,
-    rel_path: String,
-    facts: FileFacts,
-}
-
-impl DiffSide {
-    /// Whether this side can produce a visual to compare (image or video still).
-    /// Text / binary / audio cannot, so compare disables itself for the pair.
-    fn previewable(&self) -> bool {
-        self.facts.is_image() || self.facts.is_video()
-    }
-
-    /// What to say when there is no picture to show.
-    fn placeholder(&self) -> String {
-        match self.facts.mime.as_deref() {
-            Some(mime) => format!("no preview for {mime}"),
-            None => "no preview for this file type".to_string(),
-        }
-    }
-}
-
-/// The user's decision in the DIFF comparison, mapped by the caller onto the same
-/// `BoardAction`s the diff board row offers.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum DiffPick {
-    /// Delete this side's file.
-    Delete { on_left: bool },
-    /// Replace the other side's file with this side's content.
-    Overwrite { from_left: bool },
-    /// Leave both alone.
-    Close,
-}
-
-/// A decoded preview arriving from a worker thread.
-struct DiffLoaded {
-    left: bool,
-    image: Option<ColorImage>,
-}
-
-/// What one side's preview pane should draw this frame.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SlotState {
-    /// The decoded image (or video still) is ready.
-    Image,
-    /// The decode is still in flight.
-    Decoding,
-    /// Settled with nothing to show — a non-previewable type, or a decode that
-    /// came back empty (e.g. video with no ffmpeg).
-    NoPreview,
-}
-
-/// The open side-by-side comparison of one BY PATH conflict — two versions of the
-/// same path in two repos — rendered through the shared lightbox viewer
-/// ([`draw_compare`]): the same zoom / pan / flicker the Duplicate lightbox has,
-/// with DIFF's own per-side actions. Previews decode off the UI thread (a large
-/// photo must never freeze the window) and handle both images and video stills;
-/// a side that can produce no visual keeps a "no preview" note and disables
-/// compare (roadmap: "if a side has no visual, compare disables itself").
-struct DiffCompare {
-    left: DiffSide,
-    right: DiffSide,
-    /// Shared A/B view transform (zoom / pan / flicker). Its `b` carries the right
-    /// side's facts, though [`draw_compare`] reads only the transform.
-    compare: CompareState,
-    tex: [Option<TextureHandle>; 2],
-    /// Whether that side's decode has come back (successfully or not).
-    settled: [bool; 2],
-    tx: Sender<DiffLoaded>,
-    rx: Receiver<DiffLoaded>,
-    started: bool,
-}
-
-impl DiffCompare {
-    fn new(left: DiffSide, right: DiffSide) -> Self {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let compare = CompareState::new(right.facts.clone());
-        Self {
-            left,
-            right,
-            compare,
-            tex: [None, None],
-            settled: [false, false],
-            tx,
-            rx,
-            started: false,
-        }
-    }
-
-    /// What one side's pane should draw right now: its decoded image, an
-    /// in-flight "decoding…" note, or a settled "no preview" note. A side is
-    /// `NoPreview` both when it can never have a visual (a document) and when its
-    /// decode came back empty (e.g. a video with no ffmpeg) — settled with no
-    /// texture. This is what keeps a failed decode from spinning "decoding…"
-    /// forever (the distinction the old two-pane `settled[]` flags carried).
-    fn slot_state(&self, slot: usize) -> SlotState {
-        if self.tex[slot].is_some() {
-            SlotState::Image
-        } else if self.settled[slot] {
-            SlotState::NoPreview
-        } else {
-            SlotState::Decoding
-        }
-    }
-
-    /// A/B compare (zoom / pan / flicker) is available only once *both* sides
-    /// have actually produced a texture — before then, or if either failed,
-    /// there is nothing to compare, so the panes stay static.
-    fn compare_ready(&self) -> bool {
-        matches!(
-            (self.slot_state(0), self.slot_state(1)),
-            (SlotState::Image, SlotState::Image)
-        )
-    }
-
-    /// Kick off both decodes once, off the UI thread. A non-previewable side is
-    /// settled immediately with no decode.
-    fn start(&mut self, ctx: &Context) {
-        if self.started {
-            return;
-        }
-        self.started = true;
-        for (is_left, side) in [(true, &self.left), (false, &self.right)] {
-            let slot = usize::from(!is_left);
-            if !side.previewable() {
-                self.settled[slot] = true;
-                continue;
-            }
-            let tx = self.tx.clone();
-            let ctx = ctx.clone();
-            let path = side.facts.abs_path.clone();
-            let hex = side.facts.hash_hex.clone();
-            let video = side.facts.is_video();
-            std::thread::spawn(move || {
-                let decoded = if video {
-                    // One still is enough to tell two clips apart at a glance.
-                    dedup_core::thumbnail::video_frame_rgba(&path, &hex, 0, 1).ok()
-                } else {
-                    dedup_core::thumbnail::load_full_rgba(&path, MAX_TEXTURE_EDGE).ok()
-                };
-                let image = decoded.map(|(w, h, rgba)| {
-                    ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba)
-                });
-                let _ = tx.send(DiffLoaded {
-                    left: is_left,
-                    image,
-                });
-                ctx.request_repaint();
-            });
-        }
-    }
-
-    /// Upload any freshly decoded previews.
-    fn poll(&mut self, ctx: &Context) {
-        while let Ok(loaded) = self.rx.try_recv() {
-            let slot = usize::from(!loaded.left);
-            self.settled[slot] = true;
-            if let Some(image) = loaded.image {
-                let name = if loaded.left {
-                    "diff-compare-left"
-                } else {
-                    "diff-compare-right"
-                };
-                self.tex[slot] = Some(ctx.load_texture(name, image, TextureOptions::LINEAR));
-            }
-        }
-    }
-
-    /// `(texture, pixel-size)` for one side, in the shape [`draw_compare`] wants.
-    /// The size comes from the indexed image dimensions, else the decoded texture
-    /// (video stills carry no stored dimensions), else a 1×1 fallback while pending.
-    fn sized(&self, slot: usize) -> (Option<TextureHandle>, Vec2) {
-        let tex = self.tex[slot].clone();
-        let facts = if slot == 0 {
-            &self.left.facts
-        } else {
-            &self.right.facts
-        };
-        let img = facts
-            .img_size
-            .map(|(w, h)| egui::vec2(w as f32, h as f32))
-            .or_else(|| tex.as_ref().map(|t| t.size_vec2()))
-            .unwrap_or(egui::vec2(1.0, 1.0));
-        (tex, img)
-    }
-
-    /// Draw the comparison over the whole window. Returns the user's decision, or
-    /// `None` while they are still looking.
-    fn view(&mut self, ctx: &Context, verbosity: TooltipVerbosity) -> Option<DiffPick> {
-        self.start(ctx);
-        self.poll(ctx);
-
-        let ready = self.compare_ready();
-        // Esc steps back (flicker → side-by-side → closed); Space drives flicker
-        // (enter it, then swap A/B), both only once both sides have decoded.
-        let (esc, space) = ctx.input(|i| {
-            (
-                i.key_pressed(egui::Key::Escape),
-                i.key_pressed(egui::Key::Space),
-            )
-        });
-        if esc {
-            if ready && self.compare.flicker {
-                self.compare.flicker = false;
-            } else {
-                return Some(DiffPick::Close);
-            }
-        }
-        if space && ready {
-            if self.compare.flicker {
-                self.compare.show_b = !self.compare.show_b;
-            } else {
-                self.compare.flicker = true;
-            }
-        }
-
-        egui::Area::new(Id::new("diff-compare"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(egui::Pos2::ZERO)
-            .show(ctx, |ui| {
-                let screen = ctx.content_rect();
-                let bg = ui.allocate_rect(screen, egui::Sense::click_and_drag());
-                // Nearly opaque: this is a judgement call about two files, so the
-                // board behind must not compete for attention.
-                ui.painter()
-                    .rect_filled(screen, 0.0, Color32::from_black_alpha(252));
-                let inner = screen.shrink(12.0);
-                let mut pick = None;
-
-                // Title + CLOSE.
-                let top =
-                    Rect::from_min_max(inner.min, egui::pos2(inner.max.x, inner.min.y + 26.0));
-                let close = ui
-                    .scope_builder(
-                        UiBuilder::new()
-                            .max_rect(top)
-                            .layout(Layout::left_to_right(Align::Center)),
-                        |ui| {
-                            ui.label(
-                                RichText::new("COMPARE — SAME PATH, DIFFERENT CONTENT")
-                                    .color(theme::TAN)
-                                    .size(16.0)
-                                    .strong(),
-                            );
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.button(RichText::new("CLOSE").color(theme::BLACK))
-                                    .explain(
-                                        verbosity,
-                                        "Close the comparison",
-                                        "Close this view and go back to the diff board. Nothing \
-                                         is changed.",
-                                    )
-                                    .clicked()
-                            })
-                            .inner
-                        },
-                    )
-                    .inner;
-                if close {
-                    pick = Some(DiffPick::Close);
-                }
-
-                // Preview viewport on top, facts / action strip along the bottom.
-                // Guard the viewport bottom so a very short window never inverts
-                // the rect (a full-window modal, but cheap to keep well-formed).
-                const STRIP_H: f32 = 150.0;
-                let viewport = Rect::from_min_max(
-                    egui::pos2(inner.min.x, inner.min.y + 32.0),
-                    egui::pos2(
-                        inner.max.x,
-                        (inner.max.y - STRIP_H).max(inner.min.y + 112.0),
-                    ),
-                );
-                if ready {
-                    // Both sides decoded: the shared A/B viewer — zoom / pan /
-                    // flicker across both panes.
-                    let (a_tex, a_img) = self.sized(0);
-                    let (b_tex, b_img) = self.sized(1);
-                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                    draw_compare(
-                        ui,
-                        &mut self.compare,
-                        viewport,
-                        (&a_tex, a_img),
-                        (&b_tex, b_img),
-                        ComparePointer {
-                            drag: bg.dragged().then(|| bg.drag_delta()),
-                            scroll,
-                            cursor: ctx.pointer_hover_pos(),
-                        },
-                    );
-                    ui.painter().text(
-                        egui::pos2(inner.min.x + 4.0, viewport.max.y + 2.0),
-                        Align2::LEFT_TOP,
-                        "wheel: zoom · drag: pan · Space flicker/swap · Esc close",
-                        FontId::proportional(11.0),
-                        theme::HAIRLINE,
-                    );
-                } else {
-                    // Not both decoded yet (or one produced no visual): static
-                    // side-by-side, each pane its image, an in-flight "decoding…"
-                    // note, or a settled "no preview" note. Compare stays disabled
-                    // until both sides yield a texture.
-                    let (left_pane, right_pane) = compare_split(viewport);
-                    for (slot, pane) in [(0usize, left_pane), (1usize, right_pane)] {
-                        match self.slot_state(slot) {
-                            SlotState::Image => {
-                                let (tex, img) = self.sized(slot);
-                                let rect = crate::lightbox::fit_rect(pane, img);
-                                draw_in_pane(ui, pane, rect, &tex);
-                            }
-                            note => {
-                                let side = if slot == 0 { &self.left } else { &self.right };
-                                let text = if note == SlotState::Decoding {
-                                    "decoding…".to_string()
-                                } else {
-                                    side.placeholder()
-                                };
-                                ui.painter().text(
-                                    pane.center(),
-                                    Align2::CENTER_CENTER,
-                                    text,
-                                    FontId::proportional(14.0),
-                                    theme::TAN,
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Facts + actions: two columns below the preview.
-                let strip = Rect::from_min_max(
-                    egui::pos2(inner.min.x, inner.max.y - STRIP_H + 10.0),
-                    inner.max,
-                );
-                let col_w = (strip.width() - 16.0) * 0.5;
-                ui.scope_builder(
-                    UiBuilder::new()
-                        .max_rect(strip)
-                        .layout(Layout::left_to_right(Align::Min)),
-                    |ui| {
-                        for is_left in [true, false] {
-                            let (side, other) = if is_left {
-                                (&self.left, &self.right)
-                            } else {
-                                (&self.right, &self.left)
-                            };
-                            let picked = ui
-                                .allocate_ui(egui::vec2(col_w, strip.height()), |ui| {
-                                    side_strip(ui, side, other, is_left, verbosity)
-                                })
-                                .inner;
-                            if picked.is_some() {
-                                pick = picked;
-                            }
-                            ui.add_space(16.0);
-                        }
-                    },
-                );
-                pick
-            })
-            .inner
-    }
-}
-
-/// One side's facts (repo, path, size / date / type with the bigger-or-newer
-/// value highlighted so the difference reads without comparing both numbers) and
-/// its OVERWRITE / DELETE actions. Returns the chosen action, if any.
-fn side_strip(
-    ui: &mut egui::Ui,
-    side: &DiffSide,
-    other: &DiffSide,
-    is_left: bool,
-    verbosity: TooltipVerbosity,
-) -> Option<DiffPick> {
-    let mut pick = None;
-    ui.vertical(|ui| {
-        ui.label(
-            RichText::new(&side.repo)
-                .color(if is_left { theme::ORANGE } else { theme::BLUE })
-                .size(14.0)
-                .strong(),
-        );
-        ui.label(RichText::new(&side.rel_path).color(theme::TEXT).size(12.0));
-        let size_color = if side.facts.size > other.facts.size {
-            theme::GREEN
-        } else {
-            theme::TEXT
-        };
-        let date_color = if side.facts.modified_ms > other.facts.modified_ms {
-            theme::GREEN
-        } else {
-            theme::TEXT
-        };
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(format_size(side.facts.size))
-                .color(size_color)
-                .size(13.0)
-                .strong(),
-        );
-        ui.label(
-            RichText::new(format_mtime(side.facts.modified_ms))
-                .color(date_color)
-                .size(13.0),
-        );
-        ui.label(
-            RichText::new(
-                side.facts
-                    .mime
-                    .clone()
-                    .unwrap_or_else(|| "unknown type".into()),
-            )
-            .color(theme::GREY)
-            .size(12.0),
-        );
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("OVERWRITE OTHER").color(theme::BLACK))
-                        .fill(theme::TAN),
-                )
-                .explain(
-                    verbosity,
-                    "Replace the other side with this version",
-                    "Copy this version over the other repository's file, so both repositories \
-                     hold this one. The other version is gone afterwards.",
-                )
-                .clicked()
-            {
-                pick = Some(DiffPick::Overwrite { from_left: is_left });
-            }
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("DELETE").color(theme::BLACK)).fill(theme::RED),
-                )
-                .explain(
-                    verbosity,
-                    "Delete this version",
-                    "Delete this file from this repository. The other repository's version is \
-                     left alone. This cannot be undone.",
-                )
-                .clicked()
-            {
-                pick = Some(DiffPick::Delete { on_left: is_left });
-            }
-        });
-    });
-    pick
-}
-
 /// Kittest UI tests for the Transfer view. Mirrors the harness pattern
 /// established in `dupes_view.rs`'s `ui_tests` module.
 #[cfg(test)]
@@ -3982,61 +3828,6 @@ mod ui_tests {
     use super::*;
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
-
-    /// A DIFF side carrying just a mime, for the previewability unit test.
-    fn diff_side(mime: Option<&str>) -> DiffSide {
-        DiffSide {
-            repo: "r".into(),
-            rel_path: "a.bin".into(),
-            facts: FileFacts {
-                size: 1,
-                modified_ms: 1,
-                mime: mime.map(str::to_string),
-                img_size: None,
-                audio_ms: None,
-                audio_seed: None,
-                hash_hex: "deadbeef".into(),
-                abs_path: PathBuf::from("/tmp/a.bin"),
-                origin: None,
-                exif: None,
-            },
-        }
-    }
-
-    /// A side with a visual (image / video) is compared through the shared
-    /// viewer; one without (a document) shows a "no preview" note naming the type
-    /// — not a stuck "decoding…" — and disables compare for the pair.
-    #[test]
-    fn diff_previewability_follows_mime_and_placeholder_names_the_type() {
-        assert!(diff_side(Some("image/jpeg")).previewable());
-        assert!(diff_side(Some("video/mp4")).previewable());
-        let doc = diff_side(Some("application/pdf"));
-        assert!(!doc.previewable(), "a document has no visual to compare");
-        assert!(
-            doc.placeholder().contains("application/pdf"),
-            "the pane names the type it cannot preview"
-        );
-        assert!(diff_side(None).placeholder().contains("file type"));
-    }
-
-    /// A previewable pair whose decode came back empty (e.g. two videos with no
-    /// ffmpeg) settles to "no preview" and keeps compare disabled — it must not
-    /// spin "decoding…" forever, and CLAUDE.md promises video degrades gracefully.
-    #[test]
-    fn a_failed_decode_settles_to_no_preview_not_a_stuck_decode() {
-        let mut dc = DiffCompare::new(diff_side(Some("video/mp4")), diff_side(Some("video/mp4")));
-        // Before decode: both in flight, compare not yet available.
-        assert_eq!(dc.slot_state(0), SlotState::Decoding);
-        assert!(!dc.compare_ready());
-        // Decode came back with no texture on both sides.
-        dc.settled = [true, true];
-        assert_eq!(dc.slot_state(0), SlotState::NoPreview);
-        assert_eq!(dc.slot_state(1), SlotState::NoPreview);
-        assert!(
-            !dc.compare_ready(),
-            "no textures ⇒ compare stays disabled, panes show 'no preview'"
-        );
-    }
 
     /// A temp store with a `source` and `target` repo, `source` holding a
     /// couple of files so the filter builder and preview have something real
@@ -5504,6 +5295,132 @@ mod ui_tests {
 
     /// The full batch flow: RUN plans off-thread, the confirmation appears with
     /// the real count, and PROCEED actually copies the files.
+    /// A bulk action is offered only when the listed rows actually contain the
+    /// relation it acts on, and it plans exactly the rows on screen.
+    #[test]
+    fn bulk_actions_are_offered_only_for_relations_the_rows_hold() {
+        let (_tmp, store) = sample_store();
+        let mut v = TransferView::new();
+        v.source = Some("source".into());
+        v.target = Some("target".into());
+        v.diff_rows = vec![
+            RepoDiffRow {
+                relation: DiffRelation::OnlyLeft,
+                left: vec![dfile("only_left.txt", 1, 0)],
+                right: vec![],
+            },
+            RepoDiffRow {
+                relation: DiffRelation::Equal,
+                left: vec![dfile("same.txt", 1, 0)],
+                right: vec![dfile("same.txt", 1, 0)],
+            },
+        ];
+        let metas = diff_metas(&v.diff_rows);
+        let listed = v.listed_diff_rows(&metas);
+        let offered = v.offered_bulk_ops(&listed);
+
+        assert!(
+            offered.contains(&BulkOp::CopyMissingRight),
+            "a left-only row offers copying it across"
+        );
+        assert!(
+            !offered.contains(&BulkOp::CopyMissingLeft),
+            "there is no right-only row, so the mirror action is not offered"
+        );
+        assert!(
+            !offered.contains(&BulkOp::RenameAllLeft),
+            "BY PATH never yields Renamed, so no bulk rename is offered"
+        );
+        let _ = store;
+    }
+
+    /// Hiding a row is how a bulk action is opted out of — the plan must skip it.
+    #[test]
+    fn a_hidden_row_is_left_out_of_a_bulk_plan() {
+        let (_tmp, _store) = sample_store();
+        let mut v = TransferView::new();
+        v.source = Some("source".into());
+        v.target = Some("target".into());
+        v.diff_rows = vec![
+            RepoDiffRow {
+                relation: DiffRelation::OnlyLeft,
+                left: vec![dfile("keep.txt", 1, 0)],
+                right: vec![],
+            },
+            RepoDiffRow {
+                relation: DiffRelation::OnlyLeft,
+                left: vec![dfile("skip.txt", 1, 0)],
+                right: vec![],
+            },
+        ];
+        let metas = diff_metas(&v.diff_rows);
+        v.preview_board.hidden.insert(metas[1].key.clone());
+
+        let listed = v.listed_diff_rows(&metas);
+        assert_eq!(listed, vec![0], "the hidden row is not listed");
+        let plan = v.bulk_plan(BulkOp::CopyMissingRight, &listed);
+        assert_eq!(plan.len(), 1, "and is not in the plan: {plan:?}");
+    }
+
+    /// End to end against real files: the bulk copy lands every listed file on
+    /// disk in the target repo.
+    #[test]
+    fn a_bulk_copy_lands_every_listed_file_on_disk() {
+        let (tmp, store) = sample_store();
+        for repo in ["source", "target"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .expect("scan");
+        }
+        let target_dir = tmp.path().join("target");
+        assert!(!target_dir.join("holiday.jpg").exists());
+
+        let mut h = transfer_harness(Arc::clone(&store), |v| {
+            v.target = Some("target".to_string());
+            v.command = Command::Diff;
+            v.diff_rows = vec![
+                RepoDiffRow {
+                    relation: DiffRelation::OnlyLeft,
+                    left: vec![dfile("holiday.jpg", 15, 0)],
+                    right: vec![],
+                },
+                RepoDiffRow {
+                    relation: DiffRelation::OnlyLeft,
+                    left: vec![dfile("notes.txt", 15, 0)],
+                    right: vec![],
+                },
+            ];
+        });
+        h.run();
+
+        let metas = diff_metas(&h.state().diff_rows);
+        let listed = h.state().listed_diff_rows(&metas);
+        let plan = h.state().bulk_plan(BulkOp::CopyMissingRight, &listed);
+        assert_eq!(plan.len(), 2, "both left-only files are planned");
+
+        h.state_mut().start_bulk(&store, plan);
+        // Wait for the worker rather than polling a fixed budget — the fixed
+        // budget was a known flake in this file.
+        for _ in 0..600 {
+            h.run();
+            if !h.state().running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        assert!(
+            target_dir.join("holiday.jpg").exists(),
+            "the bulk copy landed the first file"
+        );
+        assert!(target_dir.join("notes.txt").exists(), "and the second");
+    }
+
     #[test]
     fn run_asks_then_copies_on_proceed() {
         let (tmp, store) = sample_store();

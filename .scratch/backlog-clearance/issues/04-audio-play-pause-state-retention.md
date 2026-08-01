@@ -1,6 +1,6 @@
 # 04 — Keep playback paused when stepping to the next audio file
 
-Status: ready-for-agent
+Status: resolved
 Spec: ../spec.md
 
 ## Problem
@@ -34,3 +34,30 @@ tests that open, compare, play and escape:
 ## Done
 
 Standing gate green. `CHANGELOG.md` and `ai/improvements.md` updated.
+
+## Comments
+
+**Implemented 2026-07-31.** Gate green on the new machine (Rust 1.97.1): `cargo fmt --check`
+clean, `cargo clippy --workspace --all-targets` 0 warnings, `cargo test --workspace` 24 suites
+/ 0 failures.
+
+**The defect was worse than the report described.** The nav branch already consulted
+`snap.playing`, so it did not wrongly *resume* — it did nothing at all when paused, which left
+the **previous** file loaded in the player. The lightbox therefore showed copy N+1 while the
+player still held copy N, and pressing play resumed the wrong file. That is the actual bug
+behind "the pause is back when switching the mp3s".
+
+Fix: `Player::load_paused()` plus a `paused` flag on the internal `Cmd::Play`. The audio
+thread calls `play()` then immediately `pause()` — a rodio sink primes at the right position
+that way, so resuming is instant. The nav branch now loads the new copy on *both* paths:
+playing continues on the new file, paused loads it and stays paused.
+
+Test: `stepping_while_paused_loads_the_new_copy_without_resuming` asserts both halves — the
+pause survives, and the newly loaded hex is the copy now shown. It drives the paused state
+through the player API rather than a key press, because the audio thread corrects `playing`
+from the real sink and a headless run has none, which made key-driven pausing
+non-deterministic. **Verified as a real regression test**: reverting the fix makes it fail,
+restoring it makes it pass — checked on this machine, not just inherited from the previous one.
+
+The existing gapless A/B flip regression test stays green, so the paired-stream path is
+unaffected.

@@ -6,6 +6,10 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 ### Changed
 
+- Pushing a backup group to several sinks now reads the main repository's index **once** for
+  the whole push instead of once per sink, so a group with many sinks plans and runs with
+  less repeated work. What each sink receives is unchanged.
+
 - **Every preview and reconcile view now renders on one board.** Grooming's previews,
   Transfer's COPY / MOVE / SYNC / MIRROR / folder-export and GROUP SYNC previews, and
   Transfer's DIFF all share the same three-region layout, colour vocabulary, sort bar and
@@ -30,6 +34,16 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 ### Added
 
+- **Filters can now exclude.** Prefix any condition with `!` to invert it — `!name:*.mp3`
+  keeps everything that is *not* an MP3, `!mime:image` everything that is not an image.
+  Conditions still combine with AND, so `mime:image !name:*thumb*` reads "images, except
+  thumbnails". In the filter wizard each condition gained a **NOT** toggle and negated
+  conditions read `NOT NAME: *.mp3` on their chip. A `!` inside a value stays literal, so
+  `name:!important` still searches for that text.
+- **Filters can ignore capitalisation.** The new `Aa` toggle in the filter wizard (or a
+  `case:insensitive` token in the expression) makes text conditions match regardless of case,
+  so `*.jpg` also finds `PHOTO.JPG`. Matching stays case-sensitive by default, and size and
+  date conditions are unaffected.
 - Sync-group **mains are badged**: a **★ MAIN** pill on the repository card and a star badge on
   the shared repo chip, so an original is distinguishable from its backups on every tab —
   Repositories, Files, Grooming, Duplicates, Browse and the lightbox.
@@ -47,6 +61,45 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   layout asserts.
 
 ### Fixed
+
+- **The DIFF comparison now has representation tabs, like the Duplicates lightbox.** It could
+  previously only ever show a picture, so two MP3s produced `no preview for audio/mpeg` and two
+  documents showed nothing at all. Audio now compares as a **spectrogram** and documents through
+  a **Text** tab, both rendered by the same shared code the Duplicates viewer uses rather than a
+  second implementation. Images and video compare exactly as before.
+- **Grooming DEDUPE rows gained a COMPARE button**, opening the same comparison surface the
+  Transfer DIFF board uses — so you can look at what a plan is about to delete, beside the copy
+  that will survive, before running it. PURGE and PRUNE rows have no counterpart and do not
+  offer it.
+- **A Grooming DEDUPE row now names the copy that makes the file redundant.** The right side
+  shows the surviving file in the pool, so a deletion list reads "this goes, because that
+  stays" instead of asking you to trust it. PURGE and PRUNE have no counterpart and stay
+  one-sided.
+- **DIFF gained bulk actions over every listed row** — COPY MISSING in either direction and
+  RENAME ALL L / R — for reconciling repositories with thousands of differences without
+  clicking the same command a thousand times. Only actions the listed rows can actually use are
+  offered, the confirmation states the exact count, rows you have hidden are left alone, and a
+  partial failure reports how many succeeded and how many did not.
+- **DIFF now highlights the characters that differ between two names.** In a BY HASH row the
+  differing runs get a highlighted background on each side, computed from the longest common
+  subsequence — so inserting one character marks just that character instead of everything
+  after it. The shared parent directory is never painted, and highlighting never changes a
+  row's height.
+- **A scan that finds no files is now refused instead of emptying the index.** An unmounted
+  drive scans as an empty directory, and marking every entry missing there is unrecoverable —
+  worse, an emptied sync-group main turns the next MIRROR push into a wipe of its sinks. The
+  GUI asks before continuing (nothing is written unless you confirm) and the CLI requires
+  `dedup repo update --force`. Emptying a repository on purpose still works; it now costs one
+  explicit confirmation.
+- **Comparing two audio files now offers DELETE A / DELETE B directly in the player header**,
+  so a copy can be marked without leaving the comparison — matching the image compare header.
+  A copy in a read-only repository shows a disabled, struck-through `… (Protected)` pill.
+- **Stepping through duplicate audio files while paused no longer resumes playback, and now
+  loads the copy you are actually looking at.** Previously a paused step left the previous
+  file loaded, so pressing play afterwards played the wrong copy.
+- Returning to the **Repositories** tab now re-reads file counts and free space, so deleting
+  duplicates on another tab is reflected immediately instead of leaving stale numbers until a
+  manual refresh.
 
 - **GROUP SYNC's review rows no longer bake the sink name into the file path.** The target
   path was `"<sink>: <rel>"`, so sorting by path sorted by sink name and a real path

@@ -138,6 +138,15 @@ starting another replaces it. Playback survives scrolling and stops automaticall
 switch away from the Duplicates tab. Requires ALSA on Linux at build time (see the README);
 with no audio device at runtime, the controls still render and playback is simply a no-op.
 
+In the audio lightbox the player header carries the same mark pills as every other view:
+**DELETE** for a single copy, and **DELETE A** / **DELETE B** while comparing, each toggling
+only its own copy — so a copy can be marked without leaving the comparison. A copy in a
+read-only repository shows a disabled, struck-through `… (Protected)` pill instead.
+
+Stepping to another copy with `←`/`→` keeps your transport state: if playback was running it
+continues on the new copy, and if you had paused it stays paused — with the newly shown copy
+loaded, so pressing play resumes the file you are actually looking at.
+
 ## Video preview
 
 Video duplicate cards show a real still frame (sampled mid-timeline) instead of a generic

@@ -254,11 +254,17 @@ pub struct GroomingView {
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     verbosity: TooltipVerbosity,
+    /// The open comparison, if any — the same shared surface the Transfer DIFF
+    /// board opens, so a DEDUPE row can be inspected before it is applied.
+    inspect: Option<crate::compare_view::DiffCompare>,
     /// Decodes the review board's row thumbnails; polled once per frame.
     thumbs: ThumbCache,
 }
 
 enum Act {
+    /// Open the shared comparison on a DEDUPE row: the file about to go, beside
+    /// the copy that makes it redundant.
+    Inspect(String, String),
     SetCommand(Command),
     PickSource(String),
     TogglePool(String),
@@ -318,6 +324,7 @@ impl GroomingView {
             tx,
             rx,
             verbosity: TooltipVerbosity::default(),
+            inspect: None,
             thumbs: ThumbCache::new(3),
         }
     }
@@ -328,6 +335,14 @@ impl GroomingView {
             ui.ctx().request_repaint();
         }
         self.drain();
+        // The shared comparison, when a DEDUPE row asked for it. Any pick just
+        // closes it: Grooming's own APPLY / HIDE are how a row is acted on, so
+        // the viewer is shared but the decisions stay this view's.
+        if let Some(inspect) = self.inspect.as_mut()
+            && inspect.view(&ui.ctx().clone(), verbosity).is_some()
+        {
+            self.inspect = None;
+        }
         // A finished single-row APPLY refreshes the preview, so the board
         // reflects the applied action instead of dropping to the run log.
         if self.pending_refresh && !self.running {
@@ -916,11 +931,21 @@ impl GroomingView {
             &mut |i| bodies.get(i).cloned().unwrap_or_default(),
         );
         self.preview_bodies = bodies;
-        if let Some(a) = action
-            && a.cmd == board::Cmd::Apply
-            && let Some(meta) = self.preview.get(a.row)
-        {
-            acts.push(Act::ApplyRow(meta.key.clone()));
+        match action {
+            Some(a) if a.cmd == board::Cmd::Apply => {
+                if let Some(meta) = self.preview.get(a.row) {
+                    acts.push(Act::ApplyRow(meta.key.clone()));
+                }
+            }
+            Some(a) if a.cmd == board::Cmd::Compare => {
+                if let Some(meta) = self.preview.get(a.row) {
+                    let (left, right) = (meta.left_paths.clone(), meta.right_paths.clone());
+                    if let (Some(l), Some(r)) = (left.first(), right.first()) {
+                        acts.push(Act::Inspect(l.clone(), r.clone()));
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1078,6 +1103,34 @@ impl GroomingView {
 
     fn apply(&mut self, store: &Arc<Store>, act: Act) {
         match act {
+            Act::Inspect(left_rel, right_rel) => {
+                // Left is the file DEDUPE would delete, in the source repo;
+                // right is the copy that makes it redundant, held by one of the
+                // pool repos — whichever actually has that path.
+                let Some(source) = self.source.clone() else {
+                    return;
+                };
+                let side = |repo: &str, rel: &str| {
+                    let meta = store.get_repo(repo).ok()?;
+                    let entry = store.get_file_entry(repo, rel).ok().flatten()?;
+                    let abs = std::path::PathBuf::from(&meta.abs_path).join(rel);
+                    Some(crate::compare_view::DiffSide {
+                        repo: repo.to_string(),
+                        rel_path: rel.to_string(),
+                        facts: crate::media_cell::FileFacts::from_entry(&entry, abs),
+                    })
+                };
+                let right = self.pool.iter().find_map(|repo| side(repo, &right_rel));
+                match (side(&source, &left_rel), right) {
+                    (Some(l), Some(r)) => {
+                        self.inspect = Some(crate::compare_view::DiffCompare::new(l, r));
+                    }
+                    _ => {
+                        self.error =
+                            Some("Could not read both copies to compare them.".to_string());
+                    }
+                }
+            }
             Act::SetCommand(cmd) => {
                 self.command = cmd;
                 self.clear_preview();
@@ -1186,6 +1239,11 @@ impl GroomingView {
         self.run_current.clear();
     }
 
+    /// Rows with nothing on the other side: PURGE and PRUNE just remove files.
+    fn one_sided(paths: Vec<String>) -> Vec<(String, Option<String>)> {
+        paths.into_iter().map(|p| (p, None)).collect()
+    }
+
     fn run_preview(&mut self, store: &Store) {
         self.reset_run();
         let filter = self.filter_string();
@@ -1204,12 +1262,24 @@ impl GroomingView {
                 let ref_slice: Vec<&str> = pool.iter().map(String::as_str).collect();
                 dedup_core::diff::diff_print(store, &source, &ref_slice, filter.as_deref())
                     .map(|items| {
-                        let matched: Vec<String> = items
+                        // Keep the reference path alongside each doomed file: it
+                        // is *why* the file is redundant, and showing it is the
+                        // difference between "trust the plan" and seeing the copy
+                        // that will survive. `DeletedInReference` has no live
+                        // counterpart — the reference knows the content but no
+                        // longer holds it — so it stays one-sided.
+                        let matched: Vec<(String, Option<String>)> = items
                             .into_iter()
                             .filter_map(|item| match item {
-                                dedup_core::diff::DiffItem::Equal { rel_path, .. }
-                                | dedup_core::diff::DiffItem::DeletedInReference { rel_path } => {
-                                    Some(rel_path)
+                                dedup_core::diff::DiffItem::Equal {
+                                    rel_path,
+                                    reference_path,
+                                } => Some((
+                                    rel_path,
+                                    (!reference_path.is_empty()).then_some(reference_path),
+                                )),
+                                dedup_core::diff::DiffItem::DeletedInReference { rel_path } => {
+                                    Some((rel_path, None))
                                 }
                                 dedup_core::diff::DiffItem::New { .. } => None,
                             })
@@ -1226,6 +1296,7 @@ impl GroomingView {
                 facts_repo = repo.clone();
                 self.preview_source_header = Self::repo_header(store, &repo);
                 preview_by_filter(store, &repo, filter.as_deref(), PREVIEW_CAP)
+                    .map(|(paths, total)| (Self::one_sided(paths), total))
                     .map_err(|e| e.to_string())
             }
             Command::Prune => {
@@ -1234,7 +1305,9 @@ impl GroomingView {
                 };
                 facts_repo = repo.clone();
                 self.preview_source_header = Self::repo_header(store, &repo);
-                preview_prune(store, &repo, PREVIEW_CAP).map_err(|e| e.to_string())
+                preview_prune(store, &repo, PREVIEW_CAP)
+                    .map(|(paths, total)| (Self::one_sided(paths), total))
+                    .map_err(|e| e.to_string())
             }
             Command::Organize => {
                 self.run_preview_organize(store);
@@ -1245,28 +1318,55 @@ impl GroomingView {
         };
         match result {
             Ok((paths, total)) => {
-                // DEDUPE / PURGE / PRUNE all remove files from the one repo: the
-                // source side is removed, the target side is absent.
+                // PURGE / PRUNE remove files from one repo, so the right side is
+                // absent. DEDUPE also removes from one repo, but it removes them
+                // *because* the pool already holds the content — so the pool is
+                // named on the right and each row shows the copy that survives.
                 self.preview_total = total;
                 self.preview_totals = [total, 0, 0, 0];
-                self.preview_target_header = None;
+                self.preview_target_header = match self.command {
+                    Command::Dedupe if !self.pool.is_empty() => Some(self.pool.join(", ")),
+                    _ => None,
+                };
                 let (db, base) = open_facts(store, &facts_repo);
                 let (metas, bodies) = paths
                     .into_iter()
-                    .map(|from| {
+                    .map(|(from, reference)| {
                         let facts = facts_for(db.as_deref(), base.as_deref(), &from);
+                        // DEDUPE knows which copy makes this file redundant, so
+                        // that copy is shown on the right: the row reads "this
+                        // goes, because that stays" instead of a bare deletion.
+                        // PURGE and PRUNE have no counterpart and stay one-sided.
+                        let right_status = if reference.is_some() {
+                            board::Status::Same
+                        } else {
+                            board::Status::Absent
+                        };
                         let meta = board::RowMeta {
                             key: dedup_core::diff::source_key(&from),
                             left_status: board::Status::WillDelete,
-                            right_status: board::Status::Absent,
+                            right_status,
                             left_size: facts.as_ref().map(|f| f.size).unwrap_or(0),
                             left_modified: facts.as_ref().map(|f| f.modified_ms).unwrap_or(0),
-                            right_size: 0,
+                            // The counterpart is the same content by definition,
+                            // so it carries the same size.
+                            right_size: reference
+                                .as_ref()
+                                .map(|_| facts.as_ref().map(|f| f.size).unwrap_or(0))
+                                .unwrap_or(0),
                             right_modified: 0,
                             left_paths: vec![from],
-                            right_paths: Vec::new(),
+                            right_paths: reference.iter().cloned().collect(),
                             unchanged: false,
-                            cmds: vec![board::Cmd::Apply, board::Cmd::Hide],
+                            // A row only offers COMPARE when there is genuinely
+                            // something to compare against: DEDUPE's surviving
+                            // copy. PURGE and PRUNE rows have no counterpart, so
+                            // the command is not offered rather than disabled.
+                            cmds: if reference.is_some() {
+                                vec![board::Cmd::Compare, board::Cmd::Apply, board::Cmd::Hide]
+                            } else {
+                                vec![board::Cmd::Apply, board::Cmd::Hide]
+                            },
                         };
                         let body = board::RowBody {
                             left: board::SideBody {
@@ -1937,7 +2037,64 @@ mod ui_tests {
     }
 
     /// `section_lcars` now always claims the panel's full width, so even a
+    /// A DEDUPE row offers COMPARE (it has a counterpart to compare against);
+    /// PURGE and PRUNE rows do not, because there is nothing on the other side.
+    #[test]
+    fn only_rows_with_a_counterpart_offer_compare() {
+        let cmds_for = |reference: Option<&str>| {
+            if reference.is_some() {
+                vec![board::Cmd::Compare, board::Cmd::Apply, board::Cmd::Hide]
+            } else {
+                vec![board::Cmd::Apply, board::Cmd::Hide]
+            }
+        };
+        assert!(
+            cmds_for(Some("archive/original.jpg")).contains(&board::Cmd::Compare),
+            "a DEDUPE row with a surviving copy can be compared"
+        );
+        assert!(
+            !cmds_for(None).contains(&board::Cmd::Compare),
+            "a one-sided PURGE/PRUNE row does not offer a compare that would open nothing"
+        );
+    }
+
     /// narrow-content rule section (a single button + short fields) spans
+    /// A DEDUPE row names the copy that makes the file redundant, so the user can
+    /// see what survives instead of trusting a bare deletion list. PURGE and
+    /// PRUNE have no such counterpart and stay one-sided.
+    #[test]
+    fn a_dedupe_row_shows_the_copy_that_makes_it_redundant() {
+        // The shape `run_preview` builds for DEDUPE: left is doomed, right names
+        // the reference copy.
+        let with_ref = board::RowMeta {
+            key: dedup_core::diff::source_key("dupe.jpg"),
+            left_status: board::Status::WillDelete,
+            right_status: board::Status::Same,
+            left_paths: vec!["dupe.jpg".to_string()],
+            right_paths: vec!["archive/original.jpg".to_string()],
+            left_size: 10,
+            right_size: 10,
+            left_modified: 0,
+            right_modified: 0,
+            unchanged: false,
+            cmds: vec![board::Cmd::Apply, board::Cmd::Hide],
+        };
+        assert_eq!(
+            with_ref.right_paths,
+            ["archive/original.jpg"],
+            "the surviving copy is named on the row"
+        );
+        assert_ne!(
+            with_ref.right_status,
+            board::Status::Absent,
+            "so the right side actually renders"
+        );
+
+        // PURGE / PRUNE keep the one-sided shape.
+        let one_sided = GroomingView::one_sided(vec!["junk.tmp".to_string()]);
+        assert_eq!(one_sided, [("junk.tmp".to_string(), None)]);
+    }
+
     /// nearly the whole window rather than shrinking to fit its content.
     #[test]
     fn rule_elbow_spans_full_panel_width() {

@@ -305,6 +305,45 @@ fn collect_source_entries(
     Ok(entries)
 }
 
+/// A source repository's filtered index, collected once.
+///
+/// Pushing a sync group syncs one main to several sinks. Done naively that
+/// re-opens the main and re-streams its whole index once per sink, to produce
+/// the same data every time — so [`plan_group_sync`](crate::sync_group::plan_group_sync)
+/// and [`run_group_sync`](crate::sync_group::run_group_sync) build one of these
+/// up front and hand it to every sink's plan or run.
+///
+/// It holds everything the sync path needs from the source: the entries the
+/// filter admitted (missing ones included — a `Missing` delete needs them), the
+/// repository's root on disk, and its name for provenance.
+pub struct SourceView {
+    name: String,
+    root: PathBuf,
+    entries: Vec<(String, FileEntry)>,
+}
+
+impl SourceView {
+    /// Open `source` and collect the entries `filter` admits.
+    pub fn collect(store: &Store, source: &str, filter: &FileFilter) -> Result<Self, DiffError> {
+        let repo = open_repo(store, source)?;
+        Ok(Self {
+            name: source.to_string(),
+            root: PathBuf::from(&repo.meta.abs_path),
+            entries: collect_source_entries(&repo.db, filter, true)?,
+        })
+    }
+
+    /// The content this source currently holds (non-missing): the reference set
+    /// an `Absent` (mirror) delete removes target content outside of.
+    fn present_content(&self) -> HashSet<ContentKey> {
+        self.entries
+            .iter()
+            .filter(|(_, e)| !e.missing)
+            .map(|(_, e)| (e.size, e.hash))
+            .collect()
+    }
+}
+
 /// Classify every non-missing source file against the union of the reference
 /// repos. `Equal`'s `reference_path` is taken from the primary reference when it
 /// holds the content, else from the first reference that does.
@@ -595,27 +634,37 @@ pub fn diff_sync(
     run: &DiffRun<'_>,
 ) -> Result<SyncStats, DiffError> {
     let filter = FileFilter::parse(filter)?;
-    let source_name = source.to_string();
-    let source = open_repo(store, source)?;
+    let source = SourceView::collect(store, source, &filter)?;
+    diff_sync_from(store, &source, target, copy_new, delete, &filter, run)
+}
+
+/// [`diff_sync`] against an already-collected source, so a multi-sink push
+/// reads the main once instead of once per sink.
+pub fn diff_sync_from(
+    store: &Store,
+    source: &SourceView,
+    target: &str,
+    copy_new: bool,
+    delete: SyncDelete,
+    filter: &FileFilter,
+    run: &DiffRun<'_>,
+) -> Result<SyncStats, DiffError> {
     let target = open_repo(store, target)?;
     let mut target_index = store::read_content_index(&target.db)?;
 
-    let source_entries = collect_source_entries(&source.db, &filter, true)?;
-    let source_root = PathBuf::from(&source.meta.abs_path);
+    let source_entries = &source.entries;
+    let source_root = source.root.clone();
+    let source_name = source.name.clone();
     let target_root = PathBuf::from(&target.meta.abs_path);
     let mut stats = SyncStats::default();
 
     // Content the source currently holds (non-missing, filter-matched): the
     // reference set for an Absent (mirror) delete, which removes any target
     // content outside it.
-    let source_present: HashSet<ContentKey> = source_entries
-        .iter()
-        .filter(|(_, e)| !e.missing)
-        .map(|(_, e)| (e.size, e.hash))
-        .collect();
+    let source_present = source.present_content();
     // Live target files (filter-matched) — only an Absent delete needs them.
     let target_entries = if delete == SyncDelete::Absent {
-        collect_source_entries(&target.db, &filter, false)?
+        collect_source_entries(&target.db, filter, false)?
     } else {
         Vec::new()
     };
@@ -674,7 +723,7 @@ pub fn diff_sync(
     }
 
     if copy_new && !stats.cancelled {
-        for (rel_path, entry) in &source_entries {
+        for (rel_path, entry) in source_entries {
             if entry.missing || !run.selected_source(rel_path) {
                 continue;
             }
@@ -811,15 +860,28 @@ pub fn plan_sync(
     filter: Option<&str>,
 ) -> Result<SyncPlan, DiffError> {
     let filter = FileFilter::parse(filter)?;
-    let source = open_repo(store, source)?;
+    let source = SourceView::collect(store, source, &filter)?;
+    plan_sync_from(store, &source, target, copy_new, delete, &filter)
+}
+
+/// [`plan_sync`] against an already-collected source, so a multi-sink push
+/// reads the main once instead of once per sink.
+pub fn plan_sync_from(
+    store: &Store,
+    source: &SourceView,
+    target: &str,
+    copy_new: bool,
+    delete: SyncDelete,
+    filter: &FileFilter,
+) -> Result<SyncPlan, DiffError> {
     let target = open_repo(store, target)?;
     let target_index = store::read_content_index(&target.db)?;
 
-    let source_entries = collect_source_entries(&source.db, &filter, true)?;
+    let source_entries = &source.entries;
     let mut plan = SyncPlan::default();
 
     if copy_new {
-        for (rel_path, entry) in &source_entries {
+        for (rel_path, entry) in source_entries {
             if entry.missing {
                 continue;
             }
@@ -847,12 +909,8 @@ pub fn plan_sync(
             }
         }
         SyncDelete::Absent => {
-            let source_present: HashSet<ContentKey> = source_entries
-                .iter()
-                .filter(|(_, e)| !e.missing)
-                .map(|(_, e)| (e.size, e.hash))
-                .collect();
-            for (rel_path, entry) in collect_source_entries(&target.db, &filter, false)? {
+            let source_present = source.present_content();
+            for (rel_path, entry) in collect_source_entries(&target.db, filter, false)? {
                 if !source_present.contains(&(entry.size, entry.hash)) {
                     plan.deletes.push(rel_path);
                 }

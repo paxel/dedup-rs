@@ -15,7 +15,7 @@ use crate::util::{ExplainExt, format_size};
 use crate::worker::{ChannelProgress, JobKind, JobOutcome, RepoStatus, WorkerMsg, WorkerState};
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::store::{RepoStats, Store};
-use dedup_core::update::{CancellationToken, ProgressEvent, check_repo, update_repo};
+use dedup_core::update::{CancellationToken, ProgressEvent, check_repo};
 use egui::{Align, Color32, Id, Layout, RichText};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -177,6 +177,9 @@ pub struct DedupApp {
     load_error: Option<String>,
     /// Transient non-error notice (e.g. a drag-and-drop add summary).
     notice: Option<String>,
+    /// A scan was refused because it would have emptied this repo's index
+    /// (name, entry count). Shows the confirmation that can authorise it.
+    empty_scan_confirm: Option<(String, u64)>,
 
     show_add: bool,
     new_name: String,
@@ -226,6 +229,7 @@ impl DedupApp {
             repos: Vec::new(),
             load_error: None,
             notice: None,
+            empty_scan_confirm: None,
             show_add: false,
             new_name: String::new(),
             new_path: String::new(),
@@ -290,6 +294,33 @@ impl DedupApp {
                 repaint.request_repaint();
             });
         }
+    }
+
+    /// Re-sync the newly-shown view from the store, once per tab switch, so
+    /// repos added or changed on another tab appear without a refresh button.
+    ///
+    /// The Repositories tab re-reads its own cards here: file counts and free
+    /// space otherwise stayed stale after deleting duplicates on another tab
+    /// until the user refreshed by hand. `reload_all` opens each repo db, so it
+    /// runs only while no update is in flight — the same gate every other call
+    /// site uses. Skipping a busy frame is harmless, because a job's completion
+    /// handler reloads anyway.
+    fn sync_shown_tab(&mut self) {
+        if self.synced_tab == Some(self.tab) {
+            return;
+        }
+        match self.tab {
+            Tab::Repositories => {
+                if self.worker.active_count() == 0 {
+                    self.reload_all();
+                }
+            }
+            Tab::Duplicates => self.dupes.sync_repos(&self.store),
+            Tab::Transfer => self.transfer.sync_repos(&self.store),
+            Tab::Grooming => self.grooming.sync_repos(&self.store),
+            Tab::Browse => self.browse.sync_repos(&self.store),
+        }
+        self.synced_tab = Some(self.tab);
     }
 
     /// Reload every repo row from the registry. Safe only when no update is
@@ -474,10 +505,25 @@ impl DedupApp {
                 log::info!("starting {kind:?} of '{name}' on {threads} thread(s)");
                 let progress = ChannelProgress::new(name.clone(), tx.clone());
                 let outcome = match kind {
-                    JobKind::Update => JobOutcome::Update(
-                        update_repo(&store, &name, threads, &progress, &cancel)
-                            .map_err(|e| e.to_string()),
-                    ),
+                    JobKind::Update | JobKind::UpdateForced => {
+                        let allow_empty = matches!(kind, JobKind::UpdateForced);
+                        match dedup_core::update::update_repo_authorized(
+                            &store,
+                            &name,
+                            threads,
+                            &progress,
+                            &cancel,
+                            allow_empty,
+                        ) {
+                            // Not an error to report: the UI turns this into a
+                            // confirmation offering to scan anyway.
+                            Err(dedup_core::update::UpdateError::WouldEmptyIndex {
+                                entries,
+                                ..
+                            }) => JobOutcome::UpdateWouldEmpty(entries),
+                            other => JobOutcome::Update(other.map_err(|e| e.to_string())),
+                        }
+                    }
                     JobKind::Check => JobOutcome::Check(
                         check_repo(&store, &name, &progress, &cancel).map_err(|e| e.to_string()),
                     ),
@@ -803,6 +849,15 @@ impl eframe::App for DedupApp {
         for (repo, outcome) in self.worker.drain(&self.rx) {
             self.cancels.remove(&repo);
             match outcome {
+                JobOutcome::UpdateWouldEmpty(entries) => {
+                    // Nothing was written. Ask before letting a scan empty an
+                    // index — an unmounted drive looks exactly like this, and an
+                    // emptied sync-group main turns the next MIRROR into a wipe.
+                    log::warn!(
+                        "scan of '{repo}' refused: it walked empty over {entries} indexed entries"
+                    );
+                    self.empty_scan_confirm = Some((repo.clone(), entries));
+                }
                 JobOutcome::Update(result) => {
                     // A clean, uncancelled update brings the index in sync.
                     let clean = matches!(&result, Ok(s) if !s.cancelled);
@@ -906,18 +961,7 @@ impl eframe::App for DedupApp {
         // On each tab switch, re-sync the newly-shown view's repo list from the
         // store, so repos added/removed elsewhere appear without a refresh
         // button. (The Repositories tab refreshes its own cards separately.)
-        if self.synced_tab != Some(self.tab) {
-            match self.tab {
-                // The Repositories tab manages its own cards (refreshed after
-                // add/scan operations), so it isn't re-synced here.
-                Tab::Repositories => {}
-                Tab::Duplicates => self.dupes.sync_repos(&self.store),
-                Tab::Transfer => self.transfer.sync_repos(&self.store),
-                Tab::Grooming => self.grooming.sync_repos(&self.store),
-                Tab::Browse => self.browse.sync_repos(&self.store),
-            }
-            self.synced_tab = Some(self.tab);
-        }
+        self.sync_shown_tab();
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Repositories => self.repositories_view(ui, &mut actions),
             Tab::Duplicates => self.dupes.show(ui, &self.store, self.tooltip_verbosity),
@@ -933,6 +977,9 @@ impl eframe::App for DedupApp {
         }
         if self.show_about {
             self.about_modal(&ctx);
+        }
+        if self.empty_scan_confirm.is_some() {
+            self.empty_scan_modal(&ctx);
         }
         if self.show_help {
             self.help_window(&ctx);
@@ -2249,6 +2296,85 @@ impl DedupApp {
         }
     }
 
+    /// Confirmation for a scan that walked empty over a non-empty index.
+    ///
+    /// Refusing is the default reading of the situation — an unmounted drive
+    /// scans as an empty directory, and if this repo is a sync group's main the
+    /// next MIRROR push would carry the emptiness to every sink. Emptying a repo
+    /// on purpose is still supported; it costs this one confirmation.
+    fn empty_scan_modal(&mut self, ctx: &egui::Context) {
+        let Some((repo, entries)) = self.empty_scan_confirm.clone() else {
+            return;
+        };
+        let mut decision: Option<bool> = None;
+        let response = egui::Modal::new(Id::new("empty-scan-confirm")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.label(
+                RichText::new("SCAN FOUND NO FILES")
+                    .color(theme::AMBER)
+                    .size(18.0)
+                    .strong(),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!(
+                    "Scanning '{repo}' found no files at all, but its index holds {entries}. \
+                 Continuing marks every one of them missing."
+                ))
+                .color(theme::TEXT),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "If this drive should not be empty, check that it is mounted and scan \
+                     again. Nothing has been changed yet.",
+                )
+                .color(theme::TAN)
+                .size(12.0),
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("SCAN ANYWAY").color(theme::BLACK))
+                            .fill(theme::RED),
+                    )
+                    .explain(
+                        self.tooltip_verbosity,
+                        "Mark every entry missing",
+                        "Run the scan and mark all indexed files missing, because this \
+                         repository really is empty now.",
+                    )
+                    .clicked()
+                {
+                    decision = Some(true);
+                }
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("CANCEL").color(theme::TEXT))
+                            .fill(theme::PANEL),
+                    )
+                    .explain(
+                        self.tooltip_verbosity,
+                        "Leave the index alone",
+                        "Close without scanning. The index keeps every entry it has.",
+                    )
+                    .clicked()
+                {
+                    decision = Some(false);
+                }
+            });
+        });
+        if let Some(go) = decision {
+            self.empty_scan_confirm = None;
+            if go {
+                self.enqueue(repo, JobKind::UpdateForced);
+            }
+        } else if response.should_close() {
+            self.empty_scan_confirm = None;
+        }
+    }
+
     fn about_modal(&mut self, ctx: &egui::Context) {
         let response = egui::Modal::new(Id::new("about")).show(ctx, |ui| {
             ui.set_width(320.0);
@@ -2737,6 +2863,49 @@ mod ui_tests {
     use egui_kittest::Harness;
 
     /// A temp store with two scanned repos, so the Repository Management
+    /// A scan that walked empty over a non-empty index must ask before marking
+    /// everything missing, and declining must leave the index untouched.
+    #[test]
+    fn an_emptying_scan_asks_first_and_declining_changes_nothing() {
+        let (tmp, mut app) = sample_app();
+        let repo = "Automatic Upload";
+
+        // Empty the directory, as an unmounted drive would appear.
+        let dir = tmp.path().join(repo.replace(' ', "_"));
+        for entry in std::fs::read_dir(&dir).expect("read repo dir") {
+            std::fs::remove_file(entry.expect("dir entry").path()).expect("remove file");
+        }
+
+        // The core refuses and writes nothing.
+        let refused = update_repo(&app.store, repo, 1, &NoProgress, &CancellationToken::new());
+        assert!(
+            matches!(
+                refused,
+                Err(dedup_core::update::UpdateError::WouldEmptyIndex { entries: 5, .. })
+            ),
+            "the scan is refused rather than emptying the index"
+        );
+
+        // The UI turns that into a confirmation rather than an error.
+        app.empty_scan_confirm = Some((repo.to_string(), 5));
+        assert!(
+            app.empty_scan_confirm.is_some(),
+            "a confirmation is pending"
+        );
+
+        // Declining leaves every entry indexed.
+        app.empty_scan_confirm = None;
+        app.tab = Tab::Repositories;
+        app.sync_shown_tab();
+        let count = app
+            .repos
+            .iter()
+            .find(|r| r.name == repo)
+            .map(|r| r.stats.file_count)
+            .expect("repo row");
+        assert_eq!(count, 5, "declining keeps all five entries");
+    }
+
     /// cards show real stats instead of all-zero placeholders.
     fn sample_app() -> (tempfile::TempDir, DedupApp) {
         let tmp = tempfile::tempdir().unwrap();
@@ -2751,6 +2920,67 @@ mod ui_tests {
             update_repo(&store, name, 1, &NoProgress, &CancellationToken::new()).unwrap();
         }
         (tmp, DedupApp::new(store))
+    }
+
+    /// Returning to the Repositories tab must re-read the registry, so counts
+    /// reflect deletions made on another tab. Before this, the numbers stayed
+    /// stale until the user refreshed by hand.
+    #[test]
+    fn switching_to_the_repositories_tab_refreshes_its_stats() {
+        let (_tmp, mut app) = sample_app();
+        app.tab = Tab::Repositories;
+        app.sync_shown_tab();
+        let before = app
+            .repos
+            .iter()
+            .find(|r| r.name == "Automatic Upload")
+            .map(|r| r.stats.file_count)
+            .expect("repo row");
+        assert_eq!(before, 5, "sample repo starts with five files");
+
+        // Change the store behind the app's back, as a delete on another tab would.
+        app.store
+            .remove_file_entry("Automatic Upload", "f0.bin")
+            .expect("remove entry");
+
+        // Leaving and returning is what triggers the re-read.
+        app.tab = Tab::Duplicates;
+        app.sync_shown_tab();
+        app.tab = Tab::Repositories;
+        app.sync_shown_tab();
+
+        let after = app
+            .repos
+            .iter()
+            .find(|r| r.name == "Automatic Upload")
+            .map(|r| r.stats.file_count)
+            .expect("repo row");
+        assert_eq!(
+            after, 4,
+            "returning to the tab picks up the change without a manual refresh"
+        );
+    }
+
+    /// The re-read happens on the transition only, not every frame — otherwise a
+    /// visible tab would reopen every repo db continuously.
+    #[test]
+    fn staying_on_the_repositories_tab_does_not_re_read_each_frame() {
+        let (_tmp, mut app) = sample_app();
+        app.tab = Tab::Repositories;
+        app.sync_shown_tab();
+        assert!(app.synced_tab == Some(Tab::Repositories));
+
+        // Change the store, then run more frames *without* leaving the tab.
+        app.store
+            .create_repo("Later", &_tmp.path().join("Later").to_string_lossy())
+            .ok();
+        for _ in 0..3 {
+            app.sync_shown_tab();
+        }
+        assert!(
+            !app.repos.iter().any(|r| r.name == "Later"),
+            "no re-read while the tab stays shown; only a switch refreshes"
+        );
     }
 
     /// A sync group is framed by one LCARS section titled with the group name,

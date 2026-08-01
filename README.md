@@ -26,6 +26,16 @@ at runtime and degrades gracefully when they are absent.
 - **Transfer / DIFF** — copy, move, sync or mirror content between repos, reconcile two repos side by side, or push a backup group's main to its sinks (each ADD ONLY or MIRROR).
 - **Grooming** — dedupe, purge by filter, prune missing records, reorganize by path templates.
 
+Most surfaces share one **filter** wizard: conditions like `mime:image`, `name:*.db` or
+`size:>=1000` combine with AND, any condition can be inverted with `!` (`!name:*.mp3` —
+everything that is not an MP3), and `case:insensitive` (the `Aa` toggle) makes text matching
+ignore capitalisation.
+
+Scanning is protective by default: a scan that finds **no files at all** in a repository whose
+index still holds entries is refused rather than marking everything missing — an unmounted drive
+is indistinguishable from an emptied one, and an emptied backup-group main would turn the next
+MIRROR push into a wipe. Confirm it in the GUI, or pass `--force` on the CLI.
+
 The same operations are available headless via `dedup <command>`.
 
 ## Documentation

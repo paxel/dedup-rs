@@ -22,6 +22,10 @@ enum Cmd {
         path: PathBuf,
         total_ms: u64,
         start_ms: u64,
+        /// Load the file but hold it paused, so stepping through a group's
+        /// copies while paused swaps which file is loaded without starting
+        /// playback the user had deliberately stopped.
+        paused: bool,
     },
     /// Load two files into two sinks, played in sync from `start_ms`; only the
     /// one selected by `active_b` is audible.
@@ -93,18 +97,32 @@ impl Player {
     /// controls respond instantly even before the decoder starts. A non-zero
     /// `start_ms` is how switching between a group's copies keeps the offset.
     pub fn play(&self, hex: &str, path: &Path, total_ms: u64, start_ms: u64) {
+        self.load(hex, path, total_ms, start_ms, false);
+    }
+
+    /// Load `path` and hold it paused at `start_ms`.
+    ///
+    /// Stepping to another copy while playback is paused must swap *which* file
+    /// is loaded — otherwise the lightbox shows one copy while the player still
+    /// holds the previous one, and pressing play resumes the wrong file.
+    pub fn load_paused(&self, hex: &str, path: &Path, total_ms: u64, start_ms: u64) {
+        self.load(hex, path, total_ms, start_ms, true);
+    }
+
+    fn load(&self, hex: &str, path: &Path, total_ms: u64, start_ms: u64, paused: bool) {
         let start = start_ms.min(total_ms);
         self.set_hex(Some(hex), None);
         self.shared.paired.store(false, Ordering::Relaxed);
         self.shared.active_b.store(false, Ordering::Relaxed);
         self.shared.total_ms.store(total_ms, Ordering::Relaxed);
         self.shared.pos_ms.store(start, Ordering::Relaxed);
-        self.shared.playing.store(true, Ordering::Relaxed);
+        self.shared.playing.store(!paused, Ordering::Relaxed);
         self.shared.loaded.store(true, Ordering::Relaxed);
         let _ = self.tx.send(Cmd::Play {
             path: path.to_path_buf(),
             total_ms,
             start_ms: start,
+            paused,
         });
     }
 
@@ -260,6 +278,7 @@ fn audio_thread(rx: Receiver<Cmd>, shared: Arc<Shared>) {
                 path,
                 total_ms,
                 start_ms,
+                paused,
             }) => {
                 if let Some(b) = &sink_b {
                     b.clear();
@@ -268,7 +287,13 @@ fn audio_thread(rx: Receiver<Cmd>, shared: Arc<Shared>) {
                 if let Some(a) = &sink_a {
                     a.set_volume(1.0);
                     if load(a, &path, start_ms) {
+                        // Always `play()` first: a rodio sink starts paused only
+                        // if told to, and pausing after play leaves it primed at
+                        // the right position for an instant resume.
                         a.play();
+                        if paused {
+                            a.pause();
+                        }
                         has_a = true;
                     }
                 }

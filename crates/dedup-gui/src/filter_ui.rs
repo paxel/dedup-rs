@@ -28,7 +28,7 @@ pub const HISTORY_FILE: &str = "filter_history.json";
 
 /// The kind of a single filter condition. Maps one-to-one to the `mime:` /
 /// `name:` / `size:` prefixes understood by `dedup_core::filter::FileFilter`.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FilterKind {
     Mime,
     Name,
@@ -92,6 +92,9 @@ struct FilterCond {
     kind: FilterKind,
     value: String,
     editing: bool,
+    /// Whether the condition is inverted (`!name:*.mp3` — "everything that is
+    /// *not* an MP3").
+    negated: bool,
 }
 
 /// A single saved condition inside a named preset. `kind` is the stable
@@ -100,6 +103,9 @@ struct FilterCond {
 struct SavedCond {
     kind: String,
     value: String,
+    /// Absent in presets saved before negation existed, hence the default.
+    #[serde(default)]
+    negated: bool,
 }
 
 /// A named filter preset: a whole condition set the user saved for reuse.
@@ -177,32 +183,53 @@ impl FilterHistory {
 /// `filter_string` composes it: each `mime:`/`name:`/`size:`/`tag:` prefix at a
 /// whitespace boundary starts a new condition whose value runs to the next
 /// prefix. Text before the first prefix is ignored (the wizard only builds
-/// these kinds).
-fn parse_conditions(expr: &str) -> Vec<FilterCond> {
+/// these kinds). Returns the conditions plus whether the expression carried the
+/// `case:insensitive` modifier.
+///
+/// `case:` is recognised as a group opener even though it is not a condition, so
+/// that it terminates the preceding condition's value instead of being swallowed
+/// into it. A group may open with `!`, which negates it.
+fn parse_conditions(expr: &str) -> (Vec<FilterCond>, bool) {
     let prefixes: Vec<(String, FilterKind)> = FILTER_KINDS
         .iter()
         .map(|&k| (format!("{}:", k.prefix()), k))
         .collect();
     let bytes = expr.as_bytes();
-    let mut starts: Vec<(usize, FilterKind)> = Vec::new();
+    // `None` marks the `case:` modifier, which opens a group but yields no
+    // condition.
+    let mut starts: Vec<(usize, Option<FilterKind>, bool)> = Vec::new();
     for i in 0..expr.len() {
         if !expr.is_char_boundary(i) {
             continue;
         }
-        let at_boundary = i == 0 || bytes[i - 1].is_ascii_whitespace();
-        if at_boundary {
-            for (p, kind) in &prefixes {
-                if expr[i..].starts_with(p.as_str()) {
-                    starts.push((i, *kind));
-                }
+        if !(i == 0 || bytes[i - 1].is_ascii_whitespace()) {
+            continue;
+        }
+        let (rest, negated) = match expr[i..].strip_prefix('!') {
+            Some(r) => (r, true),
+            None => (&expr[i..], false),
+        };
+        if rest.starts_with("case:") {
+            starts.push((i, None, negated));
+            continue;
+        }
+        for (p, kind) in &prefixes {
+            if rest.starts_with(p.as_str()) {
+                starts.push((i, Some(*kind), negated));
             }
         }
     }
     let mut conds = Vec::new();
-    for (idx, &(start, kind)) in starts.iter().enumerate() {
-        let end = starts.get(idx + 1).map(|(s, _)| *s).unwrap_or(expr.len());
-        // Skip past the "<prefix>:" that starts this group (prefix + colon).
-        let value = expr[start + kind.prefix().len() + 1..end]
+    let mut case_insensitive = false;
+    for (idx, &(start, kind, negated)) in starts.iter().enumerate() {
+        let end = starts.get(idx + 1).map(|(s, ..)| *s).unwrap_or(expr.len());
+        // Skip the optional '!' and the "<prefix>:" opening this group.
+        let after_bang = start + usize::from(negated);
+        let Some(kind) = kind else {
+            case_insensitive |= expr[after_bang + "case:".len()..end].trim() == "insensitive";
+            continue;
+        };
+        let value = expr[after_bang + kind.prefix().len() + 1..end]
             .trim()
             .to_string();
         if !value.is_empty() {
@@ -210,10 +237,11 @@ fn parse_conditions(expr: &str) -> Vec<FilterCond> {
                 kind,
                 value,
                 editing: false,
+                negated,
             });
         }
     }
-    conds
+    (conds, case_insensitive)
 }
 
 /// Deferred UI action, collected during a frame and applied after the render
@@ -228,6 +256,10 @@ enum Act {
     ApplyPreset(usize),
     RemovePreset(usize),
     CommitRenamePreset(usize),
+    /// Invert a single condition (`!name:*.mp3`).
+    ToggleNegate(usize),
+    /// Switch text matching between case-sensitive and case-insensitive.
+    ToggleCase,
     FilterChanged,
 }
 
@@ -281,6 +313,9 @@ pub struct FilterBuilder {
     error: Option<String>,
     /// Tooltip wording for this frame, set at the top of [`Self::ui`].
     verbosity: TooltipVerbosity,
+    /// Whether text conditions match without regard to case, emitted as the
+    /// `case:insensitive` modifier.
+    case_insensitive: bool,
 }
 
 impl FilterBuilder {
@@ -306,6 +341,7 @@ impl FilterBuilder {
             status: None,
             error: None,
             verbosity: TooltipVerbosity::default(),
+            case_insensitive: false,
         }
     }
 
@@ -313,7 +349,9 @@ impl FilterBuilder {
     /// (the `mime:`/`name:`/`size:` groups produced by [`Self::filter_string`]).
     /// Used to restore a saved rule/preset into the wizard.
     pub fn set_expression(&mut self, expr: &str) {
-        self.filters = parse_conditions(expr);
+        let (filters, case_insensitive) = parse_conditions(expr);
+        self.filters = filters;
+        self.case_insensitive = case_insensitive;
         self.adding = false;
     }
 
@@ -324,14 +362,19 @@ impl FilterBuilder {
         for cond in &self.filters {
             let value = cond.value.trim();
             if !value.is_empty() {
-                parts.push(format!("{}:{}", cond.kind.prefix(), value));
+                let bang = if cond.negated { "!" } else { "" };
+                parts.push(format!("{bang}{}:{value}", cond.kind.prefix()));
             }
         }
         if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join(" "))
+            // The case modifier alone narrows nothing, so an expression with no
+            // conditions is still match-all.
+            return None;
         }
+        if self.case_insensitive {
+            parts.insert(0, "case:insensitive".to_string());
+        }
+        Some(parts.join(" "))
     }
 
     /// Render the FILTER section. `count_repo` is the repo whose index backs the
@@ -428,10 +471,18 @@ impl FilterBuilder {
                             editing_idx = Some(i);
                         }
                         let shown = cond.value.trim();
-                        let text = if shown.is_empty() {
-                            format!("{}: …", cond.kind.label())
+                        // A negated condition reads "NOT NAME: *.mp3", so the
+                        // inversion is visible on the chip itself rather than
+                        // only inside the editor.
+                        let label = if cond.negated {
+                            format!("NOT {}", cond.kind.label())
                         } else {
-                            format!("{}: {}", cond.kind.label(), shown)
+                            cond.kind.label().to_string()
+                        };
+                        let text = if shown.is_empty() {
+                            format!("{label}: …")
+                        } else {
+                            format!("{label}: {shown}")
                         };
                         let fill = if cond.editing {
                             theme::ORANGE
@@ -524,8 +575,23 @@ impl FilterBuilder {
                         }
                     }
 
-                    if !self.filters.is_empty()
-                        && ui
+                    // Case mode applies to every text condition at once, so it is
+                    // a bar-level toggle rather than a per-condition one.
+                    if !self.filters.is_empty() {
+                        if crate::lcars::toggle_button(ui, "Aa", self.case_insensitive, theme::BLUE)
+                            .explain(
+                                self.verbosity,
+                                "Ignore upper/lower case",
+                                "When on, text conditions match regardless of capitalisation, so \
+                             *.jpg also finds PHOTO.JPG. Size and date conditions are \
+                             unaffected.",
+                            )
+                            .clicked()
+                        {
+                            acts.push(Act::ToggleCase);
+                        }
+
+                        if ui
                             .add(
                                 egui::Button::new(RichText::new("CLEAR").color(theme::BLACK))
                                     .fill(theme::RED),
@@ -536,8 +602,9 @@ impl FilterBuilder {
                                 "Remove every filter condition, going back to matching all files.",
                             )
                             .clicked()
-                    {
-                        acts.push(Act::ClearConds);
+                        {
+                            acts.push(Act::ClearConds);
+                        }
                     }
                 });
 
@@ -664,6 +731,20 @@ impl FilterBuilder {
                     .color(theme::LILAC)
                     .size(11.0),
             );
+            // NOT inverts just this condition; conditions still combine with AND,
+            // so "images, except thumbnails" is MIME image + NOT NAME *thumb*.
+            let negated = self.filters.get(idx).is_some_and(|c| c.negated);
+            if crate::lcars::toggle_button(ui, "NOT", negated, theme::ORANGE)
+                .explain(
+                    self.verbosity,
+                    "Invert this condition",
+                    "Match everything this condition does *not* select — for example NOT \
+                     NAME *.mp3 keeps every file that is not an MP3.",
+                )
+                .clicked()
+            {
+                acts.push(Act::ToggleNegate(idx));
+            }
             if let Some(cond) = self.filters.get_mut(idx) {
                 changed |= ui
                     .add(
@@ -831,6 +912,7 @@ impl FilterBuilder {
                     kind,
                     value: String::new(),
                     editing: true,
+                    negated: false,
                 });
                 self.adding = false;
                 self.schedule_count();
@@ -879,6 +961,19 @@ impl FilterBuilder {
                 self.schedule_count();
                 true
             }
+            Act::ToggleNegate(i) => {
+                let Some(cond) = self.filters.get_mut(i) else {
+                    return false;
+                };
+                cond.negated = !cond.negated;
+                self.schedule_count();
+                true
+            }
+            Act::ToggleCase => {
+                self.case_insensitive = !self.case_insensitive;
+                self.schedule_count();
+                true
+            }
             Act::StorePreset => {
                 self.store_preset(store);
                 false
@@ -893,6 +988,7 @@ impl FilterBuilder {
                                 kind,
                                 value: c.value.clone(),
                                 editing: false,
+                                negated: c.negated,
                             })
                         })
                         .collect();
@@ -994,6 +1090,7 @@ impl FilterBuilder {
             .map(|c| SavedCond {
                 kind: c.kind.prefix().to_string(),
                 value: c.value.trim().to_string(),
+                negated: c.negated,
             })
             .collect();
         if conds.is_empty() {
@@ -1039,12 +1136,21 @@ impl FilterBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui_kittest::kittest::Queryable;
 
     fn cond(kind: FilterKind, value: &str) -> FilterCond {
         FilterCond {
             kind,
             value: value.to_string(),
             editing: false,
+            negated: false,
+        }
+    }
+
+    fn negated_cond(kind: FilterKind, value: &str) -> FilterCond {
+        FilterCond {
+            negated: true,
+            ..cond(kind, value)
         }
     }
 
@@ -1072,6 +1178,193 @@ mod tests {
     }
 
     #[test]
+    fn negated_condition_emits_a_bang() {
+        let mut fb = FilterBuilder::new();
+        fb.filters = vec![
+            cond(FilterKind::Mime, "image"),
+            negated_cond(FilterKind::Name, "*thumb*"),
+        ];
+        assert_eq!(
+            fb.filter_string().as_deref(),
+            Some("mime:image !name:*thumb*")
+        );
+    }
+
+    #[test]
+    fn case_toggle_emits_the_modifier() {
+        let mut fb = FilterBuilder::new();
+        fb.filters = vec![cond(FilterKind::Name, "*.jpg")];
+        assert_eq!(fb.filter_string().as_deref(), Some("name:*.jpg"));
+
+        fb.case_insensitive = true;
+        assert_eq!(
+            fb.filter_string().as_deref(),
+            Some("case:insensitive name:*.jpg")
+        );
+
+        // The modifier alone narrows nothing, so it is not emitted on its own.
+        fb.filters.clear();
+        assert_eq!(fb.filter_string(), None);
+    }
+
+    #[test]
+    fn expression_round_trips_through_the_builder() {
+        // What filter_string emits, set_expression must read back identically —
+        // this is the path a saved rule or preset takes.
+        for expr in [
+            "mime:image !name:*thumb*",
+            "case:insensitive name:*.jpg",
+            "case:insensitive !mime:audio size:>=100",
+            "name:!important",
+        ] {
+            let mut fb = FilterBuilder::new();
+            fb.set_expression(expr);
+            assert_eq!(
+                fb.filter_string().as_deref(),
+                Some(expr),
+                "round trip {expr}"
+            );
+        }
+    }
+
+    /// Drive a real `FilterBuilder` through `ui()` in a headless harness, so the
+    /// NOT / `Aa` controls are actually rendered and clicked rather than having
+    /// their state poked directly. Returns the builder for assertions.
+    fn harness_with(
+        conds: Vec<FilterCond>,
+        click: &str,
+    ) -> Result<FilterBuilder, Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(Store::open_at(dir.path().to_path_buf())?);
+        let mut fb = FilterBuilder::new();
+        fb.filters = conds;
+        let mut init = false;
+
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, fb: &mut FilterBuilder| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    fb.ui(ui, &store, None, TooltipVerbosity::default());
+                },
+                fb,
+            );
+
+        harness.run();
+        harness.get_by_label(click).click();
+        harness.run();
+        Ok(harness.into_state())
+    }
+
+    #[test]
+    fn clicking_not_negates_that_condition() -> Result<(), Box<dyn std::error::Error>> {
+        // The condition must be `editing` for its inline editor (which hosts NOT)
+        // to be on screen.
+        let mut editing = cond(FilterKind::Name, "*.mp3");
+        editing.editing = true;
+        let fb = harness_with(vec![editing], "NOT")?;
+
+        assert!(
+            fb.filters[0].negated,
+            "clicking NOT inverts the condition it belongs to"
+        );
+        assert_eq!(
+            fb.filter_string().as_deref(),
+            Some("!name:*.mp3"),
+            "and that reaches the composed expression"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn clicking_aa_switches_to_case_insensitive() -> Result<(), Box<dyn std::error::Error>> {
+        let fb = harness_with(vec![cond(FilterKind::Name, "*.jpg")], "Aa")?;
+
+        assert!(
+            fb.case_insensitive,
+            "clicking Aa turns off case sensitivity"
+        );
+        assert_eq!(
+            fb.filter_string().as_deref(),
+            Some("case:insensitive name:*.jpg"),
+            "and that reaches the composed expression"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_filter_bar_stays_inside_a_narrow_window() -> Result<(), Box<dyn std::error::Error>> {
+        // The Aa toggle shares the chips' wrapped row, so assert geometrically
+        // that nothing escapes the window — a label query would pass even clipped.
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(Store::open_at(dir.path().to_path_buf())?);
+        let mut fb = FilterBuilder::new();
+        fb.filters = vec![
+            cond(FilterKind::Mime, "image/"),
+            negated_cond(FilterKind::Name, "*thumbnail*"),
+            cond(FilterKind::Size, ">=100000"),
+        ];
+        fb.case_insensitive = true;
+        let mut init = false;
+
+        let width = 560.0;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(width, 700.0))
+            .build_ui_state(
+                move |ui, fb: &mut FilterBuilder| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx());
+                        init = true;
+                    }
+                    fb.ui(ui, &store, None, TooltipVerbosity::default());
+                },
+                fb,
+            );
+        harness.run();
+
+        for label in ["Aa", "CLEAR"] {
+            let rect = harness.get_by_label(label).rect();
+            assert!(
+                rect.max.x <= width,
+                "'{label}' escapes the {width}px window: {rect:?}"
+            );
+            assert!(rect.min.x >= 0.0, "'{label}' starts off-screen: {rect:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parsing_reads_negation_and_case_back() {
+        let (conds, ci) = parse_conditions("case:insensitive mime:image !name:*thumb*");
+        assert!(ci, "case modifier recognised");
+        assert_eq!(conds.len(), 2);
+        assert_eq!(conds[0].kind, FilterKind::Mime);
+        assert_eq!(conds[0].value, "image");
+        assert!(!conds[0].negated);
+        assert_eq!(conds[1].kind, FilterKind::Name);
+        assert_eq!(conds[1].value, "*thumb*");
+        assert!(conds[1].negated, "negation survives the round trip");
+
+        // The case modifier must terminate the preceding value rather than being
+        // absorbed into it.
+        let (conds, ci) = parse_conditions("name:foo case:insensitive");
+        assert!(ci);
+        assert_eq!(conds.len(), 1);
+        assert_eq!(conds[0].value, "foo");
+
+        // A '!' inside a value is ordinary text, not a negation.
+        let (conds, _) = parse_conditions("name:!important");
+        assert_eq!(conds.len(), 1);
+        assert_eq!(conds[0].value, "!important");
+        assert!(!conds[0].negated);
+    }
+
+    #[test]
     fn history_round_trips_through_json_file() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join(HISTORY_FILE);
@@ -1085,6 +1378,7 @@ mod tests {
             conds: vec![SavedCond {
                 kind: "mime".to_string(),
                 value: "image/".to_string(),
+                negated: false,
             }],
         });
 

@@ -701,6 +701,9 @@ struct SideView<'a> {
     /// Draw this side's own repo chip (the board's right side spans several
     /// repos, as GROUP SYNC's sinks do).
     multi_repo: bool,
+    /// The opposite side's names, so the characters that differ can be picked
+    /// out. Empty when there is no counterpart to compare against.
+    counterpart: &'a [String],
 }
 
 /// The per-board constants every row is drawn against. One value, computed
@@ -752,6 +755,7 @@ fn draw_row(
             size: meta.left_size,
             modified: meta.left_modified,
             multi_repo: false,
+            counterpart: &meta.right_paths,
         },
     );
 
@@ -812,6 +816,7 @@ fn draw_row(
                 size: meta.right_size,
                 modified: meta.right_modified,
                 multi_repo,
+                counterpart: &meta.left_paths,
             },
         );
     }
@@ -856,24 +861,163 @@ fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view:
         {
             crate::repo_chip::repo_chip(ui, repo, false, theme::BLUE, view.body.repo_is_main, None);
         }
-        for path in view.paths {
+        // Which counterpart name each of this side's names is compared against.
+        // A side may list several names for one content (BY HASH); they are
+        // paired off in order, and a name with no counterpart is not painted.
+        for (i, path) in view.paths.iter().enumerate() {
             // Elided from the left, so the distinguishing tail survives — two
             // files under a long shared prefix would otherwise clip to the same
             // text. `truncate` is the backstop when the estimate runs long.
-            ui.add(
-                egui::Label::new(
-                    RichText::new(elide_left(path, chars_that_fit(text_width, 12.0)))
-                        .size(12.0)
-                        .color(view.status.color()),
-                )
-                .truncate(),
-            )
-            .on_hover_text(path);
+            let shown = elide_left(path, chars_that_fit(text_width, 12.0));
+            let job = highlight_job(
+                &shown,
+                path,
+                view.counterpart.get(i).map(String::as_str),
+                view.status.color(),
+                ui,
+            );
+            ui.add(egui::Label::new(job).truncate()).on_hover_text(path);
         }
         if let Some(line) = facts_line(view.size, view.modified, view.body.facts.as_ref()) {
             ui.add(egui::Label::new(RichText::new(line).color(theme::TAN).size(10.5)).truncate());
         }
     });
+}
+
+/// Byte ranges of `a` that do not appear in the corresponding place of `b`,
+/// computed from the **longest common subsequence** of the two names.
+///
+/// A positional, character-by-character comparison is the obvious approach and
+/// the wrong one: inserting a single character shifts everything after it, so
+/// the whole tail reads as "different" and the highlight becomes noise. Matching
+/// on a common subsequence instead means `photo.jpg` vs `photo1.jpg` highlights
+/// just the `1`.
+///
+/// Compares the file **name**, not the path — a shared parent directory is not a
+/// difference worth painting.
+fn name_diff_ranges(a: &str, b: &str) -> Vec<std::ops::Range<usize>> {
+    let av: Vec<char> = a.chars().collect();
+    let bv: Vec<char> = b.chars().collect();
+    // Classic LCS table. Names are short, so the quadratic table is fine; guard
+    // anyway so a pathological path cannot cost real time.
+    const MAX: usize = 512;
+    if av.len() > MAX || bv.len() > MAX {
+        return Vec::new();
+    }
+    let mut table = vec![vec![0usize; bv.len() + 1]; av.len() + 1];
+    for i in (0..av.len()).rev() {
+        for j in (0..bv.len()).rev() {
+            table[i][j] = if av[i] == bv[j] {
+                table[i + 1][j + 1] + 1
+            } else {
+                table[i + 1][j].max(table[i][j + 1])
+            };
+        }
+    }
+    // Walk the table, recording the runs of `a` that are not part of the LCS.
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    let (mut i, mut j, mut byte) = (0usize, 0usize, 0usize);
+    while i < av.len() {
+        let width = av[i].len_utf8();
+        if j < bv.len() && av[i] == bv[j] {
+            // Part of the common subsequence: keep it plain.
+            i += 1;
+            j += 1;
+            byte += width;
+        } else if j < bv.len() && table[i + 1][j] < table[i][j + 1] {
+            // Consuming a character of `b` keeps more in common — `b` has an
+            // insertion here, which is nothing to paint in `a`.
+            j += 1;
+        } else {
+            push_range(&mut ranges, byte..byte + width);
+            i += 1;
+            byte += width;
+        }
+    }
+    ranges
+}
+
+/// Append `r`, merging it into the previous range when they touch, so a run of
+/// differing characters is one highlight rather than several.
+fn push_range(ranges: &mut Vec<std::ops::Range<usize>>, r: std::ops::Range<usize>) {
+    match ranges.last_mut() {
+        Some(last) if last.end == r.start => last.end = r.end,
+        _ => ranges.push(r),
+    }
+}
+
+/// The file name part of a relative path (what [`name_diff_ranges`] compares),
+/// plus its byte offset within the path so ranges can be shifted back.
+fn file_name_at(path: &str) -> (usize, &str) {
+    match path.rfind('/') {
+        Some(i) => (i + 1, &path[i + 1..]),
+        None => (0, path),
+    }
+}
+
+/// Lay out `shown` (the possibly-elided form of `full`) with the characters that
+/// differ from `other`'s file name given a highlighted background.
+///
+/// Elision complicates this: ranges are computed against the real name, so they
+/// are only applied when the label is showing that name untruncated. An elided
+/// label falls back to plain text rather than painting the wrong characters.
+fn highlight_job(
+    shown: &str,
+    full: &str,
+    other: Option<&str>,
+    colour: egui::Color32,
+    ui: &egui::Ui,
+) -> egui::text::LayoutJob {
+    let font = egui::FontId::proportional(12.0);
+    let mut job = egui::text::LayoutJob::default();
+    let plain = |job: &mut egui::text::LayoutJob, text: &str| {
+        job.append(
+            text,
+            0.0,
+            egui::TextFormat {
+                font_id: font.clone(),
+                color: colour,
+                ..Default::default()
+            },
+        );
+    };
+
+    let Some(other) = other else {
+        plain(&mut job, shown);
+        return job;
+    };
+    let (offset, name) = file_name_at(full);
+    let (_, other_name) = file_name_at(other);
+    let ranges = name_diff_ranges(name, other_name);
+    // Nothing differs, or the label is elided and the offsets no longer line up.
+    if ranges.is_empty() || shown != full {
+        plain(&mut job, shown);
+        return job;
+    }
+
+    let hl = ui.visuals().selection.bg_fill.gamma_multiply(0.9);
+    plain(&mut job, &full[..offset]);
+    let mut at = 0usize;
+    for r in ranges {
+        if r.start > at {
+            plain(&mut job, &name[at..r.start]);
+        }
+        job.append(
+            &name[r.clone()],
+            0.0,
+            egui::TextFormat {
+                font_id: font.clone(),
+                color: colour,
+                background: hl,
+                ..Default::default()
+            },
+        );
+        at = r.end;
+    }
+    if at < name.len() {
+        plain(&mut job, &name[at..]);
+    }
+    job
 }
 
 /// Roughly how many characters of `pt`-sized proportional text fit in `width`.
@@ -1028,6 +1172,114 @@ fn summary(ui: &mut egui::Ui, totals: [usize; 4]) {
 
 #[cfg(test)]
 mod tests {
+
+    /// Highlighting is paint only: it must not change how tall a row is, or the
+    /// prefix-sum index would disagree with what is drawn.
+    #[test]
+    fn highlighting_does_not_change_row_height() {
+        let row = |left: &str, right: &str| RowMeta {
+            key: "k".to_string(),
+            left_status: Status::Differs,
+            right_status: Status::Differs,
+            left_paths: vec![left.to_string()],
+            right_paths: vec![right.to_string()],
+            left_size: 0,
+            right_size: 0,
+            left_modified: 0,
+            right_modified: 0,
+            unchanged: false,
+            cmds: some_cmds(1),
+        };
+        let differing = row("a/photo1.jpg", "a/photo.jpg");
+        let identical = row("a/photo.jpg", "a/photo.jpg");
+        assert_eq!(
+            differing.height(),
+            identical.height(),
+            "a highlighted row is exactly as tall as an unhighlighted one"
+        );
+    }
+
+    /// A name with no counterpart on the other side is left plain rather than
+    /// being compared against an unrelated name.
+    #[test]
+    fn a_name_without_a_counterpart_is_not_painted() {
+        // Two names on the left, one on the right: the second has no partner.
+        let left = ["photo.jpg".to_string(), "photo (1).jpg".to_string()];
+        let right = ["photo.jpg".to_string()];
+        assert!(
+            right.get(1).is_none(),
+            "the second left name has no counterpart, so nothing is compared"
+        );
+        // The first pair is identical, so even that one paints nothing.
+        assert!(name_diff_ranges(&left[0], &right[0]).is_empty());
+    }
+
+    /// Highlighting must come from a common-subsequence match, not a positional
+    /// one: the reporter predicted the trap themselves — "some smart algorithm
+    /// that prevents a 1:1 comparison and highlighting everything after an
+    /// additional character".
+    #[test]
+    fn an_inserted_character_highlights_only_that_character() {
+        let a = "photo1.jpg";
+        let b = "photo.jpg";
+        let ranges = name_diff_ranges(a, b);
+        let shown: Vec<&str> = ranges.iter().map(|r| &a[r.clone()]).collect();
+        assert_eq!(shown, ["1"], "only the inserted character differs");
+    }
+
+    #[test]
+    fn a_changed_extension_highlights_the_extension() {
+        let a = "clip.mov";
+        let b = "clip.mp4";
+        let ranges = name_diff_ranges(a, b);
+        let shown: String = ranges.iter().map(|r| &a[r.clone()]).collect();
+        assert!(
+            shown.contains('o') || shown.contains('v'),
+            "the differing extension characters are highlighted, got {shown:?}"
+        );
+        // The shared stem is never painted.
+        assert!(
+            ranges.iter().all(|r| r.start >= 4),
+            "the common 'clip' stem stays plain: {ranges:?}"
+        );
+    }
+
+    #[test]
+    fn identical_names_highlight_nothing() {
+        assert!(name_diff_ranges("holiday.png", "holiday.png").is_empty());
+    }
+
+    #[test]
+    fn a_shared_prefix_run_is_one_highlight_not_many() {
+        // "copy_of_" inserted at the front: one merged range, not eight.
+        let a = "copy_of_report.txt";
+        let b = "report.txt";
+        let ranges = name_diff_ranges(a, b);
+        assert_eq!(ranges.len(), 1, "adjacent differences merge: {ranges:?}");
+        assert_eq!(&a[ranges[0].clone()], "copy_of_");
+    }
+
+    #[test]
+    fn diffing_is_over_the_file_name_not_the_directory() {
+        // Same name under different parents: nothing to paint.
+        let (off_a, name_a) = file_name_at("2021/holiday.jpg");
+        let (_, name_b) = file_name_at("backup/2019/holiday.jpg");
+        assert_eq!(name_a, "holiday.jpg");
+        assert_eq!(off_a, 5);
+        assert!(
+            name_diff_ranges(name_a, name_b).is_empty(),
+            "a differing parent directory is not a name difference"
+        );
+    }
+
+    #[test]
+    fn a_pathological_length_is_skipped_rather_than_costing_quadratic_time() {
+        let long = "x".repeat(600);
+        assert!(
+            name_diff_ranges(&long, "short.txt").is_empty(),
+            "over the guard length, highlighting is simply not offered"
+        );
+    }
     use super::*;
 
     /// `cmds` distinct commands. They must differ in kind: the grid pairs by
@@ -1776,7 +2028,12 @@ mod tests {
         simple.right_status = Status::Absent;
         simple.right_paths = Vec::new();
         simple.cmds = vec![Cmd::CopyRight, Cmd::DeleteLeft, Cmd::Hide];
-        let metas = vec![diff_row("holiday"), multi, simple];
+        // A rename pair, so the screenshot shows the differing characters picked
+        // out (`_v2` here) rather than two identical names.
+        let mut renamed = diff_row("holiday");
+        renamed.left_paths = vec!["a/b/holiday_v2.jpg".into()];
+        renamed.right_paths = vec!["a/b/holiday.jpg".into()];
+        let metas = vec![renamed, multi, simple];
 
         let mut init = false;
         let mut harness = egui_kittest::Harness::builder()

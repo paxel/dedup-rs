@@ -107,6 +107,14 @@ pub enum UpdateError {
 
     #[error("Failed to build hashing thread pool: {0}")]
     ThreadPool(String),
+
+    #[error(
+        "Scanning '{repo}' found no files at all, but its index holds {entries}. Marking every \
+         entry missing would empty the index — and if this repo is a sync group's main, the next \
+         MIRROR push would then wipe its sinks. If the drive should not be empty, check it is \
+         mounted. To scan it anyway, re-run with --force."
+    )]
+    WouldEmptyIndex { repo: String, entries: u64 },
 }
 
 struct WalkedFile {
@@ -251,6 +259,27 @@ pub fn update_repo(
     progress: &dyn Progress,
     cancel: &CancellationToken,
 ) -> Result<UpdateStats, UpdateError> {
+    update_repo_authorized(store, name, threads, progress, cancel, false)
+}
+
+/// [`update_repo`], with explicit authorisation for the destructive-empty case.
+///
+/// A walk that finds **no file at all** over an index that still holds entries
+/// marks every one of them missing. That is far more often an unmounted drive
+/// than a repo somebody emptied — an unmounted mountpoint is still a directory,
+/// so the `is_dir` check below lets it through — and an emptied main turns the
+/// next MIRROR push into a wipe of every sink. So it is refused with
+/// [`UpdateError::WouldEmptyIndex`] unless `allow_empty` is set, and the index is
+/// left untouched. Emptying a repo on purpose stays supported; it costs one
+/// explicit confirmation (GUI) or `--force` (CLI).
+pub fn update_repo_authorized(
+    store: &Store,
+    name: &str,
+    threads: usize,
+    progress: &dyn Progress,
+    cancel: &CancellationToken,
+    allow_empty: bool,
+) -> Result<UpdateStats, UpdateError> {
     let meta = store.get_repo(name)?;
     let root = PathBuf::from(&meta.abs_path);
     if !root.is_dir() {
@@ -377,6 +406,21 @@ pub fn update_repo(
     // marked missing — but the caller is told, because an emptied main is what
     // turns a MIRROR sync into a wipe.
     stats.empty_walk = total == 0 && stats.unchanged == 0 && !remaining.is_empty();
+
+    // Refuse before anything is marked, unless the caller authorised it. The
+    // walk found no files, so nothing has been written yet and the index is
+    // exactly as it was.
+    if stats.empty_walk && !allow_empty && !cancel.is_cancelled() {
+        log::error!(
+            "refusing to scan '{}': it walked empty while its index holds {} entries",
+            meta.abs_path,
+            remaining.len()
+        );
+        return Err(UpdateError::WouldEmptyIndex {
+            repo: name.to_string(),
+            entries: remaining.len() as u64,
+        });
+    }
 
     // Only a complete, uncancelled walk proves a file vanished.
     if cancel.is_cancelled() {

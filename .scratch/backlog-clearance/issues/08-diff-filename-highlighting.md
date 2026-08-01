@@ -1,6 +1,6 @@
 # 08 — Highlight the differing characters between two near-identical filenames
 
-Status: ready-for-agent
+Status: resolved
 Spec: ../spec.md
 
 ## Problem
@@ -51,3 +51,34 @@ Render check: a `doc_screenshot_` for a BY HASH row with highlighting, looked at
 
 Standing gate green. `CHANGELOG.md`, `ai/improvements.md`, and the GUI documentation page for
 the Transfer tab updated.
+
+## Comments
+
+**Implemented 2026-07-31.** Gate green: fmt clean, clippy 0 warnings, `cargo test --workspace`
+24 suites / 0 failures.
+
+`name_diff_ranges(a, b)` returns the byte ranges of `a` absent from the longest common
+subsequence with `b`; adjacent ranges merge so a run is one highlight rather than several.
+`highlight_job` turns those into a `LayoutJob` with a highlighted background per run.
+
+Decisions the ticket left open:
+
+- **Names, not paths.** `file_name_at` splits the basename off first, so a differing parent
+  directory is never painted. Pinned by `diffing_is_over_the_file_name_not_the_directory`.
+- **Multi-name rows**: a side's names are paired against the other side's **in order**, and a
+  name with no counterpart is rendered plain rather than compared against an unrelated one.
+- **Colour** comes from `visuals().selection.bg_fill`, not a new constant.
+- **Elision interaction**, which the ticket did not anticipate: ranges are computed against the
+  real name, but the label may be elided from the left, which shifts every offset. Painting
+  then would highlight the wrong characters, so an elided label falls back to plain text.
+- A 512-character guard keeps the quadratic LCS table off pathological paths.
+
+Six algorithm tests plus `highlighting_does_not_change_row_height` (paint must not desync the
+prefix-sum index) and `a_name_without_a_counterpart_is_not_painted`.
+
+**Verified by rendering, not just asserting** — the standing lesson in this repo. The doc
+screenshot gained a rename pair so the feature is actually visible, and
+`docs/screenshots/board.png` was regenerated and looked at: `a/b/holiday_v2.jpg` highlights
+`_v2` only (the shared stem and `.jpg` stay plain — exactly the insertion trap the reporter
+predicted), `photo.jpg` vs `IMG_0042.jpg` highlights both differing stems, and the counterpart
+row shows no highlight because the insertion exists on one side only.

@@ -38,7 +38,7 @@ Repository lifecycle management.
 | `dedup repo mv <name> <new_name>`                                   | Rename a repository's registry entry (its target folder is unchanged).                                                                                                                                                                                                                                                          |
 | `dedup repo rel <name> <new_path>`                                  | Point a repository at a different folder while keeping its existing index — use after moving the data.                                                                                                                                                                                                                          |
 | `dedup repo cp <source> <dest> <path>`                              | Clone `source`'s entire index into a new repository `dest` at `path`. `source` is left completely unchanged; this is for branching off a snapshot, not moving anything.                                                                                                                                                         |
-| `dedup repo update <name>... \| -a/--all [-t/--threads N]`          | Walk the repository's folder, hash new/changed files (in parallel across `--threads` threads; `0` = one thread per CPU core), and mark vanished files missing. Already-hashed unchanged files are skipped, so a repeat run is fast. Shows live progress and can be cancelled with Ctrl-C — already-hashed files stay committed. |
+| `dedup repo update <name>... \| -a/--all [-t/--threads N] [--force]` | Walk the repository's folder, hash new/changed files (in parallel across `--threads` threads; `0` = one thread per CPU core), and mark vanished files missing. Already-hashed unchanged files are skipped, so a repeat run is fast. Shows live progress and can be cancelled with Ctrl-C — already-hashed files stay committed. A scan that finds **no files at all** over a non-empty index is refused (an unmounted drive looks exactly like this, and an emptied sync-group main would make the next MIRROR push a wipe); pass `--force` to allow it. |
 | `dedup repo dupes <name>... \| -a/--all [--threshold N] [--delete]` | Find exact duplicates, or with `--threshold <1-100>` perceptually similar files (`similarity % = (1 − hamming_distance / bits) × 100`). `--delete` removes every copy except the best one per group.                                                                                                                            |
 
 Alongside the content hash, `update` computes a perceptual fingerprint by MIME kind: a
@@ -173,9 +173,17 @@ are treated as opaque members (one level deep); encrypted or unreadable archives
 | `origin:<substring>`                             | The repo the file was copied/synced from (provenance) contains this substring.                                                        |
 | `date:YYYY[-MM[-DD]]`                            | The file's best-known date (EXIF capture time, else mtime) falls in that year/month/day.                                              |
 | `before:YYYY[-MM[-DD]]` / `after:YYYY[-MM[-DD]]` | Best-known date is strictly before / on-or-after the given point.                                                                     |
+| `case:sensitive` / `case:insensitive`            | Whether text fields match regardless of capitalisation. Sensitive is the default; size and date fields are unaffected.                |
+
+Any field can be **negated** by prefixing it with `!`, which matches everything the field does
+*not* select: `!mime:image` is "not an image", `!name:*.mp3` is "not an MP3". Since fields
+combine with AND, mixing them reads naturally — `-f "mime:image !name:*thumb*"` is "images,
+except thumbnails". The `!` is only special at the start of a field, so a value may contain it
+freely: `-f "name:!important"` searches for that literal text.
 
 Example: `-f "mime:image/ name:2020 size:>=1000"` matches images whose path contains `2020`
 and are at least 1000 bytes. `-f "date:2021-03"` matches everything from March 2021.
+`-f "case:insensitive name:*.jpg"` also finds `PHOTO.JPG`.
 
 The GUI's File Management tab exposes the same three base fields (`mime:`/`name:`/`size:`) as
 an assisted pill builder — see [`docs/gui/files.md`](gui/files.md).

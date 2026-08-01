@@ -15,8 +15,10 @@
 //! stop the others, and every sink's outcome is reported.
 
 use crate::diff::{
-    DiffError, DiffItem, DiffRun, SyncDelete, SyncPlan, SyncStats, diff_print, diff_sync, plan_sync,
+    DiffError, DiffItem, DiffRun, SourceView, SyncDelete, SyncPlan, SyncStats, diff_print,
+    diff_sync_from, plan_sync_from,
 };
+use crate::filter::FileFilter;
 use crate::store::{Store, SyncGroup, SyncMode};
 
 /// One repository's content overlap with a reference repository, compared by
@@ -125,15 +127,19 @@ pub fn plan_group_sync(
     group: &SyncGroup,
 ) -> Result<Vec<(String, SyncPlan)>, DiffError> {
     guard_mirror_source(store, group)?;
+    // Every sink is planned against the same main, so its index is streamed once
+    // here rather than re-read inside each `plan_sync`.
+    let filter = FileFilter::All;
+    let main = SourceView::collect(store, &group.main, &filter)?;
     let mut plans = Vec::with_capacity(group.sinks.len());
     for sink in &group.sinks {
-        let plan = plan_sync(
+        let plan = plan_sync_from(
             store,
-            &group.main,
+            &main,
             &sink.repo,
             true,
             delete_mode(sink.mode),
-            None,
+            &filter,
         )?;
         plans.push((sink.repo.clone(), plan));
     }
@@ -163,6 +169,11 @@ pub fn run_group_sync(
     // A group-level refusal is not a per-sink failure: nothing is attempted.
     guard_mirror_source(store, group)?;
     log::info!("pushing '{}' to {} sink(s)", group.main, group.sinks.len(),);
+    // The main is the same for every sink, so its index is streamed once here
+    // instead of being re-read inside each `diff_sync`. Collected after the
+    // guard, so an empty-main mirror is still refused before any work.
+    let filter = FileFilter::All;
+    let main = SourceView::collect(store, &group.main, &filter)?;
     let mut results = Vec::with_capacity(group.sinks.len());
     for sink in &group.sinks {
         let repo = sink.repo.as_str();
@@ -171,13 +182,13 @@ pub fn run_group_sync(
         let outcome = if run.cancel.is_cancelled() {
             SinkOutcome::Skipped
         } else {
-            match diff_sync(
+            match diff_sync_from(
                 store,
-                &group.main,
+                &main,
                 repo,
                 true,
                 delete_mode(sink.mode),
-                None,
+                &filter,
                 run,
             ) {
                 Ok(stats) => {

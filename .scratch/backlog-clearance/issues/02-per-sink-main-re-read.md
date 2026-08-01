@@ -1,6 +1,6 @@
 # 02 — Read the sync group's main once per push, not once per sink
 
-Status: ready-for-agent
+Status: resolved
 Spec: ../spec.md
 
 ## Problem
@@ -43,3 +43,30 @@ implementation-detail testing.
 ## Done
 
 Standing gate green. `CHANGELOG.md` and `ai/improvements.md` updated.
+
+## Comments
+
+**Implemented 2026-07-31.** Gate green: fmt clean, clippy clean, `cargo test --workspace`
+24 suites / 0 failures (sync_groups: 24 tests).
+
+Took the additive route the ticket recommended, which turned out to be genuinely small
+because both `plan_sync` and `diff_sync` use the source for only three things: the entries
+the filter admits, the repo root on disk, and the repo name for provenance. That is exactly
+what `diff::SourceView` now holds, collected by `SourceView::collect`.
+
+- `plan_sync_from` / `diff_sync_from` take a `&SourceView` and do the real work.
+- `plan_sync` / `diff_sync` keep their **exact existing signatures** and simply collect a
+  view then delegate — so Transfer, the CLI and every other caller were untouched, which was
+  the risk the ticket flagged.
+- Only `plan_group_sync` / `run_group_sync` changed behaviourally: each collects one view
+  and passes it to every sink.
+
+Ordering detail worth keeping: the view is collected **after** `guard_mirror_source`, so an
+empty-main mirror is still refused before any index work happens. Pinned by
+`a_shared_main_view_still_refuses_an_empty_mirror`, which also asserts the sink's file
+survives.
+
+Per the ticket, the assertions are behaviour parity, not a read counter — an artificial
+counter would have been implementation-detail testing. Three new tests: a two-sink push with
+*different modes* (AddOnly keeps the sink's own `extra.txt`, Mirror converges), the empty-main
+refusal above, and a cancelled multi-sink push still reporting every sink as `Skipped`.

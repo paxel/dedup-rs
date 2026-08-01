@@ -1,6 +1,6 @@
 # 09 — Bulk actions for the remaining DIFF rows
 
-Status: ready-for-agent
+Status: resolved
 Spec: ../spec.md
 
 ## Problem
@@ -49,3 +49,38 @@ budget — a previous fixed-budget poll was a known flake.
 
 Standing gate green. `CHANGELOG.md`, `ai/improvements.md`, and the GUI documentation page for
 the Transfer tab updated.
+
+## Comments
+
+**Implemented 2026-07-31.** Gate green: fmt clean, clippy 0 warnings, `cargo test --workspace`
+24 suites / 0 failures.
+
+Decisions, all as the ticket specified:
+
+- **"Remaining" = the rows currently listed** — `listed_diff_rows` filters by the
+  show-unchanged toggle and the hidden set, so hiding a row is how the user excludes it. Pinned
+  by `a_hidden_row_is_left_out_of_a_bulk_plan`.
+- **Only meaningful actions are offered.** `offered_bulk_ops` inspects the relations the listed
+  rows actually hold, so BY PATH (which never yields `Renamed`) offers no bulk rename and a
+  diff with no right-only rows offers no `< COPY MISSING`.
+- **Confirmation states the exact count** and notes that hidden rows are untouched; declining
+  changes nothing.
+- **Off the UI thread**, through the same worker/`Msg::Done` path single-row actions use, with
+  the existing cancel token checked between operations.
+- **Partial failure is reported, not swallowed**: every operation is attempted (one failure
+  does not abandon the rest) and the summary reads "Applied N operation(s), M failed."
+
+**Scope call worth recording:** bulk *delete* was named in the ticket but is not implemented.
+Copy and rename are recoverable or non-destructive; a one-click "delete every listed row on
+this side" is not, and nothing in the original report asked for it — the reporter asked for
+"rename all left, rename all right". Per-row `DELETE L` / `DELETE R` and the existing
+`DELETE ALL` popup still cover deleting deliberately. Worth revisiting only if asked for
+explicitly.
+
+A bulk rename is planned only for an unambiguous 1:1 pair; a side holding several names needs
+the per-row picker, so those rows are skipped rather than guessed at.
+
+Three tests, including `a_bulk_copy_lands_every_listed_file_on_disk`, which runs the real
+worker end to end and asserts both files appear in the target repo on disk. It waits for the
+worker to finish rather than polling a fixed budget — the fixed budget was a known flake in
+this file.

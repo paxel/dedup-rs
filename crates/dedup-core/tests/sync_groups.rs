@@ -595,7 +595,31 @@ fn an_empty_walk_is_flagged_and_disarms_mirror() -> TestResult {
     // Simulate the unmounted mountpoint: the directory is there, empty.
     std::fs::remove_file(sb.dir("MAIN").join("a.txt"))?;
     std::fs::remove_file(sb.dir("MAIN").join("b.txt"))?;
-    let stats = update_repo(&sb.store, "MAIN", 1, &NoProgress, &CancellationToken::new())?;
+
+    // Unauthorised, this is refused outright and the index is left intact —
+    // an unmounted drive must not be able to empty it.
+    assert!(
+        matches!(
+            update_repo(&sb.store, "MAIN", 1, &NoProgress, &CancellationToken::new()),
+            Err(dedup_core::update::UpdateError::WouldEmptyIndex { entries: 2, .. })
+        ),
+        "a walk that would empty the index is refused without authorisation"
+    );
+    assert_eq!(
+        live_paths(&sb.store, "MAIN")?,
+        ["a.txt", "b.txt"],
+        "the refusal leaves every entry exactly as it was"
+    );
+
+    // Authorised (the GUI confirmation / CLI --force), it proceeds as before.
+    let stats = dedup_core::update::update_repo_authorized(
+        &sb.store,
+        "MAIN",
+        1,
+        &NoProgress,
+        &CancellationToken::new(),
+        true,
+    )?;
 
     assert!(stats.empty_walk, "the scan flags a walk that found nothing");
     assert_eq!(stats.marked_missing, 2);
@@ -709,5 +733,125 @@ fn diff_overview_counts_unique_shared_and_missing_per_repo() -> TestResult {
         .find(|o| o.repo == "SINK2")
         .ok_or("SINK2 missing")?;
     assert_eq!((sink2.unique, sink2.shared, sink2.missing), (0, 0, 2));
+    Ok(())
+}
+
+// --- one main, several sinks ------------------------------------------------
+
+#[test]
+fn a_push_to_several_sinks_plans_and_runs_each_independently() -> TestResult {
+    // The main's index is collected once and shared across every sink's plan and
+    // run. This pins the behaviour that sharing must not change: each sink is
+    // still planned against its own contents and its own mode.
+    let sb = Sandbox::new()?;
+    write(&sb.dir("MAIN"), "a.txt", b"alpha")?;
+    write(&sb.dir("MAIN"), "b.txt", b"beta")?;
+    // SINK1 already has one of the two and an extra of its own.
+    write(&sb.dir("SINK1"), "a.txt", b"alpha")?;
+    write(&sb.dir("SINK1"), "extra.txt", b"only in sink1")?;
+    // SINK2 is empty, so it needs both.
+    sb.scan(&["MAIN", "SINK1", "SINK2"])?;
+    sb.store.create_sync_group("offsite", "MAIN")?;
+    sb.store
+        .add_sync_sink("offsite", "SINK1", SyncMode::AddOnly)?;
+    sb.store
+        .add_sync_sink("offsite", "SINK2", SyncMode::Mirror)?;
+    let group = sb.store.get_sync_group("offsite")?;
+
+    let plans = plan_group_sync(&sb.store, &group)?;
+    assert_eq!(plans.len(), 2, "one plan per sink, in group order");
+    assert_eq!(plans[0].0, "SINK1");
+    assert_eq!(plans[0].1.copies, ["b.txt"], "SINK1 only lacks b.txt");
+    assert!(
+        plans[0].1.deletes.is_empty(),
+        "AddOnly leaves extra.txt alone"
+    );
+    assert_eq!(plans[1].0, "SINK2");
+    let mut sink2_copies = plans[1].1.copies.clone();
+    sink2_copies.sort();
+    assert_eq!(sink2_copies, ["a.txt", "b.txt"], "SINK2 is empty");
+
+    let results = run_group_sync(
+        &sb.store,
+        &group,
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
+    )?;
+    assert_eq!(results.len(), 2);
+    for (repo, outcome) in &results {
+        assert!(
+            matches!(outcome, SinkOutcome::Pushed(_)),
+            "sink '{repo}' should have been pushed"
+        );
+    }
+
+    // Both sinks now hold the main's content; only the AddOnly sink kept its own.
+    assert_eq!(
+        live_paths(&sb.store, "SINK1")?,
+        ["a.txt", "b.txt", "extra.txt"]
+    );
+    assert_eq!(live_paths(&sb.store, "SINK2")?, ["a.txt", "b.txt"]);
+    Ok(())
+}
+
+#[test]
+fn a_shared_main_view_still_refuses_an_empty_mirror() -> TestResult {
+    // The guard runs before the main is collected, so the refusal survives the
+    // shared-source path exactly as before.
+    let sb = Sandbox::new()?;
+    write(&sb.dir("SINK1"), "keep.txt", b"precious")?;
+    sb.scan(&["MAIN", "SINK1", "SINK2"])?;
+    sb.store.create_sync_group("offsite", "MAIN")?;
+    sb.store
+        .add_sync_sink("offsite", "SINK1", SyncMode::Mirror)?;
+    sb.store
+        .add_sync_sink("offsite", "SINK2", SyncMode::Mirror)?;
+    let group = sb.store.get_sync_group("offsite")?;
+
+    assert!(
+        plan_group_sync(&sb.store, &group).is_err(),
+        "planning a mirror from an empty main is refused"
+    );
+    assert!(
+        run_group_sync(
+            &sb.store,
+            &group,
+            &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
+        )
+        .is_err(),
+        "so is running it"
+    );
+    assert_eq!(
+        live_paths(&sb.store, "SINK1")?,
+        ["keep.txt"],
+        "nothing was deleted"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_cancelled_multi_sink_push_still_reports_every_sink() -> TestResult {
+    // Cancelling must not drop sinks from the report, so the caller can say which
+    // backups are now stale — unchanged by sharing the main's view.
+    let sb = Sandbox::new()?;
+    write(&sb.dir("MAIN"), "a.txt", b"alpha")?;
+    sb.scan(&["MAIN", "SINK1", "SINK2"])?;
+    sb.store.create_sync_group("offsite", "MAIN")?;
+    sb.store
+        .add_sync_sink("offsite", "SINK1", SyncMode::AddOnly)?;
+    sb.store
+        .add_sync_sink("offsite", "SINK2", SyncMode::AddOnly)?;
+    let group = sb.store.get_sync_group("offsite")?;
+
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let results = run_group_sync(&sb.store, &group, &DiffRun::new(&NoDiffProgress, &cancel))?;
+
+    assert_eq!(results.len(), 2, "every sink is still reported");
+    for (repo, outcome) in &results {
+        assert!(
+            matches!(outcome, SinkOutcome::Skipped),
+            "sink '{repo}' should be reported as skipped"
+        );
+    }
     Ok(())
 }

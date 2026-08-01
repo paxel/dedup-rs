@@ -6,7 +6,7 @@ use dedup_core::diff::{
 use dedup_core::dupes::{DupeGroup, delete_duplicates, find_exact_duplicates, wasted_bytes};
 use dedup_core::similar::find_similar;
 use dedup_core::store::Store;
-use dedup_core::update::{CancellationToken, Progress, ProgressEvent, update_repo};
+use dedup_core::update::{CancellationToken, Progress, ProgressEvent, update_repo_authorized};
 
 #[derive(Parser)]
 #[command(name = "dedup")]
@@ -226,6 +226,10 @@ enum RepoCommands {
         /// Number of hashing threads (0 = one per CPU core)
         #[arg(short, long, default_value_t = 0)]
         threads: usize,
+        /// Allow a scan that finds no files to mark every indexed entry missing.
+        /// Without this, such a scan is refused — it is usually an unmounted drive.
+        #[arg(long)]
+        force: bool,
     },
     /// Find exact duplicates (or, with --threshold, similar files) in repositories
     Dupes {
@@ -327,8 +331,9 @@ fn main() -> anyhow::Result<()> {
                     names,
                     all,
                     threads,
+                    force,
                 } => {
-                    update_repos(&store, names, all, threads)?;
+                    update_repos(&store, names, all, threads, force)?;
                 }
                 RepoCommands::Dupes {
                     names,
@@ -798,6 +803,7 @@ fn update_repos(
     names: Vec<String>,
     all: bool,
     threads: usize,
+    force: bool,
 ) -> anyhow::Result<()> {
     let names: Vec<String> = if all {
         store
@@ -821,7 +827,7 @@ fn update_repos(
     for name in names {
         println!("Updating '{}'...", name);
         let progress = TerminalProgress::new();
-        let stats = update_repo(store, &name, threads, &progress, &cancel)?;
+        let stats = update_repo_authorized(store, &name, threads, &progress, &cancel, force)?;
         progress.finish();
         println!(
             "  added: {}, updated: {}, unchanged: {}, missing: {}, errors: {}, hashed: {}",

@@ -397,16 +397,19 @@ pub fn tab_kinds(
 }
 
 /// Draw the top tab bar displaying representation tabs available across Left (A) and Right (B).
+/// Takes the active tab by reference rather than a whole [`LightboxState`], so
+/// any surface comparing two files can use it — the Duplicates lightbox and the
+/// Transfer DIFF comparison both do.
 pub fn draw_tab_bar(
     ui: &mut egui::Ui,
-    state: &mut LightboxState,
+    active_tab: &mut RepresentationKind,
     left_reps: &FileRepresentations,
     right_reps: &FileRepresentations,
 ) {
     ui.horizontal(|ui| {
         for kind in tab_kinds(left_reps, Some(right_reps)) {
             let label = format!("{} {}", kind.icon(), kind.name());
-            let selected = state.active_tab == kind;
+            let selected = *active_tab == kind;
             let fill = if selected { theme::AMBER } else { theme::PANEL };
             let text_color = if selected { theme::BLACK } else { theme::TEXT };
 
@@ -414,7 +417,7 @@ pub fn draw_tab_bar(
                 .add(egui::Button::new(RichText::new(label).color(text_color)).fill(fill))
                 .clicked()
             {
-                state.active_tab = kind;
+                *active_tab = kind;
             }
         }
     });

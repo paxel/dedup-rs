@@ -73,14 +73,26 @@ and date, with the commands between them.
   row. Same content at the same path is *equal*; same content under different names offers
   **RENAME L** / **RENAME R** (renaming that side to the other's name); content only one side
   has offers **COPY >** / **< COPY** to send it across and **DELETE L** / **DELETE R** to drop
-  it where it is.
+  it where it is. Where two names differ, the differing characters are highlighted on each
+  side, so you can see at a glance whether the difference is a suffix, a counter or a
+  different extension. The comparison ignores the folder the files sit in, and an inserted
+  character marks only itself rather than everything after it.
 - **BY PATH** — files are matched by their path inside the repo. Same path with the same
   content is *equal*; same path with different content is a conflict, offering **COMPARE**,
   **OVERWRITE >** / **< OVERWRITE** (replace the other side's file with this one) and
   **DELETE L** / **DELETE R**.
 
-**COMPARE** opens the two versions side by side over the whole window, using the same viewer
-as the Duplicates lightbox: each side shows a preview appropriate to the file (image, or a
+Above the board, **ALL LISTED** offers bulk actions for reconciling large repositories:
+**COPY MISSING >** / **< COPY MISSING** send everything only one side has to the other, and
+**RENAME ALL L** / **RENAME ALL R** rename each side's files to the other's names. Only actions
+the rows on screen can actually use are offered. They act on every row *currently listed* — so
+hiding a row is how you leave it out — and a confirmation states the exact count first. If some
+operations fail the summary says how many succeeded and how many did not.
+
+**COMPARE** opens the two versions side by side over the whole window, with the same
+representation tabs as the Duplicates lightbox — so what you get depends on the file type, not
+on which tab you happen to be in. Two audio files compare as **spectrograms**, two documents
+through a **Text** tab, and images and video as pictures: each side shows a preview appropriate to the file (image, or a
 still for video), the repo it lives in, and its size, modification date and type — with the
 larger size and the newer date highlighted, so which is which is obvious at a glance. When
 both sides have a picture you can **wheel to zoom**, **drag to pan**, and press **Space** to
