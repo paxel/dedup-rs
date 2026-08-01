@@ -410,8 +410,16 @@ pub fn draw_tab_bar(
         for kind in tab_kinds(left_reps, Some(right_reps)) {
             let label = format!("{} {}", kind.icon(), kind.name());
             let selected = *active_tab == kind;
-            let fill = if selected { theme::AMBER } else { theme::PANEL };
-            let text_color = if selected { theme::BLACK } else { theme::TEXT };
+            let fill = if selected {
+                theme::amber()
+            } else {
+                theme::panel()
+            };
+            let text_color = if selected {
+                theme::black()
+            } else {
+                theme::text()
+            };
 
             if ui
                 .add(egui::Button::new(RichText::new(label).color(text_color)).fill(fill))
@@ -494,7 +502,11 @@ impl ColumnHead<'_> {
             Some(self.read_only),
         );
         ui.add_space(4.0);
-        ui.label(RichText::new(self.file_name).color(theme::TEXT).size(13.0));
+        ui.label(
+            RichText::new(self.file_name)
+                .color(theme::text())
+                .size(13.0),
+        );
         ui.add_space(4.0);
     }
 }
@@ -557,7 +569,7 @@ pub fn draw_metadata_column(
                 ui.horizontal(|ui| {
                     ui.add_sized(
                         [56.0, 18.0],
-                        egui::Label::new(RichText::new(label).color(theme::TAN).size(12.0)),
+                        egui::Label::new(RichText::new(label).color(theme::tan()).size(12.0)),
                     );
                     let w = (ui.available_width() - 32.0).max(80.0);
                     ui.add(egui::TextEdit::singleline(val).desired_width(w));
@@ -565,7 +577,7 @@ pub fn draw_metadata_column(
                     if !options[i].is_empty() {
                         ui.menu_button(icon::CARET_RIGHT, |ui| {
                             for o in &options[i] {
-                                if ui.button(RichText::new(o).color(theme::TEXT)).clicked() {
+                                if ui.button(RichText::new(o).color(theme::text())).clicked() {
                                     *val = o.clone();
                                 }
                             }
@@ -579,15 +591,15 @@ pub fn draw_metadata_column(
             ui.horizontal(|ui| {
                 if ui
                     .add(
-                        egui::Button::new(RichText::new("SAVE TAGS").color(theme::BLACK))
-                            .fill(theme::AMBER),
+                        egui::Button::new(RichText::new("SAVE TAGS").color(theme::black()))
+                            .fill(theme::amber()),
                     )
                     .clicked()
                 {
                     action = MetaAction::Save;
                 }
                 if ui
-                    .button(RichText::new("CANCEL").color(theme::TEXT))
+                    .button(RichText::new("CANCEL").color(theme::text()))
                     .clicked()
                 {
                     action = MetaAction::Cancel;
@@ -598,7 +610,7 @@ pub fn draw_metadata_column(
                 RichText::new(
                     "Saving writes the tags to the file on disk; the audio is unchanged.",
                 )
-                .color(theme::LILAC)
+                .color(theme::lilac())
                 .size(11.0),
             );
         }
@@ -620,7 +632,7 @@ pub fn draw_metadata_column(
                 None => {
                     ui.label(
                         RichText::new("No ID3 tags in this file")
-                            .color(theme::GREY)
+                            .color(theme::grey())
                             .size(12.0),
                     );
                 }
@@ -628,7 +640,9 @@ pub fn draw_metadata_column(
             ui.add_space(8.0);
             if can_edit {
                 if ui
-                    .button(RichText::new(format!("{} EDIT TAGS", icon::PENCIL)).color(theme::TEXT))
+                    .button(
+                        RichText::new(format!("{} EDIT TAGS", icon::PENCIL)).color(theme::text()),
+                    )
                     .clicked()
                 {
                     action = MetaAction::Edit;
@@ -636,7 +650,7 @@ pub fn draw_metadata_column(
             } else {
                 ui.label(
                     RichText::new("Read-only repository — tags cannot be changed")
-                        .color(theme::GREY)
+                        .color(theme::grey())
                         .size(11.0),
                 );
             }
@@ -647,7 +661,7 @@ pub fn draw_metadata_column(
             ui.add_space(8.0);
             ui.label(
                 RichText::new("Capture metadata is shown as recorded and is not edited here.")
-                    .color(theme::GREY)
+                    .color(theme::grey())
                     .size(11.0),
             );
         }
@@ -660,9 +674,9 @@ fn fact_row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.horizontal(|ui| {
         ui.add_sized(
             [56.0, 18.0],
-            egui::Label::new(RichText::new(label).color(theme::TAN).size(12.0)),
+            egui::Label::new(RichText::new(label).color(theme::tan()).size(12.0)),
         );
-        ui.label(RichText::new(value).color(theme::TEXT).size(12.0));
+        ui.label(RichText::new(value).color(theme::text()).size(12.0));
     });
 }
 
@@ -771,7 +785,7 @@ pub fn draw_text_column(
         (None, true, false) => "Full contents, as text".to_string(),
         (None, false, _) => "Not text — showing the first bytes as hex".to_string(),
     };
-    ui.label(RichText::new(note).color(theme::LILAC).size(11.0));
+    ui.label(RichText::new(note).color(theme::lilac()).size(11.0));
     ui.add_space(4.0);
     // The column itself is laid out top-down from a zero-height cursor, so the
     // scroll viewport has to be given its size explicitly — left to
@@ -793,7 +807,7 @@ pub fn draw_text_column(
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let text = RichText::new(&preview.body)
-                    .color(theme::TEXT)
+                    .color(theme::text())
                     .monospace()
                     .size(12.0);
                 // Prose wraps to the column; a hex dump must not — its columns only
@@ -1039,7 +1053,7 @@ pub fn draw_compare(
             egui::Align2::LEFT_TOP,
             text,
             egui::FontId::proportional(18.0),
-            theme::AMBER,
+            theme::amber(),
         );
     };
     if state.flicker {
@@ -1075,7 +1089,7 @@ pub fn draw_in_pane(ui: &egui::Ui, pane: Rect, rect: Rect, tex: &Option<TextureH
                 egui::Align2::CENTER_CENTER,
                 "decoding…",
                 egui::FontId::proportional(16.0),
-                theme::TAN,
+                theme::tan(),
             );
         }
     }
@@ -1160,8 +1174,8 @@ pub fn single_view(
                     if pill(
                         ui,
                         &format!("{} CLOSE", icon::CHECK),
-                        theme::AMBER,
-                        theme::BLACK,
+                        theme::amber(),
+                        theme::black(),
                         "Close the viewer",
                         "Close the image viewer (Esc does the same).",
                     ) {
@@ -1170,8 +1184,8 @@ pub fn single_view(
                     if pill(
                         ui,
                         "FIT",
-                        theme::PANEL,
-                        theme::TEXT,
+                        theme::panel(),
+                        theme::text(),
                         "Fit to window",
                         "Scale the image to fit the viewport (F does the same).",
                     ) {
@@ -1180,8 +1194,8 @@ pub fn single_view(
                     if pill(
                         ui,
                         "1:1",
-                        theme::PANEL,
-                        theme::TEXT,
+                        theme::panel(),
+                        theme::text(),
                         "True pixels",
                         "Show the image at 100% — one screen pixel per image pixel \
                          (1 does the same).",
@@ -1198,14 +1212,14 @@ pub fn single_view(
                 egui::Align2::LEFT_BOTTOM,
                 meta,
                 egui::FontId::proportional(13.0),
-                theme::TAN,
+                theme::tan(),
             );
             p.text(
                 egui::pos2(screen.min.x + 10.0, screen.max.y - 10.0),
                 egui::Align2::LEFT_BOTTOM,
                 "wheel: zoom · drag: pan · F fit · 1 100% · Esc close",
                 egui::FontId::proportional(12.0),
-                theme::HAIRLINE,
+                theme::hairline(),
             );
         });
     if do_fit {
@@ -1524,7 +1538,7 @@ mod tests {
         let head = ColumnHead {
             file_name: "long.txt",
             repo: "r",
-            accent: theme::BLUE,
+            accent: theme::blue(),
             read_only: false,
             is_main: false,
             source: Path::new("/tmp/r/long.txt"),

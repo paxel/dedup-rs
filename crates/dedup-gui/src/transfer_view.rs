@@ -1277,7 +1277,7 @@ impl TransferView {
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new("TRANSFER")
-                        .color(theme::BLUE)
+                        .color(theme::blue())
                         .size(18.0)
                         .strong(),
                 );
@@ -1327,10 +1327,10 @@ impl TransferView {
                 self.action_bar(ui, &mut acts);
 
                 if let Some(err) = &self.error {
-                    ui.colored_label(theme::RED, err);
+                    ui.colored_label(theme::red(), err);
                 }
                 if let Some(status) = &self.status {
-                    ui.label(RichText::new(status).color(theme::TAN).size(13.0));
+                    ui.label(RichText::new(status).color(theme::tan()).size(13.0));
                 }
                 ui.separator();
                 // RUN and REVIEW are mutually exclusive: while a run is active
@@ -1445,7 +1445,7 @@ impl TransferView {
     }
 
     fn repo_rows(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "REPOS — PICK SOURCE & TARGET", theme::LILAC, |ui| {
+        crate::lcars::section_lcars(ui, "REPOS — PICK SOURCE & TARGET", theme::lilac(), |ui| {
             // SOURCE: every repo, orange when picked.
             let src = self.repos.clone();
             let mains = self.mains.clone();
@@ -1456,7 +1456,7 @@ impl TransferView {
                     ui,
                     name,
                     sel,
-                    theme::ORANGE,
+                    theme::orange(),
                     mains.contains(name),
                     None,
                 );
@@ -1493,7 +1493,7 @@ impl TransferView {
                         ui,
                         name,
                         sel,
-                        theme::BLUE,
+                        theme::blue(),
                         mains.contains(name),
                         None,
                     );
@@ -1531,8 +1531,8 @@ impl TransferView {
                     .cloned()
                     .collect();
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("DUPEPOOL").color(theme::TEXT).size(12.0));
-                    if crate::repo_chip::small_button(ui, "ALL", theme::LILAC)
+                    ui.label(RichText::new("DUPEPOOL").color(theme::text()).size(12.0));
+                    if crate::repo_chip::small_button(ui, "ALL", theme::lilac())
                         .explain(
                             self.verbosity,
                             "Add every eligible repo to the pool",
@@ -1542,7 +1542,7 @@ impl TransferView {
                     {
                         self.extra_refs = eligible.clone();
                     }
-                    if crate::repo_chip::small_button(ui, "NONE", theme::LILAC)
+                    if crate::repo_chip::small_button(ui, "NONE", theme::lilac())
                         .explain(
                             self.verbosity,
                             "Clear the dupe pool",
@@ -1561,7 +1561,7 @@ impl TransferView {
                         ui,
                         name,
                         sel,
-                        theme::LILAC,
+                        theme::lilac(),
                         mains.contains(name),
                         None,
                     );
@@ -1639,7 +1639,7 @@ impl TransferView {
         } else {
             "COMMAND — COPY, MOVE, SYNC, MIRROR OR DIFF"
         };
-        crate::lcars::section_lcars(ui, title, theme::ORANGE, |ui| {
+        crate::lcars::section_lcars(ui, title, theme::orange(), |ui| {
             ui.horizontal(|ui| {
                 let mut cmds = vec![Command::Copy, Command::Move, Command::Sync, Command::Mirror];
                 // Only offered when the source is a sync group's main —
@@ -1651,14 +1651,14 @@ impl TransferView {
                 for cmd in cmds {
                     let sel = self.command == cmd;
                     let accent = if cmd.destructive() {
-                        theme::RED
+                        theme::red()
                     } else {
-                        theme::AMBER
+                        theme::amber()
                     };
-                    let fill = if sel { accent } else { theme::PANEL };
+                    let fill = if sel { accent } else { theme::panel() };
                     // Unselected pills sit on the dark panel — black text would
                     // vanish there, so they carry their accent color instead.
-                    let col = if sel { theme::BLACK } else { accent };
+                    let col = if sel { theme::black() } else { accent };
                     let (short, verbose) = cmd.tooltip();
                     if ui
                         .add(egui::Button::new(RichText::new(cmd.label()).color(col)).fill(fill))
@@ -1677,7 +1677,7 @@ impl TransferView {
         crate::lcars::section_lcars(
             ui,
             "INTO — SUBFOLDER INSIDE THE TARGET",
-            theme::BLUE,
+            theme::blue(),
             |ui| {
                 ui.horizontal(|ui| {
                     let changed = ui
@@ -1704,7 +1704,7 @@ impl TransferView {
                             can_browse,
                             egui::Button::new(
                                 RichText::new(format!("{} BROWSE", icon::FOLDER_OPEN))
-                                    .color(theme::BLACK),
+                                    .color(theme::black()),
                             ),
                         )
                         .explain(
@@ -1722,7 +1722,7 @@ impl TransferView {
                 RichText::new(
                     "Files keep their source-relative path under this folder inside the target.",
                 )
-                .color(theme::LILAC)
+                .color(theme::lilac())
                 .size(11.0),
             );
             },
@@ -1731,7 +1731,7 @@ impl TransferView {
 
     /// Selector for where COPY/MOVE lands: into a repo or into a picked folder.
     fn dest_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "DEST — WHERE COPIED FILES LAND", theme::BLUE, |ui| {
+        crate::lcars::section_lcars(ui, "DEST — WHERE COPIED FILES LAND", theme::blue(), |ui| {
             ui.horizontal(|ui| {
                 for (dest, label, short, verbose) in [
                     (
@@ -1750,8 +1750,8 @@ impl TransferView {
                     ),
                 ] {
                     let sel = self.destination == dest;
-                    let fill = if sel { theme::BLUE } else { theme::PANEL };
-                    let col = if sel { theme::BLACK } else { theme::BLUE };
+                    let fill = if sel { theme::blue() } else { theme::panel() };
+                    let col = if sel { theme::black() } else { theme::blue() };
                     if ui
                         .add(egui::Button::new(RichText::new(label).color(col)).fill(fill))
                         .explain(self.verbosity, short, verbose)
@@ -1769,7 +1769,7 @@ impl TransferView {
         crate::lcars::section_lcars(
             ui,
             "FOLDER — EXPORT DESTINATION ON DISK",
-            theme::BLUE,
+            theme::blue(),
             |ui| {
                 ui.horizontal(|ui| {
                     let changed = ui
@@ -1791,7 +1791,7 @@ impl TransferView {
                     if ui
                         .add(egui::Button::new(
                             RichText::new(format!("{} BROWSE", icon::FOLDER_OPEN))
-                                .color(theme::BLACK),
+                                .color(theme::black()),
                         ))
                         .explain(
                             self.verbosity,
@@ -1813,13 +1813,13 @@ impl TransferView {
         crate::lcars::section_lcars(
             ui,
             "MODE — EXACT OR SIMILAR MATCHING",
-            theme::LILAC,
+            theme::lilac(),
             |ui| {
                 ui.horizontal(|ui| {
                     for mode in [SelectMode::Exact, SelectMode::Similar] {
                         let sel = self.select_mode == mode;
-                        let fill = if sel { theme::LILAC } else { theme::PANEL };
-                        let col = if sel { theme::BLACK } else { theme::LILAC };
+                        let fill = if sel { theme::lilac() } else { theme::panel() };
+                        let col = if sel { theme::black() } else { theme::lilac() };
                         let (short, verbose) = match mode {
                             SelectMode::Exact => (
                                 "Group by exact content",
@@ -1845,14 +1845,14 @@ impl TransferView {
                     }
                     ui.separator();
                     let fill = if self.invert {
-                        theme::ORANGE
+                        theme::orange()
                     } else {
-                        theme::PANEL
+                        theme::panel()
                     };
                     let col = if self.invert {
-                        theme::BLACK
+                        theme::black()
                     } else {
-                        theme::ORANGE
+                        theme::orange()
                     };
                     if ui
                         .add(egui::Button::new(RichText::new("INVERT").color(col)).fill(fill))
@@ -1885,7 +1885,7 @@ impl TransferView {
                 } else {
                     "Exports the unique files (best copy of each group plus every singleton)."
                 };
-                ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
+                ui.label(RichText::new(hint).color(theme::lilac()).size(11.0));
             },
         );
     }
@@ -1914,7 +1914,7 @@ impl TransferView {
                  copy, delete, rename or overwrite, one row at a time."
             }
         };
-        ui.label(RichText::new(text).color(theme::LILAC).size(11.0));
+        ui.label(RichText::new(text).color(theme::lilac()).size(11.0));
     }
 
     /// MIRROR's info bar: no toggle (it always deletes), just a red warning that
@@ -1923,7 +1923,7 @@ impl TransferView {
         crate::lcars::section_lcars(
             ui,
             &format!("{} DELETES EXTRAS", icon::TRASH),
-            theme::RED,
+            theme::red(),
             |ui| {
                 ui.label(
                     RichText::new(
@@ -1931,7 +1931,7 @@ impl TransferView {
                      deleted, so the target ends up holding exactly the source's content. \
                      Deletions cannot be undone.",
                     )
-                    .color(theme::LILAC)
+                    .color(theme::lilac())
                     .size(11.0),
                 );
             },
@@ -1943,91 +1943,96 @@ impl TransferView {
     /// push mode (set on the Repositories tab, not editable here) so the
     /// selection reads honestly — this panel picks *which* sinks, not *how*.
     fn group_sinks_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "SINKS — WHERE THE MAIN IS PUSHED", theme::BLUE, |ui| {
-            let Some(group) = self.current_group.clone() else {
-                return;
-            };
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("SINKS").color(theme::TEXT).size(12.0));
-                if crate::repo_chip::small_button(ui, "ALL", theme::BLUE)
-                    .explain(
-                        self.verbosity,
-                        "Include every sink",
-                        "Include every sink of this group in the next push.",
-                    )
-                    .clicked()
-                {
-                    acts.push(Act::SelectAllSinks);
-                }
-                if crate::repo_chip::small_button(ui, "NONE", theme::BLUE)
-                    .explain(
-                        self.verbosity,
-                        "Clear the sink selection",
-                        "Deselect every sink (REVIEW/RUN are disabled until at least one is \
+        crate::lcars::section_lcars(
+            ui,
+            "SINKS — WHERE THE MAIN IS PUSHED",
+            theme::blue(),
+            |ui| {
+                let Some(group) = self.current_group.clone() else {
+                    return;
+                };
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("SINKS").color(theme::text()).size(12.0));
+                    if crate::repo_chip::small_button(ui, "ALL", theme::blue())
+                        .explain(
+                            self.verbosity,
+                            "Include every sink",
+                            "Include every sink of this group in the next push.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::SelectAllSinks);
+                    }
+                    if crate::repo_chip::small_button(ui, "NONE", theme::blue())
+                        .explain(
+                            self.verbosity,
+                            "Clear the sink selection",
+                            "Deselect every sink (REVIEW/RUN are disabled until at least one is \
                          picked).",
-                    )
-                    .clicked()
-                {
-                    acts.push(Act::SelectNoSinks);
-                }
-            });
-            crate::repo_chip::chip_row(ui, "xfer_sinks", "", group.sinks.len(), |ui, i| {
-                let sink = &group.sinks[i];
-                let mode = match sink.mode {
-                    SyncMode::AddOnly => "ADD ONLY",
-                    SyncMode::Mirror => "MIRROR",
-                };
-                let sel = self.selected_sinks.iter().any(|s| s == &sink.repo);
-                let accent = if sink.mode == SyncMode::Mirror {
-                    theme::RED
-                } else {
-                    theme::BLUE
-                };
-                // The chip gets the bare repo name: the identicon is hashed from
-                // whatever string it is handed, so folding the mode into the name
-                // gave this sink a different glyph here than on every other tab.
-                // The mode rides alongside as its own label instead.
-                //
-                // Chip and label are wrapped together, and the *wrapper's*
-                // response is what this closure returns: `chip_row` packs rows
-                // from that rect, so a label drawn outside it would never be
-                // budgeted and the row would overrun the available width.
-                let row = ui.horizontal(|ui| {
-                    let chip =
-                        crate::repo_chip::repo_chip(ui, &sink.repo, sel, accent, false, None);
-                    // Same wording as the sink's mode pill on the Repositories tab.
-                    ui.label(
-                        RichText::new(format!("MODE: {mode}"))
-                            .color(accent)
-                            .size(10.0),
-                    );
-                    chip
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::SelectNoSinks);
+                    }
                 });
-                if row
-                    .inner
-                    .name
-                    .explain(
-                        self.verbosity,
-                        "Include this sink in the push",
-                        "Toggle whether this sink is included when GROUP SYNC runs. Its mode \
+                crate::repo_chip::chip_row(ui, "xfer_sinks", "", group.sinks.len(), |ui, i| {
+                    let sink = &group.sinks[i];
+                    let mode = match sink.mode {
+                        SyncMode::AddOnly => "ADD ONLY",
+                        SyncMode::Mirror => "MIRROR",
+                    };
+                    let sel = self.selected_sinks.iter().any(|s| s == &sink.repo);
+                    let accent = if sink.mode == SyncMode::Mirror {
+                        theme::red()
+                    } else {
+                        theme::blue()
+                    };
+                    // The chip gets the bare repo name: the identicon is hashed from
+                    // whatever string it is handed, so folding the mode into the name
+                    // gave this sink a different glyph here than on every other tab.
+                    // The mode rides alongside as its own label instead.
+                    //
+                    // Chip and label are wrapped together, and the *wrapper's*
+                    // response is what this closure returns: `chip_row` packs rows
+                    // from that rect, so a label drawn outside it would never be
+                    // budgeted and the row would overrun the available width.
+                    let row = ui.horizontal(|ui| {
+                        let chip =
+                            crate::repo_chip::repo_chip(ui, &sink.repo, sel, accent, false, None);
+                        // Same wording as the sink's mode pill on the Repositories tab.
+                        ui.label(
+                            RichText::new(format!("MODE: {mode}"))
+                                .color(accent)
+                                .size(10.0),
+                        );
+                        chip
+                    });
+                    if row
+                        .inner
+                        .name
+                        .explain(
+                            self.verbosity,
+                            "Include this sink in the push",
+                            "Toggle whether this sink is included when GROUP SYNC runs. Its mode \
                          (ADD ONLY / MIRROR) is set on the Repositories tab.",
-                    )
-                    .clicked()
-                {
-                    acts.push(Act::ToggleSink(sink.repo.clone()));
-                }
-                row.response
-            });
-            ui.label(
-                RichText::new(
-                    "Each selected sink pushes in its own stored mode: ADD ONLY copies and \
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::ToggleSink(sink.repo.clone()));
+                    }
+                    row.response
+                });
+                ui.label(
+                    RichText::new(
+                        "Each selected sink pushes in its own stored mode: ADD ONLY copies and \
                      never deletes; MIRROR also deletes what the main no longer has. The main \
                      is never changed.",
-                )
-                .color(theme::LILAC)
-                .size(11.0),
-            );
-        });
+                    )
+                    .color(theme::lilac())
+                    .size(11.0),
+                );
+            },
+        );
     }
 
     /// The delete policy the current command runs with: MIRROR always deletes
@@ -2046,63 +2051,68 @@ impl TransferView {
     /// same relative path.
     /// DIFF's option bar: how the two repos are paired up.
     fn pairing_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "PAIR BY — HOW FILES ARE MATCHED", theme::BLUE, |ui| {
-            ui.horizontal(|ui| {
-                for (pairing, label, short, verbose) in [
-                    (
-                        DiffPairing::ByHash,
-                        "BY HASH",
-                        "Match files by content",
-                        "Match files by their content, so the same photo under two \
+        crate::lcars::section_lcars(
+            ui,
+            "PAIR BY — HOW FILES ARE MATCHED",
+            theme::blue(),
+            |ui| {
+                ui.horizontal(|ui| {
+                    for (pairing, label, short, verbose) in [
+                        (
+                            DiffPairing::ByHash,
+                            "BY HASH",
+                            "Match files by content",
+                            "Match files by their content, so the same photo under two \
                          different names is one row you can resolve with a rename. \
                          This is the view for finding what one repo has and the other \
                          doesn't, whatever things are called.",
-                    ),
-                    (
-                        DiffPairing::ByPath,
-                        "BY PATH",
-                        "Match files by name and folder",
-                        "Match files by their path inside the repo, so the same name on \
+                        ),
+                        (
+                            DiffPairing::ByPath,
+                            "BY PATH",
+                            "Match files by name and folder",
+                            "Match files by their path inside the repo, so the same name on \
                          both sides is one row — and when the two versions differ you can \
                          overwrite one side with the other. This is the view for spotting \
                          edited files.",
-                    ),
-                ] {
-                    let selected = self.pairing == pairing;
-                    if crate::lcars::toggle_button(ui, label, selected, theme::BLUE)
-                        .explain(self.verbosity, short, verbose)
-                        .clicked()
-                    {
-                        acts.push(Act::SetPairing(pairing));
+                        ),
+                    ] {
+                        let selected = self.pairing == pairing;
+                        if crate::lcars::toggle_button(ui, label, selected, theme::blue())
+                            .explain(self.verbosity, short, verbose)
+                            .clicked()
+                        {
+                            acts.push(Act::SetPairing(pairing));
+                        }
                     }
-                }
-            });
-            let hint = match self.pairing {
-                DiffPairing::ByHash => {
-                    "Rows pair files with identical content; a file only one side has can \
+                });
+                let hint = match self.pairing {
+                    DiffPairing::ByHash => {
+                        "Rows pair files with identical content; a file only one side has can \
                      be copied across or deleted."
-                }
-                DiffPairing::ByPath => {
-                    "Rows pair files with the same path; same name with different content \
+                    }
+                    DiffPairing::ByPath => {
+                        "Rows pair files with the same path; same name with different content \
                      is a conflict you resolve per side."
-                }
-            };
-            ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
-        });
+                    }
+                };
+                ui.label(RichText::new(hint).color(theme::lilac()).size(11.0));
+            },
+        );
     }
 
     fn sync_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "OPTIONS — SYNC BEHAVIOUR", theme::BLUE, |ui| {
+        crate::lcars::section_lcars(ui, "OPTIONS — SYNC BEHAVIOUR", theme::blue(), |ui| {
             ui.horizontal(|ui| {
                 let fill = if self.sync_delete_missing {
-                    theme::RED
+                    theme::red()
                 } else {
-                    theme::PANEL
+                    theme::panel()
                 };
                 let col = if self.sync_delete_missing {
-                    theme::BLACK
+                    theme::black()
                 } else {
-                    theme::RED
+                    theme::red()
                 };
                 if ui
                     .add(egui::Button::new(RichText::new("DELETE MISSING").color(col)).fill(fill))
@@ -2124,7 +2134,7 @@ impl TransferView {
             } else {
                 "Copies content the target lacks. Nothing in the target is deleted."
             };
-            ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
+            ui.label(RichText::new(hint).color(theme::lilac()).size(11.0));
         });
     }
 
@@ -2143,13 +2153,13 @@ impl TransferView {
     }
 
     fn action_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "ACTION — REVIEW & RUN", theme::AMBER, |ui| {
+        crate::lcars::section_lcars(ui, "ACTION — REVIEW & RUN", theme::amber(), |ui| {
             ui.horizontal(|ui| {
                 let ready = self.ready();
                 if ui
                     .add_enabled(
                         ready,
-                        egui::Button::new(RichText::new("REVIEW").color(theme::BLACK)),
+                        egui::Button::new(RichText::new("REVIEW").color(theme::black())),
                     )
                     .explain(
                         self.verbosity,
@@ -2165,12 +2175,12 @@ impl TransferView {
                 }
                 if self.command.is_diff() {
                     if self.running || self.previewing {
-                        ui.add(egui::Spinner::new().color(theme::AMBER));
+                        ui.add(egui::Spinner::new().color(theme::amber()));
                     }
                     return;
                 }
-                let run =
-                    egui::Button::new(RichText::new("RUN").color(theme::BLACK)).fill(theme::AMBER);
+                let run = egui::Button::new(RichText::new("RUN").color(theme::black()))
+                    .fill(theme::amber());
                 if ui
                     .add_enabled(ready, run)
                     .explain(
@@ -2185,11 +2195,11 @@ impl TransferView {
                     acts.push(Act::Ask);
                 }
                 if self.running {
-                    ui.add(egui::Spinner::new().color(theme::AMBER));
+                    ui.add(egui::Spinner::new().color(theme::amber()));
                     if ui
                         .add(
-                            egui::Button::new(RichText::new("CANCEL").color(theme::BLACK))
-                                .fill(theme::RED),
+                            egui::Button::new(RichText::new("CANCEL").color(theme::black()))
+                                .fill(theme::red()),
                         )
                         .explain(
                             self.verbosity,
@@ -2296,7 +2306,7 @@ impl TransferView {
             if self.diff_rows.is_empty() {
                 ui.add_space(6.0);
                 ui.colored_label(
-                    theme::TEXT,
+                    theme::text(),
                     "Pick two repos and press REVIEW to compare them.",
                 );
                 return;
@@ -2324,16 +2334,16 @@ impl TransferView {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         egui::RichText::new("ALL LISTED")
-                            .color(theme::LILAC)
+                            .color(theme::lilac())
                             .size(11.0),
                     );
                     for op in &offered {
                         if ui
                             .add(
                                 egui::Button::new(
-                                    egui::RichText::new(op.label()).color(theme::BLACK),
+                                    egui::RichText::new(op.label()).color(theme::black()),
                                 )
-                                .fill(theme::AMBER),
+                                .fill(theme::amber()),
                             )
                             .explain(
                                 self.verbosity,
@@ -2420,7 +2430,7 @@ impl TransferView {
             } else {
                 "Pick a source, a target and a command, then press REVIEW."
             };
-            ui.colored_label(theme::TEXT, hint);
+            ui.colored_label(theme::text(), hint);
             return;
         }
         // GROUP SYNC pushes several sinks as one all-or-nothing run, so each
@@ -2489,14 +2499,14 @@ impl TransferView {
     fn run_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if self.running {
-                ui.add(egui::Spinner::new().color(theme::AMBER));
+                ui.add(egui::Spinner::new().color(theme::amber()));
             }
             let current = if self.run_current.is_empty() {
                 "preparing…".to_string()
             } else {
                 self.run_current.clone()
             };
-            ui.label(RichText::new(current).color(theme::AMBER).strong());
+            ui.label(RichText::new(current).color(theme::amber()).strong());
         });
 
         let summary = if self.run_total > 0 {
@@ -2506,7 +2516,7 @@ impl TransferView {
         };
         ui.label(
             RichText::new(format!("Processed {summary}"))
-                .color(theme::TAN)
+                .color(theme::tan())
                 .size(12.0),
         );
 
@@ -2516,7 +2526,7 @@ impl TransferView {
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 for line in &self.run_log {
-                    ui.label(RichText::new(line).color(theme::TEXT).size(12.0));
+                    ui.label(RichText::new(line).color(theme::text()).size(12.0));
                 }
             });
     }
@@ -2526,21 +2536,24 @@ impl TransferView {
             ui.set_width(380.0);
             ui.label(
                 RichText::new(format!("CONFIRM {}", self.command.label()))
-                    .color(theme::AMBER)
+                    .color(theme::amber())
                     .size(16.0)
                     .strong(),
             );
             ui.add_space(6.0);
-            ui.colored_label(theme::TEXT, prompt);
+            ui.colored_label(theme::text(), prompt);
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 let fill = if self.destructive_run() {
-                    theme::RED
+                    theme::red()
                 } else {
-                    theme::AMBER
+                    theme::amber()
                 };
                 if ui
-                    .add(egui::Button::new(RichText::new("PROCEED").color(theme::BLACK)).fill(fill))
+                    .add(
+                        egui::Button::new(RichText::new("PROCEED").color(theme::black()))
+                            .fill(fill),
+                    )
                     .explain(
                         self.verbosity,
                         "Confirm and run",
@@ -2551,7 +2564,7 @@ impl TransferView {
                     acts.push(Act::Confirm);
                 }
                 if ui
-                    .button(RichText::new("CANCEL").color(theme::BLACK))
+                    .button(RichText::new("CANCEL").color(theme::black()))
                     .explain(
                         self.verbosity,
                         "Cancel",
@@ -3176,24 +3189,24 @@ impl TransferView {
             ui.set_width(400.0);
             ui.label(
                 egui::RichText::new("APPLY TO EVERY LISTED ROW")
-                    .color(theme::AMBER)
+                    .color(theme::amber())
                     .size(16.0)
                     .strong(),
             );
             ui.add_space(8.0);
-            ui.colored_label(theme::TEXT, op.describe(plan.len()));
+            ui.colored_label(theme::text(), op.describe(plan.len()));
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new("Rows you have hidden are not touched.")
-                    .color(theme::TAN)
+                    .color(theme::tan())
                     .size(11.0),
             );
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui
                     .add(
-                        egui::Button::new(egui::RichText::new("APPLY").color(theme::BLACK))
-                            .fill(theme::RED),
+                        egui::Button::new(egui::RichText::new("APPLY").color(theme::black()))
+                            .fill(theme::red()),
                     )
                     .clicked()
                 {
@@ -3201,8 +3214,8 @@ impl TransferView {
                 }
                 if ui
                     .add(
-                        egui::Button::new(egui::RichText::new("CANCEL").color(theme::TEXT))
-                            .fill(theme::PANEL),
+                        egui::Button::new(egui::RichText::new("CANCEL").color(theme::text()))
+                            .fill(theme::panel()),
                     )
                     .clicked()
                 {
@@ -3913,7 +3926,7 @@ mod ui_tests {
                 move |ui, view: &mut TransferView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default(), None);
@@ -4263,7 +4276,7 @@ mod ui_tests {
                 move |ui, view: &mut TransferView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default(), None);
@@ -4473,7 +4486,7 @@ mod ui_tests {
                 move |ui, view: &mut TransferView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default(), None);
@@ -4528,7 +4541,7 @@ mod ui_tests {
                 move |ui, view: &mut TransferView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default(), None);
@@ -4568,7 +4581,7 @@ mod ui_tests {
                 move |ui, view: &mut TransferView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default(), None);
@@ -4607,7 +4620,7 @@ mod ui_tests {
                 move |ui, view: &mut TransferView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default(), None);
@@ -4668,7 +4681,7 @@ mod ui_tests {
                 move |ui, view: &mut TransferView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store, TooltipVerbosity::default(), None);
@@ -4729,7 +4742,7 @@ mod ui_tests {
                 move |ui, view: &mut TransferView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store, TooltipVerbosity::default(), None);
@@ -5062,7 +5075,7 @@ mod ui_tests {
                 move |ui, view: &mut TransferView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default(), None);

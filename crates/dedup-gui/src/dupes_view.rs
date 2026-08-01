@@ -225,7 +225,7 @@ fn lightbox_shell(
 
             ui.horizontal(|ui| {
                 if ui
-                    .button(RichText::new(format!("{} CLOSE", icon::CHECK)).color(theme::BLACK))
+                    .button(RichText::new(format!("{} CLOSE", icon::CHECK)).color(theme::black()))
                     .explain(
                         verbosity,
                         "Close the lightbox",
@@ -322,7 +322,7 @@ fn draw_overview_column(
     ui.add_space(4.0);
     ui.label(
         RichText::new(&side.file.rel_path)
-            .color(theme::TEXT)
+            .color(theme::text())
             .size(13.0),
     );
     ui.label(
@@ -332,11 +332,11 @@ fn draw_overview_column(
             side.facts.dims_or_duration(),
             format_mtime(side.facts.modified_ms),
         ))
-        .color(theme::LILAC)
+        .color(theme::lilac())
         .size(11.0),
     );
     if let Some(mime) = &side.facts.mime {
-        ui.label(RichText::new(mime).color(theme::GREY).size(11.0));
+        ui.label(RichText::new(mime).color(theme::grey()).size(11.0));
     }
     ui.add_space(4.0);
     mark_pill(ui, verbosity, side.mark_label, side.marked, side.markable)
@@ -374,11 +374,11 @@ fn draw_filmstrip(
                 .image(t.id(), r, uv, egui::Color32::WHITE);
         }
         let (col, w) = if i == scrub {
-            (theme::AMBER, 2.0)
+            (theme::amber(), 2.0)
         } else if cell_resp.hovered() {
-            (theme::TAN, 1.5)
+            (theme::tan(), 1.5)
         } else {
-            (theme::HAIRLINE, 1.0)
+            (theme::hairline(), 1.0)
         };
         ui.painter().rect_stroke(
             cell,
@@ -409,13 +409,13 @@ fn mark_pill(
     } else {
         base.to_string()
     };
-    let fill = if marked { theme::RED } else { theme::PANEL };
+    let fill = if marked { theme::red() } else { theme::panel() };
     let col = if marked {
-        theme::BLACK
+        theme::black()
     } else if !markable {
-        theme::HAIRLINE
+        theme::hairline()
     } else {
-        theme::TEXT
+        theme::text()
     };
     let mut rt = RichText::new(label).color(col);
     if !markable {
@@ -676,7 +676,7 @@ impl DupesView {
         ui.add_space(6.0);
         ui.label(
             RichText::new("DUPLICATE MANAGEMENT")
-                .color(theme::LILAC)
+                .color(theme::lilac())
                 .size(18.0)
                 .strong(),
         );
@@ -701,10 +701,10 @@ impl DupesView {
             ),
         );
         if let Some(err) = &self.error {
-            ui.colored_label(theme::RED, err);
+            ui.colored_label(theme::red(), err);
         }
         if let Some(status) = &self.status {
-            ui.label(RichText::new(status).color(theme::TAN).size(13.0));
+            ui.label(RichText::new(status).color(theme::tan()).size(13.0));
         }
         ui.separator();
         self.results(ui, store, &mut acts);
@@ -837,12 +837,12 @@ impl DupesView {
         crate::lcars::section_lcars(
             ui,
             "REPOS — WHERE TO LOOK FOR DUPLICATES",
-            theme::LILAC,
+            theme::lilac(),
             |ui| {
                 // Bulk MARK ALL / NONE (repos start excluded, so this is the quick way
                 // to include/clear all of them at once).
                 ui.horizontal(|ui| {
-                    if crate::lcars::toggle_button(ui, "ALL", false, theme::ORANGE)
+                    if crate::lcars::toggle_button(ui, "ALL", false, theme::orange())
                         .explain(
                             self.verbosity,
                             "Include every repo in the search",
@@ -852,7 +852,7 @@ impl DupesView {
                     {
                         self.repos.iter_mut().for_each(|r| r.included = true);
                     }
-                    if crate::lcars::toggle_button(ui, "NONE", false, theme::ORANGE)
+                    if crate::lcars::toggle_button(ui, "NONE", false, theme::orange())
                         .explain(
                             self.verbosity,
                             "Exclude every repo",
@@ -881,7 +881,7 @@ impl DupesView {
             ui,
             &repo.name,
             repo.included,
-            theme::ORANGE,
+            theme::orange(),
             repo.is_main,
             Some(repo.read_only),
         );
@@ -925,12 +925,12 @@ impl DupesView {
         crate::lcars::section_lcars(
             ui,
             "MODE — WHAT COUNTS AS A DUPLICATE",
-            theme::AMBER,
+            theme::amber(),
             |ui| {
                 ui.horizontal(|ui| {
                     let exact = self.mode == Mode::Exact;
                     // The two match modes: DUPLICATES (orange) / SIMILAR (lilac).
-                    if crate::lcars::toggle_button(ui, "DUPLICATES", exact, theme::ORANGE)
+                    if crate::lcars::toggle_button(ui, "DUPLICATES", exact, theme::orange())
                         .explain(
                             self.verbosity,
                             "Exact byte-for-byte duplicates",
@@ -941,7 +941,7 @@ impl DupesView {
                     {
                         self.mode = Mode::Exact;
                     }
-                    if crate::lcars::toggle_button(ui, "SIMILAR", !exact, theme::LILAC)
+                    if crate::lcars::toggle_button(ui, "SIMILAR", !exact, theme::lilac())
                         .explain(
                             self.verbosity,
                             "Perceptually similar images/videos",
@@ -957,7 +957,7 @@ impl DupesView {
                         ui,
                         &format!("{} FIND", icon::SEARCH),
                         self.busy.is_none(),
-                        theme::AMBER,
+                        theme::amber(),
                     )
                     .explain(
                         self.verbosity,
@@ -971,7 +971,7 @@ impl DupesView {
                     }
                     // Progress while a background op runs.
                     if let Some(op) = &self.busy {
-                        ui.add(egui::Spinner::new().color(theme::AMBER));
+                        ui.add(egui::Spinner::new().color(theme::amber()));
                         let text = match op {
                             Op::Find(n) => format!("searching… {n} groups"),
                             Op::AutoResolve { done, total } => {
@@ -979,7 +979,7 @@ impl DupesView {
                             }
                             Op::Delete => "deleting…".to_string(),
                         };
-                        ui.label(RichText::new(text).color(theme::AMBER).size(12.0));
+                        ui.label(RichText::new(text).color(theme::amber()).size(12.0));
                     }
                 });
 
@@ -1000,7 +1000,7 @@ impl DupesView {
                 // A proper bordered toggle now (filled red when on), so it's
                 // clearly a clickable control even when off.
                 let label = format!("{} QUICK DELETE", icon::LIGHTNING);
-                if crate::lcars::toggle_button(ui, &label, self.quick_delete, theme::RED)
+                if crate::lcars::toggle_button(ui, &label, self.quick_delete, theme::red())
                     .explain(
                         self.verbosity,
                         "Show a DELETE NOW button on each group that deletes its marked files immediately, no confirmation",
@@ -1015,7 +1015,7 @@ impl DupesView {
                 if self.quick_delete {
                     ui.label(
                         RichText::new("on — DELETE NOW removes files instantly")
-                            .color(theme::RED)
+                            .color(theme::red())
                             .size(12.0),
                     );
                 }
@@ -1027,7 +1027,7 @@ impl DupesView {
             ui.horizontal(|ui| {
                 let n = self.marked.len();
                 let idle = self.busy.is_none();
-                if crate::lcars::action_button(ui, "AUTO-RESOLVE REST", idle, theme::ORANGE)
+                if crate::lcars::action_button(ui, "AUTO-RESOLVE REST", idle, theme::orange())
                     .explain(
                         self.verbosity,
                         "Mark every non-best copy in a deletable repo",
@@ -1043,7 +1043,7 @@ impl DupesView {
                     ui,
                     &format!("DELETE MARKED ({n})"),
                     idle && n > 0,
-                    theme::RED,
+                    theme::red(),
                 )
                 .explain(
                     self.verbosity,
@@ -1069,7 +1069,7 @@ impl DupesView {
             } else {
                 "No groups. Pick repos and press FIND."
             };
-            ui.colored_label(theme::TEXT, msg);
+            ui.colored_label(theme::text(), msg);
             return;
         }
 
@@ -1089,7 +1089,7 @@ impl DupesView {
             }
             ui.label(
                 RichText::new(format!("page {}/{} · {} groups", page + 1, pages, total))
-                    .color(theme::TAN),
+                    .color(theme::tan()),
             );
             if ui
                 .add_enabled(page + 1 < pages, egui::Button::new(icon::CARET_RIGHT))
@@ -1196,9 +1196,9 @@ impl DupesView {
         // A group deleted this session collapses to a one-line note.
         if self.resolved.contains(&gi) {
             egui::Frame::new()
-                .fill(theme::PANEL)
+                .fill(theme::panel())
                 .corner_radius(theme::PILL)
-                .stroke(egui::Stroke::new(1.0, theme::TAN))
+                .stroke(egui::Stroke::new(1.0, theme::tan()))
                 .inner_margin(10.0)
                 .outer_margin(egui::Margin {
                     left: 0,
@@ -1209,7 +1209,7 @@ impl DupesView {
                 .show(ui, |ui| {
                     ui.label(
                         RichText::new(format!("{} deleted", icon::CHECK))
-                            .color(theme::TAN)
+                            .color(theme::tan())
                             .strong(),
                     );
                 });
@@ -1247,9 +1247,9 @@ impl DupesView {
         let idle = self.busy.is_none();
         let has_marked = group.iter().any(|f| self.marked.contains(&key(f)));
         egui::Frame::new()
-            .fill(theme::PANEL)
+            .fill(theme::panel())
             .corner_radius(theme::PILL)
-            .stroke(egui::Stroke::new(1.5, theme::ORANGE))
+            .stroke(egui::Stroke::new(1.5, theme::orange()))
             .inner_margin(10.0)
             .outer_margin(egui::Margin {
                 left: 0,
@@ -1259,10 +1259,10 @@ impl DupesView {
             })
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(header).color(theme::AMBER).strong());
+                    ui.label(RichText::new(header).color(theme::amber()).strong());
                     // Group-level bulk actions: mark every copy, keep every copy,
                     // or dismiss the whole group — no need to touch each card.
-                    if crate::repo_chip::small_button(ui, "MARK ALL", theme::RED)
+                    if crate::repo_chip::small_button(ui, "MARK ALL", theme::red())
                         .explain(
                             self.verbosity,
                             "Mark every copy in this group for deletion",
@@ -1274,7 +1274,7 @@ impl DupesView {
                     {
                         acts.push(Act::MarkGroup(gi));
                     }
-                    if crate::repo_chip::small_button(ui, "MARK NONE", theme::TAN)
+                    if crate::repo_chip::small_button(ui, "MARK NONE", theme::tan())
                         .explain(
                             self.verbosity,
                             "Keep every copy in this group",
@@ -1284,7 +1284,7 @@ impl DupesView {
                     {
                         acts.push(Act::UnmarkGroup(gi));
                     }
-                    if crate::repo_chip::small_button(ui, "HIDE", theme::BLUE)
+                    if crate::repo_chip::small_button(ui, "HIDE", theme::blue())
                         .explain(
                             self.verbosity,
                             "Hide this group until the next search",
@@ -1299,9 +1299,9 @@ impl DupesView {
                     if quick && has_marked {
                         let del = egui::Button::new(
                             RichText::new(format!("{} DELETE NOW", icon::TRASH))
-                                .color(theme::BLACK),
+                                .color(theme::black()),
                         )
-                        .fill(theme::RED);
+                        .fill(theme::red());
                         if ui
                             .add_enabled(idle, del)
                             .explain(
@@ -1347,7 +1347,7 @@ impl DupesView {
         let unlocked = repo_ro && self.unlocked.contains(&k);
         let ro = repo_ro && !unlocked;
         egui::Frame::new()
-            .fill(theme::BLACK)
+            .fill(theme::black())
             .corner_radius(theme::PILL)
             .inner_margin(8.0)
             .outer_margin(egui::Margin::same(4))
@@ -1368,7 +1368,7 @@ impl DupesView {
                             self.thumbnail(ui, gi, fi, file, acts);
                             ui.label(
                                 RichText::new(&file.rel_path)
-                                    .color(theme::TEXT)
+                                    .color(theme::text())
                                     .size(12.0)
                                     .strong(),
                             );
@@ -1378,7 +1378,7 @@ impl DupesView {
                                     file.repo,
                                     format_size(file.entry.size)
                                 ))
-                                .color(theme::TAN)
+                                .color(theme::tan())
                                 .size(11.0),
                             );
                             let dims = file
@@ -1391,14 +1391,14 @@ impl DupesView {
                                     "{dims} · {}",
                                     format_mtime(file.entry.modified_ms)
                                 ))
-                                .color(theme::TAN)
+                                .color(theme::tan())
                                 .size(11.0),
                             );
 
                             if let Some(origin) = &file.entry.origin {
                                 ui.label(
                                     RichText::new(format!("from {origin}"))
-                                        .color(theme::LILAC)
+                                        .color(theme::lilac())
                                         .size(11.0),
                                 );
                             }
@@ -1408,7 +1408,7 @@ impl DupesView {
                             if is_best {
                                 ui.label(
                                     RichText::new(format!("{} BEST", icon::STAR))
-                                        .color(theme::BLUE)
+                                        .color(theme::blue())
                                         .size(12.0)
                                         .strong(),
                                 );
@@ -1421,7 +1421,7 @@ impl DupesView {
                                     .add(
                                         egui::Label::new(
                                             RichText::new("read-only")
-                                                .color(theme::BLUE)
+                                                .color(theme::blue())
                                                 .size(11.0),
                                         )
                                         .sense(egui::Sense::click()),
@@ -1459,7 +1459,7 @@ impl DupesView {
                                 .add(
                                     egui::Label::new(
                                         RichText::new(format!("{} unlocked", icon::LOCK_OPEN))
-                                            .color(theme::RED)
+                                            .color(theme::red())
                                             .size(11.0),
                                     )
                                     .sense(egui::Sense::click()),
@@ -1489,11 +1489,15 @@ impl DupesView {
                                     });
                                 }
                                 let (label, fill) = if marked {
-                                    (format!("{} DELETE", icon::CHECK), theme::RED)
+                                    (format!("{} DELETE", icon::CHECK), theme::red())
                                 } else {
-                                    ("KEEP".to_string(), theme::PANEL)
+                                    ("KEEP".to_string(), theme::panel())
                                 };
-                                let color = if marked { theme::BLACK } else { theme::TEXT };
+                                let color = if marked {
+                                    theme::black()
+                                } else {
+                                    theme::text()
+                                };
                                 if ui
                                     .add(
                                         egui::Button::new(RichText::new(label).color(color))
@@ -1571,8 +1575,16 @@ impl DupesView {
 
         ui.horizontal(|ui| {
             let label = if playing { "PAUSE" } else { "PLAY" };
-            let fill = if playing { theme::AMBER } else { theme::PANEL };
-            let col = if playing { theme::BLACK } else { theme::TEXT };
+            let fill = if playing {
+                theme::amber()
+            } else {
+                theme::panel()
+            };
+            let col = if playing {
+                theme::black()
+            } else {
+                theme::text()
+            };
             if ui
                 .add(egui::Button::new(RichText::new(label).color(col)).fill(fill))
                 .explain(
@@ -1592,7 +1604,7 @@ impl DupesView {
             };
             ui.label(
                 RichText::new(format!("{} / {}", fmt_ms(pos), fmt_ms(total)))
-                    .color(theme::TAN)
+                    .color(theme::tan())
                     .size(11.0),
             );
         });
@@ -1799,7 +1811,7 @@ impl DupesView {
                         let side = OverviewSide {
                             file: a,
                             facts: &a_facts,
-                            accent: theme::BLUE,
+                            accent: theme::blue(),
                             read_only: a_ro,
                             is_main: a_is_main,
                             mark_label: if b_info.is_some() {
@@ -1819,7 +1831,7 @@ impl DupesView {
                         let side = OverviewSide {
                             file: bf,
                             facts: b_facts,
-                            accent: theme::TAN,
+                            accent: theme::tan(),
                             read_only: *b_ro,
                             is_main: b_is_main,
                             mark_label: "DELETE B",
@@ -1848,7 +1860,7 @@ impl DupesView {
                                     other_sel.unwrap_or(0),
                                     others.len(),
                                 ))
-                                .color(theme::TAN),
+                                .color(theme::tan()),
                             );
                             if ui
                                 .button(format!("{} NEXT OTHER", icon::CARET_RIGHT))
@@ -2063,7 +2075,7 @@ impl DupesView {
                             &ColumnHead {
                                 file_name: &a.name,
                                 repo: &a.repo,
-                                accent: theme::BLUE,
+                                accent: theme::blue(),
                                 read_only: a.read_only,
                                 is_main: a.is_main,
                                 source: &a.path,
@@ -2081,7 +2093,7 @@ impl DupesView {
                             &ColumnHead {
                                 file_name: &s.name,
                                 repo: &s.repo,
-                                accent: theme::TAN,
+                                accent: theme::tan(),
                                 read_only: s.read_only,
                                 is_main: s.is_main,
                                 source: &s.path,
@@ -2159,7 +2171,7 @@ impl DupesView {
                 // which collapses the preview to a few lines.
                 let height = (screen_h - 140.0).max(160.0);
                 let mut cols: Vec<ColumnFn<'_, ()>> = Vec::new();
-                for (s, accent) in [(Some(&a), theme::BLUE), (b.as_ref(), theme::TAN)]
+                for (s, accent) in [(Some(&a), theme::blue()), (b.as_ref(), theme::tan())]
                     .into_iter()
                     .filter_map(|(s, c)| s.map(|s| (s, c)))
                 {
@@ -2401,7 +2413,7 @@ impl DupesView {
         let (a_size_col, b_size_col, a_dim_col, b_dim_col) = match &b_bundle {
             Some((bf, _, _, _, _, _)) => {
                 let bigger = |x: u64, y: u64| {
-                    if x > y { theme::BLUE } else { theme::TAN }
+                    if x > y { theme::blue() } else { theme::tan() }
                 };
                 let area = |f: &DupeFile| {
                     f.entry
@@ -2416,7 +2428,7 @@ impl DupesView {
                     bigger(area(bf), area(&a)),
                 )
             }
-            None => (theme::TEXT, theme::TEXT, theme::TEXT, theme::TEXT),
+            None => (theme::text(), theme::text(), theme::text(), theme::text()),
         };
 
         // Destructure the B bundle into individual locals for the closure.
@@ -2525,7 +2537,7 @@ impl DupesView {
                             egui::Align2::CENTER_CENTER,
                             "decoding…",
                             egui::FontId::proportional(16.0),
-                            theme::TAN,
+                            theme::tan(),
                         );
                     }
                     ui.painter().text(
@@ -2533,7 +2545,7 @@ impl DupesView {
                         egui::Align2::LEFT_TOP,
                         "VIDEO — click a still to view",
                         egui::FontId::proportional(14.0),
-                        theme::AMBER,
+                        theme::amber(),
                     );
                     // Filmstrip of stills; the pinned one is outlined. A click
                     // pins that frame in the big view.
@@ -2618,8 +2630,8 @@ impl DupesView {
                         if pill(
                             ui,
                             &format!("{} CLOSE", icon::CHECK),
-                            theme::AMBER,
-                            theme::BLACK,
+                            theme::amber(),
+                            theme::black(),
                             "Close the lightbox",
                             "Close the lightbox and return to the group list (Esc does the same).",
                         ) {
@@ -2628,8 +2640,8 @@ impl DupesView {
                         if pill(
                             ui,
                             "OVERVIEW",
-                            theme::PANEL,
-                            theme::TEXT,
+                            theme::panel(),
+                            theme::text(),
                             "Facts, repo, and mark",
                             "Switch to the Overview tab: repo, size, dimensions, and the mark \
                              control for the copy (and the compare candidate, if comparing) — \
@@ -2640,8 +2652,8 @@ impl DupesView {
                         if pill(
                             ui,
                             icon::CARET_LEFT,
-                            theme::PANEL,
-                            theme::TEXT,
+                            theme::panel(),
+                            theme::text(),
                             "Previous copy",
                             "Step to the previous copy in this group (← does the same).",
                         ) {
@@ -2649,14 +2661,14 @@ impl DupesView {
                         }
                         ui.label(
                             RichText::new(format!("{} / {count}", idx + 1))
-                                .color(theme::TAN)
+                                .color(theme::tan())
                                 .strong(),
                         );
                         if pill(
                             ui,
                             icon::CARET_RIGHT,
-                            theme::PANEL,
-                            theme::TEXT,
+                            theme::panel(),
+                            theme::text(),
                             "Next copy",
                             "Step to the next copy in this group (→ does the same).",
                         ) {
@@ -2666,8 +2678,8 @@ impl DupesView {
                             if pill(
                                 ui,
                                 "FIT",
-                                theme::PANEL,
-                                theme::TEXT,
+                                theme::panel(),
+                                theme::text(),
                                 "Fit to window",
                                 "Scale the image to fit the viewport (F does the same).",
                             ) {
@@ -2676,8 +2688,8 @@ impl DupesView {
                             if pill(
                                 ui,
                                 "1:1",
-                                theme::PANEL,
-                                theme::TEXT,
+                                theme::panel(),
+                                theme::text(),
                                 "True pixels",
                                 "Show the image at 100% — one screen pixel per image pixel \
                                  (1 does the same).",
@@ -2685,11 +2697,11 @@ impl DupesView {
                                 do_one = true;
                             }
                             let (ml, mf) = if a_marked {
-                                (format!("{} MARKED", icon::CHECK), theme::RED)
+                                (format!("{} MARKED", icon::CHECK), theme::red())
                             } else {
-                                ("MARK".to_string(), theme::PANEL)
+                                ("MARK".to_string(), theme::panel())
                             };
-                            let mc = if a_marked { theme::BLACK } else { theme::TEXT };
+                            let mc = if a_marked { theme::black() } else { theme::text() };
                             if a_markable
                                 && pill(
                                     ui,
@@ -2709,8 +2721,8 @@ impl DupesView {
                                 && pill(
                                     ui,
                                     "COMPARE",
-                                    theme::PANEL,
-                                    theme::BLUE,
+                                    theme::panel(),
+                                    theme::blue(),
                                     "A/B compare with the best copy",
                                     "Enter A/B compare against the group's best copy, with a \
                                      shared zoom/pan (C does the same).",
@@ -2722,8 +2734,8 @@ impl DupesView {
                                 if pill(
                                     ui,
                                     "ROT L",
-                                    theme::PANEL,
-                                    theme::TEXT,
+                                    theme::panel(),
+                                    theme::text(),
                                     "Rotate counter-clockwise",
                                     "Rotate 90° counter-clockwise. Lossless for PNG etc.; JPEG is \
                                      re-encoded at high quality when you save.",
@@ -2733,8 +2745,8 @@ impl DupesView {
                                 if pill(
                                     ui,
                                     "ROT R",
-                                    theme::PANEL,
-                                    theme::TEXT,
+                                    theme::panel(),
+                                    theme::text(),
                                     "Rotate clockwise",
                                     "Rotate the image 90° clockwise.",
                                 ) {
@@ -2743,8 +2755,8 @@ impl DupesView {
                                 if pill(
                                     ui,
                                     "FLIP H",
-                                    theme::PANEL,
-                                    theme::TEXT,
+                                    theme::panel(),
+                                    theme::text(),
                                     "Flip horizontally",
                                     "Mirror the image left-to-right.",
                                 ) {
@@ -2753,8 +2765,8 @@ impl DupesView {
                                 if pill(
                                     ui,
                                     "FLIP V",
-                                    theme::PANEL,
-                                    theme::TEXT,
+                                    theme::panel(),
+                                    theme::text(),
                                     "Flip vertically",
                                     "Mirror the image top-to-bottom.",
                                 ) {
@@ -2764,8 +2776,8 @@ impl DupesView {
                                     if pill(
                                         ui,
                                         "RESET",
-                                        theme::PANEL,
-                                        theme::TAN,
+                                        theme::panel(),
+                                        theme::tan(),
                                         "Discard edits",
                                         "Discard the rotate/flip edits and show the original.",
                                     ) {
@@ -2774,8 +2786,8 @@ impl DupesView {
                                     if pill(
                                         ui,
                                         &format!("{} SAVE", icon::CHECK),
-                                        theme::AMBER,
-                                        theme::BLACK,
+                                        theme::amber(),
+                                        theme::black(),
                                         "Save the rotated image",
                                         "Write the rotated/flipped image to disk. You'll choose \
                                          overwrite or a new copy, and confirm first.",
@@ -2788,8 +2800,8 @@ impl DupesView {
                             if pill(
                                 ui,
                                 "EXIT COMPARE",
-                                theme::PANEL,
-                                theme::BLUE,
+                                theme::panel(),
+                                theme::blue(),
                                 "Back to single view",
                                 "Leave A/B compare and return to the single-image view \
                                  (C does the same).",
@@ -2811,15 +2823,15 @@ impl DupesView {
                                      compression artifacts.",
                                 )
                             };
-                            if pill(ui, mode, theme::PANEL, theme::TEXT, mode_short, mode_verbose) {
+                            if pill(ui, mode, theme::panel(), theme::text(), mode_short, mode_verbose) {
                                 toggle_flicker = true;
                             }
                             if flicker
                                 && pill(
                                     ui,
                                     "SWAP",
-                                    theme::PANEL,
-                                    theme::TEXT,
+                                    theme::panel(),
+                                    theme::text(),
                                     "Swap A/B",
                                     "Swap which of A or B is currently shown in flicker mode \
                                      (space does the same).",
@@ -2832,7 +2844,7 @@ impl DupesView {
                                 ui,
                                 &a.repo,
                                 false,
-                                theme::BLUE,
+                                theme::blue(),
                                 self.repo_is_main(&a.repo),
                                 Some(self.repo_is_ro(&a.repo)),
                             );
@@ -2841,7 +2853,7 @@ impl DupesView {
                                     ui,
                                     &bf.repo,
                                     false,
-                                    theme::TAN,
+                                    theme::tan(),
                                     self.repo_is_main(&bf.repo),
                                     Some(self.repo_is_ro(&bf.repo)),
                                 );
@@ -2875,8 +2887,8 @@ impl DupesView {
                         if let Some(b_meta) = &b_meta {
                             let row = |ui: &mut egui::Ui, tag: &str, f: &DupeFile, sc: egui::Color32, dc: egui::Color32| {
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new(tag).color(theme::AMBER).strong());
-                                    ui.label(RichText::new(&f.rel_path).color(theme::TEXT).size(12.0));
+                                    ui.label(RichText::new(tag).color(theme::amber()).strong());
+                                    ui.label(RichText::new(&f.rel_path).color(theme::text()).size(12.0));
                                     ui.label(RichText::new(format_size(f.entry.size)).color(sc).size(12.0));
                                     ui.label(
                                         RichText::new(
@@ -2890,7 +2902,7 @@ impl DupesView {
                                     );
                                     ui.label(
                                         RichText::new(format_mtime(f.entry.modified_ms))
-                                            .color(theme::TAN)
+                                            .color(theme::tan())
                                             .size(12.0),
                                     );
                                 });
@@ -2905,9 +2917,9 @@ impl DupesView {
                             } else {
                                 "wheel zoom · drag pan · space: flicker · Del/K mark B · Esc/C: back to single"
                             };
-                            ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
+                            ui.label(RichText::new(hint).color(theme::lilac()).size(11.0));
                         } else {
-                            ui.label(RichText::new(&a_meta).color(theme::TEXT).size(13.0));
+                            ui.label(RichText::new(&a_meta).color(theme::text()).size(13.0));
                             let (l, r) = (icon::CARET_LEFT, icon::CARET_RIGHT);
                             let hint = if a_is_video {
                                 format!(
@@ -2921,7 +2933,7 @@ impl DupesView {
                                 // No visual to zoom or compare — offer only what works.
                                 format!("{l}/{r} copy · Del/K mark · Esc close")
                             };
-                            ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
+                            ui.label(RichText::new(hint).color(theme::lilac()).size(11.0));
                         }
                     },
                 );
@@ -2988,18 +3000,18 @@ impl DupesView {
                 ui.set_width(400.0);
                 ui.label(
                     RichText::new("SAVE ROTATED IMAGE")
-                        .color(theme::AMBER)
+                        .color(theme::amber())
                         .size(16.0)
                         .strong(),
                 );
                 ui.add_space(6.0);
-                ui.label(RichText::new(&a.rel_path).color(theme::TEXT).size(12.0));
+                ui.label(RichText::new(&a.rel_path).color(theme::text()).size(12.0));
                 if is_jpeg {
                     ui.label(
                         RichText::new(
                             "JPEG will be re-encoded at high quality — a small, unavoidable loss.",
                         )
-                        .color(theme::TAN)
+                        .color(theme::tan())
                         .size(11.0),
                     );
                 }
@@ -3008,9 +3020,9 @@ impl DupesView {
                     if ui
                         .add(
                             egui::Button::new(
-                                RichText::new("OVERWRITE ORIGINAL").color(theme::BLACK),
+                                RichText::new("OVERWRITE ORIGINAL").color(theme::black()),
                             )
-                            .fill(theme::RED),
+                            .fill(theme::red()),
                         )
                         .clicked()
                     {
@@ -3018,15 +3030,15 @@ impl DupesView {
                     }
                     if ui
                         .add(
-                            egui::Button::new(RichText::new("SAVE A COPY").color(theme::BLACK))
-                                .fill(theme::BLUE),
+                            egui::Button::new(RichText::new("SAVE A COPY").color(theme::black()))
+                                .fill(theme::blue()),
                         )
                         .clicked()
                     {
                         do_copy = true;
                     }
                     if ui
-                        .button(RichText::new("CANCEL").color(theme::TEXT))
+                        .button(RichText::new("CANCEL").color(theme::text()))
                         .clicked()
                     {
                         cancel = true;
@@ -3035,7 +3047,7 @@ impl DupesView {
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new("Overwriting changes the file on disk and cannot be undone.")
-                        .color(theme::LILAC)
+                        .color(theme::lilac())
                         .size(11.0),
                 );
             });
@@ -3326,7 +3338,7 @@ impl DupesView {
                                 tag: &str,
                                 cursor: Option<f32>| {
                     let p = ui.painter_at(rect);
-                    p.rect_filled(rect, 4.0, theme::PANEL);
+                    p.rect_filled(rect, 4.0, theme::panel());
                     let ready = if spectrogram {
                         if let Some(tex) = tex {
                             p.image(tex.id(), rect, uv, egui::Color32::WHITE);
@@ -3360,14 +3372,14 @@ impl DupesView {
                             egui::Align2::CENTER_CENTER,
                             "analyzing…",
                             egui::FontId::proportional(16.0),
-                            theme::TAN,
+                            theme::tan(),
                         );
                     }
                     if let Some(f) = cursor {
                         let x = rect.left() + f * rect.width();
                         p.line_segment(
                             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                            egui::Stroke::new(1.5, theme::AMBER),
+                            egui::Stroke::new(1.5, theme::amber()),
                         );
                     }
                     p.text(
@@ -3375,7 +3387,7 @@ impl DupesView {
                         egui::Align2::LEFT_TOP,
                         tag,
                         egui::FontId::proportional(16.0),
-                        theme::AMBER,
+                        theme::amber(),
                     );
                 };
 
@@ -3435,9 +3447,9 @@ impl DupesView {
                                     .add(
                                         egui::Button::new(
                                             RichText::new(format!("{} EDIT", icon::PENCIL))
-                                                .color(theme::TEXT),
+                                                .color(theme::text()),
                                         )
-                                        .fill(theme::PANEL),
+                                        .fill(theme::panel()),
                                     )
                                     .clicked()
                                 {
@@ -3449,15 +3461,15 @@ impl DupesView {
                                 let ov = own.as_ref().map(get).unwrap_or("");
                                 let tv = other.as_ref().map(get).unwrap_or("");
                                 let col = if own.is_some() && ov != tv {
-                                    theme::AMBER
+                                    theme::amber()
                                 } else {
-                                    theme::TEXT
+                                    theme::text()
                                 };
                                 ui.horizontal(|ui| {
                                     ui.add_sized(
                                         [46.0, 15.0],
                                         egui::Label::new(
-                                            RichText::new(name).color(theme::LILAC).size(10.0),
+                                            RichText::new(name).color(theme::lilac()).size(10.0),
                                         ),
                                     );
                                     ui.add(
@@ -3479,9 +3491,9 @@ impl DupesView {
                     let show_b = state.compare.as_ref().is_some_and(|c| c.show_b);
                     let ra = ui.allocate_rect(wave_area, egui::Sense::click());
                     if show_b {
-                        draw_row(ui, wave_area, b_viz.as_ref(), b_tex.as_ref(), theme::TAN, "B", b_cursor);
+                        draw_row(ui, wave_area, b_viz.as_ref(), b_tex.as_ref(), theme::tan(), "B", b_cursor);
                     } else {
-                        draw_row(ui, wave_area, a_viz.as_ref(), a_tex.as_ref(), theme::BLUE, "A", a_cursor);
+                        draw_row(ui, wave_area, a_viz.as_ref(), a_tex.as_ref(), theme::blue(), "A", a_cursor);
                     }
                     if ra.clicked()
                         && let Some(f) = frac_at(wave_area, &ra)
@@ -3489,9 +3501,9 @@ impl DupesView {
                         click_play = Some((show_b, f));
                     }
                     let hit = if show_b {
-                        draw_tags(ui, tags_col, &b_tags, &a_tags, "B", theme::TAN, b_idx.unwrap_or(idx))
+                        draw_tags(ui, tags_col, &b_tags, &a_tags, "B", theme::tan(), b_idx.unwrap_or(idx))
                     } else {
-                        draw_tags(ui, tags_col, &a_tags, &b_tags, "A", theme::BLUE, idx)
+                        draw_tags(ui, tags_col, &a_tags, &b_tags, "A", theme::blue(), idx)
                     };
                     open_tags = open_tags.or(hit);
                 } else if comparing {
@@ -3510,40 +3522,40 @@ impl DupesView {
                         egui::vec2(tags_col.width(), half),
                     );
                     let ra = ui.allocate_rect(top, egui::Sense::click());
-                    draw_row(ui, top, a_viz.as_ref(), a_tex.as_ref(), theme::BLUE, "A", a_cursor);
+                    draw_row(ui, top, a_viz.as_ref(), a_tex.as_ref(), theme::blue(), "A", a_cursor);
                     if ra.clicked()
                         && let Some(f) = frac_at(top, &ra)
                     {
                         click_play = Some((false, f));
                     }
                     let rb = ui.allocate_rect(bot, egui::Sense::click());
-                    draw_row(ui, bot, b_viz.as_ref(), b_tex.as_ref(), theme::TAN, "B", b_cursor);
+                    draw_row(ui, bot, b_viz.as_ref(), b_tex.as_ref(), theme::tan(), "B", b_cursor);
                     if rb.clicked()
                         && let Some(f) = frac_at(bot, &rb)
                     {
                         click_play = Some((true, f));
                     }
                     // Symmetric tag panels: A beside the top row, B beside bottom.
-                    let ha = draw_tags(ui, ttop, &a_tags, &b_tags, "A", theme::BLUE, idx);
+                    let ha = draw_tags(ui, ttop, &a_tags, &b_tags, "A", theme::blue(), idx);
                     let hb = draw_tags(
                         ui,
                         tbot,
                         &b_tags,
                         &a_tags,
                         "B",
-                        theme::TAN,
+                        theme::tan(),
                         b_idx.unwrap_or(idx),
                     );
                     open_tags = open_tags.or(ha).or(hb);
                 } else {
                     let ra = ui.allocate_rect(wave_area, egui::Sense::click());
-                    draw_row(ui, wave_area, a_viz.as_ref(), a_tex.as_ref(), theme::BLUE, "A", a_cursor);
+                    draw_row(ui, wave_area, a_viz.as_ref(), a_tex.as_ref(), theme::blue(), "A", a_cursor);
                     if ra.clicked()
                         && let Some(f) = frac_at(wave_area, &ra)
                     {
                         click_play = Some((false, f));
                     }
-                    let hit = draw_tags(ui, tags_col, &a_tags, &b_tags, "A", theme::BLUE, idx);
+                    let hit = draw_tags(ui, tags_col, &a_tags, &b_tags, "A", theme::blue(), idx);
                     open_tags = open_tags.or(hit);
                 }
 
@@ -3574,8 +3586,8 @@ impl DupesView {
                         if pill(
                             ui,
                             &format!("{} CLOSE", icon::CHECK),
-                            theme::AMBER,
-                            theme::BLACK,
+                            theme::amber(),
+                            theme::black(),
                             "Close the audio lightbox",
                             "Close and return to the group list (Esc steps back one level).",
                         ) {
@@ -3584,8 +3596,8 @@ impl DupesView {
                         if pill(
                             ui,
                             "OVERVIEW",
-                            theme::PANEL,
-                            theme::TEXT,
+                            theme::panel(),
+                            theme::text(),
                             "Facts, repo, and mark",
                             "Switch to the Overview tab: repo, size, duration, and the mark \
                              control for the copy (and the compare candidate, if comparing) — \
@@ -3596,8 +3608,8 @@ impl DupesView {
                         if pill(
                             ui,
                             icon::CARET_LEFT,
-                            theme::PANEL,
-                            theme::TEXT,
+                            theme::panel(),
+                            theme::text(),
                             "Previous copy",
                             "Switch to the previous copy, keeping the playback offset (← does \
                              the same).",
@@ -3606,14 +3618,14 @@ impl DupesView {
                         }
                         ui.label(
                             RichText::new(format!("{} / {count}", idx + 1))
-                                .color(theme::TAN)
+                                .color(theme::tan())
                                 .strong(),
                         );
                         if pill(
                             ui,
                             icon::CARET_RIGHT,
-                            theme::PANEL,
-                            theme::TEXT,
+                            theme::panel(),
+                            theme::text(),
                             "Next copy",
                             "Switch to the next copy, keeping the playback offset (→ does the \
                              same).",
@@ -3621,9 +3633,9 @@ impl DupesView {
                             new_idx = (idx + 1) % count;
                         }
                         let (pl, pf, pc) = if playing {
-                            ("PAUSE", theme::AMBER, theme::BLACK)
+                            ("PAUSE", theme::amber(), theme::black())
                         } else {
-                            ("PLAY", theme::PANEL, theme::TEXT)
+                            ("PLAY", theme::panel(), theme::text())
                         };
                         if pill(
                             ui,
@@ -3651,14 +3663,14 @@ impl DupesView {
                                  loud music (S toggles).",
                             )
                         };
-                        if pill(ui, vl, theme::PANEL, theme::LILAC, vshort, vverbose) {
+                        if pill(ui, vl, theme::panel(), theme::lilac(), vshort, vverbose) {
                             toggle_spec = true;
                         }
                         if pill(
                             ui,
                             &format!("{} TAGS", icon::PENCIL),
-                            theme::PANEL,
-                            theme::TEXT,
+                            theme::panel(),
+                            theme::text(),
                             "Edit ID3 tags",
                             "Open this copy's tags on the Metadata tab, ready to edit — saving \
                              writes only the tags, the audio is untouched (T does the same).",
@@ -3700,7 +3712,7 @@ impl DupesView {
                                      visible; click either to hear that spot.",
                                 )
                             };
-                            if pill(ui, cl, theme::PANEL, theme::BLUE, cshort, cverbose) {
+                            if pill(ui, cl, theme::panel(), theme::blue(), cshort, cverbose) {
                                 toggle_compare = true;
                             }
                             if comparing {
@@ -3718,15 +3730,15 @@ impl DupesView {
                                          then swaps between them — flick A↔B to spot differences.",
                                     )
                                 };
-                                if pill(ui, ml, theme::PANEL, theme::TEXT, mshort, mverbose) {
+                                if pill(ui, ml, theme::panel(), theme::text(), mshort, mverbose) {
                                     toggle_flicker = true;
                                 }
                                 if flicker
                                     && pill(
                                         ui,
                                         "SWAP",
-                                        theme::PANEL,
-                                        theme::TEXT,
+                                        theme::panel(),
+                                        theme::text(),
                                         "Swap A/B",
                                         "Swap which copy is shown in flicker (space does the same).",
                                     )
@@ -3761,7 +3773,7 @@ impl DupesView {
                                             .map_or(0, |a| u64::from(a.duration_ms))
                                     ),
                                 ))
-                                .color(theme::TEXT)
+                                .color(theme::text())
                                 .size(12.0),
                             );
                         };
@@ -3793,7 +3805,7 @@ impl DupesView {
                         };
                         ui.label(
                             RichText::new(hint)
-                            .color(theme::LILAC)
+                            .color(theme::lilac())
                             .size(11.0),
                         );
                     },
@@ -4013,24 +4025,25 @@ impl DupesView {
             ui.set_width(360.0);
             ui.label(
                 RichText::new("CONFIRM")
-                    .color(theme::AMBER)
+                    .color(theme::amber())
                     .size(16.0)
                     .strong(),
             );
             ui.add_space(6.0);
-            ui.colored_label(theme::TEXT, prompt);
+            ui.colored_label(theme::text(), prompt);
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui
                     .add(
-                        egui::Button::new(RichText::new(verb).color(theme::BLACK)).fill(theme::RED),
+                        egui::Button::new(RichText::new(verb).color(theme::black()))
+                            .fill(theme::red()),
                     )
                     .clicked()
                 {
                     acts.push(Act::ConfirmDelete);
                 }
                 if ui
-                    .button(RichText::new("CANCEL").color(theme::BLACK))
+                    .button(RichText::new("CANCEL").color(theme::black()))
                     .clicked()
                 {
                     acts.push(Act::CancelDelete);
@@ -4405,7 +4418,7 @@ mod ui_tests {
             .build_ui(move |ui| {
                 if !init {
                     crate::icon::install(ui.ctx());
-                    crate::theme::apply(ui.ctx());
+                    crate::theme::apply(ui.ctx(), crate::theme::DARK);
                     init = true;
                 }
                 view.show(ui, &store, TooltipVerbosity::default());
@@ -4492,7 +4505,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default());
@@ -4533,7 +4546,7 @@ mod ui_tests {
             .build_ui(move |ui| {
                 if !init {
                     crate::icon::install(ui.ctx());
-                    crate::theme::apply(ui.ctx());
+                    crate::theme::apply(ui.ctx(), crate::theme::DARK);
                     init = true;
                 }
                 view.show(ui, &store, TooltipVerbosity::default());
@@ -4615,7 +4628,7 @@ mod ui_tests {
             .build_ui(move |ui| {
                 if !init {
                     crate::icon::install(ui.ctx());
-                    crate::theme::apply(ui.ctx());
+                    crate::theme::apply(ui.ctx(), crate::theme::DARK);
                     init = true;
                 }
                 view.show(ui, &store, TooltipVerbosity::default());
@@ -4684,7 +4697,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store, TooltipVerbosity::default());
@@ -4722,7 +4735,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store, TooltipVerbosity::default());
@@ -4809,7 +4822,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default());
@@ -4839,7 +4852,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default());
@@ -4893,7 +4906,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default());
@@ -4969,7 +4982,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     // keep tmp alive for the store's lifetime
@@ -5057,7 +5070,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -5128,7 +5141,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -5199,7 +5212,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -5244,7 +5257,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -5291,7 +5304,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -5465,7 +5478,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -5513,7 +5526,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -5602,7 +5615,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -5667,7 +5680,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -5904,7 +5917,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store, TooltipVerbosity::default());
@@ -5972,7 +5985,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -6052,7 +6065,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -6170,7 +6183,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store, TooltipVerbosity::default());
@@ -6299,7 +6312,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -6385,7 +6398,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -6432,7 +6445,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -6542,7 +6555,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store, TooltipVerbosity::default());
@@ -6630,7 +6643,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store, TooltipVerbosity::default());
@@ -6681,7 +6694,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -6771,7 +6784,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -6913,7 +6926,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store, TooltipVerbosity::default());
@@ -6983,7 +6996,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -7144,7 +7157,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default());
@@ -7247,7 +7260,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store, TooltipVerbosity::default());
@@ -7315,7 +7328,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -7358,7 +7371,7 @@ mod ui_tests {
             .build_ui(move |ui| {
                 if !init {
                     crate::icon::install(ui.ctx());
-                    crate::theme::apply(ui.ctx());
+                    crate::theme::apply(ui.ctx(), crate::theme::DARK);
                     init = true;
                 }
                 view.show(ui, &store, TooltipVerbosity::default());
@@ -7409,7 +7422,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -7499,7 +7512,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -7543,7 +7556,7 @@ mod ui_tests {
             .build_ui(move |ui| {
                 if !init {
                     crate::icon::install(ui.ctx());
-                    crate::theme::apply(ui.ctx());
+                    crate::theme::apply(ui.ctx(), crate::theme::DARK);
                     init = true;
                 }
                 view.show(ui, &store, TooltipVerbosity::default());
@@ -7586,7 +7599,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default());
@@ -7650,7 +7663,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -7727,7 +7740,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -7822,7 +7835,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -7930,7 +7943,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -7997,7 +8010,7 @@ mod ui_tests {
                     move |ui, view: &mut DupesView| {
                         if !init {
                             crate::icon::install(ui.ctx());
-                            crate::theme::apply(ui.ctx());
+                            crate::theme::apply(ui.ctx(), crate::theme::DARK);
                             init = true;
                         }
                         let _ = &tmp;
@@ -8089,7 +8102,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = (&tmp, &dir);
@@ -8175,7 +8188,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = (&tmp, &dir);
@@ -8234,7 +8247,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default());
@@ -8306,7 +8319,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = (&tmp, &dir);
@@ -8402,7 +8415,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = (&tmp, &dir);
@@ -8487,7 +8500,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = (&tmp, &dir);
@@ -8550,7 +8563,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -8988,7 +9001,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = &tmp;
@@ -9052,7 +9065,7 @@ mod ui_tests {
                 move |ui, view: &mut DupesView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let _ = (&tmp, &text_dir);

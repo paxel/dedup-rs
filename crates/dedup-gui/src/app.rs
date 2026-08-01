@@ -948,7 +948,7 @@ impl eframe::App for DedupApp {
                 egui::Align2::CENTER_CENTER,
                 "Drop folders to add them as repositories",
                 egui::FontId::proportional(22.0),
-                theme::AMBER,
+                theme::amber(),
             );
         }
 
@@ -1039,19 +1039,19 @@ impl DedupApp {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("top")
             .exact_size(56.0)
-            .frame(egui::Frame::new().fill(theme::BLACK).inner_margin(8.0))
+            .frame(egui::Frame::new().fill(theme::black()).inner_margin(8.0))
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.label(
                         RichText::new("DEDUP")
-                            .color(theme::ORANGE)
+                            .color(theme::orange())
                             .size(26.0)
                             .strong(),
                     );
                     ui.add_space(6.0);
                     ui.label(
                         RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                            .color(theme::LILAC)
+                            .color(theme::lilac())
                             .size(13.0),
                     );
                     ui.add_space(16.0);
@@ -1066,7 +1066,7 @@ impl DedupApp {
                             ui,
                             &format!("{} SETTINGS", icon::GEAR),
                             true,
-                            theme::TAN,
+                            theme::tan(),
                         )
                         .explain(
                             self.tooltip_verbosity,
@@ -1079,7 +1079,7 @@ impl DedupApp {
                         }
                         // Added after SETTINGS so it renders immediately to its
                         // left in this right-to-left layout.
-                        if crate::lcars::action_button(ui, "ABOUT", true, theme::TAN)
+                        if crate::lcars::action_button(ui, "ABOUT", true, theme::tan())
                             .explain(
                                 self.tooltip_verbosity,
                                 "Version and license",
@@ -1090,7 +1090,7 @@ impl DedupApp {
                             self.show_about = true;
                         }
                         // Added after ABOUT so it renders immediately to its left.
-                        if crate::lcars::action_button(ui, "HELP", true, theme::TAN)
+                        if crate::lcars::action_button(ui, "HELP", true, theme::tan())
                             .explain(
                                 self.tooltip_verbosity,
                                 "Explain the current tab",
@@ -1113,7 +1113,7 @@ impl DedupApp {
                                         &mut self.tab,
                                         Tab::Repositories,
                                         "REPOSITORIES",
-                                        theme::ORANGE,
+                                        theme::orange(),
                                         self.tooltip_verbosity,
                                         "Add, update, and manage repository links",
                                     );
@@ -1122,7 +1122,7 @@ impl DedupApp {
                                         &mut self.tab,
                                         Tab::Duplicates,
                                         "DUPLICATES",
-                                        theme::LILAC,
+                                        theme::lilac(),
                                         self.tooltip_verbosity,
                                         "Find and review exact or perceptually similar duplicates",
                                     );
@@ -1131,7 +1131,7 @@ impl DedupApp {
                                         &mut self.tab,
                                         Tab::Transfer,
                                         "TRANSFER",
-                                        theme::BLUE,
+                                        theme::blue(),
                                         self.tooltip_verbosity,
                                         "Copy, move, sync or push a backup group between \
                                          repositories by content",
@@ -1141,7 +1141,7 @@ impl DedupApp {
                                         &mut self.tab,
                                         Tab::Grooming,
                                         "GROOMING",
-                                        theme::TAN,
+                                        theme::tan(),
                                         self.tooltip_verbosity,
                                         "Prune and reorganize repositories (coming soon)",
                                     );
@@ -1150,7 +1150,7 @@ impl DedupApp {
                                         &mut self.tab,
                                         Tab::Browse,
                                         "BROWSE",
-                                        theme::AMBER,
+                                        theme::amber(),
                                         self.tooltip_verbosity,
                                         "Browse a repo's files by directory, from the index",
                                     );
@@ -1165,17 +1165,17 @@ impl DedupApp {
         ui.add_space(6.0);
         ui.label(
             RichText::new("REPOSITORY MANAGEMENT")
-                .color(theme::AMBER)
+                .color(theme::amber())
                 .size(18.0)
                 .strong(),
         );
         ui.add_space(4.0);
 
         if let Some(err) = &self.load_error {
-            ui.colored_label(theme::RED, err);
+            ui.colored_label(theme::red(), err);
         }
         if let Some(notice) = &self.notice {
-            ui.colored_label(theme::AMBER, notice);
+            ui.colored_label(theme::amber(), notice);
         }
 
         // The registry is locked while any repo is updating, so adding a repo
@@ -1184,13 +1184,14 @@ impl DedupApp {
         crate::lcars::section_lcars(
             ui,
             "MANAGE — ADD & UPDATE REPOSITORIES",
-            theme::BLUE,
+            theme::blue(),
             |ui| {
                 ui.horizontal(|ui| {
                     let add = egui::Button::new(
-                        RichText::new(format!("{} ADD REPOSITORY", icon::PLUS)).color(theme::BLACK),
+                        RichText::new(format!("{} ADD REPOSITORY", icon::PLUS))
+                            .color(theme::black()),
                     )
-                    .fill(theme::BLUE);
+                    .fill(theme::blue());
                     if ui
                     .add_enabled(!busy, add)
                     .explain(
@@ -1206,9 +1207,10 @@ impl DedupApp {
                     // Enqueues every repo; it only touches names (no db access), so it
                     // stays enabled even while a batch is running.
                     let update_all = egui::Button::new(
-                        RichText::new(format!("{} UPDATE ALL", icon::REFRESH)).color(theme::BLACK),
+                        RichText::new(format!("{} UPDATE ALL", icon::REFRESH))
+                            .color(theme::black()),
                     )
-                    .fill(theme::ORANGE);
+                    .fill(theme::orange());
                     if ui
                     .add_enabled(!self.repos.is_empty(), update_all)
                     .explain(
@@ -1225,9 +1227,9 @@ impl DedupApp {
                     // db access), so it is fine to run any time.
                     let refresh = egui::Button::new(
                         RichText::new(format!("{} REFRESH STATUS", icon::REFRESH))
-                            .color(theme::BLACK),
+                            .color(theme::black()),
                     )
-                    .fill(theme::LILAC);
+                    .fill(theme::lilac());
                     if ui
                     .add_enabled(!self.repos.is_empty(), refresh)
                     .explain(
@@ -1243,7 +1245,7 @@ impl DedupApp {
                     if busy {
                         ui.label(
                             RichText::new("· busy: a scan is running")
-                                .color(theme::TAN)
+                                .color(theme::tan())
                                 .size(12.0),
                         );
                     }
@@ -1258,7 +1260,7 @@ impl DedupApp {
             .show(ui, |ui| {
                 if rows.is_empty() {
                     ui.add_space(8.0);
-                    ui.colored_label(theme::TEXT, "No repositories yet — use ADD REPOSITORY.");
+                    ui.colored_label(theme::text(), "No repositories yet — use ADD REPOSITORY.");
                 }
                 for row in &rows {
                     // A sink is shown inside its group's section, not as a
@@ -1278,7 +1280,7 @@ impl DedupApp {
                             crate::lcars::section_lcars_collapsible(
                                 ui,
                                 &name,
-                                theme::GREEN,
+                                theme::green(),
                                 false,
                                 |ui| {
                                     self.repo_card(ui, row, actions);
@@ -1336,7 +1338,7 @@ impl DedupApp {
                 ui,
                 &format!("{} ADD REPO", icon::PLUS),
                 true,
-                theme::BLUE,
+                theme::blue(),
             )
             .explain(
                 verbosity,
@@ -1355,7 +1357,7 @@ impl DedupApp {
                 ui,
                 &format!("{} UPDATE ALL", icon::REFRESH),
                 true,
-                theme::AMBER,
+                theme::amber(),
             )
             .explain(
                 verbosity,
@@ -1366,7 +1368,7 @@ impl DedupApp {
             {
                 actions.push(Action::UpdateGroup(group_name.clone()));
             }
-            if crate::lcars::action_button(ui, "UNGROUP", true, theme::LILAC)
+            if crate::lcars::action_button(ui, "UNGROUP", true, theme::lilac())
                 .explain(
                     verbosity,
                     "Disband this group",
@@ -1404,9 +1406,9 @@ impl DedupApp {
             )
         });
         egui::Frame::new()
-            .fill(theme::PANEL)
+            .fill(theme::panel())
             .corner_radius(theme::PILL)
-            .stroke(egui::Stroke::new(1.5, theme::ORANGE))
+            .stroke(egui::Stroke::new(1.5, theme::orange()))
             .inner_margin(12.0)
             .outer_margin(egui::Margin {
                 left: 0,
@@ -1418,7 +1420,7 @@ impl DedupApp {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(&row.name)
-                            .color(theme::AMBER)
+                            .color(theme::amber())
                             .size(17.0)
                             .strong(),
                     );
@@ -1438,7 +1440,7 @@ impl DedupApp {
                         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(&row.path).color(theme::TEXT).size(12.0),
+                                    RichText::new(&row.path).color(theme::text()).size(12.0),
                                 )
                                 .truncate(),
                             )
@@ -1455,7 +1457,7 @@ impl DedupApp {
                         ui,
                         "FILES",
                         &row.stats.file_count.to_string(),
-                        theme::ORANGE,
+                        theme::orange(),
                         "Indexed files (missing files excluded)",
                         "Number of files currently indexed for this repository. Files that \
                          were indexed before but have since vanished from disk are excluded \
@@ -1466,7 +1468,7 @@ impl DedupApp {
                         ui,
                         "SIZE",
                         &format_size(row.stats.total_size),
-                        theme::BLUE,
+                        theme::blue(),
                         "Total size of indexed files",
                         "Sum of the on-disk size of every indexed (non-missing) file in this \
                          repository.",
@@ -1476,7 +1478,7 @@ impl DedupApp {
                         ui,
                         "MISSING",
                         &row.stats.missing_count.to_string(),
-                        theme::LILAC,
+                        theme::lilac(),
                         "Indexed before but no longer on disk",
                         "Files that were indexed by a previous scan but are no longer found \
                          on disk. They stay in the index as history but are excluded from \
@@ -1487,7 +1489,7 @@ impl DedupApp {
                         ui,
                         "SCANNED",
                         &format_last_scan(row.stats.last_scan_ms),
-                        theme::TAN,
+                        theme::tan(),
                         "When this repository was last scanned",
                         "Date and time of the most recent completed UPDATE / SCAN of this \
                          repository. \"never\" means it hasn't been scanned yet.",
@@ -1508,7 +1510,7 @@ impl DedupApp {
                                     "queued to {verb} — waiting {}",
                                     format_elapsed(waited)
                                 ))
-                                .color(theme::TAN),
+                                .color(theme::tan()),
                             );
                             if cancel_button(
                                 ui,
@@ -1526,7 +1528,7 @@ impl DedupApp {
                         let elapsed = elapsed.unwrap_or_default();
                         let checking = kind == JobKind::Check;
                         ui.horizontal(|ui| {
-                            ui.add(egui::Spinner::new().color(theme::AMBER));
+                            ui.add(egui::Spinner::new().color(theme::amber()));
                             match &event {
                                 // Only a full update hashes; a check never does.
                                 ProgressEvent::Hashing { done, total, .. }
@@ -1545,12 +1547,12 @@ impl DedupApp {
                                         RichText::new(format!(
                                             "checking — {files} files, {dirs} dirs"
                                         ))
-                                        .color(theme::AMBER),
+                                        .color(theme::amber()),
                                     );
                                 }
                                 other => {
                                     ui.label(
-                                        RichText::new(progress_line(other)).color(theme::AMBER),
+                                        RichText::new(progress_line(other)).color(theme::amber()),
                                     );
                                 }
                             }
@@ -1582,12 +1584,12 @@ impl DedupApp {
                             ),
                             _ => format!("{verb} for {}", format_elapsed(elapsed)),
                         };
-                        ui.label(RichText::new(timing).color(theme::TAN).size(12.0));
+                        ui.label(RichText::new(timing).color(theme::tan()).size(12.0));
                     }
                     None => {
                         self.card_controls(ui, row, actions);
                         if let Some(last) = &row.last {
-                            ui.label(RichText::new(last).color(theme::TAN).size(12.0));
+                            ui.label(RichText::new(last).color(theme::tan()).size(12.0));
                         }
                     }
                 }
@@ -1600,7 +1602,7 @@ impl DedupApp {
             Some(Edit::Rename { name, buf }) if *name == row.name => {
                 let verbosity = self.tooltip_verbosity;
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("RENAME →").color(theme::LILAC));
+                    ui.label(RichText::new("RENAME →").color(theme::lilac()));
                     ui.text_edit_singleline(buf).explain(
                         verbosity,
                         "New name",
@@ -1608,14 +1610,14 @@ impl DedupApp {
                          on-disk folder it points at is unchanged).",
                     );
                     if ui
-                        .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::BLACK))
+                        .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::black()))
                         .explain(verbosity, "Confirm rename", "Apply the new name.")
                         .clicked()
                     {
                         actions.push(Action::CommitRename(name.clone(), buf.trim().to_string()));
                     }
                     if ui
-                        .button(RichText::new(icon::X).color(theme::BLACK))
+                        .button(RichText::new(icon::X).color(theme::black()))
                         .explain(
                             verbosity,
                             "Cancel",
@@ -1631,11 +1633,11 @@ impl DedupApp {
             Some(Edit::Relocate { name, buf }) if *name == row.name => {
                 let verbosity = self.tooltip_verbosity;
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("RELOCATE →").color(theme::LILAC));
+                    ui.label(RichText::new("RELOCATE →").color(theme::lilac()));
                     if ui
                         .button(
                             RichText::new(format!("{} CHOOSE…", icon::FOLDER_OPEN))
-                                .color(theme::BLACK),
+                                .color(theme::black()),
                         )
                         .explain(
                             verbosity,
@@ -1654,14 +1656,14 @@ impl DedupApp {
                          existing index is kept — only the target path changes.",
                     );
                     if ui
-                        .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::BLACK))
+                        .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::black()))
                         .explain(verbosity, "Confirm relocate", "Apply the new folder path.")
                         .clicked()
                     {
                         actions.push(Action::CommitRelocate(name.clone(), buf.trim().to_string()));
                     }
                     if ui
-                        .button(RichText::new(icon::X).color(theme::BLACK))
+                        .button(RichText::new(icon::X).color(theme::black()))
                         .explain(
                             verbosity,
                             "Cancel",
@@ -1677,18 +1679,18 @@ impl DedupApp {
             Some(Edit::Duplicate { name, dest, path }) if *name == row.name => {
                 let verbosity = self.tooltip_verbosity;
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("COPY → NAME").color(theme::LILAC));
+                    ui.label(RichText::new("COPY → NAME").color(theme::lilac()));
                     ui.add(egui::TextEdit::singleline(dest).desired_width(140.0))
                         .explain(
                             verbosity,
                             "New repository's name",
                             "Name for the new repository the index is copied into.",
                         );
-                    ui.label(RichText::new("PATH").color(theme::LILAC));
+                    ui.label(RichText::new("PATH").color(theme::lilac()));
                     if ui
                         .button(
                             RichText::new(format!("{} CHOOSE…", icon::FOLDER_OPEN))
-                                .color(theme::BLACK),
+                                .color(theme::black()),
                         )
                         .explain(
                             verbosity,
@@ -1712,7 +1714,7 @@ impl DedupApp {
                          repository is left completely unchanged.",
                     );
                     if ui
-                        .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::BLACK))
+                        .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::black()))
                         .explain(
                             verbosity,
                             "Confirm duplicate",
@@ -1727,7 +1729,7 @@ impl DedupApp {
                         });
                     }
                     if ui
-                        .button(RichText::new(icon::X).color(theme::BLACK))
+                        .button(RichText::new(icon::X).color(theme::black()))
                         .explain(
                             verbosity,
                             "Cancel",
@@ -1748,7 +1750,7 @@ impl DedupApp {
             }) if *main == row.name => {
                 let verbosity = self.tooltip_verbosity;
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("ADD SINK → NAME").color(theme::GREEN));
+                    ui.label(RichText::new("ADD SINK → NAME").color(theme::green()));
                     ui.add(egui::TextEdit::singleline(dest).desired_width(140.0))
                         .explain(
                             verbosity,
@@ -1756,11 +1758,11 @@ impl DedupApp {
                             "Name for the new backup repository. It starts as a copy of this \
                              group's main index, pointed at the folder you choose.",
                         );
-                    ui.label(RichText::new("PATH").color(theme::GREEN));
+                    ui.label(RichText::new("PATH").color(theme::green()));
                     if ui
                         .button(
                             RichText::new(format!("{} CHOOSE…", icon::FOLDER_OPEN))
-                                .color(theme::BLACK),
+                                .color(theme::black()),
                         )
                         .explain(
                             verbosity,
@@ -1784,7 +1786,7 @@ impl DedupApp {
                          is left completely unchanged.",
                     );
                     if ui
-                        .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::BLACK))
+                        .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::black()))
                         .explain(
                             verbosity,
                             "Add this backup",
@@ -1801,7 +1803,7 @@ impl DedupApp {
                         });
                     }
                     if ui
-                        .button(RichText::new(icon::X).color(theme::BLACK))
+                        .button(RichText::new(icon::X).color(theme::black()))
                         .explain(verbosity, "Cancel", "Discard and close the editor.")
                         .clicked()
                     {
@@ -1813,11 +1815,11 @@ impl DedupApp {
             Some(Edit::ConfirmDelete { name }) if *name == row.name => {
                 let verbosity = self.tooltip_verbosity;
                 ui.horizontal(|ui| {
-                    ui.colored_label(theme::RED, format!("Delete '{name}' and its index?"));
+                    ui.colored_label(theme::red(), format!("Delete '{name}' and its index?"));
                     if ui
                         .add(
-                            egui::Button::new(RichText::new("DELETE").color(theme::BLACK))
-                                .fill(theme::RED),
+                            egui::Button::new(RichText::new("DELETE").color(theme::black()))
+                                .fill(theme::red()),
                         )
                         .explain(
                             verbosity,
@@ -1830,7 +1832,7 @@ impl DedupApp {
                         actions.push(Action::CommitDelete(name.clone()));
                     }
                     if ui
-                        .button(RichText::new("KEEP").color(theme::BLACK))
+                        .button(RichText::new("KEEP").color(theme::black()))
                         .explain(
                             verbosity,
                             "Cancel",
@@ -1851,7 +1853,7 @@ impl DedupApp {
         let reachable = row.location.is_none_or(|l| l.reachable());
         ui.horizontal(|ui| {
             let update = egui::Button::new(
-                RichText::new(format!("{} UPDATE / SCAN", icon::REFRESH)).color(theme::BLACK),
+                RichText::new(format!("{} UPDATE / SCAN", icon::REFRESH)).color(theme::black()),
             );
             if ui
                 .add_enabled(reachable, update)
@@ -1867,7 +1869,7 @@ impl DedupApp {
                 actions.push(Action::Update(row.name.clone()));
             }
             let check = egui::Button::new(
-                RichText::new(format!("{} CHECK", icon::SEARCH)).color(theme::BLACK),
+                RichText::new(format!("{} CHECK", icon::SEARCH)).color(theme::black()),
             );
             if ui
                 .add_enabled(reachable, check)
@@ -1883,7 +1885,7 @@ impl DedupApp {
                 actions.push(Action::Check(row.name.clone()));
             }
             if ui
-                .button(RichText::new(format!("{} RENAME", icon::PENCIL)).color(theme::BLACK))
+                .button(RichText::new(format!("{} RENAME", icon::PENCIL)).color(theme::black()))
                 .explain(
                     self.tooltip_verbosity,
                     "Rename this repository",
@@ -1895,7 +1897,7 @@ impl DedupApp {
                 actions.push(Action::BeginRename(row.name.clone()));
             }
             if ui
-                .button(RichText::new(format!("{} RELOCATE", icon::RELOCATE)).color(theme::BLACK))
+                .button(RichText::new(format!("{} RELOCATE", icon::RELOCATE)).color(theme::black()))
                 .explain(
                     self.tooltip_verbosity,
                     "Point this repository at a different folder",
@@ -1907,7 +1909,7 @@ impl DedupApp {
                 actions.push(Action::BeginRelocate(row.name.clone()));
             }
             if ui
-                .button(RichText::new(format!("{} DUPLICATE", icon::COPY)).color(theme::BLACK))
+                .button(RichText::new(format!("{} DUPLICATE", icon::COPY)).color(theme::black()))
                 .explain(
                     self.tooltip_verbosity,
                     "Copy this repository's index into a new one at a new path",
@@ -1922,9 +1924,9 @@ impl DedupApp {
             if ui
                 .add(
                     egui::Button::new(
-                        RichText::new(format!("{} DELETE", icon::TRASH)).color(theme::BLACK),
+                        RichText::new(format!("{} DELETE", icon::TRASH)).color(theme::black()),
                     )
-                    .fill(theme::RED),
+                    .fill(theme::red()),
                 )
                 .explain(
                     self.tooltip_verbosity,
@@ -1966,7 +1968,7 @@ impl DedupApp {
                     } else {
                         "MODE: ADD ONLY"
                     };
-                    if crate::lcars::toggle_button(ui, mode_label, is_mirror, theme::ORANGE)
+                    if crate::lcars::toggle_button(ui, mode_label, is_mirror, theme::orange())
                         .explain(
                             verbosity,
                             "How this backup is pushed — click to flip",
@@ -1987,7 +1989,9 @@ impl DedupApp {
                         });
                     }
                     if ui
-                        .button(RichText::new(format!("{} SINK OUT", icon::X)).color(theme::BLACK))
+                        .button(
+                            RichText::new(format!("{} SINK OUT", icon::X)).color(theme::black()),
+                        )
                         .explain(
                             verbosity,
                             "Take this backup out of its group",
@@ -2006,9 +2010,9 @@ impl DedupApp {
                         .add(
                             egui::Button::new(
                                 RichText::new(format!("{} MAKE MAIN", icon::STAR))
-                                    .color(theme::BLACK),
+                                    .color(theme::black()),
                             )
-                            .fill(theme::GREEN),
+                            .fill(theme::green()),
                         )
                         .explain(
                             verbosity,
@@ -2023,7 +2027,7 @@ impl DedupApp {
                     if !group_targets.is_empty() {
                         ui.menu_button(
                             RichText::new(format!("{} SINK INTO", icon::ARROW_RIGHT))
-                                .color(theme::TEXT),
+                                .color(theme::text()),
                             |ui| {
                                 for (group, main) in &group_targets {
                                     if ui.button(format!("{} {main}", icon::STAR)).clicked() {
@@ -2063,17 +2067,18 @@ impl DedupApp {
             ui.set_width(460.0);
             ui.label(
                 RichText::new("ADD REPOSITORY")
-                    .color(theme::AMBER)
+                    .color(theme::amber())
                     .size(18.0)
                     .strong(),
             );
             ui.add_space(8.0);
 
             ui.horizontal(|ui| {
-                ui.label(RichText::new("FOLDER").color(theme::TEXT).size(12.0));
+                ui.label(RichText::new("FOLDER").color(theme::text()).size(12.0));
                 if ui
                     .button(
-                        RichText::new(format!("{} CHOOSE…", icon::FOLDER_OPEN)).color(theme::BLACK),
+                        RichText::new(format!("{} CHOOSE…", icon::FOLDER_OPEN))
+                            .color(theme::black()),
                     )
                     .explain(
                         self.tooltip_verbosity,
@@ -2098,12 +2103,12 @@ impl DedupApp {
                 );
             });
             ui.horizontal(|ui| {
-                ui.label(RichText::new("NAME  ").color(theme::TEXT).size(12.0));
+                ui.label(RichText::new("NAME  ").color(theme::text()).size(12.0));
                 let mut name_edit = egui::TextEdit::singleline(&mut self.new_name)
                     .desired_width(300.0)
                     .hint_text("defaults to the folder name");
                 if clashes {
-                    name_edit = name_edit.text_color(theme::RED);
+                    name_edit = name_edit.text_color(theme::red());
                 }
                 ui.add(name_edit).explain(
                     self.tooltip_verbosity,
@@ -2116,17 +2121,17 @@ impl DedupApp {
             if clashes {
                 ui.add_space(4.0);
                 ui.colored_label(
-                    theme::RED,
+                    theme::red(),
                     format!("A repository named '{effective}' already exists."),
                 );
             } else if let Some(err) = &self.form_error {
                 ui.add_space(4.0);
-                ui.colored_label(theme::RED, err);
+                ui.colored_label(theme::red(), err);
             }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                let add =
-                    egui::Button::new(RichText::new("ADD").color(theme::BLACK)).fill(theme::BLUE);
+                let add = egui::Button::new(RichText::new("ADD").color(theme::black()))
+                    .fill(theme::blue());
                 if ui
                     .add_enabled(can_add, add)
                     .explain(
@@ -2140,7 +2145,7 @@ impl DedupApp {
                     actions.push(Action::Create);
                 }
                 if ui
-                    .button(RichText::new("CANCEL").color(theme::BLACK))
+                    .button(RichText::new("CANCEL").color(theme::black()))
                     .explain(
                         self.tooltip_verbosity,
                         "Cancel",
@@ -2162,13 +2167,13 @@ impl DedupApp {
             ui.set_width(320.0);
             ui.label(
                 RichText::new("SETTINGS")
-                    .color(theme::AMBER)
+                    .color(theme::amber())
                     .size(18.0)
                     .strong(),
             );
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Hashing threads").color(theme::TEXT));
+                ui.label(RichText::new("Hashing threads").color(theme::text()));
                 ui.add(egui::DragValue::new(&mut self.threads).range(0..=64))
                     .explain(
                         self.tooltip_verbosity,
@@ -2180,23 +2185,23 @@ impl DedupApp {
             });
             ui.label(
                 RichText::new("0 = one thread per CPU core")
-                    .color(theme::TAN)
+                    .color(theme::tan())
                     .size(12.0),
             );
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Tooltips").color(theme::TEXT));
+                ui.label(RichText::new("Tooltips").color(theme::text()));
                 let short = self.tooltip_verbosity == TooltipVerbosity::Short;
                 egui::Frame::new()
-                    .stroke(egui::Stroke::new(1.0, theme::BLUE))
+                    .stroke(egui::Stroke::new(1.0, theme::blue()))
                     .corner_radius(6)
                     .inner_margin(egui::Margin::symmetric(4, 2))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let (short_fill, short_text) = if short {
-                                (theme::BLUE, theme::BLACK)
+                                (theme::blue(), theme::black())
                             } else {
-                                (theme::PANEL, theme::BLUE)
+                                (theme::panel(), theme::blue())
                             };
                             if ui
                                 .add(
@@ -2214,9 +2219,9 @@ impl DedupApp {
                                 self.tooltip_verbosity = TooltipVerbosity::Short;
                             }
                             let (verbose_fill, verbose_text) = if short {
-                                (theme::PANEL, theme::LILAC)
+                                (theme::panel(), theme::lilac())
                             } else {
-                                (theme::LILAC, theme::BLACK)
+                                (theme::lilac(), theme::black())
                             };
                             if ui
                                 .add(
@@ -2238,16 +2243,16 @@ impl DedupApp {
             });
             ui.label(
                 RichText::new("Controls how much detail hover tooltips show throughout the app")
-                    .color(theme::TAN)
+                    .color(theme::tan())
                     .size(12.0),
             );
             ui.add_space(12.0);
 
-            ui.label(RichText::new("DIAGNOSTICS").color(theme::TAN).size(13.0));
+            ui.label(RichText::new("DIAGNOSTICS").color(theme::tan()).size(13.0));
             ui.add_space(4.0);
             if ui
                 .add(egui::Button::new(
-                    RichText::new("OPEN LOG FOLDER").color(theme::BLACK),
+                    RichText::new("OPEN LOG FOLDER").color(theme::black()),
                 ))
                 .explain(
                     self.tooltip_verbosity,
@@ -2272,14 +2277,14 @@ impl DedupApp {
                         dedup_core::logging::log_dir().display()
                     ),
                 })
-                .color(theme::TAN)
+                .color(theme::tan())
                 .size(11.0),
             );
             ui.add_space(12.0);
 
             if ui
                 .add(egui::Button::new(
-                    RichText::new("CLOSE").color(theme::BLACK),
+                    RichText::new("CLOSE").color(theme::black()),
                 ))
                 .explain(
                     self.tooltip_verbosity,
@@ -2311,7 +2316,7 @@ impl DedupApp {
             ui.set_width(420.0);
             ui.label(
                 RichText::new("SCAN FOUND NO FILES")
-                    .color(theme::AMBER)
+                    .color(theme::amber())
                     .size(18.0)
                     .strong(),
             );
@@ -2321,7 +2326,7 @@ impl DedupApp {
                     "Scanning '{repo}' found no files at all, but its index holds {entries}. \
                  Continuing marks every one of them missing."
                 ))
-                .color(theme::TEXT),
+                .color(theme::text()),
             );
             ui.add_space(6.0);
             ui.label(
@@ -2329,15 +2334,15 @@ impl DedupApp {
                     "If this drive should not be empty, check that it is mounted and scan \
                      again. Nothing has been changed yet.",
                 )
-                .color(theme::TAN)
+                .color(theme::tan())
                 .size(12.0),
             );
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui
                     .add(
-                        egui::Button::new(RichText::new("SCAN ANYWAY").color(theme::BLACK))
-                            .fill(theme::RED),
+                        egui::Button::new(RichText::new("SCAN ANYWAY").color(theme::black()))
+                            .fill(theme::red()),
                     )
                     .explain(
                         self.tooltip_verbosity,
@@ -2351,8 +2356,8 @@ impl DedupApp {
                 }
                 if ui
                     .add(
-                        egui::Button::new(RichText::new("CANCEL").color(theme::TEXT))
-                            .fill(theme::PANEL),
+                        egui::Button::new(RichText::new("CANCEL").color(theme::text()))
+                            .fill(theme::panel()),
                     )
                     .explain(
                         self.tooltip_verbosity,
@@ -2380,37 +2385,38 @@ impl DedupApp {
             ui.set_width(320.0);
             ui.label(
                 RichText::new("ABOUT")
-                    .color(theme::AMBER)
+                    .color(theme::amber())
                     .size(18.0)
                     .strong(),
             );
             ui.add_space(8.0);
             ui.label(
-                RichText::new(format!("DEDUP  v{}", env!("CARGO_PKG_VERSION"))).color(theme::TEXT),
+                RichText::new(format!("DEDUP  v{}", env!("CARGO_PKG_VERSION")))
+                    .color(theme::text()),
             );
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("License:").color(theme::TAN).size(12.0));
+                ui.label(RichText::new("License:").color(theme::tan()).size(12.0));
                 ui.hyperlink_to(
-                    RichText::new("MIT").color(theme::LILAC).size(12.0),
+                    RichText::new("MIT").color(theme::lilac()).size(12.0),
                     "https://opensource.org/license/mit",
                 );
             });
             ui.label(
                 RichText::new("© 2026 Patrick Zimmer")
-                    .color(theme::TAN)
+                    .color(theme::tan())
                     .size(12.0),
             );
             ui.hyperlink_to(
                 RichText::new("dedup@tuta.io")
-                    .color(theme::LILAC)
+                    .color(theme::lilac())
                     .size(12.0),
                 "mailto:dedup@tuta.io",
             );
             ui.add_space(12.0);
             if ui
                 .add(egui::Button::new(
-                    RichText::new("CLOSE").color(theme::BLACK),
+                    RichText::new("CLOSE").color(theme::black()),
                 ))
                 .explain(
                     self.tooltip_verbosity,
@@ -2462,14 +2468,14 @@ impl DedupApp {
                     ui.horizontal(|ui| {
                         ui.label(
                             RichText::new(tab_label)
-                                .color(theme::AMBER)
+                                .color(theme::amber())
                                 .size(18.0)
                                 .strong(),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui
                                 .add(egui::Button::new(
-                                    RichText::new("CLOSE").color(theme::BLACK),
+                                    RichText::new("CLOSE").color(theme::black()),
                                 ))
                                 .clicked()
                             {
@@ -2481,7 +2487,7 @@ impl DedupApp {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            ui.label(RichText::new(text).color(theme::TEXT));
+                            ui.label(RichText::new(text).color(theme::text()));
                         });
                 });
                 close_clicked || ui.input(|i| i.viewport().close_requested())
@@ -2500,7 +2506,7 @@ fn pill(ui: &mut egui::Ui, text: &str, fill: Color32) -> egui::Response {
         .corner_radius(6)
         .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
-            ui.label(RichText::new(text).color(theme::BLACK).size(11.0))
+            ui.label(RichText::new(text).color(theme::black()).size(11.0))
         })
         .inner
 }
@@ -2511,7 +2517,7 @@ fn pill(ui: &mut egui::Ui, text: &str, fill: Color32) -> egui::Response {
 fn main_pill(ui: &mut egui::Ui, verbosity: TooltipVerbosity) {
     // Built from the shared `pill` helper, like every other pill on this card,
     // rather than a second hand-rolled one.
-    let resp = pill(ui, &format!("{} MAIN", icon::STAR), theme::AMBER);
+    let resp = pill(ui, &format!("{} MAIN", icon::STAR), theme::amber());
     // Announced as the bare word, not glyph-plus-word, so it reads the same as
     // the chip badge everywhere else.
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "MAIN"));
@@ -2528,21 +2534,21 @@ fn main_pill(ui: &mut egui::Ui, verbosity: TooltipVerbosity) {
 fn status_pills(ui: &mut egui::Ui, row: &RepoRow, verbosity: TooltipVerbosity) {
     match row.location {
         Some(Location::Local) => {
-            pill(ui, "LOCAL", theme::BLUE).explain(
+            pill(ui, "LOCAL", theme::blue()).explain(
                 verbosity,
                 "On this machine",
                 "The repository's folder is on a local disk of this machine.",
             );
         }
         Some(Location::Remote) => {
-            pill(ui, "REMOTE", theme::LILAC).explain(
+            pill(ui, "REMOTE", theme::lilac()).explain(
                 verbosity,
                 "Network mount",
                 "The repository's folder is on a reachable network mount (e.g. NFS/SMB).",
             );
         }
         Some(Location::Offline) => {
-            pill(ui, "OFFLINE", theme::AMBER).explain(
+            pill(ui, "OFFLINE", theme::amber()).explain(
                 verbosity,
                 "Network mount is not reachable right now",
                 "This repository's network mount is not reachable right now — scans and \
@@ -2550,7 +2556,7 @@ fn status_pills(ui: &mut egui::Ui, row: &RepoRow, verbosity: TooltipVerbosity) {
             );
         }
         Some(Location::Missing) => {
-            pill(ui, "MISSING", theme::RED).explain(
+            pill(ui, "MISSING", theme::red()).explain(
                 verbosity,
                 "Local folder is not accessible",
                 "This repository's local folder no longer exists or can't be read — RELOCATE \
@@ -2562,14 +2568,14 @@ fn status_pills(ui: &mut egui::Ui, row: &RepoRow, verbosity: TooltipVerbosity) {
     match row.freshness {
         Freshness::Unknown => {}
         Freshness::UpToDate => {
-            pill(ui, "UP TO DATE", theme::TAN).explain(
+            pill(ui, "UP TO DATE", theme::tan()).explain(
                 verbosity,
                 "No changes since the last scan",
                 "The last CHECK found no new, changed, or missing files since the last scan.",
             );
         }
         Freshness::Stale { changed, missing } => {
-            pill(ui, "UPDATE REQUIRED", theme::ORANGE).explain(
+            pill(ui, "UPDATE REQUIRED", theme::orange()).explain(
                 verbosity,
                 &format!("{changed} new/changed, {missing} missing since the last scan"),
                 &format!(
@@ -2590,8 +2596,8 @@ fn cancel_button(
     verbosity: TooltipVerbosity,
 ) -> egui::Response {
     ui.add(
-        egui::Button::new(RichText::new(format!("{} CANCEL", icon::X)).color(theme::BLACK))
-            .fill(theme::RED),
+        egui::Button::new(RichText::new(format!("{} CANCEL", icon::X)).color(theme::black()))
+            .fill(theme::red()),
     )
     .explain(verbosity, hover, hover_verbose)
 }
@@ -2626,7 +2632,7 @@ fn stat(
     ui.add_space(2.0);
     ui.label(
         RichText::new(format!("{label} "))
-            .color(theme::TEXT)
+            .color(theme::text())
             .size(12.0),
     )
     .explain(verbosity, tip, tip_verbose);
@@ -2659,7 +2665,7 @@ fn mime_tags(ui: &mut egui::Ui, row: &RepoRow, verbosity: TooltipVerbosity) {
     if extra > 0 {
         ui.label(
             RichText::new(format!("+{extra}"))
-                .color(theme::TEXT)
+                .color(theme::text())
                 .size(11.0),
         )
         .explain(
@@ -2679,7 +2685,7 @@ fn mime_tags(ui: &mut egui::Ui, row: &RepoRow, verbosity: TooltipVerbosity) {
             .show(ui, |ui| {
                 ui.label(
                     RichText::new(format!("{mime} {}", mime_pct(*count, total)))
-                        .color(theme::BLACK)
+                        .color(theme::black())
                         .size(11.0),
                 )
                 .explain(
@@ -3005,7 +3011,7 @@ mod ui_tests {
                 move |ui, app: &mut DedupApp| {
                     if !init {
                         icon::install(ui.ctx());
-                        theme::apply(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
                         init = true;
                     }
                     let mut actions = Vec::new();
@@ -3079,7 +3085,7 @@ mod ui_tests {
                 move |ui, app: &mut DedupApp| {
                     if !init {
                         icon::install(ui.ctx());
-                        theme::apply(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
                         init = true;
                     }
                     let mut actions = Vec::new();
@@ -3189,7 +3195,7 @@ mod ui_tests {
                 move |ui, app: &mut DedupApp| {
                     if !init {
                         icon::install(ui.ctx());
-                        theme::apply(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
                         init = true;
                     }
                     let mut actions = Vec::new();
@@ -3223,7 +3229,7 @@ mod ui_tests {
                 move |ui, app: &mut DedupApp| {
                     if !init {
                         icon::install(ui.ctx());
-                        theme::apply(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
                         init = true;
                     }
                     let ctx = ui.ctx().clone();
@@ -3271,7 +3277,7 @@ mod ui_tests {
                 move |ui, app: &mut DedupApp| {
                     if !init {
                         icon::install(ui.ctx());
-                        theme::apply(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
                         init = true;
                     }
                     app.top_bar(ui);
@@ -3352,7 +3358,7 @@ mod ui_tests {
                 move |ui, app: &mut DedupApp| {
                     if !init {
                         icon::install(ui.ctx());
-                        theme::apply(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
                         init = true;
                     }
                     let mut actions = Vec::new();
@@ -3422,7 +3428,7 @@ mod ui_tests {
                 move |ui, app: &mut DedupApp| {
                     if !init {
                         icon::install(ui.ctx());
-                        theme::apply(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
                         init = true;
                     }
                     let mut actions = Vec::new();
@@ -3477,7 +3483,7 @@ mod ui_tests {
                 move |ui, app: &mut DedupApp| {
                     if !init {
                         icon::install(ui.ctx());
-                        theme::apply(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
                         init = true;
                     }
                     let mut actions = Vec::new();
@@ -3515,7 +3521,7 @@ mod ui_tests {
                 move |ui, app: &mut DedupApp| {
                     if !init {
                         icon::install(ui.ctx());
-                        theme::apply(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
                         init = true;
                     }
                     app.settings_modal(&ui.ctx().clone());

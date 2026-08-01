@@ -112,36 +112,36 @@ pub fn popup(
                 "DELETE ALL COPIES",
                 "Delete every one of these files. The content stays in the other \
                  repository. This cannot be undone.",
-                theme::RED,
+                theme::red(),
             ),
             PopupKind::KeepOne => (
                 "KEEP ONE COPY",
                 "Pick the copy to keep — every other file listed here is deleted. \
                  This cannot be undone.",
-                theme::RED,
+                theme::red(),
             ),
             PopupKind::PickName => (
                 "TAKE WHICH NAME?",
                 "The other repository holds this content under several names. Pick \
                  the one this file should take.",
-                theme::TAN,
+                theme::tan(),
             ),
         };
         ui.label(RichText::new(title).color(title_color).size(16.0).strong());
         ui.add_space(6.0);
-        ui.colored_label(theme::TEXT, blurb);
+        ui.colored_label(theme::text(), blurb);
         ui.add_space(10.0);
 
         match kind {
             PopupKind::ConfirmDeleteAll => {
                 for file in here {
-                    ui.colored_label(theme::RED, &file.rel_path);
+                    ui.colored_label(theme::red(), &file.rel_path);
                 }
                 ui.add_space(10.0);
                 if ui
                     .add(
-                        egui::Button::new(RichText::new("DELETE ALL").color(theme::BLACK))
-                            .fill(theme::RED),
+                        egui::Button::new(RichText::new("DELETE ALL").color(theme::black()))
+                            .fill(theme::red()),
                     )
                     .clicked()
                 {
@@ -155,7 +155,7 @@ pub fn popup(
                 for file in here {
                     if ui
                         .add(egui::Button::new(
-                            RichText::new(&file.rel_path).color(theme::TEXT),
+                            RichText::new(&file.rel_path).color(theme::text()),
                         ))
                         .on_hover_text("Keep this one and delete the others")
                         .clicked()
@@ -176,7 +176,7 @@ pub fn popup(
                 for file in there {
                     if ui
                         .add(egui::Button::new(
-                            RichText::new(&file.rel_path).color(theme::TEXT),
+                            RichText::new(&file.rel_path).color(theme::text()),
                         ))
                         .on_hover_text("Rename this file to that name")
                         .clicked()
@@ -192,7 +192,7 @@ pub fn popup(
         }
         ui.add_space(10.0);
         if ui
-            .button(RichText::new("CANCEL").color(theme::BLACK))
+            .button(RichText::new("CANCEL").color(theme::black()))
             .clicked()
         {
             close = true;

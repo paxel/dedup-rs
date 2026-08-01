@@ -1,6 +1,6 @@
 # 01 — Turn the palette into data, with the dark appearance provably unchanged
 
-Status: ready-for-agent
+Status: resolved
 Spec: ../spec.md
 
 ## Problem
@@ -46,3 +46,42 @@ No new seam. The existing GUI tests are the regression net for the rename: they 
 
 Standing gate green (`cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`). No
 user-visible change, so no `CHANGELOG.md` entry; note the mechanism in `ai/improvements.md`.
+
+## Comments
+
+**Implemented 2026-08-01, TDD.** Gate green: fmt clean, clippy 0 warnings,
+`cargo test --workspace` 24 suites / 0 failures.
+
+Assessed as **legacy**: `theme.rs` had no test module at all, so ~737 call sites depended on
+twelve entirely unpinned constants. Characterization first, then refactor.
+
+Five cycles:
+
+1. **RED→GREEN** `text()` reads the dark palette's value — invents `Palette`, the
+   `thread_local` and one accessor. One colour, because this cycle's job was the mechanism.
+2. **RED→GREEN** every accessor reads the dark value — the characterization proper, twelve
+   colours in one test. Refactored the twelve near-identical accessors into a macro in the
+   same step.
+3. **RED→GREEN** installing a palette changes what the accessors read — the new behaviour the
+   whole ticket exists for.
+4. `thread_local` isolation across threads. **Honest note: this one passed on first run** — the
+   implementation already had the property, so it is a regression guard on a decision, not a
+   RED→GREEN cycle. It earns its place by failing if anyone later "simplifies" the
+   `thread_local` into a `static`.
+5. **RED→GREEN** `apply` installs the palette it is given, and egui's own chrome uses it — so
+   the style egui draws with and the colours the app draws with cannot disagree.
+
+Then the mechanical rename, with the four tests plus the existing 263 as the net. It compiled
+clean on the first pass. One self-inflicted wound worth recording: the sed that added the
+palette argument to `apply` used `[^)]*`, which stopped at the inner paren of `ui.ctx()` and
+produced `apply(ui.ctx(, DARK))` at ~95 sites. The compiler caught it immediately and it was
+repaired in one pass — but a regex over call sites containing nested parens is a trap.
+
+**Strongest evidence the appearance is unchanged:** re-rendering `docs/screenshots/board.png`
+produced a **byte-identical** file. No assertion could show that as well.
+
+REFACTOR: the twelve raw colour constants became private. Nothing outside the module needed
+them after the rename, and keeping them public would let new code bypass the active palette —
+a future `theme::TEXT` now fails to compile.
+
+**Not committed** — this repo's standing rule keeps git writes with the user.

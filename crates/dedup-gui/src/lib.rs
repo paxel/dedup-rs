@@ -74,7 +74,7 @@ pub fn run(ui_scale: Option<f32>) -> Result<(), String> {
         options,
         Box::new(move |cc| {
             icon::install(&cc.egui_ctx);
-            theme::apply(&cc.egui_ctx);
+            theme::apply(&cc.egui_ctx, theme::DARK);
             if let Some(scale) = ui_scale {
                 cc.egui_ctx.set_zoom_factor(scale.clamp(0.5, 3.0));
             }

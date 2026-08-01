@@ -36,8 +36,14 @@ open items deliberately left out.
 
 ## Open work (verified against source, 2026-07-30)
 
-- **Light theme toggle** (deferred by decision 2026-07-08): requires converting
-  `theme.rs` constants to a runtime palette across all views. Still dark-only.
+- **Light theme** — specced in [`.scratch/light-theme/`](../.scratch/light-theme/spec.md),
+  ticket `01` landed 2026-08-01. The palette is now a `theme::Palette` value installed in a
+  **`thread_local`** (not a `static` — the test suite runs in parallel and a shared palette
+  would let light/dark assertions race), read through accessors (`theme::text()`), with the
+  raw values private so new code cannot bypass the active palette. `theme::apply` takes the
+  palette to install. Still dark-only: `DARK` is the only palette, and the rendered board
+  screenshot is byte-identical to before, so the appearance provably did not change.
+  Remaining: tickets `02`–`05` (light values, preference wiring, Settings control, identicon).
 - **Performance at scale**: banded grouping, staged pipelines, and the multi-reference
   diff's merged content index are fine at ~10⁵ files; revisit content-index memory
   (`HashMap<(u64,[u8;32]), _>` across all references) and timeline streaming at 10⁷.

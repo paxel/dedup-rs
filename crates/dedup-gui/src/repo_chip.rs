@@ -21,7 +21,7 @@ pub fn identicon(painter: &egui::Painter, rect: Rect, name: &str) {
     let side = rect.width().min(rect.height());
     let tile = Rect::from_center_size(rect.center(), Vec2::splat(side));
     // A dark tile makes the pastel cells legible on any chip fill.
-    painter.rect_filled(tile, 3.0, theme::BLACK);
+    painter.rect_filled(tile, 3.0, theme::black());
 
     let hash = theme::name_hash(name);
     let color = theme::hsl((hash % 360) as f32, 0.55, 0.70);
@@ -81,9 +81,9 @@ pub fn repo_chip(
     lock: Option<bool>,
 ) -> RepoChipResponse {
     let (fill, fg) = if selected {
-        (accent, theme::BLACK)
+        (accent, theme::black())
     } else {
-        (theme::PANEL, accent)
+        (theme::panel(), accent)
     };
     let mut lock_resp = None;
     let inner = egui::Frame::new()
@@ -160,7 +160,7 @@ pub fn chip_row(
             .layout_no_wrap(
                 label.to_owned(),
                 egui::FontId::proportional(12.0),
-                theme::TEXT,
+                theme::text(),
             )
             .size()
             .x
@@ -186,7 +186,7 @@ pub fn chip_row(
         for (r, row) in rows.iter().enumerate() {
             ui.horizontal_top(|ui| {
                 if r == 0 && !label.is_empty() {
-                    ui.label(RichText::new(label).color(theme::TEXT).size(12.0));
+                    ui.label(RichText::new(label).color(theme::text()).size(12.0));
                 }
                 for &i in row {
                     let resp = chip(ui, i);
@@ -212,7 +212,7 @@ pub fn chip_row(
 pub fn small_button(ui: &mut egui::Ui, label: &str, accent: Color32) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(label).color(accent).size(11.0))
-            .fill(theme::PANEL)
+            .fill(theme::panel())
             .stroke(egui::Stroke::new(1.0, accent)),
     )
 }
@@ -233,12 +233,12 @@ fn main_badge(ui: &mut egui::Ui) -> egui::Response {
     let galley = ui.painter().layout_no_wrap(
         icon::STAR.to_owned(),
         egui::FontId::proportional(13.0),
-        theme::BLACK,
+        theme::black(),
     );
     let (rect, resp) = ui.allocate_exact_size(galley.size() + pad * 2.0, Sense::hover());
     if ui.is_rect_visible(rect) {
-        ui.painter().rect_filled(rect, 4.0, theme::AMBER);
-        ui.painter().galley(rect.min + pad, galley, theme::BLACK);
+        ui.painter().rect_filled(rect, 4.0, theme::amber());
+        ui.painter().galley(rect.min + pad, galley, theme::black());
     }
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "MAIN"));
     resp
@@ -249,9 +249,9 @@ fn main_badge(ui: &mut egui::Ui) -> egui::Response {
 /// accent so "locked" always reads the same.
 fn lock_button(ui: &mut egui::Ui, read_only: bool) -> egui::Response {
     let (glyph, fill, text) = if read_only {
-        (icon::LOCK, theme::BLUE, theme::BLACK)
+        (icon::LOCK, theme::blue(), theme::black())
     } else {
-        (icon::LOCK_OPEN, theme::PANEL, theme::BLUE)
+        (icon::LOCK_OPEN, theme::panel(), theme::blue())
     };
     ui.add(egui::Button::new(RichText::new(glyph).color(text)).fill(fill))
 }
@@ -293,10 +293,10 @@ mod tests {
                 move |ui, clicked: &mut bool| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
-                    let r = repo_chip(ui, "Photos", true, theme::ORANGE, false, Some(true));
+                    let r = repo_chip(ui, "Photos", true, theme::orange(), false, Some(true));
                     if r.name.clicked() {
                         *clicked = true;
                     }
@@ -323,10 +323,10 @@ mod tests {
             .build_ui(move |ui| {
                 if !init {
                     crate::icon::install(ui.ctx());
-                    crate::theme::apply(ui.ctx());
+                    crate::theme::apply(ui.ctx(), crate::theme::DARK);
                     init = true;
                 }
-                let r = repo_chip(ui, "Videos", false, theme::BLUE, false, None);
+                let r = repo_chip(ui, "Videos", false, theme::blue(), false, None);
                 assert!(r.lock.is_none(), "no lock response when lock is None");
             });
         harness.run();
@@ -348,10 +348,10 @@ mod tests {
             .build_ui(move |ui| {
                 if !init {
                     crate::icon::install(ui.ctx());
-                    crate::theme::apply(ui.ctx());
+                    crate::theme::apply(ui.ctx(), crate::theme::DARK);
                     init = true;
                 }
-                let r = repo_chip(ui, "Photos", false, theme::ORANGE, true, None);
+                let r = repo_chip(ui, "Photos", false, theme::orange(), true, None);
                 let outer = r.outer.rect;
                 ui.ctx()
                     .memory_mut(|m| m.data.insert_temp("outer".into(), outer));
@@ -386,10 +386,10 @@ mod tests {
                     move |ui, w: &mut f32| {
                         if !init {
                             crate::icon::install(ui.ctx());
-                            crate::theme::apply(ui.ctx());
+                            crate::theme::apply(ui.ctx(), crate::theme::DARK);
                             init = true;
                         }
-                        *w = repo_chip(ui, "Photos", false, theme::ORANGE, main, None)
+                        *w = repo_chip(ui, "Photos", false, theme::orange(), main, None)
                             .outer
                             .rect
                             .width();

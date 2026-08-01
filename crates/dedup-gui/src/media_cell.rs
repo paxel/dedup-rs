@@ -199,7 +199,7 @@ pub fn media_cell(
                 ui.painter().rect_stroke(
                     resp.rect,
                     6,
-                    egui::Stroke::new(1.0, theme::HAIRLINE),
+                    egui::Stroke::new(1.0, theme::hairline()),
                     egui::StrokeKind::Inside,
                 );
                 return Some(resp);
@@ -217,11 +217,11 @@ pub fn media_cell(
         let bottom = if style.captions { 24.0 } else { 8.0 };
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 6.0, theme::PANEL);
+        painter.rect_filled(rect, 6.0, theme::panel());
         painter.rect_stroke(
             rect,
             6.0,
-            egui::Stroke::new(1.0, theme::HAIRLINE),
+            egui::Stroke::new(1.0, theme::hairline()),
             egui::StrokeKind::Inside,
         );
         let glyph = egui::Rect::from_min_max(
@@ -237,7 +237,7 @@ pub fn media_cell(
                 egui::Align2::CENTER_CENTER,
                 fmt_ms(ms as u64),
                 egui::FontId::proportional(12.0),
-                theme::TAN,
+                theme::tan(),
             );
         }
         return Some(resp);
@@ -246,7 +246,7 @@ pub fn media_cell(
     // Placeholder for non-media or not-yet-ready thumbnails.
     let label = facts.mime.clone().unwrap_or_else(|| "file".into());
     egui::Frame::new()
-        .fill(theme::PANEL)
+        .fill(theme::panel())
         .corner_radius(6)
         .inner_margin(if style.captions { 18.0 } else { 6.0 })
         .show(ui, |ui| {
@@ -254,11 +254,11 @@ pub fn media_cell(
             ui.vertical_centered(|ui| {
                 ui.label(
                     RichText::new(icon::IMAGE)
-                        .color(theme::LILAC)
+                        .color(theme::lilac())
                         .size(if style.captions { 28.0 } else { 18.0 }),
                 );
                 if style.captions {
-                    ui.label(RichText::new(label).color(theme::LILAC).size(11.0));
+                    ui.label(RichText::new(label).color(theme::lilac()).size(11.0));
                 }
             });
         });
@@ -273,11 +273,11 @@ pub fn media_cell(
 /// of similarity.
 pub(crate) fn paint_audio_glyph(painter: &egui::Painter, rect: egui::Rect, seed: [u8; 32]) {
     let palette = [
-        theme::AMBER,
-        theme::TAN,
-        theme::LILAC,
-        theme::BLUE,
-        theme::ORANGE,
+        theme::amber(),
+        theme::tan(),
+        theme::lilac(),
+        theme::blue(),
+        theme::orange(),
     ];
     let accent = palette[seed[0] as usize % palette.len()];
     let bars = 15usize;

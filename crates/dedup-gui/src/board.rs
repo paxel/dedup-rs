@@ -81,11 +81,11 @@ pub enum Status {
 impl Status {
     pub fn color(self) -> egui::Color32 {
         match self {
-            Status::Same => theme::GREY,
-            Status::OnlyHere => theme::GREEN,
-            Status::WillDelete => theme::RED,
-            Status::Differs => theme::AMBER,
-            Status::Absent => theme::GREY,
+            Status::Same => theme::grey(),
+            Status::OnlyHere => theme::green(),
+            Status::WillDelete => theme::red(),
+            Status::Differs => theme::amber(),
+            Status::Absent => theme::grey(),
         }
     }
 
@@ -233,19 +233,19 @@ impl Cmd {
 
     fn color(self) -> egui::Color32 {
         match self {
-            Cmd::Apply => theme::GREEN,
-            Cmd::Hide => theme::GREY,
-            Cmd::CopyRight | Cmd::CopyLeft => theme::GREEN,
+            Cmd::Apply => theme::green(),
+            Cmd::Hide => theme::grey(),
+            Cmd::CopyRight | Cmd::CopyLeft => theme::green(),
             Cmd::DeleteLeft | Cmd::DeleteRight | Cmd::DeleteAllLeft | Cmd::DeleteAllRight => {
-                theme::RED
+                theme::red()
             }
-            Cmd::Compare => theme::LILAC,
+            Cmd::Compare => theme::lilac(),
             Cmd::OverwriteRight
             | Cmd::OverwriteLeft
             | Cmd::RenameLeft
             | Cmd::RenameRight
             | Cmd::KeepOneLeft
-            | Cmd::KeepOneRight => theme::TAN,
+            | Cmd::KeepOneRight => theme::tan(),
         }
     }
 
@@ -609,7 +609,7 @@ pub fn board(
                 metas.len(),
                 view.full_len
             ))
-            .color(theme::TAN)
+            .color(theme::tan())
             .size(11.0),
         );
     }
@@ -624,7 +624,7 @@ pub fn board(
     let index = Index::build(metas, state);
     ui.label(
         RichText::new(format!("{} rows", index.order.len()))
-            .color(theme::TAN)
+            .color(theme::tan())
             .size(11.0),
     );
 
@@ -662,7 +662,7 @@ pub fn board(
         );
         // Striping, which TableBuilder used to provide.
         if vis % 2 == 1 {
-            ui.painter().rect_filled(row_rect, 0.0, theme::PANEL);
+            ui.painter().rect_filled(row_rect, 0.0, theme::panel());
         }
         // The row's vertical padding is an inset on the content rect. Adding it
         // with `add_space` inside a left-to-right row would have spent it
@@ -829,7 +829,7 @@ fn cmd_button(ui: &mut egui::Ui, at: egui::Rect, cmd: Cmd, hide_skips_run: bool)
     let resp = ui.put(
         at,
         egui::Button::new(RichText::new(cmd.label()).color(cmd.color()).size(10.0))
-            .fill(theme::PANEL)
+            .fill(theme::panel())
             .stroke(egui::Stroke::new(1.0, cmd.color())),
     );
     resp.on_hover_text(cmd.hint(hide_skips_run))
@@ -859,7 +859,14 @@ fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view:
         if view.multi_repo
             && let Some(repo) = &view.body.repo
         {
-            crate::repo_chip::repo_chip(ui, repo, false, theme::BLUE, view.body.repo_is_main, None);
+            crate::repo_chip::repo_chip(
+                ui,
+                repo,
+                false,
+                theme::blue(),
+                view.body.repo_is_main,
+                None,
+            );
         }
         // Which counterpart name each of this side's names is compared against.
         // A side may list several names for one content (BY HASH); they are
@@ -879,7 +886,7 @@ fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view:
             ui.add(egui::Label::new(job).truncate()).on_hover_text(path);
         }
         if let Some(line) = facts_line(view.size, view.modified, view.body.facts.as_ref()) {
-            ui.add(egui::Label::new(RichText::new(line).color(theme::TAN).size(10.5)).truncate());
+            ui.add(egui::Label::new(RichText::new(line).color(theme::tan()).size(10.5)).truncate());
         }
     });
 }
@@ -1059,17 +1066,23 @@ fn controls_bar(ui: &mut egui::Ui, state: &mut BoardState, two_sided: bool, any_
                 "{} UNCHANGED",
                 if state.show_unchanged { "HIDE" } else { "SHOW" }
             );
-            if crate::lcars::toggle_button(ui, &label, state.show_unchanged, theme::GREY).clicked()
+            if crate::lcars::toggle_button(ui, &label, state.show_unchanged, theme::grey())
+                .clicked()
             {
                 state.show_unchanged = !state.show_unchanged;
             }
             ui.add_space(12.0);
         }
-        ui.label(RichText::new("SORT").color(theme::TEXT).size(11.0));
+        ui.label(RichText::new("SORT").color(theme::text()).size(11.0));
         if two_sided {
             for (is_left, label) in [(true, "LEFT"), (false, "RIGHT")] {
-                if crate::lcars::toggle_button(ui, label, state.sort_left == is_left, theme::LILAC)
-                    .clicked()
+                if crate::lcars::toggle_button(
+                    ui,
+                    label,
+                    state.sort_left == is_left,
+                    theme::lilac(),
+                )
+                .clicked()
                 {
                     state.sort_left = is_left;
                 }
@@ -1077,7 +1090,7 @@ fn controls_bar(ui: &mut egui::Ui, state: &mut BoardState, two_sided: bool, any_
             ui.add_space(8.0);
         }
         for key in [SortKey::Path, SortKey::Size, SortKey::Date, SortKey::Status] {
-            if crate::lcars::toggle_button(ui, key.label(), state.sort_key == key, theme::BLUE)
+            if crate::lcars::toggle_button(ui, key.label(), state.sort_key == key, theme::blue())
                 .clicked()
             {
                 state.sort_key = key;
@@ -1085,7 +1098,7 @@ fn controls_bar(ui: &mut egui::Ui, state: &mut BoardState, two_sided: bool, any_
         }
         ui.add_space(8.0);
         let arrow = if state.sort_asc { "▲" } else { "▼" };
-        if crate::lcars::toggle_button(ui, arrow, true, theme::AMBER).clicked() {
+        if crate::lcars::toggle_button(ui, arrow, true, theme::amber()).clicked() {
             state.sort_asc = !state.sort_asc;
         }
     });
@@ -1115,15 +1128,15 @@ fn headers(ui: &mut egui::Ui, view: &BoardView, metas: &[RowMeta]) {
 fn header_cell(ui: &mut egui::Ui, width: f32, role: &str, repo: &str, is_main: bool, path: &str) {
     ui.allocate_ui_with_layout(egui::vec2(width, 0.0), Layout::top_down(Align::Min), |ui| {
         ui.set_width(width);
-        ui.label(RichText::new(role).color(theme::TEXT).size(11.0).strong());
+        ui.label(RichText::new(role).color(theme::text()).size(11.0).strong());
         if !repo.is_empty() {
-            crate::repo_chip::repo_chip(ui, repo, false, theme::ORANGE, is_main, None);
+            crate::repo_chip::repo_chip(ui, repo, false, theme::orange(), is_main, None);
         }
         if !path.is_empty() {
             ui.add(
                 egui::Label::new(
                     RichText::new(elide_left(path, 44))
-                        .color(theme::HAIRLINE)
+                        .color(theme::hairline())
                         .size(10.0),
                 )
                 .truncate(),
@@ -1318,10 +1331,10 @@ mod tests {
     #[test]
     fn the_four_statuses_have_distinct_colours() {
         use Status::*;
-        assert_eq!(Same.color(), theme::GREY);
-        assert_eq!(OnlyHere.color(), theme::GREEN);
-        assert_eq!(WillDelete.color(), theme::RED);
-        assert_eq!(Differs.color(), theme::AMBER);
+        assert_eq!(Same.color(), theme::grey());
+        assert_eq!(OnlyHere.color(), theme::green());
+        assert_eq!(WillDelete.color(), theme::red());
+        assert_eq!(Differs.color(), theme::amber());
         for (a, b) in [
             (Same, OnlyHere),
             (Same, WillDelete),
@@ -1584,7 +1597,7 @@ mod tests {
                 move |ui, state: &mut BoardState| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let mut thumbs = ThumbCache::new(4);
@@ -1869,7 +1882,7 @@ mod tests {
                 move |ui, state: &mut BoardState| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let mut thumbs = ThumbCache::new(4);
@@ -2043,7 +2056,7 @@ mod tests {
                 move |ui, state: &mut BoardState| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     let mut thumbs = ThumbCache::new(4);

@@ -116,11 +116,11 @@ impl RunReport {
 
     fn accent(&self) -> egui::Color32 {
         if self.total_problems() > 0 {
-            theme::RED
+            theme::red()
         } else if self.cancelled {
-            theme::AMBER
+            theme::amber()
         } else {
-            theme::GREEN
+            theme::green()
         }
     }
 }
@@ -160,15 +160,15 @@ impl ResultModal {
                 .strong(),
             );
             ui.add_space(4.0);
-            ui.colored_label(theme::TEXT, &report.title);
+            ui.colored_label(theme::text(), &report.title);
             ui.add_space(10.0);
 
             for (label, value) in &report.counts {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(label).color(theme::TAN).size(12.0));
+                    ui.label(RichText::new(label).color(theme::tan()).size(12.0));
                     ui.label(
                         RichText::new(value.to_string())
-                            .color(theme::TEXT)
+                            .color(theme::text())
                             .size(12.0)
                             .strong(),
                     );
@@ -178,20 +178,20 @@ impl ResultModal {
             if report.cancelled {
                 ui.add_space(8.0);
                 ui.colored_label(
-                    theme::AMBER,
+                    theme::amber(),
                     "Cancelled before it finished — what is listed above is all that was done.",
                 );
             }
             for note in &report.notes {
                 ui.add_space(6.0);
-                ui.colored_label(theme::AMBER, note);
+                ui.colored_label(theme::amber(), note);
             }
 
             if report.total_problems() > 0 {
                 ui.add_space(10.0);
                 ui.label(
                     RichText::new(format!("{} PROBLEM(S)", report.total_problems()))
-                        .color(theme::RED)
+                        .color(theme::red())
                         .size(13.0)
                         .strong(),
                 );
@@ -202,11 +202,11 @@ impl ResultModal {
                     .max_height(220.0)
                     .show(ui, |ui| {
                         for problem in &report.problems {
-                            ui.colored_label(theme::RED, problem);
+                            ui.colored_label(theme::red(), problem);
                         }
                         if report.problems_dropped > 0 {
                             ui.colored_label(
-                                theme::TAN,
+                                theme::tan(),
                                 format!(
                                     "…and {} more (see the session log for the full list).",
                                     report.problems_dropped
@@ -219,7 +219,7 @@ impl ResultModal {
             ui.add_space(12.0);
             if ui
                 .add(egui::Button::new(
-                    RichText::new("CLOSE").color(theme::BLACK),
+                    RichText::new("CLOSE").color(theme::black()),
                 ))
                 .clicked()
             {
@@ -310,7 +310,7 @@ mod tests {
             .build_ui_state(
                 move |ui, modal: &mut ResultModal| {
                     if !init {
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     modal.show(ui);

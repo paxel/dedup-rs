@@ -460,7 +460,7 @@ impl FilterBuilder {
         crate::lcars::section_lcars(
             ui,
             "FILTER — NARROW WHICH FILES COUNT",
-            theme::LILAC,
+            theme::lilac(),
             |ui| {
                 let mut editing_idx = None;
                 ui.horizontal_wrapped(|ui| {
@@ -485,14 +485,14 @@ impl FilterBuilder {
                             format!("{label}: {shown}")
                         };
                         let fill = if cond.editing {
-                            theme::ORANGE
+                            theme::orange()
                         } else {
-                            theme::PANEL
+                            theme::panel()
                         };
                         let col = if cond.editing {
-                            theme::BLACK
+                            theme::black()
                         } else {
-                            theme::TEXT
+                            theme::text()
                         };
                         if ui
                             .add(egui::Button::new(RichText::new(text).color(col)).fill(fill))
@@ -506,7 +506,7 @@ impl FilterBuilder {
                             acts.push(Act::EditCond(i));
                         }
                         if ui
-                            .add(egui::Button::new(RichText::new("×").color(theme::RED)))
+                            .add(egui::Button::new(RichText::new("×").color(theme::red())))
                             .explain(
                                 self.verbosity,
                                 "Remove this condition",
@@ -522,8 +522,8 @@ impl FilterBuilder {
                     // The trailing `+` pill toggles the type picker.
                     if ui
                         .add(
-                            egui::Button::new(RichText::new("+").color(theme::BLACK))
-                                .fill(theme::AMBER),
+                            egui::Button::new(RichText::new("+").color(theme::black()))
+                                .fill(theme::amber()),
                         )
                         .explain(
                             self.verbosity,
@@ -563,9 +563,9 @@ impl FilterBuilder {
                             if ui
                                 .add(
                                     egui::Button::new(
-                                        RichText::new(kind.label()).color(theme::BLUE),
+                                        RichText::new(kind.label()).color(theme::blue()),
                                     )
-                                    .fill(theme::PANEL),
+                                    .fill(theme::panel()),
                                 )
                                 .explain(self.verbosity, short, verbose)
                                 .clicked()
@@ -578,23 +578,28 @@ impl FilterBuilder {
                     // Case mode applies to every text condition at once, so it is
                     // a bar-level toggle rather than a per-condition one.
                     if !self.filters.is_empty() {
-                        if crate::lcars::toggle_button(ui, "Aa", self.case_insensitive, theme::BLUE)
-                            .explain(
-                                self.verbosity,
-                                "Ignore upper/lower case",
-                                "When on, text conditions match regardless of capitalisation, so \
+                        if crate::lcars::toggle_button(
+                            ui,
+                            "Aa",
+                            self.case_insensitive,
+                            theme::blue(),
+                        )
+                        .explain(
+                            self.verbosity,
+                            "Ignore upper/lower case",
+                            "When on, text conditions match regardless of capitalisation, so \
                              *.jpg also finds PHOTO.JPG. Size and date conditions are \
                              unaffected.",
-                            )
-                            .clicked()
+                        )
+                        .clicked()
                         {
                             acts.push(Act::ToggleCase);
                         }
 
                         if ui
                             .add(
-                                egui::Button::new(RichText::new("CLEAR").color(theme::BLACK))
-                                    .fill(theme::RED),
+                                egui::Button::new(RichText::new("CLEAR").color(theme::black()))
+                                    .fill(theme::red()),
                             )
                             .explain(
                                 self.verbosity,
@@ -627,7 +632,7 @@ impl FilterBuilder {
         }
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("PRESETS").color(theme::TEXT).size(12.0));
+            ui.label(RichText::new("PRESETS").color(theme::text()).size(12.0));
             // Snapshot names first so the loop body is free to mutate `self`
             // (rename state) without fighting a borrow of `self.history`.
             let presets: Vec<(usize, String)> = self
@@ -654,8 +659,8 @@ impl FilterBuilder {
                 }
                 let resp = ui
                     .add(
-                        egui::Button::new(RichText::new(&name).color(theme::TAN))
-                            .fill(theme::PANEL),
+                        egui::Button::new(RichText::new(&name).color(theme::tan()))
+                            .fill(theme::panel()),
                     )
                     .explain(
                         self.verbosity,
@@ -675,7 +680,7 @@ impl FilterBuilder {
                     }
                 });
                 if ui
-                    .add(egui::Button::new(RichText::new("×").color(theme::RED)))
+                    .add(egui::Button::new(RichText::new("×").color(theme::red())))
                     .explain(
                         self.verbosity,
                         "Forget this preset",
@@ -692,8 +697,8 @@ impl FilterBuilder {
             if has_conds
                 && ui
                     .add(
-                        egui::Button::new(RichText::new("STORE PRESET").color(theme::BLACK))
-                            .fill(theme::AMBER),
+                        egui::Button::new(RichText::new("STORE PRESET").color(theme::black()))
+                            .fill(theme::amber()),
                     )
                     .explain(
                         self.verbosity,
@@ -728,13 +733,13 @@ impl FilterBuilder {
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new(format!("{}:", kind.label()))
-                    .color(theme::LILAC)
+                    .color(theme::lilac())
                     .size(11.0),
             );
             // NOT inverts just this condition; conditions still combine with AND,
             // so "images, except thumbnails" is MIME image + NOT NAME *thumb*.
             let negated = self.filters.get(idx).is_some_and(|c| c.negated);
-            if crate::lcars::toggle_button(ui, "NOT", negated, theme::ORANGE)
+            if crate::lcars::toggle_button(ui, "NOT", negated, theme::orange())
                 .explain(
                     self.verbosity,
                     "Invert this condition",
@@ -763,7 +768,8 @@ impl FilterBuilder {
             }
             if ui
                 .add(
-                    egui::Button::new(RichText::new("DONE").color(theme::BLACK)).fill(theme::AMBER),
+                    egui::Button::new(RichText::new("DONE").color(theme::black()))
+                        .fill(theme::amber()),
                 )
                 .explain(
                     self.verbosity,
@@ -787,7 +793,7 @@ impl FilterBuilder {
                     None => None,
                 };
                 if let Some(text) = text {
-                    ui.label(RichText::new(text).color(theme::AMBER).size(11.0));
+                    ui.label(RichText::new(text).color(theme::amber()).size(11.0));
                 }
             }
         });
@@ -811,9 +817,9 @@ impl FilterBuilder {
                     if ui
                         .add(
                             egui::Button::new(
-                                RichText::new(format!("{mime} ({count})")).color(theme::BLUE),
+                                RichText::new(format!("{mime} ({count})")).color(theme::blue()),
                             )
-                            .fill(theme::PANEL),
+                            .fill(theme::panel()),
                         )
                         .explain(
                             self.verbosity,
@@ -846,8 +852,8 @@ impl FilterBuilder {
                     }
                     if ui
                         .add(
-                            egui::Button::new(RichText::new(tag).color(theme::BLUE))
-                                .fill(theme::PANEL),
+                            egui::Button::new(RichText::new(tag).color(theme::blue()))
+                                .fill(theme::panel()),
                         )
                         .explain(
                             self.verbosity,
@@ -868,12 +874,12 @@ impl FilterBuilder {
         let recent = self.history.for_kind(kind).clone();
         if !recent.is_empty() {
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("recent:").color(theme::LILAC).size(11.0));
+                ui.label(RichText::new("recent:").color(theme::lilac()).size(11.0));
                 for value in &recent {
                     if ui
                         .add(
-                            egui::Button::new(RichText::new(value).color(theme::TAN))
-                                .fill(theme::PANEL),
+                            egui::Button::new(RichText::new(value).color(theme::tan()))
+                                .fill(theme::panel()),
                         )
                         .explain(
                             self.verbosity,
@@ -1246,7 +1252,7 @@ mod tests {
                 move |ui, fb: &mut FilterBuilder| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     fb.ui(ui, &store, None, TooltipVerbosity::default());
@@ -1318,7 +1324,7 @@ mod tests {
                 move |ui, fb: &mut FilterBuilder| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     fb.ui(ui, &store, None, TooltipVerbosity::default());

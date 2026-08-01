@@ -398,7 +398,7 @@ impl GroomingView {
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new("GROOMING")
-                        .color(theme::TAN)
+                        .color(theme::tan())
                         .size(18.0)
                         .strong(),
                 );
@@ -429,10 +429,10 @@ impl GroomingView {
                 self.action_bar(ui, &mut acts);
 
                 if let Some(err) = &self.error {
-                    ui.colored_label(theme::RED, err);
+                    ui.colored_label(theme::red(), err);
                 }
                 if let Some(status) = &self.status {
-                    ui.label(RichText::new(status).color(theme::TAN).size(13.0));
+                    ui.label(RichText::new(status).color(theme::tan()).size(13.0));
                 }
                 ui.separator();
                 if self.running || !self.run_log.is_empty() {
@@ -452,33 +452,40 @@ impl GroomingView {
     }
 
     fn command_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "COMMAND — PICK A GROOMING TOOL", theme::ORANGE, |ui| {
-            ui.horizontal(|ui| {
-                for cmd in [
-                    Command::Dedupe,
-                    Command::Purge,
-                    Command::EmptyDirs,
-                    Command::Organize,
-                    Command::Prune,
-                ] {
-                    let sel = self.command == cmd;
-                    let fill = if sel { theme::RED } else { theme::PANEL };
-                    let col = if sel { theme::BLACK } else { theme::RED };
-                    let (short, verbose) = cmd.tooltip();
-                    if ui
-                        .add(egui::Button::new(RichText::new(cmd.label()).color(col)).fill(fill))
-                        .explain(self.verbosity, short, verbose)
-                        .clicked()
-                    {
-                        acts.push(Act::SetCommand(cmd));
+        crate::lcars::section_lcars(
+            ui,
+            "COMMAND — PICK A GROOMING TOOL",
+            theme::orange(),
+            |ui| {
+                ui.horizontal(|ui| {
+                    for cmd in [
+                        Command::Dedupe,
+                        Command::Purge,
+                        Command::EmptyDirs,
+                        Command::Organize,
+                        Command::Prune,
+                    ] {
+                        let sel = self.command == cmd;
+                        let fill = if sel { theme::red() } else { theme::panel() };
+                        let col = if sel { theme::black() } else { theme::red() };
+                        let (short, verbose) = cmd.tooltip();
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new(cmd.label()).color(col)).fill(fill),
+                            )
+                            .explain(self.verbosity, short, verbose)
+                            .clicked()
+                        {
+                            acts.push(Act::SetCommand(cmd));
+                        }
                     }
-                }
-            });
-        });
+                });
+            },
+        );
     }
 
     fn dedupe_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "REPOS — SOURCE & DUPE POOL", theme::LILAC, |ui| {
+        crate::lcars::section_lcars(ui, "REPOS — SOURCE & DUPE POOL", theme::lilac(), |ui| {
             // SOURCE: the repo duplicates are deleted from, orange when picked.
             let src = self.repos.clone();
             let mains = self.mains.clone();
@@ -489,7 +496,7 @@ impl GroomingView {
                     ui,
                     name,
                     sel,
-                    theme::ORANGE,
+                    theme::orange(),
                     mains.contains(name),
                     None,
                 );
@@ -515,8 +522,8 @@ impl GroomingView {
                 .cloned()
                 .collect();
             ui.horizontal(|ui| {
-                ui.label(RichText::new("DUPEPOOL").color(theme::TEXT).size(12.0));
-                if crate::repo_chip::small_button(ui, "ALL", theme::LILAC)
+                ui.label(RichText::new("DUPEPOOL").color(theme::text()).size(12.0));
+                if crate::repo_chip::small_button(ui, "ALL", theme::lilac())
                     .explain(
                         self.verbosity,
                         "Add every eligible repo to the pool",
@@ -526,7 +533,7 @@ impl GroomingView {
                 {
                     self.pool = pool.clone();
                 }
-                if crate::repo_chip::small_button(ui, "NONE", theme::LILAC)
+                if crate::repo_chip::small_button(ui, "NONE", theme::lilac())
                     .explain(
                         self.verbosity,
                         "Clear the dupe pool",
@@ -545,7 +552,7 @@ impl GroomingView {
                     ui,
                     name,
                     sel,
-                    theme::LILAC,
+                    theme::lilac(),
                     mains.contains(name),
                     None,
                 );
@@ -574,7 +581,7 @@ impl GroomingView {
                     "PURGE needs at least one filter condition — with no filter, nothing \
                      matches and nothing can be deleted.",
                 )
-                .color(theme::TAN)
+                .color(theme::tan())
                 .size(12.0),
             );
         }
@@ -617,13 +624,13 @@ impl GroomingView {
         crate::lcars::section_lcars(
             ui,
             "RULES — MATCH FILES & BUILD THEIR NEW PATHS",
-            theme::LILAC,
+            theme::lilac(),
             |ui| {
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .add(
-                            egui::Button::new(RichText::new("+ RULE").color(theme::BLACK))
-                                .fill(theme::AMBER),
+                            egui::Button::new(RichText::new("+ RULE").color(theme::black()))
+                                .fill(theme::amber()),
                         )
                         .explain(
                             self.verbosity,
@@ -656,7 +663,7 @@ impl GroomingView {
         acts: &mut Vec<Act>,
     ) {
         let title = format!("RULE {} — MATCH & RENAME", i + 1);
-        crate::lcars::section_lcars_collapsible(ui, &title, theme::BLUE, true, |ui| {
+        crate::lcars::section_lcars_collapsible(ui, &title, theme::blue(), true, |ui| {
             // The rule's filter (which files this rule applies to).
             let outcome = self.rules[i].filter.ui(ui, store, repo, self.verbosity);
             if outcome.changed {
@@ -668,7 +675,7 @@ impl GroomingView {
             // The target path template, its inline delete, and the token chips.
             let template_id = egui::Id::new(("organize_template", i));
             ui.horizontal(|ui| {
-                ui.label(RichText::new("TEMPLATE").color(theme::TEXT).size(12.0));
+                ui.label(RichText::new("TEMPLATE").color(theme::text()).size(12.0));
                 let changed = ui
                     .add(
                         egui::TextEdit::singleline(&mut self.rules[i].template)
@@ -689,8 +696,8 @@ impl GroomingView {
                 }
                 if ui
                     .add(
-                        egui::Button::new(RichText::new(icon::TRASH).color(theme::RED))
-                            .fill(theme::PANEL),
+                        egui::Button::new(RichText::new(icon::TRASH).color(theme::red()))
+                            .fill(theme::panel()),
                     )
                     .explain(
                         self.verbosity,
@@ -704,12 +711,12 @@ impl GroomingView {
                 }
             });
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("insert:").color(theme::LILAC).size(11.0));
+                ui.label(RichText::new("insert:").color(theme::lilac()).size(11.0));
                 for (label, insert) in TEMPLATE_TOKENS {
                     if ui
                         .add(
-                            egui::Button::new(RichText::new(*label).color(theme::BLUE))
-                                .fill(theme::PANEL),
+                            egui::Button::new(RichText::new(*label).color(theme::blue()))
+                                .fill(theme::panel()),
                         )
                         .clicked()
                     {
@@ -730,7 +737,7 @@ impl GroomingView {
     /// rename), plus a STORE PRESET pill for the current rule list.
     fn preset_row(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         ui.separator();
-        ui.label(RichText::new("PRESETS").color(theme::TEXT).size(12.0));
+        ui.label(RichText::new("PRESETS").color(theme::text()).size(12.0));
         // Snapshot names first so the loop body is free to mutate `self`
         // (rename state) without fighting a borrow of `self.presets`.
         let presets: Vec<(usize, String)> = self
@@ -755,7 +762,10 @@ impl GroomingView {
                 continue;
             }
             let resp = ui
-                .add(egui::Button::new(RichText::new(&name).color(theme::TAN)).fill(theme::PANEL))
+                .add(
+                    egui::Button::new(RichText::new(&name).color(theme::tan()))
+                        .fill(theme::panel()),
+                )
                 .explain(
                     self.verbosity,
                     "Apply this preset",
@@ -774,7 +784,7 @@ impl GroomingView {
                 }
             });
             if ui
-                .add(egui::Button::new(RichText::new("×").color(theme::RED)))
+                .add(egui::Button::new(RichText::new("×").color(theme::red())))
                 .explain(
                     self.verbosity,
                     "Forget this preset",
@@ -788,8 +798,8 @@ impl GroomingView {
         if !self.rules.is_empty()
             && ui
                 .add(
-                    egui::Button::new(RichText::new("STORE PRESET").color(theme::BLACK))
-                        .fill(theme::AMBER),
+                    egui::Button::new(RichText::new("STORE PRESET").color(theme::black()))
+                        .fill(theme::amber()),
                 )
                 .explain(
                     self.verbosity,
@@ -809,7 +819,7 @@ impl GroomingView {
         crate::lcars::section_lcars(
             ui,
             "REPO — WHICH REPOSITORY TO GROOM",
-            theme::LILAC,
+            theme::lilac(),
             |ui| {
                 let repos = self.repos.clone();
                 let mains = self.mains.clone();
@@ -820,7 +830,7 @@ impl GroomingView {
                         ui,
                         name,
                         sel,
-                        theme::ORANGE,
+                        theme::orange(),
                         mains.contains(name),
                         None,
                     );
@@ -833,14 +843,14 @@ impl GroomingView {
                     }
                     chip.outer
                 });
-                ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
+                ui.label(RichText::new(hint).color(theme::lilac()).size(11.0));
             },
         );
     }
 
     /// A single-line filter expression (mime / size / name with `*` wildcards).
     fn action_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "ACTION — REVIEW & RUN", theme::AMBER, |ui| {
+        crate::lcars::section_lcars(ui, "ACTION — REVIEW & RUN", theme::amber(), |ui| {
             ui.horizontal(|ui| {
                 let ready = self.ready();
                 // EMPTY DIRS has no meaningful file preview (its count is only
@@ -849,7 +859,7 @@ impl GroomingView {
                     && ui
                         .add_enabled(
                             ready,
-                            egui::Button::new(RichText::new("REVIEW").color(theme::BLACK)),
+                            egui::Button::new(RichText::new("REVIEW").color(theme::black())),
                         )
                         .explain(
                             self.verbosity,
@@ -861,8 +871,8 @@ impl GroomingView {
                 {
                     acts.push(Act::Preview);
                 }
-                let run =
-                    egui::Button::new(RichText::new("RUN").color(theme::BLACK)).fill(theme::RED);
+                let run = egui::Button::new(RichText::new("RUN").color(theme::black()))
+                    .fill(theme::red());
                 if ui
                     .add_enabled(ready, run)
                     .explain(
@@ -876,11 +886,11 @@ impl GroomingView {
                     acts.push(Act::Ask);
                 }
                 if self.running {
-                    ui.add(egui::Spinner::new().color(theme::AMBER));
+                    ui.add(egui::Spinner::new().color(theme::amber()));
                     if ui
                         .add(
-                            egui::Button::new(RichText::new("CANCEL").color(theme::BLACK))
-                                .fill(theme::RED),
+                            egui::Button::new(RichText::new("CANCEL").color(theme::black()))
+                                .fill(theme::red()),
                         )
                         .explain(
                             self.verbosity,
@@ -900,7 +910,7 @@ impl GroomingView {
     fn preview_panel(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         if self.preview.is_empty() {
             ui.add_space(6.0);
-            ui.colored_label(theme::TEXT, "Pick a repo and command, then press REVIEW.");
+            ui.colored_label(theme::text(), "Pick a repo and command, then press REVIEW.");
             return;
         }
         let bodies = std::mem::take(&mut self.preview_bodies);
@@ -961,14 +971,14 @@ impl GroomingView {
     fn run_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if self.running {
-                ui.add(egui::Spinner::new().color(theme::AMBER));
+                ui.add(egui::Spinner::new().color(theme::amber()));
             }
             let current = if self.run_current.is_empty() {
                 "preparing…".to_string()
             } else {
                 self.run_current.clone()
             };
-            ui.label(RichText::new(current).color(theme::AMBER).strong());
+            ui.label(RichText::new(current).color(theme::amber()).strong());
         });
         let summary = if self.run_total > 0 {
             format!("{} / {}", self.run_done, self.run_total)
@@ -977,7 +987,7 @@ impl GroomingView {
         };
         ui.label(
             RichText::new(format!("Processed {summary}"))
-                .color(theme::TAN)
+                .color(theme::tan())
                 .size(12.0),
         );
         egui::ScrollArea::vertical()
@@ -986,7 +996,7 @@ impl GroomingView {
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 for line in &self.run_log {
-                    ui.label(RichText::new(line).color(theme::TEXT).size(12.0));
+                    ui.label(RichText::new(line).color(theme::text()).size(12.0));
                 }
             });
     }
@@ -996,18 +1006,18 @@ impl GroomingView {
             ui.set_width(380.0);
             ui.label(
                 RichText::new(format!("CONFIRM {}", self.command.label()))
-                    .color(theme::AMBER)
+                    .color(theme::amber())
                     .size(16.0)
                     .strong(),
             );
             ui.add_space(6.0);
-            ui.colored_label(theme::TEXT, prompt);
+            ui.colored_label(theme::text(), prompt);
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui
                     .add(
-                        egui::Button::new(RichText::new("PROCEED").color(theme::BLACK))
-                            .fill(theme::RED),
+                        egui::Button::new(RichText::new("PROCEED").color(theme::black()))
+                            .fill(theme::red()),
                     )
                     .clicked()
                 {
@@ -1015,7 +1025,7 @@ impl GroomingView {
                 }
                 if ui
                     .add(egui::Button::new(
-                        RichText::new("CANCEL").color(theme::TEXT),
+                        RichText::new("CANCEL").color(theme::text()),
                     ))
                     .clicked()
                 {
@@ -1794,7 +1804,7 @@ mod ui_tests {
                 move |ui, view: &mut GroomingView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default());

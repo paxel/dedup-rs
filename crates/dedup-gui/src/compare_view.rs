@@ -314,12 +314,12 @@ impl DiffCompare {
                         |ui| {
                             ui.label(
                                 RichText::new("COMPARE — SAME PATH, DIFFERENT CONTENT")
-                                    .color(theme::TAN)
+                                    .color(theme::tan())
                                     .size(16.0)
                                     .strong(),
                             );
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.button(RichText::new("CLOSE").color(theme::BLACK))
+                                ui.button(RichText::new("CLOSE").color(theme::black()))
                                     .explain(
                                         verbosity,
                                         "Close the comparison",
@@ -434,7 +434,7 @@ impl DiffCompare {
                                 &ColumnHead {
                                     file_name: &l.rel_path,
                                     repo: &l.repo,
-                                    accent: theme::BLUE,
+                                    accent: theme::blue(),
                                     read_only: true,
                                     is_main: false,
                                     source: &l.facts.abs_path,
@@ -448,7 +448,7 @@ impl DiffCompare {
                                 &ColumnHead {
                                     file_name: &r.rel_path,
                                     repo: &r.repo,
-                                    accent: theme::TAN,
+                                    accent: theme::tan(),
                                     read_only: true,
                                     is_main: false,
                                     source: &r.facts.abs_path,
@@ -484,7 +484,7 @@ impl DiffCompare {
                                     &ColumnHead {
                                         file_name: &l.rel_path,
                                         repo: &l.repo,
-                                        accent: theme::BLUE,
+                                        accent: theme::blue(),
                                         read_only: true,
                                         is_main: false,
                                         source: &l.facts.abs_path,
@@ -501,7 +501,7 @@ impl DiffCompare {
                                     &ColumnHead {
                                         file_name: &r.rel_path,
                                         repo: &r.repo,
-                                        accent: theme::TAN,
+                                        accent: theme::tan(),
                                         read_only: true,
                                         is_main: false,
                                         source: &r.facts.abs_path,
@@ -536,7 +536,7 @@ impl DiffCompare {
                         Align2::LEFT_TOP,
                         "wheel: zoom · drag: pan · Space flicker/swap · Esc close",
                         FontId::proportional(11.0),
-                        theme::HAIRLINE,
+                        theme::hairline(),
                     );
                 } else {
                     // Not both decoded yet (or one produced no visual): static
@@ -563,7 +563,7 @@ impl DiffCompare {
                                     Align2::CENTER_CENTER,
                                     text,
                                     FontId::proportional(14.0),
-                                    theme::TAN,
+                                    theme::tan(),
                                 );
                             }
                         }
@@ -619,20 +619,28 @@ fn side_strip(
     ui.vertical(|ui| {
         ui.label(
             RichText::new(&side.repo)
-                .color(if is_left { theme::ORANGE } else { theme::BLUE })
+                .color(if is_left {
+                    theme::orange()
+                } else {
+                    theme::blue()
+                })
                 .size(14.0)
                 .strong(),
         );
-        ui.label(RichText::new(&side.rel_path).color(theme::TEXT).size(12.0));
+        ui.label(
+            RichText::new(&side.rel_path)
+                .color(theme::text())
+                .size(12.0),
+        );
         let size_color = if side.facts.size > other.facts.size {
-            theme::GREEN
+            theme::green()
         } else {
-            theme::TEXT
+            theme::text()
         };
         let date_color = if side.facts.modified_ms > other.facts.modified_ms {
-            theme::GREEN
+            theme::green()
         } else {
-            theme::TEXT
+            theme::text()
         };
         ui.add_space(4.0);
         ui.label(
@@ -653,15 +661,15 @@ fn side_strip(
                     .clone()
                     .unwrap_or_else(|| "unknown type".into()),
             )
-            .color(theme::GREY)
+            .color(theme::grey())
             .size(12.0),
         );
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui
                 .add(
-                    egui::Button::new(RichText::new("OVERWRITE OTHER").color(theme::BLACK))
-                        .fill(theme::TAN),
+                    egui::Button::new(RichText::new("OVERWRITE OTHER").color(theme::black()))
+                        .fill(theme::tan()),
                 )
                 .explain(
                     verbosity,
@@ -675,7 +683,8 @@ fn side_strip(
             }
             if ui
                 .add(
-                    egui::Button::new(RichText::new("DELETE").color(theme::BLACK)).fill(theme::RED),
+                    egui::Button::new(RichText::new("DELETE").color(theme::black()))
+                        .fill(theme::red()),
                 )
                 .explain(
                     verbosity,

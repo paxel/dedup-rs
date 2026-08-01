@@ -30,7 +30,7 @@ pub fn toggle_button(
     let font = egui::TextStyle::Button.resolve(ui.style());
     let text_w = ui
         .painter()
-        .layout_no_wrap(label.to_owned(), font.clone(), theme::TEXT)
+        .layout_no_wrap(label.to_owned(), font.clone(), theme::text())
         .size();
     // Roomy horizontal padding gives the classic long-bar proportions.
     let pad = Vec2::new(16.0, 6.0);
@@ -38,11 +38,11 @@ pub fn toggle_button(
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     if ui.is_rect_visible(rect) {
         let (fill, fg, border) = if selected {
-            (accent, theme::BLACK, accent)
+            (accent, theme::black(), accent)
         } else if resp.hovered() {
-            (tint(accent), theme::TEXT, accent)
+            (tint(accent), theme::text(), accent)
         } else {
-            (theme::PANEL, accent, accent)
+            (theme::panel(), accent, accent)
         };
         // Stadium caps: the corner radius is half the height, so the ends are
         // fully round bars.
@@ -70,7 +70,7 @@ pub fn action_button(
     let font = egui::TextStyle::Button.resolve(ui.style());
     let text_w = ui
         .painter()
-        .layout_no_wrap(label.to_owned(), font.clone(), theme::BLACK)
+        .layout_no_wrap(label.to_owned(), font.clone(), theme::black())
         .size();
     let pad = Vec2::new(16.0, 6.0);
     let size = text_w + pad * 2.0;
@@ -89,9 +89,9 @@ pub fn action_button(
             accent
         };
         let fg = if enabled {
-            theme::BLACK
+            theme::black()
         } else {
-            theme::BLACK.gamma_multiply(0.6)
+            theme::black().gamma_multiply(0.6)
         };
         let r = CornerRadius::same((rect.height() / 2.0) as u8);
         let p = ui.painter();
@@ -226,7 +226,7 @@ fn collapsed_header(ui: &mut egui::Ui, title: &str, accent: Color32) -> egui::Re
             Align2::LEFT_CENTER,
             format!("{} {title}", icon::CARET_RIGHT),
             egui::FontId::proportional(13.0),
-            theme::BLACK,
+            theme::black(),
         );
     }
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, title));
@@ -243,7 +243,7 @@ fn elbow_shapes(ui: &egui::Ui, rect: Rect, title: &str, accent: Color32) -> Vec<
     let galley = ui.painter().layout_no_wrap(
         title.to_owned(),
         egui::FontId::proportional(13.0),
-        theme::BLACK,
+        theme::black(),
     );
     // Safety net: the panel is always full-width (see `section_lcars`), so this
     // only bites for a title too long even for that — widen the chrome rather
@@ -291,8 +291,8 @@ fn elbow_shapes(ui: &egui::Ui, rect: Rect, title: &str, accent: Color32) -> Vec<
                 sw: 0,
                 se: 0,
             },
-            theme::PANEL,
+            theme::panel(),
         ),
-        egui::Shape::galley(tpos, galley, theme::BLACK),
+        egui::Shape::galley(tpos, galley, theme::black()),
     ]
 }
