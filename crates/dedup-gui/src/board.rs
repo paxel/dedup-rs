@@ -208,6 +208,10 @@ pub enum Cmd {
     KeepOneRight,
     DeleteAllLeft,
     DeleteAllRight,
+    /// Not a button: synthesised when the row body itself is clicked. Every row
+    /// opens the shared viewer, which is why rows no longer carry a COMPARE
+    /// command — it would be a second door to the same place.
+    OpenRow,
 }
 
 impl Cmd {
@@ -220,6 +224,7 @@ impl Cmd {
             Cmd::DeleteLeft => "DELETE L",
             Cmd::DeleteRight => "DELETE R",
             Cmd::Compare => "COMPARE",
+            Cmd::OpenRow => "OPEN",
             Cmd::OverwriteRight => "OVERWRITE >",
             Cmd::OverwriteLeft => "< OVERWRITE",
             Cmd::RenameLeft => "RENAME L",
@@ -239,7 +244,7 @@ impl Cmd {
             Cmd::DeleteLeft | Cmd::DeleteRight | Cmd::DeleteAllLeft | Cmd::DeleteAllRight => {
                 theme::red()
             }
-            Cmd::Compare => theme::lilac(),
+            Cmd::Compare | Cmd::OpenRow => theme::lilac(),
             Cmd::OverwriteRight
             | Cmd::OverwriteLeft
             | Cmd::RenameLeft
@@ -266,7 +271,7 @@ impl Cmd {
             | Cmd::RenameRight
             | Cmd::KeepOneRight
             | Cmd::DeleteAllRight => Side::Right,
-            Cmd::Apply | Cmd::Hide | Cmd::Compare => Side::Neither,
+            Cmd::Apply | Cmd::Hide | Cmd::Compare | Cmd::OpenRow => Side::Neither,
         }
     }
 
@@ -283,6 +288,8 @@ impl Cmd {
             Cmd::Compare => Kind::Compare,
             Cmd::Apply => Kind::Apply,
             Cmd::Hide => Kind::Hide,
+            // Never laid out with the others — it is not a button.
+            Cmd::OpenRow => Kind::Apply,
         }
     }
 
@@ -301,6 +308,7 @@ impl Cmd {
             Cmd::DeleteLeft => "Delete this file from the left-hand repository",
             Cmd::DeleteRight => "Delete this file from the right-hand repository",
             Cmd::Compare => "Show both versions side by side",
+            Cmd::OpenRow => "Open this row in the viewer",
             Cmd::OverwriteRight => "Replace the right-hand file with this one",
             Cmd::OverwriteLeft => "Replace the left-hand file with this one",
             Cmd::RenameLeft => "Rename the left-hand file to the other side's name",
@@ -664,6 +672,23 @@ pub fn board(
         if vis % 2 == 1 {
             ui.painter().rect_filled(row_rect, 0.0, theme::panel());
         }
+        // The row body opens the shared viewer — the law: clicking any file
+        // anywhere shows it. Allocated before the commands so their own clicks
+        // still win.
+        if ui
+            .interact(
+                row_rect,
+                ui.id().with(("board-row", i)),
+                egui::Sense::click(),
+            )
+            .clicked()
+        {
+            action = Some(BoardAction {
+                row: i,
+                cmd: Cmd::OpenRow,
+            });
+        }
+        {}
         // The row's vertical padding is an inset on the content rect. Adding it
         // with `add_space` inside a left-to-right row would have spent it
         // sideways instead, leaving the content taller than its measured height.
@@ -1185,6 +1210,24 @@ fn summary(ui: &mut egui::Ui, totals: [usize; 4]) {
 
 #[cfg(test)]
 mod tests {
+
+    /// The law reaches the boards: clicking a row body opens the shared viewer.
+    /// Rows therefore carry no COMPARE command — it would be a second door.
+    #[test]
+    fn a_row_body_click_reports_open_rather_than_a_command() {
+        // `OpenRow` is synthesised by the board, never listed in a row's
+        // commands, so it can never be laid out as a button competing for space.
+        let m = meta("k", 2, 1);
+        assert!(
+            !m.cmds.contains(&Cmd::OpenRow),
+            "OPEN is not a command a caller supplies"
+        );
+        assert_eq!(
+            Cmd::OpenRow.side(),
+            Side::Neither,
+            "it acts on the row as a whole"
+        );
+    }
 
     /// Highlighting is paint only: it must not change how tall a row is, or the
     /// prefix-sum index would disagree with what is drawn.

@@ -78,9 +78,9 @@ and date, with the commands between them.
   different extension. The comparison ignores the folder the files sit in, and an inserted
   character marks only itself rather than everything after it.
 - **BY PATH** — files are matched by their path inside the repo. Same path with the same
-  content is *equal*; same path with different content is a conflict, offering **COMPARE**,
+  content is *equal*; same path with different content is a conflict, offering
   **OVERWRITE >** / **< OVERWRITE** (replace the other side's file with this one) and
-  **DELETE L** / **DELETE R**.
+  **DELETE L** / **DELETE R**. Clicking the row opens the two versions in the viewer.
 
 Above the board, **ALL LISTED** offers bulk actions for reconciling large repositories:
 **COPY MISSING >** / **< COPY MISSING** send everything only one side has to the other, and
@@ -89,9 +89,9 @@ the rows on screen can actually use are offered. They act on every row *currentl
 hiding a row is how you leave it out — and a confirmation states the exact count first. If some
 operations fail the summary says how many succeeded and how many did not.
 
-**COMPARE** opens the two versions side by side over the whole window, with the same
-representation tabs as the Duplicates lightbox — so what you get depends on the file type, not
-on which tab you happen to be in. Two audio files compare as **spectrograms**, two documents
+**Clicking a row** opens the two versions side by side over the whole window, in the same
+shared viewer every surface opens — so what you get depends on the file type, not on which
+tab you happen to be in. Two audio files compare as **spectrograms**, two documents
 through a **Text** tab, and images and video as pictures: each side shows a preview appropriate to the file (image, or a
 still for video), the repo it lives in, and its size, modification date and type — with the
 larger size and the newer date highlighted, so which is which is obvious at a glance. When

@@ -339,7 +339,7 @@ impl GroomingView {
         // closes it: Grooming's own APPLY / HIDE are how a row is acted on, so
         // the viewer is shared but the decisions stay this view's.
         if let Some(inspect) = self.inspect.as_mut()
-            && inspect.view(&ui.ctx().clone(), verbosity).is_some()
+            && inspect.view(&ui.ctx().clone(), verbosity, None).is_some()
         {
             self.inspect = None;
         }
@@ -947,7 +947,7 @@ impl GroomingView {
                     acts.push(Act::ApplyRow(meta.key.clone()));
                 }
             }
-            Some(a) if a.cmd == board::Cmd::Compare => {
+            Some(a) if a.cmd == board::Cmd::OpenRow => {
                 if let Some(meta) = self.preview.get(a.row) {
                     let (left, right) = (meta.left_paths.clone(), meta.right_paths.clone());
                     if let (Some(l), Some(r)) = (left.first(), right.first()) {
@@ -1128,6 +1128,7 @@ impl GroomingView {
                         repo: repo.to_string(),
                         rel_path: rel.to_string(),
                         facts: crate::media_cell::FileFacts::from_entry(&entry, abs),
+                        read_only: true,
                     })
                 };
                 let right = self.pool.iter().find_map(|repo| side(repo, &right_rel));
@@ -1368,15 +1369,10 @@ impl GroomingView {
                             left_paths: vec![from],
                             right_paths: reference.iter().cloned().collect(),
                             unchanged: false,
-                            // A row only offers COMPARE when there is genuinely
-                            // something to compare against: DEDUPE's surviving
-                            // copy. PURGE and PRUNE rows have no counterpart, so
-                            // the command is not offered rather than disabled.
-                            cmds: if reference.is_some() {
-                                vec![board::Cmd::Compare, board::Cmd::Apply, board::Cmd::Hide]
-                            } else {
-                                vec![board::Cmd::Apply, board::Cmd::Hide]
-                            },
+                            // No COMPARE command: clicking the row opens the
+                            // shared viewer, so a row-level command would be a
+                            // second door to the same place.
+                            cmds: vec![board::Cmd::Apply, board::Cmd::Hide],
                         };
                         let body = board::RowBody {
                             left: board::SideBody {
@@ -2047,24 +2043,15 @@ mod ui_tests {
     }
 
     /// `section_lcars` now always claims the panel's full width, so even a
-    /// A DEDUPE row offers COMPARE (it has a counterpart to compare against);
-    /// PURGE and PRUNE rows do not, because there is nothing on the other side.
+    /// Rows carry no COMPARE command any more: clicking the row itself opens the
+    /// shared viewer, so a row-level command would be a second door to the same
+    /// place. This deliberately undoes part of the 2026-07-31 backlog batch.
     #[test]
-    fn only_rows_with_a_counterpart_offer_compare() {
-        let cmds_for = |reference: Option<&str>| {
-            if reference.is_some() {
-                vec![board::Cmd::Compare, board::Cmd::Apply, board::Cmd::Hide]
-            } else {
-                vec![board::Cmd::Apply, board::Cmd::Hide]
-            }
-        };
+    fn rows_carry_no_compare_command() {
+        let cmds = [board::Cmd::Apply, board::Cmd::Hide];
         assert!(
-            cmds_for(Some("archive/original.jpg")).contains(&board::Cmd::Compare),
-            "a DEDUPE row with a surviving copy can be compared"
-        );
-        assert!(
-            !cmds_for(None).contains(&board::Cmd::Compare),
-            "a one-sided PURGE/PRUNE row does not offer a compare that would open nothing"
+            !cmds.contains(&board::Cmd::Compare),
+            "the row body is how a row is opened, not a command"
         );
     }
 

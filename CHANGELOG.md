@@ -6,6 +6,26 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 ### Changed
 
+- **One viewer for every file, everywhere.** Clicking any file — a duplicate card (or the
+  typed placeholder a document shows), a review board row, a file in Browse, a DIFF conflict —
+  opens the same full-window viewer, with the same representation tabs (Image, Video, Audio,
+  Metadata, Text), the same per-side switchers, and the actions of the place you came from:
+  the Duplicates tab offers its DELETE / DELETE A / DELETE B mark pills, the DIFF board its
+  OVERWRITE/DELETE commands. The Duplicates tab's own tabbed lightbox and its separate audio
+  viewer are gone; the three viewers were three implementations of one job, drifting apart.
+- In the viewer, a file opens **alone** first; **SHOW B** reveals a second side — always
+  another candidate, never the file already shown — and **HIDE B** returns. Each side's
+  switcher (`< PREV A`, `<1 / 3>`, `NEXT A >`) steps through the group or listing, skipping
+  the file the other side shows, and its position counts that side's candidates, never the
+  group size. Stepping keeps the audio transport state: playing keeps playing the newly shown
+  copy, a deliberate pause stays paused with the new copy loaded.
+- The viewer's **Overview tab is gone**: its facts moved into each side's own title block
+  (repo, path, size, date, type, mark pill), so which file you are about to act on is always
+  written beside it.
+- **ID3 tags are editable in the shared viewer** for a writable audio file — EDIT TAGS /
+  SAVE TAGS on the Metadata tab, `T` as the shortcut, with values from every other candidate
+  offered for adoption — so the tag editor also reached Browse and the boards for the first
+  time. Read-only repositories still never offer an edit.
 - Pushing a backup group to several sinks now reads the main repository's index **once** for
   the whole push instead of once per sink, so a group with many sinks plans and runs with
   less repeated work. What each sink receives is unchanged.
@@ -54,6 +74,12 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 ### Removed
 
+- With the old Duplicates viewers deleted, three of their extras did not move into the shared
+  viewer: the in-viewer **image edit save** (writing a rotated `_rot` copy or overwriting in
+  place — rotate and mirror remain as viewing aids, but changing a file on disk is no longer
+  offered from the viewer), the audio **WAVEFORM/SPECTROGRAM toggle** (the viewer shows
+  spectrograms; cards keep their inline preview), and the **video filmstrip scrubber** (a clip
+  is now identified by one representative still per side; full playback stays the OPEN path).
 - The GUI pixel-diff snapshot test (`dupes_view_snapshot`). Its baseline directory was
   gitignored, so no baseline was ever committed and the test could not pass on any machine
   but the one that last generated it; being `#[ignore]`d, the drift went unnoticed.

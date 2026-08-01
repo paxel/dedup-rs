@@ -41,7 +41,8 @@ everything currently marked, batched per repo in one transaction, behind a confi
 Results page 50 groups at a time (← / → to navigate). Each group shows a header (copy count,
 size, reclaimable bytes) and one card per file:
 
-- Thumbnail (click to open the [lightbox](#lightbox)), path, repo, size, dimensions, mtime.
+- Thumbnail (click to open the [viewer](#the-viewer-lightbox)), path, repo, size, dimensions,
+  mtime.
 - **from `<repo>`** — if this file's provenance is known (it was copied/synced in from
   another repo).
 - Audio files get inline **PLAY/PAUSE** + a seek bar (see [Audio preview](#audio-preview)).
@@ -55,79 +56,76 @@ size, reclaimable bytes) and one card per file:
   **SHOW IN FOLDER** (reveal it in the file manager) — the full-fidelity escape hatch for
   any file type, and the designated way to actually play a video full-screen.
 
-## Lightbox
+## The viewer (lightbox)
 
-Click any thumbnail to open the full-window lightbox — including the typed placeholder a
-document, archive or other non-visual duplicate shows instead of a picture, which opens on
-its [Text](#representation-tabs) preview.
+Click any card — the thumbnail, or the typed placeholder a document or archive shows instead
+of a picture — to open the full-window viewer. It is the **same viewer every surface opens**:
+Browse, the review boards and Transfer's DIFF all land on this one screen, so it behaves
+identically wherever you came from. It opens on the clicked file alone, on the file's own
+representation: a photo on Image, a track on Audio, a document on Text.
 
-![Lightbox in A/B compare mode](../screenshots/lightbox_compare.png)
+![The viewer in A/B compare mode](../screenshots/lightbox_compare.png)
+
+**Two sides.** SHOW B reveals a second side — another member of the group, never the file
+already shown — and HIDE B returns the first file to the whole screen. Each side carries its
+own identifying facts (repo, path, size, date, type) and its own mark pill: **DELETE** for a
+single file, **DELETE A** / **DELETE B** while both are shown, each toggling only its own
+copy's mark without closing the viewer. A copy in a read-only repository shows a disabled,
+struck-through `… (Protected)` pill instead.
+
+**Switching copies.** With more than two copies in the group, each side gets its own switcher
+(`< PREV A`, `<1 / 3>`, `NEXT A >`) that steps that side through the group. It always skips
+the file the other side is showing — the two sides can never be the same file — and the
+position counts that side's candidates, never the group size. A two-copy group offers no
+switcher at all: the only other candidate is already on the other side.
 
 ### Representation tabs
 
-A file can be looked at in more than one way, so the lightbox is tabbed by *representation*.
-The tab bar offers every representation at least one of the two compared files has —
-**Overview**, **Image**, **Video**, **Audio**, **Metadata**, **Text** — and nothing else: a
-photo has no Audio tab, an untagged FLAC no Metadata tab. Selecting a tab draws only the
-column(s) whose file supports it, always left (A) against right (B), never stacked. If you
-step to a copy that lacks the current representation, the lightbox drops back to Overview.
+A file can be looked at in more than one way, so the viewer is tabbed by *representation*.
+The tab bar offers every representation at least one side has — **Image**, **Video**,
+**Audio**, **Metadata**, **Text** — and nothing else: a photo has no Audio tab, an untagged
+FLAC no Metadata tab. Selecting a tab draws only the column(s) whose file supports it, always
+left (A) against right (B), never stacked. If a side steps to a copy that lacks the current
+representation, the viewer drops back to the pair's own representation.
 
-**Overview** is where a lightbox opens: repo badge, thumbnail, path, size/dimensions/duration,
-mtime and mime for each side, the DELETE / DELETE A / DELETE B mark pill, and the COMPARE
-button that hands off to the native view. While comparing, `< i / N >` cycles B through every
-*other* copy in the group.
+**Image**: mouse-wheel zooms around the cursor, drag pans, `space` enters flicker — one
+full-window pane swapping between A and B in place, the fastest way to spot a subtle edit —
+and ROTATE / MIRROR turn one side to align a copy somebody flipped. The turn carries into the
+comparison and is a viewing aid only: nothing is written back to disk.
+
+**Audio** compares as spectrograms — frequency-vs-time, far more telling than a flat waveform
+— with a transport per side: **PLAY A** / **PLAY B**, **PAUSE**, and a cycling **SPEED** pill
+(slowing a passage makes small differences between two takes audible). Playing while both
+sides are shown loads the two copies as a synced pair, so `←`/`→` flip which copy is audible
+instantly and gap-free — any difference is audible rather than masked by a pause. With one
+file shown, `←`/`→` step through the group keeping the transport state: playing keeps playing
+the newly shown copy, and a deliberate pause stays paused with the new copy loaded, so play
+resumes the file you are actually looking at. `P` toggles play/pause.
 
 **Metadata** shows the file's tags. For MP3/WAV/AIFF that is the ID3 editor: EDIT TAGS opens
 Title/Artist/Album/Year/Track/Genre for that copy, the `>` beside a field offers the value any
 other copy in the group carries (adopt the best one), and SAVE TAGS writes only the tags — the
-audio itself is untouched. `T` from the audio view jumps straight here. A file in a read-only
+audio itself is untouched. `T` jumps straight here with the editor open. A file in a read-only
 repository is shown but never editable. For images the tab shows the EXIF capture facts
 (camera, taken) as recorded; they are not edited here.
 
 ![The Metadata tab, editing one copy's ID3 tags against another's](../screenshots/lightbox_metadata.png)
 
-**Text** is the representation for everything that is not image, video or audio — documents,
-archives, anything a thumbnail cannot describe. It shows the head of each file (the first
-64 KB) as text, or as an offset/hex/ASCII dump when the file is not text, so two same-sized
-"duplicates" can still be told apart by eye. Long files scroll inside their column.
+**Text** is offered for **every** file — reading a JPEG's header bytes is as legitimate as
+looking at its pixels. It shows the head of each file (the first 64 KB) as text, or as an
+offset/hex/ASCII dump when the file is not text, so two same-sized "duplicates" can still be
+told apart by eye — and documents, archives and unknown formats get a real surface of their
+own. Long files scroll inside their column.
 
 ![The Text tab, a markdown file beside a binary one](../screenshots/lightbox_text.png)
 
-**Images**: mouse-wheel zooms around the cursor, drag pans. `F` fits to window / `1` shows
-true pixels (100%, one screen pixel per image pixel). `←`/`→` step through the group's other
-copies. `Del`/`K` toggles the mark on the shown file (respecting read-only). `Esc` or CLOSE
-exits. Full-resolution decoding runs off the UI thread with an aggressively-capped texture
-cache, so even a very large photo never freezes the interface — the thumbnail shows upscaled
-until the full image lands.
+**Videos** compare as one representative still per side, enough to tell two clips apart at a
+glance. Full playback stays the OPEN (external app) path.
 
-**Videos**: the lightbox is a scrubbable filmstrip instead of a zoomable image — ten
-evenly-spaced stills, with the frame under the cursor enlarged, so you can identify a clip
-and judge its quality without full playback. Frames are extracted with `ffmpeg` on demand and
-cached; without ffmpeg the card and strip fall back to a placeholder. Full playback is the
-OPEN (external app) path.
+![Two clips side by side in the viewer](../screenshots/video_compare.png)
 
-### A/B compare
-
-Press `C` (needs ≥2 copies in the group, and a group with a visual — images or videos) to pit
-the shown copy against the group's best copy, with a shared, resolution-independent zoom/pan:
-
-- **SIDE BY SIDE** (default) — both panes at once, each labeled A/B.
-- **FLICKER** — one full-window pane; `space` swaps between A and B in place, the fastest way
-  to spot compression artifacts.
-- **Videos compare scrubbed in sync**: a shared filmstrip sits below the two panes, and
-  clicking a still moves **both** sides to that frame — the same position on each clip's
-  ten-still grid (the same time-*fraction*, not the same absolute timestamp if their durations
-  differ) — so you can line up the same moment and spot a re-encode or crop.
-- The bottom metadata strip shows both files' size and dimensions, with the larger value
-  highlighted.
-- **MARK A** / **MARK B** toggle either copy's deletion mark independently; `Del`/`K` marks B
-  (the compare candidate) while comparing.
-- **EXIT COMPARE** (or `C` again) returns to the single view.
-
-![Two clips in A/B compare with the shared frame scrubber](../screenshots/video_compare.png)
-
-Groups with nothing to show (duplicate PDFs, text, or other non-visual files) have no compare —
-`C` does nothing there.
+`Esc` steps back one level — out of flicker, or an open tag editor — and then closes the
+viewer; whatever the viewer was playing falls silent with it.
 
 ## Audio preview
 
@@ -138,18 +136,12 @@ starting another replaces it. Playback survives scrolling and stops automaticall
 switch away from the Duplicates tab. Requires ALSA on Linux at build time (see the README);
 with no audio device at runtime, the controls still render and playback is simply a no-op.
 
-In the audio lightbox the player header carries the same mark pills as every other view:
-**DELETE** for a single copy, and **DELETE A** / **DELETE B** while comparing, each toggling
-only its own copy — so a copy can be marked without leaving the comparison. A copy in a
-read-only repository shows a disabled, struck-through `… (Protected)` pill instead.
-
-Stepping to another copy with `←`/`→` keeps your transport state: if playback was running it
-continues on the new copy, and if you had paused it stays paused — with the newly shown copy
-loaded, so pressing play resumes the file you are actually looking at.
+The [viewer](#the-viewer-lightbox) shares the same single audio device: opening a track there
+and pressing PLAY replaces what a card was playing, and closing the viewer silences what it
+started while leaving a card's own playback alone.
 
 ## Video preview
 
 Video duplicate cards show a real still frame (sampled mid-timeline) instead of a generic
-icon, using the same evenly-spaced grid the lightbox filmstrip uses — so the card's frame is
-reused there instead of being extracted twice. Without ffmpeg on `PATH`, the card falls back
-to the placeholder.
+icon. Frames are extracted with `ffmpeg` on demand and cached; without ffmpeg on `PATH`, the
+card falls back to the placeholder.

@@ -30,7 +30,6 @@
 
 use crate::external;
 use crate::filter_ui::FilterBuilder;
-use crate::lightbox::{FullResCache, LightboxState};
 use crate::settings::TooltipVerbosity;
 use crate::theme;
 use crate::thumbs::ThumbCache;
@@ -213,9 +212,7 @@ pub struct BrowseView {
     annos_map: HashMap<String, Vec<String>>,
     verbosity: TooltipVerbosity,
     /// Open full-window viewer for the previewed image/video, if any.
-    lightbox: Option<OpenLightbox>,
-    /// Full-resolution texture cache backing the lightbox.
-    full_res: FullResCache,
+    lightbox: Option<crate::compare_view::DiffCompare>,
     /// Audio preview: show the spectrogram instead of the amplitude waveform.
     audio_spec: bool,
     /// One-entry spectrogram texture cache for the previewed audio file.
@@ -232,16 +229,6 @@ struct BrowseTagEdit {
     hex: String,
     abs: std::path::PathBuf,
     tags: crate::id3tags::Tags,
-}
-
-/// Everything the open lightbox needs, captured when the preview is clicked so
-/// the viewer stays valid even if the selection changes underneath it.
-struct OpenLightbox {
-    state: LightboxState,
-    hex: String,
-    abs: std::path::PathBuf,
-    is_video: bool,
-    meta: String,
 }
 
 impl BrowseView {
@@ -281,7 +268,6 @@ impl BrowseView {
             annos_map: HashMap::new(),
             verbosity: TooltipVerbosity::default(),
             lightbox: None,
-            full_res: FullResCache::new(1),
             audio_spec: false,
             spec_tex: None,
             audio_tags: None,
@@ -732,22 +718,10 @@ impl BrowseView {
     /// images (the thumbnail stands in while it decodes), the scrub frame for
     /// videos. Rendering and interactions live in [`crate::lightbox`].
     fn lightbox_modal(&mut self, ctx: &egui::Context) {
-        let Some(lb) = self.lightbox.as_mut() else {
-            return;
-        };
-        self.full_res.poll(ctx);
-        let tex = if lb.is_video {
-            self.thumbs.get_video(&lb.hex, &lb.abs, 2, 5)
-        } else {
-            self.full_res
-                .get(&lb.hex, &lb.abs)
-                .or_else(|| self.thumbs.get(&lb.hex, &lb.abs))
-        };
-        let img = tex
-            .as_ref()
-            .map(|t| t.size_vec2())
-            .unwrap_or(egui::vec2(1.0, 1.0));
-        if crate::lightbox::single_view(ctx, &mut lb.state, tex, img, &lb.meta, self.verbosity) {
+        let verbosity = self.verbosity;
+        if let Some(lb) = self.lightbox.as_mut()
+            && lb.view(ctx, verbosity, None).is_some()
+        {
             self.lightbox = None;
         }
     }
@@ -1057,18 +1031,34 @@ impl BrowseView {
                     if resp.clicked()
                         && let Some(abs) = abs
                     {
-                        let mut meta = vec![sel.rel.clone(), format_size(sel.size)];
-                        if !sel.info.is_empty() {
-                            meta.push(sel.info.clone());
-                        }
-                        meta.push(format_mtime(sel.modified_ms));
-                        self.lightbox = Some(OpenLightbox {
-                            state: LightboxState::new(0, 0),
-                            hex: hash_hex(&sel.hash),
-                            abs: abs.to_path_buf(),
-                            is_video: cat == Cat::Video,
-                            meta: meta.join(" · "),
-                        });
+                        // The law: clicking any file opens the shared viewer —
+                        // whatever it is, picture or not. The listing is the pool
+                        // it can be stepped through.
+                        let side = crate::compare_view::DiffSide {
+                            repo: self.repo.clone().unwrap_or_default(),
+                            rel_path: sel.rel.clone(),
+                            read_only: true,
+                            facts: crate::media_cell::FileFacts {
+                                size: sel.size,
+                                modified_ms: sel.modified_ms,
+                                mime: Some(sel.mime.clone()),
+                                img_size: None,
+                                audio_ms: None,
+                                audio_seed: None,
+                                hash_hex: hash_hex(&sel.hash),
+                                abs_path: abs.to_path_buf(),
+                                origin: None,
+                                exif: None,
+                            },
+                        };
+                        // One file, so no second side and no switcher. Browsing
+                        // the whole listing as a pool wants the file list, which
+                        // the preview dock does not hold — noted for later.
+                        self.lightbox = Some(crate::compare_view::DiffCompare::new_with_pool(
+                            side,
+                            None,
+                            Vec::new(),
+                        ));
                     }
                 } else {
                     placeholder(ui, "decoding…");
@@ -2678,13 +2668,28 @@ mod tests {
 
         let mut view = BrowseView::new();
         view.repo = Some("R".into());
-        view.lightbox = Some(OpenLightbox {
-            state: LightboxState::new(0, 0),
-            hex: "00".into(),
-            abs: repo_dir.join("pic.png"),
-            is_video: false,
-            meta: "pic.png · 100 B".into(),
-        });
+        // Browse now opens the shared viewer, like every other caller.
+        view.lightbox = Some(crate::compare_view::DiffCompare::new_with_pool(
+            crate::compare_view::DiffSide {
+                repo: "R".into(),
+                rel_path: "pic.png".into(),
+                facts: crate::media_cell::FileFacts {
+                    size: 100,
+                    modified_ms: 0,
+                    mime: Some("image/png".into()),
+                    img_size: None,
+                    audio_ms: None,
+                    audio_seed: None,
+                    hash_hex: "00".into(),
+                    abs_path: repo_dir.join("pic.png"),
+                    origin: None,
+                    exif: None,
+                },
+                read_only: true,
+            },
+            None,
+            Vec::new(),
+        ));
         let store_ui = Arc::clone(&store);
         let mut init = false;
         let mut h = Harness::builder()
@@ -2707,9 +2712,12 @@ mod tests {
             h.query_by_label_contains("CLOSE").is_some(),
             "the open lightbox shows its CLOSE control"
         );
+        // Browse uses the shared viewer now, so it shows that viewer's chrome —
+        // the tab row and the file's own title — rather than the single-image
+        // viewer's FIT / 1:1 controls, which went with it.
         assert!(
-            h.query_by_label("FIT").is_some() && h.query_by_label("1:1").is_some(),
-            "the open lightbox shows FIT and 1:1"
+            h.query_all_by_label_contains("pic.png").count() > 0,
+            "the file's title identifies what is open"
         );
         h.key_press(egui::Key::Escape);
         h.run();

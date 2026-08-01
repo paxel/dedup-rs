@@ -13,12 +13,26 @@ Eleven of the items below are specced and ticketed in
 agent, fixed order, tickets `01`–`11`. Light theme and performance-at-scale are the only
 open items deliberately left out.
 
-## Decisions resolved (2026-07-30/31)
+## Decisions resolved (2026-07-30 – 2026-08-01)
 
+- ~~**Three viewers for one job.**~~ Done 2026-08-01 — the
+  [`.scratch/lightbox-redesign/`](../.scratch/lightbox-redesign/spec.md) epic is complete,
+  tickets `01`–`05`. `compare_view::DiffCompare` is the one viewer; every caller (Duplicates,
+  Browse, review boards, DIFF) opens it with its own pool and its own actions (marks for
+  Duplicates via `set_marks`/`DiffPick::ToggleMark`, board commands for DIFF), and the
+  Duplicates tab's tabbed lightbox, its separate audio viewer and the Browse single-image
+  viewer are **deleted** — pinned by
+  `compare_view::tests::nothing_in_the_crate_references_the_deleted_viewers`, which scans the
+  crate for their identifiers. The five audio regression tests survived with their assertions
+  unchanged (gapless pair flip, paused stepping, per-copy tags, four-copy cycler, independent
+  marks). Deliberately not carried over, recorded in the CHANGELOG: the in-viewer image edit
+  save, the waveform/spectrogram toggle, and the video filmstrip scrubber. Pool identity is
+  the **absolute path** (cross-repo duplicates share their relative path), and a stepped side
+  re-decodes (`refresh_side`) — keyed caches died with the old viewers.
 - **Audio comparison is spectrogram-only.** The amplitude waveform is painter-drawn rather
   than a texture, and compare works on textures. No `waveform::wave_image()` will be added;
-  amplitude stays available in the native audio view with its existing toggle. Accepted
-  consequence: entering compare from the amplitude view changes the visual.
+  amplitude stays available in the cards' inline preview. (The old audio view's toggle left
+  with that view, 2026-08-01.)
 - ~~**The native audio compare header gains inline `DELETE A`/`DELETE B` pills**~~. Done
   2026-07-31 (ticket `06`), built from the shared `mark_pill` helper so labels and the
   protected state cannot drift from the image header. The mark keys and markability are
@@ -43,7 +57,8 @@ open items deliberately left out.
   raw values private so new code cannot bypass the active palette. `theme::apply` takes the
   palette to install. Still dark-only: `DARK` is the only palette, and the rendered board
   screenshot is byte-identical to before, so the appearance provably did not change.
-  Remaining: tickets `02`–`05` (light values, preference wiring, Settings control, identicon).
+  Remaining: tickets `02`–`05` (light values, preference wiring, Settings control, identicon)
+  — **unblocked** since 2026-08-01, when the lightbox-redesign epic landed.
 - **Performance at scale**: banded grouping, staged pipelines, and the multi-reference
   diff's merged content index are fine at ~10⁵ files; revisit content-index memory
   (`HashMap<(u64,[u8;32]), _>` across all references) and timeline streaming at 10⁷.

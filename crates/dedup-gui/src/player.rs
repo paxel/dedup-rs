@@ -37,13 +37,14 @@ enum Cmd {
     },
     /// Swap which sink of a pair is audible (instant, gap-free).
     Flip,
+    /// Change the playback rate.
+    Speed(f32),
     TogglePause,
     Seek(f32),
     Stop,
 }
 
 /// Playback state shared between the audio thread and the UI.
-#[derive(Default)]
 struct Shared {
     /// Content-hash hex of the A (and, paired, B) channel currently loaded.
     hex_a: Mutex<Option<String>>,
@@ -54,6 +55,8 @@ struct Shared {
     active_b: AtomicBool,
     pos_ms: AtomicU64,
     total_ms: AtomicU64,
+    /// Playback rate, as a percentage so it fits an atomic. 100 = normal.
+    speed_pct: std::sync::atomic::AtomicU32,
     /// A file is loaded and not paused.
     playing: AtomicBool,
     /// A file is loaded (playing or paused).
@@ -61,6 +64,24 @@ struct Shared {
 }
 
 /// A cheap snapshot of the player state for one UI frame.
+impl Default for Shared {
+    /// Hand-written rather than derived: a derived default would leave the
+    /// playback rate at zero, which is silence rather than normal speed.
+    fn default() -> Self {
+        Self {
+            hex_a: Mutex::new(None),
+            hex_b: Mutex::new(None),
+            paired: AtomicBool::new(false),
+            active_b: AtomicBool::new(false),
+            total_ms: AtomicU64::new(0),
+            pos_ms: AtomicU64::new(0),
+            speed_pct: std::sync::atomic::AtomicU32::new(100),
+            playing: AtomicBool::new(false),
+            loaded: AtomicBool::new(false),
+        }
+    }
+}
+
 pub struct PlayerSnapshot {
     /// Hex of the currently audible file (the A or B channel).
     pub hex: Option<String>,
@@ -71,6 +92,8 @@ pub struct PlayerSnapshot {
     pub total_ms: u64,
     pub playing: bool,
     pub loaded: bool,
+    /// Playback rate; 1.0 is normal.
+    pub speed: f32,
 }
 
 pub struct Player {
@@ -155,6 +178,16 @@ impl Player {
         });
     }
 
+    /// Set the playback rate. Clamped to a usable range: zero would stall and a
+    /// runaway rate is not a forensic tool.
+    pub fn set_speed(&self, speed: f32) {
+        let clamped = speed.clamp(0.25, 4.0);
+        self.shared
+            .speed_pct
+            .store((clamped * 100.0).round() as u32, Ordering::Relaxed);
+        let _ = self.tx.send(Cmd::Speed(clamped));
+    }
+
     /// Swap which channel of a loaded pair is audible — instant and gap-free.
     pub fn flip(&self) {
         let now = self.shared.active_b.load(Ordering::Relaxed);
@@ -213,6 +246,7 @@ impl Player {
             pos_ms: self.shared.pos_ms.load(Ordering::Relaxed),
             total_ms: self.shared.total_ms.load(Ordering::Relaxed),
             playing: self.shared.playing.load(Ordering::Relaxed),
+            speed: self.shared.speed_pct.load(Ordering::Relaxed) as f32 / 100.0,
             loaded: self.shared.loaded.load(Ordering::Relaxed),
         }
     }
@@ -318,6 +352,11 @@ fn audio_thread(rx: Receiver<Cmd>, shared: Arc<Shared>) {
                 shared.pos_ms.store(start_ms, Ordering::Relaxed);
             }
             Ok(Cmd::Flip) => apply_volumes(&shared),
+            Ok(Cmd::Speed(v)) => {
+                for s in [&sink_a, &sink_b].into_iter().flatten() {
+                    s.set_speed(v);
+                }
+            }
             Ok(Cmd::TogglePause) => {
                 for s in [&sink_a, &sink_b].into_iter().flatten() {
                     if s.is_paused() {
@@ -364,5 +403,40 @@ fn audio_thread(rx: Receiver<Cmd>, shared: Arc<Shared>) {
                 *shared.hex_b.lock().unwrap_or_else(|e| e.into_inner()) = None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Playing a passage slowly is a forensic tool: it is how you tell two
+    /// near-identical recordings apart by ear. The rate is part of the player's
+    /// state, so it survives switching between the copies being compared.
+    #[test]
+    fn playback_speed_is_remembered_across_a_file_switch() {
+        let player = Player::new();
+        assert_eq!(player.snapshot().speed, 1.0, "normal rate by default");
+
+        player.set_speed(0.5);
+        assert_eq!(player.snapshot().speed, 0.5);
+
+        player.load_paused("abc", std::path::Path::new("/nonexistent.mp3"), 1000, 0);
+        assert_eq!(
+            player.snapshot().speed,
+            0.5,
+            "loading another copy keeps the chosen rate"
+        );
+    }
+
+    /// A rate of zero or a negative rate would stall or reverse playback; clamp
+    /// rather than trust the caller.
+    #[test]
+    fn playback_speed_is_clamped_to_a_usable_range() {
+        let player = Player::new();
+        player.set_speed(0.0);
+        assert!(player.snapshot().speed > 0.0, "never stalls");
+        player.set_speed(99.0);
+        assert!(player.snapshot().speed <= 4.0, "never runs away");
     }
 }

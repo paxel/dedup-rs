@@ -26,6 +26,11 @@ at runtime and degrades gracefully when they are absent.
 - **Transfer / DIFF** — copy, move, sync or mirror content between repos, reconcile two repos side by side, or push a backup group's main to its sinks (each ADD ONLY or MIRROR).
 - **Grooming** — dedupe, purge by filter, prune missing records, reorganize by path templates.
 
+Clicking any file anywhere — a duplicate card, a review-board row, a Browse listing, a DIFF
+conflict — opens the **same full-window viewer**: two files side by side, tabbed by
+representation (image, video, audio as spectrograms with gapless A/B playback, editable ID3
+metadata, text/hex for everything else), with the actions of the surface you came from.
+
 Most surfaces share one **filter** wizard: conditions like `mime:image`, `name:*.db` or
 `size:>=1000` combine with AND, any condition can be inverted with `!` (`!name:*.mp3` —
 everything that is not an MP3), and `case:insensitive` (the `Aa` toggle) makes text matching

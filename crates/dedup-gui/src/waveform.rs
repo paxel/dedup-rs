@@ -2,7 +2,7 @@
 //! to a small amplitude envelope (one normalized peak per bucket) so a group's
 //! "similar" copies can be compared visually and their differences spotted.
 //!
-//! Mirrors the `lightbox::FullResCache` worker/cache pattern — decoding never
+//! Mirrors the `thumbs.rs` worker/cache pattern — decoding never
 //! blocks the UI, a finished envelope wakes the UI at rest, and a tiny LRU keeps
 //! only the few copies on screen resident.
 

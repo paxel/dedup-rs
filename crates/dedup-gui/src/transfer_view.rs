@@ -443,6 +443,13 @@ fn diff_action(
         })
     };
     match cmd {
+        // The row body opens the shared viewer — the law: clicking any file
+        // anywhere shows it. Same destination COMPARE used to reach, now without
+        // a command competing for row space.
+        Cmd::OpenRow | Cmd::Compare => Some(BoardAction::Inspect {
+            left_rel: left?,
+            right_rel: right?,
+        }),
         Cmd::CopyRight => Some(BoardAction::Copy {
             from_left: true,
             rel_path: left?,
@@ -458,10 +465,6 @@ fn diff_action(
         Cmd::DeleteRight => Some(BoardAction::Delete {
             on_left: false,
             rel_path: right?,
-        }),
-        Cmd::Compare => Some(BoardAction::Inspect {
-            left_rel: left?,
-            right_rel: right?,
         }),
         Cmd::OverwriteRight => Some(BoardAction::Overwrite {
             from_left: true,
@@ -1353,7 +1356,7 @@ impl TransferView {
             self.bulk_confirm_modal(&ui.ctx().clone(), &store);
         }
         if let Some(inspect) = self.inspect.as_mut()
-            && let Some(pick) = inspect.view(&ui.ctx().clone(), verbosity)
+            && let Some(pick) = inspect.view(&ui.ctx().clone(), verbosity, None)
         {
             let (left_rel, right_rel) = (
                 inspect.left.rel_path.clone(),
@@ -1362,6 +1365,8 @@ impl TransferView {
             self.inspect = None;
             match pick {
                 DiffPick::Close => {}
+                // DIFF never supplies marks, so a toggle cannot arrive here.
+                DiffPick::ToggleMark { .. } => {}
                 DiffPick::Delete { on_left } => {
                     acts.push(Act::Board(crate::diff_board::BoardAction::Delete {
                         on_left,
@@ -3165,11 +3170,16 @@ impl TransferView {
                 repo: repo.to_string(),
                 rel_path: rel.to_string(),
                 facts: FileFacts::from_entry(&entry, abs_path),
+                read_only: true,
             })
         };
         match (side(&source, left_rel), side(&target, right_rel)) {
             (Some(left), Some(right)) => {
-                self.inspect = Some(DiffCompare::new(left, right));
+                // A DIFF row offers exactly these two files, so the pool is the
+                // pair itself and neither side renders a switcher — there is
+                // nowhere else to go.
+                let pool = vec![left.clone(), right.clone()];
+                self.inspect = Some(DiffCompare::new_with_pool(left, Some(right), pool));
                 self.error = None;
             }
             _ => self.error = Some("Could not read both versions of that file.".to_string()),

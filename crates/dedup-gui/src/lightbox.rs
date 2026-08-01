@@ -1,32 +1,18 @@
-//! Full-window image viewer (lightbox): click a duplicate's thumbnail to judge
-//! it at pixel level — wheel to zoom around the cursor, drag to pan, arrow keys
-//! to step through the group, and mark/close without leaving the app.
-//!
-//! Full-resolution decoding must never block the UI, so it reuses the
-//! `thumbs.rs` worker pattern with a tiny, aggressively-evicted cache (a 50 MP
-//! photo is ~200 MB of RGBA — only the current image and its neighbours stay
-//! resident). While a decode is in flight the caller draws the 512-px thumbnail
-//! scaled up.
+//! The shared building blocks of the one full-window viewer
+//! ([`crate::compare_view::DiffCompare`]): the representation model
+//! ([`FileRepresentations`] and its per-kind facts), the tab bar, the
+//! column/metadata/text drawing helpers, the mark pill, and the A/B compare
+//! transform. Every surface that shows or compares a file draws through these,
+//! so each piece exists exactly once.
 
 use crate::icon;
 use crate::media_cell::FileFacts;
 use crate::settings::TooltipVerbosity;
 use crate::theme;
-use crate::thumbs::ThumbCache;
 use crate::util::ExplainExt;
-use crossbeam_channel::{Receiver, Sender};
-use egui::{ColorImage, Context, Rect, RichText, TextureHandle, TextureOptions, Vec2};
-use std::collections::{HashMap, HashSet};
+use egui::{Rect, RichText, TextureHandle, Vec2};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
-/// Longest texture edge uploaded to the GPU; larger images are downscaled by
-/// the decoder to stay within driver limits (commonly 8192 px).
-const MAX_TEXTURE_EDGE: u32 = 8192;
-/// How many full-resolution textures stay resident (current + a few neighbours).
-const FULL_CACHE_CAP: usize = 3;
-
-const MIN_SCALE: f32 = 0.02;
 const MAX_SCALE: f32 = 32.0;
 
 /// Classification of file representation tabs available in the Lightbox.
@@ -217,8 +203,13 @@ pub struct FileRepresentations {
 /// is not image, audio or video. Public because the Duplicate cards need the
 /// same rule to decide whether a placeholder (a file with no thumbnail) is
 /// still worth opening the lightbox for.
-pub fn has_text_representation(facts: &FileFacts) -> bool {
-    !facts.is_image() && !facts.is_audio() && !facts.is_video()
+pub fn has_text_representation(_facts: &FileFacts) -> bool {
+    // Every file has bytes, and reading them is a forensic act in its own right:
+    // a JPEG's header, a document's magic number, the tail of an unknown format.
+    // Previously restricted to files that were not image/audio/video, which left
+    // exactly the cases where "is this really the same file?" needed an answer
+    // with no way to look.
+    true
 }
 
 impl FileRepresentations {
@@ -397,9 +388,8 @@ pub fn tab_kinds(
 }
 
 /// Draw the top tab bar displaying representation tabs available across Left (A) and Right (B).
-/// Takes the active tab by reference rather than a whole [`LightboxState`], so
-/// any surface comparing two files can use it — the Duplicates lightbox and the
-/// Transfer DIFF comparison both do.
+/// Takes the active tab by reference rather than any larger viewer state, so
+/// any surface comparing two files can use it.
 pub fn draw_tab_bar(
     ui: &mut egui::Ui,
     active_tab: &mut RepresentationKind,
@@ -407,7 +397,12 @@ pub fn draw_tab_bar(
     right_reps: &FileRepresentations,
 ) {
     ui.horizontal(|ui| {
-        for kind in tab_kinds(left_reps, Some(right_reps)) {
+        // No Overview tab: its content lives in the per-side titles and the
+        // Metadata tab, so a button for it would select nothing.
+        for kind in tab_kinds(left_reps, Some(right_reps))
+            .into_iter()
+            .filter(|k| *k != RepresentationKind::Overview)
+        {
             let label = format!("{} {}", kind.icon(), kind.name());
             let selected = *active_tab == kind;
             let fill = if selected {
@@ -669,6 +664,53 @@ pub fn draw_metadata_column(
     action
 }
 
+/// A DELETE mark pill (`DELETE` / `DELETE A` / `DELETE B`): filled red when
+/// marked; when the repo is read-only the file is *protected*, so the pill shows
+/// `… (Protected)`, is disabled, and struck through. Returns `true` when a
+/// markable pill was clicked. Shared so the labels and the protected state
+/// cannot drift between surfaces (`qa.md`: standardize DELETE / DELETE A /
+/// DELETE B).
+pub fn mark_pill(
+    ui: &mut egui::Ui,
+    verbosity: TooltipVerbosity,
+    base: &str,
+    marked: bool,
+    markable: bool,
+) -> bool {
+    let label = if marked {
+        format!("{base} {}", icon::CHECK)
+    } else if !markable {
+        format!("{base} (Protected)")
+    } else {
+        base.to_string()
+    };
+    let fill = if marked { theme::red() } else { theme::panel() };
+    let col = if marked {
+        theme::black()
+    } else if !markable {
+        theme::hairline()
+    } else {
+        theme::text()
+    };
+    let mut rt = RichText::new(label).color(col);
+    if !markable {
+        rt = rt.strikethrough();
+    }
+    let btn = egui::Button::new(rt).fill(fill);
+    if !markable {
+        let _ = ui.add_enabled(false, btn);
+        false
+    } else {
+        ui.add(btn)
+            .explain(
+                verbosity,
+                "Toggle deletion mark",
+                "Toggle whether this copy is marked for deletion.",
+            )
+            .clicked()
+    }
+}
+
 /// A `Label   value` row, the read-only counterpart of the editor's fields.
 fn fact_row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.horizontal(|ui| {
@@ -772,6 +814,23 @@ fn hex_dump(bytes: &[u8]) -> String {
 /// monospaced text or a hex dump, in its own scroll area. Returns the viewport
 /// the preview was drawn into — exactly `height` tall however long the file is,
 /// because a file longer than the window has to scroll, not overflow it.
+/// What a text/hex column says about what it is showing.
+///
+/// A sampled view has to *say* it is sampled: two files whose first 64 KB match
+/// are not thereby identical, and the conclusion drawn from this pane can end in
+/// a deletion.
+fn preview_note(preview: &TextPreview) -> String {
+    match (&preview.error, preview.is_text, preview.truncated) {
+        (Some(e), _, _) => format!("Could not read this file: {e}"),
+        (None, true, true) => "As text — only the first 64 KB, not the whole file".to_string(),
+        (None, true, false) => "Full contents, as text".to_string(),
+        (None, false, true) => {
+            "Not text — hex of only the first bytes, not the whole file".to_string()
+        }
+        (None, false, false) => "Not text — full contents as hex".to_string(),
+    }
+}
+
 pub fn draw_text_column(
     ui: &mut egui::Ui,
     head: &ColumnHead<'_>,
@@ -779,12 +838,7 @@ pub fn draw_text_column(
     height: f32,
 ) -> egui::Rect {
     head.draw(ui);
-    let note = match (&preview.error, preview.is_text, preview.truncated) {
-        (Some(e), _, _) => format!("Could not read this file: {e}"),
-        (None, true, true) => "First 64 KB, as text".to_string(),
-        (None, true, false) => "Full contents, as text".to_string(),
-        (None, false, _) => "Not text — showing the first bytes as hex".to_string(),
-    };
+    let note = preview_note(preview);
     ui.label(RichText::new(note).color(theme::lilac()).size(11.0));
     ui.add_space(4.0);
     // The column itself is laid out top-down from a zero-height cursor, so the
@@ -865,141 +919,6 @@ impl CompareState {
         let size = img * (fit * self.zoom);
         Rect::from_center_size(pane.center() + self.pan, size)
     }
-}
-
-/// Live state of an open lightbox. `group`/`index` address a member of the
-/// current page's groups; `scale`/`pan` are the view transform. In `fit` mode
-/// the scale is recomputed from the viewport each frame (so window resizes stay
-/// fitted) and the pan is ignored.
-pub struct LightboxState {
-    pub group: usize,
-    pub index: usize,
-    pub active_tab: RepresentationKind,
-    scale: f32,
-    pan: Vec2,
-    fit: bool,
-    /// Active A/B compare, if the user pressed `C`.
-    pub compare: Option<CompareState>,
-    /// Audio lightbox only: the group index whose playback cursor is shown (the
-    /// copy the user last started). Needed because exact-duplicate copies share
-    /// a content hash, so the hash alone can't say which row is playing.
-    pub audio_active: Option<usize>,
-    /// Audio lightbox only: show spectrograms instead of amplitude waveforms.
-    pub spectrogram: bool,
-    /// Video lightbox only: the filmstrip still the user pinned (clicked) to show
-    /// enlarged. `None` until they click one — then the middle frame is shown.
-    /// Reset when navigating to another copy.
-    pub video_frame: Option<usize>,
-}
-
-impl LightboxState {
-    pub fn new(group: usize, index: usize) -> Self {
-        Self {
-            group,
-            index,
-            // Overview is the intro: a freshly-opened lightbox shows facts +
-            // repo + mark pill first, not native content straight away
-            // (improvements.md: "the tab on top should always be the intro to
-            // comparison").
-            active_tab: RepresentationKind::Overview,
-            scale: 1.0,
-            pan: Vec2::ZERO,
-            fit: true,
-            compare: None,
-            audio_active: None,
-            spectrogram: false,
-            video_frame: None,
-        }
-    }
-
-    /// Reset to fit-to-window (used when switching to another image).
-    pub fn reset_view(&mut self) {
-        self.scale = 1.0;
-        self.pan = Vec2::ZERO;
-        self.fit = true;
-    }
-
-    /// Effective pixels-per-image-pixel for the current mode and viewport.
-    fn effective_scale(&self, view: Rect, img: Vec2) -> f32 {
-        if self.fit {
-            (view.width() / img.x)
-                .min(view.height() / img.y)
-                .clamp(MIN_SCALE, MAX_SCALE)
-        } else {
-            self.scale
-        }
-    }
-
-    /// Screen rectangle the image occupies inside `view`.
-    pub fn image_rect(&self, view: Rect, img: Vec2) -> Rect {
-        let scale = self.effective_scale(view, img);
-        let size = img * scale;
-        let pan = if self.fit { Vec2::ZERO } else { self.pan };
-        Rect::from_center_size(view.center() + pan, size)
-    }
-
-    /// Enter fit mode.
-    pub fn fit(&mut self) {
-        self.fit = true;
-    }
-
-    /// Enter 1:1 (true pixels) mode, keeping the image centred.
-    pub fn one_to_one(&mut self) {
-        self.scale = 1.0;
-        self.pan = Vec2::ZERO;
-        self.fit = false;
-    }
-
-    /// Pan by a screen-space delta (from a drag). No-op in fit mode until the
-    /// user has zoomed.
-    pub fn pan_by(&mut self, delta: Vec2, view: Rect, img: Vec2) {
-        self.leave_fit(view, img);
-        self.pan += delta;
-    }
-
-    /// Zoom by `factor` keeping the image point under `cursor` fixed.
-    pub fn zoom_at(&mut self, cursor: egui::Pos2, factor: f32, view: Rect, img: Vec2) {
-        self.leave_fit(view, img);
-        let new_scale = (self.scale * factor).clamp(MIN_SCALE, MAX_SCALE);
-        let ratio = new_scale / self.scale;
-        // Keep `cursor` anchored: center' = cursor - (cursor - center) * ratio.
-        let center = view.center() + self.pan;
-        let new_center = cursor + (center - cursor) * ratio;
-        self.pan = new_center - view.center();
-        self.scale = new_scale;
-    }
-
-    /// Materialize the current fit scale into an explicit scale so subsequent
-    /// zoom/pan operate from what the user currently sees.
-    fn leave_fit(&mut self, view: Rect, img: Vec2) {
-        if self.fit {
-            self.scale = self.effective_scale(view, img);
-            self.pan = Vec2::ZERO;
-            self.fit = false;
-        }
-    }
-}
-
-/// Resolve a previewable file's full-resolution image texture (upscaled thumbnail
-/// while the full decode is in flight) and its pixel size, from the shared
-/// caches. The viewer-agnostic generalisation of the Duplicate tab's
-/// `lightbox_texture`: it takes [`FileFacts`] rather than a `DupeFile`, so any
-/// side — a duplicate, a DIFF file, a cross-repo file — resolves the same way.
-pub fn full_texture(
-    facts: &FileFacts,
-    full: &mut FullResCache,
-    thumbs: &mut ThumbCache,
-) -> (Option<TextureHandle>, Vec2) {
-    let source = facts.abs_path.as_path();
-    let tex = full
-        .get(&facts.hash_hex, source)
-        .or_else(|| thumbs.get(&facts.hash_hex, source));
-    let img = facts
-        .img_size
-        .map(|(w, h)| egui::vec2(w as f32, h as f32))
-        .or_else(|| tex.as_ref().map(|t| t.size_vec2()))
-        .unwrap_or(egui::vec2(1.0, 1.0));
-    (tex, img)
 }
 
 /// Split `viewport` into the two equal panes of a side-by-side compare, with a
@@ -1101,263 +1020,45 @@ pub fn fit_rect(target: Rect, size: Vec2) -> Rect {
     Rect::from_center_size(target.center(), size * s)
 }
 
-/// The shared full-window viewer for one image: wheel zoom around the cursor,
-/// drag pan, FIT / 1:1, Esc or CLOSE to leave. Browse uses it as-is; the
-/// Duplicates lightbox layers compare/mark/edit on the same [`LightboxState`].
-/// Returns `true` when the viewer was closed this frame.
-pub fn single_view(
-    ctx: &Context,
-    state: &mut LightboxState,
-    tex: Option<TextureHandle>,
-    img: Vec2,
-    meta: &str,
-    verbosity: TooltipVerbosity,
-) -> bool {
-    let mut close = false;
-    let (mut do_fit, mut do_one) = (false, false);
-    ctx.input(|i| {
-        if i.key_pressed(egui::Key::Escape) {
-            close = true;
-        }
-        if i.key_pressed(egui::Key::F) {
-            do_fit = true;
-        }
-        if i.key_pressed(egui::Key::Num1) {
-            do_one = true;
-        }
-    });
-    egui::Area::new(egui::Id::new("single_lightbox"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(egui::Pos2::ZERO)
-        .show(ctx, |ui| {
-            let screen = ctx.content_rect();
-            let bg = ui.allocate_rect(screen, egui::Sense::click_and_drag());
-            ui.painter()
-                .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(238));
-            // Viewport = screen minus the top control bar and bottom meta strip.
-            let viewport = Rect::from_min_max(
-                egui::pos2(screen.min.x + 8.0, screen.min.y + 44.0),
-                egui::pos2(screen.max.x - 8.0, screen.max.y - 50.0),
-            );
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if bg.dragged() {
-                state.pan_by(bg.drag_delta(), viewport, img);
-            }
-            if scroll != 0.0
-                && let Some(c) = ctx.pointer_hover_pos()
-                && viewport.contains(c)
-            {
-                state.zoom_at(c, (scroll * 0.005).exp(), viewport, img);
-            }
-            draw_in_pane(ui, viewport, state.image_rect(viewport, img), &tex);
-
-            // Top control bar: CLOSE / FIT / 1:1.
-            let top = Rect::from_min_max(
-                egui::pos2(screen.min.x + 8.0, screen.min.y + 6.0),
-                egui::pos2(screen.max.x - 8.0, screen.min.y + 40.0),
-            );
-            ui.scope_builder(
-                egui::UiBuilder::new()
-                    .max_rect(top)
-                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                |ui| {
-                    let pill = |ui: &mut egui::Ui,
-                                text: &str,
-                                fill: egui::Color32,
-                                col: egui::Color32,
-                                short: &str,
-                                verbose: &str| {
-                        ui.add(egui::Button::new(egui::RichText::new(text).color(col)).fill(fill))
-                            .explain(verbosity, short, verbose)
-                            .clicked()
-                    };
-                    if pill(
-                        ui,
-                        &format!("{} CLOSE", icon::CHECK),
-                        theme::amber(),
-                        theme::black(),
-                        "Close the viewer",
-                        "Close the image viewer (Esc does the same).",
-                    ) {
-                        close = true;
-                    }
-                    if pill(
-                        ui,
-                        "FIT",
-                        theme::panel(),
-                        theme::text(),
-                        "Fit to window",
-                        "Scale the image to fit the viewport (F does the same).",
-                    ) {
-                        do_fit = true;
-                    }
-                    if pill(
-                        ui,
-                        "1:1",
-                        theme::panel(),
-                        theme::text(),
-                        "True pixels",
-                        "Show the image at 100% — one screen pixel per image pixel \
-                         (1 does the same).",
-                    ) {
-                        do_one = true;
-                    }
-                },
-            );
-
-            // Bottom strip: file metadata plus the interaction hint.
-            let p = ui.painter();
-            p.text(
-                egui::pos2(screen.min.x + 10.0, screen.max.y - 28.0),
-                egui::Align2::LEFT_BOTTOM,
-                meta,
-                egui::FontId::proportional(13.0),
-                theme::tan(),
-            );
-            p.text(
-                egui::pos2(screen.min.x + 10.0, screen.max.y - 10.0),
-                egui::Align2::LEFT_BOTTOM,
-                "wheel: zoom · drag: pan · F fit · 1 100% · Esc close",
-                egui::FontId::proportional(12.0),
-                theme::hairline(),
-            );
-        });
-    if do_fit {
-        state.fit();
-    }
-    if do_one {
-        state.one_to_one();
-    }
-    close
-}
-
-struct Request {
-    hex: String,
-    source: PathBuf,
-}
-
-enum Decoded {
-    Ready(String, ColorImage),
-    Failed(String),
-}
-
-/// Tiny full-resolution texture cache backed by a background decode pool.
-pub struct FullResCache {
-    requests: Sender<Request>,
-    decoded: Receiver<Decoded>,
-    textures: HashMap<String, TextureHandle>,
-    order: Vec<String>,
-    pending: HashSet<String>,
-    failed: HashSet<String>,
-    /// The UI context, so a finished decode can wake the UI at rest (the
-    /// lightbox does not spin repaints while idle).
-    ctx: Arc<Mutex<Option<Context>>>,
-}
-
-impl FullResCache {
-    pub fn new(workers: usize) -> Self {
-        let (req_tx, req_rx) = crossbeam_channel::unbounded::<Request>();
-        let (dec_tx, dec_rx) = crossbeam_channel::unbounded::<Decoded>();
-        let ctx: Arc<Mutex<Option<Context>>> = Arc::new(Mutex::new(None));
-        for _ in 0..workers.max(1) {
-            let req_rx = req_rx.clone();
-            let dec_tx = dec_tx.clone();
-            let ctx = Arc::clone(&ctx);
-            std::thread::spawn(move || {
-                while let Ok(req) = req_rx.recv() {
-                    // Only a successful decode has something new to show, so
-                    // only that wakes the UI; waking on failure would spin
-                    // repaints for missing files (and never settle).
-                    match dedup_core::thumbnail::load_full_rgba(&req.source, MAX_TEXTURE_EDGE) {
-                        Ok((w, h, rgba)) => {
-                            let img =
-                                ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
-                            let _ = dec_tx.send(Decoded::Ready(req.hex, img));
-                            if let Some(ctx) =
-                                ctx.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
-                            {
-                                ctx.request_repaint();
-                            }
-                        }
-                        Err(_) => {
-                            let _ = dec_tx.send(Decoded::Failed(req.hex));
-                        }
-                    }
-                }
-            });
-        }
-        Self {
-            requests: req_tx,
-            decoded: dec_rx,
-            textures: HashMap::new(),
-            order: Vec::new(),
-            pending: HashSet::new(),
-            failed: HashSet::new(),
-            ctx,
-        }
-    }
-
-    /// Upload freshly decoded images into textures. Returns whether anything
-    /// changed (so the caller can repaint).
-    pub fn poll(&mut self, ctx: &Context) -> bool {
-        *self.ctx.lock().unwrap_or_else(|e| e.into_inner()) = Some(ctx.clone());
-        let mut changed = false;
-        while let Ok(decoded) = self.decoded.try_recv() {
-            changed = true;
-            match decoded {
-                Decoded::Ready(hex, img) => {
-                    let handle = ctx.load_texture(&hex, img, TextureOptions::LINEAR);
-                    self.pending.remove(&hex);
-                    self.touch(&hex);
-                    self.textures.insert(hex, handle);
-                    self.evict();
-                }
-                Decoded::Failed(hex) => {
-                    self.pending.remove(&hex);
-                    self.failed.insert(hex);
-                }
-            }
-        }
-        changed
-    }
-
-    /// Texture for `hex`, requesting a full-resolution decode of `source` if it
-    /// is not resident yet. `None` while pending or failed (caller shows the
-    /// upscaled thumbnail meanwhile).
-    pub fn get(&mut self, hex: &str, source: &Path) -> Option<TextureHandle> {
-        if self.textures.contains_key(hex) {
-            self.touch(hex);
-            return self.textures.get(hex).cloned();
-        }
-        if self.failed.contains(hex) {
-            return None;
-        }
-        if self.pending.insert(hex.to_string()) {
-            let _ = self.requests.send(Request {
-                hex: hex.to_string(),
-                source: source.to_path_buf(),
-            });
-        }
-        None
-    }
-
-    fn touch(&mut self, hex: &str) {
-        if self.order.last().map(String::as_str) != Some(hex) {
-            self.order.retain(|h| h != hex);
-            self.order.push(hex.to_string());
-        }
-    }
-
-    fn evict(&mut self) {
-        while self.order.len() > FULL_CACHE_CAP {
-            let old = self.order.remove(0);
-            self.textures.remove(&old);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+
+    /// A sampled view must say it is a sample. Concluding two files are
+    /// identical from their first kilobyte is the mistake this prevents, and it
+    /// is a mistake with deletions on the other side of it.
+    #[test]
+    fn a_sampled_preview_discloses_that_it_is_a_sample() {
+        let sampled_text = TextPreview {
+            body: String::new(),
+            is_text: true,
+            truncated: true,
+            error: None,
+        };
+        let note = preview_note(&sampled_text);
+        assert!(
+            note.contains("64 KB") && note.to_lowercase().contains("only"),
+            "a truncated text view says how much it read and that it is partial: {note:?}"
+        );
+
+        let hex = TextPreview {
+            is_text: false,
+            ..sampled_text.clone()
+        };
+        assert!(
+            preview_note(&hex).to_lowercase().contains("only"),
+            "so does the hex view: {:?}",
+            preview_note(&hex)
+        );
+
+        let whole = TextPreview {
+            truncated: false,
+            ..sampled_text.clone()
+        };
+        assert!(
+            !preview_note(&whole).to_lowercase().contains("only"),
+            "a complete view does not warn about sampling"
+        );
+    }
     use super::*;
 
     #[test]
@@ -1398,10 +1099,12 @@ mod tests {
         assert!(kinds.contains(&RepresentationKind::Overview));
         assert!(kinds.contains(&RepresentationKind::Image));
         assert!(!kinds.contains(&RepresentationKind::Audio));
-        // An image without EXIF has nothing to put on a Metadata tab, and a
-        // visual is never offered as text.
+        // An image without EXIF has nothing to put on a Metadata tab.
         assert!(!kinds.contains(&RepresentationKind::Metadata));
-        assert!(!kinds.contains(&RepresentationKind::Text));
+        // Text/bytes *are* offered — every file has bytes worth inspecting, and
+        // restricting that to non-media hid exactly the cases where "is this the
+        // same file?" needed an answer (lightbox redesign, 2026-08-01).
+        assert!(kinds.contains(&RepresentationKind::Text));
 
         // The same image *with* EXIF does offer Metadata — read-only, since
         // there is no EXIF writer.
