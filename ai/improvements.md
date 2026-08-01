@@ -25,10 +25,14 @@ open items deliberately left out.
   `compare_view::tests::nothing_in_the_crate_references_the_deleted_viewers`, which scans the
   crate for their identifiers. The five audio regression tests survived with their assertions
   unchanged (gapless pair flip, paused stepping, per-copy tags, four-copy cycler, independent
-  marks). Deliberately not carried over, recorded in the CHANGELOG: the in-viewer image edit
-  save, the waveform/spectrogram toggle, and the video filmstrip scrubber. Pool identity is
-  the **absolute path** (cross-repo duplicates share their relative path), and a stepped side
-  re-decodes (`refresh_side`) — keyed caches died with the old viewers.
+  marks). Deliberately not carried over, recorded in the CHANGELOG: the waveform/spectrogram
+  toggle and the video filmstrip scrubber. (The in-viewer image edit save was initially
+  dropped too, then restored the same day at the user's request — as a shared-viewer feature
+  with new semantics: saves keep the file's modified time or stamp it from the EXIF capture
+  date, and an overwrite re-indexes the file at once via `update::refresh_file_entry`,
+  because a kept timestamp makes the change invisible to the (size, mtime) scan skip.)
+  Pool identity is the **absolute path** (cross-repo duplicates share their relative path),
+  and a stepped side re-decodes (`refresh_side`) — keyed caches died with the old viewers.
 - **Audio comparison is spectrogram-only.** The amplitude waveform is painter-drawn rather
   than a texture, and compare works on textures. No `waveform::wave_image()` will be added;
   amplitude stays available in the cards' inline preview. (The old audio view's toggle left

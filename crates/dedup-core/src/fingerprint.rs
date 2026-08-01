@@ -161,6 +161,30 @@ pub fn read_exif(path: &Path) -> Option<ExifInfo> {
     Some(ExifInfo { taken_ms, camera })
 }
 
+/// Every EXIF field of the primary image, as `(tag name, display value)`
+/// pairs in file order — the Metadata tab's full listing. The index keeps
+/// only camera and capture date ([`read_exif`]); everything else is read
+/// from the file on demand. Best-effort like every fingerprint: a file with
+/// no EXIF, or none at all, yields an empty list.
+pub fn exif_fields(path: &Path) -> Vec<(String, String)> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let Ok(exif) = exif::Reader::new().read_from_container(&mut reader) else {
+        return Vec::new();
+    };
+    exif.fields()
+        .filter(|f| f.ifd_num == exif::In::PRIMARY)
+        .map(|f| {
+            (
+                f.tag.to_string(),
+                f.display_value().with_unit(&exif).to_string(),
+            )
+        })
+        .collect()
+}
+
 /// Convert an EXIF `DateTime` (naive, no timezone) to epoch milliseconds,
 /// treated as if UTC (via the shared civil-date math in [`crate::filter`]).
 fn exif_datetime_to_ms(dt: &exif::DateTime) -> i64 {
@@ -667,6 +691,74 @@ fn probe_audio_duration_ms(path: &Path) -> Option<u32> {
 mod tests {
     use super::*;
     use image::{DynamicImage, Rgb, RgbImage};
+
+    /// A minimal JPEG whose APP1 segment carries a hand-built little-endian
+    /// TIFF with three ASCII fields: Make "Fuj", Model "X", and a DateTime.
+    fn jpeg_with_exif(path: &std::path::Path) {
+        let mut tiff: Vec<u8> = Vec::new();
+        tiff.extend_from_slice(b"II"); // little-endian
+        tiff.extend_from_slice(&0x2Au16.to_le_bytes());
+        tiff.extend_from_slice(&8u32.to_le_bytes()); // IFD0 at offset 8
+        // IFD0: three entries, sorted by tag.
+        tiff.extend_from_slice(&3u16.to_le_bytes());
+        let entry = |tiff: &mut Vec<u8>, tag: u16, count: u32, value: [u8; 4]| {
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+            tiff.extend_from_slice(&count.to_le_bytes());
+            tiff.extend_from_slice(&value);
+        };
+        entry(&mut tiff, 0x010F, 4, *b"Fuj\0"); // Make, inline
+        entry(&mut tiff, 0x0110, 2, *b"X\0\0\0"); // Model, inline
+        // DateTime is 20 bytes, so it lives after the IFD: 8 + 2 + 36 + 4 = 50.
+        entry(&mut tiff, 0x0132, 20, 50u32.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
+        tiff.extend_from_slice(b"2004:01:06 18:42:00\0");
+
+        let mut app1: Vec<u8> = Vec::new();
+        app1.extend_from_slice(b"Exif\0\0");
+        app1.extend_from_slice(&tiff);
+
+        let mut jpeg: Vec<u8> = vec![0xFF, 0xD8]; // SOI
+        jpeg.extend_from_slice(&[0xFF, 0xE1]); // APP1
+        jpeg.extend_from_slice(&((app1.len() as u16 + 2).to_be_bytes()));
+        jpeg.extend_from_slice(&app1);
+        jpeg.extend_from_slice(&[0xFF, 0xD9]); // EOI
+        std::fs::write(path, jpeg).unwrap();
+    }
+
+    /// The Metadata view lists *every* EXIF field, not only the two the index
+    /// keeps — EXIF carries far more than camera and date.
+    #[test]
+    fn exif_fields_lists_every_primary_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shot.jpg");
+        jpeg_with_exif(&path);
+
+        let fields = exif_fields(&path);
+        let get = |tag: &str| -> Option<&str> {
+            fields
+                .iter()
+                .find(|(t, _)| t == tag)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(fields.len(), 3, "all three fields are listed: {fields:?}");
+        assert!(
+            get("Make").is_some_and(|v| v.contains("Fuj")),
+            "Make is listed with its value: {fields:?}"
+        );
+        assert!(
+            get("DateTime").is_some_and(|v| v.contains("2004")),
+            "so is the capture date: {fields:?}"
+        );
+
+        // Best-effort like every fingerprint: no EXIF (or no file) → empty.
+        let plain = tmp.path().join("plain.png");
+        RgbImage::from_fn(4, 4, |_, _| Rgb([1, 2, 3]))
+            .save(&plain)
+            .unwrap();
+        assert!(exif_fields(&plain).is_empty());
+        assert!(exif_fields(&tmp.path().join("missing.jpg")).is_empty());
+    }
 
     #[test]
     fn playlists_are_not_audio_media() {

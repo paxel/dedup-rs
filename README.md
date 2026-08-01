@@ -29,7 +29,9 @@ at runtime and degrades gracefully when they are absent.
 Clicking any file anywhere — a duplicate card, a review-board row, a Browse listing, a DIFF
 conflict — opens the **same full-window viewer**: two files side by side, tabbed by
 representation (image, video, audio as spectrograms with gapless A/B playback, editable ID3
-metadata, text/hex for everything else), with the actions of the surface you came from.
+metadata and the full EXIF listing, text/hex for everything else), with the actions of the
+surface you came from. A wrongly rotated scan can be turned and **saved back to disk** —
+in place or as a copy, keeping the file's date (or stamping it from the EXIF capture date).
 
 Most surfaces share one **filter** wizard: conditions like `mime:image`, `name:*.db` or
 `size:>=1000` combine with AND, any condition can be inverted with `!` (`!name:*.mp3` —

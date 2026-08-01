@@ -711,18 +711,30 @@ impl BrowseView {
         // frame, so it survives the next re-sort or refresh.
         self.sel_rel = files.get(self.file_sel).map(|f| f.rel.clone());
 
-        self.lightbox_modal(ui.ctx());
+        self.lightbox_modal(ui.ctx(), store);
     }
 
-    /// The full-window viewer for the clicked preview: full resolution for
-    /// images (the thumbnail stands in while it decodes), the scrub frame for
-    /// videos. Rendering and interactions live in [`crate::lightbox`].
-    fn lightbox_modal(&mut self, ctx: &egui::Context) {
+    /// The shared full-window viewer for the clicked file. A save that rewrote
+    /// a file in place refreshes that file's index entry right away — the save
+    /// may have deliberately kept the file's timestamp, which a rescan's
+    /// (size, mtime) skip would never notice.
+    fn lightbox_modal(&mut self, ctx: &egui::Context, store: &Store) {
         let verbosity = self.verbosity;
-        if let Some(lb) = self.lightbox.as_mut()
-            && lb.view(ctx, verbosity, None).is_some()
-        {
-            self.lightbox = None;
+        let Some(lb) = self.lightbox.as_mut() else {
+            return;
+        };
+        match lb.view(ctx, verbosity, None) {
+            Some(crate::compare_view::DiffPick::Edited { on_left }) => {
+                let side = if on_left { &lb.left } else { &lb.right };
+                let (repo, rel) = (side.repo.clone(), side.rel_path.clone());
+                if let Err(e) = dedup_core::update::refresh_file_entry(store, &repo, &rel) {
+                    self.error = Some(format!("Saved, but re-indexing failed: {e}"));
+                }
+                // The listing shows sizes/dates from the index — reload it.
+                self.entries_repo = None;
+            }
+            Some(_) => self.lightbox = None,
+            None => {}
         }
     }
 
@@ -942,7 +954,7 @@ impl BrowseView {
         let hex_view = self.hex_view;
         egui::CentralPanel::default().show(ui, |ui| {
             let height = ui.available_height();
-            self.draw_preview(ui, &sel, cat, abs.as_deref(), height, hex_view);
+            self.draw_preview(ui, store, &sel, abs.as_deref(), height, hex_view);
         });
     }
 
@@ -987,8 +999,8 @@ impl BrowseView {
     fn draw_preview(
         &mut self,
         ui: &mut egui::Ui,
+        store: &Store,
         sel: &FileRow,
-        cat: Cat,
         abs: Option<&Path>,
         height: f32,
         hex_view: bool,
@@ -999,6 +1011,7 @@ impl BrowseView {
             self.draw_preview_body(ui);
             return;
         }
+        let cat = Cat::of(&sel.mime);
         match cat {
             Cat::Image | Cat::Video => {
                 let tex = abs.and_then(|abs| {
@@ -1032,13 +1045,19 @@ impl BrowseView {
                         && let Some(abs) = abs
                     {
                         // The law: clicking any file opens the shared viewer —
-                        // whatever it is, picture or not. The listing is the pool
-                        // it can be stepped through.
-                        let side = crate::compare_view::DiffSide {
-                            repo: self.repo.clone().unwrap_or_default(),
-                            rel_path: sel.rel.clone(),
-                            read_only: true,
-                            facts: crate::media_cell::FileFacts {
+                        // whatever it is, picture or not. The index entry gives
+                        // the viewer the full facts (dimensions, EXIF); the row
+                        // alone stands in if the entry cannot be read. Browse
+                        // is the owner's tab, so its sides are writable.
+                        let repo = self.repo.clone().unwrap_or_default();
+                        let facts = store
+                            .get_file_entry(&repo, &sel.rel)
+                            .ok()
+                            .flatten()
+                            .map(|e| {
+                                crate::media_cell::FileFacts::from_entry(&e, abs.to_path_buf())
+                            })
+                            .unwrap_or_else(|| crate::media_cell::FileFacts {
                                 size: sel.size,
                                 modified_ms: sel.modified_ms,
                                 mime: Some(sel.mime.clone()),
@@ -1049,16 +1068,20 @@ impl BrowseView {
                                 abs_path: abs.to_path_buf(),
                                 origin: None,
                                 exif: None,
-                            },
+                            });
+                        let side = crate::compare_view::DiffSide {
+                            repo,
+                            rel_path: sel.rel.clone(),
+                            read_only: false,
+                            facts,
                         };
                         // One file, so no second side and no switcher. Browsing
                         // the whole listing as a pool wants the file list, which
                         // the preview dock does not hold — noted for later.
-                        self.lightbox = Some(crate::compare_view::DiffCompare::new_with_pool(
-                            side,
-                            None,
-                            Vec::new(),
-                        ));
+                        let mut lb =
+                            crate::compare_view::DiffCompare::new_with_pool(side, None, Vec::new());
+                        lb.hide_second();
+                        self.lightbox = Some(lb);
                     }
                 } else {
                     placeholder(ui, "decoding…");
@@ -2725,6 +2748,83 @@ mod tests {
             h.state().lightbox.is_none(),
             "Esc closes the Browse lightbox"
         );
+    }
+
+    /// Saving a turned image from Browse's viewer rewrites the file in place —
+    /// keeping its date — and refreshes that file's index entry immediately.
+    /// The kept timestamp means a rescan's (size, mtime) skip would never
+    /// notice the new bytes, so the index must follow the save itself.
+    #[test]
+    fn saving_a_turned_image_refreshes_the_index_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let repo_dir = tmp.path().join("R");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        store.create_repo("R", &repo_dir.to_string_lossy()).unwrap();
+        let png = repo_dir.join("scan.png");
+        image::RgbImage::from_fn(40, 20, |x, y| image::Rgb([x as u8, y as u8, 60]))
+            .save(&png)
+            .unwrap();
+        dedup_core::update::update_repo(
+            &store,
+            "R",
+            1,
+            &dedup_core::update::NoProgress,
+            &dedup_core::update::CancellationToken::new(),
+        )
+        .unwrap();
+        let before = store.get_file_entry("R", "scan.png").unwrap().unwrap();
+
+        let mut view = BrowseView::new();
+        view.repo = Some("R".into());
+        view.lightbox = Some(crate::compare_view::DiffCompare::new_with_pool(
+            crate::compare_view::DiffSide {
+                repo: "R".into(),
+                rel_path: "scan.png".into(),
+                read_only: false,
+                facts: crate::media_cell::FileFacts::from_entry(&before, png.clone()),
+            },
+            None,
+            Vec::new(),
+        ));
+        view.lightbox.as_mut().unwrap().hide_second();
+
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1200.0, 800.0))
+            .build_ui_state(
+                move |ui, view: &mut BrowseView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    ui.allocate_ui(egui::vec2(ui.available_width(), 780.0), |ui| {
+                        view.show(ui, &store_ui, TooltipVerbosity::default());
+                    });
+                },
+                view,
+            );
+        h.run();
+        h.get_by_label_contains("ROTATE A").click();
+        h.run();
+        h.get_by_label_contains("SAVE A").click();
+        h.run();
+        h.get_by_label("OVERWRITE").click();
+        h.run();
+
+        assert_eq!(
+            image::image_dimensions(&png).unwrap(),
+            (20, 40),
+            "the rotated pixels are on disk"
+        );
+        let after = store.get_file_entry("R", "scan.png").unwrap().unwrap();
+        assert_ne!(
+            after.hash, before.hash,
+            "the index entry follows the new bytes immediately"
+        );
+        assert!(h.state().lightbox.is_some(), "saving keeps the viewer open");
     }
 
     /// An audio file's preview shows its ID3 tags, the Waveform/Spectrogram

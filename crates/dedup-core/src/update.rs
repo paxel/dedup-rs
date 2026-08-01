@@ -115,6 +115,12 @@ pub enum UpdateError {
          mounted. To scan it anyway, re-run with --force."
     )]
     WouldEmptyIndex { repo: String, entries: u64 },
+
+    #[error("Could not read {path}: {source}")]
+    FileUnreadable {
+        path: String,
+        source: std::io::Error,
+    },
 }
 
 struct WalkedFile {
@@ -541,6 +547,43 @@ fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
     let mut file = std::fs::File::open(path)?;
     std::io::copy(&mut file, &mut hasher)?;
     Ok(*hasher.finalize().as_bytes())
+}
+
+/// Re-stat, re-hash and re-fingerprint a single file and rewrite its index
+/// entry, preserving the entry's provenance (`origin`).
+///
+/// For a caller that has just changed the file's bytes **in place** — saving a
+/// rotated image, say — possibly while deliberately preserving its modified
+/// time, which would make the change invisible to the (size, mtime) skip of a
+/// normal scan. Content identity is the hash, so the index must follow the
+/// bytes immediately rather than wait for a rescan that may never notice.
+pub fn refresh_file_entry(store: &Store, repo: &str, rel: &str) -> Result<FileEntry, UpdateError> {
+    let meta = store.get_repo(repo)?;
+    let abs = Path::new(&meta.abs_path).join(rel);
+    let unreadable = |source: std::io::Error| UpdateError::FileUnreadable {
+        path: abs.display().to_string(),
+        source,
+    };
+    let md = std::fs::metadata(&abs).map_err(unreadable)?;
+    let hash = hash_file(&abs).map_err(unreadable)?;
+    let fp = fingerprint::compute(&abs, fingerprint::ffmpeg_available());
+    let origin = store.get_file_entry(repo, rel)?.and_then(|e| e.origin);
+    let entry = FileEntry {
+        size: md.len(),
+        hash,
+        modified_ms: md.modified().ok().map(system_time_to_ms).unwrap_or(0),
+        missing: false,
+        mime: fp.mime,
+        img_fingerprint: fp.img_fingerprint,
+        video_hash: fp.video_hash,
+        pdf_hash: fp.pdf_hash,
+        audio: fp.audio,
+        img_size: fp.img_size,
+        origin,
+        exif: fp.exif,
+    };
+    store.update_file_entry(repo, rel, &entry)?;
+    Ok(entry)
 }
 
 /// Give `to` the modification time of `from`.

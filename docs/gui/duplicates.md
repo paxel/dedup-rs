@@ -73,11 +73,11 @@ single file, **DELETE A** / **DELETE B** while both are shown, each toggling onl
 copy's mark without closing the viewer. A copy in a read-only repository shows a disabled,
 struck-through `… (Protected)` pill instead.
 
-**Switching copies.** With more than two copies in the group, each side gets its own switcher
-(`< PREV A`, `<1 / 3>`, `NEXT A >`) that steps that side through the group. It always skips
-the file the other side is showing — the two sides can never be the same file — and the
-position counts that side's candidates, never the group size. A two-copy group offers no
-switcher at all: the only other candidate is already on the other side.
+**Switching copies.** With one file shown, the switcher (`< PREV A`, `<1 / 2>`, `NEXT A >`)
+steps through the whole group. With both sides shown, each side's switcher skips the file
+the other side is showing — the two sides can never be the same file — and the position
+counts that side's candidates, never the group size; a two-copy group then offers no
+switcher at all, because the only other candidate is already on the other side.
 
 ### Representation tabs
 
@@ -88,10 +88,15 @@ FLAC no Metadata tab. Selecting a tab draws only the column(s) whose file suppor
 left (A) against right (B), never stacked. If a side steps to a copy that lacks the current
 representation, the viewer drops back to the pair's own representation.
 
-**Image**: mouse-wheel zooms around the cursor, drag pans, `space` enters flicker — one
-full-window pane swapping between A and B in place, the fastest way to spot a subtle edit —
-and ROTATE / MIRROR turn one side to align a copy somebody flipped. The turn carries into the
-comparison and is a viewing aid only: nothing is written back to disk.
+**Image**: mouse-wheel zooms around the cursor, drag pans, and FLICKER (or `space`) overlays
+the two files in one pane — SWAP trades them in place, the fastest way to spot a subtle edit;
+SIDE BY SIDE returns. ROTATE / MIRROR turn one side to align a copy somebody flipped; the
+turn carries into the comparison. On a writable file, **SAVE** then writes the turned image
+to disk: **OVERWRITE** replaces it in place, **SAVE COPY** writes a `_rot` sibling and leaves
+the original alone. Either way the file keeps its modified time — a turned scan is still the
+same photograph from the same date — or, when the image carries an EXIF capture date, the
+dialog can stamp the file's date from EXIF instead. An overwrite re-indexes the file
+immediately, so its new content identity is never stale.
 
 **Audio** compares as spectrograms — frequency-vs-time, far more telling than a flat waveform
 — with a transport per side: **PLAY A** / **PLAY B**, **PAUSE**, and a cycling **SPEED** pill
@@ -106,8 +111,9 @@ resumes the file you are actually looking at. `P` toggles play/pause.
 Title/Artist/Album/Year/Track/Genre for that copy, the `>` beside a field offers the value any
 other copy in the group carries (adopt the best one), and SAVE TAGS writes only the tags — the
 audio itself is untouched. `T` jumps straight here with the editor open. A file in a read-only
-repository is shown but never editable. For images the tab shows the EXIF capture facts
-(camera, taken) as recorded; they are not edited here.
+repository is shown but never editable. For images the tab lists **every EXIF field** the
+file carries — camera, capture date, exposure, GPS, all of it — as recorded; EXIF is not
+edited here.
 
 ![The Metadata tab, editing one copy's ID3 tags against another's](../screenshots/lightbox_metadata.png)
 

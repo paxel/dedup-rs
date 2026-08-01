@@ -1365,8 +1365,9 @@ impl TransferView {
             self.inspect = None;
             match pick {
                 DiffPick::Close => {}
-                // DIFF never supplies marks, so a toggle cannot arrive here.
-                DiffPick::ToggleMark { .. } => {}
+                // DIFF's sides are read-only, so neither a mark toggle nor an
+                // in-place save can arrive here.
+                DiffPick::ToggleMark { .. } | DiffPick::Edited { .. } => {}
                 DiffPick::Delete { on_left } => {
                     acts.push(Act::Board(crate::diff_board::BoardAction::Delete {
                         on_left,

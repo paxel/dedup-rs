@@ -77,6 +77,11 @@ pub(crate) enum DiffPick {
     /// [`DiffCompare::set_marks`]). Unlike the commands above, acting on it
     /// does not close the viewer — marking is part of looking.
     ToggleMark { on_left: bool },
+    /// This side's file was rewritten in place (a turned image saved over the
+    /// original). The caller must refresh its index entry — the save may have
+    /// deliberately preserved the file's timestamp, which a rescan's
+    /// (size, mtime) skip would never notice. Does not close the viewer.
+    Edited { on_left: bool },
     /// Leave both alone.
     Close,
 }
@@ -165,6 +170,9 @@ pub(crate) struct DiffCompare {
     /// Stored ID3 tags per side, read once. `Some(None)` means "read, carries
     /// none" — distinct from "not read yet".
     tags: [Option<Option<crate::id3tags::Tags>>; 2],
+    /// Full EXIF field list per side, read once from the file — the Metadata
+    /// tab shows everything, not only the camera and date the index keeps.
+    exif_all: [Option<Vec<(String, String)>>; 2],
     /// Per-side deletion-mark state, when the caller's actions are marks rather
     /// than the DIFF board's commands. Set each frame via [`Self::set_marks`] —
     /// the caller owns the marks, the viewer only shows and reports them.
@@ -173,6 +181,9 @@ pub(crate) struct DiffCompare {
     /// from this viewer — the side the playback cursor belongs to. Exact
     /// duplicates share a content hash, so the hash alone cannot say.
     pub audio_active: Option<usize>,
+    /// The Text tab's shared scroll position: both panes are locked to the
+    /// same offset, so a byte comparison always looks at the same place.
+    text_scroll: egui::Vec2,
     /// The open ID3 tag editor (Metadata tab), if any. Only a writable audio
     /// side ever opens one.
     pub(crate) tag_edit: Option<TagEdit>,
@@ -182,6 +193,14 @@ pub(crate) struct DiffCompare {
     /// The caller's own headline for the viewer — what these two files are to
     /// the surface that opened it.
     title: String,
+    /// The open save-confirmation dialog for a turned image, if any: which
+    /// side is being saved.
+    save_confirm: Option<bool>,
+    /// In the save dialog: stamp the file's modified time from the EXIF
+    /// capture date instead of keeping the original's.
+    save_exif_date: bool,
+    /// Why the last save failed, shown in the dialog until one succeeds.
+    save_error: Option<String>,
 }
 
 impl DiffCompare {
@@ -205,11 +224,16 @@ impl DiffCompare {
             tab: crate::lightbox::RepresentationKind::Overview,
             text: [None, None],
             tags: [None, None],
+            exif_all: [None, None],
             marks: [None, None],
             audio_active: None,
+            text_scroll: egui::Vec2::ZERO,
             tag_edit: None,
             tag_error: None,
             title: "COMPARE — SAME PATH, DIFFERENT CONTENT".into(),
+            save_confirm: None,
+            save_exif_date: false,
+            save_error: None,
         }
     }
 
@@ -305,10 +329,13 @@ impl DiffCompare {
     /// Whether the pool holds a candidate that is neither `from` nor `other`.
     /// Identity is the absolute path, not the relative one: duplicates across
     /// two repositories routinely share their relative path while being
-    /// distinct copies.
+    /// distinct copies. With the second side hidden, `other` is only a
+    /// placeholder and masks nothing — the whole pool is free.
     fn has_free_candidate(&self, from: &DiffSide, other: &DiffSide) -> bool {
+        let mask = self.two_sided();
         self.pool.iter().any(|c| {
-            c.facts.abs_path != from.facts.abs_path && c.facts.abs_path != other.facts.abs_path
+            c.facts.abs_path != from.facts.abs_path
+                && (!mask || c.facts.abs_path != other.facts.abs_path)
         })
     }
 
@@ -360,6 +387,7 @@ impl DiffCompare {
     /// goes to the third when the second is taken — which is the accepted cost
     /// of never colliding.
     fn stepped(&self, from: &DiffSide, other: &DiffSide, dir: isize) -> Option<DiffSide> {
+        let mask = self.two_sided();
         let at = self
             .pool
             .iter()
@@ -372,7 +400,7 @@ impl DiffCompare {
         for _ in 0..n {
             probe = (probe + step).rem_euclid(n);
             let candidate = self.pool.get(probe as usize)?;
-            if candidate.facts.abs_path != other.facts.abs_path {
+            if !mask || candidate.facts.abs_path != other.facts.abs_path {
                 return Some(candidate.clone());
             }
         }
@@ -544,6 +572,7 @@ impl DiffCompare {
         }
         self.text[slot] = None;
         self.tags[slot] = None;
+        self.exif_all[slot] = None;
         self.spawn_decode(ctx, slot);
     }
 
@@ -672,9 +701,10 @@ impl DiffCompare {
             self.tab = RepresentationKind::Metadata;
         }
         // Space swaps within flicker; whether audio follows is settled with the
-        // other transport actions after drawing.
+        // other transport actions after drawing. A hidden second side has
+        // nothing to flicker against.
         let mut swapped = false;
-        if space && ready {
+        if space && ready && self.two_sided() {
             if self.compare.flicker {
                 self.compare.show_b = !self.compare.show_b;
                 swapped = true;
@@ -686,6 +716,10 @@ impl DiffCompare {
         let mut step: Option<(bool, isize)> = None;
         let mut hide = false;
         let mut turn: Option<(bool, Orient)> = None;
+        let mut open_save: Option<bool> = None;
+        let mut enter_flicker = false;
+        let mut leave_flicker = false;
+        let mut do_swap = false;
         let mut play: Option<bool> = None;
         let mut pause = false;
         let mut cycle_speed = false;
@@ -694,7 +728,7 @@ impl DiffCompare {
             crate::lightbox::MetaAction::None,
             crate::lightbox::MetaAction::None,
         );
-        let picked = egui::Area::new(Id::new("diff-compare"))
+        let mut picked = egui::Area::new(Id::new("diff-compare"))
             .order(egui::Order::Foreground)
             .fixed_pos(egui::Pos2::ZERO)
             .show(ctx, |ui| {
@@ -756,7 +790,9 @@ impl DiffCompare {
                 // the rect (a full-window modal, but cheap to keep well-formed).
                 // The identifying facts sit with their side, above the images —
                 // so the images get the space the old bottom legend occupied.
-                const TITLE_H: f32 = 96.0;
+                // Tall enough for the whole facts block plus the mark pill, so
+                // the strip never bleeds into the images below it.
+                const TITLE_H: f32 = 132.0;
                 let tab_h = 30.0;
                 let titles_top = inner.min.y + 32.0 + tab_h;
                 let viewport = Rect::from_min_max(
@@ -816,15 +852,65 @@ impl DiffCompare {
                 );
                 self.tab = tab;
                 // Hiding the second side is how a single file gets the whole
-                // screen for close analysis.
+                // screen for close analysis. Beside it, once both sides have
+                // decoded, flicker gets buttons — space alone was a mystery.
                 if two_sided_now {
                     ui.scope_builder(
                         UiBuilder::new()
                             .max_rect(tab_rect)
                             .layout(Layout::right_to_left(Align::Center)),
                         |ui| {
-                            if ui.button("HIDE B").clicked() {
+                            if ui
+                                .button("HIDE B")
+                                .explain(
+                                    verbosity,
+                                    "Show only the first file",
+                                    "Hide the second side so the first file gets the whole \
+                                     screen for close analysis.",
+                                )
+                                .clicked()
+                            {
                                 hide = true;
+                            }
+                            if ready {
+                                if self.compare.flicker {
+                                    if ui
+                                        .button("SIDE BY SIDE")
+                                        .explain(
+                                            verbosity,
+                                            "Both files at once",
+                                            "Leave flicker and show A and B next to each other \
+                                             again.",
+                                        )
+                                        .clicked()
+                                    {
+                                        leave_flicker = true;
+                                    }
+                                    if ui
+                                        .button("SWAP")
+                                        .explain(
+                                            verbosity,
+                                            "Show the other file",
+                                            "Swap which file fills the screen (Space does the \
+                                             same).",
+                                        )
+                                        .clicked()
+                                    {
+                                        do_swap = true;
+                                    }
+                                } else if ui
+                                    .button("FLICKER")
+                                    .explain(
+                                        verbosity,
+                                        "Overlay the two files",
+                                        "Show one file at a time in the full pane and swap \
+                                         between them in place — a subtle difference stands \
+                                         out immediately (Space does the same).",
+                                    )
+                                    .clicked()
+                                {
+                                    enter_flicker = true;
+                                }
                             }
                         },
                     );
@@ -834,7 +920,15 @@ impl DiffCompare {
                             .max_rect(tab_rect)
                             .layout(Layout::right_to_left(Align::Center)),
                         |ui| {
-                            if ui.button("SHOW B").clicked() {
+                            if ui
+                                .button("SHOW B")
+                                .explain(
+                                    verbosity,
+                                    "Compare against another file",
+                                    "Show a second file beside this one to compare them.",
+                                )
+                                .clicked()
+                            {
                                 show = true;
                             }
                         },
@@ -847,18 +941,45 @@ impl DiffCompare {
                 // stay the caller's; tags are the one write a side carries.
                 if self.tab == RepresentationKind::Metadata {
                     for slot in [0usize, 1usize] {
+                        let side = if slot == 0 { &self.left } else { &self.right };
                         if self.tags[slot].is_none() {
-                            let side = if slot == 0 { &self.left } else { &self.right };
                             self.tags[slot] = Some(
                                 crate::id3tags::container_supported(side.facts.mime.as_deref())
                                     .then(|| crate::id3tags::read(&side.facts.abs_path))
                                     .flatten(),
                             );
                         }
+                        // The full EXIF listing, read from the file once. When
+                        // the file itself yields nothing, the two indexed
+                        // facts still show.
+                        if self.exif_all[slot].is_none() {
+                            let fields = if side.facts.is_image() {
+                                let mut f =
+                                    dedup_core::fingerprint::exif_fields(&side.facts.abs_path);
+                                if f.is_empty()
+                                    && let Some(ex) = side.facts.exif.as_ref()
+                                {
+                                    if let Some(c) = &ex.camera {
+                                        f.push(("Camera".into(), c.clone()));
+                                    }
+                                    if let Some(ms) = ex.taken_ms {
+                                        f.push(("Taken".into(), crate::util::format_mtime(ms)));
+                                    }
+                                }
+                                f
+                            } else {
+                                Vec::new()
+                            };
+                            self.exif_all[slot] = Some(fields);
+                        }
                     }
                     let (lt, rt) = (
                         self.tags[0].clone().flatten(),
                         self.tags[1].clone().flatten(),
+                    );
+                    let (lx, rx) = (
+                        self.exif_all[0].clone().unwrap_or_default(),
+                        self.exif_all[1].clone().unwrap_or_default(),
                     );
                     // The editor travels out of `self` for the frame so the
                     // column closures can bind text fields to it.
@@ -875,6 +996,7 @@ impl DiffCompare {
                     fn meta_body<'a>(
                         side: &'a DiffSide,
                         stored: Option<&'a crate::id3tags::Tags>,
+                        exif: Vec<(String, String)>,
                         te: &'a mut Option<TagEdit>,
                     ) -> crate::lightbox::MetaBody<'a> {
                         match te {
@@ -887,15 +1009,7 @@ impl DiffCompare {
                                 tags: stored,
                                 can_edit: !side.read_only,
                             },
-                            _ => crate::lightbox::MetaBody::Exif {
-                                camera: side.facts.exif.as_ref().and_then(|e| e.camera.as_deref()),
-                                taken: side
-                                    .facts
-                                    .exif
-                                    .as_ref()
-                                    .and_then(|e| e.taken_ms)
-                                    .map(crate::util::format_mtime),
-                            },
+                            _ => crate::lightbox::MetaBody::Exif { fields: exif },
                         }
                     }
                     // Only the side(s) that actually carry metadata get a
@@ -914,7 +1028,7 @@ impl DiffCompare {
                                     is_main: false,
                                     source: &l.facts.abs_path,
                                 },
-                                meta_body(l, lt.as_ref(), te),
+                                meta_body(l, lt.as_ref(), lx.clone(), te),
                             );
                         }));
                     }
@@ -930,7 +1044,7 @@ impl DiffCompare {
                                     read_only: r.read_only,
                                     source: &r.facts.abs_path,
                                 },
-                                meta_body(r, rt.as_ref(), te),
+                                meta_body(r, rt.as_ref(), rx.clone(), te),
                             );
                         }));
                     }
@@ -954,10 +1068,17 @@ impl DiffCompare {
                             .max_rect(viewport)
                             .layout(Layout::top_down(Align::Min)),
                     );
-                    let mut cols: Vec<crate::lightbox::ColumnFn<'_, ()>> =
-                        vec![Box::new(move |ui: &mut egui::Ui, _: &mut ()| {
+                    // Both panes are locked to one scroll offset: each column
+                    // is drawn at the shared position and reports back where
+                    // it ended up, so whichever pane the user scrolled becomes
+                    // the new shared position (§ story 31 — comparing bytes
+                    // means looking at the same offset in both).
+                    type ScrollSync = (egui::Vec2, Option<egui::Vec2>);
+                    let mut sync: ScrollSync = (self.text_scroll, None);
+                    let mut cols: Vec<crate::lightbox::ColumnFn<'_, ScrollSync>> =
+                        vec![Box::new(move |ui: &mut egui::Ui, sync: &mut ScrollSync| {
                             if let Some(p) = &lt {
-                                draw_text_column(
+                                let (_, off) = draw_text_column(
                                     ui,
                                     &ColumnHead {
                                         file_name: &l.rel_path,
@@ -969,13 +1090,17 @@ impl DiffCompare {
                                     },
                                     p,
                                     height,
+                                    Some(sync.0),
                                 );
+                                if off != sync.0 {
+                                    sync.1 = Some(off);
+                                }
                             }
                         })];
                     if two_sided_now {
-                        cols.push(Box::new(move |ui: &mut egui::Ui, _: &mut ()| {
+                        cols.push(Box::new(move |ui: &mut egui::Ui, sync: &mut ScrollSync| {
                             if let Some(p) = &rt {
-                                draw_text_column(
+                                let (_, off) = draw_text_column(
                                     ui,
                                     &ColumnHead {
                                         file_name: &r.rel_path,
@@ -987,11 +1112,62 @@ impl DiffCompare {
                                     },
                                     p,
                                     height,
+                                    Some(sync.0),
                                 );
+                                if off != sync.0 {
+                                    sync.1 = Some(off);
+                                }
                             }
                         }));
                     }
-                    draw_columns(&mut child, &mut (), cols);
+                    draw_columns(&mut child, &mut sync, cols);
+                    self.text_scroll = sync.1.unwrap_or(sync.0);
+                } else if !two_sided_now {
+                    // One file, the whole viewport — the hidden side must not
+                    // paint a second copy of the same picture.
+                    match self.slot_state(0) {
+                        SlotState::Image => {
+                            let (a_tex, a_img) = self.sized(0);
+                            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                            if bg.dragged() {
+                                self.compare.pan_by(bg.drag_delta());
+                            }
+                            if scroll != 0.0
+                                && ctx
+                                    .pointer_hover_pos()
+                                    .is_some_and(|c| viewport.contains(c))
+                            {
+                                self.compare.zoom_by((scroll * 0.005).exp());
+                            }
+                            draw_in_pane(
+                                ui,
+                                viewport,
+                                self.compare.pane_rect(viewport, a_img),
+                                &a_tex,
+                            );
+                            ui.painter().text(
+                                egui::pos2(inner.min.x + 4.0, viewport.max.y + 2.0),
+                                Align2::LEFT_TOP,
+                                "wheel: zoom · drag: pan · Esc close",
+                                FontId::proportional(11.0),
+                                theme::hairline(),
+                            );
+                        }
+                        note => {
+                            let text = if note == SlotState::Decoding {
+                                "decoding…".to_string()
+                            } else {
+                                self.left.placeholder()
+                            };
+                            ui.painter().text(
+                                viewport.center(),
+                                Align2::CENTER_CENTER,
+                                text,
+                                FontId::proportional(14.0),
+                                theme::tan(),
+                            );
+                        }
+                    }
                 } else if ready {
                     // Both sides decoded: the shared A/B viewer — zoom / pan /
                     // flicker across both panes.
@@ -1054,112 +1230,145 @@ impl DiffCompare {
                     egui::pos2(inner.min.x, titles_top),
                     egui::pos2(inner.max.x, titles_top + TITLE_H),
                 );
+                // Each side gets a *fixed* half of the strip, aligned with the
+                // pane below it. Flow layout advanced by the other side's used
+                // width, so B's facts drifted mid-window when A's were narrow.
                 let col_w = (strip.width() - 16.0) * 0.5;
-                ui.scope_builder(
-                    UiBuilder::new()
-                        .max_rect(strip)
-                        .layout(Layout::left_to_right(Align::Min)),
-                    |ui| {
-                        for is_left in [true, false] {
-                            if !is_left && !two_sided {
-                                continue;
-                            }
-                            let (side, other) = if is_left {
-                                (&self.left, &self.right)
-                            } else {
-                                (&self.right, &self.left)
-                            };
-                            let can_step = if is_left {
-                                self.can_step_left()
-                            } else {
-                                self.can_step_right()
-                            };
-                            let mark = self.marks[usize::from(!is_left)];
-                            let mark_label = if two_sided {
-                                if is_left { "DELETE A" } else { "DELETE B" }
-                            } else {
-                                "DELETE"
-                            };
-                            let picked = ui
-                                .allocate_ui(egui::vec2(col_w, strip.height()), |ui| {
-                                    let picked = side_strip(
-                                        ui,
-                                        side,
-                                        other,
-                                        is_left,
-                                        verbosity,
-                                        mark.map(|m| (mark_label, m)),
-                                    );
-                                    // The switcher belongs to its side, and is
-                                    // offered only when that side has somewhere
-                                    // to go — a pair shows none at all, so it can
-                                    // never land on the file the other side has.
-                                    let label = if is_left { "A" } else { "B" };
-                                    // The control rows stack beside the facts:
-                                    // one row chained after another was what
-                                    // clipped the rightmost tool off the edge.
-                                    ui.vertical(|ui| {
-                                        if can_step {
-                                            let position = self.switcher_label(is_left);
-                                            ui.horizontal(|ui| {
-                                                if ui.button(format!("< PREV {label}")).clicked() {
-                                                    step = Some((is_left, -1));
-                                                }
-                                                if let Some(pos) = position {
-                                                    ui.label(
-                                                        RichText::new(pos).color(theme::tan()),
-                                                    );
-                                                }
-                                                if ui.button(format!("NEXT {label} >")).clicked() {
-                                                    step = Some((is_left, 1));
-                                                }
-                                            });
-                                        }
-                                        // Tools belong to the tab, and to the
-                                        // side they act on. Available while
-                                        // comparing — aligning a flipped copy
-                                        // is done by looking at both.
-                                        if tab_is_image {
-                                            ui.horizontal(|ui| {
-                                                if ui.button(format!("ROTATE {label}")).clicked() {
-                                                    turn = Some((is_left, Orient::RotateCw));
-                                                }
-                                                if ui.button(format!("MIRROR {label}")).clicked() {
-                                                    turn = Some((is_left, Orient::FlipH));
-                                                }
-                                            });
-                                        }
-                                        // Audio transport, per side. The caller
-                                        // owns the player — one audio device,
-                                        // and the tab it belongs to also drives
-                                        // the cards behind.
-                                        if tab_is_audio && player.is_some() {
-                                            ui.horizontal(|ui| {
-                                                if ui.button(format!("PLAY {label}")).clicked() {
-                                                    play = Some(is_left);
-                                                }
-                                                if ui.button("PAUSE").clicked() {
-                                                    pause = true;
-                                                }
-                                                if ui
-                                                    .button(format!("SPEED {}×", speed_label))
+                for is_left in [true, false] {
+                    if !is_left && !two_sided {
+                        continue;
+                    }
+                    let half = if two_sided { col_w } else { strip.width() };
+                    let x0 = if is_left {
+                        strip.min.x
+                    } else {
+                        strip.min.x + col_w + 16.0
+                    };
+                    let half_rect = Rect::from_min_size(
+                        egui::pos2(x0, strip.min.y),
+                        egui::vec2(half, strip.height()),
+                    );
+                    let (side, other) = if is_left {
+                        (&self.left, &self.right)
+                    } else {
+                        (&self.right, &self.left)
+                    };
+                    let can_step = if is_left {
+                        self.can_step_left()
+                    } else {
+                        self.can_step_right()
+                    };
+                    let mark = self.marks[usize::from(!is_left)];
+                    let mark_label = if two_sided {
+                        if is_left { "DELETE A" } else { "DELETE B" }
+                    } else {
+                        "DELETE"
+                    };
+                    let picked = ui
+                        .scope_builder(
+                            UiBuilder::new()
+                                .max_rect(half_rect)
+                                .layout(Layout::left_to_right(Align::Min)),
+                            |ui| {
+                                let picked = side_strip(
+                                    ui,
+                                    side,
+                                    other,
+                                    is_left,
+                                    verbosity,
+                                    mark.map(|m| (mark_label, m)),
+                                );
+                                // The switcher belongs to its side, and is
+                                // offered only when that side has somewhere
+                                // to go — a pair shows none at all, so it can
+                                // never land on the file the other side has.
+                                let label = if is_left { "A" } else { "B" };
+                                // The control rows stack beside the facts:
+                                // one row chained after another was what
+                                // clipped the rightmost tool off the edge.
+                                ui.vertical(|ui| {
+                                    if can_step {
+                                        let position = self.switcher_label(is_left);
+                                        ui.horizontal(|ui| {
+                                            if ui.button(format!("< PREV {label}")).clicked() {
+                                                step = Some((is_left, -1));
+                                            }
+                                            if let Some(pos) = position {
+                                                ui.label(RichText::new(pos).color(theme::tan()));
+                                            }
+                                            if ui.button(format!("NEXT {label} >")).clicked() {
+                                                step = Some((is_left, 1));
+                                            }
+                                        });
+                                    }
+                                    // Tools belong to the tab, and to the
+                                    // side they act on. Available while
+                                    // comparing — aligning a flipped copy
+                                    // is done by looking at both.
+                                    if tab_is_image {
+                                        let slot = usize::from(!is_left);
+                                        let turned = !self.ops[slot].is_empty();
+                                        ui.horizontal(|ui| {
+                                            if ui.button(format!("ROTATE {label}")).clicked() {
+                                                turn = Some((is_left, Orient::RotateCw));
+                                            }
+                                            if ui.button(format!("MIRROR {label}")).clicked() {
+                                                turn = Some((is_left, Orient::FlipH));
+                                            }
+                                            // A pending turn on a writable
+                                            // side can be written to disk.
+                                            if turned
+                                                && !side.read_only
+                                                && ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            RichText::new(format!("SAVE {label}"))
+                                                                .color(theme::black()),
+                                                        )
+                                                        .fill(theme::amber()),
+                                                    )
+                                                    .explain(
+                                                        verbosity,
+                                                        "Write the turned image to disk",
+                                                        "Save this side's rotation/mirror to \
+                                                             the file — overwriting it in place \
+                                                             or as a new copy; you choose next.",
+                                                    )
                                                     .clicked()
-                                                {
-                                                    cycle_speed = true;
-                                                }
-                                            });
-                                        }
-                                    });
-                                    picked
-                                })
-                                .inner;
-                            if picked.is_some() {
-                                pick = picked;
-                            }
-                            ui.add_space(16.0);
-                        }
-                    },
-                );
+                                            {
+                                                open_save = Some(is_left);
+                                            }
+                                        });
+                                    }
+                                    // Audio transport, per side. The caller
+                                    // owns the player — one audio device,
+                                    // and the tab it belongs to also drives
+                                    // the cards behind.
+                                    if tab_is_audio && player.is_some() {
+                                        ui.horizontal(|ui| {
+                                            if ui.button(format!("PLAY {label}")).clicked() {
+                                                play = Some(is_left);
+                                            }
+                                            if ui.button("PAUSE").clicked() {
+                                                pause = true;
+                                            }
+                                            if ui
+                                                .button(format!("SPEED {}×", speed_label))
+                                                .clicked()
+                                            {
+                                                cycle_speed = true;
+                                            }
+                                        });
+                                    }
+                                });
+                                picked
+                            },
+                        )
+                        .inner;
+                    if picked.is_some() {
+                        pick = picked;
+                    }
+                }
                 pick
             })
             .inner;
@@ -1176,9 +1385,141 @@ impl DiffCompare {
                 (MetaAction::None, MetaAction::None) => {}
             }
         }
+        // The flicker buttons mirror the space bar exactly; a button swap
+        // flips the audio with the picture, settled in the player block below.
+        if enter_flicker {
+            self.compare.flicker = true;
+        }
+        if leave_flicker {
+            self.compare.flicker = false;
+        }
+        if do_swap && self.compare.flicker {
+            self.compare.show_b = !self.compare.show_b;
+            swapped = true;
+        }
         if let Some((is_left, op)) = turn {
             self.rotate(is_left, op);
             self.upload(ctx, usize::from(!is_left));
+        }
+        // The save dialog for a turned image: overwrite in place or write a
+        // `_rot` sibling, in either case carrying the date the user chose —
+        // the original's, or (opt-in) the EXIF capture date.
+        if let Some(is_left) = open_save {
+            self.save_confirm = Some(is_left);
+            self.save_exif_date = false;
+            self.save_error = None;
+        }
+        if let Some(is_left) = self.save_confirm {
+            let slot = usize::from(!is_left);
+            let (name, path, taken) = {
+                let side = if is_left { &self.left } else { &self.right };
+                (
+                    side.rel_path.clone(),
+                    side.facts.abs_path.clone(),
+                    side.facts.exif.as_ref().and_then(|e| e.taken_ms),
+                )
+            };
+            let mut do_save: Option<bool> = None; // Some(overwrite)
+            let mut cancel = false;
+            let mut exif_date = self.save_exif_date;
+            let save_error = self.save_error.clone();
+            egui::Modal::new(Id::new("viewer-save")).show(ctx, |ui| {
+                ui.set_width(440.0);
+                ui.label(
+                    RichText::new("WRITE THE TURNED IMAGE")
+                        .color(theme::amber())
+                        .size(16.0)
+                        .strong(),
+                );
+                ui.add_space(6.0);
+                ui.colored_label(theme::text(), &name);
+                ui.label(
+                    RichText::new(
+                        "Overwriting replaces the file in place; saving a copy writes a \
+                         new `_rot` file beside it and leaves the original untouched. \
+                         Either way the file keeps its modified time.",
+                    )
+                    .color(theme::lilac())
+                    .size(11.0),
+                );
+                if let Some(ms) = taken {
+                    ui.add_space(4.0);
+                    ui.checkbox(
+                        &mut exif_date,
+                        RichText::new(format!(
+                            "Set the file date to the EXIF capture date ({})",
+                            crate::util::format_mtime(ms)
+                        ))
+                        .color(theme::text()),
+                    );
+                }
+                if let Some(err) = &save_error {
+                    ui.add_space(4.0);
+                    ui.colored_label(theme::red(), err);
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("OVERWRITE").color(theme::black()))
+                                .fill(theme::red()),
+                        )
+                        .explain(
+                            verbosity,
+                            "Replace the file in place",
+                            "Write the turned image over the original. The previous pixels \
+                             are gone afterwards; the file's date is kept.",
+                        )
+                        .clicked()
+                    {
+                        do_save = Some(true);
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("SAVE COPY").color(theme::black()))
+                                .fill(theme::tan()),
+                        )
+                        .explain(
+                            verbosity,
+                            "Write a new file beside the original",
+                            "Write the turned image as a new `_rot` file next to the \
+                             original, which stays exactly as it was.",
+                        )
+                        .clicked()
+                    {
+                        do_save = Some(false);
+                    }
+                    if ui
+                        .button(RichText::new("CANCEL").color(theme::text()))
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+            });
+            self.save_exif_date = exif_date;
+            if cancel {
+                self.save_confirm = None;
+            }
+            if let Some(overwrite) = do_save {
+                let time = match taken {
+                    Some(ms) if self.save_exif_date => crate::imgedit::SavedTime::At(ms),
+                    _ => crate::imgedit::SavedTime::Original,
+                };
+                let ops = self.ops.get(slot).cloned().unwrap_or_default();
+                match crate::imgedit::save_edited(&path, &ops, overwrite, time) {
+                    Ok(_) => {
+                        self.save_confirm = None;
+                        if overwrite {
+                            // The bytes behind this side changed: re-decode
+                            // them, and tell the caller to refresh its index.
+                            self.refresh_side(ctx, slot);
+                            picked = picked.or(Some(DiffPick::Edited { on_left: is_left }));
+                        }
+                    }
+                    Err(e) => self.save_error = Some(format!("Save failed: {e}")),
+                }
+            }
         }
         if hide {
             self.hide_second();
@@ -1395,10 +1736,14 @@ fn side_strip(
                 .size(14.0)
                 .strong(),
         );
-        ui.label(
-            RichText::new(&side.rel_path)
-                .color(theme::text())
-                .size(12.0),
+        // Truncated: a deep path must not widen this side into the other's half.
+        ui.add(
+            egui::Label::new(
+                RichText::new(&side.rel_path)
+                    .color(theme::text())
+                    .size(12.0),
+            )
+            .truncate(),
         );
         let size_color = if side.facts.size > other.facts.size {
             theme::green()
@@ -1479,7 +1824,7 @@ fn side_strip(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     /// An audio side with its own identity, for the transport tests.
     fn audio_side(name: &str, hex: &str) -> DiffSide {
@@ -1624,7 +1969,10 @@ mod tests {
     }
 
     /// Each side's identifying facts belong with that side, above its image —
-    /// not in a shared legend at the bottom, and not in a distant top bar.
+    /// not in a shared legend at the bottom, and not in a distant top bar. B's
+    /// block sits in the right half of the window, over B's own pane — it must
+    /// not drift left when A's facts happen to be narrow (the user's screenshot
+    /// showed B's title floating mid-window, nowhere near B's image).
     #[test]
     fn each_side_has_its_own_title_above_the_images() {
         use egui_kittest::kittest::Queryable;
@@ -1644,6 +1992,104 @@ mod tests {
         assert!(
             a.max.y < 400.0 && b.max.y < 400.0,
             "both titles sit in the top half, above the images: {a:?} {b:?}"
+        );
+        assert!(
+            b.min.x >= 590.0,
+            "B's title sits in the right half of a 1200px window, over B's own \
+             pane: {b:?}"
+        );
+    }
+
+    /// With the second side hidden, the switcher walks the *whole* pool — the
+    /// hidden placeholder must not mask a candidate. The reported defect: in a
+    /// two-copy group the switcher appeared, worked once, and then vanished,
+    /// because the stale hidden side masked the file just stepped away from.
+    #[test]
+    fn a_single_view_steps_the_whole_pool_repeatedly() {
+        use egui_kittest::kittest::Queryable;
+        let pool = vec![named_side("a.jpg"), named_side("b.jpg")];
+        let mut cmp = DiffCompare::new_with_pool(named_side("a.jpg"), None, pool);
+        cmp.hide_second();
+        let mut h = rendered(cmp);
+
+        assert!(
+            h.query_by_label("<1 / 2>").is_some(),
+            "a single view of a two-copy group offers the switcher"
+        );
+        h.get_by_label_contains("NEXT A").click();
+        h.run();
+        assert_eq!(h.state().left.rel_path, "b.jpg", "the step lands");
+        assert!(
+            h.query_by_label("<2 / 2>").is_some(),
+            "and the switcher is still there, at the new position"
+        );
+        h.get_by_label_contains("NEXT A").click();
+        h.run();
+        assert_eq!(
+            h.state().left.rel_path,
+            "a.jpg",
+            "stepping wraps instead of dying"
+        );
+
+        // Revealing B turns the pair two-sided: nothing left to switch to.
+        h.get_by_label_contains("SHOW B").click();
+        h.run();
+        assert_eq!(
+            h.query_all_by_label_contains("NEXT").count(),
+            0,
+            "a two-sided pair offers no switcher at all"
+        );
+    }
+
+    /// Flicker has buttons, not only the space bar: once both sides are
+    /// decoded, FLICKER overlays the panes, SWAP trades A for B, and
+    /// SIDE BY SIDE returns. A single (hidden-B) view offers none of it —
+    /// flickering a file against its own placeholder shows nothing.
+    #[test]
+    fn a_decoded_pair_offers_flicker_buttons() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let a = writable_png_side(tmp.path(), "a.png", 40, 20);
+        let b = writable_png_side(tmp.path(), "b.png", 40, 20);
+        let cmp = DiffCompare::new_with_pool(a, Some(b), Vec::new());
+        let mut h = save_harness(cmp);
+
+        // The decodes land on worker threads; settle until the button shows.
+        for _ in 0..200 {
+            h.step();
+            if h.query_by_label("FLICKER").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            h.query_by_label("FLICKER").is_some(),
+            "a decoded pair offers the FLICKER control"
+        );
+
+        h.get_by_label("FLICKER").click();
+        h.run();
+        assert!(
+            h.state().0.compare.flicker,
+            "clicking it enters flicker mode"
+        );
+        assert!(
+            h.query_by_label("SWAP").is_some() && h.query_by_label("SIDE BY SIDE").is_some(),
+            "flicker offers SWAP and the way back"
+        );
+        h.get_by_label("SWAP").click();
+        h.run();
+        assert!(h.state().0.compare.show_b, "SWAP shows the other side");
+        h.get_by_label("SIDE BY SIDE").click();
+        h.run();
+        assert!(!h.state().0.compare.flicker, "SIDE BY SIDE leaves flicker");
+
+        // A hidden second side has nothing to flicker against.
+        h.get_by_label_contains("HIDE B").click();
+        h.run();
+        assert!(
+            h.query_by_label("FLICKER").is_none(),
+            "a single view offers no flicker"
         );
     }
 
@@ -2213,6 +2659,250 @@ mod tests {
         assert!(cmp.can_step_right());
     }
 
+    /// A real on-disk PNG as a writable viewer side, for the save tests.
+    fn writable_png_side(dir: &Path, name: &str, w: u32, h: u32) -> DiffSide {
+        let path = dir.join(name);
+        image::RgbImage::from_fn(w, h, |x, y| image::Rgb([x as u8, y as u8, 60]))
+            .save(&path)
+            .unwrap();
+        let mut side = named_side(name);
+        side.read_only = false;
+        side.facts.abs_path = path;
+        side.facts.mime = Some("image/png".into());
+        side.facts.img_size = Some((w, h));
+        side
+    }
+
+    /// Drive the viewer with pick capture, for the save tests.
+    fn save_harness(
+        cmp: DiffCompare,
+    ) -> egui_kittest::Harness<'static, (DiffCompare, Vec<DiffPick>)> {
+        let mut init = false;
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1200.0, 800.0))
+            .build_ui_state(
+                move |ui, state: &mut (DiffCompare, Vec<DiffPick>)| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    let (cmp, picks) = state;
+                    if let Some(p) = cmp.view(&ui.ctx().clone(), TooltipVerbosity::default(), None)
+                    {
+                        picks.push(p);
+                    }
+                },
+                (cmp, Vec::new()),
+            );
+        h.run();
+        h
+    }
+
+    fn file_mtime_ms(path: &Path) -> i64 {
+        std::fs::metadata(path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    }
+
+    /// A turned, writable image side offers SAVE; OVERWRITE in the confirm
+    /// dialog writes the rotated pixels over the original — keeping its
+    /// modified time — clears the pending turn, and reports `Edited` so the
+    /// caller can refresh its index (a kept timestamp makes the change
+    /// invisible to a rescan). The viewer stays open.
+    #[test]
+    fn a_turned_writable_image_saves_over_the_original_keeping_its_date() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let side = writable_png_side(tmp.path(), "scan.png", 40, 20);
+        let path = side.facts.abs_path.clone();
+        // Give the scan a distinctly old date, as the real ones have.
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_000_000_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let mut cmp = DiffCompare::new_with_pool(side, None, Vec::new());
+        cmp.hide_second();
+        let mut h = save_harness(cmp);
+
+        // No pending turn → nothing to save yet.
+        assert_eq!(h.query_all_by_label_contains("SAVE A").count(), 0);
+        h.get_by_label_contains("ROTATE A").click();
+        h.run();
+        h.get_by_label_contains("SAVE A").click();
+        h.run();
+        h.get_by_label("OVERWRITE").click();
+        h.run();
+
+        assert_eq!(
+            image::image_dimensions(&path).unwrap(),
+            (20, 40),
+            "the rotated pixels are on disk"
+        );
+        assert_eq!(
+            file_mtime_ms(&path),
+            1_000_000_000_000,
+            "the file keeps its modified time"
+        );
+        assert_eq!(
+            h.state().1.as_slice(),
+            &[DiffPick::Edited { on_left: true }],
+            "the caller is told the bytes changed, and the viewer stays open"
+        );
+        assert_eq!(
+            h.state().0.ops_len(0),
+            0,
+            "the pending turn is consumed by the save"
+        );
+    }
+
+    /// SAVE COPY writes a `_rot` sibling carrying the original's date and
+    /// leaves the original untouched — the never-lose-data path.
+    #[test]
+    fn save_copy_writes_a_sibling_and_leaves_the_original() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let side = writable_png_side(tmp.path(), "scan.png", 40, 20);
+        let path = side.facts.abs_path.clone();
+
+        let mut cmp = DiffCompare::new_with_pool(side, None, Vec::new());
+        cmp.hide_second();
+        let mut h = save_harness(cmp);
+
+        h.get_by_label_contains("ROTATE A").click();
+        h.run();
+        h.get_by_label_contains("SAVE A").click();
+        h.run();
+        h.get_by_label_contains("SAVE COPY").click();
+        h.run();
+
+        let copy = tmp.path().join("scan_rot.png");
+        assert_eq!(
+            image::image_dimensions(&copy).unwrap(),
+            (20, 40),
+            "the sibling carries the rotated pixels"
+        );
+        assert_eq!(
+            image::image_dimensions(&path).unwrap(),
+            (40, 20),
+            "the original is untouched"
+        );
+        assert!(
+            h.state().1.is_empty(),
+            "a copy changes no indexed file, so no event is reported"
+        );
+    }
+
+    /// When the image carries an EXIF capture date, the save dialog can stamp
+    /// the file's modified time from it — a scan's file date is often the copy
+    /// date, and the capture date is the honest one.
+    #[test]
+    fn saving_can_stamp_the_exif_capture_date() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut side = writable_png_side(tmp.path(), "scan.png", 40, 20);
+        let taken_ms = 869_037_150_000i64; // 1997-07-16
+        side.facts.exif = Some(dedup_core::store::ExifInfo {
+            taken_ms: Some(taken_ms),
+            camera: None,
+        });
+        let path = side.facts.abs_path.clone();
+
+        let mut cmp = DiffCompare::new_with_pool(side, None, Vec::new());
+        cmp.hide_second();
+        let mut h = save_harness(cmp);
+
+        h.get_by_label_contains("ROTATE A").click();
+        h.run();
+        h.get_by_label_contains("SAVE A").click();
+        h.run();
+        h.get_by_label_contains("EXIF capture date").click();
+        h.run();
+        h.get_by_label("OVERWRITE").click();
+        h.run();
+
+        assert_eq!(
+            file_mtime_ms(&path),
+            taken_ms,
+            "the saved file carries the EXIF capture date"
+        );
+    }
+
+    /// The Metadata tab lists *every* EXIF field read from the file — EXIF
+    /// carries far more than the camera and date the index keeps.
+    #[test]
+    fn the_metadata_tab_lists_every_exif_field() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shot.jpg");
+        // A minimal JPEG whose APP1 carries a hand-built little-endian TIFF
+        // with Make "Fuj", Model "X" and a DateTime (same fixture the core
+        // `exif_fields` test builds).
+        {
+            let mut tiff: Vec<u8> = Vec::new();
+            tiff.extend_from_slice(b"II");
+            tiff.extend_from_slice(&0x2Au16.to_le_bytes());
+            tiff.extend_from_slice(&8u32.to_le_bytes());
+            tiff.extend_from_slice(&3u16.to_le_bytes());
+            let entry = |tiff: &mut Vec<u8>, tag: u16, count: u32, value: [u8; 4]| {
+                tiff.extend_from_slice(&tag.to_le_bytes());
+                tiff.extend_from_slice(&2u16.to_le_bytes());
+                tiff.extend_from_slice(&count.to_le_bytes());
+                tiff.extend_from_slice(&value);
+            };
+            entry(&mut tiff, 0x010F, 4, *b"Fuj\0");
+            entry(&mut tiff, 0x0110, 2, *b"X\0\0\0");
+            entry(&mut tiff, 0x0132, 20, 50u32.to_le_bytes());
+            tiff.extend_from_slice(&0u32.to_le_bytes());
+            tiff.extend_from_slice(b"2004:01:06 18:42:00\0");
+            let mut app1: Vec<u8> = Vec::new();
+            app1.extend_from_slice(b"Exif\0\0");
+            app1.extend_from_slice(&tiff);
+            let mut jpeg: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xE1];
+            jpeg.extend_from_slice(&((app1.len() as u16 + 2).to_be_bytes()));
+            jpeg.extend_from_slice(&app1);
+            jpeg.extend_from_slice(&[0xFF, 0xD9]);
+            std::fs::write(&path, jpeg).unwrap();
+        }
+
+        let mut side = named_side("shot.jpg");
+        side.facts.abs_path = path;
+        side.facts.mime = Some("image/jpeg".into());
+        // The indexed facts gate the Metadata tab's presence for an image.
+        side.facts.exif = Some(dedup_core::store::ExifInfo {
+            taken_ms: Some(1_073_413_320_000),
+            camera: Some("Fuj X".into()),
+        });
+
+        let mut cmp = DiffCompare::new_with_pool(side, None, Vec::new());
+        cmp.hide_second();
+        let mut h = rendered(cmp);
+        h.get_by_label_contains("Metadata").click();
+        h.run();
+
+        assert!(
+            h.query_by_label("Make").is_some(),
+            "the field's tag name is listed"
+        );
+        assert!(
+            h.query_all_by_label_contains("Fuj").count() > 0,
+            "with its value beside it"
+        );
+        assert!(
+            h.query_by_label("DateTime").is_some()
+                && h.query_all_by_label_contains("2004").count() > 0,
+            "every field the file carries is shown, not only camera and date"
+        );
+    }
+
     /// The completeness check this rewrite exists to make: the old viewers —
     /// the Duplicates tab's tabbed lightbox, its separate audio viewer, and the
     /// Browse single-image viewer — are deleted, and nothing in the crate
@@ -2229,7 +2919,6 @@ mod tests {
             name(&["lightbox_", "shell"]),
             name(&["Lightbox", "State"]),
             name(&["FullRes", "Cache"]),
-            name(&["save_", "edited"]),
             name(&["draw_", "filmstrip"]),
             name(&["draw_", "overview_", "column"]),
             name(&["previewable_", "texture"]),

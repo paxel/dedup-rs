@@ -189,3 +189,27 @@ waveform/spectrogram toggle, and the video filmstrip scrubber (one still per sid
 Docs updated in the same change: `docs/gui/duplicates.md` (viewer section rewritten),
 `docs/gui/files.md` (row-click replaces COMPARE), `README.md` (the law got its line),
 `CHANGELOG.md`, `ai/improvements.md`. The light-theme tickets `02`–`05` are unblocked.
+
+**Addendum, same day — user feedback from live testing, all folded in:**
+
+- **The image edit save came back**, overruled by the user ("I literally need it" for
+  wrongly-rotated scans), as a shared-viewer feature with stronger semantics than the old
+  one: SAVE on a turned, writable side offers OVERWRITE (atomic, in place) or SAVE COPY
+  (`_rot` sibling); both **keep the file's modified time**, or optionally **stamp it from
+  the EXIF capture date**. Because a kept timestamp is invisible to the (size, mtime) scan
+  skip, an overwrite re-indexes the file at once — new core API
+  `update::refresh_file_entry`, which re-stats/re-hashes/re-fingerprints one file and
+  preserves its provenance. Browse's viewer sides became writable (and carry full facts
+  from the index entry) for exactly this.
+- **The Metadata tab lists every EXIF field** (`fingerprint::exif_fields`, read on demand),
+  not just the indexed camera/date.
+- **Layout defects found by the user's screenshots, fixed and pinned by tests:** the
+  hidden-B state drew a second pane of the same picture (and Space "flickered" a file
+  against its own clone — now single-pane, flicker gated on two sides); the per-side
+  title/control strips drifted mid-window because flow layout advanced by used width (now
+  fixed half-width rects); the single view's switcher died after one use because the stale
+  hidden clone masked the file just stepped from (masking now applies only while
+  two-sided); flicker got real buttons (FLICKER / SWAP / SIDE BY SIDE); the Text tab's two
+  panes are scroll-locked to one offset (spec story 31, previously unimplemented).
+- The completeness scan dropped `save_edited` from its forbidden list — that identifier is
+  legitimately alive again.

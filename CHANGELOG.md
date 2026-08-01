@@ -13,12 +13,15 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   the Duplicates tab offers its DELETE / DELETE A / DELETE B mark pills, the DIFF board its
   OVERWRITE/DELETE commands. The Duplicates tab's own tabbed lightbox and its separate audio
   viewer are gone; the three viewers were three implementations of one job, drifting apart.
-- In the viewer, a file opens **alone** first; **SHOW B** reveals a second side — always
-  another candidate, never the file already shown — and **HIDE B** returns. Each side's
-  switcher (`< PREV A`, `<1 / 3>`, `NEXT A >`) steps through the group or listing, skipping
-  the file the other side shows, and its position counts that side's candidates, never the
-  group size. Stepping keeps the audio transport state: playing keeps playing the newly shown
-  copy, a deliberate pause stays paused with the new copy loaded.
+- In the viewer, a file opens **alone**, filling the whole screen; **SHOW B** reveals a second
+  side — always another candidate, never the file already shown — and **HIDE B** returns.
+  With one file shown the switcher walks the whole group or listing; with two, each side's
+  switcher (`< PREV A`, `<1 / 3>`, `NEXT A >`) skips the file the other side shows, and its
+  position counts that side's candidates, never the group size. Stepping keeps the audio
+  transport state: playing keeps playing the newly shown copy, a deliberate pause stays
+  paused with the new copy loaded. Flicker has buttons now — **FLICKER**, **SWAP**,
+  **SIDE BY SIDE** — beside the space bar it always answered to, and the two panes of a Text
+  (bytes) comparison are **scroll-locked** to the same offset.
 - The viewer's **Overview tab is gone**: its facts moved into each side's own title block
   (repo, path, size, date, type, mark pill), so which file you are about to act on is always
   written beside it.
@@ -54,6 +57,18 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 ### Added
 
+- **A turned image can be saved to disk from the viewer.** After ROTATE / MIRROR on a
+  writable file, **SAVE** offers the choice: **OVERWRITE** replaces the file in place
+  (atomically — a failure cannot truncate it), or **SAVE COPY** writes a `_rot` sibling and
+  leaves the original untouched. Either way the file **keeps its modified time** — a turned
+  scan is still the same photograph from the same date — and when the image carries an EXIF
+  capture date, the dialog can instead **stamp the file's date from EXIF**, for scans whose
+  file date is only the day they were copied. An overwrite immediately re-hashes and
+  re-indexes the file: content identity follows the bytes, and a save that kept its timestamp
+  would otherwise be invisible to the next scan.
+- **The Metadata tab lists every EXIF field** an image carries — camera, capture date,
+  exposure, GPS, whatever is in the file — read on demand, scrolling in its column. The index
+  still stores only camera and capture date; the rest never needed indexing to be shown.
 - **Filters can now exclude.** Prefix any condition with `!` to invert it — `!name:*.mp3`
   keeps everything that is *not* an MP3, `!mime:image` everything that is not an image.
   Conditions still combine with AND, so `mime:image !name:*thumb*` reads "images, except
@@ -74,12 +89,10 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 ### Removed
 
-- With the old Duplicates viewers deleted, three of their extras did not move into the shared
-  viewer: the in-viewer **image edit save** (writing a rotated `_rot` copy or overwriting in
-  place — rotate and mirror remain as viewing aids, but changing a file on disk is no longer
-  offered from the viewer), the audio **WAVEFORM/SPECTROGRAM toggle** (the viewer shows
-  spectrograms; cards keep their inline preview), and the **video filmstrip scrubber** (a clip
-  is now identified by one representative still per side; full playback stays the OPEN path).
+- With the old Duplicates viewers deleted, two of their extras did not move into the shared
+  viewer: the audio **WAVEFORM/SPECTROGRAM toggle** (the viewer shows spectrograms; cards
+  keep their inline preview), and the **video filmstrip scrubber** (a clip is now identified
+  by one representative still per side; full playback stays the OPEN path).
 - The GUI pixel-diff snapshot test (`dupes_view_snapshot`). Its baseline directory was
   gitignored, so no baseline was ever committed and the test could not pass on any machine
   but the one that last generated it; being `#[ignore]`d, the drift went unnoticed.

@@ -355,7 +355,7 @@ impl DupesView {
         }
 
         // The shared viewer overlays everything else when open.
-        self.viewer_modal(&ctx, &mut acts);
+        self.viewer_modal(&ctx, store, &mut acts);
 
         for act in acts {
             self.apply(&ctx, store, act);
@@ -1329,7 +1329,7 @@ impl DupesView {
     /// while open. The Duplicates tab supplies what is its own: the group as
     /// the pool, its player (one audio device — the cards behind the overlay
     /// share it), and its deletion marks as the per-side actions.
-    fn viewer_modal(&mut self, ctx: &egui::Context, acts: &mut Vec<Act>) {
+    fn viewer_modal(&mut self, ctx: &egui::Context, store: &Arc<Store>, acts: &mut Vec<Act>) {
         // Marks are resolved through `self` before the viewer is borrowed.
         let marks = self.lightbox.as_ref().map(|lb| {
             let mark = |side: &crate::compare_view::DiffSide| {
@@ -1354,6 +1354,23 @@ impl DupesView {
             Some(crate::compare_view::DiffPick::ToggleMark { on_left }) => {
                 let side = if on_left { &lb.left } else { &lb.right };
                 acts.push(Act::ToggleMark((side.repo.clone(), side.rel_path.clone())));
+            }
+            Some(crate::compare_view::DiffPick::Edited { on_left }) => {
+                // A file was rewritten in place, possibly keeping its
+                // timestamp — the index must follow the bytes now, not wait
+                // for a rescan that would skip an unchanged (size, mtime).
+                let side = if on_left { &lb.left } else { &lb.right };
+                let (repo, rel) = (side.repo.clone(), side.rel_path.clone());
+                match dedup_core::update::refresh_file_entry(store, &repo, &rel) {
+                    Ok(_) => {
+                        self.status = Some(format!("Saved {rel}"));
+                        // The cards show sizes from the loaded page — reload it.
+                        self.cached_page = None;
+                    }
+                    Err(e) => {
+                        self.error = Some(format!("Saved, but re-indexing failed: {e}"));
+                    }
+                }
             }
             Some(_) => {
                 // Closing the viewer also silences what it was playing; the
@@ -4661,9 +4678,19 @@ mod ui_tests {
         harness
             .state_mut()
             .apply(&ctx, &store2, Act::OpenLightbox(0, 0));
-        harness.run();
+        // Several frames with pauses so the background decode lands; first the
+        // single (hidden-B) view, which must show exactly one pane.
+        for _ in 0..12 {
+            harness.run();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        let img = harness.render().expect("wgpu render failed");
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/lightbox_single.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+
         harness.get_by_label_contains("SHOW B").click(); // render A/B side-by-side
-        // Several frames with pauses so the background decode lands.
         for _ in 0..12 {
             harness.run();
             std::thread::sleep(std::time::Duration::from_millis(30));

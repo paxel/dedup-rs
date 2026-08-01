@@ -533,11 +533,9 @@ pub enum MetaBody<'a> {
         tags: Option<&'a crate::id3tags::Tags>,
         can_edit: bool,
     },
-    /// Read-only EXIF capture facts (images have no tag writer here).
-    Exif {
-        camera: Option<&'a str>,
-        taken: Option<String>,
-    },
+    /// Read-only EXIF facts (images have no tag writer here) — the full field
+    /// list as `(tag, value)` pairs, not only camera and date.
+    Exif { fields: Vec<(String, String)> },
 }
 
 /// One column of the Metadata tab: repo badge + file name, then the file's tag
@@ -650,9 +648,33 @@ pub fn draw_metadata_column(
                 );
             }
         }
-        MetaBody::Exif { camera, taken } => {
-            fact_row(ui, "Camera", camera.unwrap_or("—"));
-            fact_row(ui, "Taken", taken.as_deref().unwrap_or("—"));
+        MetaBody::Exif { fields } => {
+            if fields.is_empty() {
+                ui.label(
+                    RichText::new("No EXIF metadata in this file")
+                        .color(theme::grey())
+                        .size(12.0),
+                );
+            } else {
+                // The full field list can be long; it scrolls in its column
+                // rather than pushing the note (and the strip below) away.
+                egui::ScrollArea::vertical()
+                    .id_salt(head.source)
+                    .max_height((ui.available_height() - 40.0).max(80.0))
+                    .show(ui, |ui| {
+                        for (tag, value) in &fields {
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [140.0, 18.0],
+                                    egui::Label::new(
+                                        RichText::new(tag).color(theme::tan()).size(12.0),
+                                    ),
+                                );
+                                ui.label(RichText::new(value).color(theme::text()).size(12.0));
+                            });
+                        }
+                    });
+            }
             ui.add_space(8.0);
             ui.label(
                 RichText::new("Capture metadata is shown as recorded and is not edited here.")
@@ -831,12 +853,18 @@ fn preview_note(preview: &TextPreview) -> String {
     }
 }
 
+/// `sync` scroll-locks the column to a shared offset: comparing two files as
+/// bytes only means anything when both panes show the same offset (§ story
+/// 31). The column applies the given offset and returns where it actually is
+/// after this frame's input, so the caller can adopt whichever pane the user
+/// scrolled as the new shared position.
 pub fn draw_text_column(
     ui: &mut egui::Ui,
     head: &ColumnHead<'_>,
     preview: &TextPreview,
     height: f32,
-) -> egui::Rect {
+    sync: Option<Vec2>,
+) -> (egui::Rect, Vec2) {
     head.draw(ui);
     let note = preview_note(preview);
     ui.label(RichText::new(note).color(theme::lilac()).size(11.0));
@@ -854,27 +882,32 @@ pub fn draw_text_column(
             .max_rect(viewport)
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
-    {
+    let offset = {
         let ui = &mut child;
-        egui::ScrollArea::both()
+        let mut area = egui::ScrollArea::both()
             .id_salt(head.source)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let text = RichText::new(&preview.body)
-                    .color(theme::text())
-                    .monospace()
-                    .size(12.0);
-                // Prose wraps to the column; a hex dump must not — its columns only
-                // line up if long lines scroll sideways instead of folding.
-                let label = egui::Label::new(text).wrap_mode(if preview.is_text {
-                    egui::TextWrapMode::Wrap
-                } else {
-                    egui::TextWrapMode::Extend
-                });
-                ui.add(label);
+            .auto_shrink([false, false]);
+        if let Some(o) = sync {
+            area = area.scroll_offset(o);
+        }
+        area.show(ui, |ui| {
+            let text = RichText::new(&preview.body)
+                .color(theme::text())
+                .monospace()
+                .size(12.0);
+            // Prose wraps to the column; a hex dump must not — its columns only
+            // line up if long lines scroll sideways instead of folding.
+            let label = egui::Label::new(text).wrap_mode(if preview.is_text {
+                egui::TextWrapMode::Wrap
+            } else {
+                egui::TextWrapMode::Extend
             });
-    }
-    viewport
+            ui.add(label);
+        })
+        .state
+        .offset
+    };
+    (viewport, offset)
 }
 
 /// A/B compare overlaid on the lightbox. `b` is the abstract B side — the
@@ -1228,6 +1261,44 @@ mod tests {
         assert!(prev.error.is_some(), "an unreadable file reports why");
     }
 
+    /// A column given a shared scroll offset lands on it — the mechanism that
+    /// keeps two byte panes locked to the same offset (§ story 31).
+    #[test]
+    fn text_columns_can_be_scroll_locked() {
+        let preview = TextPreview {
+            body: (0..400).map(|i| format!("line {i}\n")).collect(),
+            is_text: true,
+            truncated: false,
+            error: None,
+        };
+        let head = ColumnHead {
+            file_name: "long.txt",
+            repo: "r",
+            accent: theme::blue(),
+            read_only: false,
+            is_main: false,
+            source: Path::new("/tmp/r/long.txt"),
+        };
+
+        let mut offset = None;
+        {
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(600.0, 400.0))
+                .build_ui(|ui| {
+                    offset = Some(
+                        draw_text_column(ui, &head, &preview, 300.0, Some(egui::vec2(0.0, 120.0)))
+                            .1,
+                    );
+                });
+            harness.run();
+        }
+        assert_eq!(
+            offset.expect("column drawn").y,
+            120.0,
+            "the column sits at the shared offset it was given"
+        );
+    }
+
     /// A file far longer than its column scrolls inside the viewport it was
     /// given instead of pushing the rest of the screen down.
     #[test]
@@ -1252,7 +1323,7 @@ mod tests {
             let mut harness = egui_kittest::Harness::builder()
                 .with_size(egui::vec2(600.0, 400.0))
                 .build_ui(|ui| {
-                    viewport = Some(draw_text_column(ui, &head, &preview, 300.0));
+                    viewport = Some(draw_text_column(ui, &head, &preview, 300.0, None).0);
                 });
             harness.run();
         }
