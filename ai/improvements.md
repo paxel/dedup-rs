@@ -54,15 +54,21 @@ open items deliberately left out.
 
 ## Open work (verified against source, 2026-07-30)
 
-- **Light theme** — specced in [`.scratch/light-theme/`](../.scratch/light-theme/spec.md),
-  ticket `01` landed 2026-08-01. The palette is now a `theme::Palette` value installed in a
-  **`thread_local`** (not a `static` — the test suite runs in parallel and a shared palette
-  would let light/dark assertions race), read through accessors (`theme::text()`), with the
-  raw values private so new code cannot bypass the active palette. `theme::apply` takes the
-  palette to install. Still dark-only: `DARK` is the only palette, and the rendered board
-  screenshot is byte-identical to before, so the appearance provably did not change.
-  Remaining: tickets `02`–`05` (light values, preference wiring, Settings control, identicon)
-  — **unblocked** since 2026-08-01, when the lightbox-redesign epic landed.
+- ~~**Light theme**~~ — done 2026-08-02, all five tickets in
+  [`.scratch/light-theme/`](../.scratch/light-theme/spec.md) resolved. The palette is a
+  `theme::Palette` value installed in a **`thread_local`** (not a `static` — the test suite
+  runs in parallel and a shared palette would let light/dark assertions race), read through
+  accessors (`theme::text()`) with the raw values private so new code cannot bypass the active
+  palette. Two palettes now exist (`DARK`, `LIGHT`); `register_themes` registers a style per
+  egui `Theme` and `sync_active` installs the palette matching the resolved theme each frame,
+  so switching is live with nothing cached. Appearance is a persisted **System / Light / Dark**
+  setting (default **Dark**, so an upgrade never repaints an existing user's semantic colours;
+  a pre-feature config loads as Dark). The four review-board semantics stay pairwise-distinct
+  in both palettes (asserted by perceptual distance), body text meets a contrast floor against
+  panel and backdrop, and repository identicons keep their hash-derived hue/glyph identity while
+  their tile and cell lightness follow the palette to stay legible on either background. The
+  both-palettes doc image (`docs/screenshots/palettes.png`) is the artifact the light values are
+  tuned against.
 - **Performance at scale**: banded grouping, staged pipelines, and the multi-reference
   diff's merged content index are fine at ~10⁵ files; revisit content-index memory
   (`HashMap<(u64,[u8;32]), _>` across all references) and timeline streaming at 10⁷.

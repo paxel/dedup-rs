@@ -23,6 +23,12 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 - **Archive redundancy shows inline in Duplicates.** When a loose file's content also lives
   inside a zip, a read-only **evidence row** names the archive — and the delete confirmation
   **warns** (never blocks) when a delete would leave content surviving only inside an archive.
+- **Light appearance.** Settings now offers a **System / Light / Dark** appearance choice
+  (Settings → Appearance). Dark stays the default and is unchanged; Light is opt-in, and
+  System follows your desktop's light/dark setting. Switching applies immediately and is
+  remembered. The review board's colour vocabulary (grey unchanged, green only-here, red
+  will-delete, amber differs) stays distinct in both appearances, and repository identicons
+  keep their identity while adapting to stay legible on either background.
 
 ### Changed
 

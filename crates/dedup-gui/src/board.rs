@@ -1370,24 +1370,37 @@ mod tests {
         }
     }
 
-    /// Every status has its own colour: a delete must never look like an add.
+    /// Every status has its own colour, distinguishable on screen — a delete
+    /// must never look like an add. Checked under **every** palette by installing
+    /// each one, so a new appearance cannot be added without the board's colour
+    /// vocabulary being re-verified, and asserted as a minimum perceptual
+    /// distance rather than mere inequality.
     #[test]
     fn the_four_statuses_have_distinct_colours() {
         use Status::*;
-        assert_eq!(Same.color(), theme::grey());
-        assert_eq!(OnlyHere.color(), theme::green());
-        assert_eq!(WillDelete.color(), theme::red());
-        assert_eq!(Differs.color(), theme::amber());
-        for (a, b) in [
-            (Same, OnlyHere),
-            (Same, WillDelete),
-            (Same, Differs),
-            (OnlyHere, WillDelete),
-            (OnlyHere, Differs),
-            (WillDelete, Differs),
-        ] {
-            assert_ne!(a.color(), b.color(), "{a:?} and {b:?} must differ");
+        const MIN: f32 = 40.0;
+        for (name, palette) in [("dark", theme::DARK), ("light", theme::LIGHT)] {
+            theme::install(palette);
+            assert_eq!(Same.color(), theme::grey());
+            assert_eq!(OnlyHere.color(), theme::green());
+            assert_eq!(WillDelete.color(), theme::red());
+            assert_eq!(Differs.color(), theme::amber());
+            for (a, b) in [
+                (Same, OnlyHere),
+                (Same, WillDelete),
+                (Same, Differs),
+                (OnlyHere, WillDelete),
+                (OnlyHere, Differs),
+                (WillDelete, Differs),
+            ] {
+                let d = theme::perceptual_distance(a.color(), b.color());
+                assert!(
+                    d >= MIN,
+                    "{name}: {a:?} and {b:?} too close on screen ({d:.0} < {MIN})"
+                );
+            }
         }
+        theme::install(theme::DARK);
     }
 
     /// Row height follows whichever is taller — the name list or the command
@@ -2136,6 +2149,86 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("screenshot dir");
         let out = dir.join("board.png");
         img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// The both-palettes image: the review board (all four statuses, LCARS
+    /// pills, an elbow rail, a repo chip, body text) rendered under **dark and
+    /// light side by side**, so the two appearances can be judged as a pair.
+    /// This is the artifact the light palette's values are tuned against.
+    #[test]
+    #[ignore = "generates the both-palettes doc image (needs wgpu)"]
+    fn doc_screenshot_both_palettes() {
+        fn render_under(palette: crate::theme::Palette) -> image::RgbaImage {
+            let mut multi = diff_row("photo");
+            multi.left_paths = vec!["photo.jpg".into(), "photo (1).jpg".into()];
+            multi.right_paths = vec!["IMG_0042.jpg".into()];
+            multi.cmds = vec![Cmd::RenameLeft, Cmd::KeepOneLeft, Cmd::CopyRight, Cmd::Hide];
+            let mut simple = diff_row("notes");
+            simple.left_status = Status::OnlyHere;
+            simple.right_status = Status::Absent;
+            simple.right_paths = Vec::new();
+            simple.cmds = vec![Cmd::CopyRight, Cmd::DeleteLeft, Cmd::Hide];
+            let mut renamed = diff_row("holiday");
+            renamed.left_paths = vec!["a/b/holiday_v2.jpg".into()];
+            renamed.right_paths = vec!["a/b/holiday.jpg".into()];
+            let metas = vec![renamed, multi, simple];
+
+            let mut init = false;
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(1000.0, 620.0))
+                .wgpu()
+                .build_ui_state(
+                    move |ui, state: &mut BoardState| {
+                        if !init {
+                            crate::icon::install(ui.ctx());
+                            crate::theme::apply(ui.ctx(), palette);
+                            init = true;
+                        }
+                        let mut thumbs = ThumbCache::new(4);
+                        board(
+                            ui,
+                            state,
+                            &metas,
+                            BoardView {
+                                left_role: "LEFT",
+                                left_repo: "photos-2024",
+                                left_is_main: true,
+                                left_path: "/home/axel/media/photos-2024",
+                                right: Some(RightHeader {
+                                    role: "RIGHT",
+                                    repo: "backup-nas",
+                                    is_main: false,
+                                    path: "/mnt/nas/backup/photos",
+                                    multi_repo: false,
+                                }),
+                                totals: [0, 1, 2, 0],
+                                full_len: 3,
+                                hide_skips_run: false,
+                            },
+                            &mut thumbs,
+                            &mut |_| RowBody::default(),
+                        );
+                    },
+                    BoardState::default(),
+                );
+            harness.run();
+            harness.run();
+            harness.render().expect("wgpu render failed")
+        }
+
+        let dark = render_under(crate::theme::DARK);
+        let light = render_under(crate::theme::LIGHT);
+        let (w, h) = (dark.width(), dark.height());
+        let gap = 16u32;
+        let mut both = image::RgbaImage::from_pixel(w * 2 + gap, h, image::Rgba([40, 40, 40, 255]));
+        image::imageops::replace(&mut both, &dark, 0, 0);
+        image::imageops::replace(&mut both, &light, (w + gap) as i64, 0);
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
+        std::fs::create_dir_all(&dir).expect("screenshot dir");
+        let out = dir.join("palettes.png");
+        both.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 

@@ -1,6 +1,6 @@
 # 02 — The light palette, and the image it is judged from
 
-Status: ready-for-agent
+Status: resolved
 Spec: ../spec.md
 Blocked by: 01
 

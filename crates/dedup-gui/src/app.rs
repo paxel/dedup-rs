@@ -7,7 +7,7 @@
 use crate::dupes_view::DupesView;
 use crate::grooming_view::GroomingView;
 use crate::icon;
-use crate::settings::TooltipVerbosity;
+use crate::settings::{ThemeChoice, TooltipVerbosity};
 use crate::status::{self, Location};
 use crate::theme;
 use crate::transfer_view::TransferView;
@@ -194,6 +194,8 @@ pub struct DedupApp {
     did_initial_status: bool,
     threads: usize,
     tooltip_verbosity: TooltipVerbosity,
+    /// Chosen interface appearance; applied to egui each frame.
+    theme: ThemeChoice,
 
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
@@ -241,6 +243,7 @@ impl DedupApp {
             did_initial_status: false,
             threads: 0,
             tooltip_verbosity: TooltipVerbosity::default(),
+            theme: ThemeChoice::default(),
             tx,
             rx,
             worker: WorkerState::default(),
@@ -264,6 +267,7 @@ impl DedupApp {
         app.transfer
             .set_threshold(settings.transfer_similarity_threshold);
         app.tooltip_verbosity = settings.tooltip_verbosity;
+        app.theme = settings.theme;
         app.saved_settings = settings;
         app.reload_all();
         app
@@ -276,6 +280,7 @@ impl DedupApp {
             similarity_threshold: self.dupes.threshold(),
             transfer_similarity_threshold: self.transfer.threshold(),
             tooltip_verbosity: self.tooltip_verbosity,
+            theme: self.theme,
             window_size: self.window_size,
         }
     }
@@ -839,6 +844,11 @@ impl DedupApp {
 impl eframe::App for DedupApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // Drive egui from the chosen appearance, then follow whatever it
+        // resolved to this frame so the application's own colours read from the
+        // matching palette. Setting the same preference each frame is idempotent.
+        ctx.set_theme(self.theme.preference());
+        theme::sync_active(&ctx);
         // One-time startup probe of every repo's location/reachability.
         if !self.did_initial_status {
             self.did_initial_status = true;
@@ -1021,7 +1031,8 @@ impl eframe::App for DedupApp {
             || current.similarity_threshold != self.saved_settings.similarity_threshold
             || current.transfer_similarity_threshold
                 != self.saved_settings.transfer_similarity_threshold
-            || current.tooltip_verbosity != self.saved_settings.tooltip_verbosity;
+            || current.tooltip_verbosity != self.saved_settings.tooltip_verbosity
+            || current.theme != self.saved_settings.theme;
         if control_changed {
             current.save(self.store.config_dir());
             self.saved_settings = current;
@@ -1039,7 +1050,7 @@ impl DedupApp {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("top")
             .exact_size(56.0)
-            .frame(egui::Frame::new().fill(theme::black()).inner_margin(8.0))
+            .frame(egui::Frame::new().fill(theme::bg()).inner_margin(8.0))
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.label(
@@ -2245,6 +2256,70 @@ impl DedupApp {
                 RichText::new("Controls how much detail hover tooltips show throughout the app")
                     .color(theme::tan())
                     .size(12.0),
+            );
+            ui.add_space(12.0);
+
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Appearance").color(theme::text()));
+                egui::Frame::new()
+                    .stroke(egui::Stroke::new(1.0, theme::amber()))
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::symmetric(4, 2))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (choice, label, short_help, long_help) in [
+                                (
+                                    ThemeChoice::System,
+                                    "SYSTEM",
+                                    "Follow your desktop",
+                                    "Follows your desktop's own light or dark setting and \
+                                     switches whenever that does.",
+                                ),
+                                (
+                                    ThemeChoice::Light,
+                                    "LIGHT",
+                                    "Always light",
+                                    "Uses the light appearance regardless of your desktop \
+                                     setting.",
+                                ),
+                                (
+                                    ThemeChoice::Dark,
+                                    "DARK",
+                                    "Always dark",
+                                    "Uses the dark appearance regardless of your desktop \
+                                     setting.",
+                                ),
+                            ] {
+                                let on = self.theme == choice;
+                                let (fill, txt) = if on {
+                                    (theme::amber(), theme::black())
+                                } else {
+                                    (theme::panel(), theme::amber())
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(RichText::new(label).color(txt))
+                                            .fill(fill),
+                                    )
+                                    .explain(self.tooltip_verbosity, short_help, long_help)
+                                    .clicked()
+                                {
+                                    // Apply immediately so the change is visible
+                                    // this frame; persistence happens in `ui`.
+                                    self.theme = choice;
+                                    ctx.set_theme(choice.preference());
+                                    theme::sync_active(ctx);
+                                }
+                            }
+                        });
+                    });
+            });
+            ui.label(
+                RichText::new(
+                    "Dark is the default; System follows your desktop's light/dark setting",
+                )
+                .color(theme::tan())
+                .size(12.0),
             );
             ui.add_space(12.0);
 
@@ -3506,6 +3581,54 @@ mod ui_tests {
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 
+    /// The appearance control offers exactly System / Light / Dark, and picking
+    /// one repaints in the same frame — the observable behaviour, not merely
+    /// that a field was written.
+    #[test]
+    fn appearance_control_offers_three_options_and_applies_at_once() {
+        use crate::settings::ThemeChoice;
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, mut app) = sample_app();
+        app.show_settings = true;
+        assert_eq!(app.theme, ThemeChoice::Dark, "default is Dark");
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(460.0, 460.0))
+            .build_ui_state(
+                move |ui, app: &mut DedupApp| {
+                    if !init {
+                        icon::install(ui.ctx());
+                        theme::register_themes(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
+                        init = true;
+                    }
+                    app.settings_modal(&ui.ctx().clone());
+                },
+                app,
+            );
+        harness.run();
+        for label in ["SYSTEM", "LIGHT", "DARK"] {
+            assert!(
+                harness.query_by_label(label).is_some(),
+                "the appearance control offers {label}"
+            );
+        }
+
+        harness.get_by_label("LIGHT").click();
+        harness.run();
+        assert_eq!(
+            harness.state().theme,
+            ThemeChoice::Light,
+            "the choice is recorded"
+        );
+        assert_eq!(
+            theme::text(),
+            theme::LIGHT.text,
+            "and the light palette is live in the same interaction — no restart"
+        );
+        theme::install(theme::DARK);
+    }
+
     /// Doc screenshot: the Settings dialog (hashing threads, tooltip
     /// verbosity toggle) to `docs/screenshots/settings_modal.png`. `--ignored`.
     #[test]
@@ -3515,7 +3638,7 @@ mod ui_tests {
         app.show_settings = true;
         let mut init = false;
         let mut harness = Harness::builder()
-            .with_size(egui::vec2(420.0, 320.0))
+            .with_size(egui::vec2(420.0, 420.0))
             .wgpu()
             .build_ui_state(
                 move |ui, app: &mut DedupApp| {

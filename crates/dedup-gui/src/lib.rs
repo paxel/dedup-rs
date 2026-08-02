@@ -47,12 +47,16 @@ pub fn run(ui_scale: Option<f32>) -> Result<(), String> {
     }
     let store = Arc::new(Store::open().map_err(|e| e.to_string())?);
 
-    // Restore the last window size (clamped to something sane), so the app opens
-    // where it was left instead of a fixed default.
-    let size = settings::Settings::load(store.config_dir())
+    // Load the persisted settings once: the last window size (so the app opens
+    // where it was left) and the appearance preference (so the very first frame
+    // already resolves to the chosen theme — no one-frame flash of the wrong
+    // appearance on a desktop whose system theme differs from the setting).
+    let settings = settings::Settings::load(store.config_dir());
+    let size = settings
         .window_size
         .map(|[w, h]| [w.clamp(760.0, 10_000.0), h.clamp(480.0, 10_000.0)])
         .unwrap_or([1100.0, 720.0]);
+    let theme_pref = settings.theme.preference();
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size(size)
         .with_min_inner_size([760.0, 480.0])
@@ -74,7 +78,12 @@ pub fn run(ui_scale: Option<f32>) -> Result<(), String> {
         options,
         Box::new(move |cc| {
             icon::install(&cc.egui_ctx);
-            theme::apply(&cc.egui_ctx, theme::DARK);
+            // Register a style per theme and resolve to the persisted
+            // preference before the first frame; the app then drives it live
+            // each frame from its own copy of the setting (default Dark).
+            theme::register_themes(&cc.egui_ctx);
+            cc.egui_ctx.set_theme(theme_pref);
+            theme::sync_active(&cc.egui_ctx);
             if let Some(scale) = ui_scale {
                 cc.egui_ctx.set_zoom_factor(scale.clamp(0.5, 3.0));
             }

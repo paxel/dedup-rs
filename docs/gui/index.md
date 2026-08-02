@@ -27,9 +27,17 @@ The tab buttons switch views; the current tab is highlighted. On the right:
   explaining what the control does and when to use it. This is the setting to flip on if
   you're new to the app and want the interface to teach you as you hover, or back to SHORT
   once you know your way around.
+- **Appearance: SYSTEM / LIGHT / DARK** — which colour appearance the interface uses.
+  **DARK** is the default classic LCARS look; **LIGHT** is an opt-in light appearance; and
+  **SYSTEM** follows your desktop's own light/dark setting and switches whenever that does.
+  Choosing one applies it instantly. Dark is deliberately the default rather than System:
+  colour here is semantic — red means a file will be deleted — so an update never silently
+  repaints an existing user's vocabulary, least of all on a light desktop.
 
-Both settings persist across launches, written to `gui_settings.json` in the config
+These settings persist across launches, written to `gui_settings.json` in the config
 directory (`$XDG_CONFIG_HOME/dedup`, or `~/.config/dedup` by default) the moment they change.
+A settings file written before the light appearance existed loads as Dark, so upgrading never
+changes how the app looks.
 Session logs live separately under `$XDG_STATE_HOME/dedup/logs` (default
 `~/.local/state/dedup/logs`), ten runs deep, reachable from Settings → OPEN LOG FOLDER. Per-repo read-only state is
 deliberately **not** persisted — every repo re-locks on launch as a safety default, since

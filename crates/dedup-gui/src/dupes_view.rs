@@ -1037,7 +1037,7 @@ impl DupesView {
         let unlocked = repo_ro && self.unlocked.contains(&k);
         let ro = repo_ro && !unlocked;
         egui::Frame::new()
-            .fill(theme::black())
+            .fill(theme::bg())
             .corner_radius(theme::PILL)
             .inner_margin(8.0)
             .outer_margin(egui::Margin::same(4))

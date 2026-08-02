@@ -1682,7 +1682,20 @@ fn tag_glyph(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
 /// `mode`. Reads as a tag everywhere and stays legible in every state. Returns
 /// the click response (for `Add`/`Removable`/`Toggle` modes).
 fn annotation_chip(ui: &mut egui::Ui, text: &str, mode: ChipMode) -> egui::Response {
-    let violet = Color32::from_rgb(0x33, 0x2A, 0x59);
+    // The annotation pill follows the palette: a deep violet under dark (bright
+    // lilac text reads on it), a light lilac tint under light (the darker lilac
+    // text reads on that). Hue stays the "annotation" violet in both.
+    let (violet, violet_hover) = if theme::is_dark() {
+        (
+            Color32::from_rgb(0x33, 0x2A, 0x59),
+            Color32::from_rgb(0x45, 0x39, 0x74),
+        )
+    } else {
+        (
+            Color32::from_rgb(0xDE, 0xD2, 0xF0),
+            Color32::from_rgb(0xCE, 0xBF, 0xEB),
+        )
+    };
     let font = egui::FontId::proportional(12.0);
     let galley = ui
         .painter()
@@ -1703,14 +1716,7 @@ fn annotation_chip(ui: &mut egui::Ui, text: &str, mode: ChipMode) -> egui::Respo
         let hov = resp.hovered();
         let (fill, fg) = match mode {
             ChipMode::Display => (violet, theme::lilac()),
-            ChipMode::Add => (
-                if hov {
-                    Color32::from_rgb(0x45, 0x39, 0x74)
-                } else {
-                    violet
-                },
-                theme::lilac(),
-            ),
+            ChipMode::Add => (if hov { violet_hover } else { violet }, theme::lilac()),
             ChipMode::Removable => (
                 if hov { theme::amber() } else { theme::tan() },
                 theme::black(),
@@ -1748,14 +1754,33 @@ fn annotation_chip(ui: &mut egui::Ui, text: &str, mode: ChipMode) -> egui::Respo
 }
 
 /// Bright/dim blue selection so both panes keep their selection marked TUI-style
+/// (bright when a pane is focused, dim otherwise). Follows the palette: dark
+/// blues under dark (cream text reads on them), light blues under light (dark
+/// ink reads) — `theme::text()` is the right text colour on either.
+fn selection_bg(active: bool) -> Color32 {
+    match (theme::is_dark(), active) {
+        (true, true) => Color32::from_rgb(0x2E, 0x45, 0x80),
+        (true, false) => Color32::from_rgb(0x1A, 0x22, 0x30),
+        (false, true) => Color32::from_rgb(0xAF, 0xC7, 0xEA),
+        (false, false) => Color32::from_rgb(0xD2, 0xDB, 0xE8),
+    }
+}
+
+/// The row-hover highlight for the list/table panes: a subtle slate that stays
+/// under the cream/ink text in either appearance.
+fn row_hover() -> Color32 {
+    if theme::is_dark() {
+        Color32::from_rgb(0x2C, 0x37, 0x4E)
+    } else {
+        Color32::from_rgb(0xE1, 0xE7, 0xF0)
+    }
+}
+
+/// Bright/dim blue selection so both panes keep their selection marked TUI-style
 /// (bright when focused, dim otherwise). Shared by the list panes.
 fn selection_colors(ui: &mut egui::Ui, active: bool) {
     let sel = &mut ui.visuals_mut().selection;
-    sel.bg_fill = if active {
-        Color32::from_rgb(0x2E, 0x45, 0x80)
-    } else {
-        Color32::from_rgb(0x1A, 0x22, 0x30)
-    };
+    sel.bg_fill = selection_bg(active);
     sel.stroke.color = theme::text();
 }
 
@@ -1790,7 +1815,7 @@ fn paint_chip(
         let (fill, fg) = if selected {
             (sel_fill, sel_fg)
         } else if resp.hovered() {
-            (Color32::from_rgb(0x2C, 0x37, 0x4E), theme::text())
+            (row_hover(), theme::text())
         } else {
             (Color32::TRANSPARENT, theme::text())
         };
@@ -1816,12 +1841,14 @@ fn pill_toggle(ui: &mut egui::Ui, on: bool, text: &str) -> egui::Response {
 /// A full-width list row (dirs pane): blue selection (bright when the pane is
 /// focused, dim otherwise) with cream text; dark hover; readable in every state.
 fn list_row(ui: &mut egui::Ui, selected: bool, active: bool, text: &str) -> egui::Response {
-    let sel_fill = if active {
-        Color32::from_rgb(0x2E, 0x45, 0x80)
-    } else {
-        Color32::from_rgb(0x1A, 0x22, 0x30)
-    };
-    paint_chip(ui, text, selected, sel_fill, theme::text(), true)
+    paint_chip(
+        ui,
+        text,
+        selected,
+        selection_bg(active),
+        theme::text(),
+        true,
+    )
 }
 
 /// Interaction colours for the **file table**, whose cells are non-interactive
@@ -1831,7 +1858,7 @@ fn list_row(ui: &mut egui::Ui, selected: bool, active: bool, text: &str) -> egui
 fn table_visuals(ui: &mut egui::Ui, active: bool) {
     let w = &mut ui.visuals_mut().widgets;
     w.noninteractive.fg_stroke.color = theme::text();
-    w.hovered.bg_fill = Color32::from_rgb(0x2C, 0x37, 0x4E);
+    w.hovered.bg_fill = row_hover();
     selection_colors(ui, active);
 }
 

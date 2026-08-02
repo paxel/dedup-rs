@@ -46,6 +46,11 @@ Most surfaces share one **filter** wizard: conditions like `mime:image`, `name:*
 everything that is not an MP3), and `case:insensitive` (the `Aa` toggle) makes text matching
 ignore capitalisation.
 
+The interface ships in its classic **dark** LCARS appearance, with an opt-in **light** one;
+Settings → Appearance offers System / Light / Dark (System follows your desktop), applied
+immediately and remembered. Dark stays the default so an update never repaints the semantic
+delete/differ colours out from under you.
+
 Scanning is protective by default: a scan that finds **no files at all** in a repository whose
 index still holds entries is refused rather than marking everything missing — an unmounted drive
 is indistinguishable from an emptied one, and an emptied backup-group main would turn the next

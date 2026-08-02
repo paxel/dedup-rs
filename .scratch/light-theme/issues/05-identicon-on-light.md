@@ -1,6 +1,6 @@
 # 05 — Make repository identicons legible on light
 
-Status: ready-for-agent
+Status: resolved
 Spec: ../spec.md
 Blocked by: 04
 

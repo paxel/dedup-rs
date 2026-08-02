@@ -967,10 +967,11 @@ impl DiffCompare {
             .show(ctx, |ui| {
                 let screen = ctx.content_rect();
                 let bg = ui.allocate_rect(screen, egui::Sense::click_and_drag());
-                // Fully opaque: this is a judgement call about two files, and a
-                // translucent backdrop let the tab underneath read through the
-                // photographs.
-                ui.painter().rect_filled(screen, 0.0, theme::black());
+                // Fully opaque, and following the palette (black under dark, the
+                // light backdrop under light): this is a judgement call about two
+                // files, and a translucent backdrop let the tab underneath read
+                // through the photographs.
+                ui.painter().rect_filled(screen, 0.0, theme::bg());
                 let inner = screen.shrink(12.0);
                 let mut pick = None;
                 let two_sided = self.two_sided();

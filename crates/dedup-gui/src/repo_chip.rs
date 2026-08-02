@@ -12,19 +12,45 @@ use egui::{Color32, Rect, RichText, Sense, Vec2};
 /// Point size of the square identicon glyph.
 const GLYPH: f32 = 18.0;
 
+/// The identicon's hue for `name`, in degrees. Derived only from the name, so
+/// it is the repo's stable identity and must never depend on the palette — a
+/// repo that changed colour when you switched appearance would defeat the point
+/// of a stable identicon.
+fn identicon_hue(name: &str) -> f32 {
+    (theme::name_hash(name) % 360) as f32
+}
+
+/// The identicon cell colour for `name` under the active palette. The hue is the
+/// stable identity; only lightness and saturation follow the appearance, so the
+/// cells hold contrast against the palette's tile without changing which repo
+/// the glyph reads as.
+fn identicon_cell(name: &str) -> Color32 {
+    let (sat, light) = if theme::is_dark() {
+        (0.55, 0.70)
+    } else {
+        (0.60, 0.42)
+    };
+    theme::hsl(identicon_hue(name), sat, light)
+}
+
 /// Paint a deterministic, left-right-symmetric 5×5 identicon for `name` into
-/// `rect`, in a stable name-hashed pastel color on a dark tile. The same name
-/// always yields the same glyph, so a repo keeps one visual identity across
-/// tabs; different names almost always differ (hash-derived).
+/// `rect`, in a stable name-hashed colour on a tile that follows the active
+/// palette. The same name always yields the same glyph and the same hue, so a
+/// repo keeps one visual identity across tabs and across appearances; different
+/// names almost always differ (hash-derived).
 pub fn identicon(painter: &egui::Painter, rect: Rect, name: &str) {
     // Square the rect from its center so the grid stays regular.
     let side = rect.width().min(rect.height());
     let tile = Rect::from_center_size(rect.center(), Vec2::splat(side));
-    // A dark tile makes the pastel cells legible on any chip fill.
-    painter.rect_filled(tile, 3.0, theme::black());
+    // A neutral tile behind the cells keeps them legible on any chip fill
+    // (selected/accent or panel). It follows the palette — a dark box under
+    // dark, a light box under light — so the cells never sit on the wrong
+    // ground. `bg` is the app backdrop: black under dark (unchanged), light
+    // parchment under light.
+    painter.rect_filled(tile, 3.0, theme::bg());
 
     let hash = theme::name_hash(name);
-    let color = theme::hsl((hash % 360) as f32, 0.55, 0.70);
+    let color = identicon_cell(name);
     // Equal, integer-sized cells centered in the tile with a margin, so every
     // column is the same width and the grid is exactly left-right symmetric — and
     // no cell sits flush against the tile edge (which clipped the last column thin).
@@ -280,6 +306,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A repo's hue is its identity: the same name yields the same hue under
+    /// both palettes, so switching appearance never makes a repo unrecognisable.
+    #[test]
+    fn identicon_hue_is_stable_across_palettes() {
+        for name in ["Photos", "Videos", "Archive", "data"] {
+            theme::install(theme::DARK);
+            let dark = identicon_hue(name);
+            theme::install(theme::LIGHT);
+            let light = identicon_hue(name);
+            assert_eq!(dark, light, "{name}: hue changed with the appearance");
+        }
+        theme::install(theme::DARK);
+    }
+
+    /// The actual defect: cells must stay legible on the tile in *both*
+    /// palettes, not just glow on black. Assert contrast rather than eyeball it.
+    #[test]
+    fn identicon_cells_contrast_with_the_tile_in_both_palettes() {
+        // A modest floor — the cells need only be discernible boxes on the tile,
+        // not body-text legible. The dark defect was fine; the light one wasn't.
+        const MIN: f32 = 1.6;
+        for (label, palette) in [("dark", theme::DARK), ("light", theme::LIGHT)] {
+            theme::install(palette);
+            let tile = theme::bg();
+            for name in ["Photos", "Videos", "Archive", "Automatic Upload", "data"] {
+                let ratio = theme::contrast_ratio(identicon_cell(name), tile);
+                assert!(
+                    ratio >= MIN,
+                    "{label}: {name} cells vs tile contrast {ratio:.2} < {MIN}"
+                );
+            }
+        }
+        theme::install(theme::DARK);
     }
 
     /// The chip renders the name and reports a click on it; with `lock` set it

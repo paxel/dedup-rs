@@ -32,7 +32,15 @@ const HAIRLINE: Color32 = Color32::from_rgb(0x5C, 0x4E, 0x40);
 /// expressible at all. Fields are added as accessors are driven out by tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Palette {
+    /// Whether this is a dark appearance — selects egui's base `Visuals` and
+    /// the `dark_mode` flag its own chrome reads.
+    pub dark_mode: bool,
+    /// The darkest ink: text drawn *on* a coloured pill, and other high-contrast
+    /// marks. Stays dark in both appearances (black on an orange pill reads on
+    /// either background) — it is **not** the window backdrop; that is `bg`.
     pub black: Color32,
+    /// The window/panel backdrop. Black in dark, near-white in light.
+    pub bg: Color32,
     pub orange: Color32,
     pub amber: Color32,
     pub tan: Color32,
@@ -48,7 +56,9 @@ pub struct Palette {
 
 /// The appearance the application has always had.
 pub const DARK: Palette = Palette {
+    dark_mode: true,
     black: BLACK,
+    bg: BLACK,
     orange: ORANGE,
     amber: AMBER,
     tan: TAN,
@@ -60,6 +70,29 @@ pub const DARK: Palette = Palette {
     text: TEXT,
     panel: PANEL,
     hairline: HAIRLINE,
+};
+
+/// The light appearance. Hand-derived, not an inversion of dark: the four
+/// review-board semantics (grey unchanged, green only-here, red will-delete,
+/// amber differs) are dark variants chosen to stay pairwise distinct on a light
+/// background, where a mechanical flip would collapse "will delete" into
+/// "differs". Starting values — the user is the customer and tunes them by eye
+/// against the both-palettes image.
+pub const LIGHT: Palette = Palette {
+    dark_mode: false,
+    black: Color32::from_rgb(0x1A, 0x14, 0x10),
+    bg: Color32::from_rgb(0xF2, 0xEE, 0xE6),
+    orange: Color32::from_rgb(0xD9, 0x7A, 0x00),
+    amber: Color32::from_rgb(0xB5, 0x82, 0x0E),
+    tan: Color32::from_rgb(0xC7, 0x9A, 0x5E),
+    lilac: Color32::from_rgb(0x82, 0x57, 0xC7),
+    blue: Color32::from_rgb(0x2C, 0x6F, 0xB5),
+    red: Color32::from_rgb(0xB0, 0x36, 0x2A),
+    green: Color32::from_rgb(0x2E, 0x7D, 0x4F),
+    grey: Color32::from_rgb(0x8C, 0x87, 0x7C),
+    text: Color32::from_rgb(0x2A, 0x20, 0x18),
+    panel: Color32::from_rgb(0xE3, 0xDD, 0xD1),
+    hairline: Color32::from_rgb(0xB8, 0xAE, 0x9C),
 };
 
 thread_local! {
@@ -89,8 +122,55 @@ macro_rules! colour {
 }
 
 colour!(
-    black, orange, amber, tan, lilac, blue, red, green, grey, text, panel, hairline
+    black, bg, orange, amber, tan, lilac, blue, red, green, grey, text, panel, hairline
 );
+
+/// Whether the active palette is a dark appearance. Lets a few pieces that
+/// aren't a single flat colour (the identicon's tile and cell lightness) adapt
+/// without threading the whole palette through.
+pub fn is_dark() -> bool {
+    ACTIVE.with(|p| p.get().dark_mode)
+}
+
+/// Perceptual colour distance (the "redmean" approximation of ΔE). Two colours
+/// that differ by one channel value are numerically unequal but visually the
+/// same; this measures whether they are *distinguishable*. Range ≈ 0–765.
+///
+/// A test-only assertion helper: the palettes are static data, so their
+/// separation is proven once in the suite rather than recomputed at runtime.
+#[cfg(test)]
+pub fn perceptual_distance(a: Color32, b: Color32) -> f32 {
+    let (r1, g1, b1) = (a.r() as f32, a.g() as f32, a.b() as f32);
+    let (r2, g2, b2) = (b.r() as f32, b.g() as f32, b.b() as f32);
+    let rbar = (r1 + r2) / 2.0;
+    let (dr, dg, db) = (r1 - r2, g1 - g2, b1 - b2);
+    ((2.0 + rbar / 256.0) * dr * dr + 4.0 * dg * dg + (2.0 + (255.0 - rbar) / 256.0) * db * db)
+        .sqrt()
+}
+
+/// WCAG relative luminance of a colour (0 = black, 1 = white).
+#[cfg(test)]
+fn relative_luminance(c: Color32) -> f32 {
+    let f = |v: u8| {
+        let s = v as f32 / 255.0;
+        if s <= 0.03928 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * f(c.r()) + 0.7152 * f(c.g()) + 0.0722 * f(c.b())
+}
+
+/// WCAG contrast ratio between two colours (1 = identical, 21 = black/white).
+/// Test-only, like [`perceptual_distance`]: legibility is asserted against the
+/// static palettes in the suite, not measured live.
+#[cfg(test)]
+pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
 
 /// Large corner radius gives widgets the rounded LCARS block look.
 pub const PILL: CornerRadius = CornerRadius::same(12);
@@ -138,25 +218,36 @@ fn pill(bg: Color32, fg: Color32) -> WidgetVisuals {
     }
 }
 
-/// Install `palette` on this thread and build the matching egui style on `ctx`.
-///
-/// Both halves happen here so egui's own chrome and the colours the application
-/// paints can never disagree about which appearance is active.
-pub fn apply(ctx: &egui::Context, palette: Palette) {
-    install(palette);
+/// Build the egui [`Style`] for one palette (its own chrome colours, widgets and
+/// spacing). Pure — installs nothing.
+fn style_for(palette: Palette) -> Style {
     let p = palette;
     let mut style = Style::default();
-    let mut v = Visuals::dark();
+    let mut v = if p.dark_mode {
+        Visuals::dark()
+    } else {
+        Visuals::light()
+    };
 
-    v.dark_mode = true;
-    v.window_fill = p.black;
-    v.panel_fill = p.black;
+    v.dark_mode = p.dark_mode;
+    v.window_fill = p.bg;
+    v.panel_fill = p.bg;
     v.faint_bg_color = p.panel;
-    v.extreme_bg_color = Color32::from_rgb(0x12, 0x0D, 0x16);
+    // A slightly deeper inset than the panel, in the palette's own direction.
+    v.extreme_bg_color = if p.dark_mode {
+        Color32::from_rgb(0x12, 0x0D, 0x16)
+    } else {
+        Color32::from_rgb(0xD8, 0xD1, 0xC3)
+    };
     v.override_text_color = Some(p.text);
     v.hyperlink_color = p.blue;
     v.window_stroke = Stroke::new(1.5, p.orange);
-    v.selection.bg_fill = Color32::from_rgb(0x24, 0x33, 0x5C);
+    // Selection fill: a muted tint of the accent blue, toward the backdrop.
+    v.selection.bg_fill = if p.dark_mode {
+        Color32::from_rgb(0x24, 0x33, 0x5C)
+    } else {
+        Color32::from_rgb(0xC6, 0xD8, 0xF0)
+    };
     v.selection.stroke = Stroke::new(1.0, p.blue);
 
     // Buttons: orange at rest, amber on hover, tan when pressed, lilac when open.
@@ -165,7 +256,15 @@ pub fn apply(ctx: &egui::Context, palette: Palette) {
     v.widgets.active = pill(p.tan, p.black);
     v.widgets.open = pill(p.lilac, p.black);
     v.widgets.noninteractive.corner_radius = PILL;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x3A, 0x2A, 0x1E));
+    // Keep the dark appearance's exact prior outline; light uses its hairline.
+    v.widgets.noninteractive.bg_stroke = Stroke::new(
+        1.0,
+        if p.dark_mode {
+            Color32::from_rgb(0x3A, 0x2A, 0x1E)
+        } else {
+            p.hairline
+        },
+    );
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
 
     style.visuals = v;
@@ -175,7 +274,41 @@ pub fn apply(ctx: &egui::Context, palette: Palette) {
     // instead of a hover-only overlay, so long result pages are visibly
     // scrollable.
     style.spacing.scroll = egui::style::ScrollStyle::solid();
+    style
+}
+
+/// Install `palette` on this thread and force it as the style everywhere on
+/// `ctx`. The low-level path — used by tests and screenshots that need one
+/// specific appearance regardless of the theme preference. Production drives the
+/// appearance through [`register_themes`] + [`sync_active`] instead.
+#[cfg(test)]
+pub fn apply(ctx: &egui::Context, palette: Palette) {
+    install(palette);
+    let style = style_for(palette);
     ctx.all_styles_mut(move |s| *s = style.clone());
+}
+
+/// The palette for an egui theme.
+fn palette_for(theme: egui::Theme) -> Palette {
+    match theme {
+        egui::Theme::Dark => DARK,
+        egui::Theme::Light => LIGHT,
+    }
+}
+
+/// Register a style for **each** theme, so egui draws its own chrome with the
+/// one matching the resolved preference. Called once; the live choice is then
+/// egui's to make and [`sync_active`] follows it each frame.
+pub fn register_themes(ctx: &egui::Context) {
+    ctx.set_style_of(egui::Theme::Dark, style_for(DARK));
+    ctx.set_style_of(egui::Theme::Light, style_for(LIGHT));
+}
+
+/// Follow egui's currently-resolved theme: install the matching palette so the
+/// application's own `theme::x()` reads agree with egui's chrome. Cheap — call
+/// it each frame; switching appearance is just the next install, nothing cached.
+pub fn sync_active(ctx: &egui::Context) {
+    install(palette_for(ctx.theme()));
 }
 
 #[cfg(test)]
@@ -249,10 +382,103 @@ mod tests {
         assert_eq!(text(), DARK.text);
     }
 
+    /// Resolving to a theme installs that theme's palette; switching is live,
+    /// with nothing cached to invalidate.
+    #[test]
+    fn sync_follows_the_resolved_theme() {
+        let ctx = egui::Context::default();
+        register_themes(&ctx);
+
+        ctx.set_theme(egui::ThemePreference::Light);
+        sync_active(&ctx);
+        assert_eq!(
+            text(),
+            LIGHT.text,
+            "resolving to light installs the light palette"
+        );
+        assert_eq!(red(), LIGHT.red);
+
+        ctx.set_theme(egui::ThemePreference::Dark);
+        sync_active(&ctx);
+        assert_eq!(
+            text(),
+            DARK.text,
+            "and back to dark on the next sync — no restart, no cache"
+        );
+        install(DARK);
+    }
+
+    /// The whole chain works inside a real egui frame: setting the preference,
+    /// syncing, and reading the accessor all connect.
+    #[test]
+    fn a_surface_under_each_theme_reads_that_palette() {
+        for (pref, want) in [
+            (egui::ThemePreference::Light, LIGHT),
+            (egui::ThemePreference::Dark, DARK),
+        ] {
+            let mut h = egui_kittest::Harness::builder().build_ui(move |ui| {
+                register_themes(ui.ctx());
+                ui.ctx().set_theme(pref);
+                sync_active(ui.ctx());
+            });
+            h.run();
+            // The harness ran the closure on this thread, so the palette it
+            // installed is what the accessors now read.
+            assert_eq!((text(), red()), (want.text, want.red));
+        }
+        install(DARK);
+    }
+
+    /// Both palettes keep the four review-board semantics **distinguishable on
+    /// screen**, not merely unequal: a light palette where "will delete" and
+    /// "differs" looked alike would be a deletion hazard. Asserted as a minimum
+    /// perceptual distance, and looped over every palette so a third cannot be
+    /// added without being checked.
+    #[test]
+    fn the_semantic_colours_stay_distinct_in_every_palette() {
+        // Redmean ~40 is a conservative "clearly different on screen" floor.
+        const MIN: f32 = 40.0;
+        for (name, p) in [("dark", DARK), ("light", LIGHT)] {
+            let semantics = [
+                ("grey", p.grey),
+                ("green", p.green),
+                ("red", p.red),
+                ("amber", p.amber),
+            ];
+            for i in 0..semantics.len() {
+                for j in (i + 1)..semantics.len() {
+                    let d = perceptual_distance(semantics[i].1, semantics[j].1);
+                    assert!(
+                        d >= MIN,
+                        "{name}: {} and {} are too close ({d:.0} < {MIN})",
+                        semantics[i].0,
+                        semantics[j].0
+                    );
+                }
+            }
+        }
+    }
+
+    /// Body text is comfortably readable against the panel background in every
+    /// palette — a light palette cannot ship with unreadable text.
+    #[test]
+    fn body_text_meets_a_contrast_threshold_in_every_palette() {
+        for (name, p) in [("dark", DARK), ("light", LIGHT)] {
+            let against_panel = contrast_ratio(p.text, p.panel);
+            let against_bg = contrast_ratio(p.text, p.bg);
+            assert!(
+                against_panel >= 4.0 && against_bg >= 4.0,
+                "{name}: text contrast too low (panel {against_panel:.1}, bg {against_bg:.1})"
+            );
+        }
+    }
+
     #[test]
     fn every_accessor_reads_the_dark_palettes_value() {
+        install(DARK); // this thread may have been left on another palette
         let rgb = Color32::from_rgb;
         assert_eq!(black(), rgb(0x00, 0x00, 0x00));
+        assert_eq!(bg(), rgb(0x00, 0x00, 0x00));
         assert_eq!(orange(), rgb(0xFF, 0x99, 0x00));
         assert_eq!(amber(), rgb(0xFF, 0xCC, 0x66));
         assert_eq!(tan(), rgb(0xFF, 0xCC, 0x99));

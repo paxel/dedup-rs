@@ -1,6 +1,6 @@
 # 03 — Resolve the active appearance from egui's theme preference
 
-Status: ready-for-agent
+Status: resolved
 Spec: ../spec.md
 Blocked by: 02
 
