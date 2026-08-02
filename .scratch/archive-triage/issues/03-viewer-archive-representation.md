@@ -1,6 +1,6 @@
 # 03 — The viewer's Archive representation: look inside a zip
 
-Status: ready-for-agent
+Status: resolved
 Spec: ../spec.md
 Blocked by: 01
 

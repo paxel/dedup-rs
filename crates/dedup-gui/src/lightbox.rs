@@ -19,6 +19,9 @@ const MAX_SCALE: f32 = 32.0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum RepresentationKind {
     Overview,
+    // Archive sorts right after Overview so it is the natural landing tab for a
+    // container file, ahead of the Text/hex fallback every file also offers.
+    Archive,
     Metadata,
     Image,
     Audio,
@@ -30,6 +33,7 @@ impl RepresentationKind {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Overview => "Overview",
+            Self::Archive => "Archive",
             Self::Metadata => "Metadata",
             Self::Image => "Image",
             Self::Audio => "Audio",
@@ -41,6 +45,7 @@ impl RepresentationKind {
     pub fn icon(&self) -> &'static str {
         match self {
             Self::Overview => icon::STAR,
+            Self::Archive => icon::FOLDER_OPEN,
             Self::Metadata => icon::PENCIL,
             Self::Image => icon::IMAGE,
             Self::Audio => icon::LIGHTNING,
@@ -187,6 +192,11 @@ impl MarkState {
     }
 }
 
+/// A file is a browsable archive (zip/tar/tar.gz). The member list itself is
+/// loaded lazily by the viewer (disk I/O), so this only records the capability.
+#[derive(Clone, Debug)]
+pub struct ArchiveRepresentation {}
+
 /// Aggregated representations for a single file instance.
 #[derive(Clone, Debug)]
 pub struct FileRepresentations {
@@ -196,6 +206,7 @@ pub struct FileRepresentations {
     pub metadata: Option<MetadataRepresentation>,
     pub video: Option<VideoRepresentation>,
     pub text: Option<TextBinaryRepresentation>,
+    pub archive: Option<ArchiveRepresentation>,
     pub mark: MarkState,
 }
 
@@ -299,6 +310,13 @@ impl FileRepresentations {
             })
         };
 
+        // A container file (zip/tar/tar.gz) can be looked inside.
+        let archive = if facts.is_archive() {
+            Some(ArchiveRepresentation {})
+        } else {
+            None
+        };
+
         Self {
             dedup: DedupDataRepresentation {
                 rel_path: facts
@@ -319,6 +337,7 @@ impl FileRepresentations {
             metadata,
             video,
             text,
+            archive,
             mark,
         }
     }
@@ -326,6 +345,9 @@ impl FileRepresentations {
     /// List representation kinds supported by this file instance.
     pub fn available_kinds(&self) -> Vec<RepresentationKind> {
         let mut kinds = vec![RepresentationKind::Overview];
+        if self.archive.is_some() {
+            kinds.push(RepresentationKind::Archive);
+        }
         if self.metadata.is_some() {
             kinds.push(RepresentationKind::Metadata);
         }

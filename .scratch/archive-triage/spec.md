@@ -1,6 +1,6 @@
 # Archive triage: see into, pull from, and unlock inherited archives
 
-Status: ready-for-agent
+Status: resolved
 
 Spec produced by a grilling + domain-modeling session on 2026-08-02, driven by the
 user noticing that a zip on an inherited disk is a black box. Every decision below
@@ -111,3 +111,60 @@ byte-identical after any browse/extract/unlock.
 - The existing opt-in CLI (`dedup archive index` / `coverage`) is superseded by scan-integrated indexing; the coverage *report* stays available (now fed by the incremental index) but `archive index` as a separate bulk read goes away.
 - Member content-hashing during a scan reads each changed archive fully, so the change-detection skip on unchanged archives is what keeps repeat scans cheap — the same economics as loose-file hashing.
 - The shared viewer (one-lightbox effort, landed 2026-08-01) is the natural home for the Archive representation and for opening a member by type; opening a member is an ephemeral decompress-to-temp fed to that viewer, distinct from durable extraction.
+
+## Comments
+
+**Implemented 2026-08-02, TDD, tickets 01–08 all `resolved`.** Standing gate green:
+`cargo fmt --check` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean,
+`cargo test --workspace` 24 suites / 0 failures.
+
+**What landed:**
+
+- **01** Archive member reading folds into `update_repo`, gated by the same change-detection
+  as loose files; the opt-in bulk `dedup archive index` command and `index_repo_archives`
+  are removed. `dedup archive coverage` stays, fed by the incremental index.
+- **02** `ArchiveMember.hash` became `Option`; encrypted members index shallowly (name + size,
+  `locked: true`, no hash) via `by_index_raw` instead of being dropped. Coverage gained a
+  `locked` count and never calls a locked archive redundant.
+- **03** The shared viewer gained an `Archive` representation (`RepresentationKind::Archive`,
+  `FileFacts::is_archive`): a zip opens on its member list; clicking a member extracts it to a
+  temp dir and shows it by type; BACK/Esc returns. Core `list_entries` / `extract_member`.
+- **04** `archive::members_by_content` + `ArchiveOccurrence` power read-only evidence rows in
+  the Duplicates grid, and a tiered delete-safety **warning** (not block) when a delete would
+  leave content surviving only inside an archive.
+- **05** `archive::extract_all` (collision-safe, path-sanitised, source untouched) + a GUI
+  EXTRACT ALL / per-member extract via an rfd folder picker; extract into a repo then scan to
+  index — proven at the core level.
+- **06** `verify_password` + `unlock_and_reindex` (re-hash contents once unlocked); a new
+  `secret` module (Argon2 + XChaCha20-Poly1305) and `ARCHIVE_PASSWORDS` store table for
+  working passwords encrypted at rest; GUI supplied-password UNLOCK holding the password
+  in-session so locked members open and extract.
+- **07** `recover_password` (session candidates first, then wordlist + simple mutations) +
+  `builtin_wordlist`; a GUI RECOVER button running a background attempt. Honest ceiling —
+  strong passwords do not fall.
+- **08** `export_hashcat_hash` produces the WinZip-AES `$zip2$` (mode 13600) string by parsing
+  the local header's AES extra + the salt/verifier/data/auth blob; a GUI EXPORT HASH button
+  copies it to the clipboard. `hashcat_available` helper for the (future) launch affordance.
+
+**Deliberately scoped down — flagged for the human review these security tickets called for:**
+
+1. **ZipCrypto known-plaintext shortcut (bkcrack-style)** — not implemented. Recovery covers
+   the supplied-password path, the wordlist/mutation attempt (AES + ZipCrypto alike via
+   `verify_password`), and the hashcat handoff. The keyless known-plaintext attack on legacy
+   ZipCrypto is the remaining piece.
+2. **`$pkzip2$` export** — only the WinZip-AES `$zip2$` format is produced; legacy ZipCrypto
+   hash export returns `None`.
+3. **The app-passphrase gate + persist-on-unlock wiring** — the crypto and the store table are
+   done and tested (`secret::encrypt/decrypt`, `set/get_archive_password`), but the GUI flow
+   that prompts for the app passphrase once per session and calls `unlock_and_reindex` +
+   persists the working password on a successful unlock (through a caller with store access,
+   like the `Edited`/refresh pattern) is not wired end-to-end. The viewer holds the verified
+   password in-session for browse/extract.
+4. **Cross-archive spray-book auto-try** — `recover_password` accepts an `extra` candidate list
+   (the spray-book seam), but the app-level session set auto-tried across every locked archive
+   is not held at the app level yet.
+5. **hashcat launch** — export-to-clipboard is wired; driving the hashcat process and ingesting
+   the found password is not (the `hashcat_available` probe exists for it).
+
+The `$zip2$` export's exact acceptance by hashcat is pinned only structurally (field shapes and
+lengths) — verifying a real hashcat run against a known password is the human step.

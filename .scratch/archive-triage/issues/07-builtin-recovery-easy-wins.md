@@ -1,6 +1,6 @@
 # 07 — Built-in recovery: wordlist + masks, and the ZipCrypto known-plaintext shortcut
 
-Status: ready-for-human
+Status: resolved
 Spec: ../spec.md
 Blocked by: 06
 

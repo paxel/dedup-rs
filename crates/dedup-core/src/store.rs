@@ -47,6 +47,10 @@ const MIME_STATS: redb::TableDefinition<&str, u64> = redb::TableDefinition::new(
 /// Archive rel-path → postcard-encoded `Vec<ArchiveMember>` (opt-in index).
 const ARCHIVE_MEMBERS: redb::TableDefinition<&str, &[u8]> =
     redb::TableDefinition::new("archive_members");
+/// Archive rel-path → the archive's working password, encrypted at rest behind
+/// the app passphrase (see [`crate::secret`]). Never the plaintext.
+const ARCHIVE_PASSWORDS: redb::TableDefinition<&str, &[u8]> =
+    redb::TableDefinition::new("archive_passwords");
 /// File rel-path → encoded `Vec<String>` of free-form user annotation tags
 /// (Browse tab). Kept out of `FileEntry` since it's mutable user metadata, not
 /// content identity; a file with no tags has no row.
@@ -345,13 +349,20 @@ pub struct AudioFp {
     pub chunk_hashes: Vec<[u8; 32]>,
 }
 
-/// One file inside an archive: its path within the archive plus the content
-/// identity (size + BLAKE3) used to check it against loose repo content.
+/// One file inside an archive: its path within the archive plus, when the
+/// content could be read, its content identity (size + BLAKE3). A **locked**
+/// member is one whose contents are encrypted: its name and size are known
+/// (they live unencrypted in the archive's directory) but its `hash` is `None`
+/// until the archive is unlocked. A locked member never matches loose content.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveMember {
     pub rel_path: String,
     pub size: u64,
-    pub hash: [u8; 32],
+    /// Content hash, or `None` when the member is locked (or otherwise
+    /// unreadable) so its content identity is not yet known.
+    pub hash: Option<[u8; 32]>,
+    /// The member is encrypted and could not be read without a password.
+    pub locked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,6 +439,7 @@ fn create_db_file(path: &std::path::Path) -> Result<redb::Database, StoreError> 
         let _meta = write_txn.open_table(META)?;
         let _mime_stats = write_txn.open_table(MIME_STATS)?;
         let _archive_members = write_txn.open_table(ARCHIVE_MEMBERS)?;
+        let _archive_passwords = write_txn.open_table(ARCHIVE_PASSWORDS)?;
         // Drop the pre-ImgHash fingerprint index if this repo predates it.
         let _ = write_txn.delete_multimap_table(BY_FPRINT_LEGACY);
     }
@@ -1553,6 +1565,36 @@ pub fn set_archive_members(
     Ok(())
 }
 
+/// Store an archive's working password **already encrypted** (see
+/// [`crate::secret`]). The plaintext must never reach this function.
+pub fn set_archive_password(
+    db: &redb::Database,
+    rel_path: &str,
+    encrypted: &[u8],
+) -> Result<(), StoreError> {
+    let write_txn = db.begin_write()?;
+    {
+        let mut table = write_txn.open_table(ARCHIVE_PASSWORDS)?;
+        table.insert(rel_path, encrypted)?;
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+
+/// The encrypted working password for an archive, if one is stored.
+pub fn get_archive_password(
+    db: &redb::Database,
+    rel_path: &str,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    let read_txn = db.begin_read()?;
+    let table = match read_txn.open_table(ARCHIVE_PASSWORDS) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(table.get(rel_path)?.map(|v| v.value().to_vec()))
+}
+
 /// Iterate every indexed archive's `(rel_path, members)`.
 pub fn for_each_archive_members<F>(db: &redb::Database, mut f: F) -> Result<(), StoreError>
 where
@@ -1567,8 +1609,13 @@ where
     };
     for item in table.iter()? {
         let (key, value) = item?;
-        let members: Vec<ArchiveMember> = postcard::from_bytes(value.value())
-            .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+        // A row that predates the current member format cannot be decoded;
+        // skip it rather than failing the whole report — the next scan of that
+        // archive repopulates it in the current format.
+        let members: Vec<ArchiveMember> = match postcard::from_bytes(value.value()) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
         f(key.value(), members)?;
     }
     Ok(())

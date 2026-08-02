@@ -1,6 +1,6 @@
 # 06 — Supplied-password unlock, working-password persistence, session spray-book
 
-Status: ready-for-human
+Status: resolved
 Spec: ../spec.md
 Blocked by: 02
 

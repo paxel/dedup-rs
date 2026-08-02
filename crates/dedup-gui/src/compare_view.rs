@@ -201,6 +201,28 @@ pub(crate) struct DiffCompare {
     save_exif_date: bool,
     /// Why the last save failed, shown in the dialog until one succeeds.
     save_error: Option<String>,
+    /// The Archive tab's member list for the current left-side archive, loaded
+    /// lazily on demand (cheap — names/sizes only). `None` until first shown or
+    /// after the left side changes.
+    archive_entries: Option<Vec<dedup_core::archive::ArchiveEntry>>,
+    /// When viewing a member opened from inside an archive: the archive side to
+    /// return to, and the temp dir holding the extracted member (kept alive so
+    /// the file isn't deleted while the viewer shows it).
+    member_return: Option<Box<DiffSide>>,
+    member_tempdir: Option<std::sync::Arc<tempfile::TempDir>>,
+    /// Result of the last extraction, shown on the Archive tab.
+    extract_status: Option<String>,
+    /// The verified password for the current locked archive, held in memory for
+    /// this session only (never written here). Once set, locked members open
+    /// and extract with it.
+    unlock_password: Option<String>,
+    /// The unlock text field's buffer, and whether the last try was wrong.
+    unlock_input: String,
+    unlock_failed: bool,
+    /// A background password-recovery attempt in flight: its result channel and
+    /// a note (progress / outcome) shown on the Archive tab.
+    recover_rx: Option<crossbeam_channel::Receiver<Option<String>>>,
+    recover_note: Option<String>,
 }
 
 impl DiffCompare {
@@ -234,6 +256,15 @@ impl DiffCompare {
             save_confirm: None,
             save_exif_date: false,
             save_error: None,
+            archive_entries: None,
+            member_return: None,
+            member_tempdir: None,
+            extract_status: None,
+            unlock_password: None,
+            unlock_input: String::new(),
+            unlock_failed: false,
+            recover_rx: None,
+            recover_note: None,
         }
     }
 
@@ -573,7 +604,175 @@ impl DiffCompare {
         self.text[slot] = None;
         self.tags[slot] = None;
         self.exif_all[slot] = None;
+        // The Archive tab lists the *left* side's members; a changed left side
+        // invalidates that list and its extraction status.
+        if slot == 0 {
+            self.archive_entries = None;
+            self.extract_status = None;
+            self.unlock_password = None;
+            self.unlock_input.clear();
+            self.unlock_failed = false;
+            self.recover_rx = None;
+            self.recover_note = None;
+        }
         self.spawn_decode(ctx, slot);
+    }
+
+    /// Open a member of the current left-side archive: extract it to a temp dir
+    /// and show it in place (rendered by its own type), remembering the archive
+    /// to return to. Ephemeral — the source archive is never modified, and the
+    /// extracted file lives only as long as the viewer shows it. `password`
+    /// decrypts a locked member (supplied by the caller's unlock flow).
+    fn open_archive_member(
+        &mut self,
+        ctx: &Context,
+        entry: &dedup_core::archive::ArchiveEntry,
+        password: Option<&str>,
+    ) {
+        let archive_name = self
+            .left
+            .facts
+            .abs_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let Ok(tmp) = tempfile::tempdir() else {
+            return;
+        };
+        let flat = entry
+            .name
+            .rsplit(['/', '\\'])
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("member");
+        let dest = tmp.path().join(flat);
+        if dedup_core::archive::extract_member(
+            &self.left.facts.abs_path,
+            &archive_name,
+            self.left.facts.mime.as_deref(),
+            &entry.name,
+            &dest,
+            password,
+        )
+        .is_err()
+        {
+            return;
+        }
+        let size = std::fs::metadata(&dest)
+            .map(|m| m.len())
+            .unwrap_or(entry.size);
+        // Detect the member's type so the viewer dispatches to the right
+        // representation (image as image, audio as audio, …).
+        let fp = dedup_core::fingerprint::compute(&dest, false);
+        let facts = crate::media_cell::FileFacts {
+            size,
+            modified_ms: 0,
+            mime: fp.mime,
+            img_size: fp.img_size,
+            audio_ms: fp.audio.as_ref().map(|a| a.duration_ms),
+            audio_seed: fp
+                .audio
+                .as_ref()
+                .and_then(|a| a.chunk_hashes.first().copied()),
+            hash_hex: String::new(),
+            abs_path: dest,
+            origin: None,
+            exif: fp.exif,
+        };
+        let member_side = DiffSide {
+            repo: self.left.repo.clone(),
+            rel_path: entry.name.clone(),
+            read_only: true,
+            facts,
+        };
+        let archive_side = std::mem::replace(&mut self.left, member_side);
+        self.member_return = Some(Box::new(archive_side));
+        self.member_tempdir = Some(std::sync::Arc::new(tmp));
+        // Let the landing-tab logic pick the member's own representation.
+        self.tab = RepresentationKind::Overview;
+        self.refresh_side(ctx, 0);
+    }
+
+    /// Go back from an opened member to the archive's member list.
+    fn return_to_archive(&mut self, ctx: &Context) {
+        if let Some(archive) = self.member_return.take() {
+            self.left = *archive;
+            self.member_tempdir = None;
+            self.tab = RepresentationKind::Archive;
+            self.refresh_side(ctx, 0);
+        }
+    }
+
+    /// Extract the whole archive (`member` = `None`) or one member into a folder
+    /// the user picks. Extract into a repository to have the contents indexed on
+    /// the next scan. The source archive is never modified; collisions never
+    /// overwrite. Records a status line for the Archive tab.
+    fn extract_to_picked_folder(&mut self, member: Option<dedup_core::archive::ArchiveEntry>) {
+        let Some(dir) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        let f = &self.left.facts;
+        let name = f
+            .abs_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mime = f.mime.clone();
+        let archive_path = f.abs_path.clone();
+        let pw = self.unlock_password.clone();
+        self.extract_status = Some(match member {
+            None => match dedup_core::archive::extract_all(
+                &archive_path,
+                &name,
+                mime.as_deref(),
+                &dir,
+                pw.as_deref(),
+            ) {
+                Ok(n) => format!("Extracted {n} member(s) to {}", dir.display()),
+                Err(e) => format!("Extract failed: {e}"),
+            },
+            Some(entry) => {
+                let flat = entry
+                    .name
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("member");
+                let dest = dir.join(flat);
+                let dest = if dest.exists() {
+                    // Never overwrite: fall back to a temp-style suffixed name.
+                    let stem = std::path::Path::new(flat)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "member".into());
+                    let ext = std::path::Path::new(flat)
+                        .extension()
+                        .map(|e| format!(".{}", e.to_string_lossy()))
+                        .unwrap_or_default();
+                    let mut i = 1;
+                    loop {
+                        let c = dir.join(format!("{stem}_{i}{ext}"));
+                        if !c.exists() {
+                            break c;
+                        }
+                        i += 1;
+                    }
+                } else {
+                    dest
+                };
+                match dedup_core::archive::extract_member(
+                    &archive_path,
+                    &name,
+                    mime.as_deref(),
+                    &entry.name,
+                    &dest,
+                    pw.as_deref(),
+                ) {
+                    Ok(()) => format!("Extracted {} to {}", entry.name, dir.display()),
+                    Err(e) => format!("Extract failed: {e}"),
+                }
+            }
+        });
     }
 
     /// Upload any freshly decoded previews.
@@ -681,10 +880,13 @@ impl DiffCompare {
             arrow_r && !typing,
         );
         // Esc backs out one level: an open tag editor first (abandoning its
-        // working copy), then flicker, then the viewer itself.
+        // working copy), then an opened archive member (back to the member
+        // list), then flicker, then the viewer itself.
         if esc {
             if self.tag_edit.is_some() {
                 self.tag_edit = None;
+            } else if self.member_return.is_some() {
+                self.return_to_archive(ctx);
             } else if ready && self.compare.flicker {
                 self.compare.flicker = false;
             } else {
@@ -724,6 +926,37 @@ impl DiffCompare {
         let mut pause = false;
         let mut cycle_speed = false;
         let mut show = false;
+        // Archive browsing: the member clicked to open, a request to go back
+        // from an opened member, and extraction requests (whole / one member).
+        let mut open_member: Option<dedup_core::archive::ArchiveEntry> = None;
+        let mut back_to_archive = false;
+        let mut extract_all_req = false;
+        let mut extract_member_req: Option<dedup_core::archive::ArchiveEntry> = None;
+        let mut unlock_req = false;
+        let mut recover_req = false;
+        let mut export_hash_req = false;
+        let viewing_member = self.member_return.is_some();
+
+        // Poll a running recovery attempt.
+        if let Some(rx) = &self.recover_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.recover_rx = None;
+                match result {
+                    Some(pw) => {
+                        self.recover_note = Some("Recovered the password.".into());
+                        self.unlock_password = Some(pw);
+                    }
+                    None => {
+                        self.recover_note = Some(
+                            "No luck — try a wordlist, or export the hash for hashcat.".into(),
+                        );
+                    }
+                }
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+        }
+        let recovering = self.recover_rx.is_some();
         let (mut meta_l, mut meta_r) = (
             crate::lightbox::MetaAction::None,
             crate::lightbox::MetaAction::None,
@@ -826,7 +1059,8 @@ impl DiffCompare {
                         .find(|k| {
                             matches!(
                                 k,
-                                RepresentationKind::Image
+                                RepresentationKind::Archive
+                                    | RepresentationKind::Image
                                     | RepresentationKind::Audio
                                     | RepresentationKind::Video
                             )
@@ -920,7 +1154,23 @@ impl DiffCompare {
                             .max_rect(tab_rect)
                             .layout(Layout::right_to_left(Align::Center)),
                         |ui| {
-                            if ui
+                            // Inside an opened archive member, the right-hand
+                            // control goes back to the member list rather than
+                            // offering a second side.
+                            if viewing_member {
+                                if ui
+                                    .button(format!("{} BACK", crate::icon::CARET_LEFT))
+                                    .explain(
+                                        verbosity,
+                                        "Back to the archive",
+                                        "Return to the archive's member list (Esc does the \
+                                         same).",
+                                    )
+                                    .clicked()
+                                {
+                                    back_to_archive = true;
+                                }
+                            } else if ui
                                 .button("SHOW B")
                                 .explain(
                                     verbosity,
@@ -935,11 +1185,211 @@ impl DiffCompare {
                     );
                 }
 
-                // Metadata: each side's tag surface — the ID3 editor for the
-                // copy being edited (only a writable audio side offers one),
-                // the stored tags for the others, an image's EXIF facts. Marks
-                // stay the caller's; tags are the one write a side carries.
-                if self.tab == RepresentationKind::Metadata {
+                // Archive: the left side's member list. A readable member opens
+                // in place (rendered by its own type); a locked member is shown
+                // disabled until the archive is unlocked.
+                if self.tab == RepresentationKind::Archive {
+                    if self.archive_entries.is_none() {
+                        let f = &self.left.facts;
+                        let name = f
+                            .abs_path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        self.archive_entries = Some(
+                            dedup_core::archive::list_entries(
+                                &f.abs_path,
+                                &name,
+                                f.mime.as_deref(),
+                            )
+                            .unwrap_or_default(),
+                        );
+                    }
+                    let entries = self.archive_entries.clone().unwrap_or_default();
+                    ui.scope_builder(
+                        UiBuilder::new()
+                            .max_rect(viewport)
+                            .layout(Layout::top_down(Align::Min)),
+                        |ui| {
+                            // Extract the whole archive into a folder you pick.
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("EXTRACT ALL").color(theme::black()),
+                                        )
+                                        .fill(theme::amber()),
+                                    )
+                                    .explain(
+                                        verbosity,
+                                        "Extract every member to a folder",
+                                        "Choose a folder and write every readable member into \
+                                         it. Extract into a repository to have the contents \
+                                         indexed on the next scan. The archive is never changed.",
+                                    )
+                                    .clicked()
+                                {
+                                    extract_all_req = true;
+                                }
+                                if let Some(s) = &self.extract_status {
+                                    ui.label(RichText::new(s).color(theme::lilac()).size(11.0));
+                                }
+                            });
+                            // Unlock: a locked archive with no session password
+                            // yet offers a password field. Once verified, locked
+                            // members open and extract.
+                            let has_locked = entries.iter().any(|e| e.locked);
+                            if has_locked && self.unlock_password.is_none() {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!("{}  LOCKED", crate::icon::LOCK))
+                                            .color(theme::amber())
+                                            .size(12.0),
+                                    );
+                                    let field = egui::TextEdit::singleline(&mut self.unlock_input)
+                                        .password(true)
+                                        .hint_text("password")
+                                        .desired_width(160.0);
+                                    let resp = ui.add(field);
+                                    let entered = resp.lost_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new("UNLOCK").color(theme::black()),
+                                            )
+                                            .fill(theme::amber()),
+                                        )
+                                        .clicked()
+                                        || entered
+                                    {
+                                        unlock_req = true;
+                                    }
+                                    // Built-in recovery: try the easy possibilities.
+                                    let recover = ui.add_enabled(
+                                        !recovering,
+                                        egui::Button::new(
+                                            RichText::new(if recovering {
+                                                "RECOVERING…"
+                                            } else {
+                                                "RECOVER"
+                                            })
+                                            .color(theme::text()),
+                                        ),
+                                    );
+                                    if recover
+                                        .on_hover_text(
+                                            "Try a built-in list of common passwords. Weak \
+                                             passwords may fall; a strong one will not — export \
+                                             the hash for hashcat instead.",
+                                        )
+                                        .clicked()
+                                    {
+                                        recover_req = true;
+                                    }
+                                    if ui
+                                        .button("EXPORT HASH")
+                                        .on_hover_text(
+                                            "Copy this archive's hash in hashcat's $zip2$ format \
+                                             (mode 13600) to the clipboard, to crack it with \
+                                             hashcat or John where the real GPU power is.",
+                                        )
+                                        .clicked()
+                                    {
+                                        export_hash_req = true;
+                                    }
+                                });
+                                if self.unlock_failed {
+                                    ui.label(
+                                        RichText::new("Wrong password.")
+                                            .color(theme::red())
+                                            .size(11.0),
+                                    );
+                                }
+                                if let Some(note) = &self.recover_note {
+                                    ui.label(RichText::new(note).color(theme::lilac()).size(11.0));
+                                }
+                                ui.add_space(4.0);
+                            } else if has_locked && self.unlock_password.is_some() {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{}  Unlocked for this session",
+                                        crate::icon::LOCK_OPEN
+                                    ))
+                                    .color(theme::green())
+                                    .size(11.0),
+                                );
+                                ui.add_space(4.0);
+                            }
+                            let unlocked = self.unlock_password.is_some();
+
+                            if entries.is_empty() {
+                                ui.label(
+                                    RichText::new(
+                                        "This archive has no readable members (or could not be \
+                                         opened).",
+                                    )
+                                    .color(theme::grey())
+                                    .size(12.0),
+                                );
+                                return;
+                            }
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for entry in &entries {
+                                        ui.horizontal(|ui| {
+                                            if entry.locked && !unlocked {
+                                                ui.add_enabled(
+                                                    false,
+                                                    egui::Button::new(
+                                                        RichText::new(format!(
+                                                            "{}  {}",
+                                                            crate::icon::LOCK,
+                                                            entry.name
+                                                        ))
+                                                        .color(theme::hairline()),
+                                                    ),
+                                                );
+                                                ui.label(
+                                                    RichText::new("LOCKED")
+                                                        .color(theme::hairline())
+                                                        .size(11.0),
+                                                );
+                                            } else {
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            RichText::new(&entry.name)
+                                                                .color(theme::text()),
+                                                        )
+                                                        .fill(theme::panel()),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    open_member = Some(entry.clone());
+                                                }
+                                                if ui
+                                                    .button(crate::icon::ARROW_RIGHT)
+                                                    .on_hover_text(
+                                                        "Extract this member to a folder",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    extract_member_req = Some(entry.clone());
+                                                }
+                                            }
+                                            ui.label(
+                                                RichText::new(crate::util::format_size(entry.size))
+                                                    .color(theme::lilac())
+                                                    .size(11.0),
+                                            );
+                                        });
+                                    }
+                                });
+                        },
+                    );
+                } else if self.tab == RepresentationKind::Metadata {
                     for slot in [0usize, 1usize] {
                         let side = if slot == 0 { &self.left } else { &self.right };
                         if self.tags[slot].is_none() {
@@ -1277,6 +1727,7 @@ impl DiffCompare {
                                     is_left,
                                     verbosity,
                                     mark.map(|m| (mark_label, m)),
+                                    self.tab != RepresentationKind::Archive,
                                 );
                                 // The switcher belongs to its side, and is
                                 // offered only when that side has somewhere
@@ -1400,6 +1851,94 @@ impl DiffCompare {
         if let Some((is_left, op)) = turn {
             self.rotate(is_left, op);
             self.upload(ctx, usize::from(!is_left));
+        }
+        // Export the hashcat $zip2$ hash to the clipboard for external cracking.
+        if export_hash_req {
+            let f = &self.left.facts;
+            let name = f
+                .abs_path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.recover_note = Some(
+                match dedup_core::archive::export_hashcat_hash(
+                    &f.abs_path,
+                    &name,
+                    f.mime.as_deref(),
+                ) {
+                    Some(hash) => {
+                        ctx.copy_text(hash);
+                        "Hash copied — run: hashcat -m 13600 <hash> <wordlist>".to_string()
+                    }
+                    None => "No exportable hash (only WinZip-AES zips are supported).".to_string(),
+                },
+            );
+        }
+        // Recover: run a built-in wordlist attempt on a background thread.
+        if recover_req && self.recover_rx.is_none() {
+            let f = &self.left.facts;
+            let name = f
+                .abs_path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let (path, mime) = (f.abs_path.clone(), f.mime.clone());
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            self.recover_rx = Some(rx);
+            self.recover_note = Some("Trying common passwords…".into());
+            let ctx2 = ctx.clone();
+            std::thread::spawn(move || {
+                let found = dedup_core::archive::recover_password(
+                    &path,
+                    &name,
+                    mime.as_deref(),
+                    &[],
+                    &dedup_core::archive::builtin_wordlist(),
+                    || false,
+                );
+                let _ = tx.send(found);
+                ctx2.request_repaint();
+            });
+        }
+        // Unlock: verify the typed password against the archive. On success it
+        // is held for this session so locked members open and extract.
+        if unlock_req {
+            let f = &self.left.facts;
+            let name = f
+                .abs_path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let candidate = self.unlock_input.clone();
+            if dedup_core::archive::verify_password(
+                &f.abs_path,
+                &name,
+                f.mime.as_deref(),
+                &candidate,
+            ) {
+                self.unlock_password = Some(candidate);
+                self.unlock_failed = false;
+                self.unlock_input.clear();
+            } else {
+                self.unlock_failed = true;
+            }
+        }
+        // Archive browsing: open a clicked member, or go back to the list.
+        let pw = self.unlock_password.clone();
+        if let Some(entry) = open_member {
+            self.open_archive_member(ctx, &entry, pw.as_deref());
+        }
+        if back_to_archive {
+            self.return_to_archive(ctx);
+        }
+        // Extraction: pick a destination folder and write the member(s) there.
+        // Extract into a repository to have the contents indexed on next scan;
+        // the source archive is never modified.
+        if extract_all_req {
+            self.extract_to_picked_folder(None);
+        }
+        if let Some(entry) = extract_member_req {
+            self.extract_to_picked_folder(Some(entry));
         }
         // The save dialog for a turned image: overwrite in place or write a
         // `_rot` sibling, in either case carrying the date the user chose —
@@ -1723,6 +2262,7 @@ fn side_strip(
     is_left: bool,
     verbosity: TooltipVerbosity,
     mark: Option<(&str, MarkPill)>,
+    actions: bool,
 ) -> Option<DiffPick> {
     let mut pick = None;
     ui.vertical(|ui| {
@@ -1777,6 +2317,11 @@ fn side_strip(
             .color(theme::grey())
             .size(12.0),
         );
+        // Some tabs (Archive) own the whole viewport with their own controls;
+        // the strip then shows identifying facts only, no action buttons.
+        if !actions {
+            return;
+        }
         ui.add_space(6.0);
         // A caller that supplied marks acts through the pill alone.
         if let Some((label, pill)) = mark {
@@ -1912,6 +2457,199 @@ mod tests {
             );
         h.run();
         h
+    }
+
+    /// A read-only zip side on disk, holding `entries`.
+    fn archive_side(dir: &Path, name: &str, entries: &[(&str, &[u8])]) -> DiffSide {
+        use std::io::Write;
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (n, d) in entries {
+            zip.start_file(*n, opts).unwrap();
+            zip.write_all(d).unwrap();
+        }
+        zip.finish().unwrap();
+        let mut side = named_side(name);
+        side.facts.abs_path = path;
+        side.facts.mime = Some("application/zip".into());
+        side
+    }
+
+    /// A zip opens on its Archive tab listing its members; clicking a readable
+    /// member opens it in place (rendered by its own type), and BACK/Esc
+    /// returns to the member list. The source archive is never modified.
+    #[test]
+    fn a_zip_opens_on_the_archive_tab_and_a_member_opens_in_place() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let side = archive_side(
+            tmp.path(),
+            "backup.zip",
+            &[("notes.txt", b"hello archive"), ("readme.md", b"# readme")],
+        );
+        let zip_bytes_before = std::fs::read(&side.facts.abs_path).unwrap();
+        let mut cmp = DiffCompare::new_with_pool(side, None, Vec::new());
+        cmp.hide_second();
+        let mut h = rendered(cmp);
+
+        // Landed on the Archive tab, with the members listed.
+        assert_eq!(
+            h.state().tab,
+            RepresentationKind::Archive,
+            "a zip opens on its Archive representation"
+        );
+        assert!(
+            h.query_by_label_contains("notes.txt").is_some(),
+            "members are listed"
+        );
+        assert!(h.query_by_label_contains("readme.md").is_some());
+
+        // Click a member: it opens in place; the shown file becomes the member.
+        h.get_by_label_contains("notes.txt").click();
+        h.run();
+        assert_eq!(
+            h.state().left.rel_path,
+            "notes.txt",
+            "the member is now the shown file"
+        );
+        assert!(
+            h.state().member_return.is_some(),
+            "the archive is remembered so BACK can return to it"
+        );
+
+        // BACK returns to the member list.
+        h.get_by_label_contains("BACK").click();
+        h.run();
+        assert!(
+            h.state().member_return.is_none(),
+            "BACK returns to the archive"
+        );
+        assert_eq!(h.state().tab, RepresentationKind::Archive);
+        assert!(
+            h.query_by_label_contains("readme.md").is_some(),
+            "the member list is shown again"
+        );
+
+        // The source archive is byte-identical after all that browsing.
+        let path = h.state().left.facts.abs_path.clone();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            zip_bytes_before,
+            "browsing never modifies the source archive"
+        );
+    }
+
+    /// A read-only zip side with one AES-encrypted member.
+    fn encrypted_archive_side(
+        dir: &Path,
+        name: &str,
+        member: &str,
+        data: &[u8],
+        password: &str,
+    ) -> DiffSide {
+        use std::io::Write;
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .with_aes_encryption(zip::AesMode::Aes256, password);
+        zip.start_file(member, opts).unwrap();
+        zip.write_all(data).unwrap();
+        zip.finish().unwrap();
+        let mut side = named_side(name);
+        side.facts.abs_path = path;
+        side.facts.mime = Some("application/zip".into());
+        side
+    }
+
+    /// A locked zip lists its (locked) member and offers UNLOCK; the wrong
+    /// password is rejected, the right one unlocks it for the session.
+    #[test]
+    fn a_locked_zip_unlocks_with_the_supplied_password() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let side = encrypted_archive_side(
+            tmp.path(),
+            "locked.zip",
+            "secret.txt",
+            b"classified",
+            "sesame",
+        );
+        let mut cmp = DiffCompare::new_with_pool(side, None, Vec::new());
+        cmp.hide_second();
+        let mut h = rendered(cmp);
+
+        assert_eq!(h.state().tab, RepresentationKind::Archive);
+        assert!(
+            h.query_by_label_contains("secret.txt").is_some(),
+            "a locked member's name is still listed"
+        );
+        assert!(
+            h.query_by_label_contains("UNLOCK").is_some(),
+            "a locked archive offers UNLOCK"
+        );
+        assert!(
+            h.query_by_label_contains("RECOVER").is_some(),
+            "and a built-in RECOVER attempt"
+        );
+        assert!(
+            h.query_by_label_contains("EXPORT HASH").is_some(),
+            "and a hashcat hash export"
+        );
+
+        // Exporting copies a $zip2$ hash to the clipboard.
+        h.get_by_label_contains("EXPORT HASH").click();
+        h.run();
+        assert!(
+            h.state()
+                .recover_note
+                .as_deref()
+                .is_some_and(|n| n.contains("13600")),
+            "the export reports the hashcat mode"
+        );
+
+        // Wrong password: rejected, still locked.
+        h.state_mut().unlock_input = "wrong".into();
+        h.get_by_label_contains("UNLOCK").click();
+        h.run();
+        assert!(h.state().unlock_password.is_none());
+        assert!(h.state().unlock_failed, "the wrong password is reported");
+
+        // Right password: unlocked for the session.
+        h.state_mut().unlock_input = "sesame".into();
+        h.get_by_label_contains("UNLOCK").click();
+        h.run();
+        assert_eq!(
+            h.state().unlock_password.as_deref(),
+            Some("sesame"),
+            "the verified password is held for the session"
+        );
+    }
+
+    /// The Archive tab offers extraction — a whole-archive EXTRACT ALL and a
+    /// per-member extract control. (The folder picker and the extraction itself
+    /// are exercised at the core level; here we assert the controls exist.)
+    #[test]
+    fn the_archive_tab_offers_extraction_controls() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let side = archive_side(tmp.path(), "backup.zip", &[("notes.txt", b"hi")]);
+        let mut cmp = DiffCompare::new_with_pool(side, None, Vec::new());
+        cmp.hide_second();
+        let h = rendered(cmp);
+        assert_eq!(
+            h.state().tab,
+            RepresentationKind::Archive,
+            "opens on the Archive tab"
+        );
+        assert!(
+            h.query_by_label_contains("EXTRACT ALL").is_some(),
+            "a whole-archive extract control is offered"
+        );
     }
 
     /// With somewhere to go, each side gets its own switcher.

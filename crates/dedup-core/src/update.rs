@@ -336,9 +336,31 @@ pub fn update_repo_authorized(
                     if cancel.is_cancelled() {
                         return;
                     }
-                    let result = hash_file(&file.abs).map(|hash| HashedFile {
-                        hash,
-                        fingerprints: fingerprint::compute(&file.abs, ffmpeg_available),
+                    let result = hash_file(&file.abs).map(|hash| {
+                        let fingerprints = fingerprint::compute(&file.abs, ffmpeg_available);
+                        // A changed archive has its members read in the same
+                        // pass; an unchanged one never reaches here, so the
+                        // heavy re-read is paid once per change, like the hash.
+                        let archive_members = if crate::archive::is_archive(
+                            &file.rel,
+                            fingerprints.mime.as_deref(),
+                        ) {
+                            Some(
+                                crate::archive::list_members(
+                                    &file.abs,
+                                    &file.rel,
+                                    fingerprints.mime.as_deref(),
+                                )
+                                .unwrap_or_default(),
+                            )
+                        } else {
+                            None
+                        };
+                        HashedFile {
+                            hash,
+                            fingerprints,
+                            archive_members,
+                        }
                     });
                     // Receiver gone means the writer failed; just stop sending.
                     let _ = sender.send((file, result));
@@ -347,6 +369,9 @@ pub fn update_repo_authorized(
         });
 
         let mut batch: Vec<(&str, FileEntry)> = Vec::new();
+        // Archive member lists to write once the file batch is flushed. Rare
+        // relative to loose files, so a per-archive write afterward is fine.
+        let mut archive_members: Vec<(&str, Vec<store::ArchiveMember>)> = Vec::new();
         let mut done_bytes: u64 = 0;
         for (index, (file, result)) in receiver.iter().enumerate() {
             let done = index as u64 + 1;
@@ -361,6 +386,9 @@ pub fn update_repo_authorized(
                         stats.added += 1;
                     }
                     stats.hashed_bytes += file.size;
+                    if let Some(members) = hashed.archive_members {
+                        archive_members.push((file.rel.as_str(), members));
+                    }
                     let fp = hashed.fingerprints;
                     batch.push((
                         file.rel.as_str(),
@@ -401,6 +429,10 @@ pub fn update_repo_authorized(
             });
         }
         store::apply_entries(&db, batch.iter().map(|(rel, e)| (*rel, e)))?;
+        // Replace each changed archive's member list wholesale.
+        for (rel, members) in &archive_members {
+            store::set_archive_members(&db, rel, members)?;
+        }
         Ok(())
     });
     write_result?;
@@ -528,6 +560,10 @@ pub fn check_repo(
 struct HashedFile {
     hash: [u8; 32],
     fingerprints: fingerprint::Fingerprints,
+    /// When the file is an archive, its members read in the same pass — so
+    /// indexing folds into the scan, gated by the same change-detection as the
+    /// content hash. `None` for non-archives.
+    archive_members: Option<Vec<store::ArchiveMember>>,
 }
 
 /// Cheap extension check used only to decide whether to warn about a missing

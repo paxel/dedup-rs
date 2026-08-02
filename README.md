@@ -33,6 +33,14 @@ metadata and the full EXIF listing, text/hex for everything else), with the acti
 surface you came from. A wrongly rotated scan can be turned and **saved back to disk** —
 in place or as a copy, keeping the file's date (or stamping it from the EXIF capture date).
 
+**Archives** (zip/tar/tar.gz) are read-only containers you can see into: the viewer's Archive
+tab lists their members, opens a member in place by its type, and extracts members into a repo
+(indexed on the next scan) or a plain folder — never modifying the source. A password-protected
+zip lists its member names and offers to unlock (supplied password, a built-in attempt at
+common passwords, or export the hash for hashcat), for archives you hold and are entitled to.
+When a loose file's content also lives inside an archive, the Duplicates view says so and warns
+before a delete would leave content surviving only inside a zip.
+
 Most surfaces share one **filter** wizard: conditions like `mime:image`, `name:*.db` or
 `size:>=1000` combine with AND, any condition can be inverted with `!` (`!name:*.mp3` —
 everything that is not an MP3), and `case:insensitive` (the `Aa` toggle) makes text matching

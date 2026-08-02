@@ -1,6 +1,6 @@
 # 05 — Extract into a repo, then index
 
-Status: ready-for-agent
+Status: resolved
 Spec: ../spec.md
 Blocked by: 03
 

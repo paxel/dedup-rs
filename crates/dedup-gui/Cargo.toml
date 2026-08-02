@@ -19,7 +19,8 @@ image = "0.25"
 id3 = "1"
 egui_extras = "0.35"
 log = "0.4"
+tempfile = "3.10"
 
 [dev-dependencies]
 egui_kittest = { version = "0.35", features = ["wgpu", "snapshot"] }
-tempfile = "3.10"
+zip = "8.6"

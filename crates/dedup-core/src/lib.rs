@@ -12,6 +12,7 @@ pub mod logging;
 pub mod organize;
 pub mod report;
 pub mod scan;
+pub mod secret;
 pub mod similar;
 pub mod store;
 pub mod sync_group;

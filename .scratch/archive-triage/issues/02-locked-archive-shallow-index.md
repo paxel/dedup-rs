@@ -1,6 +1,6 @@
 # 02 — Locked archives index shallowly instead of vanishing
 
-Status: ready-for-agent
+Status: resolved
 Spec: ../spec.md
 Blocked by: 01
 

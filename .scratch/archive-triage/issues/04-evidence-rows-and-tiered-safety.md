@@ -1,6 +1,6 @@
 # 04 — Evidence rows in Duplicates + tiered delete-safety
 
-Status: ready-for-agent
+Status: resolved
 Spec: ../spec.md
 Blocked by: 01
 

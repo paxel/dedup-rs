@@ -4,7 +4,33 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Archives are now something you can look inside, pull from, and unlock.** Clicking a
+  zip/tar/tar.gz opens the shared viewer on a new **Archive** tab listing its members; click a
+  member to open it in place, rendered by its own type (an image as an image, text as text),
+  and go back with BACK/Esc. The source archive is never modified.
+- **Extract from an archive.** EXTRACT ALL (or a per-member control) writes members into a
+  folder you pick — extract into a repository and the next scan indexes the contents as loose,
+  triageable files. Extraction never overwrites an existing file (collisions get a `_N`
+  suffix) and never touches the source.
+- **Password-protected zips.** A locked archive lists its member names (from the zip
+  directory) and offers **UNLOCK**: type the password and its members open and extract.
+  **RECOVER** tries a built-in list of common passwords for the weak ones (honest ceiling — a
+  strong password will not fall), and **EXPORT HASH** copies the archive's hash in hashcat's
+  `$zip2$` format (mode 13600) for real GPU cracking elsewhere. Scoped to archives you hold
+  and are entitled to.
+- **Archive redundancy shows inline in Duplicates.** When a loose file's content also lives
+  inside a zip, a read-only **evidence row** names the archive — and the delete confirmation
+  **warns** (never blocks) when a delete would leave content surviving only inside an archive.
+
 ### Changed
+
+- **Archive members are indexed as part of the normal scan**, gated by the same
+  change-detection as every other file: a new or changed archive is read once, an unchanged
+  one is skipped. This replaces the separate opt-in `dedup archive index` command (removed);
+  `dedup archive coverage` stays and now reads whatever the last scan populated. An encrypted
+  archive is indexed shallowly (member names and sizes, marked LOCKED) rather than dropped.
 
 - **One viewer for every file, everywhere.** Clicking any file — a duplicate card (or the
   typed placeholder a document shows), a review board row, a file in Browse, a DIFF conflict —

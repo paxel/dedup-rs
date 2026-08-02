@@ -1,6 +1,6 @@
 # 01 — Scan-integrated, incremental archive indexing
 
-Status: ready-for-agent
+Status: resolved
 Spec: ../spec.md
 
 ## Problem

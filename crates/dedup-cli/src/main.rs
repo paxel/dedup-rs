@@ -158,14 +158,12 @@ enum DiffCommands {
 
 #[derive(Subcommand)]
 enum ArchiveCommands {
-    /// Index every archive's members in a repo (opt-in; reads each archive)
-    Index {
-        /// Repository holding the archives
-        repo: String,
-    },
     /// Report how much of each archive already exists as loose content
+    ///
+    /// Archive members are indexed as part of the normal scan (`repo update`),
+    /// so no separate index step is needed — just scan, then run this.
     Coverage {
-        /// Repository holding the (already indexed) archives
+        /// Repository holding the archives (indexed by its last scan)
         repo: String,
         /// Extra repos to count as "already have it"; repeatable
         #[arg(long = "ref", value_name = "REPO")]
@@ -526,10 +524,6 @@ fn run_scan(store: &Store, names: Vec<String>, all: bool) -> anyhow::Result<()> 
 
 fn run_archive(store: &Store, command: ArchiveCommands) -> anyhow::Result<()> {
     match command {
-        ArchiveCommands::Index { repo } => {
-            let n = dedup_core::archive::index_repo_archives(store, &repo)?;
-            println!("Indexed {n} archive(s) in '{repo}'.");
-        }
         ArchiveCommands::Coverage {
             repo,
             refs,
@@ -546,13 +540,26 @@ fn run_archive(store: &Store, command: ArchiveCommands) -> anyhow::Result<()> {
                 if cov.redundant {
                     redundant += 1;
                 }
+                let tag = if cov.redundant {
+                    "  [REDUNDANT]"
+                } else if cov.has_locked() {
+                    "  [LOCKED]"
+                } else {
+                    ""
+                };
+                let locked = if cov.has_locked() {
+                    format!(" ({} locked)", cov.locked)
+                } else {
+                    String::new()
+                };
                 println!(
-                    "{:>5.1}%  {}/{}  {}{}",
+                    "{:>5.1}%  {}/{}  {}{}{}",
                     cov.percent(),
                     cov.present,
                     cov.members,
                     cov.rel_path,
-                    if cov.redundant { "  [REDUNDANT]" } else { "" }
+                    locked,
+                    tag,
                 );
             }
             println!(

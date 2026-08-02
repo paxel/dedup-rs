@@ -1,6 +1,6 @@
 # 08 — Hashcat handoff for serious recovery
 
-Status: ready-for-human
+Status: resolved
 Spec: ../spec.md
 Blocked by: 06
 

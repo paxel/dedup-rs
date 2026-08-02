@@ -21,7 +21,7 @@ use dedup_core::similar::find_similar;
 use dedup_core::store::Store;
 use dedup_core::thumbnail::hash_hex;
 use egui::{Id, RichText};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -213,6 +213,10 @@ pub struct DupesView {
     /// The shared FILTER wizard: FIND keeps only groups with at least one member
     /// matching this (the same widget used by Transfer/Grooming/Browse).
     filter: FilterBuilder,
+    /// Content identity → the archives (across the searched repos) that contain
+    /// it, built on FIND. Drives the read-only "evidence rows" (this content
+    /// also lives inside a zip) and the tiered delete-safety warning.
+    archive_evidence: HashMap<(u64, [u8; 32]), Vec<dedup_core::archive::ArchiveOccurrence>>,
 }
 
 impl DupesView {
@@ -247,6 +251,7 @@ impl DupesView {
             player: Player::new(),
             verbosity: TooltipVerbosity::default(),
             filter: FilterBuilder::new(),
+            archive_evidence: HashMap::new(),
         }
     }
 
@@ -389,6 +394,14 @@ impl DupesView {
                             self.page = 0;
                             self.cached_page = None;
                             self.error = None;
+                            // The archives across the searched repos that contain
+                            // the same content as loose files — for evidence rows
+                            // and the tiered delete-safety warning.
+                            let refs: Vec<&str> =
+                                self.result_names.iter().map(String::as_str).collect();
+                            self.archive_evidence =
+                                dedup_core::archive::members_by_content(store, &refs)
+                                    .unwrap_or_default();
                         }
                         Err(e) => self.error = Some(e),
                     }
@@ -966,6 +979,46 @@ impl DupesView {
                             }
                         });
                     });
+
+                // Evidence rows: archives that also contain this group's
+                // content. Read-only — they inform the keep/delete decision
+                // (the loose copy is also archived; or the whole zip is that
+                // much more redundant) but carry no action of their own.
+                let mut occ: Vec<&dedup_core::archive::ArchiveOccurrence> = Vec::new();
+                let mut seen = HashSet::new();
+                for f in &group {
+                    if let Some(list) = self.archive_evidence.get(&(f.entry.size, f.entry.hash)) {
+                        for o in list {
+                            if seen.insert((
+                                o.repo.clone(),
+                                o.archive_rel.clone(),
+                                o.member_name.clone(),
+                            )) {
+                                occ.push(o);
+                            }
+                        }
+                    }
+                }
+                if !occ.is_empty() {
+                    ui.add_space(4.0);
+                    for o in occ {
+                        ui.label(
+                            RichText::new(format!(
+                                "{}  in archive:  {} › {}  ({})",
+                                icon::FOLDER_OPEN,
+                                o.archive_rel,
+                                o.member_name,
+                                o.repo,
+                            ))
+                            .color(theme::lilac())
+                            .size(11.0),
+                        )
+                        .on_hover_text(
+                            "This content also lives inside this archive. It cannot be marked \
+                             here — delete a loose copy, or the whole archive.",
+                        );
+                    }
+                }
             });
     }
 
@@ -1521,13 +1574,24 @@ impl DupesView {
             Act::AskDelete => {
                 let n = self.marked.len();
                 if n > 0 {
-                    self.confirm = Some((
-                        format!(
-                            "Delete {n} marked file{} from disk? This cannot be undone.",
-                            if n == 1 { "" } else { "s" }
-                        ),
-                        ConfirmAction::DeleteAll,
-                    ));
+                    let mut prompt = format!(
+                        "Delete {n} marked file{} from disk? This cannot be undone.",
+                        if n == 1 { "" } else { "s" }
+                    );
+                    // Tiered safety: warn (don't block) when a delete would
+                    // leave some content surviving only inside an archive — a
+                    // weaker tier that needs extraction (and maybe a password)
+                    // to read, and may itself be deleted later.
+                    let survivors = self.archive_only_survivors();
+                    if !survivors.is_empty() {
+                        prompt.push_str(&format!(
+                            "\n\n⚠ {} file(s) will then survive only inside an archive \
+                             (extract to keep a loose copy): {}",
+                            survivors.len(),
+                            survivors.join(", "),
+                        ));
+                    }
+                    self.confirm = Some((prompt, ConfirmAction::DeleteAll));
                 }
             }
             Act::CancelDelete => self.confirm = None,
@@ -1759,6 +1823,29 @@ impl DupesView {
 
     fn repo_is_ro(&self, name: &str) -> bool {
         self.repos.iter().any(|r| r.name == name && r.read_only)
+    }
+
+    /// Contents (named by a loose file's path) that a delete of the marked set
+    /// would leave surviving *only* inside an archive: a loaded group whose
+    /// every copy is marked, and whose content is present in an archive. Used
+    /// for the tiered delete-safety warning. Best-effort over the loaded pages.
+    fn archive_only_survivors(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for g in &self.page_groups {
+            let Some(first) = g.first() else { continue };
+            // Every copy of this content marked ⇒ no loose copy would survive.
+            if !g.iter().all(|f| self.marked.contains(&key(f))) {
+                continue;
+            }
+            if let Some(occ) = self
+                .archive_evidence
+                .get(&(first.entry.size, first.entry.hash))
+                .filter(|v| !v.is_empty())
+            {
+                out.push(format!("{} (in {})", first.rel_path, occ[0].archive_rel));
+            }
+        }
+        out
     }
 }
 
@@ -2031,6 +2118,125 @@ mod ui_tests {
             (dup_top - find_top).abs() < 0.75,
             "SIMILAR row misaligned: DUPLICATES top {dup_top} vs FIND top {find_top}"
         );
+    }
+
+    /// A duplicate file with a chosen content identity (so two can share one).
+    fn content_file(rel: &str, hash0: u8) -> DupeFile {
+        let mut hash = [0u8; 32];
+        hash[0] = hash0;
+        DupeFile {
+            repo: "r".into(),
+            repo_root: "/nonexistent-dedup-test".into(),
+            rel_path: rel.into(),
+            entry: dedup_core::store::FileEntry {
+                size: 500,
+                hash,
+                modified_ms: 0,
+                missing: false,
+                mime: Some("image/png".into()),
+                img_fingerprint: None,
+                video_hash: None,
+                pdf_hash: None,
+                audio: None,
+                img_size: Some((10, 10)),
+                origin: None,
+                exif: None,
+            },
+        }
+    }
+
+    fn occ(archive_rel: &str, member: &str) -> dedup_core::archive::ArchiveOccurrence {
+        dedup_core::archive::ArchiveOccurrence {
+            repo: "r".into(),
+            archive_rel: archive_rel.into(),
+            member_name: member.into(),
+        }
+    }
+
+    /// A duplicate group whose content also lives inside an archive shows a
+    /// read-only evidence row naming that archive.
+    #[test]
+    fn archive_evidence_rows_name_the_containing_zip() {
+        let group: DupeGroup = vec![content_file("a.png", 7), content_file("b.png", 7)];
+        let ck = (group[0].entry.size, group[0].entry.hash);
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+        view.archive_evidence
+            .insert(ck, vec![occ("backup_2019.zip", "a.png")]);
+
+        let (_t, store) = sample_store(&[]);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        h.run();
+        assert!(
+            h.query_all_by_label_contains("backup_2019.zip").count() > 0,
+            "the evidence row names the archive that contains this content"
+        );
+        assert!(
+            h.query_all_by_label_contains("in archive").count() > 0,
+            "and marks it as living inside an archive"
+        );
+    }
+
+    /// Deleting every loose copy of content that also lives in an archive warns
+    /// (does not block): the content would survive only inside the archive.
+    #[test]
+    fn deleting_all_loose_copies_warns_when_content_survives_only_in_an_archive() {
+        let group: DupeGroup = vec![content_file("a.png", 9), content_file("b.png", 9)];
+        let ck = (group[0].entry.size, group[0].entry.hash);
+        let (ka, kb) = (key(&group[0]), key(&group[1]));
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+        view.archive_evidence
+            .insert(ck, vec![occ("backup.zip", "a.png")]);
+        view.marked.insert(ka);
+        view.marked.insert(kb);
+
+        let (_t, store) = sample_store(&[]);
+        let store2 = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        h.run(); // populates the page's materialized groups
+
+        let ctx = egui::Context::default();
+        h.state_mut().apply(&ctx, &store2, Act::AskDelete);
+        let prompt = h
+            .state()
+            .confirm
+            .as_ref()
+            .map(|(p, _)| p.clone())
+            .unwrap_or_default();
+        assert!(
+            prompt.contains("survive only inside an archive"),
+            "the delete is warned, not blocked: {prompt:?}"
+        );
+        assert!(prompt.contains("a.png"), "and names the file: {prompt:?}");
     }
 
     /// A dummy image-type duplicate file with a unique hash (→ unique thumbnail).

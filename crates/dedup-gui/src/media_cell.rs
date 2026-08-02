@@ -94,6 +94,16 @@ impl FileFacts {
             .is_some_and(dedup_core::fingerprint::is_audio_mime)
     }
 
+    /// A browsable container (zip/tar/tar.gz), detected by name or MIME.
+    pub fn is_archive(&self) -> bool {
+        let name = self
+            .abs_path
+            .file_name()
+            .map(|s| s.to_string_lossy())
+            .unwrap_or_default();
+        dedup_core::archive::is_archive(&name, self.mime.as_deref())
+    }
+
     /// Pixel dimensions (`W×H`) for images, a duration for audio, else `—`.
     pub fn dims_or_duration(&self) -> String {
         if let Some((w, h)) = self.img_size {

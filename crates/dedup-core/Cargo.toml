@@ -26,6 +26,10 @@ mail-parser = "0.11.5"
 bip39 = "2.2.2"
 log = "0.4"
 chrono = "0.4"
+# Encrypting a recovered archive password at rest (behind an app passphrase).
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+getrandom = "0.2"
 
 [dev-dependencies]
 tempfile = "3.10"
