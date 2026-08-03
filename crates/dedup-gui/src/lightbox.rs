@@ -433,15 +433,18 @@ pub fn draw_tab_bar(
                 theme::panel()
             };
             let text_color = if selected {
-                theme::black()
+                theme::ink_on(theme::amber())
             } else {
                 theme::text()
             };
 
-            if ui
-                .add(egui::Button::new(RichText::new(label).color(text_color)).fill(fill))
-                .clicked()
-            {
+            let mut button = egui::Button::new(RichText::new(label).color(text_color)).fill(fill);
+            // The selected tab carries a bright outline so which representation is
+            // active reads at a glance, not just from the fill.
+            if selected {
+                button = button.stroke(egui::Stroke::new(2.0, theme::orange()));
+            }
+            if ui.add(button).clicked() {
                 *active_tab = kind;
             }
         }
@@ -536,6 +539,8 @@ pub enum MetaAction {
     Edit,
     Save,
     Cancel,
+    /// Write this side's metadata to a human-readable sidecar file.
+    ExportMetadata,
 }
 
 /// The body of one Metadata column: an open ID3 editor, a file's stored tags, or
@@ -556,8 +561,13 @@ pub enum MetaBody<'a> {
         can_edit: bool,
     },
     /// Read-only EXIF facts (images have no tag writer here) — the full field
-    /// list as `(tag, value)` pairs, not only camera and date.
-    Exif { fields: Vec<(String, String)> },
+    /// list as `(tag, value)` pairs, not only camera and date. `differing` names
+    /// the tags whose value differs from the other side, highlighted so the
+    /// difference reads at a glance.
+    Exif {
+        fields: Vec<(String, String)>,
+        differing: std::collections::HashSet<String>,
+    },
 }
 
 /// One column of the Metadata tab: repo badge + file name, then the file's tag
@@ -670,7 +680,7 @@ pub fn draw_metadata_column(
                 );
             }
         }
-        MetaBody::Exif { fields } => {
+        MetaBody::Exif { fields, differing } => {
             if fields.is_empty() {
                 ui.label(
                     RichText::new("No EXIF metadata in this file")
@@ -682,22 +692,52 @@ pub fn draw_metadata_column(
                 // rather than pushing the note (and the strip below) away.
                 egui::ScrollArea::vertical()
                     .id_salt(head.source)
-                    .max_height((ui.available_height() - 40.0).max(80.0))
+                    .max_height((ui.available_height() - 64.0).max(80.0))
                     .show(ui, |ui| {
                         for (tag, value) in &fields {
+                            // A field that differs from the other side is the
+                            // point of comparison — mark it (tag and value) in
+                            // the "differs" amber.
+                            let differs = differing.contains(tag);
+                            let tag_color = if differs {
+                                theme::amber()
+                            } else {
+                                theme::tan()
+                            };
+                            let val_color = if differs {
+                                theme::amber()
+                            } else {
+                                theme::text()
+                            };
                             ui.horizontal(|ui| {
                                 ui.add_sized(
                                     [140.0, 18.0],
                                     egui::Label::new(
-                                        RichText::new(tag).color(theme::tan()).size(12.0),
+                                        RichText::new(tag).color(tag_color).size(12.0),
                                     ),
                                 );
-                                ui.label(RichText::new(value).color(theme::text()).size(12.0));
+                                ui.label(RichText::new(value).color(val_color).size(12.0));
                             });
                         }
                     });
             }
-            ui.add_space(8.0);
+            ui.add_space(6.0);
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("SAVE METADATA").color(theme::ink_on(theme::tan())),
+                    )
+                    .fill(theme::tan()),
+                )
+                .on_hover_text(
+                    "Write this file's metadata to a text file in a folder you pick, so it is \
+                     preserved before you delete a copy.",
+                )
+                .clicked()
+            {
+                action = MetaAction::ExportMetadata;
+            }
+            ui.add_space(6.0);
             ui.label(
                 RichText::new("Capture metadata is shown as recorded and is not edited here.")
                     .color(theme::grey())
@@ -742,7 +782,10 @@ pub fn mark_pill(
     }
     let btn = egui::Button::new(rt).fill(fill);
     if !markable {
-        let _ = ui.add_enabled(false, btn);
+        ui.add_enabled(false, btn).on_disabled_hover_text(
+            "This copy is protected: its repository is locked. Unlock it in the Duplicates \
+             tab to mark this copy for deletion.",
+        );
         false
     } else {
         ui.add(btn)

@@ -949,7 +949,7 @@ impl DupesView {
                     if quick && has_marked {
                         let del = egui::Button::new(
                             RichText::new(format!("{} DELETE NOW", icon::TRASH))
-                                .color(theme::black()),
+                                .color(theme::ink_on(theme::red())),
                         )
                         .fill(theme::red());
                         if ui
@@ -1452,7 +1452,7 @@ impl DupesView {
             ui.horizontal(|ui| {
                 if ui
                     .add(
-                        egui::Button::new(RichText::new(verb).color(theme::black()))
+                        egui::Button::new(RichText::new(verb).color(theme::ink_on(theme::red())))
                             .fill(theme::red()),
                     )
                     .clicked()
@@ -3659,8 +3659,19 @@ mod ui_tests {
         // rather than repeating every second click as reported.
         for expected in ["<2 / 3>", "<3 / 3>", "<1 / 3>"] {
             harness.get_by_label_contains("NEXT B").click();
-            for _ in 0..4 {
+            // Settle until the new candidate fully resolves — the target label
+            // present and the member-count labels gone — rather than a fixed
+            // step count: under parallel decode load a handful of frames isn't
+            // enough, and breaking on a transient frame catches a stale count.
+            for _ in 0..200 {
+                let settled = harness.query_all_by_label(expected).count() > 0
+                    && harness.query_all_by_label("<1 / 4>").count() == 0
+                    && harness.query_all_by_label("<4 / 4>").count() == 0;
+                if settled {
+                    break;
+                }
                 harness.step();
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
             assert!(
                 harness.query_all_by_label(expected).count() > 0,
@@ -5512,9 +5523,9 @@ mod ui_tests {
     }
 
     /// Non-media duplicates (documents, archives) reach a Text tab — the
-    /// representation that gives them a lightbox at all — with each side's head
-    /// in its own column: decoded text where it decodes, a hex dump where it
-    /// does not.
+    /// representation that gives them a lightbox at all. A single file previews
+    /// its head as decoded text (or a hex dump); revealing the second side turns
+    /// the tab into the full-file, aligned hex diff of the two.
     #[test]
     fn text_tab_previews_both_sides_as_text_or_hex() {
         let dir = tempfile::tempdir().unwrap();
@@ -5542,16 +5553,17 @@ mod ui_tests {
             "A's text is previewed"
         );
 
-        // With B revealed, the binary side shows a hex dump beside it.
+        // With B revealed, the tab becomes the aligned, paginated hex diff of
+        // the two files — equal bytes lined up, differences marked.
         harness.get_by_label_contains("SHOW B").click();
         harness.run();
-        let notes = harness
-            .query_all_by_label_contains("Full contents, as text")
-            .count();
-        assert!(notes > 0, "the text side is labelled as text");
         assert!(
-            harness.query_all_by_label_contains("as hex").count() > 0,
-            "the binary side falls back to a hex dump"
+            harness.query_all_by_label_contains("page 1 /").count() > 0,
+            "two sides turn the Text tab into the paginated hex diff"
+        );
+        assert!(
+            harness.query_all_by_label_contains("NEXT DIFF").count() > 0,
+            "and it offers to jump to the difference"
         );
     }
 

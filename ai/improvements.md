@@ -51,6 +51,17 @@ open items deliberately left out.
   re-queues the job as `JobKind::UpdateForced`.
 - **DIFF compare is routed through the shared lightbox** and `DiffCompare` is deleted, rather
   than bolting a spectrogram onto the second compare surface. Ticket `11`.
+- **Compare-viewer diff intelligence** — done 2026-08-03, nine tickets in
+  [`.scratch/compare-intel/`](../.scratch/compare-intel/spec.md). Governing principle: the
+  viewer *reveals and compares* faithfully and never weighs in on keep-vs-delete. The Text tab
+  is now a full-file, aligned, paginated hex diff driven by a new pure `dedup_core::align`
+  engine (prefix/suffix trim + bounded LCS, degrading to greedy block-anchoring past a budget,
+  flagged so the UI says so); it renders gaps green and substitutions amber with jump-to-diff.
+  The image view states pixel-identity; the Metadata tab diffs EXIF/TIFF fields and saves a
+  sidecar. Flicker became single-file focus (one side's chrome, SWAP flips it; image-only). A
+  locked repo now allows save-as-a-copy (protects existing files, permits adding). Light-mode
+  legibility got a palette-aware `theme::ink_on(fill)` for filled pills, a selected-tab border,
+  and a consistent repo identicon. The "better" cue prefers the older copy.
 
 ## Open work (verified against source, 2026-07-30)
 

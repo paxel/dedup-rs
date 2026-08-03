@@ -2204,8 +2204,10 @@ impl TransferView {
                     ui.add(egui::Spinner::new().color(theme::amber()));
                     if ui
                         .add(
-                            egui::Button::new(RichText::new("CANCEL").color(theme::black()))
-                                .fill(theme::red()),
+                            egui::Button::new(
+                                RichText::new("CANCEL").color(theme::ink_on(theme::red())),
+                            )
+                            .fill(theme::red()),
                         )
                         .explain(
                             self.verbosity,
@@ -3216,8 +3218,10 @@ impl TransferView {
             ui.horizontal(|ui| {
                 if ui
                     .add(
-                        egui::Button::new(egui::RichText::new("APPLY").color(theme::black()))
-                            .fill(theme::red()),
+                        egui::Button::new(
+                            egui::RichText::new("APPLY").color(theme::ink_on(theme::red())),
+                        )
+                        .fill(theme::red()),
                     )
                     .clicked()
                 {

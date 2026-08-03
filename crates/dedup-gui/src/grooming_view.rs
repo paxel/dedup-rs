@@ -871,8 +871,9 @@ impl GroomingView {
                 {
                     acts.push(Act::Preview);
                 }
-                let run = egui::Button::new(RichText::new("RUN").color(theme::black()))
-                    .fill(theme::red());
+                let run =
+                    egui::Button::new(RichText::new("RUN").color(theme::ink_on(theme::red())))
+                        .fill(theme::red());
                 if ui
                     .add_enabled(ready, run)
                     .explain(
@@ -889,8 +890,10 @@ impl GroomingView {
                     ui.add(egui::Spinner::new().color(theme::amber()));
                     if ui
                         .add(
-                            egui::Button::new(RichText::new("CANCEL").color(theme::black()))
-                                .fill(theme::red()),
+                            egui::Button::new(
+                                RichText::new("CANCEL").color(theme::ink_on(theme::red())),
+                            )
+                            .fill(theme::red()),
                         )
                         .explain(
                             self.verbosity,
@@ -1016,8 +1019,10 @@ impl GroomingView {
             ui.horizontal(|ui| {
                 if ui
                     .add(
-                        egui::Button::new(RichText::new("PROCEED").color(theme::black()))
-                            .fill(theme::red()),
+                        egui::Button::new(
+                            RichText::new("PROCEED").color(theme::ink_on(theme::red())),
+                        )
+                        .fill(theme::red()),
                     )
                     .clicked()
                 {

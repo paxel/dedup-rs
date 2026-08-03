@@ -598,8 +598,10 @@ impl FilterBuilder {
 
                         if ui
                             .add(
-                                egui::Button::new(RichText::new("CLEAR").color(theme::black()))
-                                    .fill(theme::red()),
+                                egui::Button::new(
+                                    RichText::new("CLEAR").color(theme::ink_on(theme::red())),
+                                )
+                                .fill(theme::red()),
                             )
                             .explain(
                                 self.verbosity,

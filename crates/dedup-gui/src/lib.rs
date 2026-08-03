@@ -11,6 +11,7 @@ mod external;
 mod filter_ui;
 mod grooming_view;
 mod help_content;
+mod hexdiff;
 mod icon;
 mod id3tags;
 mod imgedit;

@@ -140,8 +140,10 @@ pub fn popup(
                 ui.add_space(10.0);
                 if ui
                     .add(
-                        egui::Button::new(RichText::new("DELETE ALL").color(theme::black()))
-                            .fill(theme::red()),
+                        egui::Button::new(
+                            RichText::new("DELETE ALL").color(theme::ink_on(theme::red())),
+                        )
+                        .fill(theme::red()),
                     )
                     .clicked()
                 {

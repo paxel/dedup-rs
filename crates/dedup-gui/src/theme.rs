@@ -149,7 +149,6 @@ pub fn perceptual_distance(a: Color32, b: Color32) -> f32 {
 }
 
 /// WCAG relative luminance of a colour (0 = black, 1 = white).
-#[cfg(test)]
 fn relative_luminance(c: Color32) -> f32 {
     let f = |v: u8| {
         let s = v as f32 / 255.0;
@@ -163,13 +162,36 @@ fn relative_luminance(c: Color32) -> f32 {
 }
 
 /// WCAG contrast ratio between two colours (1 = identical, 21 = black/white).
-/// Test-only, like [`perceptual_distance`]: legibility is asserted against the
-/// static palettes in the suite, not measured live.
-#[cfg(test)]
 pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
     let (la, lb) = (relative_luminance(a), relative_luminance(b));
     let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
     (hi + 0.05) / (lo + 0.05)
+}
+
+/// A light ink for text on a *dark* accent fill. Warm near-white so it sits in
+/// the LCARS family rather than reading as pure white.
+const INK_LIGHT: Color32 = Color32::from_rgb(0xF5, 0xF1, 0xE8);
+
+/// The legible text colour for a filled pill on `palette`, given its `fill`:
+/// the palette's dark ink or a light ink, whichever contrasts more with the fill.
+fn ink_on_palette(palette: &Palette, fill: Color32) -> Color32 {
+    if contrast_ratio(palette.black, fill) >= contrast_ratio(INK_LIGHT, fill) {
+        palette.black
+    } else {
+        INK_LIGHT
+    }
+}
+
+/// The legible text colour for a filled pill, given its `fill`: the active
+/// palette's dark ink or a light ink, whichever contrasts more with the fill.
+///
+/// This is why filled pills read on **both** appearances: on the dark palette
+/// the accents are bright, so dark ink always wins and every pill is unchanged;
+/// on the light palette the darker accents (red, blue, green, lilac) flip to the
+/// light ink while the lighter ones (amber, tan) keep dark ink. Route every
+/// filled pill's text through here instead of hard-coding [`black`].
+pub fn ink_on(fill: Color32) -> Color32 {
+    ACTIVE.with(|p| ink_on_palette(&p.get(), fill))
 }
 
 /// Large corner radius gives widgets the rounded LCARS block look.
@@ -251,10 +273,12 @@ fn style_for(palette: Palette) -> Style {
     v.selection.stroke = Stroke::new(1.0, p.blue);
 
     // Buttons: orange at rest, amber on hover, tan when pressed, lilac when open.
-    v.widgets.inactive = pill(p.orange, p.black);
-    v.widgets.hovered = pill(p.amber, p.black);
-    v.widgets.active = pill(p.tan, p.black);
-    v.widgets.open = pill(p.lilac, p.black);
+    // Ink follows the fill so it stays legible on the light palette's darker
+    // accents (lilac in particular), and is unchanged on dark.
+    v.widgets.inactive = pill(p.orange, ink_on_palette(&p, p.orange));
+    v.widgets.hovered = pill(p.amber, ink_on_palette(&p, p.amber));
+    v.widgets.active = pill(p.tan, ink_on_palette(&p, p.tan));
+    v.widgets.open = pill(p.lilac, ink_on_palette(&p, p.lilac));
     v.widgets.noninteractive.corner_radius = PILL;
     // Keep the dark appearance's exact prior outline; light uses its hairline.
     v.widgets.noninteractive.bg_stroke = Stroke::new(
@@ -380,6 +404,35 @@ mod tests {
 
         install(DARK);
         assert_eq!(text(), DARK.text);
+    }
+
+    /// The ink chosen for a filled pill is legible on every accent used as a
+    /// fill, in both palettes — the actual defect behind "check the delete
+    /// buttons", asserted rather than eyeballed.
+    #[test]
+    fn ink_on_accent_is_legible_in_every_palette() {
+        const MIN: f32 = 4.0;
+        for (name, palette) in [("dark", DARK), ("light", LIGHT)] {
+            install(palette);
+            for fill in [orange(), amber(), tan(), lilac(), blue(), red(), green()] {
+                let ratio = contrast_ratio(ink_on(fill), fill);
+                assert!(
+                    ratio >= MIN,
+                    "{name}: ink on {fill:?} contrast {ratio:.2} < {MIN}"
+                );
+            }
+        }
+        install(DARK);
+    }
+
+    /// On the dark palette the accents are bright, so the ink is always the dark
+    /// ink — every existing filled pill is byte-identical to before the change.
+    #[test]
+    fn ink_on_accent_is_the_dark_ink_on_the_dark_palette() {
+        install(DARK);
+        for fill in [orange(), amber(), tan(), lilac(), blue(), red(), green()] {
+            assert_eq!(ink_on(fill), black(), "dark pills keep their dark ink");
+        }
     }
 
     /// Resolving to a theme installs that theme's palette; switching is live,

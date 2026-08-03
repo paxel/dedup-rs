@@ -88,15 +88,20 @@ FLAC no Metadata tab. Selecting a tab draws only the column(s) whose file suppor
 left (A) against right (B), never stacked. If a side steps to a copy that lacks the current
 representation, the viewer drops back to the pair's own representation.
 
-**Image**: mouse-wheel zooms around the cursor, drag pans, and FLICKER (or `space`) overlays
-the two files in one pane — SWAP trades them in place, the fastest way to spot a subtle edit;
-SIDE BY SIDE returns. ROTATE / MIRROR turn one side to align a copy somebody flipped; the
-turn carries into the comparison. On a writable file, **SAVE** then writes the turned image
-to disk: **OVERWRITE** replaces it in place, **SAVE COPY** writes a `_rot` sibling and leaves
-the original alone. Either way the file keeps its modified time — a turned scan is still the
-same photograph from the same date — or, when the image carries an EXIF capture date, the
-dialog can stamp the file's date from EXIF instead. An overwrite re-indexes the file
-immediately, so its new content identity is never stale.
+**Image**: mouse-wheel zooms around the cursor, drag pans, and FLICKER (or `space`) shows one
+file at a time in the pane — the fastest way to spot a subtle edit. Flicker is **single-file
+focus**: only the shown file's facts and its ROTATE / MIRROR / SAVE / delete are on screen, and
+**SWAP** flips the picture and all of that to the other file together, so there is no hidden
+side to act on by accident; SIDE BY SIDE returns. If the two decode to **identical pixels** the
+view says so — the difference, if any, is in the metadata, not the image. ROTATE / MIRROR turn
+one side to align a copy somebody flipped; the turn carries into the comparison. **SAVE** then
+writes the turned image to disk: **OVERWRITE** replaces it in place, **SAVE COPY** writes a
+`_rot` sibling and leaves the original alone. A **locked** ("Protected") repository allows the
+copy — it only adds a file — but not the overwrite or a delete, which are shown disabled with
+the reason. Either way the file keeps its modified time — a turned scan is still the same
+photograph from the same date — or, when the image carries an EXIF capture date, the dialog can
+stamp the file's date from EXIF instead. An overwrite re-indexes the file immediately, so its
+new content identity is never stale.
 
 **Audio** compares as spectrograms — frequency-vs-time, far more telling than a flat waveform
 — with a transport per side: **PLAY A** / **PLAY B**, **PAUSE**, and a cycling **SPEED** pill
@@ -113,17 +118,25 @@ other copy in the group carries (adopt the best one), and SAVE TAGS writes only 
 audio itself is untouched. `T` jumps straight here with the editor open. A file in a read-only
 repository is shown but never editable. For images the tab lists **every EXIF field** the
 file carries — camera, capture date, exposure, GPS, all of it — as recorded; EXIF is not
-edited here.
+edited here. When two files are compared, the fields that **differ** between them are
+highlighted, and **SAVE METADATA** writes a side's fields to a plain-text sidecar in a folder
+you pick — so the Title/Author/Keywords are rescued before you delete a copy.
 
 ![The Metadata tab, editing one copy's ID3 tags against another's](../screenshots/lightbox_metadata.png)
 
 **Text** is offered for **every** file — reading a JPEG's header bytes is as legitimate as
-looking at its pixels. It shows the head of each file (the first 64 KB) as text, or as an
-offset/hex/ASCII dump when the file is not text, so two same-sized "duplicates" can still be
-told apart by eye — and documents, archives and unknown formats get a real surface of their
-own. Long files scroll inside their column.
+looking at its pixels. For one file it shows the head (the first 64 KB) as text, or as an
+offset/hex/ASCII dump when the file is not text. Comparing **two** files it becomes a
+**full-file, aligned hex diff**: the byte streams are aligned so equal runs line up — even when
+one side has an inserted header — with the differences marked (a **green** gap where bytes
+exist on only one side, **amber** where they differ on both). It **paginates** through the whole
+file, **jump to next/previous difference** skips the long equal stretches, and a very large or
+pervasively-different pair falls back to a coarse block-level match and says so. So two
+same-sized "duplicates" that differ only in an inserted metadata header read as exactly that.
 
-![The Text tab, a markdown file beside a binary one](../screenshots/lightbox_text.png)
+![The Text tab, a single file's head as text or hex](../screenshots/lightbox_text.png)
+
+![The Text tab comparing two files as an aligned hex diff](../screenshots/hex_diff.png)
 
 **Videos** compare as one representative still per side, enough to tell two clips apart at a
 glance. Full playback stays the OPEN (external app) path.

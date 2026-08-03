@@ -184,6 +184,12 @@ pub(crate) struct DiffCompare {
     /// The Text tab's shared scroll position: both panes are locked to the
     /// same offset, so a byte comparison always looks at the same place.
     text_scroll: egui::Vec2,
+    /// The Text tab's aligned hex diff (two-sided), built from the two files'
+    /// bytes and cached under their content hashes so it rebuilds only when a
+    /// side changes. `hex_page` is the current page within it.
+    hexdiff: Option<crate::hexdiff::HexDiff>,
+    hexdiff_key: Option<(String, String)>,
+    hex_page: usize,
     /// The open ID3 tag editor (Metadata tab), if any. Only a writable audio
     /// side ever opens one.
     pub(crate) tag_edit: Option<TagEdit>,
@@ -250,6 +256,9 @@ impl DiffCompare {
             marks: [None, None],
             audio_active: None,
             text_scroll: egui::Vec2::ZERO,
+            hexdiff: None,
+            hexdiff_key: None,
+            hex_page: 0,
             tag_edit: None,
             tag_error: None,
             title: "COMPARE — SAME PATH, DIFFERENT CONTENT".into(),
@@ -503,6 +512,138 @@ impl DiffCompare {
                 self.tag_error = Some(format!("Tag save failed: {e}"));
                 self.tag_edit = Some(te);
             }
+        }
+    }
+
+    /// Write one side's metadata to a human-readable sidecar in a folder the user
+    /// picks — salvaging it before a copy is deleted. A new file, so it is
+    /// allowed even for a locked repo (it only adds). Cancelling the folder
+    /// picker is a no-op.
+    fn export_metadata(&mut self, is_left: bool) {
+        let slot = usize::from(!is_left);
+        let (abs, rel) = {
+            let side = if is_left { &self.left } else { &self.right };
+            (side.facts.abs_path.clone(), side.rel_path.clone())
+        };
+        let fields = self.exif_all[slot]
+            .clone()
+            .unwrap_or_else(|| dedup_core::fingerprint::exif_fields(&abs));
+        let base = std::path::Path::new(&rel)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "metadata".to_string());
+        let Some(dir) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        let text = metadata_sidecar(&base, &fields);
+        let dest = non_colliding_sidecar(&dir, &format!("{base}.metadata.txt"));
+        match std::fs::write(&dest, text) {
+            Ok(()) => self.tag_error = None,
+            Err(e) => self.tag_error = Some(format!("Metadata export failed: {e}")),
+        }
+    }
+
+    /// Render the Text tab's aligned hex diff for a two-sided comparison: build
+    /// (and cache under the two content hashes) the alignment, then a row of
+    /// controls — page navigation, jump-to-difference, and any degrade or
+    /// truncation notice — over the current page.
+    fn render_hex_diff(&mut self, ui: &mut egui::Ui) {
+        let key = (
+            self.left.facts.hash_hex.clone(),
+            self.right.facts.hash_hex.clone(),
+        );
+        if self.hexdiff_key.as_ref() != Some(&key) {
+            let a = crate::hexdiff::read_capped(&self.left.facts.abs_path);
+            let b = crate::hexdiff::read_capped(&self.right.facts.abs_path);
+            self.hexdiff = Some(crate::hexdiff::HexDiff::build(
+                &a.bytes,
+                &b.bytes,
+                a.truncated || b.truncated,
+                !a.read_ok || !b.read_ok,
+            ));
+            self.hexdiff_key = Some(key);
+            self.hex_page = 0;
+        }
+        let (pages, identical, degraded, truncated, read_failed) = match &self.hexdiff {
+            Some(d) => (
+                d.pages(),
+                d.is_identical(),
+                d.degraded,
+                d.truncated,
+                d.read_failed,
+            ),
+            None => return,
+        };
+        self.hex_page = self.hex_page.min(pages.saturating_sub(1));
+
+        let mut go: Option<usize> = None;
+        let mut jump_next = false;
+        let mut jump_prev = false;
+        ui.horizontal(|ui| {
+            if ui.button("< PREV PAGE").clicked() {
+                go = Some(self.hex_page.saturating_sub(1));
+            }
+            ui.label(
+                RichText::new(format!("page {} / {pages}", self.hex_page + 1)).color(theme::tan()),
+            );
+            if ui.button("NEXT PAGE >").clicked() && self.hex_page + 1 < pages {
+                go = Some(self.hex_page + 1);
+            }
+            ui.add_space(12.0);
+            if identical {
+                ui.label(RichText::new("The shown bytes are identical.").color(theme::green()));
+            } else {
+                if ui
+                    .button(format!("{} PREV DIFF", crate::icon::CARET_LEFT))
+                    .clicked()
+                {
+                    jump_prev = true;
+                }
+                if ui
+                    .button(format!("NEXT DIFF {}", crate::icon::CARET_RIGHT))
+                    .clicked()
+                {
+                    jump_next = true;
+                }
+            }
+        });
+        if degraded {
+            ui.label(
+                RichText::new("File too large for exact alignment — showing a block-level match.")
+                    .color(theme::red())
+                    .size(11.0),
+            );
+        }
+        if truncated {
+            ui.label(
+                RichText::new("Large file — only the first part is shown.")
+                    .color(theme::tan())
+                    .size(11.0),
+            );
+        }
+        if read_failed {
+            ui.label(
+                RichText::new(
+                    "A file could not be read — the diff below treats it as empty and may be \
+                     misleading.",
+                )
+                .color(theme::red())
+                .size(11.0),
+            );
+        }
+        if let Some(d) = &self.hexdiff {
+            if jump_next {
+                go = d.next_diff_page(self.hex_page);
+            }
+            if jump_prev {
+                go = d.prev_diff_page(self.hex_page);
+            }
+        }
+        if let Some(p) = go {
+            self.hex_page = p;
+        }
+        if let Some(d) = &self.hexdiff {
+            d.show_page(ui, self.hex_page);
         }
     }
 
@@ -825,6 +966,15 @@ impl DiffCompare {
         self.tex[slot] = Some(ctx.load_texture(name, image, TextureOptions::LINEAR));
     }
 
+    /// True when both sides decoded to byte-identical rasters: the two files are
+    /// the same picture, so any difference between them is in their metadata.
+    fn pixels_identical(&self) -> bool {
+        match (&self.base_image[0], &self.base_image[1]) {
+            (Some(a), Some(b)) => rasters_equal(a, b),
+            _ => false,
+        }
+    }
+
     /// `(texture, pixel-size)` for one side, in the shape [`draw_compare`] wants.
     /// The size comes from the indexed image dimensions, else the decoded texture
     /// (video stills carry no stored dimensions), else a 1×1 fallback while pending.
@@ -978,6 +1128,14 @@ impl DiffCompare {
                 let two_sided_now = two_sided;
                 let tab_is_image = self.tab == RepresentationKind::Image;
                 let tab_is_audio = self.tab == RepresentationKind::Audio;
+                // Flicker is a media-only mode (image/audio/video); its controls
+                // and single-file chrome must never appear on the Text/hex tab.
+                let tab_is_media = matches!(
+                    self.tab,
+                    RepresentationKind::Image
+                        | RepresentationKind::Audio
+                        | RepresentationKind::Video
+                );
                 let speed_label = player
                     .map(|p| {
                         let r = p.snapshot().speed;
@@ -1107,7 +1265,7 @@ impl DiffCompare {
                             {
                                 hide = true;
                             }
-                            if ready {
+                            if ready && tab_is_media {
                                 if self.compare.flicker {
                                     if ui
                                         .button("SIDE BY SIDE")
@@ -1432,6 +1590,9 @@ impl DiffCompare {
                         self.exif_all[0].clone().unwrap_or_default(),
                         self.exif_all[1].clone().unwrap_or_default(),
                     );
+                    // Tags that differ between the two sides drive the Metadata
+                    // tab's highlight — the whole point of comparing them.
+                    let differing = differing_exif_tags(&lx, &rx);
                     // The editor travels out of `self` for the frame so the
                     // column closures can bind text fields to it.
                     let mut tag_edit = self.tag_edit.take();
@@ -1448,6 +1609,7 @@ impl DiffCompare {
                         side: &'a DiffSide,
                         stored: Option<&'a crate::id3tags::Tags>,
                         exif: Vec<(String, String)>,
+                        differing: std::collections::HashSet<String>,
                         te: &'a mut Option<TagEdit>,
                     ) -> crate::lightbox::MetaBody<'a> {
                         match te {
@@ -1460,7 +1622,10 @@ impl DiffCompare {
                                 tags: stored,
                                 can_edit: !side.read_only,
                             },
-                            _ => crate::lightbox::MetaBody::Exif { fields: exif },
+                            _ => crate::lightbox::MetaBody::Exif {
+                                fields: exif,
+                                differing,
+                            },
                         }
                     }
                     // Only the side(s) that actually carry metadata get a
@@ -1479,7 +1644,7 @@ impl DiffCompare {
                                     is_main: false,
                                     source: &l.facts.abs_path,
                                 },
-                                meta_body(l, lt.as_ref(), lx.clone(), te),
+                                meta_body(l, lt.as_ref(), lx.clone(), differing.clone(), te),
                             );
                         }));
                     }
@@ -1495,84 +1660,104 @@ impl DiffCompare {
                                     read_only: r.read_only,
                                     source: &r.facts.abs_path,
                                 },
-                                meta_body(r, rt.as_ref(), rx.clone(), te),
+                                meta_body(r, rt.as_ref(), rx.clone(), differing.clone(), te),
                             );
                         }));
                     }
                     draw_columns(&mut child, &mut tag_edit, cols);
                     self.tag_edit = tag_edit;
                 } else if self.tab == RepresentationKind::Text {
-                    for slot in [0usize, 1usize] {
-                        if self.text[slot].is_none() {
-                            let side = if slot == 0 { &self.left } else { &self.right };
-                            self.text[slot] = Some(load_text_preview(&side.facts.abs_path));
-                        }
-                    }
-                    let (lt, rt) = (
-                        self.text[0].as_ref().cloned(),
-                        self.text[1].as_ref().cloned(),
-                    );
-                    let (l, r) = (&self.left, &self.right);
-                    let height = viewport.height().max(80.0);
-                    let mut child = ui.new_child(
-                        UiBuilder::new()
-                            .max_rect(viewport)
-                            .layout(Layout::top_down(Align::Min)),
-                    );
-                    // Both panes are locked to one scroll offset: each column
-                    // is drawn at the shared position and reports back where
-                    // it ended up, so whichever pane the user scrolled becomes
-                    // the new shared position (§ story 31 — comparing bytes
-                    // means looking at the same offset in both).
-                    type ScrollSync = (egui::Vec2, Option<egui::Vec2>);
-                    let mut sync: ScrollSync = (self.text_scroll, None);
-                    let mut cols: Vec<crate::lightbox::ColumnFn<'_, ScrollSync>> =
-                        vec![Box::new(move |ui: &mut egui::Ui, sync: &mut ScrollSync| {
-                            if let Some(p) = &lt {
-                                let (_, off) = draw_text_column(
-                                    ui,
-                                    &ColumnHead {
-                                        file_name: &l.rel_path,
-                                        repo: &l.repo,
-                                        accent: theme::blue(),
-                                        read_only: l.read_only,
-                                        is_main: false,
-                                        source: &l.facts.abs_path,
-                                    },
-                                    p,
-                                    height,
-                                    Some(sync.0),
-                                );
-                                if off != sync.0 {
-                                    sync.1 = Some(off);
-                                }
-                            }
-                        })];
                     if two_sided_now {
-                        cols.push(Box::new(move |ui: &mut egui::Ui, sync: &mut ScrollSync| {
-                            if let Some(p) = &rt {
-                                let (_, off) = draw_text_column(
-                                    ui,
-                                    &ColumnHead {
-                                        file_name: &r.rel_path,
-                                        repo: &r.repo,
-                                        accent: theme::tan(),
-                                        read_only: r.read_only,
-                                        is_main: false,
-                                        source: &r.facts.abs_path,
-                                    },
-                                    p,
-                                    height,
-                                    Some(sync.0),
-                                );
-                                if off != sync.0 {
-                                    sync.1 = Some(off);
-                                }
+                        // Two sides: the full-file, aligned, paginated hex diff.
+                        // Clear the strip's per-side action row (which extends a
+                        // little past the titles into the viewport top) so the
+                        // hex diff's own page/jump bar can't collide with it —
+                        // and the extra switcher row when the group has a pool.
+                        let has_switcher = self.can_step_left() || self.can_step_right();
+                        let clearance = if has_switcher { 58.0 } else { 30.0 };
+                        let hex_rect = Rect::from_min_max(
+                            egui::pos2(viewport.min.x, viewport.min.y + clearance),
+                            viewport.max,
+                        );
+                        let mut child = ui.new_child(
+                            UiBuilder::new()
+                                .max_rect(hex_rect)
+                                .layout(Layout::top_down(Align::Min)),
+                        );
+                        self.render_hex_diff(&mut child);
+                    } else {
+                        for slot in [0usize, 1usize] {
+                            if self.text[slot].is_none() {
+                                let side = if slot == 0 { &self.left } else { &self.right };
+                                self.text[slot] = Some(load_text_preview(&side.facts.abs_path));
                             }
-                        }));
+                        }
+                        let (lt, rt) = (
+                            self.text[0].as_ref().cloned(),
+                            self.text[1].as_ref().cloned(),
+                        );
+                        let (l, r) = (&self.left, &self.right);
+                        let height = viewport.height().max(80.0);
+                        let mut child = ui.new_child(
+                            UiBuilder::new()
+                                .max_rect(viewport)
+                                .layout(Layout::top_down(Align::Min)),
+                        );
+                        // Both panes are locked to one scroll offset: each column
+                        // is drawn at the shared position and reports back where
+                        // it ended up, so whichever pane the user scrolled becomes
+                        // the new shared position (§ story 31 — comparing bytes
+                        // means looking at the same offset in both).
+                        type ScrollSync = (egui::Vec2, Option<egui::Vec2>);
+                        let mut sync: ScrollSync = (self.text_scroll, None);
+                        let mut cols: Vec<crate::lightbox::ColumnFn<'_, ScrollSync>> =
+                            vec![Box::new(move |ui: &mut egui::Ui, sync: &mut ScrollSync| {
+                                if let Some(p) = &lt {
+                                    let (_, off) = draw_text_column(
+                                        ui,
+                                        &ColumnHead {
+                                            file_name: &l.rel_path,
+                                            repo: &l.repo,
+                                            accent: theme::blue(),
+                                            read_only: l.read_only,
+                                            is_main: false,
+                                            source: &l.facts.abs_path,
+                                        },
+                                        p,
+                                        height,
+                                        Some(sync.0),
+                                    );
+                                    if off != sync.0 {
+                                        sync.1 = Some(off);
+                                    }
+                                }
+                            })];
+                        if two_sided_now {
+                            cols.push(Box::new(move |ui: &mut egui::Ui, sync: &mut ScrollSync| {
+                                if let Some(p) = &rt {
+                                    let (_, off) = draw_text_column(
+                                        ui,
+                                        &ColumnHead {
+                                            file_name: &r.rel_path,
+                                            repo: &r.repo,
+                                            accent: theme::tan(),
+                                            read_only: r.read_only,
+                                            is_main: false,
+                                            source: &r.facts.abs_path,
+                                        },
+                                        p,
+                                        height,
+                                        Some(sync.0),
+                                    );
+                                    if off != sync.0 {
+                                        sync.1 = Some(off);
+                                    }
+                                }
+                            }));
+                        }
+                        draw_columns(&mut child, &mut sync, cols);
+                        self.text_scroll = sync.1.unwrap_or(sync.0);
                     }
-                    draw_columns(&mut child, &mut sync, cols);
-                    self.text_scroll = sync.1.unwrap_or(sync.0);
                 } else if !two_sided_now {
                     // One file, the whole viewport — the hidden side must not
                     // paint a second copy of the same picture.
@@ -1644,6 +1829,33 @@ impl DiffCompare {
                         FontId::proportional(11.0),
                         theme::hairline(),
                     );
+                    // Identical rasters: state it plainly (a comparison result,
+                    // not a verdict) so "flicker does nothing" isn't a mystery,
+                    // and point — without hijacking the tab — to where the
+                    // difference actually lives.
+                    if self.two_sided() && self.pixels_identical() {
+                        let banner = Rect::from_min_size(
+                            egui::pos2(viewport.min.x + 8.0, viewport.min.y + 6.0),
+                            egui::vec2((viewport.width() - 16.0).max(0.0), 24.0),
+                        );
+                        ui.painter().rect_filled(banner, 6.0, theme::panel());
+                        ui.put(
+                            banner,
+                            egui::Label::new(
+                                // Deliberately free of tab names ("Metadata"/
+                                // "Text"): this label is on screen whenever two
+                                // images match, and a tab name here would collide
+                                // with every `query_by_label_contains` for a tab.
+                                RichText::new(
+                                    "Pixels identical — the two images are the same; any \
+                                     difference between the files is in their embedded data.",
+                                )
+                                .color(theme::text())
+                                .size(12.0),
+                            )
+                            .truncate(),
+                        );
+                    }
                 } else {
                     // Not both decoded yet (or one produced no visual): static
                     // side-by-side, each pane its image, an in-flight "decoding…"
@@ -1685,12 +1897,22 @@ impl DiffCompare {
                 // pane below it. Flow layout advanced by the other side's used
                 // width, so B's facts drifted mid-window when A's were narrow.
                 let col_w = (strip.width() - 16.0) * 0.5;
+                // In flicker the viewer is single-file: only the shown side (A or
+                // B) carries chrome, full-width, and SWAP flips the image and this
+                // chrome to the other side together — so there is no hidden-side
+                // control to click by accident.
+                let flicker_active = self.compare.flicker && two_sided && tab_is_media;
+                let shown_is_left = !self.compare.show_b;
                 for is_left in [true, false] {
                     if !is_left && !two_sided {
                         continue;
                     }
-                    let half = if two_sided { col_w } else { strip.width() };
-                    let x0 = if is_left {
+                    if flicker_active && is_left != shown_is_left {
+                        continue;
+                    }
+                    let full = !two_sided || flicker_active;
+                    let half = if full { strip.width() } else { col_w };
+                    let x0 = if full || is_left {
                         strip.min.x
                     } else {
                         strip.min.x + col_w + 16.0
@@ -1710,7 +1932,7 @@ impl DiffCompare {
                         self.can_step_right()
                     };
                     let mark = self.marks[usize::from(!is_left)];
-                    let mark_label = if two_sided {
+                    let mark_label = if two_sided && !flicker_active {
                         if is_left { "DELETE A" } else { "DELETE B" }
                     } else {
                         "DELETE"
@@ -1767,24 +1989,36 @@ impl DiffCompare {
                                             if ui.button(format!("MIRROR {label}")).clicked() {
                                                 turn = Some((is_left, Orient::FlipH));
                                             }
-                                            // A pending turn on a writable
-                                            // side can be written to disk.
+                                            // A pending turn can always be
+                                            // written — as a new copy even on a
+                                            // locked side (that only adds a
+                                            // file); overwriting the original is
+                                            // the part a lock gates, decided in
+                                            // the save dialog.
+                                            let long_help = if side.read_only {
+                                                "Save this side's rotation/mirror as a new copy \
+                                                 beside the original. This repo is locked, so the \
+                                                 original itself can't be overwritten."
+                                            } else {
+                                                "Save this side's rotation/mirror to the file — \
+                                                 overwriting it in place or as a new copy; you \
+                                                 choose next."
+                                            };
                                             if turned
-                                                && !side.read_only
                                                 && ui
                                                     .add(
                                                         egui::Button::new(
                                                             RichText::new(format!("SAVE {label}"))
-                                                                .color(theme::black()),
+                                                                .color(theme::ink_on(
+                                                                    theme::amber(),
+                                                                )),
                                                         )
                                                         .fill(theme::amber()),
                                                     )
                                                     .explain(
                                                         verbosity,
                                                         "Write the turned image to disk",
-                                                        "Save this side's rotation/mirror to \
-                                                             the file — overwriting it in place \
-                                                             or as a new copy; you choose next.",
+                                                        long_help,
                                                     )
                                                     .clicked()
                                             {
@@ -1833,6 +2067,8 @@ impl DiffCompare {
                 (MetaAction::Edit, _) => self.open_tag_editor(true),
                 (_, MetaAction::Edit) => self.open_tag_editor(false),
                 (MetaAction::Save, _) | (_, MetaAction::Save) => self.save_tag_edit(),
+                (MetaAction::ExportMetadata, _) => self.export_metadata(true),
+                (_, MetaAction::ExportMetadata) => self.export_metadata(false),
                 (MetaAction::Cancel, _) | (_, MetaAction::Cancel) => self.tag_edit = None,
                 (MetaAction::None, MetaAction::None) => {}
             }
@@ -1951,14 +2187,16 @@ impl DiffCompare {
         }
         if let Some(is_left) = self.save_confirm {
             let slot = usize::from(!is_left);
-            let (name, path, taken) = {
+            let (name, path, taken, read_only) = {
                 let side = if is_left { &self.left } else { &self.right };
                 (
                     side.rel_path.clone(),
                     side.facts.abs_path.clone(),
                     side.facts.exif.as_ref().and_then(|e| e.taken_ms),
+                    side.read_only,
                 )
             };
+            let actions = save_actions(read_only, true);
             let mut do_save: Option<bool> = None; // Some(overwrite)
             let mut cancel = false;
             let mut exif_date = self.save_exif_date;
@@ -1973,15 +2211,17 @@ impl DiffCompare {
                 );
                 ui.add_space(6.0);
                 ui.colored_label(theme::text(), &name);
-                ui.label(
-                    RichText::new(
-                        "Overwriting replaces the file in place; saving a copy writes a \
-                         new `_rot` file beside it and leaves the original untouched. \
-                         Either way the file keeps its modified time.",
-                    )
-                    .color(theme::lilac())
-                    .size(11.0),
-                );
+                let blurb = if actions.overwrite {
+                    "Overwriting replaces the file in place; saving a copy writes a \
+                     new `_rot` file beside it and leaves the original untouched. \
+                     Either way the file keeps its modified time."
+                } else {
+                    "This repo is locked, so the original can't be overwritten — but \
+                     saving a copy is fine, since it only adds a new `_rot` file beside \
+                     the original. Unlock the repo in Duplicates to overwrite in place. \
+                     The copy keeps the file's modified time."
+                };
+                ui.label(RichText::new(blurb).color(theme::lilac()).size(11.0));
                 if let Some(ms) = taken {
                     ui.add_space(4.0);
                     ui.checkbox(
@@ -1999,18 +2239,21 @@ impl DiffCompare {
                 }
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("OVERWRITE").color(theme::black()))
+                    if actions.overwrite
+                        && ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("OVERWRITE").color(theme::ink_on(theme::red())),
+                                )
                                 .fill(theme::red()),
-                        )
-                        .explain(
-                            verbosity,
-                            "Replace the file in place",
-                            "Write the turned image over the original. The previous pixels \
-                             are gone afterwards; the file's date is kept.",
-                        )
-                        .clicked()
+                            )
+                            .explain(
+                                verbosity,
+                                "Replace the file in place",
+                                "Write the turned image over the original. The previous pixels \
+                                 are gone afterwards; the file's date is kept.",
+                            )
+                            .clicked()
                     {
                         do_save = Some(true);
                     }
@@ -2251,7 +2494,86 @@ impl DiffCompare {
     }
 }
 
-/// One side's facts (repo, path, size / date / type with the bigger-or-newer
+/// Which save actions the viewer offers for a turned image on one side. A locked
+/// repo protects its *existing* files but permits adding *new* ones, so writing a
+/// copy is always available once there are edits; only overwriting the original
+/// in place is gated by the lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SaveActions {
+    copy: bool,
+    overwrite: bool,
+}
+
+fn save_actions(read_only: bool, has_edits: bool) -> SaveActions {
+    SaveActions {
+        copy: has_edits,
+        overwrite: has_edits && !read_only,
+    }
+}
+
+/// Whether two decoded rasters are byte-for-byte identical — same dimensions and
+/// the same pixels. The seam behind the image view's "pixels identical" verdict.
+fn rasters_equal(a: &ColorImage, b: &ColorImage) -> bool {
+    a.size == b.size && a.pixels == b.pixels
+}
+
+/// Tag names whose value differs between the two sides: present on both with a
+/// different value, or present on only one. Drives the Metadata tab's "differs"
+/// highlight.
+fn differing_exif_tags(
+    a: &[(String, String)],
+    b: &[(String, String)],
+) -> std::collections::HashSet<String> {
+    let amap: std::collections::HashMap<&str, &str> =
+        a.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let bmap: std::collections::HashMap<&str, &str> =
+        b.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let mut out = std::collections::HashSet::new();
+    for (k, v) in a {
+        if bmap.get(k.as_str()) != Some(&v.as_str()) {
+            out.insert(k.clone());
+        }
+    }
+    for (k, _) in b {
+        if !amap.contains_key(k.as_str()) {
+            out.insert(k.clone());
+        }
+    }
+    out
+}
+
+/// A human-readable metadata sidecar: a header naming the file, then each field
+/// as `Tag: value`. The goal is preserving the *information* before a copy is
+/// deleted, not reconstructing the exact bytes.
+fn metadata_sidecar(name: &str, fields: &[(String, String)]) -> String {
+    let header = format!("Metadata for {name}");
+    let mut out = String::new();
+    out.push_str(&header);
+    out.push('\n');
+    out.push_str(&"=".repeat(header.len().min(72)));
+    out.push('\n');
+    if fields.is_empty() {
+        out.push_str("(no metadata)\n");
+    }
+    for (tag, value) in fields {
+        out.push_str(&format!("{tag}: {value}\n"));
+    }
+    out
+}
+
+/// Write `dir/name`, appending `.N` before it collides with an existing file, so
+/// a sidecar export never clobbers something already there.
+fn non_colliding_sidecar(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let mut dest = dir.join(name);
+    let mut n = 1;
+    while dest.exists() {
+        dest = dir.join(format!("{name}.{n}"));
+        n += 1;
+    }
+    dest
+}
+
+/// One side's facts (repo, path, size / date / type with the bigger-or-older
 /// value highlighted so the difference reads without comparing both numbers) and
 /// its actions — the caller's own: a deletion-mark pill when `mark` is supplied,
 /// else the DIFF board's OVERWRITE / DELETE commands. Returns the chosen action,
@@ -2267,16 +2589,24 @@ fn side_strip(
 ) -> Option<DiffPick> {
     let mut pick = None;
     ui.vertical(|ui| {
-        ui.label(
-            RichText::new(&side.repo)
-                .color(if is_left {
-                    theme::orange()
-                } else {
-                    theme::blue()
-                })
-                .size(14.0)
-                .strong(),
-        );
+        // Prefix the repo name with its identicon, so a side's header is
+        // decorated the same way the Text/Metadata columns' repo chips are —
+        // one repo reads with one identity across every tab.
+        ui.horizontal(|ui| {
+            let (icon_rect, _) =
+                ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+            crate::repo_chip::identicon(ui.painter(), icon_rect, &side.repo);
+            ui.label(
+                RichText::new(&side.repo)
+                    .color(if is_left {
+                        theme::orange()
+                    } else {
+                        theme::blue()
+                    })
+                    .size(14.0)
+                    .strong(),
+            );
+        });
         // Truncated: a deep path must not widen this side into the other's half.
         ui.add(
             egui::Label::new(
@@ -2291,7 +2621,10 @@ fn side_strip(
         } else {
             theme::text()
         };
-        let date_color = if side.facts.modified_ms > other.facts.modified_ms {
+        // Prefer the *older* copy: in inheritance triage the earlier file is the
+        // more original, so age (not recency) is the "better" cue. Equal dates
+        // green neither side.
+        let date_color = if side.facts.modified_ms < other.facts.modified_ms {
             theme::green()
         } else {
             theme::text()
@@ -2349,7 +2682,7 @@ fn side_strip(
             }
             if ui
                 .add(
-                    egui::Button::new(RichText::new("DELETE").color(theme::black()))
+                    egui::Button::new(RichText::new("DELETE").color(theme::ink_on(theme::red())))
                         .fill(theme::red()),
                 )
                 .explain(
@@ -2371,6 +2704,136 @@ fn side_strip(
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    /// The metadata diff names every tag that differs — changed on both sides,
+    /// or present on only one — and nothing that matches.
+    #[test]
+    fn differing_exif_tags_names_only_the_differences() {
+        let a = vec![
+            ("Make".to_string(), "Canon".to_string()),
+            ("Model".to_string(), "5D".to_string()),
+            ("Title".to_string(), "Beach".to_string()),
+        ];
+        let b = vec![
+            ("Make".to_string(), "Canon".to_string()), // same
+            ("Model".to_string(), "6D".to_string()),   // changed
+            ("Author".to_string(), "Sam".to_string()), // only on b
+        ];
+        let diff = differing_exif_tags(&a, &b);
+        assert!(!diff.contains("Make"), "an identical field is not flagged");
+        assert!(diff.contains("Model"), "a changed field is flagged");
+        assert!(
+            diff.contains("Title"),
+            "a field only on the left is flagged"
+        );
+        assert!(
+            diff.contains("Author"),
+            "a field only on the right is flagged"
+        );
+        assert_eq!(diff.len(), 3);
+    }
+
+    /// The sidecar is human-readable: a header naming the file, then `Tag: value`
+    /// lines carrying the information.
+    #[test]
+    fn metadata_sidecar_is_readable_and_names_the_file() {
+        let fields = vec![
+            ("Title".to_string(), "Beach".to_string()),
+            ("Author".to_string(), "Sam".to_string()),
+        ];
+        let text = metadata_sidecar("photo.tif", &fields);
+        assert!(text.contains("Metadata for photo.tif"));
+        assert!(text.contains("Title: Beach"));
+        assert!(text.contains("Author: Sam"));
+        // Empty metadata is stated, not a blank file.
+        assert!(metadata_sidecar("x.jpg", &[]).contains("(no metadata)"));
+    }
+
+    /// Raster equality is dimensions + pixels: same picture, or not.
+    #[test]
+    fn rasters_equal_compares_size_and_pixels() {
+        let a = ColorImage::from_rgba_unmultiplied([1, 1], &[10, 20, 30, 255]);
+        let same = ColorImage::from_rgba_unmultiplied([1, 1], &[10, 20, 30, 255]);
+        let other_pixels = ColorImage::from_rgba_unmultiplied([1, 1], &[99, 20, 30, 255]);
+        let other_size =
+            ColorImage::from_rgba_unmultiplied([2, 1], &[10, 20, 30, 255, 10, 20, 30, 255]);
+        assert!(rasters_equal(&a, &same));
+        assert!(!rasters_equal(&a, &other_pixels));
+        assert!(!rasters_equal(&a, &other_size));
+    }
+
+    /// Two same-sized images decode to identical rasters, so the image view
+    /// states it; two differently-sized ones do not.
+    #[test]
+    fn the_image_view_states_when_the_pixels_are_identical() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        // Same dimensions ⇒ writable_png_side's gradient is byte-identical.
+        let a = writable_png_side(tmp.path(), "a.png", 40, 20);
+        let b = writable_png_side(tmp.path(), "b.png", 40, 20);
+        let cmp = DiffCompare::new_with_pool(a, Some(b), Vec::new());
+        let mut h = save_harness(cmp);
+        for _ in 0..200 {
+            h.step();
+            if h.query_by_label_contains("Pixels identical").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            h.query_by_label_contains("Pixels identical").is_some(),
+            "identical rasters are stated in the image view"
+        );
+
+        // Different dimensions ⇒ different rasters ⇒ no banner.
+        let tmp2 = tempfile::tempdir().unwrap();
+        let c = writable_png_side(tmp2.path(), "c.png", 40, 20);
+        let d = writable_png_side(tmp2.path(), "d.png", 30, 24);
+        let cmp2 = DiffCompare::new_with_pool(c, Some(d), Vec::new());
+        let mut h2 = save_harness(cmp2);
+        for _ in 0..200 {
+            h2.step();
+            if h2.query_by_label("FLICKER").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            h2.query_by_label_contains("Pixels identical").is_none(),
+            "differing rasters get no such banner"
+        );
+    }
+
+    /// A locked repo protects its existing files but permits adding new ones, so
+    /// a copy is always offered once there are edits; only overwriting in place
+    /// is gated by the lock.
+    #[test]
+    fn save_actions_allow_a_copy_when_locked_but_not_an_overwrite() {
+        // Nothing edited: nothing to save.
+        assert_eq!(
+            save_actions(false, false),
+            SaveActions {
+                copy: false,
+                overwrite: false
+            }
+        );
+        // Unlocked with edits: both a copy and an in-place overwrite.
+        assert_eq!(
+            save_actions(false, true),
+            SaveActions {
+                copy: true,
+                overwrite: true
+            }
+        );
+        // Locked with edits: a copy is fine (it only adds), overwrite is not.
+        assert_eq!(
+            save_actions(true, true),
+            SaveActions {
+                copy: true,
+                overwrite: false
+            }
+        );
+    }
 
     /// An audio side with its own identity, for the transport tests.
     fn audio_side(name: &str, hex: &str) -> DiffSide {
@@ -2830,6 +3293,172 @@ mod tests {
             h.query_by_label("FLICKER").is_none(),
             "a single view offers no flicker"
         );
+    }
+
+    /// In flicker the viewer is single-file: only the shown side's facts are on
+    /// screen, and SWAP flips *which* side's facts show along with the image —
+    /// so there is no hidden-side control to click by accident.
+    #[test]
+    fn flicker_shows_only_the_visible_sides_chrome_and_swap_flips_it() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let a = writable_png_side(tmp.path(), "alpha.png", 40, 20);
+        let b = writable_png_side(tmp.path(), "beta.png", 40, 20);
+        let cmp = DiffCompare::new_with_pool(a, Some(b), Vec::new());
+        let mut h = save_harness(cmp);
+        for _ in 0..200 {
+            h.step();
+            if h.query_by_label("FLICKER").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        h.get_by_label("FLICKER").click();
+        h.run();
+        // show_b is false, so only side A's facts are present.
+        assert!(
+            h.query_by_label_contains("alpha.png").is_some(),
+            "the shown side's facts are on screen"
+        );
+        assert!(
+            h.query_by_label_contains("beta.png").is_none(),
+            "the hidden side's facts (and its tools) are not"
+        );
+        h.get_by_label("SWAP").click();
+        h.run();
+        assert!(
+            h.query_by_label_contains("beta.png").is_some(),
+            "SWAP brings the other side's facts on screen"
+        );
+        assert!(
+            h.query_by_label_contains("alpha.png").is_none(),
+            "and takes the first side's away — the chrome flipped with the image"
+        );
+    }
+
+    /// Selecting a representation tab switches to it, and the repo header (its
+    /// identicon-decorated name) is present on both the Image and the Text tab —
+    /// one repo reads with one identity across tabs, not decorated on one and
+    /// plain on the other.
+    #[test]
+    fn selecting_a_tab_switches_it_and_the_repo_header_is_consistent() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        // Different sizes so the rasters differ (no "pixels identical" banner,
+        // whose text would otherwise collide with the tab-name queries here).
+        let mut a = writable_png_side(tmp.path(), "a.png", 40, 20);
+        let mut b = writable_png_side(tmp.path(), "b.png", 30, 24);
+        a.repo = "shoebox".into();
+        b.repo = "shoebox".into();
+        let cmp = DiffCompare::new_with_pool(a, Some(b), Vec::new());
+        let mut h = save_harness(cmp);
+        // Wait for the decode: the Image tab appears only once both sides decode
+        // (Text is offered immediately, so it can't be the settle signal).
+        for _ in 0..200 {
+            h.step();
+            if h.query_by_label_contains("Image").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            h.query_by_label_contains("Image").is_some(),
+            "the Image tab is offered"
+        );
+        assert!(
+            h.query_by_label_contains("Text").is_some(),
+            "the Text tab is offered"
+        );
+        assert!(
+            h.query_all_by_label_contains("shoebox").count() > 0,
+            "the repo header shows on the image tab"
+        );
+        h.get_by_label_contains("Text").click();
+        h.run();
+        assert_eq!(
+            h.state().0.tab,
+            RepresentationKind::Text,
+            "clicking Text selects it"
+        );
+        assert!(
+            h.query_all_by_label_contains("shoebox").count() > 0,
+            "the repo header is still shown on the Text tab — consistent across tabs"
+        );
+    }
+
+    /// Build a two-sided, Text-tab compare over two real files whose only
+    /// difference is an inserted header — the case the aligned hex diff exists
+    /// for.
+    fn hex_diff_pair(tmp: &Path) -> DiffCompare {
+        let payload: Vec<u8> = (0..600u32).map(|i| (i % 251) as u8).collect();
+        let pa = tmp.join("a.bin");
+        let pb = tmp.join("b.bin");
+        std::fs::write(&pa, &payload).unwrap();
+        let mut bbytes = b"INSERTED-HEADER-BYTES".to_vec();
+        bbytes.extend_from_slice(&payload);
+        std::fs::write(&pb, &bbytes).unwrap();
+        let mut a = named_side("a.bin");
+        a.facts.abs_path = pa;
+        a.facts.hash_hex = "hash-a".into();
+        a.facts.mime = Some("application/octet-stream".into());
+        let mut b = named_side("b.bin");
+        b.facts.abs_path = pb;
+        b.facts.hash_hex = "hash-b".into();
+        b.facts.mime = Some("application/octet-stream".into());
+        let mut cmp = DiffCompare::new(a, b);
+        cmp.tab = RepresentationKind::Text;
+        cmp
+    }
+
+    /// The Text tab of a two-sided compare is the aligned, paginated hex diff:
+    /// it paginates and offers to jump to the difference.
+    #[test]
+    fn the_text_tab_is_a_paginated_hex_diff_with_a_jump_control() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let h = rendered(hex_diff_pair(tmp.path()));
+        assert!(
+            h.query_by_label_contains("page 1 /").is_some(),
+            "the hex diff paginates"
+        );
+        assert!(
+            h.query_by_label_contains("NEXT DIFF").is_some(),
+            "and offers jump-to-difference (the header insertion is a difference)"
+        );
+        assert!(
+            h.query_by_label_contains("block-level").is_none(),
+            "a small pair aligns exactly — no degrade notice"
+        );
+    }
+
+    /// Doc screenshot: the aligned hex diff on the Text tab, to
+    /// `docs/screenshots/hex_diff.png`. `--ignored` (needs wgpu).
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_hex_diff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cmp = hex_diff_pair(tmp.path());
+        let mut init = false;
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 620.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, cmp: &mut DiffCompare| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::LIGHT);
+                        init = true;
+                    }
+                    cmp.view(&ui.ctx().clone(), TooltipVerbosity::default(), None);
+                },
+                cmp,
+            );
+        h.run();
+        let img = h.render().expect("wgpu render failed");
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/screenshots/hex_diff.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 
     /// Hiding the second side gives the first the whole screen — the single-file

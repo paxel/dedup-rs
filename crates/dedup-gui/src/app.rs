@@ -1200,7 +1200,7 @@ impl DedupApp {
                 ui.horizontal(|ui| {
                     let add = egui::Button::new(
                         RichText::new(format!("{} ADD REPOSITORY", icon::PLUS))
-                            .color(theme::black()),
+                            .color(theme::ink_on(theme::blue())),
                     )
                     .fill(theme::blue());
                     if ui
@@ -1238,7 +1238,7 @@ impl DedupApp {
                     // db access), so it is fine to run any time.
                     let refresh = egui::Button::new(
                         RichText::new(format!("{} REFRESH STATUS", icon::REFRESH))
-                            .color(theme::black()),
+                            .color(theme::ink_on(theme::lilac())),
                     )
                     .fill(theme::lilac());
                     if ui
@@ -1829,8 +1829,10 @@ impl DedupApp {
                     ui.colored_label(theme::red(), format!("Delete '{name}' and its index?"));
                     if ui
                         .add(
-                            egui::Button::new(RichText::new("DELETE").color(theme::black()))
-                                .fill(theme::red()),
+                            egui::Button::new(
+                                RichText::new("DELETE").color(theme::ink_on(theme::red())),
+                            )
+                            .fill(theme::red()),
                         )
                         .explain(
                             verbosity,
@@ -1935,7 +1937,8 @@ impl DedupApp {
             if ui
                 .add(
                     egui::Button::new(
-                        RichText::new(format!("{} DELETE", icon::TRASH)).color(theme::black()),
+                        RichText::new(format!("{} DELETE", icon::TRASH))
+                            .color(theme::ink_on(theme::red())),
                     )
                     .fill(theme::red()),
                 )
@@ -2021,7 +2024,7 @@ impl DedupApp {
                         .add(
                             egui::Button::new(
                                 RichText::new(format!("{} MAKE MAIN", icon::STAR))
-                                    .color(theme::black()),
+                                    .color(theme::ink_on(theme::green())),
                             )
                             .fill(theme::green()),
                         )
@@ -2141,8 +2144,9 @@ impl DedupApp {
             }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                let add = egui::Button::new(RichText::new("ADD").color(theme::black()))
-                    .fill(theme::blue());
+                let add =
+                    egui::Button::new(RichText::new("ADD").color(theme::ink_on(theme::blue())))
+                        .fill(theme::blue());
                 if ui
                     .add_enabled(can_add, add)
                     .explain(
@@ -2416,8 +2420,10 @@ impl DedupApp {
             ui.horizontal(|ui| {
                 if ui
                     .add(
-                        egui::Button::new(RichText::new("SCAN ANYWAY").color(theme::black()))
-                            .fill(theme::red()),
+                        egui::Button::new(
+                            RichText::new("SCAN ANYWAY").color(theme::ink_on(theme::red())),
+                        )
+                        .fill(theme::red()),
                     )
                     .explain(
                         self.tooltip_verbosity,
@@ -2671,8 +2677,10 @@ fn cancel_button(
     verbosity: TooltipVerbosity,
 ) -> egui::Response {
     ui.add(
-        egui::Button::new(RichText::new(format!("{} CANCEL", icon::X)).color(theme::black()))
-            .fill(theme::red()),
+        egui::Button::new(
+            RichText::new(format!("{} CANCEL", icon::X)).color(theme::ink_on(theme::red())),
+        )
+        .fill(theme::red()),
     )
     .explain(verbosity, hover, hover_verbose)
 }

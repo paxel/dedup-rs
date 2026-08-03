@@ -32,6 +32,14 @@ representation (image, video, audio as spectrograms with gapless A/B playback, e
 metadata and the full EXIF listing, text/hex for everything else), with the actions of the
 surface you came from. A wrongly rotated scan can be turned and **saved back to disk** —
 in place or as a copy, keeping the file's date (or stamping it from the EXIF capture date).
+Comparing two files, the **Text tab is a full-file, aligned hex diff**: equal bytes line up
+even when one side has an inserted header, differences are marked (a green gap, an amber
+substitution), and you page through and jump between them — so two near-duplicate scans that
+differ only in embedded metadata read as "same payload, header inserted". The **Metadata tab**
+highlights which EXIF/TIFF fields differ and can save a side's metadata to a sidecar file, so
+capture details are rescued before a copy is deleted; when two pictures decode identically the
+image view says so plainly. **Flicker** is single-file focus — one file's facts and tools at a
+time, SWAP flips to the other.
 
 **Archives** (zip/tar/tar.gz) are read-only containers you can see into: the viewer's Archive
 tab lists their members, opens a member in place by its type, and extracts members into a repo

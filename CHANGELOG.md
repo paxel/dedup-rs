@@ -29,9 +29,34 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   remembered. The review board's colour vocabulary (grey unchanged, green only-here, red
   will-delete, amber differs) stays distinct in both appearances, and repository identicons
   keep their identity while adapting to stay legible on either background.
+- **The Text tab is now a real byte-level diff.** Comparing two files, the Text tab shows the
+  **whole file** as an **aligned, paginated hex diff**: equal bytes line up, an inserted run
+  shows as a green gap on one side, and a substitution shows the differing bytes in amber on
+  both — so an inserted header no longer makes everything after it read as different. **Jump to
+  next/previous difference** skips long equal runs; a very large or pervasively-different pair
+  degrades to a block-level match and **says so** rather than pretending. (Two near-duplicate
+  scans that differ only in embedded metadata now read as "same payload, header inserted".)
+- **The image view states when two pictures are pixel-identical** — "Pixels identical — the
+  difference is in the metadata" — so flicker no longer looks broken when there is simply
+  nothing visual to flicker.
+- **Compare and salvage metadata.** The Metadata tab highlights which EXIF/TIFF fields differ
+  between the two sides, and **SAVE METADATA** writes a side's fields to a human-readable
+  sidecar in a folder you pick — rescue the Title/Author/Keywords before deleting a copy.
 
 ### Changed
 
+- **Flicker is now single-file focus.** In flicker the viewer shows only the visible file's
+  facts and its rotate/mirror/save/delete — never both sides — and **SWAP** flips the image and
+  all of that chrome together. Flicker is image-only; its controls no longer appear on the Text
+  tab. (Previously the hidden side's controls were still clickable, so "ROTATE B" seemed to do
+  nothing.)
+- **A locked ("Protected") repo now lets you save a corrected copy.** The lock protects existing
+  files, so **DELETE** and **overwrite-in-place** stay blocked — shown disabled with the reason
+  rather than vanishing — but **save-as-a-new-copy** is allowed, since it only adds a file.
+- **The compare viewer's "better" cue prefers the older copy**, and the highlight is a neutral
+  distinction marker, not a keep/delete recommendation.
+- **Filled buttons stay legible on the light appearance**, and the selected representation tab
+  carries a border; a repo's identicon now decorates its name consistently across tabs.
 - **Archive members are indexed as part of the normal scan**, gated by the same
   change-detection as every other file: a new or changed archive is read once, an unchanged
   one is skipped. This replaces the separate opt-in `dedup archive index` command (removed);

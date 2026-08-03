@@ -38,7 +38,7 @@ pub fn toggle_button(
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     if ui.is_rect_visible(rect) {
         let (fill, fg, border) = if selected {
-            (accent, theme::black(), accent)
+            (accent, theme::ink_on(accent), accent)
         } else if resp.hovered() {
             (tint(accent), theme::text(), accent)
         } else {
@@ -89,9 +89,9 @@ pub fn action_button(
             accent
         };
         let fg = if enabled {
-            theme::black()
+            theme::ink_on(accent)
         } else {
-            theme::black().gamma_multiply(0.6)
+            theme::ink_on(accent).gamma_multiply(0.6)
         };
         let r = CornerRadius::same((rect.height() / 2.0) as u8);
         let p = ui.painter();
@@ -226,7 +226,7 @@ fn collapsed_header(ui: &mut egui::Ui, title: &str, accent: Color32) -> egui::Re
             Align2::LEFT_CENTER,
             format!("{} {title}", icon::CARET_RIGHT),
             egui::FontId::proportional(13.0),
-            theme::black(),
+            theme::ink_on(accent),
         );
     }
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, title));
@@ -243,7 +243,7 @@ fn elbow_shapes(ui: &egui::Ui, rect: Rect, title: &str, accent: Color32) -> Vec<
     let galley = ui.painter().layout_no_wrap(
         title.to_owned(),
         egui::FontId::proportional(13.0),
-        theme::black(),
+        theme::ink_on(accent),
     );
     // Safety net: the panel is always full-width (see `section_lcars`), so this
     // only bites for a title too long even for that — widen the chrome rather
@@ -293,6 +293,6 @@ fn elbow_shapes(ui: &egui::Ui, rect: Rect, title: &str, accent: Color32) -> Vec<
             },
             theme::panel(),
         ),
-        egui::Shape::galley(tpos, galley, theme::black()),
+        egui::Shape::galley(tpos, galley, theme::ink_on(accent)),
     ]
 }
