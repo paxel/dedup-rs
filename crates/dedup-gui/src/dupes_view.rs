@@ -5620,8 +5620,12 @@ mod ui_tests {
             "and the Text tab is offered there"
         );
         assert!(
-            harness.query_all_by_label_contains("25 50 44 46").count() > 0,
-            "showing the file's head — as hex, since a PDF is not text"
+            harness
+                .query_all_by_label_contains("Nothing readable")
+                .count()
+                > 0,
+            "an unreadable PDF shows the empty-state note here, not its raw bytes \
+             (the byte view lives on its own tab)"
         );
     }
 

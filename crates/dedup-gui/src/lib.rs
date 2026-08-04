@@ -23,6 +23,7 @@ mod repo_chip;
 mod run_result;
 mod settings;
 mod status;
+mod textdiff;
 mod theme;
 mod thumbs;
 mod transfer_view;

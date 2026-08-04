@@ -1925,24 +1925,7 @@ fn build_bytes(bytes: &[u8]) -> Preview {
             .collect();
         hex.push(format!("{:04x}  {:<48} {ascii}", row * 16, cols));
     }
-    let mut strings = Vec::new();
-    let mut run = String::new();
-    for &b in bytes {
-        if (0x20..0x7f).contains(&b) {
-            run.push(b as char);
-        } else {
-            if run.len() >= 4 {
-                strings.push(run.clone());
-            }
-            run.clear();
-        }
-        if strings.len() >= 40 {
-            break;
-        }
-    }
-    if run.len() >= 4 && strings.len() < 40 {
-        strings.push(run);
-    }
+    let strings = dedup_core::strings::printable_strings(bytes, 4, 40);
     Preview::Bytes { hex, strings }
 }
 

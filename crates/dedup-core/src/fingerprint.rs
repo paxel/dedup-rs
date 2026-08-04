@@ -449,12 +449,46 @@ fn text_hash(text: &str) -> Option<[u8; 32]> {
     Some(*blake3::hash(normalized.as_bytes()).as_bytes())
 }
 
+/// Extract a document's readable text for display — the words as extracted,
+/// spacing intact, *not* the whitespace-stripped form [`text_hash`] uses for
+/// dedup identity. `None` when `mime` has no extractor, or the document yields
+/// no text (empty, scanned, or encrypted). Reuses the same per-format extractors
+/// that back the dedup text-hash, so what groups two documents is what you read.
+pub fn extract_document_text(path: &Path, mime: &str) -> Option<String> {
+    let text = if mime == "application/pdf" {
+        pdf_text(path)?
+    } else if mime == "application/vnd.ms-excel" {
+        xls_text(path)?
+    } else if is_office_doc(mime) {
+        zip_doc_text(path, mime)?
+    } else if mime == "message/rfc822" {
+        eml_text(path)?
+    } else {
+        return None;
+    };
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// Whether `mime` is a document we can extract readable text from — the binary
+/// containers (PDF, office, email). Plain `text/*` is excluded: it is already
+/// its own text. The cheap per-frame predicate behind the viewer's readable-text
+/// tab; [`extract_document_text`] does the actual read.
+pub fn is_extractable_document(mime: &str) -> bool {
+    mime == "application/pdf" || is_office_doc(mime) || mime == "message/rfc822"
+}
+
+/// The raw extracted text of a PDF, or `None` if it has none — the text half of
+/// [`pdf_text_hash`], shared with [`extract_document_text`].
+fn pdf_text(path: &Path) -> Option<String> {
+    let doc = lopdf::Document::load(path).ok()?;
+    let pages: Vec<u32> = doc.get_pages().keys().copied().collect();
+    doc.extract_text(&pages).ok()
+}
+
 /// BLAKE3 of the normalized text of a PDF, or `None` if it has no extractable
 /// text.
 pub fn pdf_text_hash(path: &Path) -> Option<[u8; 32]> {
-    let doc = lopdf::Document::load(path).ok()?;
-    let pages: Vec<u32> = doc.get_pages().keys().copied().collect();
-    text_hash(&doc.extract_text(&pages).ok()?)
+    text_hash(&pdf_text(path)?)
 }
 
 /// MIME types handled by [`doc_text_hash`] (office documents). The same text
@@ -535,6 +569,14 @@ fn zip_doc_text(path: &Path, mime: &str) -> Option<String> {
                         out.push(' ');
                     }
                 }
+                // A paragraph (`w:p`/`a:p`/`text:p`) or spreadsheet shared string
+                // (`si`) ends a line, so paragraph structure survives for the
+                // content diff. Whitespace-neutral for `text_hash`.
+                Ok(quick_xml::events::Event::End(e))
+                    if matches!(e.local_name().as_ref(), b"p" | b"si") =>
+                {
+                    out.push('\n');
+                }
                 Ok(quick_xml::events::Event::Eof) | Err(_) => break,
                 _ => {}
             }
@@ -559,6 +601,16 @@ pub fn eml_hash(path: &Path) -> Option<[u8; 32]> {
         }
     };
     text_hash(&basis)
+}
+
+/// The readable text of an `.eml` — its subject and body — for display. Distinct
+/// from [`eml_hash`], which keys on Message-ID for dedup identity.
+fn eml_text(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let msg = mail_parser::MessageParser::default().parse(&bytes)?;
+    let subject = msg.subject().unwrap_or_default();
+    let body = msg.body_text(0).unwrap_or_default();
+    Some(format!("{subject}\n{body}"))
 }
 
 /// Above this size a text file gets no normalized hash, bounding both the read
@@ -946,6 +998,106 @@ mod tests {
             )],
         );
         assert_ne!(doc_text_hash(&other, DOCX).unwrap(), h_docx);
+    }
+
+    /// A document's readable text is returned *as extracted* — the actual words,
+    /// spacing and all — not the whitespace-stripped form [`text_hash`] uses for
+    /// dedup identity. This is what the viewer shows.
+    #[test]
+    fn extract_document_text_returns_raw_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let docx = dir.path().join("a.docx");
+        write_zip(
+            &docx,
+            &[(
+                "word/document.xml",
+                "<w:document><w:body><w:p><w:r><w:t>Hello World</w:t></w:r>\
+                 <w:r><w:t> again</w:t></w:r></w:p></w:body></w:document>",
+            )],
+        );
+        let text = extract_document_text(&docx, DOCX).expect("docx text");
+        assert!(text.contains("Hello World"), "words present: {text:?}");
+        assert!(text.contains("again"));
+        // Un-normalized: spacing survives (the hashing form strips all of it).
+        assert!(text.contains(' '), "spacing preserved, not stripped");
+    }
+
+    /// A mime with no document extractor (a JPEG) yields no text — the viewer
+    /// uses that to decide the readable-text tab is absent.
+    #[test]
+    fn extract_document_text_is_none_for_non_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let jpg = dir.path().join("a.jpg");
+        std::fs::write(&jpg, [0xff, 0xd8, 0xff, 0xe0]).unwrap();
+        assert!(extract_document_text(&jpg, "image/jpeg").is_none());
+    }
+
+    /// An `.eml` extracts its subject and body as readable text — distinct from
+    /// the Message-ID identity `eml_hash` keys on.
+    #[test]
+    fn extract_document_text_reads_eml_subject_and_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let eml = dir.path().join("m.eml");
+        std::fs::write(
+            &eml,
+            "From: a@example.com\r\nSubject: Quarterly Report\r\n\r\nRevenue was up.\r\n"
+                .as_bytes(),
+        )
+        .unwrap();
+        let text = extract_document_text(&eml, "message/rfc822").expect("eml text");
+        assert!(text.contains("Quarterly Report"), "subject: {text:?}");
+        assert!(text.contains("Revenue was up"), "body: {text:?}");
+    }
+
+    /// A document container with no body text yields None, so the viewer shows
+    /// its empty state rather than a blank diff.
+    #[test]
+    fn extract_document_text_is_none_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let docx = dir.path().join("empty.docx");
+        write_zip(
+            &docx,
+            &[(
+                "word/document.xml",
+                "<w:document><w:body></w:body></w:document>",
+            )],
+        );
+        assert!(extract_document_text(&docx, DOCX).is_none());
+    }
+
+    /// Paragraph boundaries survive extraction as line breaks, so a Word/Office
+    /// document's content diffs line by line instead of as one wrapped run. This
+    /// is hash-neutral — [`text_hash`] strips all whitespace anyway.
+    #[test]
+    fn extract_document_text_keeps_paragraph_line_breaks() {
+        let dir = tempfile::tempdir().unwrap();
+        let docx = dir.path().join("multi.docx");
+        write_zip(
+            &docx,
+            &[(
+                "word/document.xml",
+                "<w:document><w:body>\
+                 <w:p><w:r><w:t>First paragraph</w:t></w:r></w:p>\
+                 <w:p><w:r><w:t>Second paragraph</w:t></w:r></w:p>\
+                 </w:body></w:document>",
+            )],
+        );
+        let text = extract_document_text(&docx, DOCX).expect("docx text");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "two paragraphs → two lines: {text:?}");
+        assert!(lines[0].contains("First paragraph"));
+        assert!(lines[1].contains("Second paragraph"));
+    }
+
+    /// The readable-text tab is offered only for the document formats we can
+    /// extract — PDF, office, email — not plain text (already text) or binary.
+    #[test]
+    fn is_extractable_document_covers_pdf_office_email_only() {
+        assert!(is_extractable_document("application/pdf"));
+        assert!(is_extractable_document(DOCX));
+        assert!(is_extractable_document("message/rfc822"));
+        assert!(!is_extractable_document("text/plain"));
+        assert!(!is_extractable_document("image/jpeg"));
     }
 
     /// The same CSV with CRLF vs LF (and a trailing newline / BOM) groups; a

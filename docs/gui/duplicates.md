@@ -83,8 +83,9 @@ switcher at all, because the only other candidate is already on the other side.
 
 A file can be looked at in more than one way, so the viewer is tabbed by *representation*.
 The tab bar offers every representation at least one side has — **Image**, **Video**,
-**Audio**, **Metadata**, **Text** — and nothing else: a photo has no Audio tab, an untagged
-FLAC no Metadata tab. Selecting a tab draws only the column(s) whose file supports it, always
+**Audio**, **Metadata**, **Text**, **Strings** — a photo has no Audio tab, an untagged
+FLAC no Metadata tab, but **Text** and **Strings** are offered for every file. Selecting a tab
+draws only the column(s) whose file supports it, always
 left (A) against right (B), never stacked. If a side steps to a copy that lacks the current
 representation, the viewer drops back to the pair's own representation.
 
@@ -92,8 +93,7 @@ representation, the viewer drops back to the pair's own representation.
 file at a time in the pane — the fastest way to spot a subtle edit. Flicker is **single-file
 focus**: only the shown file's facts and its ROTATE / MIRROR / SAVE / delete are on screen, and
 **SWAP** flips the picture and all of that to the other file together, so there is no hidden
-side to act on by accident; SIDE BY SIDE returns. If the two decode to **identical pixels** the
-view says so — the difference, if any, is in the metadata, not the image. ROTATE / MIRROR turn
+side to act on by accident; SIDE BY SIDE returns. ROTATE / MIRROR turn
 one side to align a copy somebody flipped; the turn carries into the comparison. **SAVE** then
 writes the turned image to disk: **OVERWRITE** replaces it in place, **SAVE COPY** writes a
 `_rot` sibling and leaves the original alone. A **locked** ("Protected") repository allows the
@@ -124,19 +124,39 @@ you pick — so the Title/Author/Keywords are rescued before you delete a copy.
 
 ![The Metadata tab, editing one copy's ID3 tags against another's](../screenshots/lightbox_metadata.png)
 
-**Text** is offered for **every** file — reading a JPEG's header bytes is as legitimate as
-looking at its pixels. For one file it shows the head (the first 64 KB) as text, or as an
-offset/hex/ASCII dump when the file is not text. Comparing **two** files it becomes a
-**full-file, aligned hex diff**: the byte streams are aligned so equal runs line up — even when
-one side has an inserted header — with the differences marked (a **green** gap where bytes
-exist on only one side, **amber** where they differ on both). It **paginates** through the whole
-file, **jump to next/previous difference** skips the long equal stretches, and a very large or
+**Text** is offered for **every** file. For a **document whose purpose is text** — a PDF, a Word
+or OpenDocument file, a spreadsheet, a presentation, or an email (see
+[Document formats read as text](index.md#document-formats-read-as-text)) — it shows the file's
+**extracted words**: the readable content of one file, or, when comparing two, their content
+**line-aligned side by side** so you can read what changed. Equal lines sit across from each
+other; a line only one side has leaves the other blank (**green**); a line that changed shows
+both versions with the differing characters marked (**amber**). Nothing is declared "the same" —
+identical documents simply show no marks. A document that yields no text (scanned, encrypted, or
+empty) says so plainly.
+
+![The Text tab comparing two documents' extracted content](../screenshots/content_diff.png)
+
+For **any other** file it shows the head (the first 64 KB) as text, or as an offset/hex/ASCII
+dump when the file is not text. Comparing **two** such files it becomes a **full-file, aligned
+hex diff**: the byte streams are aligned so equal runs line up — even when one side has an
+inserted header — with the differences marked (a **green** gap where bytes exist on only one
+side, **amber** where they differ on both). It **paginates** through the whole file, **jump to
+next/previous difference** skips the long equal stretches, and a very large or
 pervasively-different pair falls back to a coarse block-level match and says so. So two
 same-sized "duplicates" that differ only in an inserted metadata header read as exactly that.
 
 ![The Text tab, a single file's head as text or hex](../screenshots/lightbox_text.png)
 
 ![The Text tab comparing two files as an aligned hex diff](../screenshots/hex_diff.png)
+
+**Strings** is offered for **every** file and shows the printable runs (four or more readable
+characters) embedded in its bytes — the text hiding inside a binary: an image's EXIF strings, an
+audio file's tags, a program's paths and version banners. One file lists its runs; comparing
+two aligns them so shared embedded text lines up and each side's distinct runs stand out (the
+same green/amber marking as the content diff). It's the forensic "what text is in here" view for
+files that aren't documents.
+
+![The Strings tab surfacing a binary's embedded runs](../screenshots/strings.png)
 
 **Videos** compare as one representative still per side, enough to tell two clips apart at a
 glance. Full playback stays the OPEN (external app) path.

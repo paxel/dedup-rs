@@ -16,6 +16,7 @@ pub mod scan;
 pub mod secret;
 pub mod similar;
 pub mod store;
+pub mod strings;
 pub mod sync_group;
 pub mod thumbnail;
 pub mod update;

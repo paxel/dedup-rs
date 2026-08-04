@@ -27,6 +27,9 @@ pub enum RepresentationKind {
     Audio,
     Video,
     Text,
+    // The printable runs embedded in any file's bytes — offered everywhere,
+    // after Text.
+    Strings,
 }
 
 impl RepresentationKind {
@@ -39,6 +42,7 @@ impl RepresentationKind {
             Self::Audio => "Audio",
             Self::Video => "Video",
             Self::Text => "Text",
+            Self::Strings => "Strings",
         }
     }
 
@@ -51,6 +55,7 @@ impl RepresentationKind {
             Self::Audio => icon::LIGHTNING,
             Self::Video => icon::IMAGE,
             Self::Text => icon::SEARCH,
+            Self::Strings => icon::SEARCH,
         }
     }
 }
@@ -363,6 +368,8 @@ impl FileRepresentations {
         if self.text.is_some() {
             kinds.push(RepresentationKind::Text);
         }
+        // Strings is offered for every file — any bytes may hold embedded text.
+        kinds.push(RepresentationKind::Strings);
         kinds
     }
 

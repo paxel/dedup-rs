@@ -65,6 +65,26 @@ appears.
 - **Sorting** is the bar above the board — which side to read, then the key (path, size, date
   or status), then the direction. Large previews scroll rather than paging.
 
+## Document formats read as text
+
+The tool understands these formats as *text documents* — it extracts their words, which is what
+lets it group two files that say the same thing even when their bytes differ (a `.docx` and the
+`.pdf` exported from it, or the same report re-saved). Extraction is built in; no external tool
+is needed for it.
+
+| Kind | Formats |
+| --- | --- |
+| Portable documents | PDF |
+| Word processing | `.docx`, `.odt` |
+| Spreadsheets | `.xlsx`, `.xls`, `.ods` |
+| Presentations | `.pptx`, `.odp` |
+| Email | `.eml` |
+| Plain text | any `text/*` — `.txt`, `.md`, `.csv`, `.html`, `.json`, source code, logs |
+
+Legacy binary `.doc` (Word 97–2003) is **not** among them — only the modern OOXML/OpenDocument
+containers are. Everything else (images, audio, video, archives, unknown binaries) is compared
+by its own means — a perceptual fingerprint, or its raw bytes — never as text.
+
 ## What's not here
 
 The important-file scanner (`dedup scan`) and the triage report (`dedup report`) are

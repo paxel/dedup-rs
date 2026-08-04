@@ -6,6 +6,17 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 ### Added
 
+- **Read a document, and compare what two documents say.** On the viewer's **Text** tab, a
+  PDF, Word/OpenDocument file, spreadsheet, presentation, or email now shows its **extracted
+  words** instead of a hex dump. Comparing two documents lines up their content **side by side**
+  and marks what changed — **green** where a line is on only one side, **amber** where a line's
+  characters differ — so you can see whether two copies say the same thing. Nothing is declared
+  identical; a document with no extractable text (scanned, encrypted, or empty) says so.
+  Word/Office documents keep their paragraph breaks, so their content diffs line by line.
+- **See the text hiding inside any file.** A new **Strings** tab on the viewer shows the
+  printable runs embedded in a file's bytes — an image's EXIF strings, an audio file's tags, a
+  program's paths and banners. Comparing two files aligns their runs so shared embedded text
+  lines up and each side's distinct runs stand out. Offered for every file.
 - **Archives are now something you can look inside, pull from, and unlock.** Clicking a
   zip/tar/tar.gz opens the shared viewer on a new **Archive** tab listing its members; click a
   member to open it in place, rendered by its own type (an image as an image, text as text),
@@ -36,9 +47,6 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   next/previous difference** skips long equal runs; a very large or pervasively-different pair
   degrades to a block-level match and **says so** rather than pretending. (Two near-duplicate
   scans that differ only in embedded metadata now read as "same payload, header inserted".)
-- **The image view states when two pictures are pixel-identical** — "Pixels identical — the
-  difference is in the metadata" — so flicker no longer looks broken when there is simply
-  nothing visual to flicker.
 - **Compare and salvage metadata.** The Metadata tab highlights which EXIF/TIFF fields differ
   between the two sides, and **SAVE METADATA** writes a side's fields to a human-readable
   sidecar in a folder you pick — rescue the Title/Author/Keywords before deleting a copy.

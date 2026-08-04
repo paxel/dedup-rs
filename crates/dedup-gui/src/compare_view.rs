@@ -190,6 +190,16 @@ pub(crate) struct DiffCompare {
     hexdiff: Option<crate::hexdiff::HexDiff>,
     hexdiff_key: Option<(String, String)>,
     hex_page: usize,
+    /// The Text tab's aligned content diff (two documents), built from both
+    /// sides' extracted text and cached under their content hashes so it
+    /// rebuilds only when a side changes.
+    textdiff: Option<crate::textdiff::TextDiff>,
+    textdiff_key: Option<(String, String)>,
+    /// The Strings tab's per-side printable runs (joined, one per line) and, when
+    /// comparing, their aligned diff — cached like the text diff.
+    strings: [Option<String>; 2],
+    stringsdiff: Option<crate::textdiff::TextDiff>,
+    stringsdiff_key: Option<(String, String)>,
     /// The open ID3 tag editor (Metadata tab), if any. Only a writable audio
     /// side ever opens one.
     pub(crate) tag_edit: Option<TagEdit>,
@@ -259,6 +269,11 @@ impl DiffCompare {
             hexdiff: None,
             hexdiff_key: None,
             hex_page: 0,
+            textdiff: None,
+            textdiff_key: None,
+            strings: [None, None],
+            stringsdiff: None,
+            stringsdiff_key: None,
             tag_edit: None,
             tag_error: None,
             title: "COMPARE — SAME PATH, DIFFERENT CONTENT".into(),
@@ -543,6 +558,85 @@ impl DiffCompare {
         }
     }
 
+    /// Render the Text tab's aligned content diff for two documents: build (and
+    /// cache under the two content hashes) the line-aligned diff of both sides'
+    /// extracted text, then show it. No verdict is drawn — two identical
+    /// documents simply show no marks.
+    fn render_text_diff(&mut self, ui: &mut egui::Ui) {
+        for slot in [0usize, 1usize] {
+            if self.text[slot].is_none() {
+                let side = if slot == 0 { &self.left } else { &self.right };
+                self.text[slot] = Some(document_preview(&side.facts));
+            }
+        }
+        let key = (
+            self.left.facts.hash_hex.clone(),
+            self.right.facts.hash_hex.clone(),
+        );
+        if self.textdiff_key.as_ref() != Some(&key) {
+            let td = {
+                let a = self.text[0]
+                    .as_ref()
+                    .map(|t| t.body.as_str())
+                    .unwrap_or_default();
+                let b = self.text[1]
+                    .as_ref()
+                    .map(|t| t.body.as_str())
+                    .unwrap_or_default();
+                crate::textdiff::TextDiff::build(a, b)
+            };
+            self.textdiff = Some(td);
+            self.textdiff_key = Some(key);
+        }
+        if let Some(td) = &self.textdiff {
+            td.show(ui);
+        }
+    }
+
+    /// Render the Strings tab: the printable runs embedded in each file's bytes,
+    /// one file's runs scrollable, or — comparing two — their runs aligned as a
+    /// content diff (green/amber). No verdict.
+    fn render_strings(&mut self, ui: &mut egui::Ui, two_sided: bool) {
+        for slot in [0usize, 1usize] {
+            if self.strings[slot].is_none() {
+                let side = if slot == 0 { &self.left } else { &self.right };
+                self.strings[slot] = Some(strings_body(&side.facts));
+            }
+        }
+        if two_sided {
+            let key = (
+                self.left.facts.hash_hex.clone(),
+                self.right.facts.hash_hex.clone(),
+            );
+            if self.stringsdiff_key.as_ref() != Some(&key) {
+                let td = {
+                    let a = self.strings[0].as_deref().unwrap_or_default();
+                    let b = self.strings[1].as_deref().unwrap_or_default();
+                    crate::textdiff::TextDiff::build(a, b)
+                };
+                self.stringsdiff = Some(td);
+                self.stringsdiff_key = Some(key);
+            }
+            if let Some(td) = &self.stringsdiff {
+                td.show(ui);
+            }
+        } else if let Some(body) = &self.strings[0] {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(body)
+                                .monospace()
+                                .size(12.0)
+                                .color(theme::text()),
+                        )
+                        .wrap(),
+                    );
+                });
+        }
+    }
+
     /// Render the Text tab's aligned hex diff for a two-sided comparison: build
     /// (and cache under the two content hashes) the alignment, then a row of
     /// controls — page navigation, jump-to-difference, and any degrade or
@@ -743,6 +837,7 @@ impl DiffCompare {
             ops.clear();
         }
         self.text[slot] = None;
+        self.strings[slot] = None;
         self.tags[slot] = None;
         self.exif_all[slot] = None;
         // The Archive tab lists the *left* side's members; a changed left side
@@ -964,15 +1059,6 @@ impl DiffCompare {
             }
         };
         self.tex[slot] = Some(ctx.load_texture(name, image, TextureOptions::LINEAR));
-    }
-
-    /// True when both sides decoded to byte-identical rasters: the two files are
-    /// the same picture, so any difference between them is in their metadata.
-    fn pixels_identical(&self) -> bool {
-        match (&self.base_image[0], &self.base_image[1]) {
-            (Some(a), Some(b)) => rasters_equal(a, b),
-            _ => false,
-        }
     }
 
     /// `(texture, pixel-size)` for one side, in the shape [`draw_compare`] wants.
@@ -1667,29 +1753,46 @@ impl DiffCompare {
                     draw_columns(&mut child, &mut tag_edit, cols);
                     self.tag_edit = tag_edit;
                 } else if self.tab == RepresentationKind::Text {
+                    // Documents (PDF/office/email) show their extracted words —
+                    // one file, or side by side when comparing. Everything else
+                    // is the byte-level hex view. Only the mime is checked per
+                    // frame; the extraction itself is cached in `self.text`.
+                    let is_doc = |facts: &FileFacts| {
+                        facts
+                            .mime
+                            .as_deref()
+                            .is_some_and(dedup_core::fingerprint::is_extractable_document)
+                    };
+                    let both_documents =
+                        is_doc(&self.left.facts) && (!two_sided_now || is_doc(&self.right.facts));
                     if two_sided_now {
-                        // Two sides: the full-file, aligned, paginated hex diff.
-                        // Clear the strip's per-side action row (which extends a
-                        // little past the titles into the viewport top) so the
-                        // hex diff's own page/jump bar can't collide with it —
-                        // and the extra switcher row when the group has a pool.
+                        // Two sides: an aligned diff below the per-side action
+                        // strip (which extends a little past the titles into the
+                        // viewport top) so its own controls can't collide with it
+                        // — plus the extra switcher row when the group has a pool.
+                        // Two documents diff their extracted content; anything
+                        // else diffs raw bytes as hex.
                         let has_switcher = self.can_step_left() || self.can_step_right();
                         let clearance = if has_switcher { 58.0 } else { 30.0 };
-                        let hex_rect = Rect::from_min_max(
+                        let diff_rect = Rect::from_min_max(
                             egui::pos2(viewport.min.x, viewport.min.y + clearance),
                             viewport.max,
                         );
                         let mut child = ui.new_child(
                             UiBuilder::new()
-                                .max_rect(hex_rect)
+                                .max_rect(diff_rect)
                                 .layout(Layout::top_down(Align::Min)),
                         );
-                        self.render_hex_diff(&mut child);
+                        if both_documents {
+                            self.render_text_diff(&mut child);
+                        } else {
+                            self.render_hex_diff(&mut child);
+                        }
                     } else {
                         for slot in [0usize, 1usize] {
                             if self.text[slot].is_none() {
                                 let side = if slot == 0 { &self.left } else { &self.right };
-                                self.text[slot] = Some(load_text_preview(&side.facts.abs_path));
+                                self.text[slot] = Some(document_preview(&side.facts));
                             }
                         }
                         let (lt, rt) = (
@@ -1758,6 +1861,21 @@ impl DiffCompare {
                         draw_columns(&mut child, &mut sync, cols);
                         self.text_scroll = sync.1.unwrap_or(sync.0);
                     }
+                } else if self.tab == RepresentationKind::Strings {
+                    // Printable runs below the per-side action strip, so its
+                    // controls can't collide — plus the switcher row when pooled.
+                    let has_switcher = self.can_step_left() || self.can_step_right();
+                    let clearance = if has_switcher { 58.0 } else { 30.0 };
+                    let rect = Rect::from_min_max(
+                        egui::pos2(viewport.min.x, viewport.min.y + clearance),
+                        viewport.max,
+                    );
+                    let mut child = ui.new_child(
+                        UiBuilder::new()
+                            .max_rect(rect)
+                            .layout(Layout::top_down(Align::Min)),
+                    );
+                    self.render_strings(&mut child, two_sided_now);
                 } else if !two_sided_now {
                     // One file, the whole viewport — the hidden side must not
                     // paint a second copy of the same picture.
@@ -1829,33 +1947,6 @@ impl DiffCompare {
                         FontId::proportional(11.0),
                         theme::hairline(),
                     );
-                    // Identical rasters: state it plainly (a comparison result,
-                    // not a verdict) so "flicker does nothing" isn't a mystery,
-                    // and point — without hijacking the tab — to where the
-                    // difference actually lives.
-                    if self.two_sided() && self.pixels_identical() {
-                        let banner = Rect::from_min_size(
-                            egui::pos2(viewport.min.x + 8.0, viewport.min.y + 6.0),
-                            egui::vec2((viewport.width() - 16.0).max(0.0), 24.0),
-                        );
-                        ui.painter().rect_filled(banner, 6.0, theme::panel());
-                        ui.put(
-                            banner,
-                            egui::Label::new(
-                                // Deliberately free of tab names ("Metadata"/
-                                // "Text"): this label is on screen whenever two
-                                // images match, and a tab name here would collide
-                                // with every `query_by_label_contains` for a tab.
-                                RichText::new(
-                                    "Pixels identical — the two images are the same; any \
-                                     difference between the files is in their embedded data.",
-                                )
-                                .color(theme::text())
-                                .size(12.0),
-                            )
-                            .truncate(),
-                        );
-                    }
                 } else {
                     // Not both decoded yet (or one produced no visual): static
                     // side-by-side, each pane its image, an in-flight "decoding…"
@@ -2511,10 +2602,49 @@ fn save_actions(read_only: bool, has_edits: bool) -> SaveActions {
     }
 }
 
-/// Whether two decoded rasters are byte-for-byte identical — same dimensions and
-/// the same pixels. The seam behind the image view's "pixels identical" verdict.
-fn rasters_equal(a: &ColorImage, b: &ColorImage) -> bool {
-    a.size == b.size && a.pixels == b.pixels
+/// The Text tab's single-file body for one side: a document's *extracted* words
+/// when the file is one we can read (PDF/office/email), a short note when such a
+/// document yields nothing, and otherwise the raw head or hex dump via
+/// [`load_text_preview`]. The extracted text is the words as written, not the
+/// normalized form used for dedup hashing.
+fn document_preview(facts: &FileFacts) -> crate::lightbox::TextPreview {
+    use crate::lightbox::TextPreview;
+    let doc_mime = facts
+        .mime
+        .as_deref()
+        .filter(|m| dedup_core::fingerprint::is_extractable_document(m));
+    if let Some(mime) = doc_mime {
+        return match dedup_core::fingerprint::extract_document_text(&facts.abs_path, mime) {
+            Some(body) => TextPreview {
+                body,
+                is_text: true,
+                truncated: false,
+                error: None,
+            },
+            None => TextPreview {
+                body: "Nothing readable here — this document may be scanned, encrypted, \
+                       or empty."
+                    .to_string(),
+                is_text: true,
+                truncated: false,
+                error: None,
+            },
+        };
+    }
+    load_text_preview(&facts.abs_path)
+}
+
+/// The Strings tab's body for one side: the printable runs (≥4 chars) embedded
+/// in the file's bytes, one per line, or a short note when there are none. Reads
+/// a bounded head so a huge file can't exhaust memory.
+fn strings_body(facts: &FileFacts) -> String {
+    let capped = crate::hexdiff::read_capped(&facts.abs_path);
+    let runs = dedup_core::strings::printable_strings(&capped.bytes, 4, 4000);
+    if runs.is_empty() {
+        "No readable runs found in this file's bytes.".to_string()
+    } else {
+        runs.join("\n")
+    }
 }
 
 /// Tag names whose value differs between the two sides: present on both with a
@@ -2749,61 +2879,6 @@ mod tests {
         assert!(metadata_sidecar("x.jpg", &[]).contains("(no metadata)"));
     }
 
-    /// Raster equality is dimensions + pixels: same picture, or not.
-    #[test]
-    fn rasters_equal_compares_size_and_pixels() {
-        let a = ColorImage::from_rgba_unmultiplied([1, 1], &[10, 20, 30, 255]);
-        let same = ColorImage::from_rgba_unmultiplied([1, 1], &[10, 20, 30, 255]);
-        let other_pixels = ColorImage::from_rgba_unmultiplied([1, 1], &[99, 20, 30, 255]);
-        let other_size =
-            ColorImage::from_rgba_unmultiplied([2, 1], &[10, 20, 30, 255, 10, 20, 30, 255]);
-        assert!(rasters_equal(&a, &same));
-        assert!(!rasters_equal(&a, &other_pixels));
-        assert!(!rasters_equal(&a, &other_size));
-    }
-
-    /// Two same-sized images decode to identical rasters, so the image view
-    /// states it; two differently-sized ones do not.
-    #[test]
-    fn the_image_view_states_when_the_pixels_are_identical() {
-        use egui_kittest::kittest::Queryable;
-        let tmp = tempfile::tempdir().unwrap();
-        // Same dimensions ⇒ writable_png_side's gradient is byte-identical.
-        let a = writable_png_side(tmp.path(), "a.png", 40, 20);
-        let b = writable_png_side(tmp.path(), "b.png", 40, 20);
-        let cmp = DiffCompare::new_with_pool(a, Some(b), Vec::new());
-        let mut h = save_harness(cmp);
-        for _ in 0..200 {
-            h.step();
-            if h.query_by_label_contains("Pixels identical").is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(
-            h.query_by_label_contains("Pixels identical").is_some(),
-            "identical rasters are stated in the image view"
-        );
-
-        // Different dimensions ⇒ different rasters ⇒ no banner.
-        let tmp2 = tempfile::tempdir().unwrap();
-        let c = writable_png_side(tmp2.path(), "c.png", 40, 20);
-        let d = writable_png_side(tmp2.path(), "d.png", 30, 24);
-        let cmp2 = DiffCompare::new_with_pool(c, Some(d), Vec::new());
-        let mut h2 = save_harness(cmp2);
-        for _ in 0..200 {
-            h2.step();
-            if h2.query_by_label("FLICKER").is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(
-            h2.query_by_label_contains("Pixels identical").is_none(),
-            "differing rasters get no such banner"
-        );
-    }
-
     /// A locked repo protects its existing files but permits adding new ones, so
     /// a copy is always offered once there are edits; only overwriting in place
     /// is gated by the lock.
@@ -2921,6 +2996,261 @@ mod tests {
             );
         h.run();
         h
+    }
+
+    /// A `.docx` side on disk whose single paragraph is `word`.
+    fn docx_side(dir: &Path, name: &str, word: &str) -> DiffSide {
+        use std::io::Write;
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("word/document.xml", opts).unwrap();
+        zip.write_all(
+            format!(
+                "<w:document><w:body><w:p><w:r><w:t>{word}</w:t></w:r>\
+                 </w:p></w:body></w:document>"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        zip.finish().unwrap();
+        let mut side = named_side(name);
+        side.facts.abs_path = path;
+        side.facts.mime =
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document".into());
+        side
+    }
+
+    /// A binary side on disk holding raw `bytes` — for the Strings tab.
+    fn bytes_side(dir: &Path, name: &str, bytes: &[u8]) -> DiffSide {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let mut side = named_side(name);
+        side.facts.abs_path = path;
+        side.facts.mime = Some("application/octet-stream".into());
+        side
+    }
+
+    /// The Strings tab surfaces the printable runs embedded in a file's bytes.
+    #[test]
+    fn strings_tab_shows_embedded_printable_runs() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let side = bytes_side(
+            tmp.path(),
+            "blob.bin",
+            b"\x00\x01CONFIG_TOKEN_abcdef\x00\xff\x02",
+        );
+        let mut cmp = DiffCompare::new_with_pool(side, None, Vec::new());
+        cmp.hide_second();
+        cmp.tab = RepresentationKind::Strings;
+        let h = rendered(cmp);
+        assert!(
+            h.query_all_by_label_contains("CONFIG_TOKEN_abcdef").count() > 0,
+            "the embedded printable run is shown on the Strings tab"
+        );
+    }
+
+    /// Comparing two files on the Strings tab aligns their runs and shows both
+    /// sides' distinct embedded text.
+    #[test]
+    fn comparing_two_files_strings_diffs_their_runs() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let a = bytes_side(
+            tmp.path(),
+            "a.bin",
+            b"\x00SHARED_MARKER_xyz\x00ONLY_IN_A_123\x00",
+        );
+        let b = bytes_side(
+            tmp.path(),
+            "b.bin",
+            b"\x00SHARED_MARKER_xyz\x00ONLY_IN_B_456\x00",
+        );
+        let mut cmp = DiffCompare::new_with_pool(a, Some(b), Vec::new());
+        cmp.tab = RepresentationKind::Strings;
+        let h = rendered(cmp);
+        assert!(
+            h.query_all_by_label_contains("ONLY_IN_A_123").count() > 0,
+            "left file's distinct run is shown"
+        );
+        assert!(
+            h.query_all_by_label_contains("ONLY_IN_B_456").count() > 0,
+            "right file's distinct run is shown alongside"
+        );
+    }
+
+    /// Stepping the shown file to another pool member refreshes the Strings tab
+    /// to the new file's runs — the per-side strings cache invalidates on a step,
+    /// the same way the Text and image caches do.
+    #[test]
+    fn stepping_refreshes_the_strings_tab() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = vec![
+            bytes_side(tmp.path(), "a.bin", b"\x00ALPHA_RUN_marker\x00"),
+            bytes_side(tmp.path(), "b.bin", b"\x00BRAVO_RUN_marker\x00"),
+        ];
+        let mut cmp = DiffCompare::new_with_pool(
+            bytes_side(tmp.path(), "a.bin", b"\x00ALPHA_RUN_marker\x00"),
+            None,
+            pool,
+        );
+        cmp.hide_second();
+        cmp.tab = RepresentationKind::Strings;
+        let mut h = rendered(cmp);
+        assert!(
+            h.query_all_by_label_contains("ALPHA_RUN_marker").count() > 0,
+            "the first file's run shows to start"
+        );
+        h.key_press(egui::Key::ArrowRight);
+        h.run();
+        assert!(
+            h.query_all_by_label_contains("BRAVO_RUN_marker").count() > 0,
+            "after stepping, the new file's run shows"
+        );
+        assert_eq!(
+            h.query_all_by_label_contains("ALPHA_RUN_marker").count(),
+            0,
+            "the previous file's run is gone — the cache refreshed"
+        );
+    }
+
+    /// An `.eml` side on disk with the given subject and (possibly multi-line)
+    /// body — its extracted text keeps the body's line breaks.
+    fn eml_side(dir: &Path, name: &str, subject: &str, body: &str) -> DiffSide {
+        let content = format!("From: a@example.com\r\nSubject: {subject}\r\n\r\n{body}");
+        let path = dir.join(name);
+        std::fs::write(&path, content).unwrap();
+        let mut side = named_side(name);
+        side.facts.abs_path = path;
+        side.facts.mime = Some("message/rfc822".into());
+        side
+    }
+
+    /// Doc screenshot: the Strings tab surfacing a binary's embedded runs, to
+    /// `docs/screenshots/strings.png`. `--ignored` (needs wgpu).
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_strings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let side = bytes_side(
+            tmp.path(),
+            "firmware.bin",
+            b"\x00\x01Copyright ACME 2021\x00\x00/usr/local/bin/agent\x00\xff\
+              version 3.4.1 build 8892\x00\x02\x03config=/etc/agent.conf\x00",
+        );
+        let mut cmp = DiffCompare::new_with_pool(side, None, Vec::new());
+        cmp.hide_second();
+        cmp.tab = RepresentationKind::Strings;
+        let mut init = false;
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 620.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, cmp: &mut DiffCompare| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::LIGHT);
+                        init = true;
+                    }
+                    cmp.view(&ui.ctx().clone(), TooltipVerbosity::default(), None);
+                },
+                cmp,
+            );
+        h.run();
+        let img = h.render().expect("wgpu render failed");
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/screenshots/strings.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Doc screenshot: the aligned content diff of two documents on the Text tab,
+    /// to `docs/screenshots/content_diff.png`. `--ignored` (needs wgpu).
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_content_diff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = eml_side(
+            tmp.path(),
+            "a.eml",
+            "Invoice 4471",
+            "Dear Bob,\r\nAmount due is 100.\r\nRegards, Acme.",
+        );
+        let b = eml_side(
+            tmp.path(),
+            "b.eml",
+            "Invoice 4471",
+            "Dear Alice,\r\nAmount due is 100.\r\nPlease remit by Friday.\r\nRegards, Acme.",
+        );
+        let mut cmp = DiffCompare::new_with_pool(a, Some(b), Vec::new());
+        cmp.tab = RepresentationKind::Text;
+        let mut init = false;
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 620.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, cmp: &mut DiffCompare| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::LIGHT);
+                        init = true;
+                    }
+                    cmp.view(&ui.ctx().clone(), TooltipVerbosity::default(), None);
+                },
+                cmp,
+            );
+        h.run();
+        let img = h.render().expect("wgpu render failed");
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/screenshots/content_diff.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Opening a document lands the Text tab on its *extracted words*, not a hex
+    /// dump of the container bytes.
+    #[test]
+    fn a_document_text_tab_shows_extracted_words() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let side = docx_side(tmp.path(), "report.docx", "Quarterly revenue climbed");
+        let mut cmp = DiffCompare::new_with_pool(side, None, Vec::new());
+        cmp.hide_second(); // one file, full width — not the mirrored two-up view
+        cmp.tab = RepresentationKind::Text;
+        let h = rendered(cmp);
+        assert_eq!(
+            h.query_all_by_label_contains("Quarterly revenue climbed")
+                .count(),
+            1,
+            "one document, shown once — its extracted words on the Text tab",
+        );
+    }
+
+    /// Comparing two documents shows both their extracted texts side by side —
+    /// the readable content — rather than routing to the byte-level hex diff.
+    #[test]
+    fn two_documents_compare_their_extracted_text() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cmp = DiffCompare::new_with_pool(
+            docx_side(tmp.path(), "a.docx", "Alpha manifest"),
+            Some(docx_side(tmp.path(), "b.docx", "Bravo manifest")),
+            Vec::new(),
+        );
+        cmp.tab = RepresentationKind::Text;
+        let h = rendered(cmp);
+        assert!(
+            h.query_by_label_contains("Alpha manifest").is_some(),
+            "left document's words are shown"
+        );
+        assert!(
+            h.query_by_label_contains("Bravo manifest").is_some(),
+            "right document's words are shown side by side"
+        );
     }
 
     /// A read-only zip side on disk, holding `entries`.
@@ -3344,8 +3674,7 @@ mod tests {
     fn selecting_a_tab_switches_it_and_the_repo_header_is_consistent() {
         use egui_kittest::kittest::Queryable;
         let tmp = tempfile::tempdir().unwrap();
-        // Different sizes so the rasters differ (no "pixels identical" banner,
-        // whose text would otherwise collide with the tab-name queries here).
+        // Two decodable PNGs so both sides yield an Image tab.
         let mut a = writable_png_side(tmp.path(), "a.png", 40, 20);
         let mut b = writable_png_side(tmp.path(), "b.png", 30, 24);
         a.repo = "shoebox".into();
