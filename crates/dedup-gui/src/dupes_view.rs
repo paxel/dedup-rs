@@ -5527,7 +5527,7 @@ mod ui_tests {
     /// its head as decoded text (or a hex dump); revealing the second side turns
     /// the tab into the full-file, aligned hex diff of the two.
     #[test]
-    fn text_tab_previews_both_sides_as_text_or_hex() {
+    fn text_tab_shows_words_and_hex_tab_shows_the_byte_diff() {
         let dir = tempfile::tempdir().unwrap();
         let group: DupeGroup = vec![
             plain_file(dir.path(), "notes.txt", 1, "text/plain", b"hello alpha"),
@@ -5550,16 +5550,18 @@ mod ui_tests {
         harness.run();
         assert!(
             harness.query_all_by_label_contains("hello alpha").count() > 0,
-            "A's text is previewed"
+            "A's readable text is previewed on the Text tab"
         );
 
-        // With B revealed, the tab becomes the aligned, paginated hex diff of
-        // the two files — equal bytes lined up, differences marked.
+        // Raw bytes live on the Hex tab now: with B revealed it is the aligned,
+        // paginated hex diff of the two files — equal bytes lined up, marked.
         harness.get_by_label_contains("SHOW B").click();
+        harness.run();
+        harness.get_by_label_contains("Hex").click();
         harness.run();
         assert!(
             harness.query_all_by_label_contains("page 1 /").count() > 0,
-            "two sides turn the Text tab into the paginated hex diff"
+            "the Hex tab is the paginated hex diff of the two files"
         );
         assert!(
             harness.query_all_by_label_contains("NEXT DIFF").count() > 0,

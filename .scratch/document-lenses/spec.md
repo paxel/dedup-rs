@@ -178,11 +178,13 @@ keep-versus-delete, and never declares two things "the same."** The removed
   synchronously (fast, no async needed). Deferred: office via headless LibreOffice
   (needs the async channel, since it is multi-second), multi-page navigation with the
   per-side page advancer, and flicker.
-- **The tab split is last.** Splitting today's dual-purpose Text tab into
-  independent **Hex** (every file), **Strings** (every file), and **Text**
-  (documents) tabs is done *after* Text/Strings/Render each have content, so the tab
-  model is reshaped once with everything in place rather than renamed and re-touched.
-  **[planned]**
+- **The tab split is last.** Splitting the dual-purpose Text tab into independent
+  **Hex** (every file), **Strings** (every file), and **Text** (readable text: documents
+  + plain text) tabs is done *after* Text/Strings/Render each have content, so the tab
+  model is reshaped once with everything in place. **[done]** — `Text` is gated on a new
+  `has_readable_text` predicate (extractable document or `text/*`); `Hex` is always
+  present, its single view a forced hex dump reusing the one `hex_dump` formatter, its
+  two-sided view the existing paginated `hexdiff`. Two text files now diff as *content*.
 - **No sameness verdict anywhere.** The image "pixels identical" banner and its
   raster-equality seam were removed; no equivalent may appear in Text, Strings, or
   Render. The factual hex "the shown bytes are identical" line is a byte statement,
@@ -244,6 +246,6 @@ codebase; prefer them, add functions at them rather than new seam types:
   (Word/Office docs diff line by line), the core `strings::printable_strings` extractor
   (Browse now reuses it), and the viewer **Strings** tab (single-file runs and a two-file
   aligned diff), and the **Render** tab (PDF first page, one file or two side by side, via
-  `pdftoppm`). Remaining: office rendering + multi-page navigation + flicker (needs headless
-  LibreOffice and the async channel), the Hex/Strings/Text **tab split**, and worker-threaded
-  extraction.
+  `pdftoppm`), and the Hex/Strings/Text **tab split** (Text = readable text only; Hex always).
+  Remaining: office rendering + multi-page navigation + flicker (needs headless LibreOffice and
+  the async channel), and worker-threaded extraction.

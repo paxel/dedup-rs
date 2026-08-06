@@ -83,9 +83,10 @@ switcher at all, because the only other candidate is already on the other side.
 
 A file can be looked at in more than one way, so the viewer is tabbed by *representation*.
 The tab bar offers every representation at least one side has — **Image**, **Video**,
-**Audio**, **Metadata**, **Text**, **Render**, **Strings** — a photo has no Audio tab, an
-untagged FLAC no Metadata tab, and only a PDF gets **Render**; but **Text** and **Strings** are
-offered for every file. Selecting a tab draws only the column(s) whose file supports it, always
+**Audio**, **Metadata**, **Text**, **Render**, **Strings**, **Hex** — a photo has no Audio tab, an
+untagged FLAC no Metadata tab, **Text** only a file with readable words, and **Render** only a
+PDF; but **Strings** and **Hex** are offered for every file. Selecting a tab draws only the
+column(s) whose file supports it, always
 left (A) against right (B), never stacked. If a side steps to a copy that lacks the current
 representation, the viewer drops back to the pair's own representation.
 
@@ -124,30 +125,18 @@ you pick — so the Title/Author/Keywords are rescued before you delete a copy.
 
 ![The Metadata tab, editing one copy's ID3 tags against another's](../screenshots/lightbox_metadata.png)
 
-**Text** is offered for **every** file. For a **document whose purpose is text** — a PDF, a Word
-or OpenDocument file, a spreadsheet, a presentation, or an email (see
-[Document formats read as text](index.md#document-formats-read-as-text)) — it shows the file's
-**extracted words**: the readable content of one file, or, when comparing two, their content
+**Text** is offered for a file with **readable text** — a **document whose purpose is text** (a
+PDF, a Word or OpenDocument file, a spreadsheet, a presentation, or an email; see
+[Document formats read as text](index.md#document-formats-read-as-text)) or a **plain-text file**
+(`.txt`, `.md`, `.csv`, source). For a document it shows the **extracted words**; for a plain-text
+file, its text as written. One file shows its content; comparing two, their content is
 **line-aligned side by side** so you can read what changed. Equal lines sit across from each
 other; a line only one side has leaves the other blank (**green**); a line that changed shows
 both versions with the differing characters marked (**amber**). Nothing is declared "the same" —
-identical documents simply show no marks. A document that yields no text (scanned, encrypted, or
-empty) says so plainly.
+identical content simply shows no marks. A document that yields no text (scanned, encrypted, or
+empty) says so plainly. Raw bytes are not here — they have their own **Hex** tab.
 
 ![The Text tab comparing two documents' extracted content](../screenshots/content_diff.png)
-
-For **any other** file it shows the head (the first 64 KB) as text, or as an offset/hex/ASCII
-dump when the file is not text. Comparing **two** such files it becomes a **full-file, aligned
-hex diff**: the byte streams are aligned so equal runs line up — even when one side has an
-inserted header — with the differences marked (a **green** gap where bytes exist on only one
-side, **amber** where they differ on both). It **paginates** through the whole file, **jump to
-next/previous difference** skips the long equal stretches, and a very large or
-pervasively-different pair falls back to a coarse block-level match and says so. So two
-same-sized "duplicates" that differ only in an inserted metadata header read as exactly that.
-
-![The Text tab, a single file's head as text or hex](../screenshots/lightbox_text.png)
-
-![The Text tab comparing two files as an aligned hex diff](../screenshots/hex_diff.png)
 
 **Render** shows a **PDF** rasterized to its page — the document as it actually *looks*, not its
 extracted words. Comparing two, their pages sit side by side to be judged by eye: there is no
@@ -166,6 +155,17 @@ same green/amber marking as the content diff). It's the forensic "what text is i
 files that aren't documents.
 
 ![The Strings tab surfacing a binary's embedded runs](../screenshots/strings.png)
+
+**Hex** is offered for **every** file, with no exceptions — the raw bytes are always one click
+away. One file shows an offset/hex/ASCII dump of its head; comparing **two** it becomes a
+**full-file, aligned hex diff**: the byte streams are aligned so equal runs line up — even when
+one side has an inserted header — with the differences marked (a **green** gap where bytes exist
+on only one side, **amber** where they differ on both). It **paginates** through the whole file,
+**jump to next/previous difference** skips the long equal stretches, and a very large or
+pervasively-different pair falls back to a coarse block-level match and says so. So two
+same-sized "duplicates" that differ only in an inserted metadata header read as exactly that.
+
+![The Hex tab comparing two files as an aligned hex diff](../screenshots/hex_diff.png)
 
 **Videos** compare as one representative still per side, enough to tell two clips apart at a
 glance. Full playback stays the OPEN (external app) path.

@@ -17,6 +17,11 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   shows it — the document's appearance, not its extracted words. Comparing two, their pages sit
   side by side to judge by eye (no pixel diff, no "same" verdict — different rendering makes that
   meaningless). Needs `pdftoppm` (poppler) at runtime; absent it, the tab just doesn't appear.
+- **Text and Hex are now separate tabs.** The viewer's **Text** tab shows *readable* content
+  only — a document's extracted words or a plain-text file's text (two text files now diff as
+  content, aligned, not as bytes) — while a new **Hex** tab shows the raw bytes of *every* file
+  (a head dump, or the full-file aligned hex diff when comparing two). A binary that used to
+  show its bytes under "Text" now shows them under "Hex", and keeps Strings for embedded runs.
 - **See the text hiding inside any file.** A new **Strings** tab on the viewer shows the
   printable runs embedded in a file's bytes — an image's EXIF strings, an audio file's tags, a
   program's paths and banners. Comparing two files aligns their runs so shared embedded text

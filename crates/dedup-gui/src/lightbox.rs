@@ -33,6 +33,9 @@ pub enum RepresentationKind {
     // The printable runs embedded in any file's bytes — offered everywhere,
     // after Text.
     Strings,
+    // The raw bytes of any file — always available, its own tab, independent of
+    // Text (which is now readable text only).
+    Hex,
 }
 
 impl RepresentationKind {
@@ -47,6 +50,7 @@ impl RepresentationKind {
             Self::Text => "Text",
             Self::Render => "Render",
             Self::Strings => "Strings",
+            Self::Hex => "Hex",
         }
     }
 
@@ -61,6 +65,7 @@ impl RepresentationKind {
             Self::Text => icon::SEARCH,
             Self::Render => icon::IMAGE,
             Self::Strings => icon::SEARCH,
+            Self::Hex => icon::SEARCH,
         }
     }
 }
@@ -240,6 +245,15 @@ pub fn has_text_representation(_facts: &FileFacts) -> bool {
     true
 }
 
+/// Whether a file has *readable text* — a text-purpose document we can extract
+/// (PDF/office/email) or a plain-text file. Drives the viewer's **Text** tab; the
+/// always-present **Hex** tab covers the raw bytes of everything else.
+pub fn has_readable_text(facts: &FileFacts) -> bool {
+    facts.mime.as_deref().is_some_and(|m| {
+        dedup_core::fingerprint::is_extractable_document(m) || m.starts_with("text/")
+    })
+}
+
 impl FileRepresentations {
     /// Construct representations from generic [`FileFacts`].
     pub fn from_facts(
@@ -310,11 +324,11 @@ impl FileRepresentations {
             None
         };
 
-        // Text/hex: the fallback representation for everything that is not
-        // image/audio/video. The preview itself is read lazily by the tab (I/O),
-        // so only the capability is decided here; `is_text` is the mime's claim,
-        // which the loader confirms or falls back to a hex dump.
-        let text = if !has_text_representation(facts) {
+        // Text: readable words — an extractable document (PDF/office/email) or a
+        // plain-text file. The raw-bytes view lives on the always-present Hex tab,
+        // not here. The preview is read lazily by the tab (I/O), so only the
+        // capability is decided; `is_text` is the mime's claim.
+        let text = if !has_readable_text(facts) {
             None
         } else {
             Some(TextBinaryRepresentation {
@@ -391,8 +405,10 @@ impl FileRepresentations {
         if self.render.is_some() {
             kinds.push(RepresentationKind::Render);
         }
-        // Strings is offered for every file — any bytes may hold embedded text.
+        // Strings and Hex are offered for every file — any bytes may hold
+        // embedded text, and the raw bytes are always worth a look.
         kinds.push(RepresentationKind::Strings);
+        kinds.push(RepresentationKind::Hex);
         kinds
     }
 
@@ -897,6 +913,32 @@ pub fn load_text_preview(path: &Path) -> TextPreview {
     }
 }
 
+/// The Hex tab's single-file view: a forced hex dump of the file's head, always
+/// bytes even for a text file (unlike [`load_text_preview`], which renders a
+/// text file as text). Reuses the one hex formatter, [`hex_dump`].
+pub(crate) fn hex_head_preview(path: &Path) -> TextPreview {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    let read = std::fs::File::open(path)
+        .and_then(|f| f.take(HEX_DUMP_BYTES as u64 + 1).read_to_end(&mut buf));
+    if let Err(e) = read {
+        return TextPreview {
+            body: String::new(),
+            is_text: false,
+            truncated: false,
+            error: Some(e.to_string()),
+        };
+    }
+    let truncated = buf.len() > HEX_DUMP_BYTES;
+    let shown = buf.len().min(HEX_DUMP_BYTES);
+    TextPreview {
+        body: hex_dump(&buf[..shown]),
+        is_text: false,
+        truncated,
+        error: None,
+    }
+}
+
 /// Classic `offset  16 hex bytes  |ascii|` dump.
 fn hex_dump(bytes: &[u8]) -> String {
     let mut out = String::new();
@@ -1229,10 +1271,11 @@ mod tests {
         assert!(!kinds.contains(&RepresentationKind::Audio));
         // An image without EXIF has nothing to put on a Metadata tab.
         assert!(!kinds.contains(&RepresentationKind::Metadata));
-        // Text/bytes *are* offered — every file has bytes worth inspecting, and
-        // restricting that to non-media hid exactly the cases where "is this the
-        // same file?" needed an answer (lightbox redesign, 2026-08-01).
-        assert!(kinds.contains(&RepresentationKind::Text));
+        // A PNG has no readable text, so no Text tab — but its raw bytes are
+        // always on Hex, and any embedded runs on Strings.
+        assert!(!kinds.contains(&RepresentationKind::Text));
+        assert!(kinds.contains(&RepresentationKind::Hex));
+        assert!(kinds.contains(&RepresentationKind::Strings));
 
         // The same image *with* EXIF does offer Metadata — read-only, since
         // there is no EXIF writer.

@@ -205,6 +205,9 @@ pub(crate) struct DiffCompare {
     /// when it fails (missing/unrenderable).
     render_tex: [Option<TextureHandle>; 2],
     render_tried: [bool; 2],
+    /// The Hex tab's single-file forced hex dump per side, cached like the text
+    /// preview. The two-sided view is the paginated `hexdiff`.
+    hex_head: [Option<crate::lightbox::TextPreview>; 2],
     /// The open ID3 tag editor (Metadata tab), if any. Only a writable audio
     /// side ever opens one.
     pub(crate) tag_edit: Option<TagEdit>,
@@ -281,6 +284,7 @@ impl DiffCompare {
             stringsdiff_key: None,
             render_tex: [None, None],
             render_tried: [false, false],
+            hex_head: [None, None],
             tag_edit: None,
             tag_error: None,
             title: "COMPARE — SAME PATH, DIFFERENT CONTENT".into(),
@@ -894,6 +898,7 @@ impl DiffCompare {
         self.strings[slot] = None;
         self.render_tex[slot] = None;
         self.render_tried[slot] = false;
+        self.hex_head[slot] = None;
         self.tags[slot] = None;
         self.exif_all[slot] = None;
         // The Archive tab lists the *left* side's members; a changed left side
@@ -1809,25 +1814,13 @@ impl DiffCompare {
                     draw_columns(&mut child, &mut tag_edit, cols);
                     self.tag_edit = tag_edit;
                 } else if self.tab == RepresentationKind::Text {
-                    // Documents (PDF/office/email) show their extracted words —
-                    // one file, or side by side when comparing. Everything else
-                    // is the byte-level hex view. Only the mime is checked per
-                    // frame; the extraction itself is cached in `self.text`.
-                    let is_doc = |facts: &FileFacts| {
-                        facts
-                            .mime
-                            .as_deref()
-                            .is_some_and(dedup_core::fingerprint::is_extractable_document)
-                    };
-                    let both_documents =
-                        is_doc(&self.left.facts) && (!two_sided_now || is_doc(&self.right.facts));
+                    // Readable text: a document's extracted words, or a plain-text
+                    // file's raw text — one file, or an aligned content diff when
+                    // comparing two. Raw bytes live on the Hex tab now, never here.
                     if two_sided_now {
-                        // Two sides: an aligned diff below the per-side action
-                        // strip (which extends a little past the titles into the
-                        // viewport top) so its own controls can't collide with it
-                        // — plus the extra switcher row when the group has a pool.
-                        // Two documents diff their extracted content; anything
-                        // else diffs raw bytes as hex.
+                        // Below the per-side action strip (which extends past the
+                        // titles into the viewport top) so the diff's own controls
+                        // can't collide — plus the switcher row when pooled.
                         let has_switcher = self.can_step_left() || self.can_step_right();
                         let clearance = if has_switcher { 58.0 } else { 30.0 };
                         let diff_rect = Rect::from_min_max(
@@ -1839,11 +1832,7 @@ impl DiffCompare {
                                 .max_rect(diff_rect)
                                 .layout(Layout::top_down(Align::Min)),
                         );
-                        if both_documents {
-                            self.render_text_diff(&mut child);
-                        } else {
-                            self.render_hex_diff(&mut child);
-                        }
+                        self.render_text_diff(&mut child);
                     } else {
                         for slot in [0usize, 1usize] {
                             if self.text[slot].is_none() {
@@ -1946,6 +1935,44 @@ impl DiffCompare {
                         self.draw_render_page(ui, right_pane, 1);
                     } else {
                         self.draw_render_page(ui, viewport, 0);
+                    }
+                } else if self.tab == RepresentationKind::Hex {
+                    // Raw bytes, always: a hex dump of one file's head, or the
+                    // full-file aligned hex diff when comparing two.
+                    if two_sided_now {
+                        let has_switcher = self.can_step_left() || self.can_step_right();
+                        let clearance = if has_switcher { 58.0 } else { 30.0 };
+                        let rect = Rect::from_min_max(
+                            egui::pos2(viewport.min.x, viewport.min.y + clearance),
+                            viewport.max,
+                        );
+                        let mut child = ui.new_child(
+                            UiBuilder::new()
+                                .max_rect(rect)
+                                .layout(Layout::top_down(Align::Min)),
+                        );
+                        self.render_hex_diff(&mut child);
+                    } else {
+                        if self.hex_head[0].is_none() {
+                            self.hex_head[0] =
+                                Some(crate::lightbox::hex_head_preview(&self.left.facts.abs_path));
+                        }
+                        if let Some(p) = &self.hex_head[0] {
+                            let body = p.body.clone();
+                            egui::ScrollArea::both()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&body)
+                                                .monospace()
+                                                .size(12.0)
+                                                .color(theme::text()),
+                                        )
+                                        .wrap_mode(egui::TextWrapMode::Extend),
+                                    );
+                                });
+                        }
                     }
                 } else if !two_sided_now {
                     // One file, the whole viewport — the hidden side must not
@@ -3164,6 +3191,67 @@ mod tests {
         );
     }
 
+    /// A plain-text side on disk.
+    fn text_side(dir: &Path, name: &str, body: &[u8]) -> DiffSide {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        let mut side = named_side(name);
+        side.facts.abs_path = path;
+        side.facts.mime = Some("text/plain".into());
+        side
+    }
+
+    /// After the tab split, a text file has *both* a Text tab (its words) and an
+    /// always-present Hex tab (its raw bytes) — the byte view no longer hides
+    /// inside Text.
+    #[test]
+    fn a_text_file_has_both_a_text_and_a_hex_view() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let side = text_side(tmp.path(), "notes.txt", b"visible words here in this file");
+        let mut cmp = DiffCompare::new_with_pool(side, None, Vec::new());
+        cmp.hide_second();
+        cmp.tab = RepresentationKind::Text;
+        let mut h = rendered(cmp);
+        assert!(
+            h.query_all_by_label_contains("visible words here").count() > 0,
+            "the Text tab shows the file's words"
+        );
+        h.get_by_label_contains("Hex").click();
+        h.run();
+        assert!(
+            h.query_all_by_label_contains("00000000").count() > 0,
+            "the Hex tab shows a byte dump (offsets), even for a text file"
+        );
+    }
+
+    /// Two text files compared on the Text tab diff as *content* (their words,
+    /// aligned), not as a hex dump — this falls out of the split for free.
+    #[test]
+    fn two_text_files_diff_as_content_not_bytes() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cmp = DiffCompare::new_with_pool(
+            text_side(tmp.path(), "a.txt", b"alpha heading\nthe shared body line"),
+            Some(text_side(
+                tmp.path(),
+                "b.txt",
+                b"bravo heading\nthe shared body line",
+            )),
+            Vec::new(),
+        );
+        cmp.tab = RepresentationKind::Text;
+        let h = rendered(cmp);
+        assert!(
+            h.query_all_by_label_contains("alpha heading").count() > 0,
+            "left file's line is shown as text"
+        );
+        assert!(
+            h.query_all_by_label_contains("bravo heading").count() > 0,
+            "right file's line is shown as text, aligned beside it"
+        );
+    }
+
     /// A binary side on disk holding raw `bytes` — for the Strings tab.
     fn bytes_side(dir: &Path, name: &str, bytes: &[u8]) -> DiffSide {
         let path = dir.join(name);
@@ -3862,7 +3950,7 @@ mod tests {
         let cmp = DiffCompare::new_with_pool(a, Some(b), Vec::new());
         let mut h = save_harness(cmp);
         // Wait for the decode: the Image tab appears only once both sides decode
-        // (Text is offered immediately, so it can't be the settle signal).
+        // (Hex is offered immediately, so it can't be the settle signal).
         for _ in 0..200 {
             h.step();
             if h.query_by_label_contains("Image").is_some() {
@@ -3875,23 +3963,23 @@ mod tests {
             "the Image tab is offered"
         );
         assert!(
-            h.query_by_label_contains("Text").is_some(),
-            "the Text tab is offered"
+            h.query_by_label_contains("Hex").is_some(),
+            "the Hex tab is offered (an image has no Text tab)"
         );
         assert!(
             h.query_all_by_label_contains("shoebox").count() > 0,
             "the repo header shows on the image tab"
         );
-        h.get_by_label_contains("Text").click();
+        h.get_by_label_contains("Hex").click();
         h.run();
         assert_eq!(
             h.state().0.tab,
-            RepresentationKind::Text,
-            "clicking Text selects it"
+            RepresentationKind::Hex,
+            "clicking Hex selects it"
         );
         assert!(
             h.query_all_by_label_contains("shoebox").count() > 0,
-            "the repo header is still shown on the Text tab — consistent across tabs"
+            "the repo header is still shown on the Hex tab — consistent across tabs"
         );
     }
 
@@ -3915,14 +4003,14 @@ mod tests {
         b.facts.hash_hex = "hash-b".into();
         b.facts.mime = Some("application/octet-stream".into());
         let mut cmp = DiffCompare::new(a, b);
-        cmp.tab = RepresentationKind::Text;
+        cmp.tab = RepresentationKind::Hex;
         cmp
     }
 
     /// The Text tab of a two-sided compare is the aligned, paginated hex diff:
     /// it paginates and offers to jump to the difference.
     #[test]
-    fn the_text_tab_is_a_paginated_hex_diff_with_a_jump_control() {
+    fn the_hex_tab_is_a_paginated_hex_diff_with_a_jump_control() {
         use egui_kittest::kittest::Queryable;
         let tmp = tempfile::tempdir().unwrap();
         let h = rendered(hex_diff_pair(tmp.path()));
@@ -4031,7 +4119,7 @@ mod tests {
         // was them sinking the further right they sat. CLOSE lives in the title
         // row above and is deliberately not compared against.
         let first = h.get_by_label_contains("Image").rect();
-        let other = h.get_by_label_contains("Text").rect();
+        let other = h.get_by_label_contains("Hex").rect();
         assert!(
             other.max.x <= width,
             "the tab escapes the {width}px window: {other:?}"
@@ -4055,8 +4143,8 @@ mod tests {
             "still an image pair: {kinds:?}"
         );
         assert!(
-            kinds.contains(&RepresentationKind::Text),
-            "and its text/bytes are reachable: {kinds:?}"
+            kinds.contains(&RepresentationKind::Hex),
+            "and its raw bytes are reachable on Hex (an image has no Text tab): {kinds:?}"
         );
     }
 
@@ -4075,8 +4163,8 @@ mod tests {
             let (l, r) = cmp.reps();
             let kinds = crate::lightbox::tab_kinds(&l, Some(&r));
             assert!(
-                kinds.contains(&RepresentationKind::Text),
-                "{mime:?} is comparable as text/bytes: {kinds:?}"
+                kinds.contains(&RepresentationKind::Hex),
+                "{mime:?} is always comparable by its raw bytes on Hex: {kinds:?}"
             );
         }
     }
