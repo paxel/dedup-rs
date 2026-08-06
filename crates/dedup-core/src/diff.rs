@@ -218,6 +218,56 @@ pub enum DiffItem {
     DeletedInReference { rel_path: String },
 }
 
+/// Why a sink file is a candidate to pull back into its main (GROUP SYNC BACK).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullKind {
+    /// Content the main has never had — a direct edit to the backup, promoted
+    /// with no risk.
+    New,
+    /// Content the main once had and **deleted** (a tombstone) that the sink
+    /// still holds. Bringing it back undoes the main's deletion — which may be a
+    /// recovered mistake or an unwanted resurrection of a deliberate cleanup — so
+    /// it is always the user's explicit choice, never automatic.
+    Resurrection,
+}
+
+/// One sink file GROUP SYNC BACK could bring into the main, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullItem {
+    pub rel_path: String,
+    pub kind: PullKind,
+}
+
+/// Classify a sink's files against its main for a pull back: the content the
+/// main never had ([`PullKind::New`]) and the content the main deleted but the
+/// sink still holds ([`PullKind::Resurrection`]). Content the main already has is
+/// omitted (nothing to pull). Reuses [`diff_print`] (source = sink, reference =
+/// main), so a file is classified by its **content**, never its path, and the
+/// order follows `diff_print`'s. The new/resurrection split is the whole point —
+/// a naive "copy what the main lacks" cannot make it, because a tombstone and a
+/// never-seen file both look like "the main lacks this content".
+pub fn plan_sync_back(
+    store: &Store,
+    sink: &str,
+    main: &str,
+    filter: Option<&str>,
+) -> Result<Vec<PullItem>, DiffError> {
+    Ok(diff_print(store, sink, &[main], filter)?
+        .into_iter()
+        .filter_map(|item| match item {
+            DiffItem::New { rel_path } => Some(PullItem {
+                rel_path,
+                kind: PullKind::New,
+            }),
+            DiffItem::DeletedInReference { rel_path } => Some(PullItem {
+                rel_path,
+                kind: PullKind::Resurrection,
+            }),
+            DiffItem::Equal { .. } => None,
+        })
+        .collect())
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CopyStats {
     pub copied: u64,

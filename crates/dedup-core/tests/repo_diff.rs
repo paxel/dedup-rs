@@ -3,8 +3,8 @@
 //! pairings.
 
 use dedup_core::diff::{
-    DiffOpError, DiffPairing, DiffRelation, RepoDiffRow, copy_file_between, delete_file,
-    overwrite_file, plan_repo_diff, rename_file,
+    DiffOpError, DiffPairing, DiffRelation, PullKind, RepoDiffRow, copy_file_between, delete_file,
+    overwrite_file, plan_repo_diff, plan_sync_back, rename_file,
 };
 use dedup_core::store::Store;
 use dedup_core::update::{CancellationToken, NoProgress, update_repo};
@@ -200,6 +200,50 @@ fn deleted_files_drop_out_of_the_diff() -> TestResult {
         assert_eq!(rows.len(), 1, "{pairing:?}: only the live file shows");
         assert_eq!(paths(&rows[0].left), ["stays.txt"]);
     }
+    Ok(())
+}
+
+#[test]
+fn plan_sync_back_separates_new_from_resurrection() -> TestResult {
+    // LEFT is the sink, RIGHT is the main.
+    let sb = Sandbox::new()?;
+    // A file both hold; a file the main once had and will delete (its content
+    // lingers on the sink); a file only the sink has.
+    Sandbox::write(&sb.right, "shared.txt", b"shared")?;
+    Sandbox::write(&sb.right, "deleted-in-main.txt", b"deleted-content")?;
+    Sandbox::write(&sb.left, "shared.txt", b"shared")?;
+    Sandbox::write(&sb.left, "deleted-in-main.txt", b"deleted-content")?;
+    Sandbox::write(&sb.left, "new-on-sink.txt", b"brand-new")?;
+    sb.update_both()?;
+    // The main deletes its copy and rescans → a tombstone for that content,
+    // which the sink still holds.
+    std::fs::remove_file(sb.right.join("deleted-in-main.txt"))?;
+    update_repo(
+        &sb.store,
+        "RIGHT",
+        1,
+        &NoProgress,
+        &CancellationToken::new(),
+    )?;
+
+    let plan = plan_sync_back(&sb.store, "LEFT", "RIGHT", None)?;
+    let by_path: std::collections::HashMap<&str, PullKind> =
+        plan.iter().map(|i| (i.rel_path.as_str(), i.kind)).collect();
+
+    assert_eq!(
+        by_path.get("new-on-sink.txt"),
+        Some(&PullKind::New),
+        "content the main never saw is New (promote)"
+    );
+    assert_eq!(
+        by_path.get("deleted-in-main.txt"),
+        Some(&PullKind::Resurrection),
+        "content the main deleted but the sink still holds is a Resurrection"
+    );
+    assert!(
+        !by_path.contains_key("shared.txt"),
+        "content the main already has is omitted — nothing to pull"
+    );
     Ok(())
 }
 

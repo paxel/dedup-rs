@@ -72,12 +72,12 @@ pub const DARK: Palette = Palette {
     hairline: HAIRLINE,
 };
 
-/// The light appearance. Hand-derived, not an inversion of dark: the four
+/// The light appearance. Hand-derived, not an inversion of dark: the five
 /// review-board semantics (grey unchanged, green only-here, red will-delete,
-/// amber differs) are dark variants chosen to stay pairwise distinct on a light
-/// background, where a mechanical flip would collapse "will delete" into
-/// "differs". Starting values — the user is the customer and tunes them by eye
-/// against the both-palettes image.
+/// amber differs, blue resurrection) are dark variants chosen to stay pairwise
+/// distinct on a light background, where a mechanical flip would collapse "will
+/// delete" into "differs". Starting values — the user is the customer and tunes
+/// them by eye against the both-palettes image.
 pub const LIGHT: Palette = Palette {
     dark_mode: false,
     black: Color32::from_rgb(0x1A, 0x14, 0x10),
@@ -482,11 +482,12 @@ mod tests {
         install(DARK);
     }
 
-    /// Both palettes keep the four review-board semantics **distinguishable on
+    /// Both palettes keep the five review-board semantics **distinguishable on
     /// screen**, not merely unequal: a light palette where "will delete" and
     /// "differs" looked alike would be a deletion hazard. Asserted as a minimum
-    /// perceptual distance, and looped over every palette so a third cannot be
-    /// added without being checked.
+    /// perceptual distance, and looped over every palette so a sixth cannot be
+    /// added without being checked. Blue joined as "resurrection" (GROUP SYNC
+    /// BACK) and must stand apart from the other four.
     #[test]
     fn the_semantic_colours_stay_distinct_in_every_palette() {
         // Redmean ~40 is a conservative "clearly different on screen" floor.
@@ -497,6 +498,7 @@ mod tests {
                 ("green", p.green),
                 ("red", p.red),
                 ("amber", p.amber),
+                ("blue", p.blue),
             ];
             for i in 0..semantics.len() {
                 for j in (i + 1)..semantics.len() {
