@@ -200,6 +200,11 @@ pub(crate) struct DiffCompare {
     strings: [Option<String>; 2],
     stringsdiff: Option<crate::textdiff::TextDiff>,
     stringsdiff_key: Option<(String, String)>,
+    /// The Render tab's first-page texture per side, rasterized once via
+    /// `pdftoppm`. `render_tried` guards against re-running the tool every frame
+    /// when it fails (missing/unrenderable).
+    render_tex: [Option<TextureHandle>; 2],
+    render_tried: [bool; 2],
     /// The open ID3 tag editor (Metadata tab), if any. Only a writable audio
     /// side ever opens one.
     pub(crate) tag_edit: Option<TagEdit>,
@@ -274,6 +279,8 @@ impl DiffCompare {
             strings: [None, None],
             stringsdiff: None,
             stringsdiff_key: None,
+            render_tex: [None, None],
+            render_tried: [false, false],
             tag_edit: None,
             tag_error: None,
             title: "COMPARE — SAME PATH, DIFFERENT CONTENT".into(),
@@ -637,6 +644,53 @@ impl DiffCompare {
         }
     }
 
+    /// Rasterize a side's document to its first page and hold the texture,
+    /// once. `pdftoppm` runs synchronously (it is fast for a page); the temp PNG
+    /// is dropped after the texture is uploaded. A failure leaves `render_tex`
+    /// empty and `render_tried` set, so the tool is not re-run every frame.
+    fn ensure_render(&mut self, ctx: &Context, slot: usize) {
+        if self.render_tried[slot] {
+            return;
+        }
+        self.render_tried[slot] = true;
+        let side = if slot == 0 { &self.left } else { &self.right };
+        let Ok(dir) = tempfile::tempdir() else {
+            return;
+        };
+        let pages = dedup_core::render::render_pdf_pages(&side.facts.abs_path, dir.path());
+        if let Some(first) = pages.first()
+            && let Ok((w, h, rgba)) = dedup_core::thumbnail::load_full_rgba(first, 2000)
+        {
+            let image = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+            self.render_tex[slot] =
+                Some(ctx.load_texture(format!("render{slot}"), image, TextureOptions::LINEAR));
+        }
+    }
+
+    /// Draw one side's rendered page fit within `area`, or a note when it could
+    /// not be rasterized.
+    fn draw_render_page(&self, ui: &mut egui::Ui, area: Rect, slot: usize) {
+        match &self.render_tex[slot] {
+            Some(tex) => {
+                let sz = tex.size();
+                let (w, h) = (sz[0] as f32, sz[1] as f32);
+                let scale = (area.width() / w).min(area.height() / h).min(4.0);
+                let fit = Rect::from_center_size(area.center(), egui::vec2(w * scale, h * scale));
+                draw_in_pane(ui, area, fit, &self.render_tex[slot]);
+            }
+            None => {
+                ui.painter().text(
+                    area.center(),
+                    Align2::CENTER_CENTER,
+                    "This document could not be drawn to pages — the page renderer \
+                     (poppler) may be missing.",
+                    FontId::proportional(13.0),
+                    theme::hairline(),
+                );
+            }
+        }
+    }
+
     /// Render the Text tab's aligned hex diff for a two-sided comparison: build
     /// (and cache under the two content hashes) the alignment, then a row of
     /// controls — page navigation, jump-to-difference, and any degrade or
@@ -838,6 +892,8 @@ impl DiffCompare {
         }
         self.text[slot] = None;
         self.strings[slot] = None;
+        self.render_tex[slot] = None;
+        self.render_tried[slot] = false;
         self.tags[slot] = None;
         self.exif_all[slot] = None;
         // The Archive tab lists the *left* side's members; a changed left side
@@ -1876,6 +1932,21 @@ impl DiffCompare {
                             .layout(Layout::top_down(Align::Min)),
                     );
                     self.render_strings(&mut child, two_sided_now);
+                } else if self.tab == RepresentationKind::Render {
+                    // The document rasterized to its first page, shown as it
+                    // looks — one file, or both side by side. Judged by eye; no
+                    // pixel diff, no verdict. (Page navigation and flicker land
+                    // with multi-page support.)
+                    let ctx = ui.ctx().clone();
+                    self.ensure_render(&ctx, 0);
+                    if two_sided_now {
+                        self.ensure_render(&ctx, 1);
+                        let (left_pane, right_pane) = compare_split(viewport);
+                        self.draw_render_page(ui, left_pane, 0);
+                        self.draw_render_page(ui, right_pane, 1);
+                    } else {
+                        self.draw_render_page(ui, viewport, 0);
+                    }
                 } else if !two_sided_now {
                     // One file, the whole viewport — the hidden side must not
                     // paint a second copy of the same picture.
@@ -3023,6 +3094,76 @@ mod tests {
         side
     }
 
+    /// Author a valid one-page PDF (a filled rectangle in the given colour) so
+    /// `pdftoppm` accepts it — for the Render tab.
+    fn tiny_pdf(path: &Path, r: f64, g: f64, b: f64) {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{Document, Object, Stream, dictionary};
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let content = Content {
+            operations: vec![
+                Operation::new("rg", vec![r.into(), g.into(), b.into()]),
+                Operation::new("re", vec![20.into(), 20.into(), 200.into(), 160.into()]),
+                Operation::new("f", vec![]),
+            ],
+        };
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "MediaBox" => vec![0.into(), 0.into(), 240.into(), 200.into()],
+        });
+        let pages = dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        };
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+        doc.save(path).unwrap();
+    }
+
+    /// A PDF side on disk, a one-page document in the given colour.
+    fn pdf_side(dir: &Path, name: &str, rgb: (f64, f64, f64)) -> DiffSide {
+        let path = dir.join(name);
+        tiny_pdf(&path, rgb.0, rgb.1, rgb.2);
+        let mut side = named_side(name);
+        side.facts.abs_path = path;
+        side.facts.mime = Some("application/pdf".into());
+        side
+    }
+
+    /// The Render tab is offered for a PDF and not for a file that cannot be
+    /// rasterized — keyed on mime, so no valid document is needed here.
+    #[test]
+    fn a_pdf_offers_a_render_tab_and_an_image_does_not() {
+        let mut pdf = named_side("doc.pdf");
+        pdf.facts.mime = Some("application/pdf".into());
+        let cmp = DiffCompare::new_with_pool(pdf, None, Vec::new());
+        assert!(
+            cmp.reps()
+                .0
+                .available_kinds()
+                .contains(&RepresentationKind::Render),
+            "a PDF offers the Render tab"
+        );
+
+        let mut jpg = named_side("photo.jpg");
+        jpg.facts.mime = Some("image/jpeg".into());
+        let cmp2 = DiffCompare::new_with_pool(jpg, None, Vec::new());
+        assert!(
+            !cmp2
+                .reps()
+                .0
+                .available_kinds()
+                .contains(&RepresentationKind::Render),
+            "an image is not rasterized to pages — no Render tab"
+        );
+    }
+
     /// A binary side on disk holding raw `bytes` — for the Strings tab.
     fn bytes_side(dir: &Path, name: &str, bytes: &[u8]) -> DiffSide {
         let path = dir.join(name);
@@ -3128,6 +3269,45 @@ mod tests {
         side.facts.abs_path = path;
         side.facts.mime = Some("message/rfc822".into());
         side
+    }
+
+    /// Doc screenshot: two PDFs rendered to pages, side by side on the Render
+    /// tab, to `docs/screenshots/render.png`. `--ignored` (needs wgpu + pdftoppm).
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu + pdftoppm)"]
+    fn doc_screenshot_render() {
+        if !dedup_core::render::pdftoppm_available() {
+            eprintln!("skipping: pdftoppm not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cmp = DiffCompare::new_with_pool(
+            pdf_side(tmp.path(), "a.pdf", (0.20, 0.35, 0.70)),
+            Some(pdf_side(tmp.path(), "b.pdf", (0.75, 0.30, 0.20))),
+            Vec::new(),
+        );
+        cmp.tab = RepresentationKind::Render;
+        let mut init = false;
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 620.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, cmp: &mut DiffCompare| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::LIGHT);
+                        init = true;
+                    }
+                    cmp.view(&ui.ctx().clone(), TooltipVerbosity::default(), None);
+                },
+                cmp,
+            );
+        h.run();
+        let img = h.render().expect("wgpu render failed");
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/screenshots/render.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 
     /// Doc screenshot: the Strings tab surfacing a binary's embedded runs, to

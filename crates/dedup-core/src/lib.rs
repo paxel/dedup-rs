@@ -11,6 +11,7 @@ pub mod fingerprint;
 pub mod groom;
 pub mod logging;
 pub mod organize;
+pub mod render;
 pub mod report;
 pub mod scan;
 pub mod secret;

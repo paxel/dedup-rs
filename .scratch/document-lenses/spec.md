@@ -34,7 +34,8 @@ a faithful lens and none of them a verdict:
   looks. Comparing two, they sit side by side, each side with its **own page
   advancer**, and **flicker** swaps the current pages so subtle differences jump
   out. Judged by eye: no automated pixel diff, no page-pairing guess, no sameness
-  verdict. **[planned]**
+  verdict. **[partial]** (PDF first-page render, side by side, ships now; office
+  formats, multi-page navigation, and flicker are follow-ups.)
 - **Strings** — the **printable character runs** embedded in any file's bytes (the
   `strings`-style view the Browse tab already has), now available in the viewer
   too, and comparable. **[done]**
@@ -171,7 +172,12 @@ keep-versus-delete, and never declares two things "the same."** The removed
   reuses the image compare surface (texture, zoom/pan, flicker) but adds an
   **independent per-side page advancer**; flicker swaps the *current* A page against
   the *current* B page. The machine never pairs pages or diffs pixels; it states the
-  page counts and lets the user align and judge. **[planned]**
+  page counts and lets the user align and judge. **[partial]** — shipped:
+  `render::render_pdf_pages` (PDF via `pdftoppm`, tool-gated) and a `Render` tab for
+  `application/pdf` showing the **first page**, one file or two side by side,
+  synchronously (fast, no async needed). Deferred: office via headless LibreOffice
+  (needs the async channel, since it is multi-second), multi-page navigation with the
+  per-side page advancer, and flicker.
 - **The tab split is last.** Splitting today's dual-purpose Text tab into
   independent **Hex** (every file), **Strings** (every file), and **Text**
   (documents) tabs is done *after* Text/Strings/Render each have content, so the tab
@@ -237,5 +243,7 @@ codebase; prefer them, add functions at them rather than new seam types:
   and the documentation of supported formats. Since shipped: office paragraph structure
   (Word/Office docs diff line by line), the core `strings::printable_strings` extractor
   (Browse now reuses it), and the viewer **Strings** tab (single-file runs and a two-file
-  aligned diff). Remaining: the **Render** tab, the Hex/Strings/Text **tab split**, and
-  worker-threaded extraction.
+  aligned diff), and the **Render** tab (PDF first page, one file or two side by side, via
+  `pdftoppm`). Remaining: office rendering + multi-page navigation + flicker (needs headless
+  LibreOffice and the async channel), the Hex/Strings/Text **tab split**, and worker-threaded
+  extraction.

@@ -83,9 +83,9 @@ switcher at all, because the only other candidate is already on the other side.
 
 A file can be looked at in more than one way, so the viewer is tabbed by *representation*.
 The tab bar offers every representation at least one side has — **Image**, **Video**,
-**Audio**, **Metadata**, **Text**, **Strings** — a photo has no Audio tab, an untagged
-FLAC no Metadata tab, but **Text** and **Strings** are offered for every file. Selecting a tab
-draws only the column(s) whose file supports it, always
+**Audio**, **Metadata**, **Text**, **Render**, **Strings** — a photo has no Audio tab, an
+untagged FLAC no Metadata tab, and only a PDF gets **Render**; but **Text** and **Strings** are
+offered for every file. Selecting a tab draws only the column(s) whose file supports it, always
 left (A) against right (B), never stacked. If a side steps to a copy that lacks the current
 representation, the viewer drops back to the pair's own representation.
 
@@ -148,6 +148,15 @@ same-sized "duplicates" that differ only in an inserted metadata header read as 
 ![The Text tab, a single file's head as text or hex](../screenshots/lightbox_text.png)
 
 ![The Text tab comparing two files as an aligned hex diff](../screenshots/hex_diff.png)
+
+**Render** shows a **PDF** rasterized to its page — the document as it actually *looks*, not its
+extracted words. Comparing two, their pages sit side by side to be judged by eye: there is no
+automated pixel diff and no "same" verdict, because different rendering (fonts, antialiasing)
+makes pixel equality meaningless. It's the visual counterpart to the Text tab's content diff —
+one reads the words, the other shows the page. Requires `pdftoppm` (poppler) at runtime; without
+it the tab simply doesn't appear, the same way video needs `ffmpeg`.
+
+![Two PDFs rendered to pages, side by side on the Render tab](../screenshots/render.png)
 
 **Strings** is offered for **every** file and shows the printable runs (four or more readable
 characters) embedded in its bytes — the text hiding inside a binary: an image's EXIF strings, an

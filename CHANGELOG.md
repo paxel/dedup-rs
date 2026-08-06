@@ -13,6 +13,10 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   characters differ — so you can see whether two copies say the same thing. Nothing is declared
   identical; a document with no extractable text (scanned, encrypted, or empty) says so.
   Word/Office documents keep their paragraph breaks, so their content diffs line by line.
+- **See a PDF as it looks, side by side.** A new **Render** tab rasterizes a PDF to its page and
+  shows it — the document's appearance, not its extracted words. Comparing two, their pages sit
+  side by side to judge by eye (no pixel diff, no "same" verdict — different rendering makes that
+  meaningless). Needs `pdftoppm` (poppler) at runtime; absent it, the tab just doesn't appear.
 - **See the text hiding inside any file.** A new **Strings** tab on the viewer shows the
   printable runs embedded in a file's bytes — an image's EXIF strings, an audio file's tags, a
   program's paths and banners. Comparing two files aligns their runs so shared embedded text

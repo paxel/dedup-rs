@@ -1640,6 +1640,7 @@ dependencies = [
  "id3",
  "image",
  "log",
+ "lopdf",
  "open",
  "redb",
  "rfd",

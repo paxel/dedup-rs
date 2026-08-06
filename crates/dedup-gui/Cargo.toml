@@ -24,3 +24,4 @@ tempfile = "3.10"
 [dev-dependencies]
 egui_kittest = { version = "0.35", features = ["wgpu", "snapshot"] }
 zip = "8.6"
+lopdf = "0.43"

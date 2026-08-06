@@ -27,6 +27,9 @@ pub enum RepresentationKind {
     Audio,
     Video,
     Text,
+    // A document rasterized to page images — how it looks. Offered for PDFs,
+    // beside Text.
+    Render,
     // The printable runs embedded in any file's bytes — offered everywhere,
     // after Text.
     Strings,
@@ -42,6 +45,7 @@ impl RepresentationKind {
             Self::Audio => "Audio",
             Self::Video => "Video",
             Self::Text => "Text",
+            Self::Render => "Render",
             Self::Strings => "Strings",
         }
     }
@@ -55,6 +59,7 @@ impl RepresentationKind {
             Self::Audio => icon::LIGHTNING,
             Self::Video => icon::IMAGE,
             Self::Text => icon::SEARCH,
+            Self::Render => icon::IMAGE,
             Self::Strings => icon::SEARCH,
         }
     }
@@ -202,6 +207,12 @@ impl MarkState {
 #[derive(Clone, Debug)]
 pub struct ArchiveRepresentation {}
 
+/// A document (currently PDF) can be rasterized to page images and looked at as
+/// it renders. The pages are produced lazily by the viewer (external tool), so
+/// this only records the capability.
+#[derive(Clone, Debug)]
+pub struct RenderRepresentation {}
+
 /// Aggregated representations for a single file instance.
 #[derive(Clone, Debug)]
 pub struct FileRepresentations {
@@ -212,6 +223,7 @@ pub struct FileRepresentations {
     pub video: Option<VideoRepresentation>,
     pub text: Option<TextBinaryRepresentation>,
     pub archive: Option<ArchiveRepresentation>,
+    pub render: Option<RenderRepresentation>,
     pub mark: MarkState,
 }
 
@@ -322,6 +334,13 @@ impl FileRepresentations {
             None
         };
 
+        // A PDF can be rasterized to page images and looked at as it renders.
+        let render = if facts.mime.as_deref() == Some("application/pdf") {
+            Some(RenderRepresentation {})
+        } else {
+            None
+        };
+
         Self {
             dedup: DedupDataRepresentation {
                 rel_path: facts
@@ -343,6 +362,7 @@ impl FileRepresentations {
             video,
             text,
             archive,
+            render,
             mark,
         }
     }
@@ -367,6 +387,9 @@ impl FileRepresentations {
         }
         if self.text.is_some() {
             kinds.push(RepresentationKind::Text);
+        }
+        if self.render.is_some() {
+            kinds.push(RepresentationKind::Render);
         }
         // Strings is offered for every file — any bytes may hold embedded text.
         kinds.push(RepresentationKind::Strings);
