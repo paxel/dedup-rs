@@ -3,7 +3,7 @@
 ![File Management tab](../screenshots/files_tab.png)
 
 Copy, move, or delete files between repositories by content (size + BLAKE3 — paths never
-matter), with an assisted filter builder and a preview before anything runs. This is the GUI
+matter), with an assisted filter builder and a review before anything runs. This is the GUI
 equivalent of [`diff cp`/`mv`/`rm`](../cli.md#diff).
 
 ## Repo pickers
@@ -21,9 +21,17 @@ equivalent of [`diff cp`/`mv`/`rm`](../cli.md#diff).
 - **COPY** — copy source files the target (and ALSO REF repos) doesn't have into the target
   repo. Source files are left in place.
 - **MOVE** — same, but marks the source entries missing afterward.
-- **DELETE** — delete source files whose content the target (or an ALSO REF repo) already
-  has; nothing is written to the target.
-
+- **SYNC** — copy source content the target lacks into it at the same relative path; turn on
+  **DELETE MISSING** to also delete target files whose content the source has since lost. The
+  source is never changed.
+- **MIRROR** — copy source content the target lacks *and* delete everything in the target the
+  source does not have, so the target ends up holding exactly the source's content. Deletions
+  cannot be undone.
+- **GROUP SYNC** — push a backup group's main to some or all of its sinks, each in its own
+  stored mode. Only offered when SOURCE is a group's main; see [Group sync](#group-sync)
+  below.
+- **GROUP SYNC BACK** — the reverse: pull one sink's changes *back* into the main. Also only
+  offered when SOURCE is a group's main; see [Group sync back](#group-sync-back) below.
 - **DIFF** — compare the two repos side by side and resolve the differences yourself, one
   row at a time (see [Diff board](#diff-board) below). Nothing runs as a batch.
 
@@ -55,40 +63,118 @@ machines.
 
 ## Diff board
 
-**DIFF** replaces the preview table with a two-sided comparison of the source (left) and
-target (right) repo, with each side's path, size and modification date in sortable columns.
+![The DIFF board](../screenshots/transfer_diff_board.png)
+
+**DIFF** compares the source (left) and target (right) repo on the same
+[review board](index.md#the-review-board) every other preview uses: each side's paths, size
+and date, with the commands between them.
 
 **PAIR BY** decides what counts as one row:
 
 - **BY HASH** — files are matched by content, so the same photo under two names is a single
   row. Same content at the same path is *equal*; same content under different names offers
-  **RENAME** on either side (renaming that side to the other's name); content only one side
-  has offers **COPY** on the side that lacks it and **DELETE** on the side that has it.
+  **RENAME L** / **RENAME R** (renaming that side to the other's name); content only one side
+  has offers **COPY >** / **< COPY** to send it across and **DELETE L** / **DELETE R** to drop
+  it where it is. Where two names differ, the differing characters are highlighted on each
+  side, so you can see at a glance whether the difference is a suffix, a counter or a
+  different extension. The comparison ignores the folder the files sit in, and an inserted
+  character marks only itself rather than everything after it.
 - **BY PATH** — files are matched by their path inside the repo. Same path with the same
-  content is *equal*; same path with different content is a conflict, offering **COMPARE**,
-  **OVERWRITE** (replace the other side's file with this one) and **DELETE** per side.
+  content is *equal*; same path with different content is a conflict, offering
+  **OVERWRITE >** / **< OVERWRITE** (replace the other side's file with this one) and
+  **DELETE L** / **DELETE R**. Clicking the row opens the two versions in the viewer.
 
-**COMPARE** opens the two versions side by side over the whole window: each side shows a
-preview appropriate to the file (image, or a still for video), the repo it lives in, and its
-size, modification date and type — with the larger size and the newer date highlighted, so
-which is which is obvious at a glance. The same OVERWRITE OTHER / DELETE actions are
-available per side inside the comparison, so the decision is made where it is being judged.
-`Esc` or **CLOSE** leaves without changing anything.
+Above the board, **ALL LISTED** offers bulk actions for reconciling large repositories:
+**COPY MISSING >** / **< COPY MISSING** send everything only one side has to the other, and
+**RENAME ALL L** / **RENAME ALL R** rename each side's files to the other's names. Only actions
+the rows on screen can actually use are offered. They act on every row *currently listed* — so
+hiding a row is how you leave it out — and a confirmation states the exact count first. If some
+operations fail the summary says how many succeeded and how many did not.
+
+**Clicking a row** opens the two versions side by side over the whole window, in the same
+shared viewer every surface opens — so what you get depends on the file type, not on which
+tab you happen to be in. Two audio files compare as **spectrograms**, two documents
+through a **Text** tab, and images and video as pictures: each side shows a preview appropriate to the file (image, or a
+still for video), the repo it lives in, and its size, modification date and type — with the
+larger size and the newer date highlighted, so which is which is obvious at a glance. When
+both sides have a picture you can **wheel to zoom**, **drag to pan**, and press **Space** to
+flicker one over the other (Space again swaps which side is shown) — the surest way to spot a
+subtle edit. A side with nothing to show (a document, audio, or a type that can't be
+previewed) says so and disables the flicker compare for that pair. The same OVERWRITE OTHER /
+DELETE actions are available per side inside the comparison, so the decision is made where it
+is being judged. `Esc` steps back out of flicker, then closes; **CLOSE** leaves without
+changing anything.
+
+![DIFF compare — two versions of the same path side by side](../screenshots/diff_compare.png)
 
 When one side holds the same content under several names, that side is narrowed down first:
-**DELETE ALL** drops every copy (after confirming) and **KEEP 1** asks which copy to keep and
-deletes the others. When the *other* side offers several names, **RENAME** asks which name to
-take. After every action the board re-compares the two repos, so the row's buttons always
-reflect the current state.
+**DEL ALL L** / **DEL ALL R** drops every copy on that side (after confirming) and
+**KEEP 1 L** / **KEEP 1 R** asks which copy to keep and deletes the others. When the *other*
+side offers several names, RENAME asks which name to take. After every action the board
+re-compares the two repos, so the row's commands always reflect the current state.
 
-Equal rows are hidden until **SHOW EQUAL** is pressed, and each action is applied to disk
+Equal rows are hidden until **SHOW UNCHANGED** is pressed, and each action is applied to disk
 and to both repo indexes immediately — there is no RUN button and no batch confirmation.
+**HIDE** parks a row you have decided to leave alone; it comes back on the next REVIEW.
 
-## Preview and run
+## Group sync
 
-- **PREVIEW** shows the first matching `from → to` transfers (up to a limit) and a total
-  count, without touching disk. PREVIEW and RUN are mutually exclusive — starting a run
-  clears the preview and vice versa.
+Keep a repository backed up to one or more others, without the manual "duplicate the repo,
+relocate the copy, rescan it" dance. Groups themselves (creating one, adding/removing sinks,
+setting each sink's mode) are managed on the [Repositories tab](repositories.md#sync-groups);
+this tab is where a group is actually *pushed*.
+
+![GROUP SYNC selected: TARGET hidden, SINKS shown](../screenshots/transfer_group_sync.png)
+
+Pick the group's main as **SOURCE** — its chip carries the **★ MAIN** badge — and the
+**GROUP SYNC** command appears. Selecting it replaces the single **TARGET** picker with a
+**SINKS** panel — every sink of that main's group, defaulting to all selected; **ALL**/**NONE**
+toggle the whole set, or click a sink to include or exclude it. Each sink chip is followed by
+its stored mode as **MODE: …** — **ADD ONLY** copies content it
+lacks and never deletes, so a sink may keep files the main no longer has; **MIRROR** also
+deletes sink content the main does not have, so it ends up holding exactly the main's
+content — those deletions cannot be undone.
+
+**REVIEW** and **RUN** work as they do for every other command: REVIEW plans every selected
+sink and shows what would be copied and deleted, without touching disk — each row naming the
+sink it belongs to. A group push is all-or-nothing, so these rows carry no per-row commands; RUN asks for
+confirmation — naming the sink count and, for a MIRROR push, any sink it would empty
+entirely — then pushes on a background thread. Sinks are handled independently, so one
+unreachable backup drive does not stop the others, and the main is never changed. The FILTER
+wizard applies here too, narrowing which files count for every selected sink.
+
+## Group sync back
+
+Sometimes the change is on a **sink** — you dropped new files straight onto a backup drive, or
+you deleted something from the main *by mistake* and a backup still has it. **GROUP SYNC BACK**
+pulls one sink back into its main. It appears next to GROUP SYNC when the SOURCE is a group's
+main; you pick **one sink** to reconcile.
+
+![GROUP SYNC BACK: a green new-file row and a blue resurrection row](../screenshots/group_sync_back.png)
+
+REVIEW sorts the sink's files against the main into two kinds:
+
+- **New** (green) — content the main never had. These are your direct edits. **RUN** promotes
+  them all into the main in one batch.
+- **Resurrection** (blue) — content the main once had and **deleted**, that the sink still
+  holds. These are **never** promoted by the batch — resurrecting a file undoes a deletion, and
+  only you know whether that deletion was a mistake or deliberate. Each blue row carries its own
+  **APPLY** to pull *just that file* back, so you recreate the ones you deleted by mistake and
+  leave the rest alone.
+
+Content already in the main is skipped, and a **RESURRECTIONS ONLY** toggle above the rows hides
+everything but the blue ones when you want to focus on what would come back. Nothing on the sink
+is ever changed. Note that a **MIRROR** sink deletes any direct edits on the next push, so run
+GROUP SYNC BACK *before* you push again.
+
+## Review and run
+
+- **REVIEW** shows the first matching transfers (up to a limit) and a total count, without
+  touching disk, on the shared [review board](index.md#the-review-board). Each side carries a
+  thumbnail (image, video still or audio fingerprint) and the file's size, dimensions or
+  duration, and date — the same info as a Duplicate card. Per row, **APPLY** runs just that
+  transfer now and **HIDE** drops it from the board and from what RUN will do. REVIEW and RUN
+  are mutually exclusive — starting a run clears the review and vice versa.
 - **RUN** starts the command on a background thread after a confirmation dialog. Live
   progress shows a spinner, the file currently being handled, the last few actions, and a
   running count. **CANCEL** stops the operation — files already transferred or deleted before

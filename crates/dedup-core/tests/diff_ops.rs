@@ -75,6 +75,20 @@ impl Sandbox {
         update_repo(&self.store, name, 1, &NoProgress, &CancellationToken::new())?;
         Ok(())
     }
+
+    /// A scan that is *allowed* to empty the index, for the cases that
+    /// deliberately remove every file from a repo.
+    fn update_emptying(&self, name: &str) -> TestResult {
+        dedup_core::update::update_repo_authorized(
+            &self.store,
+            name,
+            1,
+            &NoProgress,
+            &CancellationToken::new(),
+            true,
+        )?;
+        Ok(())
+    }
 }
 
 /// A handcrafted index entry for tests that need MIME types (real scans
@@ -160,7 +174,8 @@ fn sync_deletes_when_marked_missing_in_a_and_updates_index() -> TestResult {
     Sandbox::write(&sb.a_root, "somewhere.txt", b"xyz")?;
     sb.update("A")?;
     std::fs::remove_file(sb.a_root.join("somewhere.txt"))?;
-    sb.update("A")?;
+    // That was A's only file, so this scan empties A's index on purpose.
+    sb.update_emptying("A")?;
     // B still has that content at another path.
     Sandbox::write(&sb.b_root, "del.txt", b"xyz")?;
     sb.update("B")?;

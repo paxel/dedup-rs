@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 dedup-core = { path = "../dedup-core" }
+redb = "2.1"
 eframe = "0.35"
 egui = "0.35"
 crossbeam-channel = "0.5"
@@ -17,7 +18,10 @@ rodio = { version = "0.20", default-features = false, features = ["symphonia-all
 image = "0.25"
 id3 = "1"
 egui_extras = "0.35"
+log = "0.4"
+tempfile = "3.10"
 
 [dev-dependencies]
 egui_kittest = { version = "0.35", features = ["wgpu", "snapshot"] }
-tempfile = "3.10"
+zip = "8.6"
+lopdf = "0.43"

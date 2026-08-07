@@ -17,9 +17,9 @@ cargo clippy -- -D warnings      # must be clean (zero warnings)
 
 Building `dedup-gui` on Linux needs ALSA headers (`libasound2-dev` on Debian/Ubuntu) because of `rodio`. Video fingerprinting requires `ffmpeg`/`ffprobe` at runtime (degrades gracefully without).
 
-GUI image-snapshot tests are `#[ignore]`d (renderer-specific baselines in `crates/dedup-gui/tests/snapshots/`). Run explicitly and regenerate after an intentional visual change with:
+GUI rendering is verified by `#[ignore]`d render tests that write a PNG for you to look at — `doc_screenshot_*` (into `docs/screenshots/`) and `render_*` (into `target/`). There is no pixel-diff baseline: it was renderer-specific, so it could only ever pass on the machine that generated it. Run them explicitly:
 ```bash
-UPDATE_SNAPSHOTS=1 cargo test -p dedup-gui dupes_view_snapshot -- --ignored
+cargo test -p dedup-gui doc_screenshot -- --ignored
 ```
 
 ## Architecture
@@ -38,7 +38,7 @@ A registry database maps repo names to paths; each repo has its own redb databas
 
 - The UI follows an LCARS design system: build sections/buttons with `lcars.rs` (`section_lcars`, stadium buttons) and the condensed font — don't hand-roll egui widgets.
 - Shared widgets are reused across tabs: repo selectors go through `repo_chip.rs`, filter editing through `filter_ui::FilterBuilder`. Don't build downgraded per-tab variants.
-- GUI tests live in inline `#[cfg(test)]` modules using `egui_kittest` harnesses (headless wgpu/lavapipe): geometric asserts on real layout, plus the ignored snapshot tests above.
+- GUI tests live in inline `#[cfg(test)]` modules using `egui_kittest` harnesses (headless wgpu/lavapipe): geometric asserts on real layout, plus the ignored render tests above. A label query passes even when the widget is clipped or off-screen — assert rects, and render anything whose layout matters.
 - Tooltip text is end-user product copy — never mention implementation details in it.
 
 ### Testing style
@@ -49,5 +49,19 @@ Prefer integration tests over manual binary runs: core behavior is verified in `
 
 - `unwrap()` / `expect()` are forbidden; handle fallible operations with `?`, `match`, or `if let`. `#[allow(...)]` is forbidden unless strictly necessary.
 - Prefer borrowing over cloning; `Arc<T>` for shared state.
-- Documentation upkeep is part of the same change, not a follow-up: `README.md` (features/usage), `CHANGELOG.md` (Keep a Changelog format, user-facing changes), `ai/rewrite.md` (phase status).
+- Documentation upkeep is part of the same change, not a follow-up: `README.md` (features/usage), `CHANGELOG.md` (Keep a Changelog format, user-facing changes), `ai/improvements.md` (phase status).
 - One focused change per pass; if a change's relation to the request is unclear, ask rather than assume.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as markdown files under `.scratch/<feature-slug>/` in this repo. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage roles, each label string equal to its name, recorded as a `Status:` line in each issue file. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context — `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.

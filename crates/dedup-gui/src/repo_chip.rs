@@ -1,8 +1,9 @@
 //! The shared repo chip: a per-repo identicon + name grouped in a bordered
 //! pill, accent-filled when selected. Every tab's repo selector renders repos
-//! with this one widget, so a repo looks and reads the same everywhere. The
-//! Duplicates tab passes a lock state, which adds a padlock as a third grouped
-//! item; every other tab shows just the identicon + name.
+//! with this one widget, so a repo looks and reads the same everywhere. A repo
+//! that is the main of a sync group carries a star badge; the Duplicates tab
+//! additionally passes a lock state, which adds a padlock as a further grouped
+//! item.
 
 use crate::icon;
 use crate::theme;
@@ -11,19 +12,45 @@ use egui::{Color32, Rect, RichText, Sense, Vec2};
 /// Point size of the square identicon glyph.
 const GLYPH: f32 = 18.0;
 
+/// The identicon's hue for `name`, in degrees. Derived only from the name, so
+/// it is the repo's stable identity and must never depend on the palette — a
+/// repo that changed colour when you switched appearance would defeat the point
+/// of a stable identicon.
+fn identicon_hue(name: &str) -> f32 {
+    (theme::name_hash(name) % 360) as f32
+}
+
+/// The identicon cell colour for `name` under the active palette. The hue is the
+/// stable identity; only lightness and saturation follow the appearance, so the
+/// cells hold contrast against the palette's tile without changing which repo
+/// the glyph reads as.
+fn identicon_cell(name: &str) -> Color32 {
+    let (sat, light) = if theme::is_dark() {
+        (0.55, 0.70)
+    } else {
+        (0.60, 0.42)
+    };
+    theme::hsl(identicon_hue(name), sat, light)
+}
+
 /// Paint a deterministic, left-right-symmetric 5×5 identicon for `name` into
-/// `rect`, in a stable name-hashed pastel color on a dark tile. The same name
-/// always yields the same glyph, so a repo keeps one visual identity across
-/// tabs; different names almost always differ (hash-derived).
+/// `rect`, in a stable name-hashed colour on a tile that follows the active
+/// palette. The same name always yields the same glyph and the same hue, so a
+/// repo keeps one visual identity across tabs and across appearances; different
+/// names almost always differ (hash-derived).
 pub fn identicon(painter: &egui::Painter, rect: Rect, name: &str) {
     // Square the rect from its center so the grid stays regular.
     let side = rect.width().min(rect.height());
     let tile = Rect::from_center_size(rect.center(), Vec2::splat(side));
-    // A dark tile makes the pastel cells legible on any chip fill.
-    painter.rect_filled(tile, 3.0, theme::BLACK);
+    // A neutral tile behind the cells keeps them legible on any chip fill
+    // (selected/accent or panel). It follows the palette — a dark box under
+    // dark, a light box under light — so the cells never sit on the wrong
+    // ground. `bg` is the app backdrop: black under dark (unchanged), light
+    // parchment under light.
+    painter.rect_filled(tile, 3.0, theme::bg());
 
     let hash = theme::name_hash(name);
-    let color = theme::hsl((hash % 360) as f32, 0.55, 0.70);
+    let color = identicon_cell(name);
     // Equal, integer-sized cells centered in the tile with a margin, so every
     // column is the same width and the grid is exactly left-right symmetric — and
     // no cell sits flush against the tile edge (which clipped the last column thin).
@@ -65,19 +92,24 @@ pub struct RepoChipResponse {
 
 /// Render a repo chip for `name`. When `selected`, the pill is filled with
 /// `accent` and black text; otherwise it's a dark panel with an `accent`
-/// outline and `accent` text. `lock: Some(read_only)` adds a padlock toggle as
-/// a third grouped item (Duplicates only).
+/// outline and `accent` text. `main` adds the sync-group main badge;
+/// `lock: Some(read_only)` adds a padlock toggle (Duplicates only).
+///
+/// `name` must be the repo's registry name and nothing else — the identicon is
+/// hashed from it, so decorating the string (a mode, a count) silently gives the
+/// same repo a different glyph here than on every other tab.
 pub fn repo_chip(
     ui: &mut egui::Ui,
     name: &str,
     selected: bool,
     accent: Color32,
+    main: bool,
     lock: Option<bool>,
 ) -> RepoChipResponse {
     let (fill, fg) = if selected {
-        (accent, theme::BLACK)
+        (accent, theme::black())
     } else {
-        (theme::PANEL, accent)
+        (theme::panel(), accent)
     };
     let mut lock_resp = None;
     let inner = egui::Frame::new()
@@ -110,6 +142,9 @@ pub fn repo_chip(
                 resp.widget_info(|| {
                     egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, name)
                 });
+                if main {
+                    main_badge(ui);
+                }
                 if let Some(read_only) = lock {
                     lock_resp = Some(lock_button(ui, read_only));
                 }
@@ -151,7 +186,7 @@ pub fn chip_row(
             .layout_no_wrap(
                 label.to_owned(),
                 egui::FontId::proportional(12.0),
-                theme::TEXT,
+                theme::text(),
             )
             .size()
             .x
@@ -177,7 +212,7 @@ pub fn chip_row(
         for (r, row) in rows.iter().enumerate() {
             ui.horizontal_top(|ui| {
                 if r == 0 && !label.is_empty() {
-                    ui.label(RichText::new(label).color(theme::TEXT).size(12.0));
+                    ui.label(RichText::new(label).color(theme::text()).size(12.0));
                 }
                 for &i in row {
                     let resp = chip(ui, i);
@@ -203,9 +238,36 @@ pub fn chip_row(
 pub fn small_button(ui: &mut egui::Ui, label: &str, accent: Color32) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(label).color(accent).size(11.0))
-            .fill(theme::PANEL)
+            .fill(theme::panel())
             .stroke(egui::Stroke::new(1.0, accent)),
     )
+}
+
+/// The "this repo is the main of a sync group" badge: a star on a filled amber
+/// tile. Not interactive — it reports state, it does not change it.
+///
+/// Colored independently of the chip accent (like the padlock) so a main always
+/// reads the same whether or not the chip is selected. The vendored Phosphor
+/// subset carries a single star codepoint, so filled-vs-outline is not available
+/// to separate this from the MAKE MAIN *action* button; the filled tile behind
+/// the glyph is what distinguishes them.
+///
+/// Announced as "MAIN" rather than as the raw glyph, so tests and screen readers
+/// get a word.
+fn main_badge(ui: &mut egui::Ui) -> egui::Response {
+    let pad = Vec2::new(5.0, 2.0);
+    let galley = ui.painter().layout_no_wrap(
+        icon::STAR.to_owned(),
+        egui::FontId::proportional(13.0),
+        theme::black(),
+    );
+    let (rect, resp) = ui.allocate_exact_size(galley.size() + pad * 2.0, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        ui.painter().rect_filled(rect, 4.0, theme::amber());
+        ui.painter().galley(rect.min + pad, galley, theme::black());
+    }
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "MAIN"));
+    resp
 }
 
 /// The padlock toggle inside a Duplicates chip. Closed blue padlock = read-only
@@ -213,9 +275,9 @@ pub fn small_button(ui: &mut egui::Ui, label: &str, accent: Color32) -> egui::Re
 /// accent so "locked" always reads the same.
 fn lock_button(ui: &mut egui::Ui, read_only: bool) -> egui::Response {
     let (glyph, fill, text) = if read_only {
-        (icon::LOCK, theme::BLUE, theme::BLACK)
+        (icon::LOCK, theme::blue(), theme::black())
     } else {
-        (icon::LOCK_OPEN, theme::PANEL, theme::BLUE)
+        (icon::LOCK_OPEN, theme::panel(), theme::blue())
     };
     ui.add(egui::Button::new(RichText::new(glyph).color(text)).fill(fill))
 }
@@ -246,6 +308,41 @@ mod tests {
         }
     }
 
+    /// A repo's hue is its identity: the same name yields the same hue under
+    /// both palettes, so switching appearance never makes a repo unrecognisable.
+    #[test]
+    fn identicon_hue_is_stable_across_palettes() {
+        for name in ["Photos", "Videos", "Archive", "data"] {
+            theme::install(theme::DARK);
+            let dark = identicon_hue(name);
+            theme::install(theme::LIGHT);
+            let light = identicon_hue(name);
+            assert_eq!(dark, light, "{name}: hue changed with the appearance");
+        }
+        theme::install(theme::DARK);
+    }
+
+    /// The actual defect: cells must stay legible on the tile in *both*
+    /// palettes, not just glow on black. Assert contrast rather than eyeball it.
+    #[test]
+    fn identicon_cells_contrast_with_the_tile_in_both_palettes() {
+        // A modest floor — the cells need only be discernible boxes on the tile,
+        // not body-text legible. The dark defect was fine; the light one wasn't.
+        const MIN: f32 = 1.6;
+        for (label, palette) in [("dark", theme::DARK), ("light", theme::LIGHT)] {
+            theme::install(palette);
+            let tile = theme::bg();
+            for name in ["Photos", "Videos", "Archive", "Automatic Upload", "data"] {
+                let ratio = theme::contrast_ratio(identicon_cell(name), tile);
+                assert!(
+                    ratio >= MIN,
+                    "{label}: {name} cells vs tile contrast {ratio:.2} < {MIN}"
+                );
+            }
+        }
+        theme::install(theme::DARK);
+    }
+
     /// The chip renders the name and reports a click on it; with `lock` set it
     /// also exposes a padlock response.
     #[test]
@@ -257,10 +354,10 @@ mod tests {
                 move |ui, clicked: &mut bool| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
-                    let r = repo_chip(ui, "Photos", true, theme::ORANGE, Some(true));
+                    let r = repo_chip(ui, "Photos", true, theme::orange(), false, Some(true));
                     if r.name.clicked() {
                         *clicked = true;
                     }
@@ -287,13 +384,87 @@ mod tests {
             .build_ui(move |ui| {
                 if !init {
                     crate::icon::install(ui.ctx());
-                    crate::theme::apply(ui.ctx());
+                    crate::theme::apply(ui.ctx(), crate::theme::DARK);
                     init = true;
                 }
-                let r = repo_chip(ui, "Videos", false, theme::BLUE, None);
+                let r = repo_chip(ui, "Videos", false, theme::blue(), false, None);
                 assert!(r.lock.is_none(), "no lock response when lock is None");
             });
         harness.run();
         assert!(harness.query_by_label("Videos").is_some());
+        assert!(
+            harness.query_by_label("MAIN").is_none(),
+            "an ordinary repo carries no main badge"
+        );
+    }
+
+    /// A sync-group main is badged, and the badge sits inside the chip frame
+    /// rather than spilling past it — a geometric check, because a label query
+    /// alone passes even when the glyph is painted outside its parent.
+    #[test]
+    fn main_chip_shows_a_badge_inside_the_frame() {
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(300.0, 80.0))
+            .build_ui(move |ui| {
+                if !init {
+                    crate::icon::install(ui.ctx());
+                    crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                    init = true;
+                }
+                let r = repo_chip(ui, "Photos", false, theme::orange(), true, None);
+                let outer = r.outer.rect;
+                ui.ctx()
+                    .memory_mut(|m| m.data.insert_temp("outer".into(), outer));
+            });
+        harness.run();
+
+        let badge = harness.get_by_label("MAIN").rect();
+        let outer: egui::Rect = harness
+            .ctx
+            .memory(|m| m.data.get_temp("outer".into()))
+            .expect("chip frame rect recorded");
+        assert!(
+            outer.contains_rect(badge),
+            "badge {badge:?} must sit inside the chip frame {outer:?}"
+        );
+        assert!(
+            harness.query_by_label("Photos").is_some(),
+            "the name still renders alongside the badge"
+        );
+    }
+
+    /// The badge widens the chip instead of overlapping the name — `chip_row`
+    /// packs rows from the measured frame width, so a badge that did not claim
+    /// space would make chips overlap when a row wraps.
+    #[test]
+    fn main_badge_widens_the_chip() {
+        fn width(main: bool) -> f32 {
+            let mut init = false;
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(300.0, 80.0))
+                .build_ui_state(
+                    move |ui, w: &mut f32| {
+                        if !init {
+                            crate::icon::install(ui.ctx());
+                            crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                            init = true;
+                        }
+                        *w = repo_chip(ui, "Photos", false, theme::orange(), main, None)
+                            .outer
+                            .rect
+                            .width();
+                    },
+                    0.0,
+                );
+            harness.run();
+            *harness.state()
+        }
+        let plain = width(false);
+        let badged = width(true);
+        assert!(
+            badged > plain + 8.0,
+            "badged chip ({badged}) must claim more width than plain ({plain})"
+        );
     }
 }

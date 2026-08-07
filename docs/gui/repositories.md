@@ -57,6 +57,36 @@ A repository mid-scan or mid-check shows a spinner, live progress (a bar with pe
 for hashing, a file/dir count while scanning), and a CANCEL button — cancelling a scan keeps
 whatever was already hashed committed to the index.
 
+## Sync groups
+
+![A sync group framed by its section, beside an ungrouped repository](../screenshots/repo_group_section.png)
+
+A **sync group** links one **main** repository to one or more **backup** repositories
+(**sinks**). Groups are managed right here on the repo cards; pushing one is done from the
+[Files tab](files.md#group-sync)'s **GROUP SYNC** command, offered whenever the selected
+source is a group's main:
+
+- **MAKE MAIN** (on an ungrouped repo) — turn the repository into the main of a new group.
+- **SINK INTO ▾** (on an ungrouped repo, when a group exists) — add it to an existing group
+  as a backup.
+- A group is framed by its own **LCARS section**, titled with the group name: the main's card
+  and every sink's card sit inside one rail, so a group reads as a single block and an
+  ungrouped repository as a bare card. Groups start **folded** — the list stays about your
+  originals — and clicking the section header opens one.
+- The main carries a **★ MAIN** badge. The same badge appears on the repo chip wherever the
+  repository is named — Files, Grooming, Duplicates, Browse and the lightbox — so an original
+  is never mistaken for a backup.
+- A main's card gains a **group controls** row:
+  - **ADD REPO** — add a *new* backup that starts as a clone of the main's index, pointed at
+    a folder you choose (the main is left unchanged).
+  - **UPDATE ALL** — queue an UPDATE / SCAN for the main and every backup in the group.
+  - **UNGROUP** — disband the group; every repository stays, just unlinked.
+- Sinks are shown inside their group's section rather than as top-level repositories, and are
+  managed there like any other repository. Each sink card carries its own **mode pill** —
+  `ADD ONLY` copies what that backup lacks; `MIRROR` also deletes from it what the main no
+  longer has (click to flip) — and **SINK OUT** to take it back out of the group. A group can
+  mirror some backups and only-add to others.
+
 ## Add Repository dialog
 
 - **FOLDER** — type a path, or **CHOOSE…** to open a native folder picker.

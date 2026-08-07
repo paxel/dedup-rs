@@ -3,8 +3,8 @@
 //! pairings.
 
 use dedup_core::diff::{
-    DiffOpError, DiffPairing, DiffRelation, RepoDiffRow, copy_file_between, delete_file,
-    overwrite_file, plan_repo_diff, rename_file,
+    DiffOpError, DiffPairing, DiffRelation, PullKind, RepoDiffRow, copy_file_between, delete_file,
+    overwrite_file, plan_repo_diff, plan_sync_back, rename_file,
 };
 use dedup_core::store::Store;
 use dedup_core::update::{CancellationToken, NoProgress, update_repo};
@@ -204,6 +204,50 @@ fn deleted_files_drop_out_of_the_diff() -> TestResult {
 }
 
 #[test]
+fn plan_sync_back_separates_new_from_resurrection() -> TestResult {
+    // LEFT is the sink, RIGHT is the main.
+    let sb = Sandbox::new()?;
+    // A file both hold; a file the main once had and will delete (its content
+    // lingers on the sink); a file only the sink has.
+    Sandbox::write(&sb.right, "shared.txt", b"shared")?;
+    Sandbox::write(&sb.right, "deleted-in-main.txt", b"deleted-content")?;
+    Sandbox::write(&sb.left, "shared.txt", b"shared")?;
+    Sandbox::write(&sb.left, "deleted-in-main.txt", b"deleted-content")?;
+    Sandbox::write(&sb.left, "new-on-sink.txt", b"brand-new")?;
+    sb.update_both()?;
+    // The main deletes its copy and rescans → a tombstone for that content,
+    // which the sink still holds.
+    std::fs::remove_file(sb.right.join("deleted-in-main.txt"))?;
+    update_repo(
+        &sb.store,
+        "RIGHT",
+        1,
+        &NoProgress,
+        &CancellationToken::new(),
+    )?;
+
+    let plan = plan_sync_back(&sb.store, "LEFT", "RIGHT", None)?;
+    let by_path: std::collections::HashMap<&str, PullKind> =
+        plan.iter().map(|i| (i.rel_path.as_str(), i.kind)).collect();
+
+    assert_eq!(
+        by_path.get("new-on-sink.txt"),
+        Some(&PullKind::New),
+        "content the main never saw is New (promote)"
+    );
+    assert_eq!(
+        by_path.get("deleted-in-main.txt"),
+        Some(&PullKind::Resurrection),
+        "content the main deleted but the sink still holds is a Resurrection"
+    );
+    assert!(
+        !by_path.contains_key("shared.txt"),
+        "content the main already has is omitted — nothing to pull"
+    );
+    Ok(())
+}
+
+#[test]
 fn two_empty_repos_diff_to_nothing() -> TestResult {
     let sb = Sandbox::new()?;
     sb.update_both()?;
@@ -251,6 +295,37 @@ fn rename_moves_the_file_and_its_index_entry() -> TestResult {
     // A follow-up scan finds nothing to do: index and disk agree.
     let stats = update_repo(&sb.store, "LEFT", 1, &NoProgress, &CancellationToken::new())?;
     assert_eq!((stats.unchanged, stats.added, stats.updated), (1, 0, 0));
+    Ok(())
+}
+
+/// A rename must leave the content indexed under exactly one path — never both.
+/// If the insert-new and drop-old writes were separate transactions, a crash
+/// between them would list the same (size, hash) twice: a phantom duplicate and
+/// inflated counts. Here we assert the post-condition the single transaction
+/// guarantees.
+#[test]
+fn rename_leaves_the_content_under_one_path_only() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.left, "old.txt", b"content")?;
+    sb.update_both()?;
+    let before = sb.store.get_repo_stats("LEFT")?;
+
+    rename_file(&sb.store, "LEFT", "old.txt", "new.txt")?;
+
+    let after = sb.store.get_repo_stats("LEFT")?;
+    assert_eq!(
+        (after.file_count, after.total_size),
+        (before.file_count, before.total_size),
+        "a rename changes neither the file count nor the total size"
+    );
+    assert_eq!(after.file_count, 1, "still exactly one file");
+    // The content-hash index lists the new path and only the new path, so the
+    // single copy is never reported as a duplicate group.
+    assert!(
+        sb.store.get_duplicate_groups("LEFT")?.is_empty(),
+        "one path per content: no phantom duplicate group"
+    );
+    assert_eq!(live_paths(&sb.store, "LEFT")?, ["new.txt"]);
     Ok(())
 }
 
@@ -331,6 +406,24 @@ fn copy_refuses_an_occupied_path_but_overwrite_replaces_it() -> TestResult {
     let rows = sb.diff(DiffPairing::ByPath)?;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].relation, DiffRelation::Equal);
+    Ok(())
+}
+
+/// An overwrite whose source and destination are the same file must not touch
+/// it: `fs::copy` onto oneself truncates the file it is about to read. Nothing
+/// in the GUI can ask for this, but the API must survive a caller that does.
+#[test]
+fn overwrite_onto_the_same_file_leaves_it_intact() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.left, "notes.txt", b"irreplaceable")?;
+    sb.update_both()?;
+
+    overwrite_file(&sb.store, "LEFT", "notes.txt", "LEFT", "notes.txt")?;
+    assert_eq!(std::fs::read(sb.left.join("notes.txt"))?, b"irreplaceable");
+
+    // A same-name rename is equally a no-op — the entry must survive it.
+    rename_file(&sb.store, "LEFT", "notes.txt", "notes.txt")?;
+    assert_eq!(live_paths(&sb.store, "LEFT")?, ["notes.txt"]);
     Ok(())
 }
 

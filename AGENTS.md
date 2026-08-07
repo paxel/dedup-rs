@@ -44,7 +44,7 @@ cargo clippy -- -D warnings  # Linting check
 Update these as part of the same change, not as a follow-up:
 - **`README.md`**: Outlines features, workspace layout, and running instructions.
 - **`CHANGELOG.md`**: Every user-facing change under Keep a Changelog format.
-- **`ai/rewrite.md`**: Check off/update task status when completing rewrite phases.
+- **`ai/improvements.md`**: Check off/update task status when completing roadmap phases.
 
 ## Working Agreements
 - Do not "fix everything" in one pass—one focused change, tested, matching the current layout.

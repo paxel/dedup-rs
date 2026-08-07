@@ -2,48 +2,174 @@
 
 All notable changes to the `dedup-rs` project will be documented in this file.
 
-## [0.1.0] - 2026-07-19
+## [0.1.0]
 
 ### Added
-- Sync groups: a new **Sync Groups** tab keeps one repository backed up to one or more others, replacing the manual duplicate → relocate → rescan dance. A group is a **main** repo plus the **sinks** it is pushed to, with the mode set per group: `ADD ONLY` copies what a sink lacks and never deletes, `MIRROR` also removes sink content the main no longer has so the sink ends up holding exactly the main's content. Membership is editable — add a sink, take one out, or promote a sink to main (the old main stays as a sink) — a repository belongs to at most one group, and while it is in one it cannot be renamed or removed out from under the group. PREVIEW plans every sink and shows the copies and deletions in the shared review board without touching disk; RUN SYNC confirms first (spelling out what MIRROR deletes) and then pushes on a background thread, handling each sink independently so one unplugged backup drive doesn't stop the others. The main is never changed by a push; to bring a change made inside a sink back, point the Transfer tab's DIFF command at the sink and the main.
-- Repository diff: the Transfer tab's new **DIFF** command compares two repositories side by side and leaves every decision to you — the opposite of the batch commands next to it. Pair the two repos **BY HASH** (content identity, so the same file under two names is one row) or **BY PATH** (same name, so an edited file shows up as a conflict), then settle each row with its own buttons: copy the file to the other repo, delete it, rename one side to the other's name, or overwrite one side's version with the other's. A side holding several copies of the same content is narrowed down first with DELETE ALL or KEEP 1 (which asks which copy survives), and a rename with several candidate names asks which to take. A conflicting row can also be opened as a full-window **COMPARE** of the two versions — a preview of each (image, or a still for video) with its repo, size, date and type, the larger size and newer date highlighted, and the same per-side actions right there. Each side shows path, size and modification date in sortable columns, equal rows are hidden until asked for, and the comparison re-runs after every action so the buttons always match the current state. Nothing is batched: there is no RUN, only the row you click.
-- Tooltip verbosity setting: the Settings dialog gets a SHORT/VERBOSE toggle controlling how much detail hover tooltips show throughout the app (SHORT is the terse one-liner default; VERBOSE expands every tooltip into a fuller explanation of what the control does and when to use it). Persists across launches alongside the hashing thread count. Every button, slider, and field across all three tabs — including the lightbox and its A/B compare controls — now has a tooltip.
-- CLI and GUI documentation: [`docs/cli.md`](docs/cli.md) walks through every CLI command in depth (multi-ref diff semantics, the full filter syntax, every command end to end); [`docs/gui/`](docs/gui/index.md) does the same per GUI tab (Repositories, Duplicates, Files, Sync Groups) with screenshots of each. Linked from the README.
-- Image lightbox in the Duplicate Management tab: click a duplicate's thumbnail to open a full-window viewer — mouse-wheel zooms around the cursor, drag pans, `F` fits / `1` shows true pixels, `←`/`→` step through the group's copies (so flipping between two is a quick compare), and `Del`/`K` marks the shown file for deletion (respecting read-only). Full-resolution decoding runs off the UI thread with an aggressively-capped texture cache, so even very large photos never freeze the interface; the thumbnail is shown upscaled until the full image lands.
-- Timeline organization: `dedup timeline <repos…>` buckets files by year/month of their best-known date (EXIF capture time, falling back to file mtime — so it works even without EXIF), and `dedup timeline <repos…> --export <dir>` copies them into a dated `<year>/<month>/` tree (copy only, never move; name collisions get a numeric suffix, destinations that already hold the same content are skipped so re-running an export is idempotent, existing files are never overwritten, and each copy keeps the source file's date so it agrees with the folder it lands in). New `date:`/`before:`/`after:` filters (`YYYY[-MM[-DD]]`) select by that best-known date and compose with the existing mime/name/size filters.
-- Triage report: `dedup report <repos…> | --all` prints a Markdown audit trail per repo — file and byte counts, exact-duplicate groups and reclaimable bytes, flagged critical-file counts by category, and the top MIME types — so a caretaker can see at a glance what was reduced, what remains, and what needs review. Read-only.
-- Important-file scanner: `dedup scan <repos…> | --all` flags likely-critical files so they're reviewed before disks are wiped — crypto wallets (`wallet.dat` + Berkeley DB magic, Ethereum keystore and Electrum JSON, `*.wallet`, BIP-39 seed phrases in small text files), key material (SSH/PGP private keys, `.pem`/`.p12`/`.gpg`/`.ssh`/`.gnupg`), password vaults (KeePass `.kdbx`, 1Password), and identity/financial documents (a multilingual filename keyword list including German Testament/Vollmacht/Steuer/Versicherung/Kontoauszug). Each flag states its reason and everything is advisory — the scan is read-only and never touches the files. Tuned for precision so photo libraries stay quiet: media files are never content-probed, Apple Keynote `.key` presentations don't count as key material, and `.asc` only flags when it actually contains an armored private key.
-- Stronger video similarity: the per-frame video temporal hash grew from a 64-bit dHash to the same 512-bit moment-canonicalized hash used for images (three frames → 1536 bits), fixing the degenerate collisions the old hash had on smooth or dark frames and fades. Existing video entries re-scan once (this re-extracts frames, so it needs ffmpeg); videos keep grouping by temporal similarity, just more accurately.
-- Email grouping (`.eml`): individual email files are now deduplicated by their `Message-ID` (falling back to a normalized subject + body digest when absent), so the same message exported twice — the paper trail inheritance triage is often looking for — groups together. mbox stores and PST are not handled yet.
-- Archive coverage: `dedup archive index <repo>` indexes each zip/tar/tar.gz's members by content identity, and `dedup archive coverage <repo> [--ref <repo>…]` reports what fraction of every archive already exists as loose content — so a `backup_2019.zip` that holds nothing you don't already have is flagged fully redundant and safe to delete. Report-only (nothing is extracted or removed); nested archives are treated as opaque members; encrypted or unreadable archives are skipped.
-- Plain-text and CSV grouping: `text/*` files (including CSV) get a normalized text hash that ignores byte-order marks, CRLF-vs-LF line endings, and trailing whitespace, so the same export or log duplicated across backups with encoding drift groups together; a genuine one-row/one-line change still separates them. Files above 32 MB skip text normalization to bound cost — their identity is already covered by the exact content hash. (Near-duplicate text matching is future work.)
-- Office-document text grouping: `.docx`/`.xlsx`/`.pptx`, OpenDocument `.odt`/`.ods`/`.odp`, and legacy `.xls` now get a normalized text hash, so the same thesis saved as `report.docx`, `report.odt`, and inside three backups groups together in similarity search exactly like PDFs already do — text identity, regardless of container (a matching PDF joins the group too). Existing document entries re-scan once to backfill; encrypted or legacy `.doc`/`.ppt` files are skipped.
-- EXIF metadata for images: scanning now reads each image's capture date and camera from its EXIF and stores them on the index entry. Because backups routinely clobber file mtimes, the real capture date is a far better signal — among pixel-identical copies the one that still carries EXIF (and the earliest capture time) is now ranked the best copy, so a metadata-stripped re-save no longer wins over the original. Existing image entries are re-scanned once to backfill EXIF; non-images are untouched.
-- File provenance: files copied or synced into a repo now record which repo they came from (a new `origin` on each index entry). It shows on duplicate cards as "from <repo>" and is filterable with `origin:<substring>`, so months later you can answer "which disk did this file come from?". Existing indexes upgrade transparently — old entries read back with no origin and are not re-scanned.
-- Multi-reference diff: `diff print`/`cp`/`mv`/`rm` now compare a source against the union of several reference repos via a repeatable `--ref <repo>` flag (the positional reference remains as sugar and is the copy-back target). A file is treated as "new" only when none of the references already has its content, which is what makes disk-triage correct — "unique" must mean unique against the sanitized dir *and* every already-processed disk, not just one. The GUI's File Management tab gains an "ALSO REF" row to pick extra reference repos beyond the target. (`diff sync` remains single-target.)
-- Video preview in the Duplicate Management tab: video duplicate cards now show a real still frame instead of a generic icon, and clicking one opens the lightbox as a scrubbable filmstrip — a strip of ten evenly-spaced stills with the frame under the cursor shown enlarged, so you can identify a clip and gauge its quality without full playback. Frames are extracted with ffmpeg on demand and cached; without ffmpeg the card and strip fall back to the placeholder. (Full playback remains the "open externally" path.)
-- Audio preview in the Duplicate Management tab: audio duplicate cards get a PLAY/PAUSE button, an elapsed/total readout, and a seek bar, so you can confirm two "similar" tracks are the same recording (and which sounds better) without opening an external player. One file plays at a time, playback survives scrolling, and switching tabs stops it. Building the GUI now links ALSA on Linux (see the README for the `libasound2-dev` prerequisite); with no audio device the controls still render and playback is simply a no-op.
-- A/B compare in the lightbox (`C`): pit the shown image against the group's best copy with a shared, resolution-independent zoom/pan — side by side, or in FLICKER mode where `space` swaps the two in place (the fastest way to spot compression artifacts). A metadata strip shows both files' size and dimensions with the larger value highlighted, and either side can be marked for deletion.
-- Concurrent repository access: scans, duplicate searches, file operations, and the views can use the same repository's index at the same time — a running scan no longer locks the rest of the app out of that repo. Deleting, renaming, or duplicating a repository while it is in use (e.g. mid-scan) is refused with a clear "repository is in use" error instead of failing unpredictably — and those operations never stall access to *other* repositories while they run.
-- File-card context menus in the Duplicate Management tab: right-clicking anywhere on a file card offers OPEN (hand the file to the system's default application, via the `open` crate) and SHOW IN FOLDER (open the file's directory in the file manager) — a full-fidelity escape hatch for inspecting any file before deciding what to delete. Card text is no longer mouse-selectable, since selectable labels would swallow the right-click; the read-only badge keeps its own unlock menu.
-- Assisted filter builder in the File Management tab: the section shows just `FILTER +`; pressing `+` offers the MIME / NAME / SIZE condition types and each added condition becomes a removable pill with an inline value editor. The editor helps with data: MIME values get clickable suggestions from the source repo's actual MIME types (with counts, narrowed as you type), NAME values show a live debounced count of matching files, and every kind offers the recently used values as one-click quick-picks. Entered values are remembered across sessions (`filter_history.json` in the config dir), whole condition sets can be saved as named presets and re-applied with one click, and the history + presets can be exported to / imported from a JSON file.
-- `diff` filters combine multiple fields: `-f/--filter` accepts any of `mime:`, `name:`, and `size:` together (space-separated), combined with AND; the GUI's filter builder maps to these same three fields (editing a condition clears the stale preview). `name:`/`mime:` substring values are taken verbatim, so internal or repeated spaces are preserved rather than collapsed.
-- The GUI's File Management tab is organised into labelled sections (repos, command, target subdir, filter, action) for a clear layout.
-- File Management operations keep both repo indexes in sync as they run: COPY/MOVE (and `diff cp`/`mv`/`sync`) carry each file's date over to the copy — a photo from 2004 stays dated 2004 in the target, so the date filters, timeline buckets and best-copy ranking keep working — and record the transferred file in the target repo index (with that same mtime, so a later scan sees it as unchanged) and MOVE/DELETE mark the source entries missing, flushed in periodic batches (plus a final flush on cancel/error) so the indexes always match what is on disk. The tab shows live progress — a spinner, the file being handled right now, the last actions, and a running count — mirroring the repo scan progress, and PREVIEW and RUN are mutually exclusive (starting a run clears the preview and vice versa).
-- Phase 0 Skeleton: Created Cargo workspace with crates `dedup-core`, `dedup-cli`, and `dedup-gui`.
-- Integrated `clap` for version reporting and basic command line arguments.
-- Copied `rewrite.md` planning document into `ai/rewrite.md`.
-- Added [README.md](README.md) and [AGENTS.md](AGENTS.md) matching Sanshain standards.
-- Phase 1 Store + registry: `redb`-backed store with per-repo index databases and repo CLI commands `create`, `ls`, `rm`, `mv`, `rel`.
-- Phase 2 Scan & update: `dedup repo update <name>... | --all` walks repository directories, hashes new/changed files with BLAKE3 (parallel via `rayon`, `-t/--threads`), batches index writes (~1000 entries per transaction), and marks vanished files missing. Terminal progress via `indicatif`; Ctrl-C cancels cleanly mid-hash.
-- CLI integration test suites for all repo commands and update (`assert_cmd` against an isolated HOME), plus core integration tests covering the Phase 2 acceptance criteria (lifecycle, zero re-hashing on unchanged trees, cancellation, unreadable files).
-- Phase 3 Dupes & diff (headless): `dedup repo dupes <name>... | --all [--delete]` finds exact duplicate groups within and across repos (sorted: image area desc, size desc, oldest first; groups by wasted bytes desc; `--delete` keeps the best copy and marks the rest missing in one transaction per repo). `dedup diff print|cp|mv|rm|sync <source> <reference/target>` compares repos by content (size + BLAKE3), with `-f mime:|name:|size:` filters; `mv` marks moved source entries missing, `sync` copies new content without overwriting occupied paths and can delete content the source marks missing (`--delete-missing`, `--mirror`). Test scenarios ported from the legacy `DiffProcessSyncTest`, `DiffProcessMoveTest`, and `DuplicateRepoProcessTest`.
-- GUI repository cards: each repo now sits in a bordered card and shows more at a glance — the last-scan date, tooltips explaining every stat and button, and a MIME-type breakdown pinned to the top-right as the top 5 share-sorted tags, each in a stable pastel color hashed from the MIME name (e.g. `image/jpeg 62%`). Small shares render as `0.10%` / `<0.01%` rather than a misleading `0%`. Scans now record their completion time (new `last_scan_ms` in repo stats, exposed via `Store::get_mime_stats` and `RepoStats`).
-- GUI icons: bundled the Phosphor icon font (MIT, vendored) and use it for buttons and labels throughout, so glyphs render reliably instead of showing as boxes (the previous folder/plus emoji did not exist in egui's default fonts).
-- GUI add-repository flow: "Add repository" is now a modal with a native folder chooser (`rfd`, via the desktop portal — no GTK build dependency). The repo name defaults to the chosen folder's own name when left blank; if the resulting name clashes with an existing repository the name field turns red and Add is disabled. Add is also disabled while a scan is running (the registry is locked during updates).
-- Phase 7 File ops + polish: the GUI's File Management tab lets you pick a source repo and a target repo, choose COPY / MOVE / DELETE, narrow with a mime/name/size filter, preview the first matches as `from → to`, and run the operation on a background thread behind a confirmation modal with cancel (built on the core `diff_copy` / `diff_delete` ops — content compared by size + hash). Added a top-level `--ui-scale <0.5–3.0>` flag that scales the desktop UI. A `.cargo/audit.toml` documents and accepts the unfixable transitive advisories from the eframe→winit→Wayland build stack so `cargo audit` passes. (Similarity search with a threshold slider was already delivered in the Duplicate Management tab.)
-- Phase 6 Duplicate review UI: the GUI's Duplicate Management tab lets you toggle which repos to search (with a read-only flag whose files are never selected for deletion), pick exact duplicates or perceptual similars (threshold slider), and review results in paged groups (50 per page) of file cards showing a thumbnail, path, repo, size, dimensions, mtime, and a KEEP/DELETE toggle with the best copy starred. Thumbnails are cached on disk at `~/.cache/dedup/thumbs/<hash>.jpg` (≤512 px, keyed by content hash; `dedup-core::thumbnail`) and decoded by a background pool into an LRU of ≤200 GPU textures. Deletions batch `missing=true` updates per repo into a single transaction (`dupes::delete_files`) and always require a confirmation; "Auto-resolve rest" preselects every non-best copy in a deletable repo. (Keyboard navigation and the similar-search filter modal are deferred to a later polish pass.)
-- Repository copy (`repo cp`): `dedup repo cp <source> <dest> <path>` duplicates a repository's index into a new repo at a new path, keeping every entry; the source is unchanged (ported from the legacy `CopyRepoProcess`). Exposed in core (`Store::duplicate_repo`), the CLI, and the GUI's DUPLICATE control.
-- Phase 5 GUI shell (eframe): `dedup` with no arguments opens an LCARS-themed desktop window (`eframe`/`egui` 0.35). A top tab bar (Repository / Duplicate / File management) with a settings cog frames the app; the Repository Management tab is fully implemented — an overview list of repos with cached stats and add / delete / rename / relocate / duplicate / update-scan controls. Updates run on a background thread; progress flows over a `crossbeam_channel` that the UI drains once per frame, coalescing to the latest event per repo (no per-event repaint; `request_repaint_after(100ms)` while active), with a per-repo cancel button. Duplicate and File tabs are placeholders for Phases 6–7. Worker coalescing/cancellation is unit-tested; the window launch is smoke-verified.
-- Phase 4 Fingerprints & similarity: `update` now detects MIME (`infer` magic bytes, `mime_guess` fallback) and computes perceptual fingerprints per file — 64-bit image dHash with dimensions (rotation/mirror invariant via dihedral canonicalization), 192-bit video temporal hash (three frames via `ffmpeg`/`ffprobe`, degrading gracefully when absent), PDF normalized-text BLAKE3 (`lopdf`), and audio duration (`symphonia`) plus a BLAKE3 chunk hash. `dedup repo dupes --threshold <1-100>` switches to similarity search: images/video group by Hamming similarity (`(1 - dist/bits) * 100 >= threshold`, images LSH-banded for near-linear grouping), PDFs by exact text hash, audio by chunk hash within a 2 s duration tolerance. Unit tests cover dHash invariance and the grouping math; integration tests cover the image and (ffmpeg-gated) video pipelines; a criterion bench groups 50k random fingerprints in ~80 ms.
 
+- CLI (`dedup <command>`) and LCARS desktop app (`dedup` with no arguments).
+- **Repositories** tab: create, rename, relocate, duplicate, remove and scan repositories, with per-repo stats and MIME breakdown.
+- **Duplicates** tab: find exact or perceptually-similar duplicates across selected repos, review as file cards with a best-copy pick, and delete the rest; image/video/audio previews and a zoom/pan lightbox with A/B compare.
+- **Transfer** tab: copy, move or sync files between repos or into a dated folder, filtered by MIME/name/size; **GROUP SYNC** pushes a backup group's main to some or all of its sinks (each in its own ADD ONLY/MIRROR mode) when the source is a group's main; plus **DIFF**, a per-row side-by-side reconcile of two repositories.
+- **Grooming** tab: dedupe against other repos, purge by filter, remove empty directories, reorganize by path templates, and prune missing records.
+- **Browse** tab: directory-based index browser for one repo with tag annotations.
+- `dedup repo <create|ls|rm|mv|rel|cp|update|dupes>`: manage repositories and run scans; `dupes` finds exact or `--threshold` perceptual duplicates.
+- `dedup diff <print|cp|mv|rm|sync>`: compare a source repo against one or more reference repos by content and apply the differences.
+- `dedup timeline <repos…> [--export <dir>]`: bucket files by date (EXIF, else mtime), optionally into a `<year>/<month>/` tree.
+- `dedup report <repos…>`: Markdown triage report of counts, duplicates and flagged files.
+- `dedup scan <repos…>`: flag likely-critical files (wallets, keys, vaults, documents).
+- `dedup archive coverage`: report archive redundancy from what the last scan populated.
+- Content identity by size + BLAKE3 hash, with per-kind perceptual fingerprints (image, video, PDF/office/text/eml, audio) for similarity; scans record EXIF date and file origin.
+- **Compare videos across their whole timeline.** The viewer's **Video** tab shows an
+  **aligned filmstrip** per side — 8 frames sampled evenly across each clip, cached so stepping
+  through a group is instant — instead of a single first frame (which two different clips often
+  share: black, a slate, a logo). Clicking the strip drops a **shared playhead** that decodes
+  the exact frame of *both* clips at that moment, enlarged side by side (A@t | B@t). The
+  playhead is **proportional** — a fraction of each clip's own length — so a trimmed or
+  re-encoded copy stays aligned at the same relative moment instead of drifting.
+- **Hear a video's soundtrack, and compare two.** A video that carries an audio track
+  offers the viewer's **Audio** tab (silent clips don't): its soundtrack is extracted once to a
+  cached WAV and treated exactly like a bare audio file — spectrogram compare, playback, and
+  the gapless A/B flicker where both sides play in sync with only one audible. Needs `ffmpeg`;
+  without it the tab simply isn't offered.
+- **Slow a track down without changing its pitch.** The viewer's audio transport has discrete
+  speed stops — **0.25 / 0.5 / 0.75 / 1 / 1.5 / 2×** — that preserve pitch, so a slowed
+  recording still sounds like itself while you confirm two tracks are the same take. The chosen
+  speed applies to the synced A/B pair too, keeping both soundtracks aligned. The first use of
+  a speed renders once and is cached; after that it is instant.
+- **Pull a backup's changes back into the main.** A **GROUP SYNC BACK** command (the reverse
+  of GROUP SYNC) reconciles one sink into its main: files you added straight to the backup are
+  **promoted** in a batch (green), while files the main **deleted** that the sink still holds are
+  shown as **resurrection** candidates (a blue mark) and never auto-promoted — you pull each
+  one back on its own, so you recreate a mistaken deletion without silently undoing a real one.
+- **Read a document, and compare what two documents say.** On the viewer's **Text** tab, a
+  PDF, Word/OpenDocument file, spreadsheet, presentation, or email shows its **extracted
+  words** instead of a hex dump. Comparing two documents lines up their content **side by side**
+  and marks what changed — **green** where a line is on only one side, **amber** where a line's
+  characters differ — so you can see whether two copies say the same thing. Nothing is declared
+  identical; a document with no extractable text (scanned, encrypted, or empty) says so.
+  Word/Office documents keep their paragraph breaks, so their content diffs line by line.
+- **See a PDF as it looks, side by side.** A **Render** tab rasterizes a PDF to its page and
+  shows it — the document's appearance, not its extracted words. Comparing two, their pages sit
+  side by side to judge by eye (no pixel diff, no "same" verdict — different rendering makes that
+  meaningless). Needs `pdftoppm` (poppler) at runtime; absent it, the tab just doesn't appear.
+- **Separate Text and Hex tabs.** The viewer's **Text** tab shows *readable* content
+  only — a document's extracted words or a plain-text file's text (two text files diff as
+  content, aligned, not as bytes) — while the **Hex** tab shows the raw bytes of *every* file
+  (a head dump, or the full-file aligned hex diff when comparing two). Comparing two files, the
+  Hex tab shows the **whole file** as an **aligned, paginated hex diff**: equal bytes line up,
+  an inserted run shows as a green gap on one side, and a substitution shows the differing bytes
+  in amber on both — so an inserted header doesn't make everything after it read as different.
+  **Jump to next/previous difference** skips long equal runs; a very large or
+  pervasively-different pair degrades to a block-level match and **says so** rather than
+  pretending. (Two near-duplicate scans that differ only in embedded metadata read as "same
+  payload, header inserted".)
+- **See the text hiding inside any file.** A **Strings** tab on the viewer shows the
+  printable runs embedded in a file's bytes — an image's EXIF strings, an audio file's tags, a
+  program's paths and banners. Comparing two files aligns their runs so shared embedded text
+  lines up and each side's distinct runs stand out. Offered for every file.
+- **Look inside archives, pull from them, and unlock them.** Clicking a
+  zip/tar/tar.gz opens the shared viewer on an **Archive** tab listing its members; click a
+  member to open it in place, rendered by its own type (an image as an image, text as text),
+  and go back with BACK/Esc. The source archive is never modified. Archive members are indexed
+  as part of the normal scan, gated by the same change-detection as every other file; an
+  encrypted archive is indexed shallowly (member names and sizes, marked LOCKED).
+- **Extract from an archive.** EXTRACT ALL (or a per-member control) writes members into a
+  folder you pick — extract into a repository and the next scan indexes the contents as loose,
+  triageable files. Extraction never overwrites an existing file (collisions get a `_N`
+  suffix) and never touches the source.
+- **Password-protected zips.** A locked archive lists its member names (from the zip
+  directory) and offers **UNLOCK**: type the password and its members open and extract.
+  **RECOVER** tries a built-in list of common passwords for the weak ones (honest ceiling — a
+  strong password will not fall), and **EXPORT HASH** copies the archive's hash in hashcat's
+  `$zip2$` format (mode 13600) for real GPU cracking elsewhere. Scoped to archives you hold
+  and are entitled to.
+- **Archive redundancy shows inline in Duplicates.** When a loose file's content also lives
+  inside a zip, a read-only **evidence row** names the archive — and the delete confirmation
+  **warns** (never blocks) when a delete would leave content surviving only inside an archive.
+- **Light appearance.** Settings offers a **System / Light / Dark** appearance choice
+  (Settings → Appearance). Dark is the default; Light is opt-in, and System follows your
+  desktop's light/dark setting. Switching applies immediately and is remembered. The review
+  board's colour vocabulary (grey unchanged, green only-here, red will-delete, amber differs)
+  stays distinct in both appearances, and repository identicons keep their identity while
+  adapting to stay legible on either background.
+- **Compare and salvage metadata.** The Metadata tab highlights which EXIF/TIFF fields differ
+  between the two sides, and **SAVE METADATA** writes a side's fields to a human-readable
+  sidecar in a folder you pick — rescue the Title/Author/Keywords before deleting a copy. The
+  tab lists **every EXIF field** an image carries — camera, capture date, exposure, GPS,
+  whatever is in the file — read on demand, scrolling in its column.
+- **A turned image can be saved to disk from the viewer.** After ROTATE / MIRROR on a
+  writable file, **SAVE** offers the choice: **OVERWRITE** replaces the file in place
+  (atomically — a failure cannot truncate it), or **SAVE COPY** writes a `_rot` sibling and
+  leaves the original untouched. Either way the file **keeps its modified time** — a turned
+  scan is still the same photograph from the same date — and when the image carries an EXIF
+  capture date, the dialog can instead **stamp the file's date from EXIF**, for scans whose
+  file date is only the day they were copied. An overwrite immediately re-hashes and
+  re-indexes the file, so content identity follows the bytes.
+- **ID3 tags are editable in the shared viewer** for a writable audio file — EDIT TAGS /
+  SAVE TAGS on the Metadata tab, `T` as the shortcut, with values from every other candidate
+  offered for adoption. Read-only repositories never offer an edit.
+- **Filters can exclude.** Prefix any condition with `!` to invert it — `!name:*.mp3`
+  keeps everything that is *not* an MP3, `!mime:image` everything that is not an image.
+  Conditions still combine with AND, so `mime:image !name:*thumb*` reads "images, except
+  thumbnails". In the filter wizard each condition has a **NOT** toggle and negated
+  conditions read `NOT NAME: *.mp3` on their chip. A `!` inside a value stays literal, so
+  `name:!important` still searches for that text.
+- **Filters can ignore capitalisation.** The `Aa` toggle in the filter wizard (or a
+  `case:insensitive` token in the expression) makes text conditions match regardless of case,
+  so `*.jpg` also finds `PHOTO.JPG`. Matching is case-sensitive by default, and size and
+  date conditions are unaffected.
+- **One viewer for every file, everywhere.** Clicking any file — a duplicate card (or the
+  typed placeholder a document shows), a review board row, a file in Browse, a DIFF conflict —
+  opens the same full-window viewer, with the same representation tabs (Image, Video, Audio,
+  Metadata, Text, Render, Strings, Hex, Archive), the same per-side switchers, and the actions
+  of the place you came from: the Duplicates tab offers its DELETE / DELETE A / DELETE B mark
+  pills, the DIFF board its OVERWRITE/DELETE commands. A file opens **alone**, filling the
+  whole screen; **SHOW B** reveals a second side — always another candidate, never the file
+  already shown — and **HIDE B** returns. With one file shown the switcher walks the whole
+  group or listing; with two, each side's switcher (`< PREV A`, `<1 / 3>`, `NEXT A >`) skips
+  the file the other side shows, and its position counts that side's candidates, never the group
+  size. **Flicker is single-file focus** — one file's facts and its rotate/mirror/save/delete,
+  never both — and **SWAP** flips the image and all of that chrome together; the two panes of a
+  byte comparison are **scroll-locked** to the same offset.
+- **A locked ("Protected") repo lets you save a corrected copy.** The lock protects existing
+  files, so **DELETE** and **overwrite-in-place** stay blocked — shown disabled with the reason
+  rather than vanishing — but **save-as-a-new-copy** is allowed, since it only adds a file.
+- Sync-group **mains are badged**: a **★ MAIN** pill on the repository card and a star badge on
+  the shared repo chip, so an original is distinguishable from its backups on every tab —
+  Repositories, Files, Grooming, Duplicates, Browse and the lightbox. On the **Repositories**
+  tab a sync group is framed by its own **LCARS elbow section**, titled with the group name and
+  holding the main and its sinks; ungrouped repositories stay bare cards.
+- **One board for every preview and reconcile view.** Grooming's previews, Transfer's
+  COPY / MOVE / SYNC / MIRROR / folder-export and GROUP SYNC previews, and Transfer's DIFF all
+  share the same three-region layout, colour vocabulary, sort bar and virtualised scrolling.
+  Commands sit in a centre column between the two sides and **act where they point** (a
+  left-hand command in the left slot, `COPY >` beside `< COPY`, `DELETE L` beside `DELETE R`),
+  and are never truncated. Path colour says the same thing everywhere: grey unchanged, green
+  only-on-this-side, red will-be-deleted, amber differing. A per-row **HIDE** drops a row from
+  the board and from what RUN will do. Sorting is an explicit bar (side · key · direction). A
+  row is as tall as its content needs.
+- **Grooming DEDUPE rows have a COMPARE button** and name the surviving copy. COMPARE opens
+  the same comparison surface the Transfer DIFF board uses, so you can look at what a plan is
+  about to delete beside the copy that will survive; the right side shows the surviving file in
+  the pool, so a deletion list reads "this goes, because that stays". PURGE and PRUNE rows have
+  no counterpart and stay one-sided.
+- **DIFF has bulk actions over every listed row** — COPY MISSING in either direction and
+  RENAME ALL L / R — for reconciling repositories with thousands of differences without
+  clicking the same command a thousand times. Only actions the listed rows can use are offered,
+  the confirmation states the exact count, hidden rows are left alone, and a partial failure
+  reports how many succeeded and how many did not. In a BY HASH row DIFF **highlights the
+  characters that differ between two names**, computed from the longest common subsequence, so
+  inserting one character marks just that character; the shared parent directory is never
+  painted, and highlighting never changes a row's height.
+- **A scan that finds no files is refused instead of emptying the index.** An unmounted
+  drive scans as an empty directory, and marking every entry missing there is unrecoverable —
+  worse, an emptied sync-group main turns the next MIRROR push into a wipe of its sinks. The
+  GUI asks before continuing (nothing is written unless you confirm) and the CLI requires
+  `dedup repo update --force`. Emptying a repository on purpose still works; it now costs one
+  explicit confirmation.
+- Returning to the **Repositories** tab re-reads file counts and free space, so deleting
+  duplicates on another tab is reflected immediately instead of leaving stale numbers.
+- Comparing two audio files offers **DELETE A / DELETE B** directly in the player header, so a
+  copy can be marked without leaving the comparison; a copy in a read-only repository shows a
+  disabled, struck-through `… (Protected)` pill. Stepping through duplicate audio files while
+  paused loads the copy you are looking at without resuming playback.

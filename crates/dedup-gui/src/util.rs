@@ -33,7 +33,7 @@ fn pick_tooltip<'a>(verbosity: TooltipVerbosity, short: &'a str, verbose: &'a st
 /// `"F find · ←/→ page · M mode"`.
 pub fn shortcut_bar(ui: &mut egui::Ui, text: &str) {
     ui.add_space(2.0);
-    ui.label(RichText::new(text).color(theme::LILAC).size(11.0));
+    ui.label(RichText::new(text).color(theme::lilac()).size(11.0));
 }
 
 /// The shared "similarity" threshold control: a labelled `50–100 %` slider
@@ -41,12 +41,12 @@ pub fn shortcut_bar(ui: &mut egui::Ui, text: &str) {
 /// chosen, so the Duplicates and Transfer tabs present it identically. Edits
 /// `threshold` in place. Meant to sit in its own `ui.horizontal` row.
 pub fn similarity_slider(ui: &mut egui::Ui, threshold: &mut f64, verbosity: TooltipVerbosity) {
-    ui.label(RichText::new("similarity").color(theme::TEXT).size(12.0));
+    ui.label(RichText::new("similarity").color(theme::text()).size(12.0));
     // The value box draws on the orange pill, where the theme's global cream
     // text is unreadable — use black there, and a light backdrop while typing.
     let visuals = ui.visuals_mut();
-    visuals.override_text_color = Some(theme::BLACK);
-    visuals.extreme_bg_color = theme::TAN;
+    visuals.override_text_color = Some(theme::black());
+    visuals.extreme_bg_color = theme::tan();
     ui.add(
         egui::Slider::new(threshold, 50.0..=100.0)
             .suffix("%")
@@ -61,7 +61,7 @@ pub fn similarity_slider(ui: &mut egui::Ui, threshold: &mut f64, verbosity: Tool
     );
     // 100% is bit-identical (512-bit hash); ≥99.5% is visually identical.
     if *threshold >= 99.5 {
-        ui.label(RichText::new("identical").color(theme::BLUE).size(11.0));
+        ui.label(RichText::new("identical").color(theme::blue()).size(11.0));
     }
 }
 
@@ -80,7 +80,11 @@ pub fn sort_header(ui: &mut egui::Ui, title: &str, active: bool, asc: bool) -> e
     } else {
         title.to_string()
     };
-    let color = if active { theme::AMBER } else { theme::TEXT };
+    let color = if active {
+        theme::amber()
+    } else {
+        theme::text()
+    };
     ui.add(egui::Label::new(RichText::new(text).color(color).strong()).sense(egui::Sense::click()))
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -113,6 +117,22 @@ pub fn format_mtime(ms: i64) -> String {
     }
 }
 
+/// Fall back to the default for a read whose failure only costs a hint — a tag
+/// list, a mime suggestion — while still recording it in the session log.
+///
+/// Only for reads the user can't act on. A failure that changes what is on
+/// screen (which repos exist, which are sinks) must reach the user directly,
+/// not just the log.
+pub fn or_log_default<T: Default, E: std::fmt::Display>(result: Result<T, E>, what: &str) -> T {
+    match result {
+        Ok(value) => value,
+        Err(e) => {
+            log::warn!("{what}: {e}");
+            T::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod explain_tests {
     use super::*;
@@ -121,5 +141,13 @@ mod explain_tests {
     fn picks_short_or_verbose_by_setting() {
         assert_eq!(pick_tooltip(TooltipVerbosity::Short, "s", "v"), "s");
         assert_eq!(pick_tooltip(TooltipVerbosity::Verbose, "s", "v"), "v");
+    }
+
+    #[test]
+    fn or_log_default_passes_values_through_and_defaults_on_error() {
+        let ok: Result<Vec<u8>, String> = Ok(vec![1, 2]);
+        assert_eq!(or_log_default(ok, "reading"), vec![1, 2]);
+        let err: Result<Vec<u8>, String> = Err("boom".to_string());
+        assert!(or_log_default(err, "reading").is_empty());
     }
 }

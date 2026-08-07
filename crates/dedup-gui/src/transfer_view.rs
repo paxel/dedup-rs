@@ -12,29 +12,38 @@
 //!   leaves every decision to the user: each row offers copy / delete / rename /
 //!   overwrite per side, applied one click at a time (see `diff_board.rs`).
 
+use crate::compare_view::{DiffCompare, DiffPick, DiffSide};
 use crate::filter_ui::FilterBuilder;
 use crate::icon;
-use crate::review;
+use crate::media_cell::{FileFacts, facts_for, open_facts};
 use crate::settings::TooltipVerbosity;
 use crate::theme;
+use crate::thumbs::ThumbCache;
 use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::diff::{
-    CopyDest, DiffAction, DiffEvent, DiffItem, DiffPairing, DiffProgress, DiffRun, FolderMode,
-    RepoDiffRow, SyncDelete, copy_file_between, delete_file, diff_copy, diff_print, diff_sync,
-    export_to_folder, overwrite_file, plan_folder_export, plan_repo_diff, plan_sync, rename_file,
+    CopyDest, DiffAction, DiffEvent, DiffItem, DiffPairing, DiffProgress, DiffRelation, DiffRun,
+    FolderMode, RepoDiffRow, SyncDelete, copy_file_between, delete_file, diff_copy, diff_print,
+    diff_sync, export_to_folder, overwrite_file, plan_folder_export, plan_repo_diff, plan_sync,
+    rename_file,
 };
-use dedup_core::store::Store;
+use dedup_core::store::{Store, SyncGroup, SyncMode};
+use dedup_core::sync_group::{delete_mode, guard_mirror_source};
 use dedup_core::update::CancellationToken;
 use egui::{Id, RichText};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::review::PREVIEW_CAP;
+use crate::board;
+use crate::board::PREVIEW_CAP;
 
 /// How many recent actions the running panel keeps in its scrolling log.
 const RUN_LOG_LIMIT: usize = 10;
+
+/// Longest texture edge uploaded to the GPU for a DIFF preview, matching the
+/// lightbox's limit; larger images are downscaled by the decoder to stay within
+/// driver limits.
 
 #[derive(PartialEq, Clone, Copy)]
 enum Command {
@@ -42,6 +51,13 @@ enum Command {
     Move,
     Sync,
     Mirror,
+    /// Push the source (a sync group's main) to some or all of its sinks, each
+    /// in its own stored mode. Only offered when the source is a group's main.
+    GroupSync,
+    /// Pull one of this group's sinks back into the main: promote content the
+    /// main never had, and offer to resurrect content the main deleted that the
+    /// sink still holds. Only offered when the source is a group's main.
+    GroupSyncBack,
     Diff,
 }
 
@@ -52,20 +68,32 @@ impl Command {
             Command::Move => "MOVE",
             Command::Sync => "SYNC",
             Command::Mirror => "MIRROR",
+            Command::GroupSync => "GROUP SYNC",
+            Command::GroupSyncBack => "GROUP SYNC BACK",
             Command::Diff => "DIFF",
         }
     }
     /// Whether the command is inherently destructive to on-disk data by itself.
     /// SYNC is additive by default (it only *copies* into the target); its
     /// optional DELETE MISSING toggle makes a given run destructive — see
-    /// [`TransferView::destructive_run`]. MIRROR always deletes.
+    /// [`TransferView::destructive_run`]. MIRROR always deletes. GROUP SYNC's
+    /// destructiveness depends on the selected sinks' own modes, so it is not
+    /// statically destructive either — see `destructive_run`.
     fn destructive(self) -> bool {
         matches!(self, Command::Move | Command::Mirror)
     }
     /// Whether the command runs repo→repo at the same relative path (SYNC /
-    /// MIRROR), which hides the DEST / subdir / folder / dupe-pool controls.
+    /// MIRROR / GROUP SYNC), which hides the DEST / subdir / folder / dupe-pool
+    /// controls.
     fn repo_to_repo(self) -> bool {
-        matches!(self, Command::Sync | Command::Mirror | Command::Diff)
+        matches!(
+            self,
+            Command::Sync
+                | Command::Mirror
+                | Command::GroupSync
+                | Command::GroupSyncBack
+                | Command::Diff
+        )
     }
     /// DIFF is a manual side-by-side view rather than a batch run: it has no
     /// filter, no RUN button and no confirmation — every change is made by
@@ -99,6 +127,20 @@ impl Command {
                 "Copy source content the target lacks AND delete everything in the target \
                  the source does not have, so the target ends up holding exactly the \
                  source's content. Deletions cannot be undone. The source is never changed.",
+            ),
+            Command::GroupSync => (
+                "Push this group's main to its sinks",
+                "Push the source (this group's main) to the selected sinks below, each in \
+                 its own stored mode — ADD ONLY copies and never deletes, MIRROR also \
+                 deletes what the main no longer has. The main is never changed.",
+            ),
+            Command::GroupSyncBack => (
+                "Pull a sink's changes back into this main",
+                "Pull one of this group's sinks back into the main: promote content the \
+                 main never had (files you added straight to the backup), and offer to \
+                 bring back content the main deleted that the sink still holds — a \
+                 resurrection, marked in blue, that you choose file by file. Nothing on \
+                 the sink is changed.",
             ),
             Command::Diff => (
                 "Compare the two repos side by side",
@@ -140,6 +182,7 @@ impl SelectMode {
 
 /// A snapshot of the destination captured when a run starts, so the worker
 /// thread owns everything it needs without borrowing the view.
+#[derive(Clone)]
 enum StartDest {
     Repo {
         references: Vec<String>,
@@ -159,6 +202,790 @@ enum StartDest {
     },
 }
 
+/// Everything a REVIEW, its confirmation, and the RUN it authorises need,
+/// snapshotted at the moment the user asks — so nothing the live controls do
+/// between an async plan landing and PROCEED can change what actually runs.
+/// (Same reasoning as `pending_group_confirm` for GROUP SYNC.)
+#[derive(Clone)]
+struct RunConfig {
+    source: String,
+    command: Command,
+    dest: StartDest,
+    filter: Option<String>,
+    move_files: bool,
+}
+
+/// The result of a board preview (Copy/Move/Sync/folder), built off the UI
+/// thread. Rows come back unsorted; the board sorts them when applied.
+struct ReviewPreviewData {
+    rows: Vec<board::RowMeta>,
+    bodies: Vec<board::RowBody>,
+    preview_total: usize,
+    sync_delete_total: usize,
+    /// `[to-delete, only-here, differing, unchanged]`.
+    preview_totals: [usize; 4],
+    source_header: String,
+    target_header: String,
+    status: String,
+}
+
+/// One side of a board row, as a preview builder describes it.
+#[derive(Default)]
+struct SideSpec {
+    status: Option<board::Status>,
+    path: Option<String>,
+    facts: Option<FileFacts>,
+    /// Only set when the board's side spans several repos (GROUP SYNC's sinks),
+    /// where each row names its own.
+    repo: Option<String>,
+}
+
+impl SideSpec {
+    fn absent() -> Self {
+        Self::default()
+    }
+    fn at(status: board::Status, path: &str, facts: Option<FileFacts>) -> Self {
+        Self {
+            status: Some(status),
+            path: Some(path.to_string()),
+            facts,
+            repo: None,
+        }
+    }
+    fn in_repo(mut self, repo: &str) -> Self {
+        self.repo = Some(repo.to_string());
+        self
+    }
+}
+
+/// Assemble one board row and its body from the two side descriptions, keeping
+/// the two collections the board takes index-aligned.
+///
+/// `key` namespaces the row the way the core ops do (see `dedup_core::diff`):
+/// the source path for source-side actions, the target path for rows that only
+/// exist on the target (a sync deletion).
+fn board_row(
+    left: SideSpec,
+    right: SideSpec,
+    unchanged: bool,
+    cmds: Vec<board::Cmd>,
+) -> (board::RowMeta, board::RowBody) {
+    let key = match (&left.path, &right.path) {
+        (Some(p), _) => dedup_core::diff::source_key(p),
+        (None, Some(p)) => dedup_core::diff::target_key(p),
+        (None, None) => String::new(),
+    };
+    let meta = board::RowMeta {
+        key,
+        left_status: left.status.unwrap_or(board::Status::Absent),
+        right_status: right.status.unwrap_or(board::Status::Absent),
+        left_size: left.facts.as_ref().map(|f| f.size).unwrap_or(0),
+        right_size: right.facts.as_ref().map(|f| f.size).unwrap_or(0),
+        left_modified: left.facts.as_ref().map(|f| f.modified_ms).unwrap_or(0),
+        right_modified: right.facts.as_ref().map(|f| f.modified_ms).unwrap_or(0),
+        left_paths: left.path.into_iter().collect(),
+        right_paths: right.path.into_iter().collect(),
+        unchanged,
+        cmds,
+    };
+    let body = board::RowBody {
+        left: board::SideBody {
+            facts: left.facts,
+            repo: left.repo,
+            repo_is_main: false,
+        },
+        right: board::SideBody {
+            facts: right.facts,
+            repo: right.repo,
+            repo_is_main: false,
+        },
+    };
+    (meta, body)
+}
+
+/// The commands a planned preview offers per row: run this one now, or drop it
+/// from the board and from what RUN will do.
+fn planned_cmds() -> Vec<board::Cmd> {
+    vec![board::Cmd::Apply, board::Cmd::Hide]
+}
+
+/// DIFF's rows as the board's cheap model. What a row offers depends on what
+/// its two sides say about each other; a side holding the same content under
+/// several names is narrowed down first, so only 1:1 rows offer RENAME.
+/// A batch operation over every DIFF row currently listed. Offered only when
+/// the listed rows actually contain the relation it acts on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BulkOp {
+    /// Copy everything only the left side has into the right repo.
+    CopyMissingRight,
+    /// Copy everything only the right side has into the left repo.
+    CopyMissingLeft,
+    /// Rename each left file to the name the right side uses.
+    RenameAllLeft,
+    /// Rename each right file to the name the left side uses.
+    RenameAllRight,
+}
+
+impl BulkOp {
+    fn label(self) -> &'static str {
+        match self {
+            BulkOp::CopyMissingRight => "COPY MISSING >",
+            BulkOp::CopyMissingLeft => "< COPY MISSING",
+            BulkOp::RenameAllLeft => "RENAME ALL L",
+            BulkOp::RenameAllRight => "RENAME ALL R",
+        }
+    }
+
+    fn describe(self, n: usize) -> String {
+        match self {
+            BulkOp::CopyMissingRight => {
+                format!("Copy {n} file(s) the right side does not have into it?")
+            }
+            BulkOp::CopyMissingLeft => {
+                format!("Copy {n} file(s) the left side does not have into it?")
+            }
+            BulkOp::RenameAllLeft => {
+                format!("Rename {n} file(s) on the left to the right side's names?")
+            }
+            BulkOp::RenameAllRight => {
+                format!("Rename {n} file(s) on the right to the left side's names?")
+            }
+        }
+    }
+}
+
+fn diff_metas(rows: &[RepoDiffRow]) -> Vec<board::RowMeta> {
+    use board::{Cmd, Status};
+    use dedup_core::diff::DiffRelation as R;
+    rows.iter()
+        .map(|row| {
+            let paths = |files: &[dedup_core::diff::DiffFile]| -> Vec<String> {
+                files.iter().map(|f| f.rel_path.clone()).collect()
+            };
+            let (left_status, right_status, mut cmds) = match row.relation {
+                R::Equal => (Status::Same, Status::Same, Vec::new()),
+                R::OnlyLeft => (
+                    Status::OnlyHere,
+                    Status::Absent,
+                    vec![Cmd::CopyRight, Cmd::DeleteLeft],
+                ),
+                R::OnlyRight => (
+                    Status::Absent,
+                    Status::OnlyHere,
+                    vec![Cmd::CopyLeft, Cmd::DeleteRight],
+                ),
+                R::Renamed => {
+                    let mut c = Vec::new();
+                    if row.left.len() > 1 {
+                        c.push(Cmd::DeleteAllLeft);
+                        c.push(Cmd::KeepOneLeft);
+                    } else if !row.left.is_empty() {
+                        c.push(Cmd::RenameLeft);
+                    }
+                    if row.right.len() > 1 {
+                        c.push(Cmd::DeleteAllRight);
+                        c.push(Cmd::KeepOneRight);
+                    } else if !row.right.is_empty() {
+                        c.push(Cmd::RenameRight);
+                    }
+                    (Status::Differs, Status::Differs, c)
+                }
+                R::Conflict => (
+                    Status::Differs,
+                    Status::Differs,
+                    vec![
+                        Cmd::Compare,
+                        Cmd::OverwriteRight,
+                        Cmd::OverwriteLeft,
+                        Cmd::DeleteLeft,
+                        Cmd::DeleteRight,
+                    ],
+                ),
+            };
+            cmds.push(Cmd::Hide);
+            let first = |files: &[dedup_core::diff::DiffFile]| files.first().cloned();
+            board::RowMeta {
+                key: format!(
+                    "{}|{}",
+                    row.left.first().map(|f| f.rel_path.as_str()).unwrap_or(""),
+                    row.right.first().map(|f| f.rel_path.as_str()).unwrap_or(""),
+                ),
+                left_status,
+                right_status,
+                left_size: first(&row.left).map(|f| f.size).unwrap_or(0),
+                right_size: first(&row.right).map(|f| f.size).unwrap_or(0),
+                left_modified: first(&row.left).map(|f| f.modified_ms).unwrap_or(0),
+                right_modified: first(&row.right).map(|f| f.modified_ms).unwrap_or(0),
+                left_paths: paths(&row.left),
+                right_paths: paths(&row.right),
+                unchanged: row.relation == R::Equal,
+                cmds,
+            }
+        })
+        .collect()
+}
+
+/// DIFF's summary counts in the board's `[to-delete, only-here, differing,
+/// unchanged]` order. A diff plans nothing, so nothing is "to delete".
+fn diff_totals(rows: &[RepoDiffRow]) -> [usize; 4] {
+    use dedup_core::diff::DiffRelation as R;
+    let mut totals = [0usize; 4];
+    for row in rows {
+        match row.relation {
+            R::Equal => totals[3] += 1,
+            R::OnlyLeft | R::OnlyRight => totals[1] += 1,
+            R::Renamed | R::Conflict => totals[2] += 1,
+        }
+    }
+    totals
+}
+
+/// Translate a board command on DIFF row `i` into the file operation the caller
+/// executes. Returns `None` when the row cannot supply what the command needs.
+fn diff_action(
+    rows: &[RepoDiffRow],
+    i: usize,
+    cmd: board::Cmd,
+) -> Option<crate::diff_board::BoardAction> {
+    use crate::diff_board::{BoardAction, PopupKind};
+    use board::Cmd;
+    let row = rows.get(i)?;
+    let left = row.left.first().map(|f| f.rel_path.clone());
+    let right = row.right.first().map(|f| f.rel_path.clone());
+    let popup = |kind, on_left| {
+        Some(BoardAction::OpenPopup {
+            row: i,
+            on_left,
+            kind,
+        })
+    };
+    match cmd {
+        // The row body opens the shared viewer — the law: clicking any file
+        // anywhere shows it. Same destination COMPARE used to reach, now without
+        // a command competing for row space.
+        Cmd::OpenRow | Cmd::Compare => Some(BoardAction::Inspect {
+            left_rel: left?,
+            right_rel: right?,
+        }),
+        Cmd::CopyRight => Some(BoardAction::Copy {
+            from_left: true,
+            rel_path: left?,
+        }),
+        Cmd::CopyLeft => Some(BoardAction::Copy {
+            from_left: false,
+            rel_path: right?,
+        }),
+        Cmd::DeleteLeft => Some(BoardAction::Delete {
+            on_left: true,
+            rel_path: left?,
+        }),
+        Cmd::DeleteRight => Some(BoardAction::Delete {
+            on_left: false,
+            rel_path: right?,
+        }),
+        Cmd::OverwriteRight => Some(BoardAction::Overwrite {
+            from_left: true,
+            from_rel: left?,
+            to_rel: right?,
+        }),
+        Cmd::OverwriteLeft => Some(BoardAction::Overwrite {
+            from_left: false,
+            from_rel: right?,
+            to_rel: left?,
+        }),
+        // Renaming to one of several names on the other side needs an answer
+        // first; a 1:1 pair can be renamed outright.
+        Cmd::RenameLeft if row.right.len() > 1 => popup(PopupKind::PickName, true),
+        Cmd::RenameLeft => Some(BoardAction::Rename {
+            on_left: true,
+            from: left?,
+            to: right?,
+        }),
+        Cmd::RenameRight if row.left.len() > 1 => popup(PopupKind::PickName, false),
+        Cmd::RenameRight => Some(BoardAction::Rename {
+            on_left: false,
+            from: right?,
+            to: left?,
+        }),
+        Cmd::KeepOneLeft => popup(PopupKind::KeepOne, true),
+        Cmd::KeepOneRight => popup(PopupKind::KeepOne, false),
+        Cmd::DeleteAllLeft => popup(PopupKind::ConfirmDeleteAll, true),
+        Cmd::DeleteAllRight => popup(PopupKind::ConfirmDeleteAll, false),
+        // The board handles HIDE itself; APPLY belongs to a planned preview.
+        Cmd::Hide | Cmd::Apply => None,
+    }
+}
+
+/// Plan a review-board preview for `config`, off the UI thread. Dispatches on
+/// where the transfer lands; each branch reads the relevant index(es), which is
+/// the work that must not block the window on large repos.
+fn build_review_preview(store: &Store, config: &RunConfig) -> Result<ReviewPreviewData, String> {
+    match &config.dest {
+        StartDest::Sync { target, delete, .. } => preview_sync(store, config, target, *delete),
+        StartDest::Repo {
+            references,
+            target,
+            subdir,
+        } => preview_repo(store, config, references, target, subdir),
+        StartDest::Folder {
+            references,
+            dir,
+            mode,
+            invert,
+        } => preview_folder(store, config, references, dir, *mode, *invert),
+    }
+}
+
+/// Plan a GROUP SYNC push for `group` (already filtered to the selected
+/// sinks), off the UI thread — the full index scan runs per sink, so a large
+/// group must not block the window. Calls `plan_sync` directly (not
+/// [`dedup_core::sync_group::plan_group_sync`]) so `filter` can be threaded
+/// through, which that function does not accept; `guard_mirror_source` is
+/// called explicitly to keep its empty-main-mirror refusal.
+fn build_group_preview(
+    store: &Store,
+    group: &SyncGroup,
+    filter: Option<&str>,
+) -> Result<GroupPreviewData, String> {
+    guard_mirror_source(store, group).map_err(|e| e.to_string())?;
+    let mut rows = Vec::new();
+    let mut bodies = Vec::new();
+    let (mut added, mut removed) = (0usize, 0usize);
+    let mut wholesale_sinks = Vec::new();
+    // Copies carry the main's file, so their facts come from the main index.
+    let (main_db, main_base) = open_facts(store, &group.main);
+    for sink in &group.sinks {
+        let plan = plan_sync(
+            store,
+            &group.main,
+            &sink.repo,
+            true,
+            delete_mode(sink.mode),
+            filter,
+        )
+        .map_err(|e| e.to_string())?;
+        // A plan that deletes everything the sink holds today is a wholesale
+        // replacement, not an incremental sync — worth naming before proceeding.
+        let live = store
+            .get_repo_stats(&sink.repo)
+            .map(|s| s.file_count)
+            .unwrap_or(0);
+        if live > 0 && plan.deletes.len() as u64 >= live {
+            wholesale_sinks.push((sink.repo.clone(), live));
+        }
+        // Deletions carry the sink's file, so their facts come from the sink index.
+        let (sink_db, sink_base) = open_facts(store, &sink.repo);
+        // The sink rides in the row's own repo chip rather than being folded
+        // into the path — `format!("{sink}: {rel}")` made sorting by path sort
+        // by sink name, and a rel-path containing ": " was ambiguous.
+        //
+        // No per-row commands: this run is all-or-nothing (`start_group_sync`
+        // builds a `DiffRun` with no selection), so offering HIDE would promise
+        // to skip a deletion and then make it anyway.
+        for rel in &plan.copies {
+            added += 1;
+            if rows.len() < PREVIEW_CAP {
+                let (meta, body) = board_row(
+                    SideSpec::at(
+                        board::Status::Same,
+                        rel,
+                        facts_for(main_db.as_deref(), main_base.as_deref(), rel),
+                    ),
+                    SideSpec::at(board::Status::OnlyHere, rel, None).in_repo(&sink.repo),
+                    false,
+                    Vec::new(),
+                );
+                rows.push(meta);
+                bodies.push(body);
+            }
+        }
+        for rel in &plan.deletes {
+            removed += 1;
+            if rows.len() < PREVIEW_CAP {
+                let (meta, body) = board_row(
+                    SideSpec::absent(),
+                    SideSpec::at(
+                        board::Status::WillDelete,
+                        rel,
+                        facts_for(sink_db.as_deref(), sink_base.as_deref(), rel),
+                    )
+                    .in_repo(&sink.repo),
+                    false,
+                    Vec::new(),
+                );
+                rows.push(meta);
+                bodies.push(body);
+            }
+        }
+    }
+    let sink_count = group.sinks.len();
+    Ok(GroupPreviewData {
+        group: group.clone(),
+        main_header: TransferView::repo_header(store, &group.main),
+        rows,
+        bodies,
+        added,
+        removed,
+        sink_count,
+        wholesale_sinks,
+    })
+}
+
+/// Plan a GROUP SYNC BACK pull of `sink` into `group.main`, off the UI thread.
+/// Rows show the main gaining each file — green ([`board::Status::OnlyHere`]) for
+/// a new promote, blue ([`board::Status::Resurrect`]) for content the main
+/// deleted that the sink still holds. No per-row commands yet (that, and the run,
+/// are the next slice). Reuses [`GroupPreviewData`], carrying `added` = new count
+/// and `removed` = resurrection count for the shared render path.
+fn build_group_back_preview(
+    store: &Store,
+    group: &SyncGroup,
+    sink: &str,
+    filter: Option<&str>,
+) -> Result<GroupPreviewData, String> {
+    let pull = dedup_core::diff::plan_sync_back(store, sink, &group.main, filter)
+        .map_err(|e| e.to_string())?;
+    let (sink_db, sink_base) = open_facts(store, sink);
+    let mut rows = Vec::new();
+    let mut bodies = Vec::new();
+    let (mut new_count, mut resurrect_count) = (0usize, 0usize);
+    for item in &pull {
+        let main_status = match item.kind {
+            dedup_core::diff::PullKind::New => {
+                new_count += 1;
+                board::Status::OnlyHere
+            }
+            dedup_core::diff::PullKind::Resurrection => {
+                resurrect_count += 1;
+                board::Status::Resurrect
+            }
+        };
+        if rows.len() < PREVIEW_CAP {
+            let (meta, body) = board_row(
+                // The main will gain the file; the sink is the source that holds it.
+                SideSpec::at(main_status, &item.rel_path, None),
+                SideSpec::at(
+                    board::Status::Same,
+                    &item.rel_path,
+                    facts_for(sink_db.as_deref(), sink_base.as_deref(), &item.rel_path),
+                )
+                .in_repo(sink),
+                false,
+                // Each row can be pulled on its own — the only way to opt a
+                // resurrection in, and a way to promote a single new file.
+                vec![board::Cmd::Apply],
+            );
+            rows.push(meta);
+            bodies.push(body);
+        }
+    }
+    Ok(GroupPreviewData {
+        group: SyncGroup {
+            main: group.main.clone(),
+            sinks: group
+                .sinks
+                .iter()
+                .filter(|s| s.repo == sink)
+                .cloned()
+                .collect(),
+        },
+        main_header: TransferView::repo_header(store, &group.main),
+        rows,
+        bodies,
+        added: new_count,
+        removed: resurrect_count,
+        sink_count: 1,
+        wholesale_sinks: Vec::new(),
+    })
+}
+
+fn preview_sync(
+    store: &Store,
+    config: &RunConfig,
+    target: &str,
+    delete: SyncDelete,
+) -> Result<ReviewPreviewData, String> {
+    let plan = plan_sync(
+        store,
+        &config.source,
+        target,
+        true,
+        delete,
+        config.filter.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
+    // Facts come from whichever side holds the file: a copy's source, a
+    // deletion's target.
+    let (src_db, src_base) = open_facts(store, &config.source);
+    let (tgt_db, tgt_base) = open_facts(store, target);
+    // A copy: source keeps the file (unchanged), target gains it (added). A
+    // delete: the source no longer has it (absent), the target loses it
+    // (removed). Capped.
+    let (mut rows, mut bodies): (Vec<_>, Vec<_>) = plan
+        .copies
+        .iter()
+        .take(PREVIEW_CAP)
+        .map(|rel| {
+            board_row(
+                SideSpec::at(
+                    board::Status::Same,
+                    rel,
+                    facts_for(src_db.as_deref(), src_base.as_deref(), rel),
+                ),
+                SideSpec::at(board::Status::OnlyHere, rel, None),
+                false,
+                planned_cmds(),
+            )
+        })
+        .unzip();
+    for rel in plan
+        .deletes
+        .iter()
+        .take(PREVIEW_CAP.saturating_sub(rows.len()))
+    {
+        let (meta, body) = board_row(
+            SideSpec::absent(),
+            SideSpec::at(
+                board::Status::WillDelete,
+                rel,
+                facts_for(tgt_db.as_deref(), tgt_base.as_deref(), rel),
+            ),
+            false,
+            planned_cmds(),
+        );
+        rows.push(meta);
+        bodies.push(body);
+    }
+    let verb = config.command.label();
+    let status = if delete == SyncDelete::None {
+        format!("{verb}: {} to copy.", plan.copies.len())
+    } else {
+        format!(
+            "{verb}: {} to copy, {} to delete.",
+            plan.copies.len(),
+            plan.deletes.len()
+        )
+    };
+    Ok(ReviewPreviewData {
+        rows,
+        bodies,
+        preview_total: plan.copies.len(),
+        sync_delete_total: plan.deletes.len(),
+        preview_totals: [plan.deletes.len(), plan.copies.len(), 0, 0],
+        source_header: TransferView::repo_header(store, &config.source),
+        target_header: TransferView::repo_header(store, target),
+        status,
+    })
+}
+
+fn preview_repo(
+    store: &Store,
+    config: &RunConfig,
+    references: &[String],
+    target: &str,
+    subdir: &str,
+) -> Result<ReviewPreviewData, String> {
+    let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
+    let items = diff_print(store, &config.source, &ref_slice, config.filter.as_deref())
+        .map_err(|e| e.to_string())?;
+    // A file the target lacks (New) is added on the target side; on the source
+    // side a COPY leaves it unchanged while a MOVE removes it. Files the target
+    // already has (Equal) are unchanged on both sides. DeletedInReference isn't
+    // part of a transfer.
+    let source_state = if config.move_files {
+        board::Status::WillDelete
+    } else {
+        board::Status::Same
+    };
+    // The source holds every New/Equal file; the target holds the Equal ones.
+    let (src_db, src_base) = open_facts(store, &config.source);
+    let (tgt_db, tgt_base) = open_facts(store, target);
+    let mut acted = 0usize;
+    let mut unchanged = 0usize;
+    let mut rows: Vec<board::RowMeta> = Vec::new();
+    let mut bodies: Vec<board::RowBody> = Vec::new();
+    for item in &items {
+        match item {
+            DiffItem::New { rel_path } => {
+                acted += 1;
+                if rows.len() < PREVIEW_CAP {
+                    let to = if subdir.is_empty() {
+                        rel_path.clone()
+                    } else {
+                        format!("{subdir}/{rel_path}")
+                    };
+                    let (meta, body) = board_row(
+                        SideSpec::at(
+                            source_state,
+                            rel_path,
+                            facts_for(src_db.as_deref(), src_base.as_deref(), rel_path),
+                        ),
+                        SideSpec::at(board::Status::OnlyHere, &to, None),
+                        false,
+                        planned_cmds(),
+                    );
+                    rows.push(meta);
+                    bodies.push(body);
+                }
+            }
+            DiffItem::Equal { rel_path, .. } => {
+                unchanged += 1;
+                if rows.len() < PREVIEW_CAP {
+                    let (meta, body) = board_row(
+                        SideSpec::at(
+                            board::Status::Same,
+                            rel_path,
+                            facts_for(src_db.as_deref(), src_base.as_deref(), rel_path),
+                        ),
+                        SideSpec::at(
+                            board::Status::Same,
+                            rel_path,
+                            facts_for(tgt_db.as_deref(), tgt_base.as_deref(), rel_path),
+                        ),
+                        true,
+                        planned_cmds(),
+                    );
+                    rows.push(meta);
+                    bodies.push(body);
+                }
+            }
+            DiffItem::DeletedInReference { .. } => {}
+        }
+    }
+    // A move both removes from source and adds to target; a copy only adds.
+    // Totals are [to-delete, only-here, differing, unchanged].
+    let preview_totals = if config.move_files {
+        [acted, acted, 0, unchanged]
+    } else {
+        [0, acted, 0, unchanged]
+    };
+    Ok(ReviewPreviewData {
+        rows,
+        bodies,
+        preview_total: acted,
+        sync_delete_total: 0,
+        preview_totals,
+        source_header: TransferView::repo_header(store, &config.source),
+        target_header: TransferView::repo_header(store, target),
+        status: format!(
+            "{acted} match the {}.",
+            config.command.label().to_lowercase()
+        ),
+    })
+}
+
+fn preview_folder(
+    store: &Store,
+    config: &RunConfig,
+    references: &[String],
+    dir: &Path,
+    mode: FolderMode,
+    invert: bool,
+) -> Result<ReviewPreviewData, String> {
+    let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
+    let rels = plan_folder_export(
+        store,
+        &config.source,
+        &ref_slice,
+        mode,
+        invert,
+        config.filter.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
+    // Exporting adds each file into the folder; a MOVE also removes it from the
+    // source repo, a COPY leaves the source unchanged.
+    let source_state = if config.move_files {
+        board::Status::WillDelete
+    } else {
+        board::Status::Same
+    };
+    // The exported files live in the source repo; the target is a plain folder,
+    // not a repo, so the added side has no index facts.
+    let (src_db, src_base) = open_facts(store, &config.source);
+    let (rows, bodies): (Vec<_>, Vec<_>) = rels
+        .iter()
+        .take(PREVIEW_CAP)
+        .map(|rel| {
+            board_row(
+                SideSpec::at(
+                    source_state,
+                    rel,
+                    facts_for(src_db.as_deref(), src_base.as_deref(), rel),
+                ),
+                SideSpec::at(board::Status::OnlyHere, rel, None),
+                false,
+                planned_cmds(),
+            )
+        })
+        .unzip();
+    let preview_totals = if config.move_files {
+        [rels.len(), rels.len(), 0, 0]
+    } else {
+        [0, rels.len(), 0, 0]
+    };
+    let what = if invert { "redundant" } else { "unique" };
+    Ok(ReviewPreviewData {
+        rows,
+        bodies,
+        preview_total: rels.len(),
+        sync_delete_total: 0,
+        preview_totals,
+        source_header: TransferView::repo_header(store, &config.source),
+        target_header: dir.to_string_lossy().into_owned(),
+        status: format!(
+            "{} {what} file(s) to {}.",
+            rels.len(),
+            config.command.label().to_lowercase()
+        ),
+    })
+}
+
+/// The confirmation text for a batch RUN of `config`, from its counts. Pure, so
+/// the prompt describes exactly what was planned. `None` for DIFF (no batch).
+fn prompt_for(config: &RunConfig, copies: usize, deletes: usize) -> Option<String> {
+    let source = &config.source;
+    let dest = match &config.dest {
+        StartDest::Repo { target, subdir, .. } => {
+            if subdir.is_empty() {
+                target.clone()
+            } else {
+                format!("{target}/{subdir}")
+            }
+        }
+        StartDest::Folder { dir, .. } => dir.to_string_lossy().into_owned(),
+        StartDest::Sync { target, .. } => target.clone(),
+    };
+    let deletes_missing =
+        matches!(&config.dest, StartDest::Sync { delete, .. } if *delete != SyncDelete::None);
+    Some(match config.command {
+        Command::Copy => format!("Copy {copies} file(s) from '{source}' into '{dest}'?"),
+        Command::Move => format!(
+            "Move {copies} file(s) from '{source}' into '{dest}'? They are removed from the \
+             source directory."
+        ),
+        Command::Sync if deletes_missing => format!(
+            "Sync '{source}' → '{dest}': copy {copies} file(s) into the target and delete \
+             {deletes} file(s) from the target. Deletions cannot be undone. The source is not \
+             changed."
+        ),
+        Command::Sync => format!(
+            "Sync '{source}' → '{dest}': copy {copies} file(s) into the target. Nothing is \
+             deleted and the source is not changed."
+        ),
+        Command::Mirror => format!(
+            "Mirror '{source}' → '{dest}': copy {copies} file(s) into the target and DELETE \
+             {deletes} file(s) the source does not have, so the target ends up holding exactly \
+             the source's content. Deletions cannot be undone. The source is not changed."
+        ),
+        // DIFF never runs as a batch: its rows are applied one by one. GROUP
+        // SYNC never reaches here either — it has its own confirm text (see
+        // `TransferView::raise_group_confirm`), built from a `SyncGroup`, not
+        // a `RunConfig` (`capture_run_config` returns `None` for it).
+        Command::Diff | Command::GroupSync | Command::GroupSyncBack => return None,
+    })
+}
+
+#[derive(Debug)]
 enum OpResult {
     Copied {
         copied: u64,
@@ -186,6 +1013,71 @@ enum OpResult {
 enum Msg {
     Progress(DiffEvent),
     Done(OpResult),
+    /// A finished DIFF comparison, built off the UI thread (it scans both
+    /// repos' full indexes). Rows come back unsorted; the board sorts them.
+    DiffPreview(Result<DiffPreviewData, String>),
+    /// A finished review-board preview (Copy/Move/Sync/folder). `confirm`
+    /// carries the run to authorise once the plan is in hand — the deferred
+    /// half of a RUN click.
+    ReviewPreview {
+        result: Result<ReviewPreviewData, String>,
+        confirm: Option<Box<RunConfig>>,
+    },
+    /// A finished GROUP SYNC plan, built off the UI thread. `confirm`, when
+    /// set, raises the RUN confirmation once the plan lands with real counts —
+    /// the deferred half of a RUN click.
+    GroupPreview {
+        result: Result<GroupPreviewData, String>,
+        confirm: bool,
+    },
+    /// A finished GROUP SYNC BACK plan (pull a sink into the main), built off the
+    /// UI thread. `confirm` raises the RUN confirmation once the real counts land.
+    GroupBackPreview {
+        result: Result<GroupPreviewData, String>,
+        confirm: bool,
+    },
+    /// A finished GROUP SYNC push, aggregated across every sink pushed.
+    GroupDone(Result<GroupSyncResult, String>),
+}
+
+/// The result of planning a GROUP SYNC push, built off the UI thread. `group`
+/// is already filtered to the sinks that were selected when the plan started.
+struct GroupPreviewData {
+    group: SyncGroup,
+    /// The main's absolute path, resolved where the store is at hand, so the
+    /// header names it the same way every other surface does.
+    main_header: String,
+    rows: Vec<board::RowMeta>,
+    bodies: Vec<board::RowBody>,
+    added: usize,
+    removed: usize,
+    sink_count: usize,
+    /// Sinks the plan would empty of their current contents, `(sink, live)`.
+    wholesale_sinks: Vec<(String, u64)>,
+}
+
+/// The aggregated outcome of a GROUP SYNC push across every sink pushed.
+/// Per-file problems are not carried here — they arrive as `Msg::Progress`
+/// events and accumulate in `TransferView::run_problems` like every other
+/// command's, so `drain` folds them in when this message lands.
+struct GroupSyncResult {
+    main: String,
+    copied: u64,
+    deleted: u64,
+    errors: u64,
+    cancelled: bool,
+    /// Sinks that failed outright, as ready-to-display `"sink: error"` lines.
+    failures: Vec<String>,
+    /// Sinks a cancel cut short before they were reached — still worth naming,
+    /// since their backups are now stale.
+    skipped: Vec<String>,
+}
+
+/// The result of a DIFF preview: the paired rows and each side's header.
+struct DiffPreviewData {
+    rows: Vec<RepoDiffRow>,
+    source_header: String,
+    target_header: String,
 }
 
 /// [`DiffProgress`] adapter that forwards every diff event onto the TransferView
@@ -202,6 +1094,9 @@ impl DiffProgress for ChannelDiffProgress {
 
 pub struct TransferView {
     repos: Vec<String>,
+    /// Repos that are the main of a sync group, for the chip badge. Refreshed
+    /// with `repos` whenever the tab is shown.
+    mains: std::collections::HashSet<String>,
     loaded: bool,
     source: Option<String>,
     target: Option<String>,
@@ -209,6 +1104,24 @@ pub struct TransferView {
     /// when neither the target nor any of these already has its content.
     extra_refs: Vec<String>,
     command: Command,
+    /// GROUP SYNC: the sync group whose main is the current source, if any —
+    /// refreshed whenever the source or the repo list changes. `None` hides
+    /// the GROUP SYNC command entirely.
+    current_group: Option<SyncGroup>,
+    /// GROUP SYNC: which of `current_group`'s sinks the next push includes.
+    /// Reset to every sink whenever `current_group` changes.
+    selected_sinks: Vec<String>,
+    /// GROUP SYNC preview: sinks the plan would empty of their current
+    /// contents, `(sink, files it holds now)` — mirrors MIRROR's warning, but
+    /// per sink since a group push can span several.
+    wholesale_sinks: Vec<(String, u64)>,
+    /// GROUP SYNC: the group (already filtered to the selected sinks) a raised
+    /// confirmation authorises, captured when its plan landed. PROCEED pushes
+    /// *this*, not whatever is selected when the button is clicked.
+    pending_group_confirm: Option<SyncGroup>,
+    /// GROUP SYNC BACK's authorised pull, `(main, sink)`, captured when its plan
+    /// landed — the batch promotes only the new files.
+    pending_group_back: Option<(String, String)>,
     /// Whether COPY/MOVE goes into a repo or a picked folder.
     destination: Destination,
     /// Absolute path of the export folder (Destination::Folder).
@@ -229,28 +1142,43 @@ pub struct TransferView {
     subdir: String,
     /// The shared FILTER wizard (conditions, presets, suggestions, live count).
     filter: FilterBuilder,
-    preview: Vec<review::ReviewRow>,
+    preview: Vec<board::RowMeta>,
+    /// Thumbnails and facts for `preview`, kept index-aligned with it: the board
+    /// resolves a row's body only for the rows actually on screen.
+    preview_bodies: Vec<board::RowBody>,
     /// DIFF: how the two repos are paired up (by content or by path).
     pairing: DiffPairing,
-    /// DIFF: the rows of the current comparison, empty until PREVIEW.
+    /// DIFF: the rows of the current comparison, empty until REVIEW.
     diff_rows: Vec<RepoDiffRow>,
-    /// Sort/paging state of the diff board.
+    /// DIFF's open follow-up question, if any. Everything else about the diff
+    /// board moved to `preview_board` when DIFF was routed onto the shared board.
     board_state: crate::diff_board::BoardState,
     /// The open side-by-side comparison of one conflicting row, if any.
-    inspect: Option<crate::diff_inspect::Inspect>,
-    /// Full per-kind counts (indexed by [`review::RowKind::idx`]) for the review
+    inspect: Option<DiffCompare>,
+    /// A bulk action awaiting confirmation: what it is, and every file operation
+    /// it would perform.
+    bulk_confirm: Option<(BulkOp, Vec<crate::diff_board::BoardAction>)>,
+    /// Full counts `[to-delete, only-here, differing, unchanged]` for the board
     /// summary; independent of the capped `preview` sample.
-    preview_totals: [usize; 3],
-    /// The two review-table column headers: the source and target absolute paths.
+    preview_totals: [usize; 4],
+    /// The two board region headers: the source and target absolute paths.
     preview_source_header: String,
     preview_target_header: String,
     preview_total: usize,
-    /// Sort column + direction for the review table.
-    review_state: review::ReviewState,
+    /// Sort key, side, direction and hidden rows for the board — shared by the
+    /// planned previews and by DIFF, which are mutually exclusive commands.
+    preview_board: board::BoardState,
     status: Option<String>,
     error: Option<String>,
     confirm: Option<String>,
     running: bool,
+    /// Set while a preview (DIFF or review-board) is being planned on a worker
+    /// thread, so the UI shows it is busy and does not launch a second one.
+    previewing: bool,
+    /// The run a raised confirmation authorises, captured when its plan landed.
+    /// PROCEED runs *this*, not whatever the live controls say — the two can
+    /// differ across the async plan/confirm gap. Cleared when the dialog closes.
+    pending_confirm: Option<Box<RunConfig>>,
     /// Set while a single-row APPLY runs: refresh the preview when it finishes.
     pending_refresh: bool,
     cancel: CancellationToken,
@@ -260,11 +1188,19 @@ pub struct TransferView {
     run_done: u64,
     run_total: u64,
     run_current: String,
+    /// Every per-file failure of the current run, capped. The live `run_log`
+    /// keeps only the last handful, so on a large run its errors scroll away;
+    /// this retains the full list for the end-of-run report.
+    run_problems: Vec<String>,
+    /// The report of the last finished batch run.
+    result: crate::run_result::ResultModal,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     /// Tooltip wording for this frame, set at the top of [`Self::show`] from
     /// the app-wide setting (not persisted here; `app.rs` owns that).
     verbosity: TooltipVerbosity,
+    /// Decodes the review board's row thumbnails; polled once per frame.
+    thumbs: ThumbCache,
 }
 
 enum Act {
@@ -290,6 +1226,12 @@ enum Act {
     SetPairing(DiffPairing),
     /// Execute a single DIFF board row action.
     Board(crate::diff_board::BoardAction),
+    /// GROUP SYNC: toggle one sink's inclusion in the next push.
+    ToggleSink(String),
+    SelectAllSinks,
+    SelectNoSinks,
+    /// GROUP SYNC BACK: pick exactly one sink to pull back (single-select).
+    SelectOnlySink(String),
 }
 
 impl TransferView {
@@ -297,11 +1239,17 @@ impl TransferView {
         let (tx, rx) = crossbeam_channel::unbounded();
         Self {
             repos: Vec::new(),
+            mains: std::collections::HashSet::new(),
             loaded: false,
             source: None,
             target: None,
             extra_refs: Vec::new(),
             command: Command::Copy,
+            current_group: None,
+            selected_sinks: Vec::new(),
+            wholesale_sinks: Vec::new(),
+            pending_group_confirm: None,
+            pending_group_back: None,
             destination: Destination::Repo,
             folder: String::new(),
             select_mode: SelectMode::Exact,
@@ -316,24 +1264,31 @@ impl TransferView {
             diff_rows: Vec::new(),
             board_state: crate::diff_board::BoardState::default(),
             inspect: None,
-            preview_totals: [0; 3],
+            bulk_confirm: None,
+            preview_totals: [0; 4],
             preview_source_header: String::new(),
             preview_target_header: String::new(),
             preview_total: 0,
-            review_state: review::ReviewState::default(),
+            preview_bodies: Vec::new(),
+            preview_board: board::BoardState::default(),
             status: None,
             error: None,
             confirm: None,
             running: false,
+            previewing: false,
+            pending_confirm: None,
             pending_refresh: false,
             cancel: CancellationToken::new(),
             run_log: VecDeque::new(),
+            run_problems: Vec::new(),
+            result: crate::run_result::ResultModal::default(),
             run_done: 0,
             run_total: 0,
             run_current: String::new(),
             tx,
             rx,
             verbosity: TooltipVerbosity::default(),
+            thumbs: ThumbCache::new(3),
         }
     }
 
@@ -356,6 +1311,9 @@ impl TransferView {
         frame: Option<&eframe::Frame>,
     ) {
         self.verbosity = verbosity;
+        if self.thumbs.poll(ui.ctx()) {
+            ui.ctx().request_repaint();
+        }
         self.drain(ui);
         // A finished single-row APPLY refreshes the preview, so the board
         // reflects the applied action instead of dropping to the run log.
@@ -367,12 +1325,20 @@ impl TransferView {
         if !self.loaded {
             self.sync_repos(store);
         }
+        // The end-of-run report sits above everything, and swallows shortcuts
+        // while it is up.
+        let result_open = self.result.show(ui);
 
         let mut acts: Vec<Act> = Vec::new();
 
-        // Keyboard shortcuts — skipped while the confirm modal is up, a run is
+        // Keyboard shortcuts — skipped while a modal is up, a run or preview is
         // active, or a text field is focused.
-        if self.confirm.is_none() && !self.running && !ui.ctx().egui_wants_keyboard_input() {
+        if self.confirm.is_none()
+            && !result_open
+            && !self.running
+            && !self.previewing
+            && !ui.ctx().egui_wants_keyboard_input()
+        {
             ui.input(|i| {
                 if i.key_pressed(egui::Key::Num1) {
                     acts.push(Act::SetCommand(Command::Copy));
@@ -411,13 +1377,13 @@ impl TransferView {
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new("TRANSFER")
-                        .color(theme::BLUE)
+                        .color(theme::blue())
                         .size(18.0)
                         .strong(),
                 );
                 crate::util::shortcut_bar(
                     ui,
-                    "1 copy · 2 move · 3 sync · 4 mirror · 5 diff · P preview · R run",
+                    "1 copy · 2 move · 3 sync · 4 mirror · 5 diff · P review · R run",
                 );
 
                 self.repo_rows(ui, &mut acts);
@@ -430,6 +1396,8 @@ impl TransferView {
                     Command::Diff => self.pairing_bar(ui, &mut acts),
                     Command::Sync => self.sync_bar(ui, &mut acts),
                     Command::Mirror => self.mirror_bar(ui),
+                    Command::GroupSync => self.group_sinks_bar(ui, &mut acts),
+                    Command::GroupSyncBack => self.group_back_sink_bar(ui, &mut acts),
                     _ => {
                         self.dest_bar(ui, &mut acts);
                         match self.destination {
@@ -460,19 +1428,19 @@ impl TransferView {
                 self.action_bar(ui, &mut acts);
 
                 if let Some(err) = &self.error {
-                    ui.colored_label(theme::RED, err);
+                    ui.colored_label(theme::red(), err);
                 }
                 if let Some(status) = &self.status {
-                    ui.label(RichText::new(status).color(theme::TAN).size(13.0));
+                    ui.label(RichText::new(status).color(theme::tan()).size(13.0));
                 }
                 ui.separator();
-                // RUN and PREVIEW are mutually exclusive: while a run is active
+                // RUN and REVIEW are mutually exclusive: while a run is active
                 // or has left a log, show the live run panel; otherwise show the
                 // preview.
                 if self.running || !self.run_log.is_empty() {
                     self.run_panel(ui);
                 } else {
-                    self.preview_panel(ui, &mut acts);
+                    self.preview_panel(ui, store, &mut acts);
                 }
             });
 
@@ -481,24 +1449,30 @@ impl TransferView {
         }
         // The comparison sits above everything, and its buttons feed the same
         // row actions the board offers.
+        if self.bulk_confirm.is_some() {
+            let store = Arc::clone(store);
+            self.bulk_confirm_modal(&ui.ctx().clone(), &store);
+        }
         if let Some(inspect) = self.inspect.as_mut()
-            && let Some(outcome) = inspect.view(&ui.ctx().clone(), verbosity)
+            && let Some(pick) = inspect.view(&ui.ctx().clone(), verbosity, None)
         {
-            use crate::diff_inspect::InspectOutcome;
             let (left_rel, right_rel) = (
                 inspect.left.rel_path.clone(),
                 inspect.right.rel_path.clone(),
             );
             self.inspect = None;
-            match outcome {
-                InspectOutcome::Close => {}
-                InspectOutcome::Delete { on_left } => {
+            match pick {
+                DiffPick::Close => {}
+                // DIFF's sides are read-only, so neither a mark toggle nor an
+                // in-place save can arrive here.
+                DiffPick::ToggleMark { .. } | DiffPick::Edited { .. } => {}
+                DiffPick::Delete { on_left } => {
                     acts.push(Act::Board(crate::diff_board::BoardAction::Delete {
                         on_left,
                         rel_path: if on_left { left_rel } else { right_rel },
                     }));
                 }
-                InspectOutcome::Overwrite { from_left } => {
+                DiffPick::Overwrite { from_left } => {
                     acts.push(Act::Board(crate::diff_board::BoardAction::Overwrite {
                         from_left,
                         from_rel: if from_left {
@@ -523,7 +1497,15 @@ impl TransferView {
     pub fn sync_repos(&mut self, store: &Store) {
         match store.list_repos() {
             Ok(list) => {
-                self.repos = list.into_iter().map(|(n, _, _)| n).collect();
+                // Sinks are managed through their group's main, not operated on
+                // directly, so they are not offered here.
+                let sinks = store.sink_repo_names().unwrap_or_default();
+                self.mains = store.main_repo_names().unwrap_or_default();
+                self.repos = list
+                    .into_iter()
+                    .map(|(n, _, _)| n)
+                    .filter(|n| !sinks.contains(n))
+                    .collect();
                 if let Some(s) = &self.source
                     && !self.repos.contains(s)
                 {
@@ -537,19 +1519,51 @@ impl TransferView {
                 self.extra_refs.retain(|r| self.repos.contains(r));
                 self.loaded = true;
                 self.error = None;
+                self.refresh_group(store);
             }
             Err(e) => self.error = Some(e.to_string()),
         }
     }
 
+    /// Re-resolve GROUP SYNC's group from the current source: the sync group
+    /// (if any) whose main *is* the source, and every one of its sinks
+    /// selected by default. Falls back off GROUP SYNC when the source no
+    /// longer names a group's main (e.g. the group was disbanded elsewhere).
+    fn refresh_group(&mut self, store: &Store) {
+        self.current_group = self.source.as_deref().and_then(|src| {
+            store
+                .list_sync_groups()
+                .ok()?
+                .into_iter()
+                .map(|(_, group)| group)
+                .find(|group| group.main == src)
+        });
+        self.selected_sinks = self
+            .current_group
+            .as_ref()
+            .map(|g| g.sinks.iter().map(|s| s.repo.clone()).collect())
+            .unwrap_or_default();
+        if self.command == Command::GroupSync && self.current_group.is_none() {
+            self.command = Command::Copy;
+        }
+    }
+
     fn repo_rows(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "REPOS — PICK SOURCE & TARGET", theme::LILAC, |ui| {
+        crate::lcars::section_lcars(ui, "REPOS — PICK SOURCE & TARGET", theme::lilac(), |ui| {
             // SOURCE: every repo, orange when picked.
             let src = self.repos.clone();
+            let mains = self.mains.clone();
             crate::repo_chip::chip_row(ui, "xfer_source", "SOURCE", src.len(), |ui, i| {
                 let name = &src[i];
                 let sel = self.source.as_deref() == Some(name.as_str());
-                let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::ORANGE, None);
+                let chip = crate::repo_chip::repo_chip(
+                    ui,
+                    name,
+                    sel,
+                    theme::orange(),
+                    mains.contains(name),
+                    None,
+                );
                 if chip
                     .name
                     .explain(
@@ -567,18 +1581,26 @@ impl TransferView {
             });
 
             // TARGET (only when copying/moving into a repo — a folder export has
-            // no target): the repos that aren't the source, blue when picked.
-            if self.destination == Destination::Repo {
+            // no target, and GROUP SYNC's targets are the SINKS panel below).
+            if self.destination == Destination::Repo && self.command != Command::GroupSync {
                 let tgt: Vec<String> = self
                     .repos
                     .iter()
                     .filter(|n| self.source.as_deref() != Some(n.as_str()))
                     .cloned()
                     .collect();
+                let mains = self.mains.clone();
                 crate::repo_chip::chip_row(ui, "xfer_target", "TARGET", tgt.len(), |ui, i| {
                     let name = &tgt[i];
                     let sel = self.target.as_deref() == Some(name.as_str());
-                    let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::BLUE, None);
+                    let chip = crate::repo_chip::repo_chip(
+                        ui,
+                        name,
+                        sel,
+                        theme::blue(),
+                        mains.contains(name),
+                        None,
+                    );
                     if chip
                         .name
                         .explain(
@@ -613,8 +1635,8 @@ impl TransferView {
                     .cloned()
                     .collect();
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("DUPEPOOL").color(theme::TEXT).size(12.0));
-                    if crate::repo_chip::small_button(ui, "ALL", theme::LILAC)
+                    ui.label(RichText::new("DUPEPOOL").color(theme::text()).size(12.0));
+                    if crate::repo_chip::small_button(ui, "ALL", theme::lilac())
                         .explain(
                             self.verbosity,
                             "Add every eligible repo to the pool",
@@ -624,7 +1646,7 @@ impl TransferView {
                     {
                         self.extra_refs = eligible.clone();
                     }
-                    if crate::repo_chip::small_button(ui, "NONE", theme::LILAC)
+                    if crate::repo_chip::small_button(ui, "NONE", theme::lilac())
                         .explain(
                             self.verbosity,
                             "Clear the dupe pool",
@@ -635,10 +1657,18 @@ impl TransferView {
                         self.extra_refs.clear();
                     }
                 });
+                let mains = self.mains.clone();
                 crate::repo_chip::chip_row(ui, "xfer_pool", "", eligible.len(), |ui, i| {
                     let name = &eligible[i];
                     let sel = self.extra_refs.iter().any(|r| r == name);
-                    let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::LILAC, None);
+                    let chip = crate::repo_chip::repo_chip(
+                        ui,
+                        name,
+                        sel,
+                        theme::lilac(),
+                        mains.contains(name),
+                        None,
+                    );
                     if chip
                         .name
                         .explain(
@@ -688,12 +1718,17 @@ impl TransferView {
         }
     }
 
-    /// Whether PREVIEW/RUN can act: a source is picked, the destination is
-    /// resolved (a target repo, or a non-blank export folder), and nothing is
-    /// already running.
+    /// Whether REVIEW/RUN can act: a source is picked, the destination is
+    /// resolved (a target repo, a non-blank export folder, or — for GROUP
+    /// SYNC — at least one sink selected), and nothing is already running.
     fn ready(&self) -> bool {
-        if self.running || self.source.is_none() {
+        // A preview in flight disables REVIEW/RUN too, so a second click cannot
+        // launch an overlapping worker.
+        if self.running || self.previewing || self.source.is_none() {
             return false;
+        }
+        if matches!(self.command, Command::GroupSync | Command::GroupSyncBack) {
+            return self.current_group.is_some() && !self.selected_sinks.is_empty();
         }
         match self.destination {
             Destination::Repo => self.target.is_some(),
@@ -702,51 +1737,52 @@ impl TransferView {
     }
 
     fn command_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(
-            ui,
-            "COMMAND — COPY, MOVE, SYNC, MIRROR OR DIFF",
-            theme::ORANGE,
-            |ui| {
-                ui.horizontal(|ui| {
-                    for cmd in [
-                        Command::Copy,
-                        Command::Move,
-                        Command::Sync,
-                        Command::Mirror,
-                        Command::Diff,
-                    ] {
-                        let sel = self.command == cmd;
-                        let accent = if cmd.destructive() {
-                            theme::RED
-                        } else {
-                            theme::AMBER
-                        };
-                        let fill = if sel { accent } else { theme::PANEL };
-                        // Unselected pills sit on the dark panel — black text would
-                        // vanish there, so they carry their accent color instead.
-                        let col = if sel { theme::BLACK } else { accent };
-                        let (short, verbose) = cmd.tooltip();
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new(cmd.label()).color(col)).fill(fill),
-                            )
-                            .explain(self.verbosity, short, verbose)
-                            .clicked()
-                        {
-                            acts.push(Act::SetCommand(cmd));
-                        }
+        let has_group = self.current_group.is_some();
+        let title = if has_group {
+            "COMMAND — COPY, MOVE, SYNC, MIRROR, GROUP SYNC, GROUP SYNC BACK OR DIFF"
+        } else {
+            "COMMAND — COPY, MOVE, SYNC, MIRROR OR DIFF"
+        };
+        crate::lcars::section_lcars(ui, title, theme::orange(), |ui| {
+            ui.horizontal(|ui| {
+                let mut cmds = vec![Command::Copy, Command::Move, Command::Sync, Command::Mirror];
+                // Only offered when the source is a sync group's main — GROUP SYNC
+                // pushes it to sinks, GROUP SYNC BACK pulls a sink into it.
+                if has_group {
+                    cmds.push(Command::GroupSync);
+                    cmds.push(Command::GroupSyncBack);
+                }
+                cmds.push(Command::Diff);
+                for cmd in cmds {
+                    let sel = self.command == cmd;
+                    let accent = if cmd.destructive() {
+                        theme::red()
+                    } else {
+                        theme::amber()
+                    };
+                    let fill = if sel { accent } else { theme::panel() };
+                    // Unselected pills sit on the dark panel — black text would
+                    // vanish there, so they carry their accent color instead.
+                    let col = if sel { theme::black() } else { accent };
+                    let (short, verbose) = cmd.tooltip();
+                    if ui
+                        .add(egui::Button::new(RichText::new(cmd.label()).color(col)).fill(fill))
+                        .explain(self.verbosity, short, verbose)
+                        .clicked()
+                    {
+                        acts.push(Act::SetCommand(cmd));
                     }
-                });
-                self.hint(ui);
-            },
-        );
+                }
+            });
+            self.hint(ui);
+        });
     }
 
     fn subdir_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         crate::lcars::section_lcars(
             ui,
             "INTO — SUBFOLDER INSIDE THE TARGET",
-            theme::BLUE,
+            theme::blue(),
             |ui| {
                 ui.horizontal(|ui| {
                     let changed = ui
@@ -773,7 +1809,7 @@ impl TransferView {
                             can_browse,
                             egui::Button::new(
                                 RichText::new(format!("{} BROWSE", icon::FOLDER_OPEN))
-                                    .color(theme::BLACK),
+                                    .color(theme::black()),
                             ),
                         )
                         .explain(
@@ -791,7 +1827,7 @@ impl TransferView {
                 RichText::new(
                     "Files keep their source-relative path under this folder inside the target.",
                 )
-                .color(theme::LILAC)
+                .color(theme::lilac())
                 .size(11.0),
             );
             },
@@ -800,7 +1836,7 @@ impl TransferView {
 
     /// Selector for where COPY/MOVE lands: into a repo or into a picked folder.
     fn dest_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "DEST — WHERE COPIED FILES LAND", theme::BLUE, |ui| {
+        crate::lcars::section_lcars(ui, "DEST — WHERE COPIED FILES LAND", theme::blue(), |ui| {
             ui.horizontal(|ui| {
                 for (dest, label, short, verbose) in [
                     (
@@ -819,8 +1855,8 @@ impl TransferView {
                     ),
                 ] {
                     let sel = self.destination == dest;
-                    let fill = if sel { theme::BLUE } else { theme::PANEL };
-                    let col = if sel { theme::BLACK } else { theme::BLUE };
+                    let fill = if sel { theme::blue() } else { theme::panel() };
+                    let col = if sel { theme::black() } else { theme::blue() };
                     if ui
                         .add(egui::Button::new(RichText::new(label).color(col)).fill(fill))
                         .explain(self.verbosity, short, verbose)
@@ -838,7 +1874,7 @@ impl TransferView {
         crate::lcars::section_lcars(
             ui,
             "FOLDER — EXPORT DESTINATION ON DISK",
-            theme::BLUE,
+            theme::blue(),
             |ui| {
                 ui.horizontal(|ui| {
                     let changed = ui
@@ -860,7 +1896,7 @@ impl TransferView {
                     if ui
                         .add(egui::Button::new(
                             RichText::new(format!("{} BROWSE", icon::FOLDER_OPEN))
-                                .color(theme::BLACK),
+                                .color(theme::black()),
                         ))
                         .explain(
                             self.verbosity,
@@ -882,13 +1918,13 @@ impl TransferView {
         crate::lcars::section_lcars(
             ui,
             "MODE — EXACT OR SIMILAR MATCHING",
-            theme::LILAC,
+            theme::lilac(),
             |ui| {
                 ui.horizontal(|ui| {
                     for mode in [SelectMode::Exact, SelectMode::Similar] {
                         let sel = self.select_mode == mode;
-                        let fill = if sel { theme::LILAC } else { theme::PANEL };
-                        let col = if sel { theme::BLACK } else { theme::LILAC };
+                        let fill = if sel { theme::lilac() } else { theme::panel() };
+                        let col = if sel { theme::black() } else { theme::lilac() };
                         let (short, verbose) = match mode {
                             SelectMode::Exact => (
                                 "Group by exact content",
@@ -914,14 +1950,14 @@ impl TransferView {
                     }
                     ui.separator();
                     let fill = if self.invert {
-                        theme::ORANGE
+                        theme::orange()
                     } else {
-                        theme::PANEL
+                        theme::panel()
                     };
                     let col = if self.invert {
-                        theme::BLACK
+                        theme::black()
                     } else {
-                        theme::ORANGE
+                        theme::orange()
                     };
                     if ui
                         .add(egui::Button::new(RichText::new("INVERT").color(col)).fill(fill))
@@ -954,7 +1990,7 @@ impl TransferView {
                 } else {
                     "Exports the unique files (best copy of each group plus every singleton)."
                 };
-                ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
+                ui.label(RichText::new(hint).color(theme::lilac()).size(11.0));
             },
         );
     }
@@ -974,12 +2010,20 @@ impl TransferView {
                 "Make the target an exact copy of the source: copy what it lacks and delete \
                  everything the source does not have."
             }
+            Command::GroupSync => {
+                "Push the source (this group's main) to the sinks selected below, each in its \
+                 own stored mode."
+            }
+            Command::GroupSyncBack => {
+                "Pull the sink selected below back into the main — promote files it added, and \
+                 choose whether to bring back files the main deleted."
+            }
             Command::Diff => {
                 "Compare the two repos side by side and resolve each difference yourself — \
                  copy, delete, rename or overwrite, one row at a time."
             }
         };
-        ui.label(RichText::new(text).color(theme::LILAC).size(11.0));
+        ui.label(RichText::new(text).color(theme::lilac()).size(11.0));
     }
 
     /// MIRROR's info bar: no toggle (it always deletes), just a red warning that
@@ -988,7 +2032,7 @@ impl TransferView {
         crate::lcars::section_lcars(
             ui,
             &format!("{} DELETES EXTRAS", icon::TRASH),
-            theme::RED,
+            theme::red(),
             |ui| {
                 ui.label(
                     RichText::new(
@@ -996,7 +2040,162 @@ impl TransferView {
                      deleted, so the target ends up holding exactly the source's content. \
                      Deletions cannot be undone.",
                     )
-                    .color(theme::LILAC)
+                    .color(theme::lilac())
+                    .size(11.0),
+                );
+            },
+        );
+    }
+
+    /// GROUP SYNC's option bar: which of the group's sinks the next push
+    /// includes, defaulting to all of them. Each sink shows its own stored
+    /// push mode (set on the Repositories tab, not editable here) so the
+    /// selection reads honestly — this panel picks *which* sinks, not *how*.
+    /// GROUP SYNC BACK's sink picker — single-select: you pull one sink back at a
+    /// time (the drive you edited). A multi-sink pull is a semantic not yet taken
+    /// on. Otherwise mirrors GROUP SYNC's sink chips.
+    fn group_back_sink_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        crate::lcars::section_lcars(
+            ui,
+            "SINK — PULL ITS CHANGES BACK INTO THE MAIN",
+            theme::blue(),
+            |ui| {
+                let Some(group) = self.current_group.clone() else {
+                    return;
+                };
+                crate::repo_chip::chip_row(ui, "xfer_back_sink", "", group.sinks.len(), |ui, i| {
+                    let sink = &group.sinks[i];
+                    let mode = match sink.mode {
+                        SyncMode::AddOnly => "ADD ONLY",
+                        SyncMode::Mirror => "MIRROR",
+                    };
+                    let sel = self
+                        .selected_sinks
+                        .first()
+                        .map(|s| s == &sink.repo)
+                        .unwrap_or(false);
+                    let accent = if sink.mode == SyncMode::Mirror {
+                        theme::red()
+                    } else {
+                        theme::blue()
+                    };
+                    let row = ui.horizontal(|ui| {
+                        let chip =
+                            crate::repo_chip::repo_chip(ui, &sink.repo, sel, accent, false, None);
+                        ui.label(
+                            RichText::new(format!("MODE: {mode}"))
+                                .color(accent)
+                                .size(10.0),
+                        );
+                        chip
+                    });
+                    if row
+                        .inner
+                        .name
+                        .explain(
+                            self.verbosity,
+                            "Pull this sink back into the main",
+                            "Compare this sink against the main and pull its changes back: \
+                             promote files the main never had, and choose whether to bring back \
+                             files the main deleted that the sink still holds.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::SelectOnlySink(sink.repo.clone()));
+                    }
+                    row.response
+                });
+            },
+        );
+    }
+
+    fn group_sinks_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        crate::lcars::section_lcars(
+            ui,
+            "SINKS — WHERE THE MAIN IS PUSHED",
+            theme::blue(),
+            |ui| {
+                let Some(group) = self.current_group.clone() else {
+                    return;
+                };
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("SINKS").color(theme::text()).size(12.0));
+                    if crate::repo_chip::small_button(ui, "ALL", theme::blue())
+                        .explain(
+                            self.verbosity,
+                            "Include every sink",
+                            "Include every sink of this group in the next push.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::SelectAllSinks);
+                    }
+                    if crate::repo_chip::small_button(ui, "NONE", theme::blue())
+                        .explain(
+                            self.verbosity,
+                            "Clear the sink selection",
+                            "Deselect every sink (REVIEW/RUN are disabled until at least one is \
+                         picked).",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::SelectNoSinks);
+                    }
+                });
+                crate::repo_chip::chip_row(ui, "xfer_sinks", "", group.sinks.len(), |ui, i| {
+                    let sink = &group.sinks[i];
+                    let mode = match sink.mode {
+                        SyncMode::AddOnly => "ADD ONLY",
+                        SyncMode::Mirror => "MIRROR",
+                    };
+                    let sel = self.selected_sinks.iter().any(|s| s == &sink.repo);
+                    let accent = if sink.mode == SyncMode::Mirror {
+                        theme::red()
+                    } else {
+                        theme::blue()
+                    };
+                    // The chip gets the bare repo name: the identicon is hashed from
+                    // whatever string it is handed, so folding the mode into the name
+                    // gave this sink a different glyph here than on every other tab.
+                    // The mode rides alongside as its own label instead.
+                    //
+                    // Chip and label are wrapped together, and the *wrapper's*
+                    // response is what this closure returns: `chip_row` packs rows
+                    // from that rect, so a label drawn outside it would never be
+                    // budgeted and the row would overrun the available width.
+                    let row = ui.horizontal(|ui| {
+                        let chip =
+                            crate::repo_chip::repo_chip(ui, &sink.repo, sel, accent, false, None);
+                        // Same wording as the sink's mode pill on the Repositories tab.
+                        ui.label(
+                            RichText::new(format!("MODE: {mode}"))
+                                .color(accent)
+                                .size(10.0),
+                        );
+                        chip
+                    });
+                    if row
+                        .inner
+                        .name
+                        .explain(
+                            self.verbosity,
+                            "Include this sink in the push",
+                            "Toggle whether this sink is included when GROUP SYNC runs. Its mode \
+                         (ADD ONLY / MIRROR) is set on the Repositories tab.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::ToggleSink(sink.repo.clone()));
+                    }
+                    row.response
+                });
+                ui.label(
+                    RichText::new(
+                        "Each selected sink pushes in its own stored mode: ADD ONLY copies and \
+                     never deletes; MIRROR also deletes what the main no longer has. The main \
+                     is never changed.",
+                    )
+                    .color(theme::lilac())
                     .size(11.0),
                 );
             },
@@ -1019,63 +2218,68 @@ impl TransferView {
     /// same relative path.
     /// DIFF's option bar: how the two repos are paired up.
     fn pairing_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "PAIR BY — HOW FILES ARE MATCHED", theme::BLUE, |ui| {
-            ui.horizontal(|ui| {
-                for (pairing, label, short, verbose) in [
-                    (
-                        DiffPairing::ByHash,
-                        "BY HASH",
-                        "Match files by content",
-                        "Match files by their content, so the same photo under two \
+        crate::lcars::section_lcars(
+            ui,
+            "PAIR BY — HOW FILES ARE MATCHED",
+            theme::blue(),
+            |ui| {
+                ui.horizontal(|ui| {
+                    for (pairing, label, short, verbose) in [
+                        (
+                            DiffPairing::ByHash,
+                            "BY HASH",
+                            "Match files by content",
+                            "Match files by their content, so the same photo under two \
                          different names is one row you can resolve with a rename. \
                          This is the view for finding what one repo has and the other \
                          doesn't, whatever things are called.",
-                    ),
-                    (
-                        DiffPairing::ByPath,
-                        "BY PATH",
-                        "Match files by name and folder",
-                        "Match files by their path inside the repo, so the same name on \
+                        ),
+                        (
+                            DiffPairing::ByPath,
+                            "BY PATH",
+                            "Match files by name and folder",
+                            "Match files by their path inside the repo, so the same name on \
                          both sides is one row — and when the two versions differ you can \
                          overwrite one side with the other. This is the view for spotting \
                          edited files.",
-                    ),
-                ] {
-                    let selected = self.pairing == pairing;
-                    if crate::lcars::toggle_button(ui, label, selected, theme::BLUE)
-                        .explain(self.verbosity, short, verbose)
-                        .clicked()
-                    {
-                        acts.push(Act::SetPairing(pairing));
+                        ),
+                    ] {
+                        let selected = self.pairing == pairing;
+                        if crate::lcars::toggle_button(ui, label, selected, theme::blue())
+                            .explain(self.verbosity, short, verbose)
+                            .clicked()
+                        {
+                            acts.push(Act::SetPairing(pairing));
+                        }
                     }
-                }
-            });
-            let hint = match self.pairing {
-                DiffPairing::ByHash => {
-                    "Rows pair files with identical content; a file only one side has can \
+                });
+                let hint = match self.pairing {
+                    DiffPairing::ByHash => {
+                        "Rows pair files with identical content; a file only one side has can \
                      be copied across or deleted."
-                }
-                DiffPairing::ByPath => {
-                    "Rows pair files with the same path; same name with different content \
+                    }
+                    DiffPairing::ByPath => {
+                        "Rows pair files with the same path; same name with different content \
                      is a conflict you resolve per side."
-                }
-            };
-            ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
-        });
+                    }
+                };
+                ui.label(RichText::new(hint).color(theme::lilac()).size(11.0));
+            },
+        );
     }
 
     fn sync_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "OPTIONS — SYNC BEHAVIOUR", theme::BLUE, |ui| {
+        crate::lcars::section_lcars(ui, "OPTIONS — SYNC BEHAVIOUR", theme::blue(), |ui| {
             ui.horizontal(|ui| {
                 let fill = if self.sync_delete_missing {
-                    theme::RED
+                    theme::red()
                 } else {
-                    theme::PANEL
+                    theme::panel()
                 };
                 let col = if self.sync_delete_missing {
-                    theme::BLACK
+                    theme::black()
                 } else {
-                    theme::RED
+                    theme::red()
                 };
                 if ui
                     .add(egui::Button::new(RichText::new("DELETE MISSING").color(col)).fill(fill))
@@ -1097,7 +2301,7 @@ impl TransferView {
             } else {
                 "Copies content the target lacks. Nothing in the target is deleted."
             };
-            ui.label(RichText::new(hint).color(theme::LILAC).size(11.0));
+            ui.label(RichText::new(hint).color(theme::lilac()).size(11.0));
         });
     }
 
@@ -1105,38 +2309,45 @@ impl TransferView {
     /// always do, and SYNC does only when DELETE MISSING is on. Drives the red
     /// accent on the confirm dialog.
     fn destructive_run(&self) -> bool {
-        self.command.destructive() || (self.command == Command::Sync && self.sync_delete_missing)
+        self.command.destructive()
+            || (self.command == Command::Sync && self.sync_delete_missing)
+            || (self.command == Command::GroupSync
+                && self.current_group.as_ref().is_some_and(|g| {
+                    g.sinks.iter().any(|s| {
+                        self.selected_sinks.contains(&s.repo) && s.mode == SyncMode::Mirror
+                    })
+                }))
     }
 
     fn action_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "ACTION — PREVIEW & RUN", theme::AMBER, |ui| {
+        crate::lcars::section_lcars(ui, "ACTION — REVIEW & RUN", theme::amber(), |ui| {
             ui.horizontal(|ui| {
                 let ready = self.ready();
                 if ui
                     .add_enabled(
                         ready,
-                        egui::Button::new(RichText::new("PREVIEW").color(theme::BLACK)),
+                        egui::Button::new(RichText::new("REVIEW").color(theme::black())),
                     )
                     .explain(
                         self.verbosity,
-                        "Preview the first transfers",
-                        "Show the first matching `from → to` transfers (up to a preview \
+                        "Review the first transfers",
+                        "Show the first matching `from → to` transfers (up to a \
                          limit) and a total count, without changing anything on disk. \
-                         PREVIEW and RUN are mutually exclusive — starting a run clears the \
-                         preview.",
+                         REVIEW and RUN are mutually exclusive — starting a run clears the \
+                         review.",
                     )
                     .clicked()
                 {
                     acts.push(Act::Preview);
                 }
                 if self.command.is_diff() {
-                    if self.running {
-                        ui.add(egui::Spinner::new().color(theme::AMBER));
+                    if self.running || self.previewing {
+                        ui.add(egui::Spinner::new().color(theme::amber()));
                     }
                     return;
                 }
-                let run =
-                    egui::Button::new(RichText::new("RUN").color(theme::BLACK)).fill(theme::AMBER);
+                let run = egui::Button::new(RichText::new("RUN").color(theme::black()))
+                    .fill(theme::amber());
                 if ui
                     .add_enabled(ready, run)
                     .explain(
@@ -1151,11 +2362,13 @@ impl TransferView {
                     acts.push(Act::Ask);
                 }
                 if self.running {
-                    ui.add(egui::Spinner::new().color(theme::AMBER));
+                    ui.add(egui::Spinner::new().color(theme::amber()));
                     if ui
                         .add(
-                            egui::Button::new(RichText::new("CANCEL").color(theme::BLACK))
-                                .fill(theme::RED),
+                            egui::Button::new(
+                                RichText::new("CANCEL").color(theme::ink_on(theme::red())),
+                            )
+                            .fill(theme::red()),
                         )
                         .explain(
                             self.verbosity,
@@ -1173,45 +2386,270 @@ impl TransferView {
         });
     }
 
-    fn preview_panel(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+    /// The rows a bulk action would touch: those currently *listed* on the
+    /// board — after the show-unchanged toggle and excluding hidden rows.
+    /// Hiding a row is how the user excludes it from a bulk action.
+    fn listed_diff_rows(&self, metas: &[board::RowMeta]) -> Vec<usize> {
+        metas
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                !self.preview_board.hidden.contains(&m.key)
+                    && (self.preview_board.show_unchanged || !m.unchanged)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The bulk operations worth offering for the rows on screen. A mode that
+    /// cannot produce a relation never offers its bulk action — BY HASH yields
+    /// no `Conflict`, BY PATH no `Renamed`.
+    fn offered_bulk_ops(&self, listed: &[usize]) -> Vec<BulkOp> {
+        let mut ops = Vec::new();
+        let has = |want: DiffRelation| listed.iter().any(|&i| self.diff_rows[i].relation == want);
+        if has(DiffRelation::OnlyLeft) {
+            ops.push(BulkOp::CopyMissingRight);
+        }
+        if has(DiffRelation::OnlyRight) {
+            ops.push(BulkOp::CopyMissingLeft);
+        }
+        if has(DiffRelation::Renamed) {
+            ops.push(BulkOp::RenameAllLeft);
+            ops.push(BulkOp::RenameAllRight);
+        }
+        ops
+    }
+
+    /// Every concrete file operation `op` would perform over `listed`.
+    fn bulk_plan(&self, op: BulkOp, listed: &[usize]) -> Vec<crate::diff_board::BoardAction> {
+        use crate::diff_board::BoardAction;
+        let mut plan = Vec::new();
+        for &i in listed {
+            let row = &self.diff_rows[i];
+            match (op, row.relation) {
+                (BulkOp::CopyMissingRight, DiffRelation::OnlyLeft) => {
+                    for f in &row.left {
+                        plan.push(BoardAction::Copy {
+                            from_left: true,
+                            rel_path: f.rel_path.clone(),
+                        });
+                    }
+                }
+                (BulkOp::CopyMissingLeft, DiffRelation::OnlyRight) => {
+                    for f in &row.right {
+                        plan.push(BoardAction::Copy {
+                            from_left: false,
+                            rel_path: f.rel_path.clone(),
+                        });
+                    }
+                }
+                // Rename this side's file to the name the other side uses. Only
+                // a 1:1 pair is unambiguous; a side holding several names needs
+                // the per-row picker, so it is left out of the batch.
+                (BulkOp::RenameAllLeft, DiffRelation::Renamed) => {
+                    if let ([from], [to]) = (row.left.as_slice(), row.right.as_slice()) {
+                        plan.push(BoardAction::Rename {
+                            on_left: true,
+                            from: from.rel_path.clone(),
+                            to: to.rel_path.clone(),
+                        });
+                    }
+                }
+                (BulkOp::RenameAllRight, DiffRelation::Renamed) => {
+                    if let ([to], [from]) = (row.left.as_slice(), row.right.as_slice()) {
+                        plan.push(BoardAction::Rename {
+                            on_left: false,
+                            from: from.rel_path.clone(),
+                            to: to.rel_path.clone(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        plan
+    }
+
+    fn preview_panel(&mut self, ui: &mut egui::Ui, store: &Store, acts: &mut Vec<Act>) {
         if self.command.is_diff() {
             if self.diff_rows.is_empty() {
                 ui.add_space(6.0);
                 ui.colored_label(
-                    theme::TEXT,
-                    "Pick two repos and press PREVIEW to compare them.",
+                    theme::text(),
+                    "Pick two repos and press REVIEW to compare them.",
                 );
                 return;
             }
-            if let Some(action) = crate::diff_board::board(
+            let metas = diff_metas(&self.diff_rows);
+            // Facts are looked up per visible row rather than carried on the
+            // rows: `DiffFile` has only a path, size and date, and the board
+            // asks for a body only for what is on screen.
+            let (ldb, lbase) = self
+                .source
+                .as_deref()
+                .map(|r| open_facts(store, r))
+                .unwrap_or((None, None));
+            let (rdb, rbase) = self
+                .target
+                .as_deref()
+                .map(|r| open_facts(store, r))
+                .unwrap_or((None, None));
+            // Bulk actions over everything currently listed. Offered above the
+            // board, so it reads as acting on the whole list rather than a row.
+            let listed = self.listed_diff_rows(&metas);
+            let offered = self.offered_bulk_ops(&listed);
+            if !offered.is_empty() {
+                let mut want: Option<BulkOp> = None;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("ALL LISTED")
+                            .color(theme::lilac())
+                            .size(11.0),
+                    );
+                    for op in &offered {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(op.label()).color(theme::black()),
+                                )
+                                .fill(theme::amber()),
+                            )
+                            .explain(
+                                self.verbosity,
+                                "Apply to every listed row",
+                                "Run this action on every row currently on the board. Rows \
+                                 you have hidden are left alone.",
+                            )
+                            .clicked()
+                        {
+                            want = Some(*op);
+                        }
+                    }
+                });
+                if let Some(op) = want {
+                    let plan = self.bulk_plan(op, &listed);
+                    if plan.is_empty() {
+                        self.status = Some("Nothing listed for that action.".to_string());
+                    } else {
+                        self.bulk_confirm = Some((op, plan));
+                    }
+                }
+                ui.add_space(4.0);
+            }
+
+            let rows = &self.diff_rows;
+            let action = board::board(
                 ui,
-                &mut self.board_state,
-                &self.diff_rows,
-                &self.preview_source_header,
-                &self.preview_target_header,
-            ) {
-                acts.push(Act::Board(action));
+                &mut self.preview_board,
+                &metas,
+                board::BoardView {
+                    left_role: "LEFT",
+                    left_repo: self.source.as_deref().unwrap_or(""),
+                    left_is_main: false,
+                    left_path: &self.preview_source_header,
+                    right: Some(board::RightHeader {
+                        role: "RIGHT",
+                        repo: self.target.as_deref().unwrap_or(""),
+                        is_main: false,
+                        path: &self.preview_target_header,
+                        multi_repo: false,
+                    }),
+                    totals: diff_totals(rows),
+                    full_len: rows.len(),
+                    // DIFF runs each command as it is clicked; there is no RUN
+                    // for a hidden row to be skipped by.
+                    hide_skips_run: false,
+                },
+                &mut self.thumbs,
+                &mut |i| {
+                    let row = &rows[i];
+                    let side = |files: &[dedup_core::diff::DiffFile],
+                                db: Option<&redb::Database>,
+                                base: Option<&str>| {
+                        board::SideBody {
+                            facts: files.first().and_then(|f| facts_for(db, base, &f.rel_path)),
+                            repo: None,
+                            repo_is_main: false,
+                        }
+                    };
+                    board::RowBody {
+                        left: side(&row.left, ldb.as_deref(), lbase.as_deref()),
+                        right: side(&row.right, rdb.as_deref(), rbase.as_deref()),
+                    }
+                },
+            );
+            if let Some(a) = action
+                && let Some(mapped) = diff_action(&self.diff_rows, a.row, a.cmd)
+            {
+                acts.push(Act::Board(mapped));
+            }
+            // The three follow-up modals (delete-all, keep-one, pick-a-name)
+            // still belong to the diff board's own state.
+            if let Some(answer) =
+                crate::diff_board::popup(ui, &mut self.board_state, &self.diff_rows)
+            {
+                acts.push(Act::Board(answer));
             }
             return;
         }
         if self.preview.is_empty() {
             ui.add_space(6.0);
-            ui.colored_label(
-                theme::TEXT,
-                "Pick a source, a target and a command, then press PREVIEW.",
-            );
+            let hint = if self.command == Command::GroupSync {
+                "Pick at least one sink above, then press REVIEW."
+            } else {
+                "Pick a source, a target and a command, then press REVIEW."
+            };
+            ui.colored_label(theme::text(), hint);
             return;
         }
-        if let Some(review::ReviewAction::Apply(key)) = review::table(
+        // GROUP SYNC pushes several sinks as one all-or-nothing run, so each
+        // row names its own sink and offers no commands (the rows themselves
+        // carry an empty command set).
+        let group_sync = self.command == Command::GroupSync;
+        let (left_role, right_role) = if group_sync {
+            ("MAIN", "SINKS")
+        } else {
+            ("SOURCE", "TARGET")
+        };
+        let bodies = std::mem::take(&mut self.preview_bodies);
+        let action = board::board(
             ui,
-            &mut self.review_state,
-            &mut self.preview,
-            self.preview_totals,
-            &self.preview_source_header,
-            &self.preview_target_header,
-            review::RowControls::Enabled,
-        ) {
-            acts.push(Act::ApplyRow(key));
+            &mut self.preview_board,
+            &self.preview,
+            board::BoardView {
+                left_role,
+                left_repo: self.source.as_deref().unwrap_or(""),
+                left_is_main: group_sync,
+                left_path: &self.preview_source_header,
+                // Transfer is always two-sided (source → target/folder/sinks).
+                right: Some(board::RightHeader {
+                    role: right_role,
+                    // GROUP SYNC's right side spans several repos, so the
+                    // header names none of them — each row carries its own chip.
+                    repo: if group_sync {
+                        ""
+                    } else {
+                        self.target.as_deref().unwrap_or("")
+                    },
+                    is_main: false,
+                    path: &self.preview_target_header,
+                    multi_repo: group_sync,
+                }),
+                totals: self.preview_totals,
+                // Every row the plan produced, not just the actionable ones —
+                // the cap notice compares this against what was materialised.
+                full_len: self.preview_totals.iter().sum(),
+                hide_skips_run: true,
+            },
+            &mut self.thumbs,
+            &mut |i| bodies.get(i).cloned().unwrap_or_default(),
+        );
+        self.preview_bodies = bodies;
+        if let Some(a) = action
+            && a.cmd == board::Cmd::Apply
+            && let Some(meta) = self.preview.get(a.row)
+        {
+            acts.push(Act::ApplyRow(meta.key.clone()));
         }
     }
 
@@ -1230,14 +2668,14 @@ impl TransferView {
     fn run_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if self.running {
-                ui.add(egui::Spinner::new().color(theme::AMBER));
+                ui.add(egui::Spinner::new().color(theme::amber()));
             }
             let current = if self.run_current.is_empty() {
                 "preparing…".to_string()
             } else {
                 self.run_current.clone()
             };
-            ui.label(RichText::new(current).color(theme::AMBER).strong());
+            ui.label(RichText::new(current).color(theme::amber()).strong());
         });
 
         let summary = if self.run_total > 0 {
@@ -1247,7 +2685,7 @@ impl TransferView {
         };
         ui.label(
             RichText::new(format!("Processed {summary}"))
-                .color(theme::TAN)
+                .color(theme::tan())
                 .size(12.0),
         );
 
@@ -1257,7 +2695,7 @@ impl TransferView {
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 for line in &self.run_log {
-                    ui.label(RichText::new(line).color(theme::TEXT).size(12.0));
+                    ui.label(RichText::new(line).color(theme::text()).size(12.0));
                 }
             });
     }
@@ -1267,21 +2705,24 @@ impl TransferView {
             ui.set_width(380.0);
             ui.label(
                 RichText::new(format!("CONFIRM {}", self.command.label()))
-                    .color(theme::AMBER)
+                    .color(theme::amber())
                     .size(16.0)
                     .strong(),
             );
             ui.add_space(6.0);
-            ui.colored_label(theme::TEXT, prompt);
+            ui.colored_label(theme::text(), prompt);
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 let fill = if self.destructive_run() {
-                    theme::RED
+                    theme::red()
                 } else {
-                    theme::AMBER
+                    theme::amber()
                 };
                 if ui
-                    .add(egui::Button::new(RichText::new("PROCEED").color(theme::BLACK)).fill(fill))
+                    .add(
+                        egui::Button::new(RichText::new("PROCEED").color(theme::black()))
+                            .fill(fill),
+                    )
                     .explain(
                         self.verbosity,
                         "Confirm and run",
@@ -1292,7 +2733,7 @@ impl TransferView {
                     acts.push(Act::Confirm);
                 }
                 if ui
-                    .button(RichText::new("CANCEL").color(theme::BLACK))
+                    .button(RichText::new("CANCEL").color(theme::black()))
                     .explain(
                         self.verbosity,
                         "Cancel",
@@ -1314,6 +2755,7 @@ impl TransferView {
                 }
                 self.extra_refs.retain(|r| r != &name);
                 self.source = Some(name);
+                self.refresh_group(store);
                 self.clear_preview();
             }
             Act::PickTarget(name) => {
@@ -1368,20 +2810,53 @@ impl TransferView {
             }
             Act::Preview => self.run_preview(store),
             Act::Ask => {
-                if let Some(mut prompt) = self.build_prompt(store) {
-                    let rejected = self.review_state.rejected.len();
-                    if rejected > 0 {
-                        prompt.push_str(&format!(" {rejected} rejected row(s) will be skipped."));
-                    }
-                    self.confirm = Some(prompt);
+                // Plan on a worker thread; the confirmation is raised (for this
+                // captured config) once the plan lands with real counts. DIFF
+                // has no batch RUN, so it never reaches here.
+                self.reset_run();
+                if self.command == Command::GroupSync {
+                    self.spawn_group_preview(store, true);
+                } else if self.command == Command::GroupSyncBack {
+                    self.spawn_group_back_preview(store, true);
+                } else if let Some(config) = self.capture_run_config() {
+                    let confirm = Box::new(config.clone());
+                    self.spawn_review_preview(store, config, Some(confirm));
                 }
             }
-            Act::CancelConfirm => self.confirm = None,
+            Act::CancelConfirm => {
+                self.confirm = None;
+                self.pending_confirm = None;
+                self.pending_group_confirm = None;
+                self.pending_group_back = None;
+            }
             Act::Confirm => {
                 self.confirm = None;
-                self.start(store, None);
+                // Run the config/group the confirmation was built for, not
+                // live state.
+                if let Some((main, sink)) = self.pending_group_back.take() {
+                    self.start_group_back_pull(store, main, sink, None);
+                } else if let Some(group) = self.pending_group_confirm.take() {
+                    self.start_group_sync(store, group);
+                } else if let Some(config) = self.pending_confirm.take() {
+                    self.start(store, *config, None);
+                }
             }
-            Act::ApplyRow(key) => self.start(store, Some(key)),
+            Act::ApplyRow(key) => {
+                // GROUP SYNC BACK has no RunConfig — a row's APPLY pulls just that
+                // file into the main (this is how a single resurrection is opted
+                // in). Every other command runs against the previewed config.
+                if self.command == Command::GroupSyncBack {
+                    if let (Some(group), Some(sink)) = (
+                        self.current_group.clone(),
+                        self.selected_sinks.first().cloned(),
+                    ) {
+                        let only = std::iter::once(key).collect();
+                        self.start_group_back_pull(store, group.main, sink, Some(only));
+                    }
+                } else if let Some(config) = self.capture_run_config() {
+                    self.start(store, config, Some(key));
+                }
+            }
             Act::SetPairing(pairing) => {
                 self.pairing = pairing;
                 self.clear_preview();
@@ -1390,26 +2865,61 @@ impl TransferView {
                 left_rel,
                 right_rel,
             }) => self.open_inspect(store, &left_rel, &right_rel),
-            Act::Board(action) => self.start_board_action(store, action),
+            // A follow-up question is board state, not a file operation: it
+            // opens the modal rather than running anything.
+            Act::Board(crate::diff_board::BoardAction::OpenPopup { row, on_left, kind }) => {
+                self.board_state.popup = Some(crate::diff_board::Popup { row, on_left, kind });
+            }
+            Act::Board(action) => {
+                self.board_state.popup = None;
+                self.start_board_action(store, action)
+            }
             Act::CancelRun => self.cancel.cancel(),
+            Act::ToggleSink(name) => {
+                if let Some(pos) = self.selected_sinks.iter().position(|s| s == &name) {
+                    self.selected_sinks.remove(pos);
+                } else {
+                    self.selected_sinks.push(name);
+                }
+                self.clear_preview();
+            }
+            Act::SelectAllSinks => {
+                self.selected_sinks = self
+                    .current_group
+                    .as_ref()
+                    .map(|g| g.sinks.iter().map(|s| s.repo.clone()).collect())
+                    .unwrap_or_default();
+                self.clear_preview();
+            }
+            Act::SelectNoSinks => {
+                self.selected_sinks.clear();
+                self.clear_preview();
+            }
+            Act::SelectOnlySink(name) => {
+                self.selected_sinks = vec![name];
+                self.clear_preview();
+            }
         }
     }
 
     fn clear_preview(&mut self) {
+        self.pending_confirm = None;
+        self.pending_group_confirm = None;
+        self.wholesale_sinks.clear();
         self.preview.clear();
         self.diff_rows.clear();
-        self.board_state.page = 0;
         // A popup (and an open comparison) belongs to the rows it was opened
         // from.
         self.board_state.popup = None;
         self.inspect = None;
-        self.preview_totals = [0; 3];
+        self.preview_totals = [0; 4];
         self.preview_source_header.clear();
         self.preview_target_header.clear();
         self.preview_total = 0;
         self.sync_delete_total = 0;
-        // Rejections are keyed to the preview they were made in.
-        self.review_state.rejected.clear();
+        self.preview_bodies.clear();
+        // Hidden rows are keyed to the preview they were hidden in.
+        self.preview_board.hidden.clear();
     }
 
     /// The subdir trimmed of surrounding whitespace and slashes; empty means
@@ -1477,182 +2987,501 @@ impl TransferView {
         self.filter.filter_string()
     }
 
-    fn run_preview(&mut self, store: &Store) {
+    fn run_preview(&mut self, store: &Arc<Store>) {
         let Some(source) = self.source.clone() else {
             return;
         };
-        // PREVIEW and RUN are mutually exclusive: previewing drops any run log.
+        // REVIEW and RUN are mutually exclusive: reviewing drops any run log.
         self.reset_run();
         if self.command.is_diff() {
             self.run_preview_diff(store, &source);
             return;
         }
-        if self.command.repo_to_repo() {
-            self.run_preview_sync(store, &source);
+        if self.command == Command::GroupSync {
+            self.spawn_group_preview(store, false);
             return;
         }
-        match self.destination {
-            Destination::Repo => self.run_preview_repo(store, &source),
-            Destination::Folder => self.run_preview_folder(store, &source),
+        if self.command == Command::GroupSyncBack {
+            self.spawn_group_back_preview(store, false);
+            return;
+        }
+        // Every other command feeds the review board. Plan off the UI thread.
+        if let Some(config) = self.capture_run_config() {
+            self.spawn_review_preview(store, config, None);
         }
     }
 
-    fn run_preview_sync(&mut self, store: &Store, source: &str) {
-        let Some(target) = self.target.clone() else {
-            return;
-        };
-        let filter = self.filter_string();
-        let delete = self.sync_delete_mode();
-        match plan_sync(store, source, &target, true, delete, filter.as_deref()) {
-            Ok(plan) => {
-                self.preview_total = plan.copies.len();
-                self.sync_delete_total = plan.deletes.len();
-                self.preview_totals = [plan.copies.len(), plan.deletes.len(), 0];
-                self.preview_source_header = Self::repo_header(store, source);
-                self.preview_target_header = Self::repo_header(store, &target);
-                // A copy: source keeps the file (unchanged), target gains it
-                // (added). A delete: the source no longer has it (absent), the
-                // target loses it (removed). Capped, then sorted.
-                let mut rows: Vec<review::ReviewRow> = plan
-                    .copies
-                    .iter()
-                    .take(PREVIEW_CAP)
-                    .map(|rel| review::ReviewRow {
-                        source: review::SideStatus::Unchanged,
-                        target: review::SideStatus::Added,
-                        source_path: rel.clone(),
-                        target_path: rel.clone(),
-                    })
-                    .collect();
-                for rel in plan
-                    .deletes
-                    .iter()
-                    .take(PREVIEW_CAP.saturating_sub(rows.len()))
-                {
-                    rows.push(review::ReviewRow {
-                        source: review::SideStatus::Absent,
-                        target: review::SideStatus::Removed,
-                        source_path: String::new(),
-                        target_path: rel.clone(),
-                    });
-                }
-                review::sort(&mut rows, &self.review_state);
-                self.preview = rows;
-                let verb = self.command.label();
-                self.status = Some(if delete == SyncDelete::None {
-                    format!("{verb}: {} to copy.", self.preview_total)
-                } else {
-                    format!(
-                        "{verb}: {} to copy, {} to delete.",
-                        self.preview_total, self.sync_delete_total
-                    )
-                });
-                self.error = None;
+    /// Snapshot the source, command, destination, filter and move flag the
+    /// current controls describe — the whole of what a preview and a run need.
+    /// Returns `None` when a required repo/folder is not chosen.
+    fn capture_run_config(&self) -> Option<RunConfig> {
+        // DIFF has no batch run — it is applied row by row. `Command::Diff` is
+        // in `repo_to_repo()`, so without this it would build a bogus Sync
+        // config (reachable via the R shortcut, which fires regardless of mode).
+        // GROUP SYNC has its own plan/run pipeline (`spawn_group_preview` /
+        // `start_group_sync`) since it targets several sinks, not one target.
+        if self.command.is_diff() || self.command == Command::GroupSync {
+            return None;
+        }
+        let source = self.source.clone()?;
+        let command = self.command;
+        let dest = if command.repo_to_repo() {
+            StartDest::Sync {
+                target: self.target.clone()?,
+                delete: self.sync_delete_mode(),
+                mirror: command == Command::Mirror,
             }
-            Err(e) => self.error = Some(e.to_string()),
-        }
-    }
-
-    fn run_preview_repo(&mut self, store: &Store, source: &str) {
-        let Some(target) = self.target.clone() else {
-            return;
-        };
-        let filter = self.filter_string();
-        let references = self.references(&target);
-        let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
-        match diff_print(store, source, &ref_slice, filter.as_deref()) {
-            Ok(items) => {
-                // A file the target lacks (New) is added on the target side; on
-                // the source side a COPY leaves it unchanged while a MOVE removes
-                // it. Files the target already has (Equal) are unchanged on both
-                // sides. DeletedInReference isn't part of a transfer.
-                let subdir = self.normalized_subdir();
-                let move_files = self.command == Command::Move;
-                let source_state = if move_files {
-                    review::SideStatus::Removed
-                } else {
-                    review::SideStatus::Unchanged
-                };
-                let mut acted = 0usize;
-                let mut unchanged = 0usize;
-                let mut rows: Vec<review::ReviewRow> = Vec::new();
-                for item in &items {
-                    match item {
-                        DiffItem::New { rel_path } => {
-                            acted += 1;
-                            if rows.len() < PREVIEW_CAP {
-                                let to = if subdir.is_empty() {
-                                    rel_path.clone()
-                                } else {
-                                    format!("{subdir}/{rel_path}")
-                                };
-                                rows.push(review::ReviewRow {
-                                    source: source_state,
-                                    target: review::SideStatus::Added,
-                                    source_path: rel_path.clone(),
-                                    target_path: to,
-                                });
-                            }
-                        }
-                        DiffItem::Equal { rel_path, .. } => {
-                            unchanged += 1;
-                            if rows.len() < PREVIEW_CAP {
-                                rows.push(review::ReviewRow {
-                                    source: review::SideStatus::Unchanged,
-                                    target: review::SideStatus::Unchanged,
-                                    source_path: rel_path.clone(),
-                                    target_path: rel_path.clone(),
-                                });
-                            }
-                        }
-                        DiffItem::DeletedInReference { .. } => {}
+        } else {
+            match self.destination {
+                Destination::Repo => {
+                    let target = self.target.clone()?;
+                    StartDest::Repo {
+                        references: self.references(&target),
+                        target,
+                        subdir: self.normalized_subdir(),
                     }
                 }
-                self.preview_total = acted;
-                // A move both removes from source and adds to target; a copy only
-                // adds. Totals are [added, removed, unchanged].
-                self.preview_totals = if move_files {
-                    [acted, acted, unchanged]
-                } else {
-                    [acted, 0, unchanged]
-                };
-                self.preview_source_header = Self::repo_header(store, source);
-                self.preview_target_header = Self::repo_header(store, &target);
-                review::sort(&mut rows, &self.review_state);
-                self.preview = rows;
-                self.status = Some(format!(
-                    "{acted} match the {}.",
-                    self.command.label().to_lowercase()
-                ));
-                self.error = None;
+                Destination::Folder => {
+                    let folder = self.folder.trim().to_string();
+                    if folder.is_empty() {
+                        return None;
+                    }
+                    StartDest::Folder {
+                        references: self.folder_references(),
+                        dir: PathBuf::from(&folder),
+                        mode: self.folder_mode(),
+                        invert: self.invert,
+                    }
+                }
             }
-            Err(e) => self.error = Some(e.to_string()),
+        };
+        Some(RunConfig {
+            source,
+            command,
+            dest,
+            filter: self.filter_string(),
+            move_files: command == Command::Move,
+        })
+    }
+
+    /// Plan a review-board preview on a worker thread. `confirm`, when set,
+    /// rides through to the result: the RUN confirmation is raised (for that
+    /// captured config) once the plan lands with real counts.
+    /// Plan a GROUP SYNC push on a worker thread: every sink currently
+    /// selected, filtered from the full group. `confirm` carries through to
+    /// the result — when set, the RUN confirmation is raised once the plan
+    /// lands with real counts.
+    fn spawn_group_preview(&mut self, store: &Arc<Store>, confirm: bool) {
+        let Some(group) = self.current_group.clone() else {
+            return;
+        };
+        let group = SyncGroup {
+            main: group.main,
+            sinks: group
+                .sinks
+                .into_iter()
+                .filter(|s| self.selected_sinks.contains(&s.repo))
+                .collect(),
+        };
+        if group.sinks.is_empty() {
+            return;
+        }
+        let filter = self.filter_string();
+        let store = Arc::clone(store);
+        let tx = self.tx.clone();
+        self.previewing = true;
+        self.status = Some("planning…".to_string());
+        std::thread::spawn(move || {
+            let result = build_group_preview(&store, &group, filter.as_deref());
+            let _ = tx.send(Msg::GroupPreview { result, confirm });
+        });
+    }
+
+    /// Plan a GROUP SYNC BACK pull of the single selected sink into the main,
+    /// off the UI thread. `confirm` defers the RUN confirmation until the plan
+    /// lands with real counts.
+    fn spawn_group_back_preview(&mut self, store: &Arc<Store>, confirm: bool) {
+        let Some(group) = self.current_group.clone() else {
+            return;
+        };
+        let Some(sink) = self.selected_sinks.first().cloned() else {
+            return;
+        };
+        let filter = self.filter_string();
+        let store = Arc::clone(store);
+        let tx = self.tx.clone();
+        self.previewing = true;
+        self.status = Some("planning…".to_string());
+        std::thread::spawn(move || {
+            let result = build_group_back_preview(&store, &group, &sink, filter.as_deref());
+            let _ = tx.send(Msg::GroupBackPreview { result, confirm });
+        });
+    }
+
+    /// Fold a finished GROUP SYNC BACK plan into the board: new files to promote
+    /// (green) and resurrection candidates (blue). When `confirm`, raise the RUN
+    /// confirmation for the batch promote (new files only).
+    fn apply_group_back_preview(
+        &mut self,
+        result: Result<GroupPreviewData, String>,
+        confirm: bool,
+    ) {
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
+        };
+        // The 4-slot summary has no resurrection bucket; new files ride the
+        // "only on one side" (green) slot, and the resurrection count is spoken
+        // in the status line and shown as the blue rows themselves.
+        self.preview_totals = [0, outcome.added, 0, 0];
+        self.preview_total = outcome.added + outcome.removed;
+        self.preview_source_header = outcome.main_header.clone();
+        self.preview_target_header = outcome
+            .group
+            .sinks
+            .first()
+            .map(|s| s.repo.clone())
+            .unwrap_or_default();
+        self.wholesale_sinks = Vec::new();
+        self.preview = outcome.rows;
+        self.preview_bodies = outcome.bodies;
+        self.status = Some(format!(
+            "{} new file(s) to promote, {} resurrection candidate(s).",
+            outcome.added, outcome.removed
+        ));
+        self.error = None;
+        if confirm {
+            // The batch promotes only the new files; resurrection is per-row.
+            let sink = outcome
+                .group
+                .sinks
+                .first()
+                .map(|s| s.repo.clone())
+                .unwrap_or_default();
+            self.confirm = Some(format!(
+                "Promote {} new file(s) from sink '{}' into main '{}'? {} resurrection \
+                 candidate(s) are left for you to pull one by one. Nothing on the sink is \
+                 changed.",
+                outcome.added, sink, outcome.group.main, outcome.removed
+            ));
+            self.pending_group_back = Some((outcome.group.main.clone(), sink));
         }
     }
 
-    /// DIFF: compare source and target and fill the board. Like the other
-    /// previews this is a plain index read, so it runs on the UI thread.
-    fn run_preview_diff(&mut self, store: &Store, source: &str) {
+    /// Fold a finished GROUP SYNC plan into the board and, if this plan was
+    /// for a RUN click, raise the confirmation now that the real counts are
+    /// known.
+    fn apply_group_preview(&mut self, result: Result<GroupPreviewData, String>, confirm: bool) {
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
+        };
+        self.preview_totals = [outcome.removed, outcome.added, 0, 0];
+        self.preview_total = outcome.added + outcome.removed;
+        // The left header names the main like every other surface does — by its
+        // path, not its bare name. The right one says how many sinks the push
+        // covers; each row names the sink it belongs to with its own chip.
+        self.preview_source_header = outcome.main_header.clone();
+        self.preview_target_header = format!(
+            "{} sink(s) selected",
+            outcome
+                .group
+                .sinks
+                .len()
+                .min(self.selected_sinks.len().max(1))
+        );
+        self.wholesale_sinks = outcome.wholesale_sinks;
+        // The board sorts through its own index; the caller just hands over the
+        // rows and their bodies, index-aligned.
+        self.preview = outcome.rows;
+        self.preview_bodies = outcome.bodies;
+        self.status = Some(format!(
+            "{} file(s) to copy, {} to delete across {} sink(s).",
+            outcome.added, outcome.removed, outcome.sink_count
+        ));
+        self.error = None;
+        if confirm {
+            // Confirm and push the group that was *planned*, captured here —
+            // the selection may have changed while the scan ran.
+            self.raise_group_confirm(&outcome.group);
+            self.pending_group_confirm = Some(outcome.group);
+        }
+    }
+
+    /// Build the GROUP SYNC RUN confirmation from the plan just applied. A
+    /// confirmation that cannot say how much it deletes is not one the user
+    /// can weigh.
+    fn raise_group_confirm(&mut self, group: &SyncGroup) {
+        let [deletes, copies, _, _] = self.preview_totals;
+        let mut prompt = format!(
+            "Push '{}' to {} sink(s): copy {copies} file(s)",
+            group.main,
+            group.sinks.len()
+        );
+        if group.sinks.iter().any(|s| s.mode == SyncMode::Mirror) {
+            prompt.push_str(&format!(
+                " and DELETE {deletes} file(s) from the mirror sink(s), which cannot be undone"
+            ));
+        }
+        prompt.push_str(". The main is never changed.");
+        if !self.wholesale_sinks.is_empty() {
+            // Say what actually happens: nothing the sink holds today
+            // survives, and the main's content takes its place. It is not
+            // left empty — claiming that would be false, and a confirmation
+            // nobody trusts is worse than none.
+            let listed: Vec<String> = self
+                .wholesale_sinks
+                .iter()
+                .map(|(sink, live)| format!("{sink} (all {live} of its files)"))
+                .collect();
+            prompt.push_str(&format!(
+                "\n\nWARNING: this replaces the entire current contents of {} with the main's \
+                 content — nothing they hold today survives. If that is not what you expect, \
+                 check the main is complete first.",
+                listed.join(", ")
+            ));
+        }
+        self.confirm = Some(prompt);
+    }
+
+    /// Push `group` (already filtered to the sinks that were selected when it
+    /// was planned) to every one of its sinks, off the UI thread. Live
+    /// progress flows through the same `ChannelDiffProgress` → `run_problems`
+    /// path every other command uses; only the terminal aggregation across
+    /// sinks is GROUP SYNC's own.
+    /// Run a GROUP SYNC BACK pull of `sink` into `main`. `only = None` is the
+    /// batch: promote every **new** file, deliberately excluding the resurrection
+    /// set (tombstoned content the sink still holds). `only = Some(keys)` pulls
+    /// exactly those rows — how a single resurrection is opted in. Off the UI
+    /// thread; reports through the shared GROUP SYNC done channel.
+    fn start_group_back_pull(
+        &mut self,
+        store: &Arc<Store>,
+        main: String,
+        sink: String,
+        only: Option<std::collections::HashSet<String>>,
+    ) {
+        let filter = self.filter_string();
+        let store = Arc::clone(store);
+        let tx = self.tx.clone();
+        self.cancel = CancellationToken::new();
+        let cancel = self.cancel.clone();
+        self.running = true;
+        self.status = Some(format!("pulling '{sink}' into '{main}'…"));
+        self.clear_preview();
+        self.reset_run();
+
+        std::thread::spawn(move || {
+            let keys: std::collections::HashSet<String> = match only {
+                Some(keys) => keys,
+                None => {
+                    match dedup_core::diff::plan_sync_back(&store, &sink, &main, filter.as_deref())
+                    {
+                        Ok(items) => items
+                            .into_iter()
+                            .filter(|i| i.kind == dedup_core::diff::PullKind::New)
+                            .map(|i| dedup_core::diff::source_key(&i.rel_path))
+                            .collect(),
+                        Err(e) => {
+                            let _ = tx.send(Msg::GroupDone(Err(e.to_string())));
+                            return;
+                        }
+                    }
+                }
+            };
+            let progress = ChannelDiffProgress { tx: tx.clone() };
+            let run = DiffRun::new(&progress, &cancel).with_selection(None, Some(&keys));
+            // Copy sink content the main lacks, scoped to the new files, into the
+            // main at the same relative path; the main is re-indexed by the sync.
+            let result = dedup_core::diff::diff_sync(
+                &store,
+                &sink,
+                &main,
+                true,
+                SyncDelete::None,
+                filter.as_deref(),
+                &run,
+            );
+            let done = match result {
+                Ok(stats) => Ok(GroupSyncResult {
+                    main: main.clone(),
+                    copied: stats.copied,
+                    deleted: 0,
+                    errors: stats.errors,
+                    cancelled: stats.cancelled,
+                    failures: Vec::new(),
+                    skipped: Vec::new(),
+                }),
+                Err(e) => Err(format!("{sink}: {e}")),
+            };
+            let _ = tx.send(Msg::GroupDone(done));
+        });
+    }
+
+    fn start_group_sync(&mut self, store: &Arc<Store>, group: SyncGroup) {
+        let filter = self.filter_string();
+        let store = Arc::clone(store);
+        let tx = self.tx.clone();
+        self.cancel = CancellationToken::new();
+        let cancel = self.cancel.clone();
+        self.running = true;
+        self.status = Some(format!("syncing '{}'…", group.main));
+        self.clear_preview();
+        self.reset_run();
+
+        std::thread::spawn(move || {
+            // Re-checked here, not just at plan time: the main could have
+            // been rescanned to empty in the gap between REVIEW and RUN.
+            if let Err(e) = guard_mirror_source(&store, &group) {
+                let _ = tx.send(Msg::GroupDone(Err(e.to_string())));
+                return;
+            }
+            let progress = ChannelDiffProgress { tx: tx.clone() };
+            let run = DiffRun::new(&progress, &cancel);
+            let (mut copied, mut deleted, mut errors) = (0u64, 0u64, 0u64);
+            let mut failures = Vec::new();
+            let mut skipped = Vec::new();
+            let mut cancelled = false;
+            for sink in &group.sinks {
+                if run.cancel.is_cancelled() {
+                    cancelled = true;
+                    skipped.push(sink.repo.clone());
+                    continue;
+                }
+                match diff_sync(
+                    &store,
+                    &group.main,
+                    &sink.repo,
+                    true,
+                    delete_mode(sink.mode),
+                    filter.as_deref(),
+                    &run,
+                ) {
+                    Ok(stats) => {
+                        copied += stats.copied;
+                        deleted += stats.deleted;
+                        errors += stats.errors;
+                        cancelled |= stats.cancelled;
+                    }
+                    Err(e) => failures.push(format!("{}: {e}", sink.repo)),
+                }
+            }
+            let _ = tx.send(Msg::GroupDone(Ok(GroupSyncResult {
+                main: group.main,
+                copied,
+                deleted,
+                errors,
+                cancelled,
+                failures,
+                skipped,
+            })));
+        });
+    }
+
+    fn spawn_review_preview(
+        &mut self,
+        store: &Arc<Store>,
+        config: RunConfig,
+        confirm: Option<Box<RunConfig>>,
+    ) {
+        let store = Arc::clone(store);
+        let tx = self.tx.clone();
+        self.previewing = true;
+        self.status = Some(format!("{}…", config.command.label().to_lowercase()));
+        std::thread::spawn(move || {
+            let result = build_review_preview(&store, &config);
+            let _ = tx.send(Msg::ReviewPreview { result, confirm });
+        });
+    }
+
+    /// Fold a finished review preview into the board, and — if the plan was for
+    /// a RUN click — raise its confirmation now that the counts are known.
+    fn apply_review_preview(
+        &mut self,
+        result: Result<ReviewPreviewData, String>,
+        confirm: Option<Box<RunConfig>>,
+    ) {
+        let data = match result {
+            Ok(data) => data,
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
+        };
+        self.preview_total = data.preview_total;
+        self.sync_delete_total = data.sync_delete_total;
+        self.preview_totals = data.preview_totals;
+        self.preview_source_header = data.source_header;
+        self.preview_target_header = data.target_header;
+        self.preview = data.rows;
+        self.preview_bodies = data.bodies;
+        self.status = Some(data.status);
+        self.error = None;
+        if let Some(config) = confirm {
+            // Confirm and run the config that was *planned*, not whatever the
+            // live controls say now — the two can differ across the async gap.
+            if let Some(mut prompt) =
+                prompt_for(&config, data.preview_total, data.sync_delete_total)
+            {
+                let hidden = self.preview_board.hidden.len();
+                if hidden > 0 {
+                    prompt.push_str(&format!(" {hidden} hidden row(s) will be skipped."));
+                }
+                self.confirm = Some(prompt);
+                self.pending_confirm = Some(config);
+            }
+        }
+    }
+
+    /// Plan the two-repo DIFF on a worker thread. `plan_repo_diff` reads both
+    /// repos' full indexes, so on the whole-disk repos this tool targets it
+    /// would freeze the window for seconds if run inline; the result comes back
+    /// over the channel and is applied in [`Self::apply_diff_preview`].
+    fn run_preview_diff(&mut self, store: &Arc<Store>, source: &str) {
         let Some(target) = self.target.clone() else {
             return;
         };
-        match plan_repo_diff(store, source, &target, self.pairing) {
-            Ok(mut rows) => {
-                crate::diff_board::sort(&mut rows, &self.board_state);
+        let store = Arc::clone(store);
+        let source = source.to_string();
+        let pairing = self.pairing;
+        let tx = self.tx.clone();
+        self.previewing = true;
+        self.status = Some(format!("comparing '{source}' and '{target}'…"));
+        std::thread::spawn(move || {
+            let result = plan_repo_diff(&store, &source, &target, pairing)
+                .map(|rows| DiffPreviewData {
+                    rows,
+                    source_header: Self::repo_header(&store, &source),
+                    target_header: Self::repo_header(&store, &target),
+                })
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Msg::DiffPreview(result));
+        });
+    }
+
+    /// Fold a finished DIFF comparison into the board.
+    fn apply_diff_preview(&mut self, result: Result<DiffPreviewData, String>) {
+        match result {
+            Ok(data) => {
+                let rows = data.rows;
                 let differing = rows
                     .iter()
                     .filter(|r| r.relation != dedup_core::diff::DiffRelation::Equal)
                     .count();
-                self.preview_source_header = Self::repo_header(store, source);
-                self.preview_target_header = Self::repo_header(store, &target);
+                self.preview_source_header = data.source_header;
+                self.preview_target_header = data.target_header;
                 self.preview_total = differing;
                 self.diff_rows = rows;
-                self.status = Some(format!(
-                    "{differing} difference(s) between '{source}' and '{target}'."
-                ));
+                self.status = Some(format!("{differing} difference(s)."));
                 self.error = None;
             }
-            Err(e) => self.error = Some(e.to_string()),
+            Err(e) => self.error = Some(e),
         }
     }
 
@@ -1662,22 +3491,24 @@ impl TransferView {
         let (Some(source), Some(target)) = (self.source.clone(), self.target.clone()) else {
             return;
         };
-        let side = |repo: &str, rel: &str| -> Option<crate::diff_inspect::InspectSide> {
+        let side = |repo: &str, rel: &str| -> Option<DiffSide> {
             let meta = store.get_repo(repo).ok()?;
             let entry = store.get_file_entry(repo, rel).ok().flatten()?;
-            Some(crate::diff_inspect::InspectSide {
+            let abs_path = PathBuf::from(&meta.abs_path).join(rel);
+            Some(DiffSide {
                 repo: repo.to_string(),
                 rel_path: rel.to_string(),
-                abs_path: PathBuf::from(&meta.abs_path).join(rel),
-                size: entry.size,
-                modified_ms: entry.modified_ms,
-                mime: entry.mime.clone(),
-                hash_hex: dedup_core::thumbnail::hash_hex(&entry.hash),
+                facts: FileFacts::from_entry(&entry, abs_path),
+                read_only: true,
             })
         };
         match (side(&source, left_rel), side(&target, right_rel)) {
             (Some(left), Some(right)) => {
-                self.inspect = Some(crate::diff_inspect::Inspect::new(left, right));
+                // A DIFF row offers exactly these two files, so the pool is the
+                // pair itself and neither side renders a switcher — there is
+                // nowhere else to go.
+                let pool = vec![left.clone(), right.clone()];
+                self.inspect = Some(DiffCompare::new_with_pool(left, Some(right), pool));
                 self.error = None;
             }
             _ => self.error = Some("Could not read both versions of that file.".to_string()),
@@ -1686,6 +3517,135 @@ impl TransferView {
 
     /// Execute one DIFF board row action on a worker thread (a single file can
     /// still be large), then re-plan the diff so the row reflects the result.
+    /// Confirm a bulk action before it runs. It is destructive and touches many
+    /// files at once, so the exact count is stated and declining does nothing.
+    fn bulk_confirm_modal(&mut self, ctx: &egui::Context, store: &Arc<Store>) {
+        let Some((op, plan)) = self.bulk_confirm.clone() else {
+            return;
+        };
+        let mut decision: Option<bool> = None;
+        let response = egui::Modal::new(egui::Id::new("diff-bulk-confirm")).show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.label(
+                egui::RichText::new("APPLY TO EVERY LISTED ROW")
+                    .color(theme::amber())
+                    .size(16.0)
+                    .strong(),
+            );
+            ui.add_space(8.0);
+            ui.colored_label(theme::text(), op.describe(plan.len()));
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Rows you have hidden are not touched.")
+                    .color(theme::tan())
+                    .size(11.0),
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("APPLY").color(theme::ink_on(theme::red())),
+                        )
+                        .fill(theme::red()),
+                    )
+                    .clicked()
+                {
+                    decision = Some(true);
+                }
+                if ui
+                    .add(
+                        egui::Button::new(egui::RichText::new("CANCEL").color(theme::text()))
+                            .fill(theme::panel()),
+                    )
+                    .clicked()
+                {
+                    decision = Some(false);
+                }
+            });
+        });
+        if let Some(go) = decision {
+            self.bulk_confirm = None;
+            if go {
+                self.start_bulk(store, plan);
+            }
+        } else if response.should_close() {
+            self.bulk_confirm = None;
+        }
+    }
+
+    /// Run a whole bulk plan on a worker thread, then re-plan the diff.
+    ///
+    /// Every operation is attempted — one failure does not abandon the rest —
+    /// and the summary reports both counts, so a partial failure is visible
+    /// rather than silently swallowed.
+    fn start_bulk(&mut self, store: &Arc<Store>, plan: Vec<crate::diff_board::BoardAction>) {
+        use crate::diff_board::BoardAction;
+        let (Some(source), Some(target)) = (self.source.clone(), self.target.clone()) else {
+            return;
+        };
+        let store = Arc::clone(store);
+        let tx = self.tx.clone();
+        let cancel = self.cancel.clone();
+        self.running = true;
+        self.pending_refresh = true;
+        self.reset_run();
+        self.status = Some(format!("applying {} operation(s)…", plan.len()));
+
+        std::thread::spawn(move || {
+            let side = |on_left: bool| {
+                if on_left {
+                    (source.clone(), target.clone())
+                } else {
+                    (target.clone(), source.clone())
+                }
+            };
+            let (mut done, mut failed) = (0usize, 0usize);
+            let mut cancelled = false;
+            for action in plan {
+                if cancel.is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
+                let outcome = match action {
+                    BoardAction::Copy {
+                        from_left,
+                        rel_path,
+                    } => {
+                        let (from, to) = side(from_left);
+                        copy_file_between(&store, &from, &rel_path, &to, &rel_path)
+                    }
+                    BoardAction::Rename { on_left, from, to } => {
+                        let (repo, _) = side(on_left);
+                        rename_file(&store, &repo, &from, &to)
+                    }
+                    BoardAction::Delete { on_left, rel_path } => {
+                        let (repo, _) = side(on_left);
+                        delete_file(&store, &repo, &rel_path)
+                    }
+                    // Not produced by `bulk_plan`.
+                    _ => Ok(()),
+                };
+                match outcome {
+                    Ok(()) => done += 1,
+                    Err(e) => {
+                        log::warn!("bulk action failed: {e}");
+                        failed += 1;
+                    }
+                }
+            }
+            let mut message = format!("Applied {done} operation(s)");
+            if failed > 0 {
+                message.push_str(&format!(", {failed} failed"));
+            }
+            if cancelled {
+                message.push_str(" (cancelled)");
+            }
+            message.push('.');
+            let _ = tx.send(Msg::Done(OpResult::Applied { message }));
+        });
+    }
+
     fn start_board_action(&mut self, store: &Arc<Store>, action: crate::diff_board::BoardAction) {
         use crate::diff_board::BoardAction;
         let (Some(source), Some(target)) = (self.source.clone(), self.target.clone()) else {
@@ -1766,164 +3726,19 @@ impl TransferView {
         });
     }
 
-    fn run_preview_folder(&mut self, store: &Store, source: &str) {
-        let folder = self.folder.trim().to_string();
-        if folder.is_empty() {
-            return;
-        }
-        let filter = self.filter_string();
-        let references = self.folder_references();
-        let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
-        match plan_folder_export(
-            store,
+    /// Start `config`'s command on a worker thread. `only` restricts the run to
+    /// a single review row (the APPLY button); `None` runs the whole batch minus
+    /// any rejected rows. `config` is a snapshot taken when the run was asked
+    /// for, so nothing the live controls do since can change what runs.
+    fn start(&mut self, store: &Arc<Store>, config: RunConfig, only: Option<String>) {
+        let RunConfig {
             source,
-            &ref_slice,
-            self.folder_mode(),
-            self.invert,
-            filter.as_deref(),
-        ) {
-            Ok(rels) => {
-                self.preview_total = rels.len();
-                let move_files = self.command == Command::Move;
-                let source_state = if move_files {
-                    review::SideStatus::Removed
-                } else {
-                    review::SideStatus::Unchanged
-                };
-                // Exporting adds each file into the folder; a MOVE also removes
-                // it from the source repo, a COPY leaves the source unchanged.
-                self.preview_totals = if move_files {
-                    [rels.len(), rels.len(), 0]
-                } else {
-                    [rels.len(), 0, 0]
-                };
-                self.preview_source_header = Self::repo_header(store, source);
-                self.preview_target_header = folder.clone();
-                let mut rows: Vec<review::ReviewRow> = rels
-                    .iter()
-                    .take(PREVIEW_CAP)
-                    .map(|rel| review::ReviewRow {
-                        source: source_state,
-                        target: review::SideStatus::Added,
-                        source_path: rel.clone(),
-                        target_path: rel.clone(),
-                    })
-                    .collect();
-                review::sort(&mut rows, &self.review_state);
-                self.preview = rows;
-                let what = if self.invert { "redundant" } else { "unique" };
-                self.status = Some(format!(
-                    "{} {what} file(s) to {}.",
-                    self.preview_total,
-                    self.command.label().to_lowercase()
-                ));
-                self.error = None;
-            }
-            Err(e) => self.error = Some(e.to_string()),
-        }
-    }
-
-    fn build_prompt(&mut self, store: &Store) -> Option<String> {
-        // Refresh the count so the confirmation reflects the current filter.
-        self.run_preview(store);
-        let source = self.source.as_ref()?;
-        let dest = match self.destination {
-            Destination::Repo => {
-                let target = self.target.as_ref()?;
-                let subdir = self.normalized_subdir();
-                if subdir.is_empty() {
-                    target.to_string()
-                } else {
-                    format!("{target}/{subdir}")
-                }
-            }
-            Destination::Folder => {
-                let folder = self.folder.trim();
-                if folder.is_empty() {
-                    return None;
-                }
-                folder.to_string()
-            }
-        };
-        Some(match self.command {
-            Command::Copy => format!(
-                "Copy {} file(s) from '{source}' into '{dest}'?",
-                self.preview_total
-            ),
-            Command::Move => format!(
-                "Move {} file(s) from '{source}' into '{dest}'? They are removed from the source directory.",
-                self.preview_total
-            ),
-            Command::Sync if self.sync_delete_missing => format!(
-                "Sync '{source}' → '{dest}': copy {} file(s) into the target and delete {} \
-                 file(s) from the target. Deletions cannot be undone. The source is not changed.",
-                self.preview_total, self.sync_delete_total
-            ),
-            Command::Sync => format!(
-                "Sync '{source}' → '{dest}': copy {} file(s) into the target. Nothing is \
-                 deleted and the source is not changed.",
-                self.preview_total
-            ),
-            Command::Mirror => format!(
-                "Mirror '{source}' → '{dest}': copy {} file(s) into the target and DELETE {} \
-                 file(s) the source does not have, so the target ends up holding exactly the \
-                 source's content. Deletions cannot be undone. The source is not changed.",
-                self.preview_total, self.sync_delete_total
-            ),
-            // DIFF never runs as a batch: its rows are applied one by one.
-            Command::Diff => return None,
-        })
-    }
-
-    /// Start the configured command on a worker thread. `only` restricts the
-    /// run to a single review row (the APPLY button); `None` runs the whole
-    /// batch minus any rejected rows.
-    fn start(&mut self, store: &Arc<Store>, only: Option<String>) {
-        let Some(source) = self.source.clone() else {
-            return;
-        };
-        let rejected: std::collections::HashSet<String> = self.review_state.rejected.clone();
-        // Snapshot everything the worker needs before spawning, branching on
-        // where the transfer lands. SYNC/MIRROR are their own destination
-        // (repo→repo at the same relative path), independent of REPO/FOLDER.
-        let dest = if self.command.repo_to_repo() {
-            let Some(target) = self.target.clone() else {
-                return;
-            };
-            StartDest::Sync {
-                target,
-                delete: self.sync_delete_mode(),
-                mirror: self.command == Command::Mirror,
-            }
-        } else {
-            match self.destination {
-                Destination::Repo => {
-                    let Some(target) = self.target.clone() else {
-                        return;
-                    };
-                    StartDest::Repo {
-                        references: self.references(&target),
-                        target,
-                        subdir: self.normalized_subdir(),
-                    }
-                }
-                Destination::Folder => {
-                    let folder = self.folder.trim().to_string();
-                    if folder.is_empty() {
-                        return;
-                    }
-                    StartDest::Folder {
-                        references: self.folder_references(),
-                        dir: PathBuf::from(&folder),
-                        mode: self.folder_mode(),
-                        invert: self.invert,
-                    }
-                }
-            }
-        };
-        let filter = self.filter_string();
-        let command = self.command;
-        let move_files = command == Command::Move;
+            command,
+            dest,
+            filter,
+            move_files,
+        } = config;
+        let hidden: std::collections::HashSet<String> = self.preview_board.hidden.clone();
         let store = Arc::clone(store);
         let tx = self.tx.clone();
         self.cancel = CancellationToken::new();
@@ -1936,7 +3751,7 @@ impl TransferView {
             self.pending_refresh = true;
             self.reset_run();
         } else {
-            // RUN and PREVIEW are mutually exclusive: starting a run drops the
+            // RUN and REVIEW are mutually exclusive: starting a run drops the
             // stale preview and resets the live run log/counters.
             self.clear_preview();
             self.reset_run();
@@ -1946,10 +3761,8 @@ impl TransferView {
             let progress = ChannelDiffProgress { tx: tx.clone() };
             let only_set: Option<std::collections::HashSet<String>> =
                 only.map(|k| std::collections::HashSet::from([k]));
-            let run = DiffRun::new(&progress, &cancel).with_selection(
-                (!rejected.is_empty()).then_some(&rejected),
-                only_set.as_ref(),
-            );
+            let run = DiffRun::new(&progress, &cancel)
+                .with_selection((!hidden.is_empty()).then_some(&hidden), only_set.as_ref());
             // Copy/Move (repo or folder) both yield CopyStats → Copied; Sync
             // yields SyncStats → Synced. Map each to its OpResult in place.
             let copied_result = |stats: Result<dedup_core::diff::CopyStats, String>| match stats {
@@ -2046,6 +3859,8 @@ impl TransferView {
     /// preview replaces it).
     fn reset_run(&mut self) {
         self.run_log.clear();
+        self.run_problems.clear();
+        self.result.close();
         self.run_done = 0;
         self.run_total = 0;
         self.run_current.clear();
@@ -2075,6 +3890,13 @@ impl TransferView {
                 }
             }
             DiffEvent::Error { path, message } => {
+                // Session log gets every failure, so a large run's error list
+                // survives even as the live log rolls; the report keeps a
+                // capped copy for the UI.
+                log::warn!("transfer error: {path}: {message}");
+                if self.run_problems.len() < crate::run_result::MAX_PROBLEMS {
+                    self.run_problems.push(format!("{path}: {message}"));
+                }
                 self.run_log.push_back(format!("✗ {path}: {message}"));
                 while self.run_log.len() > RUN_LOG_LIMIT {
                     self.run_log.pop_front();
@@ -2089,20 +3911,74 @@ impl TransferView {
             got = true;
             match msg {
                 Msg::Progress(event) => self.apply_progress(event),
+                Msg::DiffPreview(result) => {
+                    self.previewing = false;
+                    self.apply_diff_preview(result);
+                }
+                Msg::ReviewPreview { result, confirm } => {
+                    self.previewing = false;
+                    self.apply_review_preview(result, confirm);
+                }
+                Msg::GroupPreview { result, confirm } => {
+                    self.previewing = false;
+                    self.apply_group_preview(result, confirm);
+                }
+                Msg::GroupBackPreview { result, confirm } => {
+                    self.previewing = false;
+                    self.apply_group_back_preview(result, confirm);
+                }
+                Msg::GroupDone(result) => {
+                    self.running = false;
+                    log::info!("group sync finished: {}", result.is_ok());
+                    match result {
+                        Ok(r) => {
+                            let mut report = crate::run_result::RunReport::new(format!(
+                                "Sync group '{}'",
+                                r.main
+                            ))
+                            .count("copied", r.copied)
+                            .count("deleted", r.deleted)
+                            .cancelled(r.cancelled)
+                            .problems(std::mem::take(&mut self.run_problems))
+                            .problems(r.failures);
+                            if !r.skipped.is_empty() {
+                                report = report.note(format!(
+                                    "{} sink(s) were never pushed and are now stale: {}",
+                                    r.skipped.len(),
+                                    r.skipped.join(", ")
+                                ));
+                            }
+                            // `errors` counts failures the capped list may not
+                            // hold all of; keep the true count visible.
+                            if r.errors > report.problem_count() {
+                                report = report.count("files that failed to copy", r.errors);
+                            }
+                            self.status = Some(report.headline());
+                            self.error = None;
+                            self.result.open(report);
+                        }
+                        Err(e) => self.error = Some(e),
+                    }
+                }
                 Msg::Done(result) => {
                     self.running = false;
+                    // The session log gets every finished run, so a bug report
+                    // covering the Transfer tab has a trail.
+                    log::info!("transfer finished: {result:?}");
                     match result {
                         OpResult::Copied {
                             copied,
                             cancelled,
                             moved,
                         } => {
-                            let verb = if moved { "Moved" } else { "Copied" };
-                            self.status = Some(format!(
-                                "{verb} {copied} file(s){}.",
-                                if cancelled { " (cancelled)" } else { "" }
-                            ));
+                            let verb = if moved { "Move" } else { "Copy" };
+                            let report = crate::run_result::RunReport::new(verb)
+                                .count("copied", copied)
+                                .cancelled(cancelled)
+                                .problems(std::mem::take(&mut self.run_problems));
+                            self.status = Some(report.headline());
                             self.error = None;
+                            self.result.open(report);
                         }
                         OpResult::Synced {
                             copied,
@@ -2112,23 +3988,21 @@ impl TransferView {
                             cancelled,
                             mirror,
                         } => {
-                            let mut parts = vec![format!("copied {copied}")];
-                            if deleted > 0 {
-                                parts.push(format!("deleted {deleted}"));
+                            let title = if mirror { "Mirror" } else { "Sync" };
+                            let mut report = crate::run_result::RunReport::new(title)
+                                .count("copied", copied)
+                                .count("deleted", deleted)
+                                .count("skipped", skipped)
+                                .cancelled(cancelled)
+                                .problems(std::mem::take(&mut self.run_problems));
+                            // `errors` counts failures the capped list may not
+                            // hold all of; keep the true count visible.
+                            if errors > report.problem_count() {
+                                report = report.count("errors", errors);
                             }
-                            if skipped > 0 {
-                                parts.push(format!("skipped {skipped}"));
-                            }
-                            if errors > 0 {
-                                parts.push(format!("errors {errors}"));
-                            }
-                            let verb = if mirror { "Mirror" } else { "Sync" };
-                            self.status = Some(format!(
-                                "{verb} done: {}{}.",
-                                parts.join(", "),
-                                if cancelled { " (cancelled)" } else { "" }
-                            ));
+                            self.status = Some(report.headline());
                             self.error = None;
+                            self.result.open(report);
                         }
                         OpResult::Applied { message } => {
                             self.status = Some(message);
@@ -2139,7 +4013,7 @@ impl TransferView {
                 }
             }
         }
-        if got || self.running {
+        if got || self.running || self.previewing {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -2150,6 +4024,165 @@ impl TransferView {
 /// established in `dupes_view.rs`'s `ui_tests` module.
 #[cfg(test)]
 mod ui_tests {
+    use dedup_core::diff::{DiffFile, DiffRelation};
+
+    fn dfile(rel: &str, size: u64, ms: i64) -> DiffFile {
+        DiffFile {
+            rel_path: rel.to_string(),
+            size,
+            modified_ms: ms,
+        }
+    }
+
+    fn drow(relation: DiffRelation, left: Vec<DiffFile>, right: Vec<DiffFile>) -> RepoDiffRow {
+        RepoDiffRow {
+            relation,
+            left,
+            right,
+        }
+    }
+
+    /// A row's sort keys come from the first file on each side, so a side
+    /// holding several names still sorts by one value.
+    #[test]
+    fn diff_metas_take_their_sort_keys_from_the_first_file() {
+        let rows = vec![drow(
+            DiffRelation::Renamed,
+            vec![dfile("b.jpg", 500, 20), dfile("a.jpg", 900, 10)],
+            vec![dfile("c.jpg", 700, 30)],
+        )];
+        let metas = diff_metas(&rows);
+        assert_eq!(metas[0].left_size, 500, "the first left file's size");
+        assert_eq!(metas[0].left_modified, 20);
+        assert_eq!(metas[0].right_size, 700);
+        assert_eq!(
+            metas[0].left_paths,
+            vec!["b.jpg".to_string(), "a.jpg".to_string()],
+            "every name on the side is listed, so the row grows to fit them"
+        );
+    }
+
+    /// Each relation lands in the right summary bucket. A diff plans nothing,
+    /// so nothing is ever counted as "to delete".
+    #[test]
+    fn diff_totals_bucket_each_relation() {
+        let rows = vec![
+            drow(
+                DiffRelation::Equal,
+                vec![dfile("a", 1, 0)],
+                vec![dfile("a", 1, 0)],
+            ),
+            drow(DiffRelation::OnlyLeft, vec![dfile("b", 1, 0)], vec![]),
+            drow(DiffRelation::OnlyRight, vec![], vec![dfile("c", 1, 0)]),
+            drow(
+                DiffRelation::Conflict,
+                vec![dfile("d", 1, 0)],
+                vec![dfile("d", 2, 0)],
+            ),
+            drow(
+                DiffRelation::Renamed,
+                vec![dfile("e", 1, 0)],
+                vec![dfile("f", 1, 0)],
+            ),
+        ];
+        assert_eq!(diff_totals(&rows), [0, 2, 2, 1]);
+    }
+
+    /// What a row offers follows what its two sides say about each other.
+    #[test]
+    fn diff_rows_offer_the_commands_their_relation_allows() {
+        use board::Cmd;
+        let only_left = diff_metas(&[drow(DiffRelation::OnlyLeft, vec![dfile("a", 1, 0)], vec![])]);
+        assert_eq!(
+            only_left[0].cmds,
+            vec![Cmd::CopyRight, Cmd::DeleteLeft, Cmd::Hide]
+        );
+
+        let conflict = diff_metas(&[drow(
+            DiffRelation::Conflict,
+            vec![dfile("a", 1, 0)],
+            vec![dfile("a", 2, 0)],
+        )]);
+        assert!(conflict[0].cmds.contains(&Cmd::Compare));
+        assert!(conflict[0].cmds.contains(&Cmd::OverwriteRight));
+
+        // A side holding several names is narrowed down before it can be
+        // renamed, so that side offers KEEP 1 / DEL ALL instead of RENAME.
+        let multi = diff_metas(&[drow(
+            DiffRelation::Renamed,
+            vec![dfile("a", 1, 0), dfile("b", 1, 0)],
+            vec![dfile("c", 1, 0)],
+        )]);
+        assert!(multi[0].cmds.contains(&Cmd::KeepOneLeft));
+        assert!(!multi[0].cmds.contains(&Cmd::RenameLeft));
+        assert!(
+            multi[0].cmds.contains(&Cmd::RenameRight),
+            "the 1:1 side can still be renamed"
+        );
+
+        // Equal rows are unchanged and offer nothing but HIDE.
+        let equal = diff_metas(&[drow(
+            DiffRelation::Equal,
+            vec![dfile("a", 1, 0)],
+            vec![dfile("a", 1, 0)],
+        )]);
+        assert!(equal[0].unchanged);
+        assert_eq!(equal[0].cmds, vec![Cmd::Hide]);
+    }
+
+    /// A command becomes the file operation the caller executes — and a rename
+    /// against several candidate names asks first instead of picking one.
+    #[test]
+    fn diff_commands_map_to_file_operations() {
+        use crate::diff_board::{BoardAction, PopupKind};
+        use board::Cmd;
+        let rows = vec![
+            drow(DiffRelation::OnlyLeft, vec![dfile("a", 1, 0)], vec![]),
+            drow(
+                DiffRelation::Renamed,
+                vec![dfile("x", 1, 0)],
+                vec![dfile("y", 1, 0), dfile("z", 1, 0)],
+            ),
+        ];
+        assert_eq!(
+            diff_action(&rows, 0, Cmd::CopyRight),
+            Some(BoardAction::Copy {
+                from_left: true,
+                rel_path: "a".to_string()
+            })
+        );
+        assert_eq!(
+            diff_action(&rows, 0, Cmd::DeleteLeft),
+            Some(BoardAction::Delete {
+                on_left: true,
+                rel_path: "a".to_string()
+            })
+        );
+        assert_eq!(
+            diff_action(&rows, 1, Cmd::RenameLeft),
+            Some(BoardAction::OpenPopup {
+                row: 1,
+                on_left: true,
+                kind: PopupKind::PickName
+            }),
+            "several names on the other side means asking which one"
+        );
+        assert_eq!(
+            diff_action(&rows, 1, Cmd::RenameRight),
+            Some(BoardAction::Rename {
+                on_left: false,
+                from: "y".to_string(),
+                to: "x".to_string()
+            }),
+            "the 1:1 direction renames outright"
+        );
+        assert_eq!(
+            diff_action(&rows, 0, Cmd::Hide),
+            None,
+            "HIDE is the board's own business"
+        );
+    }
+
     use super::*;
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
@@ -2175,6 +4208,683 @@ mod ui_tests {
         (tmp, Arc::new(store))
     }
 
+    /// A sink is managed through its group's main, so it is not offered as a
+    /// source or target here — only the main and ungrouped repos are.
+    #[test]
+    fn a_sink_is_not_offered_as_a_repo() {
+        let (_tmp, store) = sample_store();
+        store.create_sync_group("source", "source").expect("group");
+        store
+            .add_sync_sink("source", "target", dedup_core::store::SyncMode::AddOnly)
+            .expect("sink");
+        let mut view = TransferView::new();
+        view.sync_repos(&store);
+        assert!(
+            view.repos.contains(&"source".to_string()),
+            "the main is offered"
+        );
+        assert!(
+            !view.repos.contains(&"target".to_string()),
+            "the sink is hidden"
+        );
+    }
+
+    /// Every sink's chip **and its MODE label** must stay inside the window.
+    ///
+    /// `chip_row` wraps by greedy-packing each chip against the width the
+    /// closure's returned response reports. The MODE label is drawn after the
+    /// chip in the same row, so if it is not part of that measured response its
+    /// width is never budgeted and the row overruns the available width — a
+    /// layout bug a `query_by_label("MODE: …")` assertion cannot see, which is
+    /// why this asserts geometry instead.
+    #[test]
+    fn group_sync_sink_chips_and_modes_stay_inside_the_window() {
+        let (tmp, store) = sample_store();
+        store.create_sync_group("grp", "source").expect("group");
+        // Long names, so the row is forced to wrap rather than fitting by luck.
+        for name in [
+            "offsite-archive-north",
+            "offsite-archive-south",
+            "nas-cold-storage-two",
+            "usb-rotation-drive-c",
+        ] {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            store.create_repo(name, &dir.to_string_lossy()).unwrap();
+            store
+                .add_sync_sink("grp", name, dedup_core::store::SyncMode::Mirror)
+                .expect("sink");
+        }
+        let store2 = Arc::clone(&store);
+        let width = 900.0;
+        let mut view = TransferView::new();
+        view.loaded = true;
+        view.source = Some("source".to_string());
+        view.sync_repos(&store2);
+        view.command = Command::GroupSync;
+
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(width, 800.0))
+            .build_ui_state(
+                move |ui, view: &mut TransferView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), None);
+                },
+                view,
+            );
+        // Two frames: chip_row packs from sizes measured the previous frame.
+        h.run();
+        h.run();
+
+        for label in ["MODE: MIRROR"] {
+            for node in h.query_all_by_label(label) {
+                let r = node.rect();
+                assert!(
+                    r.right() <= width,
+                    "a sink's {label} runs off the window: right {:.1} > {width}",
+                    r.right()
+                );
+            }
+        }
+        for name in ["offsite-archive-north", "usb-rotation-drive-c"] {
+            let r = h.get_by_label(name).rect();
+            assert!(
+                r.right() <= width,
+                "sink chip {name} runs off the window: right {:.1} > {width}",
+                r.right()
+            );
+        }
+    }
+
+    /// GROUP SYNC is only offered when the source names a sync group's main.
+    #[test]
+    fn group_sync_only_offered_when_source_is_a_group_main() {
+        let (_tmp, store) = sample_store();
+        store.create_sync_group("grp", "source").expect("group");
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::AddOnly)
+            .expect("sink");
+        let store2 = Arc::clone(&store);
+        let h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+        });
+        assert!(
+            h.query_by_label("GROUP SYNC").is_some(),
+            "GROUP SYNC is offered when the source is a group's main"
+        );
+    }
+
+    /// Doc screenshot: a GROUP SYNC BACK review board with a green new-file row
+    /// and a blue resurrection row, to `docs/screenshots/group_sync_back.png`.
+    /// `--ignored` (needs wgpu).
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_group_sync_back() {
+        let (_tmp, store) = back_preview_store();
+        let mut view = TransferView::new();
+        view.loaded = true;
+        view.repos = vec!["source".to_string(), "target".to_string()];
+        view.sync_repos(&store);
+        view.source = Some("source".to_string());
+        view.refresh_group(&store);
+        view.command = Command::GroupSyncBack;
+
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 940.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut TransferView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::LIGHT);
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), None);
+                },
+                view,
+            );
+        harness.run();
+        harness.get_by_label("REVIEW").click_accesskit();
+        settle_preview(&mut harness);
+        harness.run();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("group_sync_back.png");
+        let img = harness.render().expect("wgpu render failed");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// GROUP SYNC BACK is offered under the same condition as GROUP SYNC — the
+    /// source is a group's main — as its reverse, and is a distinct command.
+    #[test]
+    fn group_sync_back_offered_when_source_is_a_group_main() {
+        let (_tmp, store) = sample_store();
+        store.create_sync_group("grp", "source").expect("group");
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::AddOnly)
+            .expect("sink");
+        let store2 = Arc::clone(&store);
+        let h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+        });
+        assert!(
+            h.query_by_label("GROUP SYNC BACK").is_some(),
+            "GROUP SYNC BACK is offered when the source is a group's main"
+        );
+        assert!(
+            h.query_by_label("GROUP SYNC").is_some(),
+            "and GROUP SYNC (the forward push) is still offered alongside it"
+        );
+    }
+
+    /// A store whose group's sink holds one file the main never saw (new) and
+    /// one the main deleted but the sink still has (resurrection).
+    fn back_preview_store() -> (tempfile::TempDir, Arc<Store>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_at(tmp.path().join("cfg")).unwrap();
+        let src = tmp.path().join("source"); // main
+        let dst = tmp.path().join("target"); // sink
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        // A file that stays on the main, so deleting the next one does not empty
+        // its index (a scan that would empty a repo is refused).
+        std::fs::write(src.join("stays.txt"), b"stays").unwrap();
+        std::fs::write(src.join("deleted.txt"), b"deleted-content").unwrap();
+        std::fs::write(dst.join("deleted.txt"), b"deleted-content").unwrap();
+        std::fs::write(dst.join("added-on-sink.txt"), b"brand-new").unwrap();
+        store.create_repo("source", &src.to_string_lossy()).unwrap();
+        store.create_repo("target", &dst.to_string_lossy()).unwrap();
+        let scan = |repo: &str| {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        };
+        scan("source");
+        scan("target");
+        // The main deletes its copy and rescans → a tombstone the sink outlives.
+        std::fs::remove_file(src.join("deleted.txt")).unwrap();
+        scan("source");
+        store.create_sync_group("grp", "source").unwrap();
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::AddOnly)
+            .unwrap();
+        (tmp, Arc::new(store))
+    }
+
+    /// GROUP SYNC BACK's REVIEW classifies the sink against the main: a file the
+    /// main never had counts as new (promote), a file the main deleted that the
+    /// sink still holds is a resurrection candidate — and both reach the board.
+    #[test]
+    fn group_sync_back_preview_separates_new_and_resurrection() {
+        let (_tmp, store) = back_preview_store();
+        let store2 = Arc::clone(&store);
+        let mut h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+            v.command = Command::GroupSyncBack;
+        });
+        h.get_by_label("REVIEW").click_accesskit();
+        settle_preview(&mut h);
+        assert_eq!(
+            h.state().preview.len(),
+            2,
+            "two rows reach the board: one new, one resurrection"
+        );
+        assert_eq!(
+            h.state().preview_totals[1],
+            1,
+            "one new file to promote (added-on-sink.txt)"
+        );
+        assert!(
+            h.state()
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("1 resurrection candidate"),
+            "status names the resurrection count: {:?}",
+            h.state().status
+        );
+        // The new row is green (OnlyHere on the main side); the resurrection row
+        // is blue (Resurrect) — the classification carried into the board.
+        let statuses: Vec<board::Status> =
+            h.state().preview.iter().map(|r| r.left_status).collect();
+        assert!(
+            statuses.contains(&board::Status::OnlyHere),
+            "a new (green) row: {statuses:?}"
+        );
+        assert!(
+            statuses.contains(&board::Status::Resurrect),
+            "a resurrection (blue) row: {statuses:?}"
+        );
+    }
+
+    /// GROUP SYNC BACK's RUN promotes only the new files into the main; the
+    /// resurrection candidate is never auto-promoted (it is opt-in, per row).
+    #[test]
+    fn group_sync_back_run_promotes_new_but_not_resurrection() {
+        let (tmp, store) = back_preview_store();
+        let store2 = Arc::clone(&store);
+        let mut h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+            v.command = Command::GroupSyncBack;
+        });
+        h.get_by_label("RUN").click_accesskit();
+        settle_preview(&mut h);
+        assert!(
+            h.state().confirm.is_some(),
+            "RUN raises a confirmation once the plan lands"
+        );
+        assert!(
+            h.state()
+                .confirm
+                .as_deref()
+                .unwrap_or_default()
+                .contains("resurrection"),
+            "the confirmation names the resurrection candidates left behind: {:?}",
+            h.state().confirm
+        );
+        h.get_by_label("PROCEED").click_accesskit();
+        for _ in 0..100 {
+            h.step();
+            if !h.state().running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!h.state().running, "the pull finished");
+        let main_dir = tmp.path().join("source");
+        assert!(
+            main_dir.join("added-on-sink.txt").exists(),
+            "the new file was promoted into the main"
+        );
+        assert!(
+            !main_dir.join("deleted.txt").exists(),
+            "the resurrection candidate was NOT auto-promoted (opt-in only)"
+        );
+    }
+
+    /// A single resurrection row's per-row APPLY pulls just that file into the
+    /// main — how a mistakenly-deleted file is recreated from the backup.
+    #[test]
+    fn group_sync_back_per_row_apply_resurrects_one_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_at(tmp.path().join("cfg")).unwrap();
+        let src = tmp.path().join("source");
+        let dst = tmp.path().join("target");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("stays.txt"), b"stays").unwrap();
+        std::fs::write(src.join("deleted.txt"), b"deleted-content").unwrap();
+        std::fs::write(dst.join("deleted.txt"), b"deleted-content").unwrap();
+        store.create_repo("source", &src.to_string_lossy()).unwrap();
+        store.create_repo("target", &dst.to_string_lossy()).unwrap();
+        let scan = |repo: &str| {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        };
+        scan("source");
+        scan("target");
+        std::fs::remove_file(src.join("deleted.txt")).unwrap();
+        scan("source");
+        store.create_sync_group("grp", "source").unwrap();
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::AddOnly)
+            .unwrap();
+        let store = Arc::new(store);
+        // A taller harness than the shared helper, so the single row's APPLY
+        // button is on-screen (the board virtualizes off-screen rows away).
+        let mut view = TransferView::new();
+        view.loaded = true;
+        view.repos = vec!["source".to_string(), "target".to_string()];
+        view.source = Some("source".to_string());
+        view.sync_repos(&store);
+        view.command = Command::GroupSyncBack;
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1120.0, 940.0))
+            .build_ui_state(
+                move |ui, view: &mut TransferView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), None);
+                },
+                view,
+            );
+        h.run();
+        h.get_by_label("REVIEW").click_accesskit();
+        settle_preview(&mut h);
+        // One row (the resurrection); its APPLY pulls just that file.
+        h.get_by_label("APPLY").click_accesskit();
+        for _ in 0..100 {
+            h.step();
+            if !h.state().running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!h.state().running, "the per-row pull finished");
+        assert!(
+            src.join("deleted.txt").exists(),
+            "the resurrection was recreated in the main by its per-row APPLY"
+        );
+    }
+
+    #[test]
+    fn group_sync_back_hidden_when_the_source_has_no_group() {
+        let (_tmp, store) = sample_store();
+        let store2 = Arc::clone(&store);
+        let h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+        });
+        assert!(
+            h.query_by_label("GROUP SYNC BACK").is_none(),
+            "GROUP SYNC BACK is hidden when the source has no group"
+        );
+    }
+
+    #[test]
+    fn group_sync_hidden_when_the_source_has_no_group() {
+        let (_tmp, store) = sample_store();
+        let store2 = Arc::clone(&store);
+        let h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+        });
+        assert!(
+            h.query_by_label("GROUP SYNC").is_none(),
+            "GROUP SYNC is hidden when the source has no group"
+        );
+    }
+
+    /// Entering GROUP SYNC hides the single TARGET picker (it has several
+    /// targets, one per sink) and shows a SINKS panel instead, defaulting to
+    /// every sink selected.
+    #[test]
+    fn group_sync_hides_target_and_shows_sinks() {
+        let (_tmp, store) = sample_store();
+        store.create_sync_group("grp", "source").expect("group");
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::Mirror)
+            .expect("sink");
+        let store2 = Arc::clone(&store);
+        let h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+            v.command = Command::GroupSync;
+        });
+        assert!(
+            h.query_by_label("TARGET").is_none(),
+            "the single TARGET picker is hidden in GROUP SYNC"
+        );
+        assert!(
+            h.query_by_label("SINKS").is_some(),
+            "the SINKS panel is shown"
+        );
+        // The SOURCE chip badges the group's main. This is the only test of the
+        // whole chain — `Store::main_repo_names` -> `TransferView::mains` ->
+        // chip badge — the rest is covered widget-side in `repo_chip`.
+        // Exact label: the section header "SINKS — WHERE THE MAIN IS PUSHED"
+        // makes a `contains` query ambiguous.
+        assert!(
+            h.query_by_label("MAIN").is_some(),
+            "the source chip badges the group's main"
+        );
+        // The chip carries the bare repo name — the identicon is hashed from it,
+        // so decorating the name gave this sink a different glyph here than on
+        // every other tab. The mode rides alongside as its own label.
+        assert!(
+            h.query_by_label("target").is_some(),
+            "the sink chip names the sink, undecorated"
+        );
+        assert!(
+            h.query_by_label("MODE: MIRROR").is_some(),
+            "the sink's stored mode is shown next to its chip"
+        );
+        assert_eq!(
+            h.state().selected_sinks,
+            vec!["target".to_string()],
+            "every sink is selected by default"
+        );
+    }
+
+    /// REVIEW plans every selected sink and folds the result into the shared
+    /// review board, exactly like every other command's preview.
+    #[test]
+    fn group_sync_review_shows_planned_copies() {
+        let (_tmp, store) = sample_store();
+        store.create_sync_group("grp", "source").expect("group");
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::AddOnly)
+            .expect("sink");
+        for repo in ["source", "target"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .expect("scan");
+        }
+        let store2 = Arc::clone(&store);
+        let mut h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+            v.command = Command::GroupSync;
+        });
+        h.get_by_label("REVIEW").click_accesskit();
+        settle_preview(&mut h);
+        assert_eq!(
+            h.state().preview_totals[1],
+            2,
+            "both source files are new to the empty sink"
+        );
+        assert!(
+            h.state()
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("1 sink"),
+            "status names the sink count: {:?}",
+            h.state().status
+        );
+    }
+
+    /// RUN plans, confirms (naming the sink count), and on PROCEED actually
+    /// pushes the main's content into the sink on a background thread.
+    #[test]
+    fn group_sync_run_pushes_to_the_sink() {
+        let (tmp, store) = sample_store();
+        store.create_sync_group("grp", "source").expect("group");
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::AddOnly)
+            .expect("sink");
+        for repo in ["source", "target"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .expect("scan");
+        }
+        let store2 = Arc::clone(&store);
+        let mut h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+            v.command = Command::GroupSync;
+        });
+        h.get_by_label("RUN").click_accesskit();
+        settle_preview(&mut h);
+        assert!(
+            h.state().confirm.is_some(),
+            "RUN raises a confirmation once the plan lands"
+        );
+        assert!(
+            h.state()
+                .confirm
+                .as_deref()
+                .unwrap_or_default()
+                .contains("1 sink"),
+            "the confirmation names the sink count: {:?}",
+            h.state().confirm
+        );
+        h.get_by_label("PROCEED").click_accesskit();
+        // The running spinner keeps requesting repaints, so `run` (step-capped)
+        // would overflow — step manually until the push finishes.
+        for _ in 0..100 {
+            h.step();
+            if !h.state().running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!h.state().running, "the push finished");
+        assert!(
+            tmp.path().join("target").join("holiday.jpg").exists(),
+            "the file actually landed in the sink"
+        );
+    }
+
+    /// The empty-main-mirror refusal (`guard_mirror_source`) survives bypassing
+    /// `plan_group_sync`/`run_group_sync` to call `plan_sync`/`diff_sync`
+    /// directly (done so the filter can be threaded through).
+    #[test]
+    fn group_sync_refuses_to_mirror_from_an_empty_main() {
+        let (_tmp, store) = sample_store();
+        store.create_sync_group("grp", "source").expect("group");
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::Mirror)
+            .expect("sink");
+        // The sink is scanned; the main ("source") never is — an empty main.
+        dedup_core::update::update_repo(
+            &store,
+            "target",
+            1,
+            &dedup_core::update::NoProgress,
+            &CancellationToken::new(),
+        )
+        .expect("scan");
+        let store2 = Arc::clone(&store);
+        let mut h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+            v.command = Command::GroupSync;
+        });
+        h.get_by_label("REVIEW").click_accesskit();
+        settle_preview(&mut h);
+        assert!(
+            h.state().error.is_some(),
+            "an empty MIRROR main is refused, not silently pushed"
+        );
+        assert!(h.state().preview.is_empty(), "nothing is planned");
+    }
+
+    /// Deselecting a sink narrows the plan to the sinks still selected — the
+    /// SINKS panel actually filters what GROUP SYNC pushes to.
+    #[test]
+    fn group_sync_deselecting_a_sink_narrows_the_plan() {
+        let (_tmp, store) = sample_store();
+        store.create_sync_group("grp", "source").expect("group");
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::AddOnly)
+            .expect("sink");
+        let other_dir = _tmp.path().join("other_sink");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        store
+            .create_repo("other_sink", &other_dir.to_string_lossy())
+            .unwrap();
+        store
+            .add_sync_sink("grp", "other_sink", dedup_core::store::SyncMode::AddOnly)
+            .expect("sink");
+        for repo in ["source", "target", "other_sink"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .expect("scan");
+        }
+        let store2 = Arc::clone(&store);
+        let mut h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+            v.command = Command::GroupSync;
+            v.selected_sinks = vec!["target".to_string()];
+        });
+        h.get_by_label("REVIEW").click_accesskit();
+        settle_preview(&mut h);
+        assert!(
+            h.state()
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("1 sink"),
+            "only the selected sink is planned: {:?}",
+            h.state().status
+        );
+    }
+
+    /// The FILTER wizard actually narrows a GROUP SYNC plan, not just the
+    /// generic COPY/MOVE/SYNC/MIRROR path — it would be worse to show a
+    /// working-looking filter panel that GROUP SYNC silently ignored.
+    #[test]
+    fn group_sync_filter_narrows_the_plan() {
+        let (_tmp, store) = sample_store();
+        store.create_sync_group("grp", "source").expect("group");
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::AddOnly)
+            .expect("sink");
+        for repo in ["source", "target"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .expect("scan");
+        }
+        let store2 = Arc::clone(&store);
+        let mut h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+            v.command = Command::GroupSync;
+        });
+        h.state_mut().filter.set_expression("name:holiday");
+        // The FILTER's live match-count keeps requesting repaints, so `run`
+        // (step-capped) would overflow — step manually past the debounce.
+        for _ in 0..5 {
+            h.step();
+        }
+        h.get_by_label("REVIEW").click_accesskit();
+        settle_preview(&mut h);
+        assert_eq!(
+            h.state().preview_totals[1],
+            1,
+            "only the filter-matching file is planned, not both source files"
+        );
+    }
+
     /// Build a headless harness showing the Transfer view over `store`, driven
     /// by the given `setup` (which runs once, before the first frame, to select
     /// repos / destination / etc.).
@@ -2196,7 +4906,7 @@ mod ui_tests {
                 move |ui, view: &mut TransferView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default(), None);
@@ -2406,7 +5116,7 @@ mod ui_tests {
                 move |ui, view: &mut TransferView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default(), None);
@@ -2417,6 +5127,61 @@ mod ui_tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("files_tab.png");
+        let img = harness.render().expect("wgpu render failed");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Doc screenshot: GROUP SYNC selected on a group's main, with the TARGET
+    /// picker hidden and the SINKS multiselect (one ADD ONLY, one MIRROR sink)
+    /// shown instead, to `docs/screenshots/transfer_group_sync.png`. First
+    /// render of this layout — the Overview-screen work this session found a
+    /// real layout bug that only showed up once actually rendered, not from
+    /// label-query tests alone, so this is checked visually before shipping.
+    /// Run with `--ignored`.
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_transfer_group_sync() {
+        let (_tmp, store) = sample_store();
+        store.create_sync_group("grp", "source").expect("group");
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::AddOnly)
+            .expect("sink");
+        let other_dir = _tmp.path().join("archive");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        store
+            .create_repo("archive", &other_dir.to_string_lossy())
+            .unwrap();
+        store
+            .add_sync_sink("grp", "archive", dedup_core::store::SyncMode::Mirror)
+            .expect("sink");
+
+        let mut view = TransferView::new();
+        view.sync_repos(&store);
+        view.source = Some("source".to_string());
+        view.refresh_group(&store);
+        view.command = Command::GroupSync;
+
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 620.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut TransferView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), None);
+                },
+                view,
+            );
+        harness.run();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("transfer_group_sync.png");
         let img = harness.render().expect("wgpu render failed");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
@@ -2446,7 +5211,7 @@ mod ui_tests {
                 move |ui, view: &mut TransferView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default(), None);
@@ -2485,7 +5250,7 @@ mod ui_tests {
                 move |ui, view: &mut TransferView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default(), None);
@@ -2516,24 +5281,28 @@ mod ui_tests {
         view.target = Some("target".to_string());
         view.preview_source_header = "/repos/source".to_string();
         view.preview_target_header = "/repos/target".to_string();
-        view.preview = vec![
-            // A copy: source unchanged (grey ✓), target added (green +).
-            review::ReviewRow {
-                source: review::SideStatus::Unchanged,
-                target: review::SideStatus::Added,
-                source_path: "holiday.jpg".to_string(),
-                target_path: "holiday.jpg".to_string(),
-            },
+        let (metas, bodies): (Vec<_>, Vec<_>) = [
+            // A copy: the source keeps it, the target gains it.
+            board_row(
+                SideSpec::at(board::Status::Same, "holiday.jpg", None),
+                SideSpec::at(board::Status::OnlyHere, "holiday.jpg", None),
+                false,
+                planned_cmds(),
+            ),
             // Unchanged on both sides (hidden until the toggle is on).
-            review::ReviewRow {
-                source: review::SideStatus::Unchanged,
-                target: review::SideStatus::Unchanged,
-                source_path: "notes.txt".to_string(),
-                target_path: "notes.txt".to_string(),
-            },
-        ];
-        view.preview_totals = [1, 0, 1];
-        review::sort(&mut view.preview, &view.review_state);
+            board_row(
+                SideSpec::at(board::Status::Same, "notes.txt", None),
+                SideSpec::at(board::Status::Same, "notes.txt", None),
+                true,
+                planned_cmds(),
+            ),
+        ]
+        .into_iter()
+        .unzip();
+        view.preview = metas;
+        view.preview_bodies = bodies;
+        view.preview_total = 2;
+        view.preview_totals = [0, 1, 0, 1];
 
         let mut init = false;
         let mut harness = Harness::builder()
@@ -2542,7 +5311,7 @@ mod ui_tests {
                 move |ui, view: &mut TransferView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store, TooltipVerbosity::default(), None);
@@ -2603,7 +5372,7 @@ mod ui_tests {
                 move |ui, view: &mut TransferView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store, TooltipVerbosity::default(), None);
@@ -2633,8 +5402,8 @@ mod ui_tests {
             "DIFF compares the repos whole, so the filter wizard is hidden"
         );
         assert!(
-            h.query_by_label("PREVIEW").is_some(),
-            "PREVIEW still builds the comparison"
+            h.query_by_label("REVIEW").is_some(),
+            "REVIEW still builds the comparison"
         );
     }
 
@@ -2652,26 +5421,30 @@ mod ui_tests {
             0,
             "equal rows are hidden by default"
         );
-        // A one-sided row offers COPY on the side that lacks it and DELETE on
-        // the side that has it; a rename offers RENAME on both sides.
+        // A one-sided row offers a copy across and a delete here; the command
+        // names its direction, so it never collides with the COPY command in
+        // the bar above.
         assert_eq!(
-            h.get_all_by_label("COPY").count(),
-            2,
-            "the COPY command button plus the row's copy-across action"
+            h.get_all_by_label("COPY >").count(),
+            1,
+            "the row offers to copy the left-only file across"
         );
-        assert!(h.query_by_label("DELETE").is_some(), "or delete it here");
-        assert_eq!(
-            h.get_all_by_label("RENAME").count(),
-            2,
-            "a renamed pair can be resolved from either side"
+        assert!(
+            h.query_by_label("DELETE L").is_some(),
+            "or delete it where it is"
         );
-        // Sizes and dates are shown for both sides.
+        assert!(
+            h.query_by_label("RENAME L").is_some() && h.query_by_label("RENAME R").is_some(),
+            "a renamed pair can be resolved from either side, and each command \
+             names the side it acts on"
+        );
+        // Each side's facts line carries its size.
         assert!(
             h.query_by_label_contains("2.00 KB").is_some(),
-            "the size column is filled"
+            "the facts line shows the size"
         );
 
-        h.get_by_label_contains("SHOW EQUAL").click();
+        h.get_by_label_contains("SHOW UNCHANGED").click();
         h.run();
         assert_eq!(
             h.get_all_by_label("notes.txt").count(),
@@ -2698,14 +5471,12 @@ mod ui_tests {
         }
         let target_dir = tmp.path().join("target");
         let mut h = diff_harness_over(Arc::clone(&store));
-        // The board renders below the command bar, so the row's COPY button is
-        // the second one on screen (the first is the COPY command).
-        match h.get_all_by_label("COPY").last() {
-            Some(button) => button.click(),
-            None => panic!("no COPY button on the board"),
-        }
+        // The row's command names its direction, so it is unambiguous against
+        // the COPY command in the bar above.
+        h.get_by_label("COPY >").click();
         // The action runs on a worker thread; pump frames until it lands.
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
             // step(), not run(): the running spinner repaints every frame.
             h.step();
             if target_dir.join("holiday.jpg").exists() {
@@ -2755,7 +5526,7 @@ mod ui_tests {
             .expect("plan diff");
         }
         h.run();
-        h.get_by_label("KEEP 1").click();
+        h.get_by_label("KEEP 1 L").click();
         h.run();
         // The popup lists all three copies; keep b.txt.
         assert!(
@@ -2883,13 +5654,89 @@ mod ui_tests {
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 
-    /// Render snapshot of the DIFF board to `target/transfer_diff.png`.
+    /// Doc screenshot of the DIFF side-by-side compare, with two genuinely
+    /// different (decodable) images at the same path, to
+    /// `docs/screenshots/diff_compare.png`. Run with `--ignored`.
     #[test]
-    #[ignore = "renders a PNG for manual inspection"]
-    fn render_diff_board() {
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_diff_compare() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        // The same relative path in both repos, different image content: a BY
+        // PATH conflict the compare can really show side by side.
+        for (repo, tint) in [("source", 40u8), ("target", 200u8)] {
+            let root = tmp.path().join(repo);
+            std::fs::create_dir_all(&root).unwrap();
+            image::RgbImage::from_fn(640, 480, |x, y| image::Rgb([x as u8, y as u8, tint]))
+                .save(root.join("holiday.png"))
+                .unwrap();
+            store.create_repo(repo, &root.to_string_lossy()).unwrap();
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &dedup_core::update::CancellationToken::new(),
+            )
+            .expect("scan test repo");
+        }
+
+        let mut view = TransferView::new();
+        view.loaded = true;
+        view.repos = vec!["source".to_string(), "target".to_string()];
+        view.source = Some("source".to_string());
+        view.target = Some("target".to_string());
+        view.command = Command::Diff;
+        view.pairing = dedup_core::diff::DiffPairing::ByPath;
+        view.diff_rows = dedup_core::diff::plan_repo_diff(
+            &store,
+            "source",
+            "target",
+            dedup_core::diff::DiffPairing::ByPath,
+        )
+        .expect("plan diff");
+
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 820.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut TransferView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), None);
+                },
+                view,
+            );
+        harness.run();
+        harness.get_by_label("COMPARE").click();
+        // Both previews decode on worker threads; run a few frames so the
+        // side-by-side A/B compare is populated before the shot.
+        for _ in 0..12 {
+            harness.run();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        harness.run();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("diff_compare.png");
+        let img = harness.render().expect("wgpu render failed");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Doc screenshot of the DIFF board — a one-sided row and a rename pair —
+    /// to `docs/screenshots/transfer_diff_board.png`.
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_diff_board() {
         let mut h = diff_harness();
-        let out =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/transfer_diff.png");
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/screenshots/transfer_diff_board.png");
         let img = h.render().expect("wgpu render failed");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
@@ -2902,8 +5749,8 @@ mod ui_tests {
     fn review_board_summarises_hides_unchanged_and_sorts() {
         let mut h = review_harness();
         assert!(
-            h.query_by_label_contains("1 added").is_some(),
-            "summary shows the added count"
+            h.query_by_label_contains("1 only on one side").is_some(),
+            "summary shows the count of files only one side has"
         );
         assert!(
             h.query_by_label_contains("1 unchanged").is_some(),
@@ -2917,7 +5764,7 @@ mod ui_tests {
         // Unchanged rows are hidden by default; the toggle reveals them. (The
         // path appears in both the source and target columns, so use query_all.)
         assert!(
-            !h.state().review_state.show_unchanged,
+            !h.state().preview_board.show_unchanged,
             "unchanged hidden by default"
         );
         assert!(
@@ -2926,61 +5773,402 @@ mod ui_tests {
         );
         h.get_by_label_contains("SHOW UNCHANGED").click();
         h.run();
-        assert!(h.state().review_state.show_unchanged, "toggle turns it on");
+        h.run();
+        assert!(h.state().preview_board.show_unchanged, "toggle turns it on");
         assert!(
             h.query_all_by_label("notes.txt").next().is_some(),
             "the unchanged row appears once shown"
         );
 
-        // Source path is the default sort column; clicking its header (the repo
-        // path) flips direction.
-        assert!(h.state().review_state.sort_asc, "starts ascending");
-        h.get_by_label_contains("/repos/source").click();
+        // Sorting is the explicit bar now, not a header click.
+        assert!(h.state().preview_board.sort_asc, "starts ascending");
+        h.get_by_label("▲").click();
         h.run();
         assert!(
-            !h.state().review_state.sort_asc,
-            "clicking the source header toggles the sort direction"
+            !h.state().preview_board.sort_asc,
+            "the direction toggle reverses the sort"
+        );
+        // Two-sided, so the board offers a side switch its one-sided
+        // counterpart does not.
+        assert!(
+            h.query_by_label("RIGHT").is_some(),
+            "a two-sided board can sort by either side"
         );
     }
 
     /// Renders the review table to a PNG for manual inspection. `--ignored`.
     #[test]
-    #[ignore = "renders a PNG for manual inspection"]
-    fn render_review_table() {
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_transfer_review_board() {
         let mut h = review_harness();
         // Seed one of each status and reveal unchanged, so the PNG shows the full
         // side-by-side vocabulary (added / removed / unchanged / absent).
         {
             let v = h.state_mut();
-            v.review_state.show_unchanged = true;
-            v.preview_totals = [1, 1, 1];
-            v.preview = vec![
-                review::ReviewRow {
-                    source: review::SideStatus::Unchanged,
-                    target: review::SideStatus::Added,
-                    source_path: "holiday.jpg".to_string(),
-                    target_path: "holiday.jpg".to_string(),
-                },
-                review::ReviewRow {
-                    source: review::SideStatus::Removed,
-                    target: review::SideStatus::Absent,
-                    source_path: "old.tmp".to_string(),
-                    target_path: String::new(),
-                },
-                review::ReviewRow {
-                    source: review::SideStatus::Unchanged,
-                    target: review::SideStatus::Unchanged,
-                    source_path: "notes.txt".to_string(),
-                    target_path: "notes.txt".to_string(),
-                },
-            ];
-            review::sort(&mut v.preview, &v.review_state);
+            v.preview_board.show_unchanged = true;
+            v.preview_totals = [1, 1, 0, 1];
+            v.preview_total = 3;
+            let (metas, bodies): (Vec<_>, Vec<_>) = [
+                board_row(
+                    SideSpec::at(board::Status::Same, "holiday.jpg", None),
+                    SideSpec::at(board::Status::OnlyHere, "holiday.jpg", None),
+                    false,
+                    planned_cmds(),
+                ),
+                board_row(
+                    SideSpec::at(board::Status::WillDelete, "old.tmp", None),
+                    SideSpec::absent(),
+                    false,
+                    planned_cmds(),
+                ),
+                board_row(
+                    SideSpec::at(board::Status::Same, "notes.txt", None),
+                    SideSpec::at(board::Status::Same, "notes.txt", None),
+                    true,
+                    planned_cmds(),
+                ),
+            ]
+            .into_iter()
+            .unzip();
+            v.preview = metas;
+            v.preview_bodies = bodies;
         }
         h.run();
-        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/transfer_review.png");
+        h.run();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
+        std::fs::create_dir_all(&dir).expect("screenshot dir");
+        let out = dir.join("transfer_review_board.png");
         let img = h.render().expect("wgpu render failed");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Pump frames until the DIFF preview worker has delivered its result.
+    /// REVIEW plans off the UI thread now, so the click's own `run()` returns
+    /// before the rows arrive; the tiny test repos finish near-instantly.
+    fn settle_preview(h: &mut Harness<'static, TransferView>) {
+        for _ in 0..100 {
+            h.run();
+            if !h.state().previewing {
+                h.run();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("diff preview did not settle");
+    }
+
+    /// REVIEW on a DIFF command plans on a worker thread and fills the board
+    /// once the comparison lands — the UI thread is never blocked on the scan.
+    #[test]
+    fn diff_preview_runs_off_thread_and_fills_the_board() {
+        let (_tmp, store) = sample_store();
+        // Give the two repos a difference to find: source has holiday.jpg,
+        // target does not; both are scanned.
+        for repo in ["source", "target"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .expect("scan");
+        }
+        let mut h = transfer_harness(Arc::clone(&store), |v| {
+            v.target = Some("target".to_string());
+            v.command = Command::Diff;
+        });
+
+        // Nothing on the board yet — the plan hasn't been asked for.
+        assert!(h.state().diff_rows.is_empty(), "board starts empty");
+
+        h.get_by_label("REVIEW").click();
+        // The result arrives over the channel from a worker thread, never inline
+        // on the UI thread; settle pumps frames until it lands.
+        settle_preview(&mut h);
+
+        assert!(!h.state().previewing, "preview finished");
+        assert!(
+            h.state()
+                .diff_rows
+                .iter()
+                .any(|r| r.left.iter().any(|f| f.rel_path == "holiday.jpg")),
+            "the comparison landed and filled the board via the worker channel"
+        );
+    }
+
+    /// REVIEW on a Copy command plans off-thread and fills the review board
+    /// once the plan lands — end to end through spawn → channel → drain, the
+    /// path the review-board tests otherwise inject around.
+    #[test]
+    fn review_preview_runs_off_thread_and_fills_the_board() {
+        let (_tmp, store) = sample_store();
+        for repo in ["source", "target"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .expect("scan");
+        }
+        // source has holiday.jpg + notes.txt, target is empty → both are "new".
+        let mut h = transfer_harness(Arc::clone(&store), |v| {
+            v.target = Some("target".to_string());
+            v.command = Command::Copy;
+        });
+        assert!(h.state().preview.is_empty(), "board starts empty");
+
+        // The button can be scrolled off the short test window; accesskit clicks
+        // reach it regardless.
+        h.get_by_label("REVIEW").click_accesskit();
+        settle_preview(&mut h);
+
+        assert!(!h.state().previewing, "preview finished");
+        assert!(
+            h.state()
+                .preview
+                .iter()
+                .any(|r| r.left_paths.iter().any(|p| p == "holiday.jpg")),
+            "the plan landed and filled the review board via the worker channel"
+        );
+    }
+
+    /// The full batch flow: RUN plans off-thread, the confirmation appears with
+    /// the real count, and PROCEED actually copies the files.
+    /// A bulk action is offered only when the listed rows actually contain the
+    /// relation it acts on, and it plans exactly the rows on screen.
+    #[test]
+    fn bulk_actions_are_offered_only_for_relations_the_rows_hold() {
+        let (_tmp, store) = sample_store();
+        let mut v = TransferView::new();
+        v.source = Some("source".into());
+        v.target = Some("target".into());
+        v.diff_rows = vec![
+            RepoDiffRow {
+                relation: DiffRelation::OnlyLeft,
+                left: vec![dfile("only_left.txt", 1, 0)],
+                right: vec![],
+            },
+            RepoDiffRow {
+                relation: DiffRelation::Equal,
+                left: vec![dfile("same.txt", 1, 0)],
+                right: vec![dfile("same.txt", 1, 0)],
+            },
+        ];
+        let metas = diff_metas(&v.diff_rows);
+        let listed = v.listed_diff_rows(&metas);
+        let offered = v.offered_bulk_ops(&listed);
+
+        assert!(
+            offered.contains(&BulkOp::CopyMissingRight),
+            "a left-only row offers copying it across"
+        );
+        assert!(
+            !offered.contains(&BulkOp::CopyMissingLeft),
+            "there is no right-only row, so the mirror action is not offered"
+        );
+        assert!(
+            !offered.contains(&BulkOp::RenameAllLeft),
+            "BY PATH never yields Renamed, so no bulk rename is offered"
+        );
+        let _ = store;
+    }
+
+    /// Hiding a row is how a bulk action is opted out of — the plan must skip it.
+    #[test]
+    fn a_hidden_row_is_left_out_of_a_bulk_plan() {
+        let (_tmp, _store) = sample_store();
+        let mut v = TransferView::new();
+        v.source = Some("source".into());
+        v.target = Some("target".into());
+        v.diff_rows = vec![
+            RepoDiffRow {
+                relation: DiffRelation::OnlyLeft,
+                left: vec![dfile("keep.txt", 1, 0)],
+                right: vec![],
+            },
+            RepoDiffRow {
+                relation: DiffRelation::OnlyLeft,
+                left: vec![dfile("skip.txt", 1, 0)],
+                right: vec![],
+            },
+        ];
+        let metas = diff_metas(&v.diff_rows);
+        v.preview_board.hidden.insert(metas[1].key.clone());
+
+        let listed = v.listed_diff_rows(&metas);
+        assert_eq!(listed, vec![0], "the hidden row is not listed");
+        let plan = v.bulk_plan(BulkOp::CopyMissingRight, &listed);
+        assert_eq!(plan.len(), 1, "and is not in the plan: {plan:?}");
+    }
+
+    /// End to end against real files: the bulk copy lands every listed file on
+    /// disk in the target repo.
+    #[test]
+    fn a_bulk_copy_lands_every_listed_file_on_disk() {
+        let (tmp, store) = sample_store();
+        for repo in ["source", "target"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .expect("scan");
+        }
+        let target_dir = tmp.path().join("target");
+        assert!(!target_dir.join("holiday.jpg").exists());
+
+        let mut h = transfer_harness(Arc::clone(&store), |v| {
+            v.target = Some("target".to_string());
+            v.command = Command::Diff;
+            v.diff_rows = vec![
+                RepoDiffRow {
+                    relation: DiffRelation::OnlyLeft,
+                    left: vec![dfile("holiday.jpg", 15, 0)],
+                    right: vec![],
+                },
+                RepoDiffRow {
+                    relation: DiffRelation::OnlyLeft,
+                    left: vec![dfile("notes.txt", 15, 0)],
+                    right: vec![],
+                },
+            ];
+        });
+        h.run();
+
+        let metas = diff_metas(&h.state().diff_rows);
+        let listed = h.state().listed_diff_rows(&metas);
+        let plan = h.state().bulk_plan(BulkOp::CopyMissingRight, &listed);
+        assert_eq!(plan.len(), 2, "both left-only files are planned");
+
+        h.state_mut().start_bulk(&store, plan);
+        // Wait for the worker rather than polling a fixed budget — the fixed
+        // budget was a known flake in this file.
+        for _ in 0..600 {
+            h.run();
+            if !h.state().running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        assert!(
+            target_dir.join("holiday.jpg").exists(),
+            "the bulk copy landed the first file"
+        );
+        assert!(target_dir.join("notes.txt").exists(), "and the second");
+    }
+
+    #[test]
+    fn run_asks_then_copies_on_proceed() {
+        let (tmp, store) = sample_store();
+        for repo in ["source", "target"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .expect("scan");
+        }
+        let target_dir = tmp.path().join("target");
+        let mut h = transfer_harness(Arc::clone(&store), |v| {
+            v.target = Some("target".to_string());
+            v.command = Command::Copy;
+        });
+
+        h.get_by_label("RUN").click_accesskit();
+        settle_preview(&mut h); // the plan lands and raises the confirmation
+        assert!(
+            h.state().confirm.is_some(),
+            "RUN raises a confirmation once the plan lands"
+        );
+        assert!(
+            h.state()
+                .confirm
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Copy 2 file(s)"),
+            "the prompt carries the real count: {:?}",
+            h.state().confirm
+        );
+
+        h.get_by_label("PROCEED").click_accesskit();
+        // Wait for the worker to actually finish, not for a fixed number of
+        // ticks: the copy runs on a background thread, and a wall-clock budget
+        // sized for an idle machine fails intermittently under a loaded test
+        // run even though the run itself is healthy.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            h.step();
+            if !h.state().running && h.state().error.is_none() {
+                break;
+            }
+            if target_dir.join("holiday.jpg").exists() && target_dir.join("notes.txt").exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            target_dir.join("holiday.jpg").exists() && target_dir.join("notes.txt").exists(),
+            "PROCEED copied the planned files: err={:?} running={} status={:?}",
+            h.state().error,
+            h.state().running,
+            h.state().status
+        );
+    }
+
+    /// A batch RUN plans off-thread, so the command/target can change before the
+    /// confirmation lands. The prompt and the run it authorises must describe the
+    /// config that was *planned*, not whatever the live controls say now.
+    #[test]
+    fn confirm_runs_the_planned_config_not_the_current_controls() {
+        let mut view = TransferView::new();
+        let planned = RunConfig {
+            source: "SRC".to_string(),
+            command: Command::Copy,
+            dest: StartDest::Repo {
+                references: Vec::new(),
+                target: "DEST_A".to_string(),
+                subdir: String::new(),
+            },
+            filter: None,
+            move_files: false,
+        };
+        let data = ReviewPreviewData {
+            rows: Vec::new(),
+            bodies: Vec::new(),
+            preview_total: 5,
+            sync_delete_total: 0,
+            preview_totals: [0, 5, 0, 0],
+            source_header: "SRC".to_string(),
+            target_header: "DEST_A".to_string(),
+            status: String::new(),
+        };
+        // The user has since flipped the live controls to a Move elsewhere.
+        view.command = Command::Move;
+        view.target = Some("DEST_B".to_string());
+        view.apply_review_preview(Ok(data), Some(Box::new(planned)));
+
+        let prompt = view.confirm.as_deref().unwrap_or_default();
+        assert!(
+            prompt.contains("Copy 5 file(s)") && prompt.contains("DEST_A"),
+            "the confirmation describes the planned Copy into DEST_A, got: {prompt}"
+        );
+        let pending = view.pending_confirm.as_ref().expect("a run is pending");
+        assert!(
+            pending.command == Command::Copy,
+            "PROCEED runs the planned command"
+        );
+        assert!(
+            matches!(&pending.dest, StartDest::Repo { target, .. } if target == "DEST_A"),
+            "and the planned target"
+        );
     }
 }

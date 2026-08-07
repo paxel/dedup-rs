@@ -41,7 +41,8 @@ everything currently marked, batched per repo in one transaction, behind a confi
 Results page 50 groups at a time (← / → to navigate). Each group shows a header (copy count,
 size, reclaimable bytes) and one card per file:
 
-- Thumbnail (click to open the [lightbox](#lightbox)), path, repo, size, dimensions, mtime.
+- Thumbnail (click to open the [viewer](#the-viewer-lightbox)), path, repo, size, dimensions,
+  mtime.
 - **from `<repo>`** — if this file's provenance is known (it was copied/synced in from
   another repo).
 - Audio files get inline **PLAY/PAUSE** + a seek bar (see [Audio preview](#audio-preview)).
@@ -55,38 +56,124 @@ size, reclaimable bytes) and one card per file:
   **SHOW IN FOLDER** (reveal it in the file manager) — the full-fidelity escape hatch for
   any file type, and the designated way to actually play a video full-screen.
 
-## Lightbox
+## The viewer (lightbox)
 
-Click any image or video thumbnail to open the full-window lightbox.
+Click any card — the thumbnail, or the typed placeholder a document or archive shows instead
+of a picture — to open the full-window viewer. It is the **same viewer every surface opens**:
+Browse, the review boards and Transfer's DIFF all land on this one screen, so it behaves
+identically wherever you came from. It opens on the clicked file alone, on the file's own
+representation: a photo on Image, a track on Audio, a document on Text.
 
-![Lightbox in A/B compare mode](../screenshots/lightbox_compare.png)
+![The viewer in A/B compare mode](../screenshots/lightbox_compare.png)
 
-**Images**: mouse-wheel zooms around the cursor, drag pans. `F` fits to window / `1` shows
-true pixels (100%, one screen pixel per image pixel). `←`/`→` step through the group's other
-copies. `Del`/`K` toggles the mark on the shown file (respecting read-only). `Esc` or CLOSE
-exits. Full-resolution decoding runs off the UI thread with an aggressively-capped texture
-cache, so even a very large photo never freezes the interface — the thumbnail shows upscaled
-until the full image lands.
+**Two sides.** SHOW B reveals a second side — another member of the group, never the file
+already shown — and HIDE B returns the first file to the whole screen. Each side carries its
+own identifying facts (repo, path, size, date, type) and its own mark pill: **DELETE** for a
+single file, **DELETE A** / **DELETE B** while both are shown, each toggling only its own
+copy's mark without closing the viewer. A copy in a read-only repository shows a disabled,
+struck-through `… (Protected)` pill instead.
 
-**Videos**: the lightbox is a scrubbable filmstrip instead of a zoomable image — ten
-evenly-spaced stills, with the frame under the cursor enlarged, so you can identify a clip
-and judge its quality without full playback. Frames are extracted with `ffmpeg` on demand and
-cached; without ffmpeg the card and strip fall back to a placeholder. Full playback is the
-OPEN (external app) path.
+**Switching copies.** With one file shown, the switcher (`< PREV A`, `<1 / 2>`, `NEXT A >`)
+steps through the whole group. With both sides shown, each side's switcher skips the file
+the other side is showing — the two sides can never be the same file — and the position
+counts that side's candidates, never the group size; a two-copy group then offers no
+switcher at all, because the only other candidate is already on the other side.
 
-### A/B compare
+### Representation tabs
 
-Press `C` (or the COMPARE button; images only, needs ≥2 copies in the group) to pit the shown
-copy against the group's best copy, with a shared, resolution-independent zoom/pan:
+A file can be looked at in more than one way, so the viewer is tabbed by *representation*.
+The tab bar offers every representation at least one side has — **Image**, **Video**,
+**Audio**, **Metadata**, **Text**, **Render**, **Strings**, **Hex** — a photo has no Audio tab, an
+untagged FLAC no Metadata tab, **Text** only a file with readable words, and **Render** only a
+PDF; but **Strings** and **Hex** are offered for every file. Selecting a tab draws only the
+column(s) whose file supports it, always
+left (A) against right (B), never stacked. If a side steps to a copy that lacks the current
+representation, the viewer drops back to the pair's own representation.
 
-- **SIDE BY SIDE** (default) — both panes at once, each labeled A/B.
-- **FLICKER** — one full-window pane; `space` swaps between A and B in place, the fastest way
-  to spot compression artifacts.
-- The bottom metadata strip shows both files' size and dimensions, with the larger value
-  highlighted.
-- **MARK A** / **MARK B** toggle either copy's deletion mark independently; `Del`/`K` marks B
-  (the compare candidate) while comparing.
-- **EXIT COMPARE** (or `C` again) returns to the single-image view.
+**Image**: mouse-wheel zooms around the cursor, drag pans, and FLICKER (or `space`) shows one
+file at a time in the pane — the fastest way to spot a subtle edit. Flicker is **single-file
+focus**: only the shown file's facts and its ROTATE / MIRROR / SAVE / delete are on screen, and
+**SWAP** flips the picture and all of that to the other file together, so there is no hidden
+side to act on by accident; SIDE BY SIDE returns. ROTATE / MIRROR turn
+one side to align a copy somebody flipped; the turn carries into the comparison. **SAVE** then
+writes the turned image to disk: **OVERWRITE** replaces it in place, **SAVE COPY** writes a
+`_rot` sibling and leaves the original alone. A **locked** ("Protected") repository allows the
+copy — it only adds a file — but not the overwrite or a delete, which are shown disabled with
+the reason. Either way the file keeps its modified time — a turned scan is still the same
+photograph from the same date — or, when the image carries an EXIF capture date, the dialog can
+stamp the file's date from EXIF instead. An overwrite re-indexes the file immediately, so its
+new content identity is never stale.
+
+**Audio** compares as spectrograms — frequency-vs-time, far more telling than a flat waveform
+— with a transport per side: **PLAY A** / **PLAY B**, **PAUSE**, and a cycling **SPEED** pill
+(slowing a passage makes small differences between two takes audible). Playing while both
+sides are shown loads the two copies as a synced pair, so `←`/`→` flip which copy is audible
+instantly and gap-free — any difference is audible rather than masked by a pause. With one
+file shown, `←`/`→` step through the group keeping the transport state: playing keeps playing
+the newly shown copy, and a deliberate pause stays paused with the new copy loaded, so play
+resumes the file you are actually looking at. `P` toggles play/pause.
+
+**Metadata** shows the file's tags. For MP3/WAV/AIFF that is the ID3 editor: EDIT TAGS opens
+Title/Artist/Album/Year/Track/Genre for that copy, the `>` beside a field offers the value any
+other copy in the group carries (adopt the best one), and SAVE TAGS writes only the tags — the
+audio itself is untouched. `T` jumps straight here with the editor open. A file in a read-only
+repository is shown but never editable. For images the tab lists **every EXIF field** the
+file carries — camera, capture date, exposure, GPS, all of it — as recorded; EXIF is not
+edited here. When two files are compared, the fields that **differ** between them are
+highlighted, and **SAVE METADATA** writes a side's fields to a plain-text sidecar in a folder
+you pick — so the Title/Author/Keywords are rescued before you delete a copy.
+
+![The Metadata tab, editing one copy's ID3 tags against another's](../screenshots/lightbox_metadata.png)
+
+**Text** is offered for a file with **readable text** — a **document whose purpose is text** (a
+PDF, a Word or OpenDocument file, a spreadsheet, a presentation, or an email; see
+[Document formats read as text](index.md#document-formats-read-as-text)) or a **plain-text file**
+(`.txt`, `.md`, `.csv`, source). For a document it shows the **extracted words**; for a plain-text
+file, its text as written. One file shows its content; comparing two, their content is
+**line-aligned side by side** so you can read what changed. Equal lines sit across from each
+other; a line only one side has leaves the other blank (**green**); a line that changed shows
+both versions with the differing characters marked (**amber**). Nothing is declared "the same" —
+identical content simply shows no marks. A document that yields no text (scanned, encrypted, or
+empty) says so plainly. Raw bytes are not here — they have their own **Hex** tab.
+
+![The Text tab comparing two documents' extracted content](../screenshots/content_diff.png)
+
+**Render** shows a **PDF** rasterized to its page — the document as it actually *looks*, not its
+extracted words. Comparing two, their pages sit side by side to be judged by eye: there is no
+automated pixel diff and no "same" verdict, because different rendering (fonts, antialiasing)
+makes pixel equality meaningless. It's the visual counterpart to the Text tab's content diff —
+one reads the words, the other shows the page. Requires `pdftoppm` (poppler) at runtime; without
+it the tab simply doesn't appear, the same way video needs `ffmpeg`.
+
+![Two PDFs rendered to pages, side by side on the Render tab](../screenshots/render.png)
+
+**Strings** is offered for **every** file and shows the printable runs (four or more readable
+characters) embedded in its bytes — the text hiding inside a binary: an image's EXIF strings, an
+audio file's tags, a program's paths and version banners. One file lists its runs; comparing
+two aligns them so shared embedded text lines up and each side's distinct runs stand out (the
+same green/amber marking as the content diff). It's the forensic "what text is in here" view for
+files that aren't documents.
+
+![The Strings tab surfacing a binary's embedded runs](../screenshots/strings.png)
+
+**Hex** is offered for **every** file, with no exceptions — the raw bytes are always one click
+away. One file shows an offset/hex/ASCII dump of its head; comparing **two** it becomes a
+**full-file, aligned hex diff**: the byte streams are aligned so equal runs line up — even when
+one side has an inserted header — with the differences marked (a **green** gap where bytes exist
+on only one side, **amber** where they differ on both). It **paginates** through the whole file,
+**jump to next/previous difference** skips the long equal stretches, and a very large or
+pervasively-different pair falls back to a coarse block-level match and says so. So two
+same-sized "duplicates" that differ only in an inserted metadata header read as exactly that.
+
+![The Hex tab comparing two files as an aligned hex diff](../screenshots/hex_diff.png)
+
+**Videos** compare as one representative still per side, enough to tell two clips apart at a
+glance. Full playback stays the OPEN (external app) path.
+
+![Two clips side by side in the viewer](../screenshots/video_compare.png)
+
+`Esc` steps back one level — out of flicker, or an open tag editor — and then closes the
+viewer; whatever the viewer was playing falls silent with it.
 
 ## Audio preview
 
@@ -97,9 +184,12 @@ starting another replaces it. Playback survives scrolling and stops automaticall
 switch away from the Duplicates tab. Requires ALSA on Linux at build time (see the README);
 with no audio device at runtime, the controls still render and playback is simply a no-op.
 
+The [viewer](#the-viewer-lightbox) shares the same single audio device: opening a track there
+and pressing PLAY replaces what a card was playing, and closing the viewer silences what it
+started while leaving a card's own playback alone.
+
 ## Video preview
 
 Video duplicate cards show a real still frame (sampled mid-timeline) instead of a generic
-icon, using the same evenly-spaced grid the lightbox filmstrip uses — so the card's frame is
-reused there instead of being extracted twice. Without ffmpeg on `PATH`, the card falls back
-to the placeholder.
+icon. Frames are extracted with `ffmpeg` on demand and cached; without ffmpeg on `PATH`, the
+card falls back to the placeholder.

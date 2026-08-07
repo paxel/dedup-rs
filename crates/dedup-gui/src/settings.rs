@@ -19,6 +19,30 @@ pub enum TooltipVerbosity {
     Verbose,
 }
 
+/// Which appearance the interface uses. **Dark is the default** — colour here is
+/// semantic (red means files will be deleted), so an existing user must never be
+/// repainted into a new vocabulary by an update; light is strictly opt-in.
+/// `System` follows the desktop's own light/dark setting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ThemeChoice {
+    /// Follow the desktop's light/dark setting.
+    System,
+    Light,
+    #[default]
+    Dark,
+}
+
+impl ThemeChoice {
+    /// The egui preference this choice maps to.
+    pub fn preference(self) -> egui::ThemePreference {
+        match self {
+            Self::System => egui::ThemePreference::System,
+            Self::Light => egui::ThemePreference::Light,
+            Self::Dark => egui::ThemePreference::Dark,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -30,6 +54,10 @@ pub struct Settings {
     pub transfer_similarity_threshold: f64,
     /// Hover-tooltip wording: short one-liners or verbose explanations.
     pub tooltip_verbosity: TooltipVerbosity,
+    /// Interface appearance. Absent in configs written before the light theme
+    /// existed; `#[serde(default)]` then fills it with `Dark`, so an upgrade
+    /// never repaints an existing user's semantic colours.
+    pub theme: ThemeChoice,
     /// Last window inner size in logical points `[w, h]`, restored next launch
     /// (`None` until the window has been sized once).
     pub window_size: Option<[f32; 2]>,
@@ -42,6 +70,7 @@ impl Default for Settings {
             similarity_threshold: 99.0,
             transfer_similarity_threshold: 90.0,
             tooltip_verbosity: TooltipVerbosity::default(),
+            theme: ThemeChoice::default(),
             window_size: None,
         }
     }
@@ -84,6 +113,7 @@ mod tests {
             similarity_threshold: 97.5,
             transfer_similarity_threshold: 88.0,
             tooltip_verbosity: TooltipVerbosity::Verbose,
+            theme: ThemeChoice::Light,
             window_size: Some([1280.0, 800.0]),
         };
         s.save(dir.path());
@@ -92,6 +122,35 @@ mod tests {
         // Corrupt file → defaults, never a panic.
         std::fs::write(dir.path().join(FILE), b"not json").unwrap();
         assert_eq!(Settings::load(dir.path()), Settings::default());
+    }
+
+    /// A settings file written before the light theme existed has no `theme`
+    /// field; it must load as Dark, not as whatever egui would otherwise pick.
+    /// This is the upgrade path that protects an existing user's colours.
+    #[test]
+    fn a_config_without_a_theme_field_loads_as_dark() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(FILE),
+            br#"{"threads":2,"similarity_threshold":95.0}"#,
+        )
+        .unwrap();
+        assert_eq!(Settings::load(dir.path()).theme, ThemeChoice::Dark);
+        assert_eq!(ThemeChoice::default(), ThemeChoice::Dark);
+    }
+
+    /// The theme tags round-trip as plain strings, so a later rename cannot
+    /// silently reset everyone's choice on the next load.
+    #[test]
+    fn theme_json_tags_are_stable() {
+        for (choice, tag) in [
+            (ThemeChoice::System, "\"System\""),
+            (ThemeChoice::Light, "\"Light\""),
+            (ThemeChoice::Dark, "\"Dark\""),
+        ] {
+            assert_eq!(serde_json::to_string(&choice).unwrap(), tag);
+            assert_eq!(serde_json::from_str::<ThemeChoice>(tag).unwrap(), choice);
+        }
     }
 
     /// The verbosity tag round-trips through JSON as a plain string, so a

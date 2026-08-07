@@ -10,7 +10,6 @@ pub fn help_text(tab: Tab) -> &'static str {
         Tab::Duplicates => DUPLICATES,
         Tab::Transfer => TRANSFER,
         Tab::Grooming => GROOMING,
-        Tab::SyncGroups => SYNC_GROUPS,
         Tab::Browse => BROWSE,
     }
 }
@@ -51,7 +50,10 @@ best copy is starred. AUTO-RESOLVE REST marks every non-best copy at once. DELET
 runs the batch behind a confirmation — or turn on QUICK DELETE to skip confirmation per \
 group.
 
-Click a thumbnail to open the lightbox (zoom, A/B compare, audio/video preview). Right-click \
+Click a thumbnail to open the lightbox. It opens on Overview — both files' facts, repos and \
+mark pills side by side — and its tabs offer whatever the two files can show: Image, Video \
+or Audio for zoom, filmstrip and A/B compare; Metadata for ID3 tags and EXIF capture facts; \
+Text for a text or hex preview of documents and anything else without a picture. Right-click \
 a card for OPEN and SHOW IN FOLDER.";
 
 const TRANSFER: &str = "\
@@ -66,6 +68,18 @@ the same, then marks the source entries missing. SYNC mirrors the source into th
 the same relative path, and can also delete target files whose content the source has lost \
 (DELETE MISSING).
 
+GROUP SYNC replaces the single TARGET with a SINKS picker, and only appears when the SOURCE \
+is a backup group's main (groups are created on the Repositories tab). Each sink pushes in \
+its own stored mode: ADD ONLY copies content it lacks and never deletes, so a sink may keep \
+files the main no longer has; MIRROR also deletes sink content the main does not have, so it \
+ends up holding exactly the main's content — those deletions cannot be undone. REVIEW plans \
+every selected sink and shows what would be copied and deleted, without touching disk; RUN \
+asks for confirmation — naming the sink count and any sink a MIRROR push would empty \
+entirely — then pushes on a background thread. Sinks are handled independently, so one \
+unreachable backup drive does not stop the others, and the main is never changed. To bring \
+changes made inside a sink back to the main, use DIFF with the sink as source and the main \
+as target.
+
 DIFF is the manual view: it compares the two repos side by side and leaves every decision \
 to you. PAIR BY HASH matches files by content, so the same file under two names is one row \
 you can settle with a rename; PAIR BY PATH matches by name and folder, so the same name \
@@ -78,29 +92,9 @@ values highlighted — and the same actions per side. Nothing happens until you 
 button; rows that are equal on both sides are hidden until you ask for them.
 
 Use the FILTER wizard below to narrow which files are considered — conditions combine with \
-AND. PREVIEW shows the matching transfers, paged, plus a total count, without touching \
+AND. REVIEW shows the matching transfers, paged, plus a total count, without touching \
 disk. RUN asks for confirmation, then performs the transfer while you watch its progress — \
 CANCEL stops it at any point.";
-
-const SYNC_GROUPS: &str = "\
-Keep one repository backed up to one or more others, without the manual duplicate-and-\
-relocate dance.
-
-A sync group is a MAIN repository plus the SINKS it is pushed to. Create a group around \
-the repo you want backed up, then add each backup location as a sink — a repository \
-belongs to at most one group, and while it is in one it cannot be renamed or removed by \
-accident.
-
-The group's mode decides what a push does. ADD ONLY copies content a sink lacks and never \
-deletes anything, so a sink may keep files the main no longer has. MIRROR also deletes \
-sink content the main does not have, so each sink ends up holding exactly the main's \
-content — those deletions cannot be undone.
-
-PREVIEW plans every sink and shows what would be copied and deleted without touching disk; \
-RUN SYNC asks for confirmation and then pushes on a background thread. Each sink is handled \
-independently, so one unreachable backup drive does not stop the others, and the main is \
-never changed. To bring changes made inside a sink back to the main, use the Transfer tab's \
-DIFF command with the sink and the main.";
 
 const GROOMING: &str = "\
 Prune and reorganize a single repository. Pick a command from the bar at the top; each has \
@@ -135,7 +129,7 @@ never outside it.
 Save the current rule list as a preset with STORE PRESET, to reuse on any repo; right-click a \
 preset to rename it.
 
-Every destructive command runs behind a PREVIEW and a confirmation dialog, on a background \
+Every destructive command runs behind a REVIEW and a confirmation dialog, on a background \
 thread with a CANCEL button.";
 
 const BROWSE: &str = "\

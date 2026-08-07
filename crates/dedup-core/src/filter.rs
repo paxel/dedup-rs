@@ -8,6 +8,25 @@
 //! characters, including `/`) anchored to the whole relative path — so
 //! `name:*.db` matches paths ending in `.db` and `name:copy_of*` matches paths
 //! starting with `copy_of`.
+//!
+//! # Negation
+//!
+//! Any condition may be negated by prefixing it with `!`: `!name:*.mp3` matches
+//! everything that is *not* an MP3, `!mime:image` everything that is not an
+//! image. Because conditions combine with AND, mixing plain and negated
+//! conditions reads as "matches every plain condition and none of the negated
+//! ones" — `mime:image !name:*thumb*` is "images, except thumbnails".
+//!
+//! The `!` is only special at the start of a condition, immediately before a
+//! known prefix, so it never needs escaping inside a value: `name:!important`
+//! searches for the literal text `!important`.
+//!
+//! # Case sensitivity
+//!
+//! Matching is case-sensitive by default. A `case:insensitive` token anywhere in
+//! the expression makes every text comparison in it case-insensitive (`mime:`,
+//! `name:`, `origin:` and `tag:`); `case:sensitive` states the default
+//! explicitly. Size and date conditions are unaffected either way.
 
 use crate::store::{FileEntry, StoreError, annotations_of_db, for_each_file_entry};
 use std::collections::HashMap;
@@ -36,6 +55,11 @@ pub enum FileFilter {
     TakenBefore(i64),
     /// Combine multiple filters with AND logic.
     And(Vec<FileFilter>),
+    /// Inverts the wrapped condition (`!name:*.mp3`).
+    Not(Box<FileFilter>),
+    /// Evaluates the wrapped subtree with case-insensitive text comparison
+    /// (`case:insensitive`). Size and date conditions are unaffected.
+    NoCase(Box<FileFilter>),
 }
 
 /// Best-known date of a file: EXIF capture time when present, else file mtime.
@@ -125,6 +149,9 @@ pub enum FilterError {
 
     #[error("Invalid date filter '{0}': expected YYYY[-MM[-DD]]")]
     InvalidDate(String),
+
+    #[error("Invalid case filter '{0}': expected case:sensitive or case:insensitive")]
+    InvalidCase(String),
 }
 
 impl FileFilter {
@@ -145,15 +172,31 @@ impl FileFilter {
         // another field's prefix (e.g. `name:report size:big`) is still split
         // into separate filters — keep such tokens out of substring values.
         let mut filters = Vec::new();
+        let mut case_insensitive = false;
         for group in Self::split_groups(filter) {
+            // `case:` is a modifier on the whole expression, not a condition, so
+            // it contributes no filter of its own.
+            if let Some(rest) = group.strip_prefix("case:") {
+                case_insensitive = match rest.trim() {
+                    "insensitive" => true,
+                    "sensitive" => false,
+                    other => return Err(FilterError::InvalidCase(other.to_string())),
+                };
+                continue;
+            }
             filters.push(Self::parse_single(group)?);
         }
 
-        match filters.len() {
-            0 => Ok(Self::All),
-            1 => Ok(filters.remove(0)),
-            _ => Ok(Self::And(filters)),
-        }
+        let base = match filters.len() {
+            0 => Self::All,
+            1 => filters.remove(0),
+            _ => Self::And(filters),
+        };
+        Ok(if case_insensitive {
+            Self::NoCase(Box::new(base))
+        } else {
+            base
+        })
     }
 
     /// Split a filter expression into groups, each beginning at a known
@@ -164,8 +207,8 @@ impl FileFilter {
     /// leading text before the first prefix is kept as its own group so
     /// genuinely unknown input is still rejected by `parse_single`.
     fn split_groups(filter: &str) -> Vec<&str> {
-        const PREFIXES: [&str; 8] = [
-            "mime:", "name:", "size:", "origin:", "tag:", "date:", "before:", "after:",
+        const PREFIXES: [&str; 9] = [
+            "mime:", "name:", "size:", "origin:", "tag:", "date:", "before:", "after:", "case:",
         ];
         let bytes = filter.as_bytes();
         let mut starts: Vec<usize> = Vec::new();
@@ -174,7 +217,15 @@ impl FileFilter {
                 continue;
             }
             let at_boundary = i == 0 || bytes[i - 1].is_ascii_whitespace();
-            if at_boundary && PREFIXES.iter().any(|p| filter[i..].starts_with(p)) {
+            // A group may open with `!` to negate it, so `!name:x` starts a group
+            // exactly where `name:x` would. The `!` is therefore only meaningful
+            // here, at a group boundary — inside a value it is ordinary text.
+            let rest = &filter[i..];
+            let opens_group = PREFIXES.iter().any(|p| rest.starts_with(p))
+                || rest
+                    .strip_prefix('!')
+                    .is_some_and(|r| PREFIXES.iter().any(|p| r.starts_with(p)));
+            if at_boundary && opens_group {
                 starts.push(i);
             }
         }
@@ -193,6 +244,12 @@ impl FileFilter {
         let filter = filter.trim();
         if filter.is_empty() {
             return Ok(Self::All);
+        }
+        // A leading `!` negates the condition. Only recognised here, at the start
+        // of a condition, so a value may contain `!` freely.
+        if let Some(rest) = filter.strip_prefix('!') {
+            let inner = Self::parse_single(rest.trim())?;
+            return Ok(Self::Not(Box::new(inner)));
         }
         if let Some(rest) = filter.strip_prefix("mime:") {
             return Ok(Self::Mime(rest.trim().to_string()));
@@ -261,24 +318,40 @@ impl FileFilter {
     /// Whether the file matches, given its annotation `tags`. Identical to
     /// [`Self::matches`] for filters without a `tag:` condition.
     pub fn matches_tagged(&self, rel_path: &str, entry: &FileEntry, tags: &[String]) -> bool {
+        self.matches_inner(rel_path, entry, tags, false)
+    }
+
+    /// The matcher proper. `ci` carries case-insensitivity down from an
+    /// enclosing [`Self::NoCase`], so the flag lives in the traversal rather
+    /// than in every leaf's data.
+    fn matches_inner(&self, rel_path: &str, entry: &FileEntry, tags: &[String], ci: bool) -> bool {
+        // Substring test honouring the inherited case mode.
+        let has = |haystack: &str, needle: &str| {
+            if ci {
+                haystack.to_lowercase().contains(&needle.to_lowercase())
+            } else {
+                haystack.contains(needle)
+            }
+        };
         match self {
             Self::All => true,
-            Self::Mime(substring) => entry
-                .mime
-                .as_ref()
-                .is_some_and(|mime| mime.contains(substring)),
+            Self::Mime(substring) => entry.mime.as_ref().is_some_and(|mime| has(mime, substring)),
             Self::Name(pattern) => {
                 if pattern.contains('*') {
-                    glob_match(pattern, rel_path)
+                    if ci {
+                        glob_match(&pattern.to_lowercase(), &rel_path.to_lowercase())
+                    } else {
+                        glob_match(pattern, rel_path)
+                    }
                 } else {
-                    rel_path.contains(pattern)
+                    has(rel_path, pattern)
                 }
             }
             Self::Origin(substring) => entry
                 .origin
                 .as_ref()
-                .is_some_and(|origin| origin.contains(substring)),
-            Self::Anno(substring) => tags.iter().any(|t| t.contains(substring)),
+                .is_some_and(|origin| has(origin, substring)),
+            Self::Anno(substring) => tags.iter().any(|t| has(t, substring)),
             Self::TakenAfter(ms) => best_date_ms(entry) >= *ms,
             Self::TakenBefore(ms) => best_date_ms(entry) < *ms,
             Self::Size(op, value) => match op {
@@ -290,7 +363,9 @@ impl FileFilter {
             },
             Self::And(filters) => filters
                 .iter()
-                .all(|f| f.matches_tagged(rel_path, entry, tags)),
+                .all(|f| f.matches_inner(rel_path, entry, tags, ci)),
+            Self::Not(inner) => !inner.matches_inner(rel_path, entry, tags, ci),
+            Self::NoCase(inner) => inner.matches_inner(rel_path, entry, tags, true),
         }
     }
 
@@ -301,6 +376,7 @@ impl FileFilter {
         match self {
             Self::Anno(_) => true,
             Self::And(filters) => filters.iter().any(FileFilter::uses_annotations),
+            Self::Not(inner) | Self::NoCase(inner) => inner.uses_annotations(),
             _ => false,
         }
     }
@@ -527,6 +603,119 @@ mod tests {
     fn invalid_filters_are_rejected() {
         assert!(FileFilter::parse(Some("bogus:x")).is_err());
         assert!(FileFilter::parse(Some("size:abc")).is_err());
+        assert!(FileFilter::parse(Some("case:maybe")).is_err());
+    }
+
+    #[test]
+    fn negation_inverts_a_condition() -> Result<(), FilterError> {
+        // The reported need: "all that are NOT *.mp3".
+        let not_mp3 = FileFilter::parse(Some("!name:*.mp3"))?;
+        assert_eq!(
+            not_mp3,
+            FileFilter::Not(Box::new(FileFilter::Name("*.mp3".to_string())))
+        );
+        assert!(!not_mp3.matches("song.mp3", &entry(1, None)));
+        assert!(not_mp3.matches("photo.jpg", &entry(1, None)));
+
+        // Works for any facet, not just name.
+        let not_image = FileFilter::parse(Some("!mime:image"))?;
+        assert!(!not_image.matches("a.png", &entry(1, Some("image/png"))));
+        assert!(not_image.matches("a.txt", &entry(1, Some("text/plain"))));
+        // A negated MIME condition also admits a file with no MIME at all: it is
+        // not an image, which is exactly what was asked for.
+        assert!(not_image.matches("a.bin", &entry(1, None)));
+        Ok(())
+    }
+
+    #[test]
+    fn negated_and_plain_conditions_combine_with_and() -> Result<(), FilterError> {
+        // "images, except thumbnails" — the documented mixing rule.
+        let filter = FileFilter::parse(Some("mime:image !name:*thumb*"))?;
+        assert_eq!(
+            filter,
+            FileFilter::And(vec![
+                FileFilter::Mime("image".to_string()),
+                FileFilter::Not(Box::new(FileFilter::Name("*thumb*".to_string()))),
+            ])
+        );
+        let img = entry(1, Some("image/png"));
+        assert!(filter.matches("holiday.png", &img));
+        assert!(!filter.matches("holiday_thumb.png", &img));
+        assert!(!filter.matches("notes.txt", &entry(1, Some("text/plain"))));
+        Ok(())
+    }
+
+    #[test]
+    fn bang_inside_a_value_is_literal_text() -> Result<(), FilterError> {
+        // `!` only opens a negation at a condition boundary, so a filename that
+        // genuinely starts with `!` needs no escaping.
+        let filter = FileFilter::parse(Some("name:!important"))?;
+        assert_eq!(filter, FileFilter::Name("!important".to_string()));
+        assert!(filter.matches("dir/!important.txt", &entry(1, None)));
+        assert!(!filter.matches("dir/ordinary.txt", &entry(1, None)));
+        Ok(())
+    }
+
+    #[test]
+    fn case_insensitive_matching_is_opt_in() -> Result<(), FilterError> {
+        let jpg = entry(1, Some("Image/JPEG"));
+
+        // Default: case-sensitive, so the upper-case name does not match.
+        let sensitive = FileFilter::parse(Some("name:*.jpg"))?;
+        assert!(!sensitive.matches("HOLIDAY.JPG", &jpg));
+        assert!(sensitive.matches("holiday.jpg", &jpg));
+
+        // Opt in, and both cases match.
+        let insensitive = FileFilter::parse(Some("case:insensitive name:*.jpg"))?;
+        assert!(insensitive.matches("HOLIDAY.JPG", &jpg));
+        assert!(insensitive.matches("holiday.jpg", &jpg));
+
+        // It reaches the other text facets too, and stated-sensitive is the default.
+        assert!(FileFilter::parse(Some("case:insensitive mime:image"))?.matches("a", &jpg));
+        assert!(!FileFilter::parse(Some("case:sensitive mime:image"))?.matches("a", &jpg));
+
+        // Plain-substring names (no glob) honour it as well.
+        assert!(
+            FileFilter::parse(Some("case:insensitive name:HOLIDAY"))?.matches("holiday.jpg", &jpg)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn case_insensitivity_reaches_inside_negation() -> Result<(), FilterError> {
+        // The modifier wraps the whole expression, so a negated condition inside
+        // it is evaluated case-insensitively too.
+        let filter = FileFilter::parse(Some("case:insensitive !name:*.mp3"))?;
+        assert!(!filter.matches("SONG.MP3", &entry(1, None)));
+        assert!(filter.matches("photo.jpg", &entry(1, None)));
+        Ok(())
+    }
+
+    #[test]
+    fn size_and_date_conditions_ignore_case_mode() -> Result<(), FilterError> {
+        // Case mode is about text; numeric and date facets are unaffected.
+        assert!(
+            FileFilter::parse(Some("case:insensitive size:>=5"))?.matches("x", &entry(6, None))
+        );
+        assert!(
+            !FileFilter::parse(Some("case:insensitive size:>=5"))?.matches("x", &entry(4, None))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn negated_tag_condition_still_needs_annotations() -> Result<(), FilterError> {
+        // A negated or case-wrapped tag condition must still declare that it
+        // reads the annotations table, or the caller would skip loading it.
+        assert!(FileFilter::parse(Some("!tag:keep"))?.uses_annotations());
+        assert!(FileFilter::parse(Some("case:insensitive tag:keep"))?.uses_annotations());
+        assert!(!FileFilter::parse(Some("!name:x"))?.uses_annotations());
+
+        let filter = FileFilter::parse(Some("!tag:keep"))?;
+        let e = entry(1, None);
+        assert!(!filter.matches_tagged("a.txt", &e, &["keeper".to_string()]));
+        assert!(filter.matches_tagged("a.txt", &e, &["trash".to_string()]));
+        Ok(())
     }
 
     #[test]

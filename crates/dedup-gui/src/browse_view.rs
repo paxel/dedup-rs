@@ -30,7 +30,6 @@
 
 use crate::external;
 use crate::filter_ui::FilterBuilder;
-use crate::lightbox::{FullResCache, LightboxState};
 use crate::settings::TooltipVerbosity;
 use crate::theme;
 use crate::thumbs::ThumbCache;
@@ -149,6 +148,9 @@ struct FileRow {
 
 pub struct BrowseView {
     repos: Vec<String>,
+    /// Repos that are the main of a sync group, for the chip badge. Refreshed
+    /// with `repos` whenever the tab is shown.
+    mains: std::collections::HashSet<String>,
     /// Repo name → its absolute root, so a selected file's on-disk path can be
     /// resolved (`root/rel`) only when the preview dock actually needs it.
     roots: HashMap<String, String>,
@@ -210,9 +212,7 @@ pub struct BrowseView {
     annos_map: HashMap<String, Vec<String>>,
     verbosity: TooltipVerbosity,
     /// Open full-window viewer for the previewed image/video, if any.
-    lightbox: Option<OpenLightbox>,
-    /// Full-resolution texture cache backing the lightbox.
-    full_res: FullResCache,
+    lightbox: Option<crate::compare_view::DiffCompare>,
     /// Audio preview: show the spectrogram instead of the amplitude waveform.
     audio_spec: bool,
     /// One-entry spectrogram texture cache for the previewed audio file.
@@ -231,20 +231,11 @@ struct BrowseTagEdit {
     tags: crate::id3tags::Tags,
 }
 
-/// Everything the open lightbox needs, captured when the preview is clicked so
-/// the viewer stays valid even if the selection changes underneath it.
-struct OpenLightbox {
-    state: LightboxState,
-    hex: String,
-    abs: std::path::PathBuf,
-    is_video: bool,
-    meta: String,
-}
-
 impl BrowseView {
     pub fn new() -> Self {
         Self {
             repos: Vec::new(),
+            mains: std::collections::HashSet::new(),
             roots: HashMap::new(),
             loaded: false,
             repo: None,
@@ -277,7 +268,6 @@ impl BrowseView {
             annos_map: HashMap::new(),
             verbosity: TooltipVerbosity::default(),
             lightbox: None,
-            full_res: FullResCache::new(1),
             audio_spec: false,
             spec_tex: None,
             audio_tags: None,
@@ -291,7 +281,14 @@ impl BrowseView {
     pub fn sync_repos(&mut self, store: &Store) {
         match store.list_repos() {
             Ok(list) => {
-                self.repos = list.iter().map(|(n, _, _)| n.clone()).collect();
+                // Sinks are browsed through their group's main, not directly.
+                let sinks = store.sink_repo_names().unwrap_or_default();
+                self.mains = store.main_repo_names().unwrap_or_default();
+                self.repos = list
+                    .iter()
+                    .map(|(n, _, _)| n.clone())
+                    .filter(|n| !sinks.contains(n))
+                    .collect();
                 self.roots = list
                     .into_iter()
                     .map(|(n, meta, _)| (n, meta.abs_path))
@@ -508,26 +505,34 @@ impl BrowseView {
         ui.add_space(6.0);
         ui.label(
             RichText::new("BROWSE")
-                .color(theme::AMBER)
+                .color(theme::amber())
                 .size(18.0)
                 .strong(),
         );
         if let Some(err) = &self.error {
-            ui.colored_label(theme::RED, err);
+            ui.colored_label(theme::red(), err);
         }
 
         // Repo picker (single repo), amber when selected.
         let repos = self.repos.clone();
+        let mains = self.mains.clone();
         let mut picked: Option<String> = None;
         crate::lcars::section_lcars(
             ui,
             "REPO — WHICH REPOSITORY TO BROWSE",
-            theme::AMBER,
+            theme::amber(),
             |ui| {
                 crate::repo_chip::chip_row(ui, "browse_repo", "", repos.len(), |ui, i| {
                     let name = &repos[i];
                     let sel = self.repo.as_deref() == Some(name.as_str());
-                    let chip = crate::repo_chip::repo_chip(ui, name, sel, theme::AMBER, None);
+                    let chip = crate::repo_chip::repo_chip(
+                        ui,
+                        name,
+                        sel,
+                        theme::amber(),
+                        mains.contains(name),
+                        None,
+                    );
                     if chip
                         .name
                         .explain(
@@ -549,7 +554,7 @@ impl BrowseView {
 
         let Some(repo) = self.repo.clone() else {
             ui.add_space(8.0);
-            ui.colored_label(theme::TEXT, "Pick a repository to browse.");
+            ui.colored_label(theme::text(), "Pick a repository to browse.");
             return;
         };
         if self.entries_repo.as_deref() != Some(repo.as_str()) {
@@ -608,7 +613,10 @@ impl BrowseView {
                             // A ScrollArea lays its content out top-down by
                             // default; the breadcrumb must stay on one line.
                             ui.horizontal(|ui| {
-                                if ui.link(RichText::new(&repo).color(theme::LILAC)).clicked() {
+                                if ui
+                                    .link(RichText::new(&repo).color(theme::lilac()))
+                                    .clicked()
+                                {
                                     self.cur.clear();
                                     self.dir_sel = 0;
                                     self.file_sel = 0;
@@ -616,8 +624,8 @@ impl BrowseView {
                                 }
                                 let segs = self.cur.clone();
                                 for (i, seg) in segs.iter().enumerate() {
-                                    ui.label(RichText::new("›").color(theme::HAIRLINE));
-                                    if ui.link(RichText::new(seg).color(theme::LILAC)).clicked() {
+                                    ui.label(RichText::new("›").color(theme::hairline()));
+                                    if ui.link(RichText::new(seg).color(theme::lilac())).clicked() {
                                         self.cur.truncate(i + 1);
                                         self.dir_sel = 0;
                                         self.file_sel = 0;
@@ -703,30 +711,30 @@ impl BrowseView {
         // frame, so it survives the next re-sort or refresh.
         self.sel_rel = files.get(self.file_sel).map(|f| f.rel.clone());
 
-        self.lightbox_modal(ui.ctx());
+        self.lightbox_modal(ui.ctx(), store);
     }
 
-    /// The full-window viewer for the clicked preview: full resolution for
-    /// images (the thumbnail stands in while it decodes), the scrub frame for
-    /// videos. Rendering and interactions live in [`crate::lightbox`].
-    fn lightbox_modal(&mut self, ctx: &egui::Context) {
+    /// The shared full-window viewer for the clicked file. A save that rewrote
+    /// a file in place refreshes that file's index entry right away — the save
+    /// may have deliberately kept the file's timestamp, which a rescan's
+    /// (size, mtime) skip would never notice.
+    fn lightbox_modal(&mut self, ctx: &egui::Context, store: &Store) {
+        let verbosity = self.verbosity;
         let Some(lb) = self.lightbox.as_mut() else {
             return;
         };
-        self.full_res.poll(ctx);
-        let tex = if lb.is_video {
-            self.thumbs.get_video(&lb.hex, &lb.abs, 2, 5)
-        } else {
-            self.full_res
-                .get(&lb.hex, &lb.abs)
-                .or_else(|| self.thumbs.get(&lb.hex, &lb.abs))
-        };
-        let img = tex
-            .as_ref()
-            .map(|t| t.size_vec2())
-            .unwrap_or(egui::vec2(1.0, 1.0));
-        if crate::lightbox::single_view(ctx, &mut lb.state, tex, img, &lb.meta, self.verbosity) {
-            self.lightbox = None;
+        match lb.view(ctx, verbosity, None) {
+            Some(crate::compare_view::DiffPick::Edited { on_left }) => {
+                let side = if on_left { &lb.left } else { &lb.right };
+                let (repo, rel) = (side.repo.clone(), side.rel_path.clone());
+                if let Err(e) = dedup_core::update::refresh_file_entry(store, &repo, &rel) {
+                    self.error = Some(format!("Saved, but re-indexing failed: {e}"));
+                }
+                // The listing shows sizes/dates from the index — reload it.
+                self.entries_repo = None;
+            }
+            Some(_) => self.lightbox = None,
+            None => {}
         }
     }
 
@@ -922,7 +930,7 @@ impl BrowseView {
     fn preview_dock(&mut self, ui: &mut egui::Ui, store: &Store, sel: Option<&FileRow>) {
         let Some(sel) = sel.cloned() else {
             ui.centered_and_justified(|ui| {
-                ui.colored_label(theme::HAIRLINE, "Select a file to preview it.");
+                ui.colored_label(theme::hairline(), "Select a file to preview it.");
             });
             return;
         };
@@ -946,7 +954,7 @@ impl BrowseView {
         let hex_view = self.hex_view;
         egui::CentralPanel::default().show(ui, |ui| {
             let height = ui.available_height();
-            self.draw_preview(ui, &sel, cat, abs.as_deref(), height, hex_view);
+            self.draw_preview(ui, store, &sel, abs.as_deref(), height, hex_view);
         });
     }
 
@@ -991,8 +999,8 @@ impl BrowseView {
     fn draw_preview(
         &mut self,
         ui: &mut egui::Ui,
+        store: &Store,
         sel: &FileRow,
-        cat: Cat,
         abs: Option<&Path>,
         height: f32,
         hex_view: bool,
@@ -1003,6 +1011,7 @@ impl BrowseView {
             self.draw_preview_body(ui);
             return;
         }
+        let cat = Cat::of(&sel.mime);
         match cat {
             Cat::Image | Cat::Video => {
                 let tex = abs.and_then(|abs| {
@@ -1035,18 +1044,44 @@ impl BrowseView {
                     if resp.clicked()
                         && let Some(abs) = abs
                     {
-                        let mut meta = vec![sel.rel.clone(), format_size(sel.size)];
-                        if !sel.info.is_empty() {
-                            meta.push(sel.info.clone());
-                        }
-                        meta.push(format_mtime(sel.modified_ms));
-                        self.lightbox = Some(OpenLightbox {
-                            state: LightboxState::new(0, 0),
-                            hex: hash_hex(&sel.hash),
-                            abs: abs.to_path_buf(),
-                            is_video: cat == Cat::Video,
-                            meta: meta.join(" · "),
-                        });
+                        // The law: clicking any file opens the shared viewer —
+                        // whatever it is, picture or not. The index entry gives
+                        // the viewer the full facts (dimensions, EXIF); the row
+                        // alone stands in if the entry cannot be read. Browse
+                        // is the owner's tab, so its sides are writable.
+                        let repo = self.repo.clone().unwrap_or_default();
+                        let facts = store
+                            .get_file_entry(&repo, &sel.rel)
+                            .ok()
+                            .flatten()
+                            .map(|e| {
+                                crate::media_cell::FileFacts::from_entry(&e, abs.to_path_buf())
+                            })
+                            .unwrap_or_else(|| crate::media_cell::FileFacts {
+                                size: sel.size,
+                                modified_ms: sel.modified_ms,
+                                mime: Some(sel.mime.clone()),
+                                img_size: None,
+                                audio_ms: None,
+                                audio_seed: None,
+                                hash_hex: hash_hex(&sel.hash),
+                                abs_path: abs.to_path_buf(),
+                                origin: None,
+                                exif: None,
+                            });
+                        let side = crate::compare_view::DiffSide {
+                            repo,
+                            rel_path: sel.rel.clone(),
+                            read_only: false,
+                            facts,
+                        };
+                        // One file, so no second side and no switcher. Browsing
+                        // the whole listing as a pool wants the file list, which
+                        // the preview dock does not hold — noted for later.
+                        let mut lb =
+                            crate::compare_view::DiffCompare::new_with_pool(side, None, Vec::new());
+                        lb.hide_second();
+                        self.lightbox = Some(lb);
                     }
                 } else {
                     placeholder(ui, "decoding…");
@@ -1079,7 +1114,7 @@ impl BrowseView {
                     egui::Sense::hover(),
                 );
                 let p = ui.painter_at(rect);
-                p.rect_filled(rect, 4.0, theme::PANEL);
+                p.rect_filled(rect, 4.0, theme::panel());
                 match viz {
                     Some(viz) if self.audio_spec && viz.spec_w > 0 => {
                         let tex = self.spec_texture(ui.ctx(), &hex, &viz);
@@ -1104,7 +1139,7 @@ impl BrowseView {
                                     egui::pos2(x + bw.max(1.0), mid + h),
                                 ),
                                 0.0,
-                                theme::BLUE,
+                                theme::blue(),
                             );
                         }
                     }
@@ -1114,7 +1149,7 @@ impl BrowseView {
                             egui::Align2::CENTER_CENTER,
                             "analyzing…",
                             egui::FontId::proportional(15.0),
-                            theme::TAN,
+                            theme::tan(),
                         );
                     }
                 }
@@ -1159,7 +1194,7 @@ impl BrowseView {
     /// The ID3 side of the audio preview: the tag values (or a "none" note) and
     /// EDIT TAGS, which swaps the panel for an inline editor with SAVE/CANCEL.
     fn audio_tag_panel(&mut self, ui: &mut egui::Ui, sel: &FileRow, abs: Option<&Path>, hex: &str) {
-        ui.label(RichText::new("ID3 TAGS").color(theme::LILAC).size(11.0));
+        ui.label(RichText::new("ID3 TAGS").color(theme::lilac()).size(11.0));
 
         // Editor open for this file → text fields + SAVE/CANCEL.
         if self.tag_edit.as_ref().is_some_and(|te| te.hex == hex) {
@@ -1169,7 +1204,7 @@ impl BrowseView {
                     ui.horizontal(|ui| {
                         ui.add_sized(
                             egui::vec2(48.0, 16.0),
-                            egui::Label::new(RichText::new(label).color(theme::TAN).size(11.0)),
+                            egui::Label::new(RichText::new(label).color(theme::tan()).size(11.0)),
                         );
                         ui.add(egui::TextEdit::singleline(v).desired_width(160.0));
                     });
@@ -1183,15 +1218,15 @@ impl BrowseView {
                 ui.horizontal(|ui| {
                     if ui
                         .add(
-                            egui::Button::new(RichText::new("SAVE TAGS").color(theme::BLACK))
-                                .fill(theme::AMBER),
+                            egui::Button::new(RichText::new("SAVE TAGS").color(theme::black()))
+                                .fill(theme::amber()),
                         )
                         .clicked()
                     {
                         save = true;
                     }
                     if ui
-                        .button(RichText::new("CANCEL").color(theme::TEXT))
+                        .button(RichText::new("CANCEL").color(theme::text()))
                         .clicked()
                     {
                         cancel = true;
@@ -1203,7 +1238,7 @@ impl BrowseView {
                          unchanged). Run UPDATE on the repo afterwards so the index sees \
                          the modified file.",
                     )
-                    .color(theme::LILAC)
+                    .color(theme::lilac())
                     .size(11.0),
                 );
             }
@@ -1242,17 +1277,17 @@ impl BrowseView {
                     ui.horizontal(|ui| {
                         ui.add_sized(
                             egui::vec2(48.0, 16.0),
-                            egui::Label::new(RichText::new(label).color(theme::TAN).size(11.0)),
+                            egui::Label::new(RichText::new(label).color(theme::tan()).size(11.0)),
                         );
-                        ui.add(egui::Label::new(RichText::new(v).color(theme::TEXT)).truncate());
+                        ui.add(egui::Label::new(RichText::new(v).color(theme::text())).truncate());
                     });
                 }
                 if !any {
-                    ui.label(RichText::new("All tags empty.").color(theme::HAIRLINE));
+                    ui.label(RichText::new("All tags empty.").color(theme::hairline()));
                 }
             }
             None => {
-                ui.label(RichText::new("No ID3 tags.").color(theme::HAIRLINE));
+                ui.label(RichText::new("No ID3 tags.").color(theme::hairline()));
             }
         }
         // Editing covers the ID3-capable containers the `id3` crate writes.
@@ -1261,8 +1296,8 @@ impl BrowseView {
             && let Some(abs) = abs
             && ui
                 .add(
-                    egui::Button::new(RichText::new("EDIT TAGS").color(theme::BLACK))
-                        .fill(theme::AMBER),
+                    egui::Button::new(RichText::new("EDIT TAGS").color(theme::black()))
+                        .fill(theme::amber()),
                 )
                 .explain(
                     self.verbosity,
@@ -1307,20 +1342,25 @@ impl BrowseView {
                 Some(Preview::Bytes { hex, strings }) => match mode {
                     ByteMode::Hex => {
                         for l in hex {
-                            ui.label(RichText::new(l).monospace().size(12.0).color(theme::TEXT));
+                            ui.label(RichText::new(l).monospace().size(12.0).color(theme::text()));
                         }
                     }
                     ByteMode::Strings => {
                         if strings.is_empty() {
-                            ui.colored_label(theme::HAIRLINE, "(no printable strings)");
+                            ui.colored_label(theme::hairline(), "(no printable strings)");
                         }
                         for s in strings {
-                            ui.label(RichText::new(s).monospace().size(12.0).color(theme::LILAC));
+                            ui.label(
+                                RichText::new(s)
+                                    .monospace()
+                                    .size(12.0)
+                                    .color(theme::lilac()),
+                            );
                         }
                     }
                 },
                 Some(Preview::Error(e)) => {
-                    ui.colored_label(theme::RED, e);
+                    ui.colored_label(theme::red(), e);
                 }
                 _ => {}
             });
@@ -1341,7 +1381,7 @@ impl BrowseView {
             let n = self.selected.len();
             ui.label(
                 RichText::new(format!("{n} FILES SELECTED"))
-                    .color(theme::AMBER)
+                    .color(theme::amber())
                     .size(11.0),
             );
             let mut batch_submit = false;
@@ -1372,31 +1412,35 @@ impl BrowseView {
 
         ui.label(
             RichText::new(truncate(&sel.name, 32))
-                .color(theme::TEXT)
+                .color(theme::text())
                 .strong(),
         );
         ui.label(
             RichText::new(format!("{} · {}", format_size(sel.size), sel.mime))
-                .color(theme::HAIRLINE)
+                .color(theme::hairline())
                 .size(11.0),
         );
         ui.label(
             RichText::new(format_mtime(sel.modified_ms))
-                .color(theme::HAIRLINE)
+                .color(theme::hairline())
                 .size(11.0),
         );
         ui.add_space(8.0);
 
         // Annotations first — the primary reason to inspect a file here, so the
         // tag editor and the existing-tag picker are visible without scrolling.
-        ui.label(RichText::new("TAGS").color(theme::AMBER).size(11.0));
+        ui.label(RichText::new("TAGS").color(theme::amber()).size(11.0));
 
         // Current tags as removable badges (click to drop).
         let mut remove: Option<usize> = None;
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             if self.annos.is_empty() {
-                ui.label(RichText::new("none yet").color(theme::HAIRLINE).size(11.0));
+                ui.label(
+                    RichText::new("none yet")
+                        .color(theme::hairline())
+                        .size(11.0),
+                );
             }
             for (i, tag) in self.annos.clone().iter().enumerate() {
                 if annotation_chip(ui, tag, ChipMode::Removable)
@@ -1438,7 +1482,7 @@ impl BrowseView {
         if !existing.is_empty() {
             ui.label(
                 RichText::new("existing — click to add")
-                    .color(theme::HAIRLINE)
+                    .color(theme::hairline())
                     .size(10.0),
             );
             ui.horizontal_wrapped(|ui| {
@@ -1531,7 +1575,9 @@ impl BrowseView {
         }
         self.annos_key = Some(rel.to_string());
         self.annos = match &self.repo {
-            Some(repo) => store.get_annotations(repo, rel).unwrap_or_default(),
+            Some(repo) => {
+                crate::util::or_log_default(store.get_annotations(repo, rel), "tags for a file")
+            }
             None => Vec::new(),
         };
     }
@@ -1547,7 +1593,9 @@ impl BrowseView {
     fn reload_all_tags(&mut self, store: &Store) {
         self.all_tags_repo = self.repo.clone();
         let map = match &self.repo {
-            Some(repo) => store.all_annotations(repo).unwrap_or_default(),
+            Some(repo) => {
+                crate::util::or_log_default(store.all_annotations(repo), "tags for the repo")
+            }
             None => HashMap::new(),
         };
         let mut set = std::collections::BTreeSet::new();
@@ -1594,7 +1642,8 @@ impl BrowseView {
             return;
         }
         for rel in self.selected.clone() {
-            let mut tags = store.get_annotations(&repo, &rel).unwrap_or_default();
+            let mut tags =
+                crate::util::or_log_default(store.get_annotations(&repo, &rel), "tags for a file");
             if !tags.iter().any(|t| t == tag) {
                 tags.push(tag.to_string());
                 if let Err(e) = store.set_annotations(&repo, &rel, &tags) {
@@ -1633,11 +1682,24 @@ fn tag_glyph(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
 /// `mode`. Reads as a tag everywhere and stays legible in every state. Returns
 /// the click response (for `Add`/`Removable`/`Toggle` modes).
 fn annotation_chip(ui: &mut egui::Ui, text: &str, mode: ChipMode) -> egui::Response {
-    let violet = Color32::from_rgb(0x33, 0x2A, 0x59);
+    // The annotation pill follows the palette: a deep violet under dark (bright
+    // lilac text reads on it), a light lilac tint under light (the darker lilac
+    // text reads on that). Hue stays the "annotation" violet in both.
+    let (violet, violet_hover) = if theme::is_dark() {
+        (
+            Color32::from_rgb(0x33, 0x2A, 0x59),
+            Color32::from_rgb(0x45, 0x39, 0x74),
+        )
+    } else {
+        (
+            Color32::from_rgb(0xDE, 0xD2, 0xF0),
+            Color32::from_rgb(0xCE, 0xBF, 0xEB),
+        )
+    };
     let font = egui::FontId::proportional(12.0);
     let galley = ui
         .painter()
-        .layout_no_wrap(text.to_owned(), font.clone(), theme::TEXT);
+        .layout_no_wrap(text.to_owned(), font.clone(), theme::text());
     let (icon, gap) = (12.0, 4.0);
     let show_x = matches!(mode, ChipMode::Removable);
     let x_w = if show_x { 14.0 } else { 0.0 };
@@ -1653,16 +1715,12 @@ fn annotation_chip(ui: &mut egui::Ui, text: &str, mode: ChipMode) -> egui::Respo
     if ui.is_rect_visible(rect) {
         let hov = resp.hovered();
         let (fill, fg) = match mode {
-            ChipMode::Display => (violet, theme::LILAC),
-            ChipMode::Add => (
-                if hov {
-                    Color32::from_rgb(0x45, 0x39, 0x74)
-                } else {
-                    violet
-                },
-                theme::LILAC,
+            ChipMode::Display => (violet, theme::lilac()),
+            ChipMode::Add => (if hov { violet_hover } else { violet }, theme::lilac()),
+            ChipMode::Removable => (
+                if hov { theme::amber() } else { theme::tan() },
+                theme::black(),
             ),
-            ChipMode::Removable => (if hov { theme::AMBER } else { theme::TAN }, theme::BLACK),
         };
         let p = ui.painter();
         if fill.a() > 0 {
@@ -1696,15 +1754,34 @@ fn annotation_chip(ui: &mut egui::Ui, text: &str, mode: ChipMode) -> egui::Respo
 }
 
 /// Bright/dim blue selection so both panes keep their selection marked TUI-style
+/// (bright when a pane is focused, dim otherwise). Follows the palette: dark
+/// blues under dark (cream text reads on them), light blues under light (dark
+/// ink reads) — `theme::text()` is the right text colour on either.
+fn selection_bg(active: bool) -> Color32 {
+    match (theme::is_dark(), active) {
+        (true, true) => Color32::from_rgb(0x2E, 0x45, 0x80),
+        (true, false) => Color32::from_rgb(0x1A, 0x22, 0x30),
+        (false, true) => Color32::from_rgb(0xAF, 0xC7, 0xEA),
+        (false, false) => Color32::from_rgb(0xD2, 0xDB, 0xE8),
+    }
+}
+
+/// The row-hover highlight for the list/table panes: a subtle slate that stays
+/// under the cream/ink text in either appearance.
+fn row_hover() -> Color32 {
+    if theme::is_dark() {
+        Color32::from_rgb(0x2C, 0x37, 0x4E)
+    } else {
+        Color32::from_rgb(0xE1, 0xE7, 0xF0)
+    }
+}
+
+/// Bright/dim blue selection so both panes keep their selection marked TUI-style
 /// (bright when focused, dim otherwise). Shared by the list panes.
 fn selection_colors(ui: &mut egui::Ui, active: bool) {
     let sel = &mut ui.visuals_mut().selection;
-    sel.bg_fill = if active {
-        Color32::from_rgb(0x2E, 0x45, 0x80)
-    } else {
-        Color32::from_rgb(0x1A, 0x22, 0x30)
-    };
-    sel.stroke.color = theme::TEXT;
+    sel.bg_fill = selection_bg(active);
+    sel.stroke.color = theme::text();
 }
 
 /// A self-painted clickable chip that stays legible in every state. The theme's
@@ -1723,7 +1800,7 @@ fn paint_chip(
     let font = egui::FontId::proportional(13.5);
     let galley = ui
         .painter()
-        .layout_no_wrap(text.to_owned(), font.clone(), theme::TEXT);
+        .layout_no_wrap(text.to_owned(), font.clone(), theme::text());
     let pad = egui::vec2(8.0, 4.0);
     let w = if full_width {
         ui.available_width()
@@ -1738,9 +1815,9 @@ fn paint_chip(
         let (fill, fg) = if selected {
             (sel_fill, sel_fg)
         } else if resp.hovered() {
-            (Color32::from_rgb(0x2C, 0x37, 0x4E), theme::TEXT)
+            (row_hover(), theme::text())
         } else {
-            (Color32::TRANSPARENT, theme::TEXT)
+            (Color32::TRANSPARENT, theme::text())
         };
         if fill.a() > 0 {
             ui.painter().rect_filled(rect, 6.0, fill);
@@ -1758,18 +1835,20 @@ fn paint_chip(
 /// A pill on/off (or segmented) toggle: amber + black when on, dark + cream on
 /// hover, transparent + cream when off. Content-width. Readable in every state.
 fn pill_toggle(ui: &mut egui::Ui, on: bool, text: &str) -> egui::Response {
-    paint_chip(ui, text, on, theme::AMBER, theme::BLACK, false)
+    paint_chip(ui, text, on, theme::amber(), theme::black(), false)
 }
 
 /// A full-width list row (dirs pane): blue selection (bright when the pane is
 /// focused, dim otherwise) with cream text; dark hover; readable in every state.
 fn list_row(ui: &mut egui::Ui, selected: bool, active: bool, text: &str) -> egui::Response {
-    let sel_fill = if active {
-        Color32::from_rgb(0x2E, 0x45, 0x80)
-    } else {
-        Color32::from_rgb(0x1A, 0x22, 0x30)
-    };
-    paint_chip(ui, text, selected, sel_fill, theme::TEXT, true)
+    paint_chip(
+        ui,
+        text,
+        selected,
+        selection_bg(active),
+        theme::text(),
+        true,
+    )
 }
 
 /// Interaction colours for the **file table**, whose cells are non-interactive
@@ -1778,15 +1857,15 @@ fn list_row(ui: &mut egui::Ui, selected: bool, active: bool, text: &str) -> egui
 /// so use a subtle dark row highlight instead (selection stays blue).
 fn table_visuals(ui: &mut egui::Ui, active: bool) {
     let w = &mut ui.visuals_mut().widgets;
-    w.noninteractive.fg_stroke.color = theme::TEXT;
-    w.hovered.bg_fill = Color32::from_rgb(0x2C, 0x37, 0x4E);
+    w.noninteractive.fg_stroke.color = theme::text();
+    w.hovered.bg_fill = row_hover();
     selection_colors(ui, active);
 }
 
 /// A normal button with readable black text (the theme forces cream text via
 /// `override_text_color`, which is illegible on the button's amber/orange fill).
 fn dark_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.button(RichText::new(label).color(theme::BLACK))
+    ui.button(RichText::new(label).color(theme::black()))
 }
 
 /// A full-width command button with readable black text on the amber pill (the
@@ -1794,8 +1873,8 @@ fn dark_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
 fn amber_button(ui: &mut egui::Ui, enabled: bool, label: &str) -> egui::Response {
     ui.add_enabled(
         enabled,
-        egui::Button::new(RichText::new(label).color(theme::BLACK))
-            .fill(theme::AMBER)
+        egui::Button::new(RichText::new(label).color(theme::black()))
+            .fill(theme::amber())
             .min_size(egui::vec2(ui.available_width(), 0.0)),
     )
 }
@@ -1846,31 +1925,14 @@ fn build_bytes(bytes: &[u8]) -> Preview {
             .collect();
         hex.push(format!("{:04x}  {:<48} {ascii}", row * 16, cols));
     }
-    let mut strings = Vec::new();
-    let mut run = String::new();
-    for &b in bytes {
-        if (0x20..0x7f).contains(&b) {
-            run.push(b as char);
-        } else {
-            if run.len() >= 4 {
-                strings.push(run.clone());
-            }
-            run.clear();
-        }
-        if strings.len() >= 40 {
-            break;
-        }
-    }
-    if run.len() >= 4 && strings.len() < 40 {
-        strings.push(run);
-    }
+    let strings = dedup_core::strings::printable_strings(bytes, 4, 40);
     Preview::Bytes { hex, strings }
 }
 
 /// A centred grey note used while a media preview is still decoding.
 fn placeholder(ui: &mut egui::Ui, text: &str) {
     ui.centered_and_justified(|ui| {
-        ui.colored_label(theme::TAN, text);
+        ui.colored_label(theme::tan(), text);
     });
 }
 
@@ -2187,7 +2249,7 @@ mod tests {
                 move |ui, view: &mut BrowseView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     ui.allocate_ui(egui::vec2(ui.available_width(), 600.0), |ui| {
@@ -2250,7 +2312,7 @@ mod tests {
                 move |ui, view: &mut BrowseView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default());
@@ -2344,7 +2406,7 @@ mod tests {
                 move |ui, view: &mut BrowseView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     ui.allocate_ui(egui::vec2(ui.available_width(), 600.0), |ui| {
@@ -2405,7 +2467,7 @@ mod tests {
                 move |ui, view: &mut BrowseView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default());
@@ -2525,7 +2587,7 @@ mod tests {
                 move |ui, view: &mut BrowseView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     // The app hosts the view in a CentralPanel (height-bounded to
@@ -2608,7 +2670,7 @@ mod tests {
                 move |ui, view: &mut BrowseView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     ui.allocate_ui(egui::vec2(ui.available_width(), 600.0), |ui| {
@@ -2639,13 +2701,28 @@ mod tests {
 
         let mut view = BrowseView::new();
         view.repo = Some("R".into());
-        view.lightbox = Some(OpenLightbox {
-            state: LightboxState::new(0, 0),
-            hex: "00".into(),
-            abs: repo_dir.join("pic.png"),
-            is_video: false,
-            meta: "pic.png · 100 B".into(),
-        });
+        // Browse now opens the shared viewer, like every other caller.
+        view.lightbox = Some(crate::compare_view::DiffCompare::new_with_pool(
+            crate::compare_view::DiffSide {
+                repo: "R".into(),
+                rel_path: "pic.png".into(),
+                facts: crate::media_cell::FileFacts {
+                    size: 100,
+                    modified_ms: 0,
+                    mime: Some("image/png".into()),
+                    img_size: None,
+                    audio_ms: None,
+                    audio_seed: None,
+                    hash_hex: "00".into(),
+                    abs_path: repo_dir.join("pic.png"),
+                    origin: None,
+                    exif: None,
+                },
+                read_only: true,
+            },
+            None,
+            Vec::new(),
+        ));
         let store_ui = Arc::clone(&store);
         let mut init = false;
         let mut h = Harness::builder()
@@ -2654,7 +2731,7 @@ mod tests {
                 move |ui, view: &mut BrowseView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     ui.allocate_ui(egui::vec2(ui.available_width(), 600.0), |ui| {
@@ -2668,9 +2745,12 @@ mod tests {
             h.query_by_label_contains("CLOSE").is_some(),
             "the open lightbox shows its CLOSE control"
         );
+        // Browse uses the shared viewer now, so it shows that viewer's chrome —
+        // the tab row and the file's own title — rather than the single-image
+        // viewer's FIT / 1:1 controls, which went with it.
         assert!(
-            h.query_by_label("FIT").is_some() && h.query_by_label("1:1").is_some(),
-            "the open lightbox shows FIT and 1:1"
+            h.query_all_by_label_contains("pic.png").count() > 0,
+            "the file's title identifies what is open"
         );
         h.key_press(egui::Key::Escape);
         h.run();
@@ -2678,6 +2758,83 @@ mod tests {
             h.state().lightbox.is_none(),
             "Esc closes the Browse lightbox"
         );
+    }
+
+    /// Saving a turned image from Browse's viewer rewrites the file in place —
+    /// keeping its date — and refreshes that file's index entry immediately.
+    /// The kept timestamp means a rescan's (size, mtime) skip would never
+    /// notice the new bytes, so the index must follow the save itself.
+    #[test]
+    fn saving_a_turned_image_refreshes_the_index_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let repo_dir = tmp.path().join("R");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        store.create_repo("R", &repo_dir.to_string_lossy()).unwrap();
+        let png = repo_dir.join("scan.png");
+        image::RgbImage::from_fn(40, 20, |x, y| image::Rgb([x as u8, y as u8, 60]))
+            .save(&png)
+            .unwrap();
+        dedup_core::update::update_repo(
+            &store,
+            "R",
+            1,
+            &dedup_core::update::NoProgress,
+            &dedup_core::update::CancellationToken::new(),
+        )
+        .unwrap();
+        let before = store.get_file_entry("R", "scan.png").unwrap().unwrap();
+
+        let mut view = BrowseView::new();
+        view.repo = Some("R".into());
+        view.lightbox = Some(crate::compare_view::DiffCompare::new_with_pool(
+            crate::compare_view::DiffSide {
+                repo: "R".into(),
+                rel_path: "scan.png".into(),
+                read_only: false,
+                facts: crate::media_cell::FileFacts::from_entry(&before, png.clone()),
+            },
+            None,
+            Vec::new(),
+        ));
+        view.lightbox.as_mut().unwrap().hide_second();
+
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1200.0, 800.0))
+            .build_ui_state(
+                move |ui, view: &mut BrowseView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    ui.allocate_ui(egui::vec2(ui.available_width(), 780.0), |ui| {
+                        view.show(ui, &store_ui, TooltipVerbosity::default());
+                    });
+                },
+                view,
+            );
+        h.run();
+        h.get_by_label_contains("ROTATE A").click();
+        h.run();
+        h.get_by_label_contains("SAVE A").click();
+        h.run();
+        h.get_by_label("OVERWRITE").click();
+        h.run();
+
+        assert_eq!(
+            image::image_dimensions(&png).unwrap(),
+            (20, 40),
+            "the rotated pixels are on disk"
+        );
+        let after = store.get_file_entry("R", "scan.png").unwrap().unwrap();
+        assert_ne!(
+            after.hash, before.hash,
+            "the index entry follows the new bytes immediately"
+        );
+        assert!(h.state().lightbox.is_some(), "saving keeps the viewer open");
     }
 
     /// An audio file's preview shows its ID3 tags, the Waveform/Spectrogram
@@ -2714,7 +2871,7 @@ mod tests {
                 move |ui, view: &mut BrowseView| {
                     if !init {
                         crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
                     ui.allocate_ui(egui::vec2(ui.available_width(), 600.0), |ui| {

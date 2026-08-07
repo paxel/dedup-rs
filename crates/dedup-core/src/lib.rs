@@ -1,6 +1,7 @@
 //! dedup-core
 //! Domain logic for file hashing, directory scanning, and indexing.
 
+pub mod align;
 pub mod archive;
 pub mod diff;
 pub mod dupes;
@@ -8,11 +9,15 @@ pub mod eta;
 pub mod filter;
 pub mod fingerprint;
 pub mod groom;
+pub mod logging;
 pub mod organize;
+pub mod render;
 pub mod report;
 pub mod scan;
+pub mod secret;
 pub mod similar;
 pub mod store;
+pub mod strings;
 pub mod sync_group;
 pub mod thumbnail;
 pub mod update;

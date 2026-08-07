@@ -2,7 +2,7 @@
 //! to a small amplitude envelope (one normalized peak per bucket) so a group's
 //! "similar" copies can be compared visually and their differences spotted.
 //!
-//! Mirrors the `lightbox::FullResCache` worker/cache pattern — decoding never
+//! Mirrors the `thumbs.rs` worker/cache pattern — decoding never
 //! blocks the UI, a finished envelope wakes the UI at rest, and a tiny LRU keeps
 //! only the few copies on screen resident.
 
@@ -407,6 +407,20 @@ fn spec_color(v: f32) -> egui::Color32 {
 /// Build a spectrogram image (time on x, frequency on y with bass at the
 /// bottom) from a decoded [`AudioViz`]. Shared by the Duplicates audio lightbox
 /// and the Browse audio preview.
+/// Decode `path` and render its spectrogram as an image, ready to upload as a
+/// texture.
+///
+/// Comparison surfaces work on textures, and the amplitude waveform is
+/// painter-drawn rather than rendered to one — so audio is compared as a
+/// spectrogram (decided 2026-07-31; no waveform-to-texture renderer exists, by
+/// choice). The amplitude view remains available in the native audio player,
+/// where its `S` toggle is unchanged.
+///
+/// Returns `None` when the file cannot be decoded or is silent.
+pub fn spec_rgba(path: &Path) -> Option<egui::ColorImage> {
+    extract_viz(path).map(|viz| spec_image(&viz))
+}
+
 pub fn spec_image(viz: &AudioViz) -> egui::ColorImage {
     let (w, h) = (viz.spec_w, viz.spec_h);
     let mut rgba = vec![0u8; w * h * 4];

@@ -288,3 +288,55 @@ fn unreadable_files_are_reported_and_skipped() -> TestResult {
     assert_eq!(errors, 1);
     Ok(())
 }
+
+/// Saving an edited image in place can deliberately preserve the file's
+/// modified time — which makes the change invisible to the (size, mtime) scan
+/// skip. `refresh_file_entry` is how a caller that just rewrote a file's bytes
+/// keeps the index honest: it re-stats, re-hashes and re-fingerprints exactly
+/// that file, preserving the entry's provenance.
+#[test]
+fn refresh_file_entry_rehashes_one_edited_file() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (store, data) = setup(tmp.path())?;
+    write(&data, "a.txt", b"original contents")?;
+    write(&data, "b.txt", b"untouched")?;
+    update_repo(&store, "test", 1, &NoProgress, &CancellationToken::new())?;
+
+    let before = store.get_file_entry("test", "a.txt")?.expect("indexed");
+    let mut with_origin = before.clone();
+    with_origin.origin = Some("copied from elsewhere".into());
+    store.update_file_entry("test", "a.txt", &with_origin)?;
+
+    // Rewrite the bytes but keep size and mtime — a rescan would skip this.
+    let path = data.join("a.txt");
+    let mtime = std::fs::metadata(&path)?.modified()?;
+    std::fs::write(&path, b"edited   contents")?;
+    std::fs::File::options()
+        .write(true)
+        .open(&path)?
+        .set_modified(mtime)?;
+
+    let entry = dedup_core::update::refresh_file_entry(&store, "test", "a.txt")?;
+    assert_ne!(entry.hash, before.hash, "the new bytes are hashed");
+    assert_eq!(
+        entry.size, before.size,
+        "same size — the scanner would skip it"
+    );
+    assert_eq!(entry.modified_ms, before.modified_ms, "mtime was preserved");
+    assert_eq!(
+        entry.origin.as_deref(),
+        Some("copied from elsewhere"),
+        "provenance survives the refresh"
+    );
+
+    let stored = store
+        .get_file_entry("test", "a.txt")?
+        .expect("still indexed");
+    assert_eq!(stored.hash, entry.hash, "the index now holds the new hash");
+    let other = store.get_file_entry("test", "b.txt")?.expect("untouched");
+    assert_eq!(
+        other.hash,
+        store.get_file_entry("test", "b.txt")?.unwrap().hash
+    );
+    Ok(())
+}

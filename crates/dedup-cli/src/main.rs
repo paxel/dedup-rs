@@ -6,7 +6,7 @@ use dedup_core::diff::{
 use dedup_core::dupes::{DupeGroup, delete_duplicates, find_exact_duplicates, wasted_bytes};
 use dedup_core::similar::find_similar;
 use dedup_core::store::Store;
-use dedup_core::update::{CancellationToken, Progress, ProgressEvent, update_repo};
+use dedup_core::update::{CancellationToken, Progress, ProgressEvent, update_repo_authorized};
 
 #[derive(Parser)]
 #[command(name = "dedup")]
@@ -158,14 +158,12 @@ enum DiffCommands {
 
 #[derive(Subcommand)]
 enum ArchiveCommands {
-    /// Index every archive's members in a repo (opt-in; reads each archive)
-    Index {
-        /// Repository holding the archives
-        repo: String,
-    },
     /// Report how much of each archive already exists as loose content
+    ///
+    /// Archive members are indexed as part of the normal scan (`repo update`),
+    /// so no separate index step is needed — just scan, then run this.
     Coverage {
-        /// Repository holding the (already indexed) archives
+        /// Repository holding the archives (indexed by its last scan)
         repo: String,
         /// Extra repos to count as "already have it"; repeatable
         #[arg(long = "ref", value_name = "REPO")]
@@ -226,6 +224,10 @@ enum RepoCommands {
         /// Number of hashing threads (0 = one per CPU core)
         #[arg(short, long, default_value_t = 0)]
         threads: usize,
+        /// Allow a scan that finds no files to mark every indexed entry missing.
+        /// Without this, such a scan is refused — it is usually an unmounted drive.
+        #[arg(long)]
+        force: bool,
     },
     /// Find exact duplicates (or, with --threshold, similar files) in repositories
     Dupes {
@@ -244,8 +246,21 @@ enum RepoCommands {
     },
 }
 
+/// Open this run's log. A diagnostic that cannot be written is worth a warning
+/// on stderr, never a failed command.
+fn start_logging() {
+    match dedup_core::logging::init() {
+        Ok(path) => log::info!("dedup CLI started; logging to {}", path.display()),
+        Err(e) => eprintln!(
+            "warning: could not open a session log in {}: {e}",
+            dedup_core::logging::log_dir().display()
+        ),
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    start_logging();
 
     match cli.command {
         Some(Commands::Repo { command }) => {
@@ -314,8 +329,9 @@ fn main() -> anyhow::Result<()> {
                     names,
                     all,
                     threads,
+                    force,
                 } => {
-                    update_repos(&store, names, all, threads)?;
+                    update_repos(&store, names, all, threads, force)?;
                 }
                 RepoCommands::Dupes {
                     names,
@@ -508,10 +524,6 @@ fn run_scan(store: &Store, names: Vec<String>, all: bool) -> anyhow::Result<()> 
 
 fn run_archive(store: &Store, command: ArchiveCommands) -> anyhow::Result<()> {
     match command {
-        ArchiveCommands::Index { repo } => {
-            let n = dedup_core::archive::index_repo_archives(store, &repo)?;
-            println!("Indexed {n} archive(s) in '{repo}'.");
-        }
         ArchiveCommands::Coverage {
             repo,
             refs,
@@ -528,13 +540,26 @@ fn run_archive(store: &Store, command: ArchiveCommands) -> anyhow::Result<()> {
                 if cov.redundant {
                     redundant += 1;
                 }
+                let tag = if cov.redundant {
+                    "  [REDUNDANT]"
+                } else if cov.has_locked() {
+                    "  [LOCKED]"
+                } else {
+                    ""
+                };
+                let locked = if cov.has_locked() {
+                    format!(" ({} locked)", cov.locked)
+                } else {
+                    String::new()
+                };
                 println!(
-                    "{:>5.1}%  {}/{}  {}{}",
+                    "{:>5.1}%  {}/{}  {}{}{}",
                     cov.percent(),
                     cov.present,
                     cov.members,
                     cov.rel_path,
-                    if cov.redundant { "  [REDUNDANT]" } else { "" }
+                    locked,
+                    tag,
                 );
             }
             println!(
@@ -785,6 +810,7 @@ fn update_repos(
     names: Vec<String>,
     all: bool,
     threads: usize,
+    force: bool,
 ) -> anyhow::Result<()> {
     let names: Vec<String> = if all {
         store
@@ -808,7 +834,7 @@ fn update_repos(
     for name in names {
         println!("Updating '{}'...", name);
         let progress = TerminalProgress::new();
-        let stats = update_repo(store, &name, threads, &progress, &cancel)?;
+        let stats = update_repo_authorized(store, &name, threads, &progress, &cancel, force)?;
         progress.finish();
         println!(
             "  added: {}, updated: {}, unchanged: {}, missing: {}, errors: {}, hashed: {}",

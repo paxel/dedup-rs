@@ -126,3 +126,66 @@ fn update_all_with_empty_registry_fails() -> TestResult {
         .stderr(predicate::str::contains("No repositories registered"));
     Ok(())
 }
+
+#[test]
+fn a_scan_that_would_empty_the_index_is_refused_without_force() -> TestResult {
+    let sb = Sandbox::new()?;
+    sb.write("data/a.txt", b"hello")?;
+    sb.write("data/b.txt", b"world")?;
+    let data = sb.home.path().join("data").to_string_lossy().into_owned();
+
+    sb.dedup()?
+        .args(["repo", "create", "docs", &data])
+        .assert()
+        .success();
+    sb.dedup()?
+        .args(["repo", "update", "docs"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added: 2"));
+
+    // The unmounted-drive shape: the directory is still there, but empty.
+    std::fs::remove_file(sb.home.path().join("data/a.txt"))?;
+    std::fs::remove_file(sb.home.path().join("data/b.txt"))?;
+
+    sb.dedup()?
+        .args(["repo", "update", "docs"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--force"));
+
+    // Refused means untouched: the two entries are still indexed.
+    sb.dedup()?
+        .args(["repo", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2"));
+
+    Ok(())
+}
+
+#[test]
+fn force_authorises_a_scan_that_empties_the_index() -> TestResult {
+    let sb = Sandbox::new()?;
+    sb.write("data/a.txt", b"hello")?;
+    let data = sb.home.path().join("data").to_string_lossy().into_owned();
+
+    sb.dedup()?
+        .args(["repo", "create", "docs", &data])
+        .assert()
+        .success();
+    sb.dedup()?
+        .args(["repo", "update", "docs"])
+        .assert()
+        .success();
+
+    std::fs::remove_file(sb.home.path().join("data/a.txt"))?;
+
+    sb.dedup()?
+        .args(["repo", "update", "docs", "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("missing: 1"));
+
+    Ok(())
+}

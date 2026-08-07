@@ -18,6 +18,25 @@ pub struct Tags {
     pub genre: String,
 }
 
+/// Whether `mime` names a container the `id3` crate can read *and* write —
+/// MP3/WAV/AIFF. Decided from the mime alone so the lightbox can advertise (or
+/// hide) its Metadata tab without touching the disk; [`read`] still returns
+/// `None` when a supported container simply carries no tag.
+pub fn container_supported(mime: Option<&str>) -> bool {
+    matches!(
+        mime,
+        Some(
+            "audio/mpeg"
+                | "audio/mp3"
+                | "audio/wav"
+                | "audio/x-wav"
+                | "audio/wave"
+                | "audio/aiff"
+                | "audio/x-aiff"
+        )
+    )
+}
+
 /// Read the common ID3 tags, trying ID3v2 first and falling back to ID3v1 (the
 /// 128-byte trailer used by older/ripped MP3s). `None` if the file has neither
 /// tag or is not an ID3-capable container (e.g. FLAC/OGG).

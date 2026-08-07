@@ -43,6 +43,13 @@ pub enum DiffError {
 
     #[error("at least one reference repo is required")]
     NoReference,
+
+    #[error(
+        "Sync group main '{main}' has no indexed files, so a MIRROR push would delete \
+         everything in its sink(s). Scan '{main}' first — a drive that failed to mount \
+         scans as an empty directory."
+    )]
+    EmptyMirrorSource { main: String },
 }
 
 /// Where a copy/move should place files: a target directory and an optional
@@ -52,6 +59,19 @@ pub enum DiffError {
 pub struct CopyDest<'a> {
     pub dir: &'a Path,
     pub subdir: Option<&'a str>,
+}
+
+/// Whether a relative path stays inside its root: every component is an ordinary
+/// name or `.`, so joining it onto a root cannot escape (no absolute prefix, no
+/// drive/root, no `..`). The single place the repo-escape rule is defined, so
+/// [`resolve_subdir`] and [`resolve_in_repo`] cannot drift apart.
+fn stays_within_root(rel: &Path) -> bool {
+    rel.components().all(|c| {
+        matches!(
+            c,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    })
 }
 
 /// Resolve the destination root for a copy/move: `target_dir` optionally
@@ -64,15 +84,10 @@ fn resolve_subdir(target_dir: &Path, subdir: Option<&str>) -> Result<PathBuf, Di
         return Ok(target_dir.to_path_buf());
     }
     let rel = Path::new(raw);
-    for component in rel.components() {
-        match component {
-            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
-            _ => {
-                return Err(DiffError::InvalidSubdir {
-                    subdir: raw.to_string(),
-                });
-            }
-        }
+    if !stays_within_root(rel) {
+        return Err(DiffError::InvalidSubdir {
+            subdir: raw.to_string(),
+        });
     }
     Ok(target_dir.join(rel))
 }
@@ -203,6 +218,56 @@ pub enum DiffItem {
     DeletedInReference { rel_path: String },
 }
 
+/// Why a sink file is a candidate to pull back into its main (GROUP SYNC BACK).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullKind {
+    /// Content the main has never had — a direct edit to the backup, promoted
+    /// with no risk.
+    New,
+    /// Content the main once had and **deleted** (a tombstone) that the sink
+    /// still holds. Bringing it back undoes the main's deletion — which may be a
+    /// recovered mistake or an unwanted resurrection of a deliberate cleanup — so
+    /// it is always the user's explicit choice, never automatic.
+    Resurrection,
+}
+
+/// One sink file GROUP SYNC BACK could bring into the main, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullItem {
+    pub rel_path: String,
+    pub kind: PullKind,
+}
+
+/// Classify a sink's files against its main for a pull back: the content the
+/// main never had ([`PullKind::New`]) and the content the main deleted but the
+/// sink still holds ([`PullKind::Resurrection`]). Content the main already has is
+/// omitted (nothing to pull). Reuses [`diff_print`] (source = sink, reference =
+/// main), so a file is classified by its **content**, never its path, and the
+/// order follows `diff_print`'s. The new/resurrection split is the whole point —
+/// a naive "copy what the main lacks" cannot make it, because a tombstone and a
+/// never-seen file both look like "the main lacks this content".
+pub fn plan_sync_back(
+    store: &Store,
+    sink: &str,
+    main: &str,
+    filter: Option<&str>,
+) -> Result<Vec<PullItem>, DiffError> {
+    Ok(diff_print(store, sink, &[main], filter)?
+        .into_iter()
+        .filter_map(|item| match item {
+            DiffItem::New { rel_path } => Some(PullItem {
+                rel_path,
+                kind: PullKind::New,
+            }),
+            DiffItem::DeletedInReference { rel_path } => Some(PullItem {
+                rel_path,
+                kind: PullKind::Resurrection,
+            }),
+            DiffItem::Equal { .. } => None,
+        })
+        .collect())
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CopyStats {
     pub copied: u64,
@@ -288,6 +353,45 @@ fn collect_source_entries(
         Ok(())
     })?;
     Ok(entries)
+}
+
+/// A source repository's filtered index, collected once.
+///
+/// Pushing a sync group syncs one main to several sinks. Done naively that
+/// re-opens the main and re-streams its whole index once per sink, to produce
+/// the same data every time — so [`plan_group_sync`](crate::sync_group::plan_group_sync)
+/// and [`run_group_sync`](crate::sync_group::run_group_sync) build one of these
+/// up front and hand it to every sink's plan or run.
+///
+/// It holds everything the sync path needs from the source: the entries the
+/// filter admitted (missing ones included — a `Missing` delete needs them), the
+/// repository's root on disk, and its name for provenance.
+pub struct SourceView {
+    name: String,
+    root: PathBuf,
+    entries: Vec<(String, FileEntry)>,
+}
+
+impl SourceView {
+    /// Open `source` and collect the entries `filter` admits.
+    pub fn collect(store: &Store, source: &str, filter: &FileFilter) -> Result<Self, DiffError> {
+        let repo = open_repo(store, source)?;
+        Ok(Self {
+            name: source.to_string(),
+            root: PathBuf::from(&repo.meta.abs_path),
+            entries: collect_source_entries(&repo.db, filter, true)?,
+        })
+    }
+
+    /// The content this source currently holds (non-missing): the reference set
+    /// an `Absent` (mirror) delete removes target content outside of.
+    fn present_content(&self) -> HashSet<ContentKey> {
+        self.entries
+            .iter()
+            .filter(|(_, e)| !e.missing)
+            .map(|(_, e)| (e.size, e.hash))
+            .collect()
+    }
 }
 
 /// Classify every non-missing source file against the union of the reference
@@ -580,27 +684,37 @@ pub fn diff_sync(
     run: &DiffRun<'_>,
 ) -> Result<SyncStats, DiffError> {
     let filter = FileFilter::parse(filter)?;
-    let source_name = source.to_string();
-    let source = open_repo(store, source)?;
+    let source = SourceView::collect(store, source, &filter)?;
+    diff_sync_from(store, &source, target, copy_new, delete, &filter, run)
+}
+
+/// [`diff_sync`] against an already-collected source, so a multi-sink push
+/// reads the main once instead of once per sink.
+pub fn diff_sync_from(
+    store: &Store,
+    source: &SourceView,
+    target: &str,
+    copy_new: bool,
+    delete: SyncDelete,
+    filter: &FileFilter,
+    run: &DiffRun<'_>,
+) -> Result<SyncStats, DiffError> {
     let target = open_repo(store, target)?;
     let mut target_index = store::read_content_index(&target.db)?;
 
-    let source_entries = collect_source_entries(&source.db, &filter, true)?;
-    let source_root = PathBuf::from(&source.meta.abs_path);
+    let source_entries = &source.entries;
+    let source_root = source.root.clone();
+    let source_name = source.name.clone();
     let target_root = PathBuf::from(&target.meta.abs_path);
     let mut stats = SyncStats::default();
 
     // Content the source currently holds (non-missing, filter-matched): the
     // reference set for an Absent (mirror) delete, which removes any target
     // content outside it.
-    let source_present: HashSet<ContentKey> = source_entries
-        .iter()
-        .filter(|(_, e)| !e.missing)
-        .map(|(_, e)| (e.size, e.hash))
-        .collect();
+    let source_present = source.present_content();
     // Live target files (filter-matched) — only an Absent delete needs them.
     let target_entries = if delete == SyncDelete::Absent {
-        collect_source_entries(&target.db, &filter, false)?
+        collect_source_entries(&target.db, filter, false)?
     } else {
         Vec::new()
     };
@@ -659,7 +773,7 @@ pub fn diff_sync(
     }
 
     if copy_new && !stats.cancelled {
-        for (rel_path, entry) in &source_entries {
+        for (rel_path, entry) in source_entries {
             if entry.missing || !run.selected_source(rel_path) {
                 continue;
             }
@@ -796,15 +910,28 @@ pub fn plan_sync(
     filter: Option<&str>,
 ) -> Result<SyncPlan, DiffError> {
     let filter = FileFilter::parse(filter)?;
-    let source = open_repo(store, source)?;
+    let source = SourceView::collect(store, source, &filter)?;
+    plan_sync_from(store, &source, target, copy_new, delete, &filter)
+}
+
+/// [`plan_sync`] against an already-collected source, so a multi-sink push
+/// reads the main once instead of once per sink.
+pub fn plan_sync_from(
+    store: &Store,
+    source: &SourceView,
+    target: &str,
+    copy_new: bool,
+    delete: SyncDelete,
+    filter: &FileFilter,
+) -> Result<SyncPlan, DiffError> {
     let target = open_repo(store, target)?;
     let target_index = store::read_content_index(&target.db)?;
 
-    let source_entries = collect_source_entries(&source.db, &filter, true)?;
+    let source_entries = &source.entries;
     let mut plan = SyncPlan::default();
 
     if copy_new {
-        for (rel_path, entry) in &source_entries {
+        for (rel_path, entry) in source_entries {
             if entry.missing {
                 continue;
             }
@@ -832,12 +959,8 @@ pub fn plan_sync(
             }
         }
         SyncDelete::Absent => {
-            let source_present: HashSet<ContentKey> = source_entries
-                .iter()
-                .filter(|(_, e)| !e.missing)
-                .map(|(_, e)| (e.size, e.hash))
-                .collect();
-            for (rel_path, entry) in collect_source_entries(&target.db, &filter, false)? {
+            let source_present = source.present_content();
+            for (rel_path, entry) in collect_source_entries(&target.db, filter, false)? {
                 if !source_present.contains(&(entry.size, entry.hash)) {
                     plan.deletes.push(rel_path);
                 }
@@ -1406,17 +1529,11 @@ pub enum DiffOpError {
 }
 
 /// Resolve a repo-relative path to an absolute one, refusing anything that
-/// would escape the repo root (absolute components or `..`).
+/// would escape the repo root (absolute components or `..`) or is empty. Shares
+/// its escape rule with [`resolve_subdir`] via [`stays_within_root`].
 fn resolve_in_repo(root: &Path, rel_path: &str) -> Result<PathBuf, DiffOpError> {
     let rel = Path::new(rel_path);
-    if rel_path.trim().is_empty()
-        || rel.components().any(|c| {
-            !matches!(
-                c,
-                std::path::Component::Normal(_) | std::path::Component::CurDir
-            )
-        })
-    {
+    if rel_path.trim().is_empty() || !stays_within_root(rel) {
         return Err(DiffOpError::InvalidPath {
             path: rel_path.to_string(),
         });
@@ -1468,9 +1585,9 @@ pub fn rename_file(
     })?;
     // The content did not change, so the entry moves over as it is; the old
     // path is dropped outright rather than left behind as missing (the file
-    // was not lost, it just has another name now).
-    store::apply_entries(&open.db, std::iter::once((to_rel, &entry)))?;
-    store::remove_entries(&open.db, std::iter::once(from_rel))?;
+    // was not lost, it just has another name now). Both index writes happen in
+    // one transaction, so a crash can never leave the content under both names.
+    store::rename_entry(&open.db, from_rel, to_rel, &entry)?;
     Ok(())
 }
 
@@ -1514,6 +1631,11 @@ fn copy_into(
     let target = open_repo(store, to_repo)?;
     let from = resolve_in_repo(&PathBuf::from(&source.meta.abs_path), from_rel)?;
     let to = resolve_in_repo(&PathBuf::from(&target.meta.abs_path), to_rel)?;
+    // A copy onto itself is complete before it starts — and must not reach
+    // `fs::copy`, which would truncate the file it is about to read.
+    if from == to {
+        return Ok(());
+    }
     let Some(entry) = store::get_entry(&source.db, from_rel)?.filter(|e| !e.missing) else {
         return Err(DiffOpError::NoSuchFile {
             repo: from_repo.to_string(),

@@ -7,7 +7,7 @@
 use crate::dupes_view::DupesView;
 use crate::grooming_view::GroomingView;
 use crate::icon;
-use crate::settings::TooltipVerbosity;
+use crate::settings::{ThemeChoice, TooltipVerbosity};
 use crate::status::{self, Location};
 use crate::theme;
 use crate::transfer_view::TransferView;
@@ -15,7 +15,7 @@ use crate::util::{ExplainExt, format_size};
 use crate::worker::{ChannelProgress, JobKind, JobOutcome, RepoStatus, WorkerMsg, WorkerState};
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::store::{RepoStats, Store};
-use dedup_core::update::{CancellationToken, ProgressEvent, check_repo, update_repo};
+use dedup_core::update::{CancellationToken, ProgressEvent, check_repo};
 use egui::{Align, Color32, Id, Layout, RichText};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -32,7 +32,6 @@ pub(crate) enum Tab {
     Duplicates,
     Transfer,
     Grooming,
-    SyncGroups,
     Browse,
 }
 
@@ -73,6 +72,9 @@ enum FolderTarget {
     Relocate,
     /// The inline duplicate editor's path buffer.
     Duplicate,
+    /// The inline "add a sink to a group" editor's path buffer (a duplicate of
+    /// the group's main pointed at a new path).
+    AddSink,
 }
 
 /// In-progress inline edit for a repo row.
@@ -87,6 +89,14 @@ enum Edit {
     },
     Duplicate {
         name: String,
+        dest: String,
+        path: String,
+    },
+    /// Add a new sink to `group`: a clone of its `main` pointed at a new path.
+    /// `main` is the row the inline editor renders under.
+    AddSink {
+        main: String,
+        group: String,
         dest: String,
         path: String,
     },
@@ -116,6 +126,40 @@ enum Action {
     },
     CommitDelete(String),
     CancelEdit,
+    /// Turn an ungrouped repo into a sync-group main (a group named after it).
+    MakeMain(String),
+    /// Add an ungrouped repo to an existing group as a sink.
+    SinkInto {
+        repo: String,
+        group: String,
+    },
+    /// Take a sink back out of its group.
+    RemoveSink {
+        group: String,
+        repo: String,
+    },
+    /// Flip one sink's push mode (ADD ONLY ↔ MIRROR).
+    SetSinkMode {
+        group: String,
+        repo: String,
+        mode: dedup_core::store::SyncMode,
+    },
+    /// Queue an UPDATE / SCAN for every member of a group (main + sinks).
+    UpdateGroup(String),
+    /// Disband a group (its repos stay, just ungrouped).
+    Ungroup(String),
+    /// Open the inline "add a sink" editor on the group's main card.
+    BeginAddSink {
+        group: String,
+        main: String,
+    },
+    /// Clone `main` into a new repo at `path` and add it to `group` as a sink.
+    CommitAddSink {
+        group: String,
+        main: String,
+        dest: String,
+        path: String,
+    },
     OpenAdd,
     CloseAdd,
     ChooseFolder(FolderTarget),
@@ -133,6 +177,9 @@ pub struct DedupApp {
     load_error: Option<String>,
     /// Transient non-error notice (e.g. a drag-and-drop add summary).
     notice: Option<String>,
+    /// A scan was refused because it would have emptied this repo's index
+    /// (name, entry count). Shows the confirmation that can authorise it.
+    empty_scan_confirm: Option<(String, u64)>,
 
     show_add: bool,
     new_name: String,
@@ -147,6 +194,8 @@ pub struct DedupApp {
     did_initial_status: bool,
     threads: usize,
     tooltip_verbosity: TooltipVerbosity,
+    /// Chosen interface appearance; applied to egui each frame.
+    theme: ThemeChoice,
 
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
@@ -160,12 +209,9 @@ pub struct DedupApp {
     dupes: DupesView,
     transfer: TransferView,
     grooming: GroomingView,
-    sync_groups: crate::sync_view::SyncView,
-    /// Sync groups as of the last reload: the Repositories list collapses a
-    /// group's sinks under its main.
+    /// Sync groups as of the last reload: the Repositories list frames each
+    /// group — its main and that main's sinks — in one LCARS section.
     groups: Vec<(String, dedup_core::store::SyncGroup)>,
-    /// Mains whose sinks are currently expanded in the repo list.
-    expanded_mains: std::collections::HashSet<String>,
     browse: crate::browse_view::BrowseView,
     /// Last settings written to disk, to avoid rewriting an unchanged file.
     saved_settings: crate::settings::Settings,
@@ -185,6 +231,7 @@ impl DedupApp {
             repos: Vec::new(),
             load_error: None,
             notice: None,
+            empty_scan_confirm: None,
             show_add: false,
             new_name: String::new(),
             new_path: String::new(),
@@ -196,6 +243,7 @@ impl DedupApp {
             did_initial_status: false,
             threads: 0,
             tooltip_verbosity: TooltipVerbosity::default(),
+            theme: ThemeChoice::default(),
             tx,
             rx,
             worker: WorkerState::default(),
@@ -206,9 +254,7 @@ impl DedupApp {
             dupes: DupesView::new(),
             transfer: TransferView::new(),
             grooming: GroomingView::new(),
-            sync_groups: crate::sync_view::SyncView::new(),
             groups: Vec::new(),
-            expanded_mains: std::collections::HashSet::new(),
             browse: crate::browse_view::BrowseView::new(),
             saved_settings: crate::settings::Settings::default(),
             window_size: None,
@@ -221,6 +267,7 @@ impl DedupApp {
         app.transfer
             .set_threshold(settings.transfer_similarity_threshold);
         app.tooltip_verbosity = settings.tooltip_verbosity;
+        app.theme = settings.theme;
         app.saved_settings = settings;
         app.reload_all();
         app
@@ -233,6 +280,7 @@ impl DedupApp {
             similarity_threshold: self.dupes.threshold(),
             transfer_similarity_threshold: self.transfer.threshold(),
             tooltip_verbosity: self.tooltip_verbosity,
+            theme: self.theme,
             window_size: self.window_size,
         }
     }
@@ -253,6 +301,33 @@ impl DedupApp {
         }
     }
 
+    /// Re-sync the newly-shown view from the store, once per tab switch, so
+    /// repos added or changed on another tab appear without a refresh button.
+    ///
+    /// The Repositories tab re-reads its own cards here: file counts and free
+    /// space otherwise stayed stale after deleting duplicates on another tab
+    /// until the user refreshed by hand. `reload_all` opens each repo db, so it
+    /// runs only while no update is in flight — the same gate every other call
+    /// site uses. Skipping a busy frame is harmless, because a job's completion
+    /// handler reloads anyway.
+    fn sync_shown_tab(&mut self) {
+        if self.synced_tab == Some(self.tab) {
+            return;
+        }
+        match self.tab {
+            Tab::Repositories => {
+                if self.worker.active_count() == 0 {
+                    self.reload_all();
+                }
+            }
+            Tab::Duplicates => self.dupes.sync_repos(&self.store),
+            Tab::Transfer => self.transfer.sync_repos(&self.store),
+            Tab::Grooming => self.grooming.sync_repos(&self.store),
+            Tab::Browse => self.browse.sync_repos(&self.store),
+        }
+        self.synced_tab = Some(self.tab);
+    }
+
     /// Reload every repo row from the registry. Safe only when no update is
     /// running (it opens each repo db to read stats); callers gate on that.
     fn reload_all(&mut self) {
@@ -270,7 +345,10 @@ impl DedupApp {
                     let (last, location, freshness) =
                         prev.remove(&name)
                             .unwrap_or((None, None, Freshness::Unknown));
-                    let mimes = self.store.get_mime_stats(&name).unwrap_or_default();
+                    let mimes = crate::util::or_log_default(
+                        self.store.get_mime_stats(&name),
+                        &format!("mime stats for '{name}'"),
+                    );
                     rows.push(RepoRow {
                         name,
                         path: meta.abs_path,
@@ -282,9 +360,22 @@ impl DedupApp {
                     });
                 }
                 self.repos = rows;
-                self.groups = self.store.list_sync_groups().unwrap_or_default();
                 self.load_error = None;
                 self.notice = None;
+                // Not silently defaulted: without the groups a sink renders as
+                // an unrelated top-level repo, so the user would be acting on a
+                // list that misrepresents what they own.
+                match self.store.list_sync_groups() {
+                    Ok(groups) => self.groups = groups,
+                    Err(e) => {
+                        log::error!("could not read sync groups: {e}");
+                        self.groups.clear();
+                        self.load_error = Some(format!(
+                            "Could not read sync groups: {e}. Backup sinks are listed as \
+                             ordinary repositories until this is resolved."
+                        ));
+                    }
+                }
                 // The repo set may have changed (add/remove/rename/relocate);
                 // force the selector tabs to re-sync when next shown.
                 self.synced_tab = None;
@@ -416,12 +507,28 @@ impl DedupApp {
             let threads = self.threads;
             let repaint = ctx.clone();
             std::thread::spawn(move || {
+                log::info!("starting {kind:?} of '{name}' on {threads} thread(s)");
                 let progress = ChannelProgress::new(name.clone(), tx.clone());
                 let outcome = match kind {
-                    JobKind::Update => JobOutcome::Update(
-                        update_repo(&store, &name, threads, &progress, &cancel)
-                            .map_err(|e| e.to_string()),
-                    ),
+                    JobKind::Update | JobKind::UpdateForced => {
+                        let allow_empty = matches!(kind, JobKind::UpdateForced);
+                        match dedup_core::update::update_repo_authorized(
+                            &store,
+                            &name,
+                            threads,
+                            &progress,
+                            &cancel,
+                            allow_empty,
+                        ) {
+                            // Not an error to report: the UI turns this into a
+                            // confirmation offering to scan anyway.
+                            Err(dedup_core::update::UpdateError::WouldEmptyIndex {
+                                entries,
+                                ..
+                            }) => JobOutcome::UpdateWouldEmpty(entries),
+                            other => JobOutcome::Update(other.map_err(|e| e.to_string())),
+                        }
+                    }
                     JobKind::Check => JobOutcome::Check(
                         check_repo(&store, &name, &progress, &cancel).map_err(|e| e.to_string()),
                     ),
@@ -460,6 +567,17 @@ impl DedupApp {
             // folder's basename unless a name was already typed.
             FolderTarget::Duplicate => {
                 if let Some(Edit::Duplicate { dest, path, .. }) = &mut self.edit {
+                    if dest.trim().is_empty()
+                        && let Some(base) = dir.file_name()
+                    {
+                        *dest = base.to_string_lossy().into_owned();
+                    }
+                    *path = picked;
+                }
+            }
+            // Add-sink editor: same behaviour as the duplicate editor.
+            FolderTarget::AddSink => {
+                if let Some(Edit::AddSink { dest, path, .. }) = &mut self.edit {
                     if dest.trim().is_empty()
                         && let Some(base) = dir.file_name()
                     {
@@ -542,6 +660,98 @@ impl DedupApp {
             }
             Action::BeginDelete(name) => self.edit = Some(Edit::ConfirmDelete { name }),
             Action::CancelEdit => self.edit = None,
+            Action::MakeMain(name) => {
+                // Name the group after its main. Repo names are unique and groups
+                // are a separate keyspace, so this only clashes with a group
+                // already named for another repo — surfaced as an error.
+                if let Err(e) = self.store.create_sync_group(&name, &name) {
+                    self.load_error = Some(e.to_string());
+                }
+                self.reload_all();
+            }
+            Action::SinkInto { repo, group } => {
+                if let Err(e) =
+                    self.store
+                        .add_sync_sink(&group, &repo, dedup_core::store::SyncMode::AddOnly)
+                {
+                    self.load_error = Some(e.to_string());
+                }
+                self.reload_all();
+            }
+            Action::RemoveSink { group, repo } => {
+                if let Err(e) = self.store.remove_sync_sink(&group, &repo) {
+                    self.load_error = Some(e.to_string());
+                }
+                self.reload_all();
+            }
+            Action::SetSinkMode { group, repo, mode } => {
+                if let Err(e) = self.store.set_sink_mode(&group, &repo, mode) {
+                    self.load_error = Some(e.to_string());
+                }
+                self.reload_all();
+            }
+            Action::UpdateGroup(group) => {
+                // Queue every member (main + sinks). enqueue takes names only, so
+                // collect first to avoid borrowing `self.groups` across the call.
+                let members: Vec<String> = self
+                    .groups
+                    .iter()
+                    .find(|(n, _)| *n == group)
+                    .map(|(_, g)| g.members().map(str::to_string).collect())
+                    .unwrap_or_default();
+                // Skip known-unreachable members, like UPDATE ALL — a backup on an
+                // unplugged drive would otherwise hang a worker. Not-yet-probed
+                // (Unknown) members are still included.
+                for member in members {
+                    let reachable = self
+                        .repos
+                        .iter()
+                        .find(|r| r.name == member)
+                        .is_none_or(|r| r.location.is_none_or(|l| l.reachable()));
+                    if reachable {
+                        self.enqueue(member, JobKind::Update);
+                    }
+                }
+            }
+            Action::Ungroup(group) => {
+                if let Err(e) = self.store.delete_sync_group(&group) {
+                    self.load_error = Some(e.to_string());
+                }
+                self.reload_all();
+            }
+            Action::BeginAddSink { group, main } => {
+                self.edit = Some(Edit::AddSink {
+                    main,
+                    group,
+                    dest: String::new(),
+                    path: String::new(),
+                });
+            }
+            Action::CommitAddSink {
+                group,
+                main,
+                dest,
+                path,
+            } => {
+                self.edit = None;
+                if dest.is_empty() || path.is_empty() {
+                    self.load_error = Some("Add repo needs a new name and path.".into());
+                } else {
+                    match self.store.duplicate_repo(&main, &dest, &path) {
+                        Ok(()) => {
+                            if let Err(e) = self.store.add_sync_sink(
+                                &group,
+                                &dest,
+                                dedup_core::store::SyncMode::AddOnly,
+                            ) {
+                                self.load_error = Some(e.to_string());
+                            }
+                        }
+                        Err(e) => self.load_error = Some(e.to_string()),
+                    }
+                    self.reload_all();
+                }
+            }
             Action::CommitRename(name, new_name) => {
                 self.edit = None;
                 if !new_name.is_empty() && new_name != name {
@@ -634,6 +844,11 @@ impl DedupApp {
 impl eframe::App for DedupApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // Drive egui from the chosen appearance, then follow whatever it
+        // resolved to this frame so the application's own colours read from the
+        // matching palette. Setting the same preference each frame is idempotent.
+        ctx.set_theme(self.theme.preference());
+        theme::sync_active(&ctx);
         // One-time startup probe of every repo's location/reachability.
         if !self.did_initial_status {
             self.did_initial_status = true;
@@ -644,19 +859,50 @@ impl eframe::App for DedupApp {
         for (repo, outcome) in self.worker.drain(&self.rx) {
             self.cancels.remove(&repo);
             match outcome {
+                JobOutcome::UpdateWouldEmpty(entries) => {
+                    // Nothing was written. Ask before letting a scan empty an
+                    // index — an unmounted drive looks exactly like this, and an
+                    // emptied sync-group main turns the next MIRROR into a wipe.
+                    log::warn!(
+                        "scan of '{repo}' refused: it walked empty over {entries} indexed entries"
+                    );
+                    self.empty_scan_confirm = Some((repo.clone(), entries));
+                }
                 JobOutcome::Update(result) => {
                     // A clean, uncancelled update brings the index in sync.
                     let clean = matches!(&result, Ok(s) if !s.cancelled);
+                    // Anything a bug report would want to find in the log.
+                    let worrying = match &result {
+                        Err(_) => true,
+                        Ok(s) => s.empty_walk || s.errors > 0,
+                    };
                     let summary = match result {
                         Ok(s) if s.cancelled => {
                             format!("cancelled — added {}, updated {}", s.added, s.updated)
                         }
-                        Ok(s) => format!(
-                            "added {}, updated {}, unchanged {}, missing {}, errors {}",
-                            s.added, s.updated, s.unchanged, s.marked_missing, s.errors
-                        ),
+                        Ok(s) => {
+                            let mut text = format!(
+                                "added {}, updated {}, unchanged {}, missing {}, errors {}",
+                                s.added, s.updated, s.unchanged, s.marked_missing, s.errors
+                            );
+                            // The scan saw an empty directory where the index
+                            // held files. Usually a drive that did not mount —
+                            // and an emptied repo is what turns a MIRROR sync
+                            // into a wipe, so it must not read as a normal scan.
+                            if s.empty_walk {
+                                text.push_str(
+                                    " — FOUND NO FILES AT ALL; check the drive is mounted",
+                                );
+                            }
+                            text
+                        }
                         Err(e) => format!("error: {e}"),
                     };
+                    if worrying {
+                        log::warn!("scan of '{repo}': {summary}");
+                    } else {
+                        log::info!("scan of '{repo}': {summary}");
+                    }
                     self.refresh_repo(&repo);
                     if let Some(row) = self.repos.iter_mut().find(|r| r.name == repo) {
                         row.last = Some(summary);
@@ -712,7 +958,7 @@ impl eframe::App for DedupApp {
                 egui::Align2::CENTER_CENTER,
                 "Drop folders to add them as repositories",
                 egui::FontId::proportional(22.0),
-                theme::AMBER,
+                theme::amber(),
             );
         }
 
@@ -725,19 +971,7 @@ impl eframe::App for DedupApp {
         // On each tab switch, re-sync the newly-shown view's repo list from the
         // store, so repos added/removed elsewhere appear without a refresh
         // button. (The Repositories tab refreshes its own cards separately.)
-        if self.synced_tab != Some(self.tab) {
-            match self.tab {
-                // The Repositories tab manages its own cards (refreshed after
-                // add/scan operations), so it isn't re-synced here.
-                Tab::Repositories => {}
-                Tab::Duplicates => self.dupes.sync_repos(&self.store),
-                Tab::Transfer => self.transfer.sync_repos(&self.store),
-                Tab::Grooming => self.grooming.sync_repos(&self.store),
-                Tab::SyncGroups => self.sync_groups.sync_repos(&self.store),
-                Tab::Browse => self.browse.sync_repos(&self.store),
-            }
-            self.synced_tab = Some(self.tab);
-        }
+        self.sync_shown_tab();
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Repositories => self.repositories_view(ui, &mut actions),
             Tab::Duplicates => self.dupes.show(ui, &self.store, self.tooltip_verbosity),
@@ -746,9 +980,6 @@ impl eframe::App for DedupApp {
                     .show(ui, &self.store, self.tooltip_verbosity, Some(frame))
             }
             Tab::Grooming => self.grooming.show(ui, &self.store, self.tooltip_verbosity),
-            Tab::SyncGroups => self
-                .sync_groups
-                .show(ui, &self.store, self.tooltip_verbosity),
             Tab::Browse => self.browse.show(ui, &self.store, self.tooltip_verbosity),
         });
         if self.show_settings {
@@ -756,6 +987,9 @@ impl eframe::App for DedupApp {
         }
         if self.show_about {
             self.about_modal(&ctx);
+        }
+        if self.empty_scan_confirm.is_some() {
+            self.empty_scan_modal(&ctx);
         }
         if self.show_help {
             self.help_window(&ctx);
@@ -797,7 +1031,8 @@ impl eframe::App for DedupApp {
             || current.similarity_threshold != self.saved_settings.similarity_threshold
             || current.transfer_similarity_threshold
                 != self.saved_settings.transfer_similarity_threshold
-            || current.tooltip_verbosity != self.saved_settings.tooltip_verbosity;
+            || current.tooltip_verbosity != self.saved_settings.tooltip_verbosity
+            || current.theme != self.saved_settings.theme;
         if control_changed {
             current.save(self.store.config_dir());
             self.saved_settings = current;
@@ -815,19 +1050,19 @@ impl DedupApp {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("top")
             .exact_size(56.0)
-            .frame(egui::Frame::new().fill(theme::BLACK).inner_margin(8.0))
+            .frame(egui::Frame::new().fill(theme::bg()).inner_margin(8.0))
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.label(
                         RichText::new("DEDUP")
-                            .color(theme::ORANGE)
+                            .color(theme::orange())
                             .size(26.0)
                             .strong(),
                     );
                     ui.add_space(6.0);
                     ui.label(
                         RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                            .color(theme::LILAC)
+                            .color(theme::lilac())
                             .size(13.0),
                     );
                     ui.add_space(16.0);
@@ -842,7 +1077,7 @@ impl DedupApp {
                             ui,
                             &format!("{} SETTINGS", icon::GEAR),
                             true,
-                            theme::TAN,
+                            theme::tan(),
                         )
                         .explain(
                             self.tooltip_verbosity,
@@ -855,7 +1090,7 @@ impl DedupApp {
                         }
                         // Added after SETTINGS so it renders immediately to its
                         // left in this right-to-left layout.
-                        if crate::lcars::action_button(ui, "ABOUT", true, theme::TAN)
+                        if crate::lcars::action_button(ui, "ABOUT", true, theme::tan())
                             .explain(
                                 self.tooltip_verbosity,
                                 "Version and license",
@@ -866,7 +1101,7 @@ impl DedupApp {
                             self.show_about = true;
                         }
                         // Added after ABOUT so it renders immediately to its left.
-                        if crate::lcars::action_button(ui, "HELP", true, theme::TAN)
+                        if crate::lcars::action_button(ui, "HELP", true, theme::tan())
                             .explain(
                                 self.tooltip_verbosity,
                                 "Explain the current tab",
@@ -889,7 +1124,7 @@ impl DedupApp {
                                         &mut self.tab,
                                         Tab::Repositories,
                                         "REPOSITORIES",
-                                        theme::ORANGE,
+                                        theme::orange(),
                                         self.tooltip_verbosity,
                                         "Add, update, and manage repository links",
                                     );
@@ -898,7 +1133,7 @@ impl DedupApp {
                                         &mut self.tab,
                                         Tab::Duplicates,
                                         "DUPLICATES",
-                                        theme::LILAC,
+                                        theme::lilac(),
                                         self.tooltip_verbosity,
                                         "Find and review exact or perceptually similar duplicates",
                                     );
@@ -907,34 +1142,26 @@ impl DedupApp {
                                         &mut self.tab,
                                         Tab::Transfer,
                                         "TRANSFER",
-                                        theme::BLUE,
+                                        theme::blue(),
                                         self.tooltip_verbosity,
-                                        "Copy or move files between repositories by content",
+                                        "Copy, move, sync or push a backup group between \
+                                         repositories by content",
                                     );
                                     tab_button(
                                         ui,
                                         &mut self.tab,
                                         Tab::Grooming,
                                         "GROOMING",
-                                        theme::TAN,
+                                        theme::tan(),
                                         self.tooltip_verbosity,
                                         "Prune and reorganize repositories (coming soon)",
                                     );
                                     tab_button(
                                         ui,
                                         &mut self.tab,
-                                        Tab::SyncGroups,
-                                        "SYNC GROUPS",
-                                        theme::GREEN,
-                                        self.tooltip_verbosity,
-                                        "Keep a repository backed up to one or more remote copies",
-                                    );
-                                    tab_button(
-                                        ui,
-                                        &mut self.tab,
                                         Tab::Browse,
                                         "BROWSE",
-                                        theme::AMBER,
+                                        theme::amber(),
                                         self.tooltip_verbosity,
                                         "Browse a repo's files by directory, from the index",
                                     );
@@ -949,17 +1176,17 @@ impl DedupApp {
         ui.add_space(6.0);
         ui.label(
             RichText::new("REPOSITORY MANAGEMENT")
-                .color(theme::AMBER)
+                .color(theme::amber())
                 .size(18.0)
                 .strong(),
         );
         ui.add_space(4.0);
 
         if let Some(err) = &self.load_error {
-            ui.colored_label(theme::RED, err);
+            ui.colored_label(theme::red(), err);
         }
         if let Some(notice) = &self.notice {
-            ui.colored_label(theme::AMBER, notice);
+            ui.colored_label(theme::amber(), notice);
         }
 
         // The registry is locked while any repo is updating, so adding a repo
@@ -968,13 +1195,14 @@ impl DedupApp {
         crate::lcars::section_lcars(
             ui,
             "MANAGE — ADD & UPDATE REPOSITORIES",
-            theme::BLUE,
+            theme::blue(),
             |ui| {
                 ui.horizontal(|ui| {
                     let add = egui::Button::new(
-                        RichText::new(format!("{} ADD REPOSITORY", icon::PLUS)).color(theme::BLACK),
+                        RichText::new(format!("{} ADD REPOSITORY", icon::PLUS))
+                            .color(theme::ink_on(theme::blue())),
                     )
-                    .fill(theme::BLUE);
+                    .fill(theme::blue());
                     if ui
                     .add_enabled(!busy, add)
                     .explain(
@@ -990,9 +1218,10 @@ impl DedupApp {
                     // Enqueues every repo; it only touches names (no db access), so it
                     // stays enabled even while a batch is running.
                     let update_all = egui::Button::new(
-                        RichText::new(format!("{} UPDATE ALL", icon::REFRESH)).color(theme::BLACK),
+                        RichText::new(format!("{} UPDATE ALL", icon::REFRESH))
+                            .color(theme::black()),
                     )
-                    .fill(theme::ORANGE);
+                    .fill(theme::orange());
                     if ui
                     .add_enabled(!self.repos.is_empty(), update_all)
                     .explain(
@@ -1009,9 +1238,9 @@ impl DedupApp {
                     // db access), so it is fine to run any time.
                     let refresh = egui::Button::new(
                         RichText::new(format!("{} REFRESH STATUS", icon::REFRESH))
-                            .color(theme::BLACK),
+                            .color(theme::ink_on(theme::lilac())),
                     )
-                    .fill(theme::LILAC);
+                    .fill(theme::lilac());
                     if ui
                     .add_enabled(!self.repos.is_empty(), refresh)
                     .explain(
@@ -1027,7 +1256,7 @@ impl DedupApp {
                     if busy {
                         ui.label(
                             RichText::new("· busy: a scan is running")
-                                .color(theme::TAN)
+                                .color(theme::tan())
                                 .size(12.0),
                         );
                     }
@@ -1042,15 +1271,36 @@ impl DedupApp {
             .show(ui, |ui| {
                 if rows.is_empty() {
                     ui.add_space(8.0);
-                    ui.colored_label(theme::TEXT, "No repositories yet — use ADD REPOSITORY.");
+                    ui.colored_label(theme::text(), "No repositories yet — use ADD REPOSITORY.");
                 }
                 for row in &rows {
-                    // A sink is shown under its main, not as a top-level repo.
+                    // A sink is shown inside its group's section, not as a
+                    // top-level repo.
                     if self.sink_of(&row.name).is_some() {
                         continue;
                     }
-                    self.repo_card(ui, row, actions);
-                    self.sink_rows(ui, &row.name, &rows, actions);
+                    // A group main and its sinks are framed together by one LCARS
+                    // elbow rail, so a group reads as a single block and an
+                    // ungrouped repo as a bare card.
+                    match self.group_of_main(&row.name) {
+                        Some(group_name) => {
+                            let name = group_name.clone();
+                            // Folded by default: the repo list is about your
+                            // originals, so a group's backups stay out of the way
+                            // until you ask for them.
+                            crate::lcars::section_lcars_collapsible(
+                                ui,
+                                &name,
+                                theme::green(),
+                                false,
+                                |ui| {
+                                    self.repo_card(ui, row, actions);
+                                    self.group_section(ui, &row.name, &rows, actions);
+                                },
+                            );
+                        }
+                        None => self.repo_card(ui, row, actions),
+                    }
                 }
             });
     }
@@ -1059,13 +1309,25 @@ impl DedupApp {
     fn sink_of(&self, repo: &str) -> Option<&(String, dedup_core::store::SyncGroup)> {
         self.groups
             .iter()
-            .find(|(_, g)| g.sinks.iter().any(|s| s == repo))
+            .find(|(_, g)| g.sinks.iter().any(|s| s.repo == repo))
     }
 
-    /// After a main's card: a chevron summarising its sinks, and — while
-    /// expanded — the sinks' own cards. Collapsed by default, so a group reads
-    /// as one repository with backups rather than several unrelated repos.
-    fn sink_rows(
+    /// The name of the group `repo` is the *main* of, if any — the title of the
+    /// LCARS section that frames the group.
+    fn group_of_main(&self, repo: &str) -> Option<&String> {
+        self.groups
+            .iter()
+            .find(|(_, g)| g.main == repo)
+            .map(|(n, _)| n)
+    }
+
+    /// The body of a group's LCARS section, drawn under its main's card: the
+    /// group controls (ADD REPO, UPDATE ALL, UNGROUP), shown for any main — even
+    /// one with no sinks yet — then each sink's own card.
+    ///
+    /// There is no chevron here: the enclosing section's caret is the single
+    /// control that folds the whole group away.
+    fn group_section(
         &mut self,
         ui: &mut egui::Ui,
         main: &str,
@@ -1080,40 +1342,62 @@ impl DedupApp {
         else {
             return;
         };
-        if group.sinks.is_empty() {
-            return;
-        }
-        let expanded = self.expanded_mains.contains(main);
-        let chevron = if expanded {
-            icon::CARET_DOWN
-        } else {
-            icon::CARET_RIGHT
-        };
-        let label = format!("{chevron} {} SINK(S) IN '{group_name}'", group.sinks.len());
+        let verbosity = self.tooltip_verbosity;
         ui.horizontal(|ui| {
             ui.add_space(16.0);
-            if crate::lcars::action_button(ui, &label, true, theme::GREEN)
+            if crate::lcars::action_button(
+                ui,
+                &format!("{} ADD REPO", icon::PLUS),
+                true,
+                theme::blue(),
+            )
+            .explain(
+                verbosity,
+                "Add a backup repository to this group",
+                "Add a backup to this group: a clone of the main's index, pointed at a new \
+                 folder.",
+            )
+            .clicked()
+            {
+                actions.push(Action::BeginAddSink {
+                    group: group_name.clone(),
+                    main: main.to_string(),
+                });
+            }
+            if crate::lcars::action_button(
+                ui,
+                &format!("{} UPDATE ALL", icon::REFRESH),
+                true,
+                theme::amber(),
+            )
+            .explain(
+                verbosity,
+                "Scan the whole group",
+                "Queue an UPDATE / SCAN for the main and every backup in this group.",
+            )
+            .clicked()
+            {
+                actions.push(Action::UpdateGroup(group_name.clone()));
+            }
+            if crate::lcars::action_button(ui, "UNGROUP", true, theme::lilac())
                 .explain(
-                    self.tooltip_verbosity,
-                    "Show the repositories this one is backed up to",
-                    "This repository is the main of a sync group. Its sinks — the copies it \
-                     is pushed to — are folded away here so the list stays about your \
-                     originals; expand to manage them like any other repository.",
+                    verbosity,
+                    "Disband this group",
+                    "Disband this group. Every repository stays; they are just no longer \
+                     linked as main and backups.",
                 )
                 .clicked()
             {
-                if expanded {
-                    self.expanded_mains.remove(main);
-                } else {
-                    self.expanded_mains.insert(main.to_string());
-                }
+                actions.push(Action::Ungroup(group_name.clone()));
             }
         });
-        if !expanded {
+        if group.sinks.is_empty() {
             return;
         }
+        // No chevron here: the enclosing LCARS section's own caret folds the
+        // whole group away, and two competing collapse controls read as a bug.
         for sink in &group.sinks {
-            if let Some(row) = rows.iter().find(|r| &r.name == sink) {
+            if let Some(row) = rows.iter().find(|r| r.name == sink.repo) {
                 self.repo_card(ui, row, actions);
             }
         }
@@ -1133,9 +1417,9 @@ impl DedupApp {
             )
         });
         egui::Frame::new()
-            .fill(theme::PANEL)
+            .fill(theme::panel())
             .corner_radius(theme::PILL)
-            .stroke(egui::Stroke::new(1.5, theme::ORANGE))
+            .stroke(egui::Stroke::new(1.5, theme::orange()))
             .inner_margin(12.0)
             .outer_margin(egui::Margin {
                 left: 0,
@@ -1147,10 +1431,15 @@ impl DedupApp {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(&row.name)
-                            .color(theme::AMBER)
+                            .color(theme::amber())
                             .size(17.0)
                             .strong(),
                     );
+                    // Inside a group section both the main and its sinks are
+                    // cards; the badge is what tells them apart.
+                    if self.group_of_main(&row.name).is_some() {
+                        main_pill(ui, self.tooltip_verbosity);
+                    }
                     status_pills(ui, row, self.tooltip_verbosity);
                     // MIME breakdown, share-sorted, pinned to the top-right. It is
                     // reserved first (right-to-left) so the path — added inside,
@@ -1162,7 +1451,7 @@ impl DedupApp {
                         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(&row.path).color(theme::TEXT).size(12.0),
+                                    RichText::new(&row.path).color(theme::text()).size(12.0),
                                 )
                                 .truncate(),
                             )
@@ -1179,7 +1468,7 @@ impl DedupApp {
                         ui,
                         "FILES",
                         &row.stats.file_count.to_string(),
-                        theme::ORANGE,
+                        theme::orange(),
                         "Indexed files (missing files excluded)",
                         "Number of files currently indexed for this repository. Files that \
                          were indexed before but have since vanished from disk are excluded \
@@ -1190,7 +1479,7 @@ impl DedupApp {
                         ui,
                         "SIZE",
                         &format_size(row.stats.total_size),
-                        theme::BLUE,
+                        theme::blue(),
                         "Total size of indexed files",
                         "Sum of the on-disk size of every indexed (non-missing) file in this \
                          repository.",
@@ -1200,7 +1489,7 @@ impl DedupApp {
                         ui,
                         "MISSING",
                         &row.stats.missing_count.to_string(),
-                        theme::LILAC,
+                        theme::lilac(),
                         "Indexed before but no longer on disk",
                         "Files that were indexed by a previous scan but are no longer found \
                          on disk. They stay in the index as history but are excluded from \
@@ -1211,7 +1500,7 @@ impl DedupApp {
                         ui,
                         "SCANNED",
                         &format_last_scan(row.stats.last_scan_ms),
-                        theme::TAN,
+                        theme::tan(),
                         "When this repository was last scanned",
                         "Date and time of the most recent completed UPDATE / SCAN of this \
                          repository. \"never\" means it hasn't been scanned yet.",
@@ -1232,7 +1521,7 @@ impl DedupApp {
                                     "queued to {verb} — waiting {}",
                                     format_elapsed(waited)
                                 ))
-                                .color(theme::TAN),
+                                .color(theme::tan()),
                             );
                             if cancel_button(
                                 ui,
@@ -1250,7 +1539,7 @@ impl DedupApp {
                         let elapsed = elapsed.unwrap_or_default();
                         let checking = kind == JobKind::Check;
                         ui.horizontal(|ui| {
-                            ui.add(egui::Spinner::new().color(theme::AMBER));
+                            ui.add(egui::Spinner::new().color(theme::amber()));
                             match &event {
                                 // Only a full update hashes; a check never does.
                                 ProgressEvent::Hashing { done, total, .. }
@@ -1269,12 +1558,12 @@ impl DedupApp {
                                         RichText::new(format!(
                                             "checking — {files} files, {dirs} dirs"
                                         ))
-                                        .color(theme::AMBER),
+                                        .color(theme::amber()),
                                     );
                                 }
                                 other => {
                                     ui.label(
-                                        RichText::new(progress_line(other)).color(theme::AMBER),
+                                        RichText::new(progress_line(other)).color(theme::amber()),
                                     );
                                 }
                             }
@@ -1306,12 +1595,12 @@ impl DedupApp {
                             ),
                             _ => format!("{verb} for {}", format_elapsed(elapsed)),
                         };
-                        ui.label(RichText::new(timing).color(theme::TAN).size(12.0));
+                        ui.label(RichText::new(timing).color(theme::tan()).size(12.0));
                     }
                     None => {
                         self.card_controls(ui, row, actions);
                         if let Some(last) = &row.last {
-                            ui.label(RichText::new(last).color(theme::TAN).size(12.0));
+                            ui.label(RichText::new(last).color(theme::tan()).size(12.0));
                         }
                     }
                 }
@@ -1324,7 +1613,7 @@ impl DedupApp {
             Some(Edit::Rename { name, buf }) if *name == row.name => {
                 let verbosity = self.tooltip_verbosity;
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("RENAME →").color(theme::LILAC));
+                    ui.label(RichText::new("RENAME →").color(theme::lilac()));
                     ui.text_edit_singleline(buf).explain(
                         verbosity,
                         "New name",
@@ -1332,14 +1621,14 @@ impl DedupApp {
                          on-disk folder it points at is unchanged).",
                     );
                     if ui
-                        .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::BLACK))
+                        .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::black()))
                         .explain(verbosity, "Confirm rename", "Apply the new name.")
                         .clicked()
                     {
                         actions.push(Action::CommitRename(name.clone(), buf.trim().to_string()));
                     }
                     if ui
-                        .button(RichText::new(icon::X).color(theme::BLACK))
+                        .button(RichText::new(icon::X).color(theme::black()))
                         .explain(
                             verbosity,
                             "Cancel",
@@ -1355,11 +1644,11 @@ impl DedupApp {
             Some(Edit::Relocate { name, buf }) if *name == row.name => {
                 let verbosity = self.tooltip_verbosity;
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("RELOCATE →").color(theme::LILAC));
+                    ui.label(RichText::new("RELOCATE →").color(theme::lilac()));
                     if ui
                         .button(
                             RichText::new(format!("{} CHOOSE…", icon::FOLDER_OPEN))
-                                .color(theme::BLACK),
+                                .color(theme::black()),
                         )
                         .explain(
                             verbosity,
@@ -1378,14 +1667,14 @@ impl DedupApp {
                          existing index is kept — only the target path changes.",
                     );
                     if ui
-                        .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::BLACK))
+                        .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::black()))
                         .explain(verbosity, "Confirm relocate", "Apply the new folder path.")
                         .clicked()
                     {
                         actions.push(Action::CommitRelocate(name.clone(), buf.trim().to_string()));
                     }
                     if ui
-                        .button(RichText::new(icon::X).color(theme::BLACK))
+                        .button(RichText::new(icon::X).color(theme::black()))
                         .explain(
                             verbosity,
                             "Cancel",
@@ -1401,18 +1690,18 @@ impl DedupApp {
             Some(Edit::Duplicate { name, dest, path }) if *name == row.name => {
                 let verbosity = self.tooltip_verbosity;
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("COPY → NAME").color(theme::LILAC));
+                    ui.label(RichText::new("COPY → NAME").color(theme::lilac()));
                     ui.add(egui::TextEdit::singleline(dest).desired_width(140.0))
                         .explain(
                             verbosity,
                             "New repository's name",
                             "Name for the new repository the index is copied into.",
                         );
-                    ui.label(RichText::new("PATH").color(theme::LILAC));
+                    ui.label(RichText::new("PATH").color(theme::lilac()));
                     if ui
                         .button(
                             RichText::new(format!("{} CHOOSE…", icon::FOLDER_OPEN))
-                                .color(theme::BLACK),
+                                .color(theme::black()),
                         )
                         .explain(
                             verbosity,
@@ -1436,7 +1725,7 @@ impl DedupApp {
                          repository is left completely unchanged.",
                     );
                     if ui
-                        .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::BLACK))
+                        .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::black()))
                         .explain(
                             verbosity,
                             "Confirm duplicate",
@@ -1451,7 +1740,7 @@ impl DedupApp {
                         });
                     }
                     if ui
-                        .button(RichText::new(icon::X).color(theme::BLACK))
+                        .button(RichText::new(icon::X).color(theme::black()))
                         .explain(
                             verbosity,
                             "Cancel",
@@ -1464,14 +1753,86 @@ impl DedupApp {
                 });
                 return;
             }
+            Some(Edit::AddSink {
+                main,
+                group,
+                dest,
+                path,
+            }) if *main == row.name => {
+                let verbosity = self.tooltip_verbosity;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("ADD SINK → NAME").color(theme::green()));
+                    ui.add(egui::TextEdit::singleline(dest).desired_width(140.0))
+                        .explain(
+                            verbosity,
+                            "New repository's name",
+                            "Name for the new backup repository. It starts as a copy of this \
+                             group's main index, pointed at the folder you choose.",
+                        );
+                    ui.label(RichText::new("PATH").color(theme::green()));
+                    if ui
+                        .button(
+                            RichText::new(format!("{} CHOOSE…", icon::FOLDER_OPEN))
+                                .color(theme::black()),
+                        )
+                        .explain(
+                            verbosity,
+                            "Pick a folder",
+                            "Open a native folder picker to choose where the new backup \
+                             repository's files live.",
+                        )
+                        .clicked()
+                    {
+                        actions.push(Action::ChooseFolder(FolderTarget::AddSink));
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(path)
+                            .desired_width(240.0)
+                            .hint_text("/backup/repo/path"),
+                    )
+                    .explain(
+                        verbosity,
+                        "New repository's folder",
+                        "On-disk folder the new backup repository will point at. The main \
+                         is left completely unchanged.",
+                    );
+                    if ui
+                        .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::black()))
+                        .explain(
+                            verbosity,
+                            "Add this backup",
+                            "Clone the main's index into the new repository at the chosen \
+                             path and add it to this group as a sink.",
+                        )
+                        .clicked()
+                    {
+                        actions.push(Action::CommitAddSink {
+                            group: group.clone(),
+                            main: main.clone(),
+                            dest: dest.trim().to_string(),
+                            path: path.trim().to_string(),
+                        });
+                    }
+                    if ui
+                        .button(RichText::new(icon::X).color(theme::black()))
+                        .explain(verbosity, "Cancel", "Discard and close the editor.")
+                        .clicked()
+                    {
+                        actions.push(Action::CancelEdit);
+                    }
+                });
+                return;
+            }
             Some(Edit::ConfirmDelete { name }) if *name == row.name => {
                 let verbosity = self.tooltip_verbosity;
                 ui.horizontal(|ui| {
-                    ui.colored_label(theme::RED, format!("Delete '{name}' and its index?"));
+                    ui.colored_label(theme::red(), format!("Delete '{name}' and its index?"));
                     if ui
                         .add(
-                            egui::Button::new(RichText::new("DELETE").color(theme::BLACK))
-                                .fill(theme::RED),
+                            egui::Button::new(
+                                RichText::new("DELETE").color(theme::ink_on(theme::red())),
+                            )
+                            .fill(theme::red()),
                         )
                         .explain(
                             verbosity,
@@ -1484,7 +1845,7 @@ impl DedupApp {
                         actions.push(Action::CommitDelete(name.clone()));
                     }
                     if ui
-                        .button(RichText::new("KEEP").color(theme::BLACK))
+                        .button(RichText::new("KEEP").color(theme::black()))
                         .explain(
                             verbosity,
                             "Cancel",
@@ -1505,7 +1866,7 @@ impl DedupApp {
         let reachable = row.location.is_none_or(|l| l.reachable());
         ui.horizontal(|ui| {
             let update = egui::Button::new(
-                RichText::new(format!("{} UPDATE / SCAN", icon::REFRESH)).color(theme::BLACK),
+                RichText::new(format!("{} UPDATE / SCAN", icon::REFRESH)).color(theme::black()),
             );
             if ui
                 .add_enabled(reachable, update)
@@ -1521,7 +1882,7 @@ impl DedupApp {
                 actions.push(Action::Update(row.name.clone()));
             }
             let check = egui::Button::new(
-                RichText::new(format!("{} CHECK", icon::SEARCH)).color(theme::BLACK),
+                RichText::new(format!("{} CHECK", icon::SEARCH)).color(theme::black()),
             );
             if ui
                 .add_enabled(reachable, check)
@@ -1537,7 +1898,7 @@ impl DedupApp {
                 actions.push(Action::Check(row.name.clone()));
             }
             if ui
-                .button(RichText::new(format!("{} RENAME", icon::PENCIL)).color(theme::BLACK))
+                .button(RichText::new(format!("{} RENAME", icon::PENCIL)).color(theme::black()))
                 .explain(
                     self.tooltip_verbosity,
                     "Rename this repository",
@@ -1549,7 +1910,7 @@ impl DedupApp {
                 actions.push(Action::BeginRename(row.name.clone()));
             }
             if ui
-                .button(RichText::new(format!("{} RELOCATE", icon::RELOCATE)).color(theme::BLACK))
+                .button(RichText::new(format!("{} RELOCATE", icon::RELOCATE)).color(theme::black()))
                 .explain(
                     self.tooltip_verbosity,
                     "Point this repository at a different folder",
@@ -1561,7 +1922,7 @@ impl DedupApp {
                 actions.push(Action::BeginRelocate(row.name.clone()));
             }
             if ui
-                .button(RichText::new(format!("{} DUPLICATE", icon::COPY)).color(theme::BLACK))
+                .button(RichText::new(format!("{} DUPLICATE", icon::COPY)).color(theme::black()))
                 .explain(
                     self.tooltip_verbosity,
                     "Copy this repository's index into a new one at a new path",
@@ -1576,9 +1937,10 @@ impl DedupApp {
             if ui
                 .add(
                     egui::Button::new(
-                        RichText::new(format!("{} DELETE", icon::TRASH)).color(theme::BLACK),
+                        RichText::new(format!("{} DELETE", icon::TRASH))
+                            .color(theme::ink_on(theme::red())),
                     )
-                    .fill(theme::RED),
+                    .fill(theme::red()),
                 )
                 .explain(
                     self.tooltip_verbosity,
@@ -1592,6 +1954,117 @@ impl DedupApp {
                 actions.push(Action::BeginDelete(row.name.clone()));
             }
         });
+
+        // Sync-group membership actions. A main's group controls live on its
+        // group section (below the card), so only sinks and ungrouped repos get a
+        // button here.
+        let is_main = self.groups.iter().any(|(_, g)| g.main == row.name);
+        let sink_group = self.sink_of(&row.name).map(|(n, _)| n.clone());
+        // This repo's own push mode when it is a sink, for its mode pill.
+        let sink_mode = self
+            .sink_of(&row.name)
+            .and_then(|(_, g)| g.sinks.iter().find(|s| s.repo == row.name).map(|s| s.mode));
+        // Every group as (group name, main), to offer as SINK INTO targets.
+        let group_targets: Vec<(String, String)> = self
+            .groups
+            .iter()
+            .map(|(n, g)| (n.clone(), g.main.clone()))
+            .collect();
+        let verbosity = self.tooltip_verbosity;
+        if !is_main {
+            ui.horizontal(|ui| {
+                if let Some(group) = &sink_group {
+                    // This backup's own push mode — MIRROR deletes what the main
+                    // dropped; ADD ONLY only copies. Click to flip.
+                    let is_mirror = sink_mode == Some(dedup_core::store::SyncMode::Mirror);
+                    let mode_label = if is_mirror {
+                        "MODE: MIRROR"
+                    } else {
+                        "MODE: ADD ONLY"
+                    };
+                    if crate::lcars::toggle_button(ui, mode_label, is_mirror, theme::orange())
+                        .explain(
+                            verbosity,
+                            "How this backup is pushed — click to flip",
+                            "How this backup is pushed. ADD ONLY copies what it lacks; MIRROR \
+                             also deletes from it what the main no longer has. Click to flip.",
+                        )
+                        .clicked()
+                    {
+                        let mode = if is_mirror {
+                            dedup_core::store::SyncMode::AddOnly
+                        } else {
+                            dedup_core::store::SyncMode::Mirror
+                        };
+                        actions.push(Action::SetSinkMode {
+                            group: group.clone(),
+                            repo: row.name.clone(),
+                            mode,
+                        });
+                    }
+                    if ui
+                        .button(
+                            RichText::new(format!("{} SINK OUT", icon::X)).color(theme::black()),
+                        )
+                        .explain(
+                            verbosity,
+                            "Take this backup out of its group",
+                            "Remove this repository from its sync group. Both repositories \
+                             stay; they are just no longer linked as main and backup.",
+                        )
+                        .clicked()
+                    {
+                        actions.push(Action::RemoveSink {
+                            group: group.clone(),
+                            repo: row.name.clone(),
+                        });
+                    }
+                } else {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(format!("{} MAKE MAIN", icon::STAR))
+                                    .color(theme::ink_on(theme::green())),
+                            )
+                            .fill(theme::green()),
+                        )
+                        .explain(
+                            verbosity,
+                            "Make this repository a sync-group main",
+                            "Turn this repository into the main of a new sync group. You can \
+                             then add backup repositories (sinks) that it is pushed to.",
+                        )
+                        .clicked()
+                    {
+                        actions.push(Action::MakeMain(row.name.clone()));
+                    }
+                    if !group_targets.is_empty() {
+                        ui.menu_button(
+                            RichText::new(format!("{} SINK INTO", icon::ARROW_RIGHT))
+                                .color(theme::text()),
+                            |ui| {
+                                for (group, main) in &group_targets {
+                                    if ui.button(format!("{} {main}", icon::STAR)).clicked() {
+                                        actions.push(Action::SinkInto {
+                                            repo: row.name.clone(),
+                                            group: group.clone(),
+                                        });
+                                        ui.close();
+                                    }
+                                }
+                            },
+                        )
+                        .response
+                        .explain(
+                            verbosity,
+                            "Add this repository to a group as a backup",
+                            "Add this repository to an existing sync group as a backup (sink) \
+                             of that group's main.",
+                        );
+                    }
+                }
+            });
+        }
     }
 
     fn add_modal(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
@@ -1608,17 +2081,18 @@ impl DedupApp {
             ui.set_width(460.0);
             ui.label(
                 RichText::new("ADD REPOSITORY")
-                    .color(theme::AMBER)
+                    .color(theme::amber())
                     .size(18.0)
                     .strong(),
             );
             ui.add_space(8.0);
 
             ui.horizontal(|ui| {
-                ui.label(RichText::new("FOLDER").color(theme::TEXT).size(12.0));
+                ui.label(RichText::new("FOLDER").color(theme::text()).size(12.0));
                 if ui
                     .button(
-                        RichText::new(format!("{} CHOOSE…", icon::FOLDER_OPEN)).color(theme::BLACK),
+                        RichText::new(format!("{} CHOOSE…", icon::FOLDER_OPEN))
+                            .color(theme::black()),
                     )
                     .explain(
                         self.tooltip_verbosity,
@@ -1643,12 +2117,12 @@ impl DedupApp {
                 );
             });
             ui.horizontal(|ui| {
-                ui.label(RichText::new("NAME  ").color(theme::TEXT).size(12.0));
+                ui.label(RichText::new("NAME  ").color(theme::text()).size(12.0));
                 let mut name_edit = egui::TextEdit::singleline(&mut self.new_name)
                     .desired_width(300.0)
                     .hint_text("defaults to the folder name");
                 if clashes {
-                    name_edit = name_edit.text_color(theme::RED);
+                    name_edit = name_edit.text_color(theme::red());
                 }
                 ui.add(name_edit).explain(
                     self.tooltip_verbosity,
@@ -1661,17 +2135,18 @@ impl DedupApp {
             if clashes {
                 ui.add_space(4.0);
                 ui.colored_label(
-                    theme::RED,
+                    theme::red(),
                     format!("A repository named '{effective}' already exists."),
                 );
             } else if let Some(err) = &self.form_error {
                 ui.add_space(4.0);
-                ui.colored_label(theme::RED, err);
+                ui.colored_label(theme::red(), err);
             }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 let add =
-                    egui::Button::new(RichText::new("ADD").color(theme::BLACK)).fill(theme::BLUE);
+                    egui::Button::new(RichText::new("ADD").color(theme::ink_on(theme::blue())))
+                        .fill(theme::blue());
                 if ui
                     .add_enabled(can_add, add)
                     .explain(
@@ -1685,7 +2160,7 @@ impl DedupApp {
                     actions.push(Action::Create);
                 }
                 if ui
-                    .button(RichText::new("CANCEL").color(theme::BLACK))
+                    .button(RichText::new("CANCEL").color(theme::black()))
                     .explain(
                         self.tooltip_verbosity,
                         "Cancel",
@@ -1707,13 +2182,13 @@ impl DedupApp {
             ui.set_width(320.0);
             ui.label(
                 RichText::new("SETTINGS")
-                    .color(theme::AMBER)
+                    .color(theme::amber())
                     .size(18.0)
                     .strong(),
             );
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Hashing threads").color(theme::TEXT));
+                ui.label(RichText::new("Hashing threads").color(theme::text()));
                 ui.add(egui::DragValue::new(&mut self.threads).range(0..=64))
                     .explain(
                         self.tooltip_verbosity,
@@ -1725,23 +2200,23 @@ impl DedupApp {
             });
             ui.label(
                 RichText::new("0 = one thread per CPU core")
-                    .color(theme::TAN)
+                    .color(theme::tan())
                     .size(12.0),
             );
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Tooltips").color(theme::TEXT));
+                ui.label(RichText::new("Tooltips").color(theme::text()));
                 let short = self.tooltip_verbosity == TooltipVerbosity::Short;
                 egui::Frame::new()
-                    .stroke(egui::Stroke::new(1.0, theme::BLUE))
+                    .stroke(egui::Stroke::new(1.0, theme::blue()))
                     .corner_radius(6)
                     .inner_margin(egui::Margin::symmetric(4, 2))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let (short_fill, short_text) = if short {
-                                (theme::BLUE, theme::BLACK)
+                                (theme::blue(), theme::black())
                             } else {
-                                (theme::PANEL, theme::BLUE)
+                                (theme::panel(), theme::blue())
                             };
                             if ui
                                 .add(
@@ -1759,9 +2234,9 @@ impl DedupApp {
                                 self.tooltip_verbosity = TooltipVerbosity::Short;
                             }
                             let (verbose_fill, verbose_text) = if short {
-                                (theme::PANEL, theme::LILAC)
+                                (theme::panel(), theme::lilac())
                             } else {
-                                (theme::LILAC, theme::BLACK)
+                                (theme::lilac(), theme::black())
                             };
                             if ui
                                 .add(
@@ -1783,13 +2258,112 @@ impl DedupApp {
             });
             ui.label(
                 RichText::new("Controls how much detail hover tooltips show throughout the app")
-                    .color(theme::TAN)
+                    .color(theme::tan())
                     .size(12.0),
             );
             ui.add_space(12.0);
+
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Appearance").color(theme::text()));
+                egui::Frame::new()
+                    .stroke(egui::Stroke::new(1.0, theme::amber()))
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::symmetric(4, 2))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (choice, label, short_help, long_help) in [
+                                (
+                                    ThemeChoice::System,
+                                    "SYSTEM",
+                                    "Follow your desktop",
+                                    "Follows your desktop's own light or dark setting and \
+                                     switches whenever that does.",
+                                ),
+                                (
+                                    ThemeChoice::Light,
+                                    "LIGHT",
+                                    "Always light",
+                                    "Uses the light appearance regardless of your desktop \
+                                     setting.",
+                                ),
+                                (
+                                    ThemeChoice::Dark,
+                                    "DARK",
+                                    "Always dark",
+                                    "Uses the dark appearance regardless of your desktop \
+                                     setting.",
+                                ),
+                            ] {
+                                let on = self.theme == choice;
+                                let (fill, txt) = if on {
+                                    (theme::amber(), theme::black())
+                                } else {
+                                    (theme::panel(), theme::amber())
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(RichText::new(label).color(txt))
+                                            .fill(fill),
+                                    )
+                                    .explain(self.tooltip_verbosity, short_help, long_help)
+                                    .clicked()
+                                {
+                                    // Apply immediately so the change is visible
+                                    // this frame; persistence happens in `ui`.
+                                    self.theme = choice;
+                                    ctx.set_theme(choice.preference());
+                                    theme::sync_active(ctx);
+                                }
+                            }
+                        });
+                    });
+            });
+            ui.label(
+                RichText::new(
+                    "Dark is the default; System follows your desktop's light/dark setting",
+                )
+                .color(theme::tan())
+                .size(12.0),
+            );
+            ui.add_space(12.0);
+
+            ui.label(RichText::new("DIAGNOSTICS").color(theme::tan()).size(13.0));
+            ui.add_space(4.0);
             if ui
                 .add(egui::Button::new(
-                    RichText::new("CLOSE").color(theme::BLACK),
+                    RichText::new("OPEN LOG FOLDER").color(theme::black()),
+                ))
+                .explain(
+                    self.tooltip_verbosity,
+                    "Open the folder holding this app's logs",
+                    "Opens the folder where dedup records what each run did. The last few \
+                     sessions are kept; attach the newest file when reporting a problem.",
+                )
+                .clicked()
+                && let Err(e) = crate::external::open(&dedup_core::logging::log_dir())
+            {
+                log::error!("could not open the log folder: {e}");
+                self.notice = Some(format!(
+                    "Could not open the log folder ({}): {e}",
+                    dedup_core::logging::log_dir().display()
+                ));
+            }
+            ui.label(
+                RichText::new(match dedup_core::logging::current_log() {
+                    Some(path) => format!("This session: {}", path.display()),
+                    None => format!(
+                        "No log this session — {} could not be opened.",
+                        dedup_core::logging::log_dir().display()
+                    ),
+                })
+                .color(theme::tan())
+                .size(11.0),
+            );
+            ui.add_space(12.0);
+
+            if ui
+                .add(egui::Button::new(
+                    RichText::new("CLOSE").color(theme::black()),
                 ))
                 .explain(
                     self.tooltip_verbosity,
@@ -1806,42 +2380,124 @@ impl DedupApp {
         }
     }
 
-    fn about_modal(&mut self, ctx: &egui::Context) {
-        let response = egui::Modal::new(Id::new("about")).show(ctx, |ui| {
-            ui.set_width(320.0);
+    /// Confirmation for a scan that walked empty over a non-empty index.
+    ///
+    /// Refusing is the default reading of the situation — an unmounted drive
+    /// scans as an empty directory, and if this repo is a sync group's main the
+    /// next MIRROR push would carry the emptiness to every sink. Emptying a repo
+    /// on purpose is still supported; it costs this one confirmation.
+    fn empty_scan_modal(&mut self, ctx: &egui::Context) {
+        let Some((repo, entries)) = self.empty_scan_confirm.clone() else {
+            return;
+        };
+        let mut decision: Option<bool> = None;
+        let response = egui::Modal::new(Id::new("empty-scan-confirm")).show(ctx, |ui| {
+            ui.set_width(420.0);
             ui.label(
-                RichText::new("ABOUT")
-                    .color(theme::AMBER)
+                RichText::new("SCAN FOUND NO FILES")
+                    .color(theme::amber())
                     .size(18.0)
                     .strong(),
             );
             ui.add_space(8.0);
             ui.label(
-                RichText::new(format!("DEDUP  v{}", env!("CARGO_PKG_VERSION"))).color(theme::TEXT),
+                RichText::new(format!(
+                    "Scanning '{repo}' found no files at all, but its index holds {entries}. \
+                 Continuing marks every one of them missing."
+                ))
+                .color(theme::text()),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "If this drive should not be empty, check that it is mounted and scan \
+                     again. Nothing has been changed yet.",
+                )
+                .color(theme::tan())
+                .size(12.0),
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("SCAN ANYWAY").color(theme::ink_on(theme::red())),
+                        )
+                        .fill(theme::red()),
+                    )
+                    .explain(
+                        self.tooltip_verbosity,
+                        "Mark every entry missing",
+                        "Run the scan and mark all indexed files missing, because this \
+                         repository really is empty now.",
+                    )
+                    .clicked()
+                {
+                    decision = Some(true);
+                }
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("CANCEL").color(theme::text()))
+                            .fill(theme::panel()),
+                    )
+                    .explain(
+                        self.tooltip_verbosity,
+                        "Leave the index alone",
+                        "Close without scanning. The index keeps every entry it has.",
+                    )
+                    .clicked()
+                {
+                    decision = Some(false);
+                }
+            });
+        });
+        if let Some(go) = decision {
+            self.empty_scan_confirm = None;
+            if go {
+                self.enqueue(repo, JobKind::UpdateForced);
+            }
+        } else if response.should_close() {
+            self.empty_scan_confirm = None;
+        }
+    }
+
+    fn about_modal(&mut self, ctx: &egui::Context) {
+        let response = egui::Modal::new(Id::new("about")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.label(
+                RichText::new("ABOUT")
+                    .color(theme::amber())
+                    .size(18.0)
+                    .strong(),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!("DEDUP  v{}", env!("CARGO_PKG_VERSION")))
+                    .color(theme::text()),
             );
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("License:").color(theme::TAN).size(12.0));
+                ui.label(RichText::new("License:").color(theme::tan()).size(12.0));
                 ui.hyperlink_to(
-                    RichText::new("MIT").color(theme::LILAC).size(12.0),
+                    RichText::new("MIT").color(theme::lilac()).size(12.0),
                     "https://opensource.org/license/mit",
                 );
             });
             ui.label(
                 RichText::new("© 2026 Patrick Zimmer")
-                    .color(theme::TAN)
+                    .color(theme::tan())
                     .size(12.0),
             );
             ui.hyperlink_to(
                 RichText::new("dedup@tuta.io")
-                    .color(theme::LILAC)
+                    .color(theme::lilac())
                     .size(12.0),
                 "mailto:dedup@tuta.io",
             );
             ui.add_space(12.0);
             if ui
                 .add(egui::Button::new(
-                    RichText::new("CLOSE").color(theme::BLACK),
+                    RichText::new("CLOSE").color(theme::black()),
                 ))
                 .explain(
                     self.tooltip_verbosity,
@@ -1868,7 +2524,6 @@ impl DedupApp {
             Tab::Duplicates => "DUPLICATES",
             Tab::Transfer => "TRANSFER",
             Tab::Grooming => "GROOMING",
-            Tab::SyncGroups => "SYNC GROUPS",
             Tab::Browse => "BROWSE",
         };
         let text = crate::help_content::help_text(self.tab);
@@ -1894,14 +2549,14 @@ impl DedupApp {
                     ui.horizontal(|ui| {
                         ui.label(
                             RichText::new(tab_label)
-                                .color(theme::AMBER)
+                                .color(theme::amber())
                                 .size(18.0)
                                 .strong(),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui
                                 .add(egui::Button::new(
-                                    RichText::new("CLOSE").color(theme::BLACK),
+                                    RichText::new("CLOSE").color(theme::black()),
                                 ))
                                 .clicked()
                             {
@@ -1913,7 +2568,7 @@ impl DedupApp {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            ui.label(RichText::new(text).color(theme::TEXT));
+                            ui.label(RichText::new(text).color(theme::text()));
                         });
                 });
                 close_clicked || ui.input(|i| i.viewport().close_requested())
@@ -1932,9 +2587,27 @@ fn pill(ui: &mut egui::Ui, text: &str, fill: Color32) -> egui::Response {
         .corner_radius(6)
         .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
-            ui.label(RichText::new(text).color(theme::BLACK).size(11.0))
+            ui.label(RichText::new(text).color(theme::black()).size(11.0))
         })
         .inner
+}
+
+/// The "main of a sync group" pill next to a repo's name on its card. Matches
+/// the star badge the shared repo chip draws on every other tab, so a main is
+/// recognisable in one glance wherever it appears.
+fn main_pill(ui: &mut egui::Ui, verbosity: TooltipVerbosity) {
+    // Built from the shared `pill` helper, like every other pill on this card,
+    // rather than a second hand-rolled one.
+    let resp = pill(ui, &format!("{} MAIN", icon::STAR), theme::amber());
+    // Announced as the bare word, not glyph-plus-word, so it reads the same as
+    // the chip badge everywhere else.
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "MAIN"));
+    resp.explain(
+        verbosity,
+        "The original this group is backed up from",
+        "This repository is the main of a sync group: the original that GROUP SYNC pushes \
+         out to the backup repositories listed under it.",
+    );
 }
 
 /// Render a repo's location + freshness as chips next to its name. Anything
@@ -1942,21 +2615,21 @@ fn pill(ui: &mut egui::Ui, text: &str, fill: Color32) -> egui::Response {
 fn status_pills(ui: &mut egui::Ui, row: &RepoRow, verbosity: TooltipVerbosity) {
     match row.location {
         Some(Location::Local) => {
-            pill(ui, "LOCAL", theme::BLUE).explain(
+            pill(ui, "LOCAL", theme::blue()).explain(
                 verbosity,
                 "On this machine",
                 "The repository's folder is on a local disk of this machine.",
             );
         }
         Some(Location::Remote) => {
-            pill(ui, "REMOTE", theme::LILAC).explain(
+            pill(ui, "REMOTE", theme::lilac()).explain(
                 verbosity,
                 "Network mount",
                 "The repository's folder is on a reachable network mount (e.g. NFS/SMB).",
             );
         }
         Some(Location::Offline) => {
-            pill(ui, "OFFLINE", theme::AMBER).explain(
+            pill(ui, "OFFLINE", theme::amber()).explain(
                 verbosity,
                 "Network mount is not reachable right now",
                 "This repository's network mount is not reachable right now — scans and \
@@ -1964,7 +2637,7 @@ fn status_pills(ui: &mut egui::Ui, row: &RepoRow, verbosity: TooltipVerbosity) {
             );
         }
         Some(Location::Missing) => {
-            pill(ui, "MISSING", theme::RED).explain(
+            pill(ui, "MISSING", theme::red()).explain(
                 verbosity,
                 "Local folder is not accessible",
                 "This repository's local folder no longer exists or can't be read — RELOCATE \
@@ -1976,14 +2649,14 @@ fn status_pills(ui: &mut egui::Ui, row: &RepoRow, verbosity: TooltipVerbosity) {
     match row.freshness {
         Freshness::Unknown => {}
         Freshness::UpToDate => {
-            pill(ui, "UP TO DATE", theme::TAN).explain(
+            pill(ui, "UP TO DATE", theme::tan()).explain(
                 verbosity,
                 "No changes since the last scan",
                 "The last CHECK found no new, changed, or missing files since the last scan.",
             );
         }
         Freshness::Stale { changed, missing } => {
-            pill(ui, "UPDATE REQUIRED", theme::ORANGE).explain(
+            pill(ui, "UPDATE REQUIRED", theme::orange()).explain(
                 verbosity,
                 &format!("{changed} new/changed, {missing} missing since the last scan"),
                 &format!(
@@ -2004,8 +2677,10 @@ fn cancel_button(
     verbosity: TooltipVerbosity,
 ) -> egui::Response {
     ui.add(
-        egui::Button::new(RichText::new(format!("{} CANCEL", icon::X)).color(theme::BLACK))
-            .fill(theme::RED),
+        egui::Button::new(
+            RichText::new(format!("{} CANCEL", icon::X)).color(theme::ink_on(theme::red())),
+        )
+        .fill(theme::red()),
     )
     .explain(verbosity, hover, hover_verbose)
 }
@@ -2040,7 +2715,7 @@ fn stat(
     ui.add_space(2.0);
     ui.label(
         RichText::new(format!("{label} "))
-            .color(theme::TEXT)
+            .color(theme::text())
             .size(12.0),
     )
     .explain(verbosity, tip, tip_verbose);
@@ -2073,7 +2748,7 @@ fn mime_tags(ui: &mut egui::Ui, row: &RepoRow, verbosity: TooltipVerbosity) {
     if extra > 0 {
         ui.label(
             RichText::new(format!("+{extra}"))
-                .color(theme::TEXT)
+                .color(theme::text())
                 .size(11.0),
         )
         .explain(
@@ -2093,7 +2768,7 @@ fn mime_tags(ui: &mut egui::Ui, row: &RepoRow, verbosity: TooltipVerbosity) {
             .show(ui, |ui| {
                 ui.label(
                     RichText::new(format!("{mime} {}", mime_pct(*count, total)))
-                        .color(theme::BLACK)
+                        .color(theme::black())
                         .size(11.0),
                 )
                 .explain(
@@ -2272,10 +2947,54 @@ mod tests {
 #[cfg(test)]
 mod ui_tests {
     use super::*;
+    use dedup_core::store::SyncMode;
     use dedup_core::update::{NoProgress, update_repo};
     use egui_kittest::Harness;
 
     /// A temp store with two scanned repos, so the Repository Management
+    /// A scan that walked empty over a non-empty index must ask before marking
+    /// everything missing, and declining must leave the index untouched.
+    #[test]
+    fn an_emptying_scan_asks_first_and_declining_changes_nothing() {
+        let (tmp, mut app) = sample_app();
+        let repo = "Automatic Upload";
+
+        // Empty the directory, as an unmounted drive would appear.
+        let dir = tmp.path().join(repo.replace(' ', "_"));
+        for entry in std::fs::read_dir(&dir).expect("read repo dir") {
+            std::fs::remove_file(entry.expect("dir entry").path()).expect("remove file");
+        }
+
+        // The core refuses and writes nothing.
+        let refused = update_repo(&app.store, repo, 1, &NoProgress, &CancellationToken::new());
+        assert!(
+            matches!(
+                refused,
+                Err(dedup_core::update::UpdateError::WouldEmptyIndex { entries: 5, .. })
+            ),
+            "the scan is refused rather than emptying the index"
+        );
+
+        // The UI turns that into a confirmation rather than an error.
+        app.empty_scan_confirm = Some((repo.to_string(), 5));
+        assert!(
+            app.empty_scan_confirm.is_some(),
+            "a confirmation is pending"
+        );
+
+        // Declining leaves every entry indexed.
+        app.empty_scan_confirm = None;
+        app.tab = Tab::Repositories;
+        app.sync_shown_tab();
+        let count = app
+            .repos
+            .iter()
+            .find(|r| r.name == repo)
+            .map(|r| r.stats.file_count)
+            .expect("repo row");
+        assert_eq!(count, 5, "declining keeps all five entries");
+    }
+
     /// cards show real stats instead of all-zero placeholders.
     fn sample_app() -> (tempfile::TempDir, DedupApp) {
         let tmp = tempfile::tempdir().unwrap();
@@ -2292,21 +3011,79 @@ mod ui_tests {
         (tmp, DedupApp::new(store))
     }
 
-    /// A sync group's sinks are folded away under their main in the repo list —
-    /// the list is about your originals — and the chevron brings them back.
+    /// Returning to the Repositories tab must re-read the registry, so counts
+    /// reflect deletions made on another tab. Before this, the numbers stayed
+    /// stale until the user refreshed by hand.
     #[test]
-    fn sink_repos_are_collapsed_under_their_main() {
+    fn switching_to_the_repositories_tab_refreshes_its_stats() {
+        let (_tmp, mut app) = sample_app();
+        app.tab = Tab::Repositories;
+        app.sync_shown_tab();
+        let before = app
+            .repos
+            .iter()
+            .find(|r| r.name == "Automatic Upload")
+            .map(|r| r.stats.file_count)
+            .expect("repo row");
+        assert_eq!(before, 5, "sample repo starts with five files");
+
+        // Change the store behind the app's back, as a delete on another tab would.
+        app.store
+            .remove_file_entry("Automatic Upload", "f0.bin")
+            .expect("remove entry");
+
+        // Leaving and returning is what triggers the re-read.
+        app.tab = Tab::Duplicates;
+        app.sync_shown_tab();
+        app.tab = Tab::Repositories;
+        app.sync_shown_tab();
+
+        let after = app
+            .repos
+            .iter()
+            .find(|r| r.name == "Automatic Upload")
+            .map(|r| r.stats.file_count)
+            .expect("repo row");
+        assert_eq!(
+            after, 4,
+            "returning to the tab picks up the change without a manual refresh"
+        );
+    }
+
+    /// The re-read happens on the transition only, not every frame — otherwise a
+    /// visible tab would reopen every repo db continuously.
+    #[test]
+    fn staying_on_the_repositories_tab_does_not_re_read_each_frame() {
+        let (_tmp, mut app) = sample_app();
+        app.tab = Tab::Repositories;
+        app.sync_shown_tab();
+        assert!(app.synced_tab == Some(Tab::Repositories));
+
+        // Change the store, then run more frames *without* leaving the tab.
+        app.store
+            .create_repo("Later", &_tmp.path().join("Later").to_string_lossy())
+            .ok();
+        for _ in 0..3 {
+            app.sync_shown_tab();
+        }
+        assert!(
+            !app.repos.iter().any(|r| r.name == "Later"),
+            "no re-read while the tab stays shown; only a switch refreshes"
+        );
+    }
+
+    /// A sync group is framed by one LCARS section titled with the group name,
+    /// holding its main and its sinks; the section's own caret folds the whole
+    /// group away. Ungrouped repos stay bare cards outside any section.
+    #[test]
+    fn a_group_is_framed_by_one_section_that_folds_it_away() {
         use egui_kittest::kittest::Queryable;
         let (_tmp, mut app) = sample_app();
         app.store
-            .create_sync_group(
-                "offsite",
-                "Automatic Upload",
-                dedup_core::store::SyncMode::AddOnly,
-            )
+            .create_sync_group("offsite", "Automatic Upload")
             .expect("create group");
         app.store
-            .add_sync_sink("offsite", "Videos")
+            .add_sync_sink("offsite", "Videos", SyncMode::AddOnly)
             .expect("add sink");
         app.reload_all();
 
@@ -2317,7 +3094,7 @@ mod ui_tests {
                 move |ui, app: &mut DedupApp| {
                     if !init {
                         icon::install(ui.ctx());
-                        theme::apply(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
                         init = true;
                     }
                     let mut actions = Vec::new();
@@ -2326,30 +3103,160 @@ mod ui_tests {
                 app,
             );
         harness.run();
+        // Folded by default: the group's title bar is all that shows, so the
+        // repo list stays about your originals.
+        assert!(
+            harness.query_by_label_contains("offsite").is_some(),
+            "the group's section is titled with the group name"
+        );
+        assert!(
+            harness.query_all_by_label_contains("Videos").count() == 0,
+            "a folded group hides its sinks"
+        );
+        // The section's caret is the one collapse control: no second chevron.
+        assert!(
+            harness.query_by_label_contains("SINK(S) IN").is_none(),
+            "the old sink-count chevron is gone — one collapse affordance only"
+        );
+
+        // Expanding it brings the whole group — main and sinks — into view.
+        harness.get_by_label_contains("offsite").click();
+        harness.run();
+        harness.run();
         assert!(
             harness
                 .query_by_label_contains("Automatic Upload")
                 .is_some(),
-            "the main is listed"
+            "expanding shows the main's card"
         );
-        assert!(
-            harness.query_all_by_label_contains("Videos").count() == 0,
-            "its sink is folded away"
-        );
-        assert!(
-            harness
-                .query_by_label_contains("SINK(S) IN 'offsite'")
-                .is_some(),
-            "a chevron summarises the folded sinks"
-        );
-
-        harness
-            .get_by_label_contains("SINK(S) IN 'offsite'")
-            .click();
-        harness.run();
         assert!(
             harness.query_all_by_label_contains("Videos").count() > 0,
-            "expanding shows the sink's own card"
+            "expanding shows the sink's card"
+        );
+        assert!(
+            harness.query_by_label("MAIN").is_some(),
+            "the main is badged so it is distinguishable from its sinks"
+        );
+    }
+
+    /// A repo that belongs to no group is a bare card: no section rail, no badge.
+    #[test]
+    fn an_ungrouped_repo_has_no_section_and_no_badge() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, app) = sample_app();
+        let harness = render_repos(app);
+        assert!(
+            harness
+                .query_by_label_contains("Automatic Upload")
+                .is_some(),
+            "the repo is listed"
+        );
+        assert!(
+            harness.query_by_label("MAIN").is_none(),
+            "an ungrouped repo carries no MAIN badge"
+        );
+    }
+
+    /// Render the Repositories tab and run a frame. The harness collects (and
+    /// discards) the deferred `Action`s, so this asserts on what is *shown* for a
+    /// given store state, which is the group-management UI's real surface.
+    fn render_repos(app: DedupApp) -> Harness<'static, DedupApp> {
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 1000.0))
+            .build_ui_state(
+                move |ui, app: &mut DedupApp| {
+                    if !init {
+                        icon::install(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
+                        init = true;
+                    }
+                    let mut actions = Vec::new();
+                    app.repositories_view(ui, &mut actions);
+                },
+                app,
+            );
+        harness.run();
+        harness
+    }
+
+    /// An ungrouped repo offers MAKE MAIN; with no groups yet, no group controls
+    /// (UNGROUP / MODE pill) are shown anywhere.
+    #[test]
+    fn ungrouped_repos_offer_make_main_and_no_group_controls() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, app) = sample_app();
+        let harness = render_repos(app);
+        assert!(
+            harness.query_all_by_label_contains("MAKE MAIN").count() >= 1,
+            "an ungrouped repo can be made a group main"
+        );
+        assert!(
+            harness.query_by_label_contains("UNGROUP").is_none(),
+            "no group controls without a group"
+        );
+    }
+
+    /// A group's main shows the group controls (UNGROUP) and never MAKE MAIN;
+    /// its sink carries its own mode pill and SINK OUT (once expanded).
+    #[test]
+    fn group_main_shows_controls_and_sink_shows_mode_and_sink_out() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, mut app) = sample_app();
+        app.store
+            .create_sync_group("Automatic Upload", "Automatic Upload")
+            .expect("create group");
+        app.store
+            .add_sync_sink("Automatic Upload", "Videos", SyncMode::AddOnly)
+            .expect("add sink");
+        app.reload_all();
+        let mut harness = render_repos(app);
+        // Groups are folded by default; open this one to reach its contents.
+        harness.get_by_label_contains("Automatic Upload").click();
+        harness.run();
+        harness.run();
+
+        assert!(
+            harness.query_by_label_contains("UNGROUP").is_some(),
+            "the main shows the UNGROUP control"
+        );
+        // Both repos are grouped, so nothing offers MAKE MAIN.
+        assert!(
+            harness.query_by_label_contains("MAKE MAIN").is_none(),
+            "a grouped repo is not offered as a new main"
+        );
+
+        // The group section starts open, so the sink's card is already drawn.
+        assert!(
+            harness.query_by_label_contains("SINK OUT").is_some(),
+            "the expanded sink offers SINK OUT"
+        );
+        assert!(
+            harness.query_by_label_contains("MODE: ADD ONLY").is_some(),
+            "the sink carries its own mode pill"
+        );
+    }
+
+    /// A sink's mode pill reflects its own stored mode.
+    #[test]
+    fn a_mirror_sink_shows_a_mirror_pill() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, mut app) = sample_app();
+        app.store
+            .create_sync_group("Automatic Upload", "Automatic Upload")
+            .expect("create group");
+        app.store
+            .add_sync_sink("Automatic Upload", "Videos", SyncMode::Mirror)
+            .expect("add sink");
+        app.reload_all();
+        let mut harness = render_repos(app);
+        // Groups are folded by default; open this one to reach its contents.
+        harness.get_by_label_contains("Automatic Upload").click();
+        harness.run();
+        harness.run();
+        assert!(
+            harness.query_by_label_contains("MODE: MIRROR").is_some(),
+            "a MIRROR sink's pill reads MIRROR"
         );
     }
 
@@ -2371,7 +3278,7 @@ mod ui_tests {
                 move |ui, app: &mut DedupApp| {
                     if !init {
                         icon::install(ui.ctx());
-                        theme::apply(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
                         init = true;
                     }
                     let mut actions = Vec::new();
@@ -2405,7 +3312,7 @@ mod ui_tests {
                 move |ui, app: &mut DedupApp| {
                     if !init {
                         icon::install(ui.ctx());
-                        theme::apply(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
                         init = true;
                     }
                     let ctx = ui.ctx().clone();
@@ -2453,7 +3360,7 @@ mod ui_tests {
                 move |ui, app: &mut DedupApp| {
                     if !init {
                         icon::install(ui.ctx());
-                        theme::apply(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
                         init = true;
                     }
                     app.top_bar(ui);
@@ -2534,7 +3441,7 @@ mod ui_tests {
                 move |ui, app: &mut DedupApp| {
                     if !init {
                         icon::install(ui.ctx());
-                        theme::apply(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
                         init = true;
                     }
                     let mut actions = Vec::new();
@@ -2604,7 +3511,7 @@ mod ui_tests {
                 move |ui, app: &mut DedupApp| {
                     if !init {
                         icon::install(ui.ctx());
-                        theme::apply(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
                         init = true;
                     }
                     let mut actions = Vec::new();
@@ -2619,6 +3526,117 @@ mod ui_tests {
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 
+    /// Doc screenshot: a sync group framed by its LCARS elbow section — the
+    /// badged main and its sink inside one rail, an ungrouped repo as a bare
+    /// card outside it. Rendered rather than label-queried, because a label
+    /// query passes even when the rail overlaps the cards it is meant to frame.
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_repo_group_section() {
+        let (tmp, mut app) = sample_app();
+        app.store
+            .create_sync_group("offsite", "Automatic Upload")
+            .expect("create group");
+        app.store
+            .add_sync_sink("offsite", "Videos", SyncMode::Mirror)
+            .expect("add sink");
+        // A third, ungrouped repo: the point of the shot is the contrast between
+        // a framed group and a bare card.
+        let scratch = tmp.path().join("Scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("f0.bin"), "scratch").unwrap();
+        app.store
+            .create_repo("Scratch", &scratch.to_string_lossy())
+            .unwrap();
+        update_repo(
+            &app.store,
+            "Scratch",
+            1,
+            &NoProgress,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        app.reload_all();
+        let _tmp = tmp;
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 760.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, app: &mut DedupApp| {
+                    if !init {
+                        icon::install(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
+                        init = true;
+                    }
+                    let mut actions = Vec::new();
+                    app.repositories_view(ui, &mut actions);
+                },
+                app,
+            );
+        harness.run();
+        // Groups fold by default; the point of the shot is what a group holds,
+        // so open it.
+        {
+            use egui_kittest::kittest::Queryable;
+            harness.get_by_label_contains("offsite").click();
+        }
+        harness.run();
+        harness.run();
+        let img = harness.render().expect("wgpu render failed");
+        let out = doc_screenshot_path("repo_group_section.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// The appearance control offers exactly System / Light / Dark, and picking
+    /// one repaints in the same frame — the observable behaviour, not merely
+    /// that a field was written.
+    #[test]
+    fn appearance_control_offers_three_options_and_applies_at_once() {
+        use crate::settings::ThemeChoice;
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, mut app) = sample_app();
+        app.show_settings = true;
+        assert_eq!(app.theme, ThemeChoice::Dark, "default is Dark");
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(460.0, 460.0))
+            .build_ui_state(
+                move |ui, app: &mut DedupApp| {
+                    if !init {
+                        icon::install(ui.ctx());
+                        theme::register_themes(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
+                        init = true;
+                    }
+                    app.settings_modal(&ui.ctx().clone());
+                },
+                app,
+            );
+        harness.run();
+        for label in ["SYSTEM", "LIGHT", "DARK"] {
+            assert!(
+                harness.query_by_label(label).is_some(),
+                "the appearance control offers {label}"
+            );
+        }
+
+        harness.get_by_label("LIGHT").click();
+        harness.run();
+        assert_eq!(
+            harness.state().theme,
+            ThemeChoice::Light,
+            "the choice is recorded"
+        );
+        assert_eq!(
+            theme::text(),
+            theme::LIGHT.text,
+            "and the light palette is live in the same interaction — no restart"
+        );
+        theme::install(theme::DARK);
+    }
+
     /// Doc screenshot: the Settings dialog (hashing threads, tooltip
     /// verbosity toggle) to `docs/screenshots/settings_modal.png`. `--ignored`.
     #[test]
@@ -2628,13 +3646,13 @@ mod ui_tests {
         app.show_settings = true;
         let mut init = false;
         let mut harness = Harness::builder()
-            .with_size(egui::vec2(420.0, 320.0))
+            .with_size(egui::vec2(420.0, 420.0))
             .wgpu()
             .build_ui_state(
                 move |ui, app: &mut DedupApp| {
                     if !init {
                         icon::install(ui.ctx());
-                        theme::apply(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
                         init = true;
                     }
                     app.settings_modal(&ui.ctx().clone());
