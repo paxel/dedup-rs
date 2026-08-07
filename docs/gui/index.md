@@ -1,12 +1,23 @@
 # GUI guide
 
-`dedup` with no arguments opens the desktop app: a single window with tabs for
-[Repositories](repositories.md), [Duplicates](duplicates.md), and [Files](files.md) (which
-also pushes a backup group's main to its sinks — see [Group sync](files.md#group-sync)) —
-plus a settings cog and an about button in the top-right.
+`dedup` with no arguments opens the desktop app: a single LCARS-styled window with five tabs
+— [Repositories](repositories.md), [Duplicates](duplicates.md), [Transfer](transfer.md),
+[Grooming](grooming.md), and [Browse](browse.md) — plus a settings cog and an about button in
+the top-right. Every tab that shows two files side by side, or a single file up close, opens
+the **one shared viewer** described in [The viewer](duplicates.md#the-viewer-lightbox).
 
 Launch with `--ui-scale <0.5–3.0>` to scale the whole interface, e.g. `dedup --ui-scale 1.25`
 for a HiDPI display or a projector.
+
+## The tabs at a glance
+
+| Tab                                  | What it is for                                                                                     |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------- |
+| **[Repositories](repositories.md)**  | Register, scan and manage repositories; frame backup groups (a main and its sinks).               |
+| **[Duplicates](duplicates.md)**      | Find exact or perceptually similar duplicates across repos and delete the worse copies.           |
+| **[Transfer](transfer.md)**          | Copy / move / sync / mirror between repos, push a backup group, or reconcile two repos with DIFF.  |
+| **[Grooming](grooming.md)**          | Tidy one repo: dedupe against others, purge by filter, clear empty dirs, reorganize, prune.       |
+| **[Browse](browse.md)**              | Walk one repo's indexed files as a folder tree, preview them, and annotate with tags.             |
 
 ## Top bar
 
@@ -92,8 +103,13 @@ CLI-only today — there's no dedicated GUI tab for them yet.
 
 ## See also
 
-- [Repositories tab](repositories.md) — register, scan, rename, relocate, duplicate, delete.
-- [Duplicates tab](duplicates.md) — find and review exact/similar duplicates, the lightbox,
-  A/B compare, audio and video preview.
-- [Files tab](files.md) — copy/move/delete between repos by content, the filter builder.
+- [Repositories tab](repositories.md) — register, scan, rename, relocate, duplicate, delete;
+  sync groups.
+- [Duplicates tab](duplicates.md) — find and review exact/similar duplicates, and the shared
+  viewer in full (Image / Video filmstrip + scrub / Audio / Metadata / Text / Render /
+  Strings / Hex).
+- [Transfer tab](transfer.md) — copy/move/sync/mirror between repos by content, group sync and
+  sync-back, the DIFF reconcile board, the filter builder.
+- [Grooming tab](grooming.md) — dedupe, purge, empty dirs, organize, prune.
+- [Browse tab](browse.md) — a keyboard-driven folder-tree browser with tagging.
 - [CLI reference](../cli.md) — every command the GUI's operations are also available from.

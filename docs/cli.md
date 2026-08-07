@@ -185,5 +185,5 @@ Example: `-f "mime:image/ name:2020 size:>=1000"` matches images whose path cont
 and are at least 1000 bytes. `-f "date:2021-03"` matches everything from March 2021.
 `-f "case:insensitive name:*.jpg"` also finds `PHOTO.JPG`.
 
-The GUI's File Management tab exposes the same three base fields (`mime:`/`name:`/`size:`) as
-an assisted pill builder — see [`docs/gui/files.md`](gui/files.md).
+The GUI's Transfer tab exposes the same three base fields (`mime:`/`name:`/`size:`) as
+an assisted pill builder — see [`docs/gui/transfer.md`](gui/transfer.md).

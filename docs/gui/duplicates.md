@@ -106,12 +106,16 @@ new content identity is never stale.
 
 **Audio** compares as spectrograms — frequency-vs-time, far more telling than a flat waveform
 — with a transport per side: **PLAY A** / **PLAY B**, **PAUSE**, and a cycling **SPEED** pill
-(slowing a passage makes small differences between two takes audible). Playing while both
-sides are shown loads the two copies as a synced pair, so `←`/`→` flip which copy is audible
-instantly and gap-free — any difference is audible rather than masked by a pause. With one
-file shown, `←`/`→` step through the group keeping the transport state: playing keeps playing
-the newly shown copy, and a deliberate pause stays paused with the new copy loaded, so play
-resumes the file you are actually looking at. `P` toggles play/pause.
+that steps through **0.25 / 0.5 / 0.75 / 1 / 1.5 / 2×**. The speed is **pitch-preserving**: a
+slowed passage still sounds like the recording rather than dropping an octave, so it stays
+recognizable while small differences between two takes become audible (the slowed track is
+pre-rendered once with ffmpeg's `atempo` and cached, so the first use of a speed costs a beat
+and every use after is instant). Playing while both sides are shown loads the two copies as a
+synced pair — at the chosen speed on both — so `←`/`→` flip which copy is audible instantly
+and gap-free, and any difference is heard rather than masked by a pause. With one file shown,
+`←`/`→` step through the group keeping the transport state: playing keeps playing the newly
+shown copy, and a deliberate pause stays paused with the new copy loaded, so play resumes the
+file you are actually looking at. `P` toggles play/pause.
 
 **Metadata** shows the file's tags. For MP3/WAV/AIFF that is the ID3 editor: EDIT TAGS opens
 Title/Artist/Album/Year/Track/Genre for that copy, the `>` beside a field offers the value any
@@ -167,10 +171,26 @@ same-sized "duplicates" that differ only in an inserted metadata header read as 
 
 ![The Hex tab comparing two files as an aligned hex diff](../screenshots/hex_diff.png)
 
-**Videos** compare as one representative still per side, enough to tell two clips apart at a
-glance. Full playback stays the OPEN (external app) path.
+**Video** shows an **aligned filmstrip** per side — a row of frames sampled evenly across the
+clip — so you see each clip's whole shape at a glance instead of guessing from one still (two
+different clips so often share an identical first frame: black, a slate, a logo). **Clicking
+the filmstrip** drops a **shared playhead** that decodes the exact frame of *both* clips at
+that moment and shows it enlarged, **A @ t | B @ t**. The playhead is **proportional** — a
+fraction of each clip's *own* duration — so a trimmed or re-encoded copy stays aligned at the
+same relative moment instead of drifting. Frames come from the cached-JPEG grid, so the strip
+is instant after first build.
 
-![Two clips side by side in the viewer](../screenshots/video_compare.png)
+![Two clips compared: a filmstrip per side and the shared playhead frame](../screenshots/video_compare.png)
+
+A clip that carries an audio track also offers the **Audio** tab beside Video: its soundtrack
+is extracted once to a cached WAV and then compared exactly like a bare audio file —
+spectrogram, playback, pitch-preserving speeds and the gapless A/B flicker — so you can tell
+whether two clips share the same footage, the same sound, or neither. (Extraction needs
+`ffmpeg`; a silent clip, or a machine without ffmpeg, simply offers no Audio tab.) Full-speed
+*watching* still lives on the OPEN (external app) path — the in-app tools augment the OS
+player rather than replace it.
+
+![A video's soundtrack on the Audio tab, filmstrip playhead frame enlarged](../screenshots/video-diff.png)
 
 `Esc` steps back one level — out of flicker, or an open tag editor — and then closes the
 viewer; whatever the viewer was playing falls silent with it.

@@ -1,6 +1,6 @@
-# Files tab
+# Transfer tab
 
-![File Management tab](../screenshots/files_tab.png)
+![Transfer tab](../screenshots/files_tab.png)
 
 Copy, move, or delete files between repositories by content (size + BLAKE3 — paths never
 matter), with an assisted filter builder and a review before anything runs. This is the GUI
@@ -50,7 +50,9 @@ removable pill with an inline editor (multiple conditions combine with AND):
 - **MIME** — matches files whose detected MIME type contains a substring (clickable
   suggestions from the source repo's actual MIME types, with counts, narrowed as you type).
 - **NAME** — matches files whose path contains a substring (a live, debounced match count
-  shows against the source repo).
+  shows against the source repo). A **NOT** toggle inverts a condition (`NOT NAME: *thumb*`
+  keeps everything that is *not* a thumbnail), and an **Aa** toggle makes text matching
+  ignore capitalisation.
 - **SIZE** — an operator + byte count, e.g. `>=1000`.
 
 Every kind offers previously used values as one-click quick-picks, remembered across
@@ -92,18 +94,16 @@ hiding a row is how you leave it out — and a confirmation states the exact cou
 operations fail the summary says how many succeeded and how many did not.
 
 **Clicking a row** opens the two versions side by side over the whole window, in the same
-shared viewer every surface opens — so what you get depends on the file type, not on which
-tab you happen to be in. Two audio files compare as **spectrograms**, two documents
-through a **Text** tab, and images and video as pictures: each side shows a preview appropriate to the file (image, or a
-still for video), the repo it lives in, and its size, modification date and type — with the
-larger size and the newer date highlighted, so which is which is obvious at a glance. When
-both sides have a picture you can **wheel to zoom**, **drag to pan**, and press **Space** to
-flicker one over the other (Space again swaps which side is shown) — the surest way to spot a
-subtle edit. A side with nothing to show (a document, audio, or a type that can't be
-previewed) says so and disables the flicker compare for that pair. The same OVERWRITE OTHER /
-DELETE actions are available per side inside the comparison, so the decision is made where it
-is being judged. `Esc` steps back out of flicker, then closes; **CLOSE** leaves without
-changing anything.
+shared viewer every surface opens — so what you get depends on the file type, not on which tab
+you happen to be in. The [viewer](duplicates.md#the-viewer-lightbox) is tabbed by
+representation: two images compare as pictures (wheel-zoom, drag-pan, Space to flicker), two
+videos as aligned filmstrips with a shared playhead, two audio files as spectrograms with
+gapless A/B playback, two documents as line-aligned extracted text, and any two files as an
+aligned hex diff — each side also showing the repo it lives in and its size, date and type,
+with the larger size and newer date highlighted. A side with nothing to show says so. The same
+OVERWRITE OTHER / DELETE actions are available per side inside the comparison, so the decision
+is made where it is being judged. `Esc` steps back out of flicker, then closes; **CLOSE**
+leaves without changing anything.
 
 ![DIFF compare — two versions of the same path side by side](../screenshots/diff_compare.png)
 

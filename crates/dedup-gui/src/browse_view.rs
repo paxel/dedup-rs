@@ -2618,6 +2618,83 @@ mod tests {
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 
+    /// Doc screenshot: the Browse tab over a real folder tree of photos and
+    /// video, to `docs/screenshots/browse.png`. Uses doc media (real thumbnails)
+    /// when `DEDUP_DOC_MEDIA` is set, otherwise skips. Run with `--ignored`.
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu + doc media)"]
+    fn doc_screenshot_browse() {
+        if !crate::doc_media::available() {
+            eprintln!("skipping: DEDUP_DOC_MEDIA not set");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        dedup_core::thumbnail::set_cache_dir(tmp.path().join("thumbs"));
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let repo_dir = tmp.path().join("Photos");
+        // A believable inherited tree: a trip folder of photos plus clips.
+        let layout: [(&str, &str); 6] = [
+            ("2019 Baltic trip/IMG_2019_field.jpg", "IMG_2019_field.jpg"),
+            ("2019 Baltic trip/sunset.jpg", "wallpaper_spacehulk.jpg"),
+            ("2019 Baltic trip/harbour.jpg", "bebop_blue.jpg"),
+            ("2019 Baltic trip/clips/kitten.mp4", "kitten.mp4"),
+            ("2019 Baltic trip/clips/lynx.webm", "lynx.webm"),
+            ("mewtwo.png", "mewtwo.png"),
+        ];
+        for (rel, asset) in layout {
+            let abs = repo_dir.join(rel);
+            std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+            crate::doc_media::place(asset, &abs);
+        }
+        store
+            .create_repo("Photos", &repo_dir.to_string_lossy())
+            .unwrap();
+        dedup_core::update::update_repo(
+            &store,
+            "Photos",
+            2,
+            &dedup_core::update::NoProgress,
+            &dedup_core::update::CancellationToken::new(),
+        )
+        .unwrap();
+
+        let mut view = BrowseView::new();
+        view.repo = Some("Photos".into());
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1100.0, 660.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut BrowseView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    ui.allocate_ui(egui::vec2(ui.available_width(), 640.0), |ui| {
+                        view.show(ui, &store_ui, TooltipVerbosity::default());
+                    });
+                },
+                view,
+            );
+        h.run();
+        // Enter the trip folder so the grid of real photos shows.
+        h.key_press(egui::Key::ArrowRight);
+        h.run();
+        // Thumbnails decode off-thread; pump so real photos appear.
+        for _ in 0..40 {
+            h.run();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let img = h.render().expect("wgpu render failed");
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/screenshots/browse.png");
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
     /// Renders Browse in flatten mode with two files multi-selected, to
     /// `target/dupes_browse_flat.png`. `--ignored`.
     #[test]

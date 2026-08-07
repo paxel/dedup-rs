@@ -32,6 +32,9 @@ mod util;
 mod waveform;
 mod worker;
 
+#[cfg(test)]
+pub(crate) mod doc_media;
+
 use dedup_core::store::Store;
 use std::sync::Arc;
 

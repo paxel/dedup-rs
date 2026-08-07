@@ -4079,6 +4079,22 @@ mod tests {
         side
     }
 
+    /// A DiffSide over a real document from the doc-media folder (a genuine
+    /// page to rasterize / extract), falling back to the synthetic colored
+    /// `pdf_side` when no doc media is configured.
+    fn pdf_side_media(dir: &Path, asset: &str, fallback_rgb: (f64, f64, f64)) -> DiffSide {
+        let dest = dir.join(asset);
+        if crate::doc_media::available() && crate::doc_media::place(asset, &dest) {
+            let mut side = named_side(asset);
+            side.facts.abs_path = dest.clone();
+            side.facts.mime = Some("application/pdf".into());
+            side.facts.size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(1);
+            side
+        } else {
+            pdf_side(dir, asset, fallback_rgb)
+        }
+    }
+
     /// The Render tab is offered for a PDF and not for a file that cannot be
     /// rasterized — keyed on mime, so no valid document is needed here.
     #[test]
@@ -4286,8 +4302,12 @@ mod tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         let mut cmp = DiffCompare::new_with_pool(
-            pdf_side(tmp.path(), "a.pdf", (0.20, 0.35, 0.70)),
-            Some(pdf_side(tmp.path(), "b.pdf", (0.75, 0.30, 0.20))),
+            pdf_side_media(tmp.path(), "menu.pdf", (0.20, 0.35, 0.70)),
+            Some(pdf_side_media(
+                tmp.path(),
+                "visa_contract.pdf",
+                (0.75, 0.30, 0.20),
+            )),
             Vec::new(),
         );
         cmp.tab = RepresentationKind::Render;

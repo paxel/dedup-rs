@@ -2999,11 +2999,42 @@ mod ui_tests {
     fn sample_app() -> (tempfile::TempDir, DedupApp) {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
-        for (name, files) in [("Automatic Upload", 5), ("Videos", 2)] {
+        // With real doc media (DEDUP_DOC_MEDIA), the two repos hold a believable
+        // mix of photos, video and documents so the cards show genuine
+        // thumbnails and a real MIME breakdown; otherwise fall back to the
+        // synthetic blobs the ordinary test suite uses.
+        let layouts: [(&str, &[&str]); 2] = [
+            (
+                "Automatic Upload",
+                &[
+                    "IMG_2019_field.jpg",
+                    "wallpaper_spacehulk.jpg",
+                    "bebop_blue.jpg",
+                    "mewtwo.png",
+                    "kitten.mp4",
+                    "menu.pdf",
+                    "visa_contract.pdf",
+                ],
+            ),
+            ("Videos", &["lynx.webm", "machine.mp4", "bebop_sepia.jpg"]),
+        ];
+        for (name, assets) in layouts {
             let dir = tmp.path().join(name.replace(' ', "_"));
             std::fs::create_dir_all(&dir).unwrap();
-            for i in 0..files {
-                std::fs::write(dir.join(format!("f{i}.bin")), format!("sample data {i}")).unwrap();
+            let mut placed = 0usize;
+            if crate::doc_media::available() {
+                for asset in assets {
+                    if crate::doc_media::place(asset, &dir.join(asset)) {
+                        placed += 1;
+                    }
+                }
+            }
+            if placed == 0 {
+                let files = if name == "Automatic Upload" { 5 } else { 2 };
+                for i in 0..files {
+                    std::fs::write(dir.join(format!("f{i}.bin")), format!("sample data {i}"))
+                        .unwrap();
+                }
             }
             store.create_repo(name, &dir.to_string_lossy()).unwrap();
             update_repo(&store, name, 1, &NoProgress, &CancellationToken::new()).unwrap();

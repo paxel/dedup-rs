@@ -2391,6 +2391,63 @@ mod ui_tests {
         (tmp, Arc::new(store))
     }
 
+    /// A real repo of exact-duplicate groups built from doc media, scanned so
+    /// entries carry genuine hashes/mime/thumbnails — the duplicates cards then
+    /// show real photos, not placeholders. The headline pair is the identical
+    /// contract PDF hiding among the photos. Falls back to `None` when no doc
+    /// media is configured, so callers keep their synthetic path.
+    fn seeded_media_store() -> Option<(TempDir, Arc<Store>)> {
+        if !crate::doc_media::available() {
+            return None;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        dedup_core::thumbnail::set_cache_dir(tmp.path().join("thumbs"));
+        let store = Store::open_at(tmp.path().join("cfg")).unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        // Each pair is one source copied under two names → one exact-dup group.
+        let pairs: [(&str, &str, &str); 4] = [
+            (
+                "IMG_2019_field.jpg",
+                "IMG_2019_field.jpg",
+                "IMG_2019_field (1).jpg",
+            ),
+            (
+                "wallpaper_spacehulk.jpg",
+                "wallpaper_spacehulk.jpg",
+                "spacehulk_backup.jpg",
+            ),
+            (
+                "visa_contract.pdf",
+                "Vertragsangebot.pdf",
+                "Vertragsangebot (1).pdf",
+            ),
+            ("mewtwo.png", "mewtwo.png", "mewtwo_copy.png"),
+        ];
+        let mut any = false;
+        for (asset, a, b) in pairs {
+            if crate::doc_media::place(asset, &root.join(a)) {
+                crate::doc_media::place(asset, &root.join(b));
+                any = true;
+            }
+        }
+        if !any {
+            return None;
+        }
+        store
+            .create_repo("Automatic Upload", &root.to_string_lossy())
+            .unwrap();
+        dedup_core::update::update_repo(
+            &store,
+            "Automatic Upload",
+            2,
+            &dedup_core::update::NoProgress,
+            &dedup_core::update::CancellationToken::new(),
+        )
+        .unwrap();
+        Some((tmp, Arc::new(store)))
+    }
+
     /// The whole point of the redesign: with many exact-duplicate groups, only
     /// the current page's members are materialized in memory (the rest stay as
     /// lightweight plan descriptors).
@@ -4829,32 +4886,51 @@ mod ui_tests {
         let dir = tempfile::tempdir().unwrap();
         // Dedicated cache so the test never writes into the user's real one.
         dedup_core::thumbnail::set_cache_dir(dir.path().join("thumbs"));
+        // Real photos when doc media is available (the A/B compare then shows
+        // genuine images, not gradients); synthetic gradients otherwise.
+        let real: [&str; 3] = [
+            "IMG_2019_field.jpg",
+            "wallpaper_spacehulk.jpg",
+            "bebop_blue.jpg",
+        ];
         let mut group: DupeGroup = Vec::new();
         for i in 0..3u8 {
-            let rel = format!("photo{i}.png");
+            let (rel, real_ok) = if crate::doc_media::available() {
+                let name = real[i as usize];
+                (
+                    name.to_string(),
+                    crate::doc_media::place(name, &dir.path().join(name)),
+                )
+            } else {
+                (format!("photo{i}.png"), false)
+            };
             let path = dir.path().join(&rel);
-            image::RgbImage::from_fn(640, 480, |x, y| {
-                image::Rgb([x as u8, y as u8, (i as u32 * 60) as u8])
-            })
-            .save(&path)
-            .unwrap();
+            if !real_ok {
+                image::RgbImage::from_fn(640, 480, |x, y| {
+                    image::Rgb([x as u8, y as u8, (i as u32 * 60) as u8])
+                })
+                .save(&path)
+                .unwrap();
+            }
             let mut hash = [0u8; 32];
             hash[0] = i;
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(1000);
             group.push(DupeFile {
                 repo: "r".into(),
                 repo_root: dir.path().to_string_lossy().into_owned(),
                 rel_path: rel,
                 entry: dedup_core::store::FileEntry {
-                    size: 1000,
+                    size,
                     hash,
                     modified_ms: 0,
                     missing: false,
-                    mime: Some("image/png".into()),
+                    mime: Some(if real_ok { "image/jpeg" } else { "image/png" }.into()),
                     img_fingerprint: None,
                     video_hash: None,
                     pdf_hash: None,
                     audio: None,
-                    img_size: Some((640, 480)),
+                    // Real media: let the decoded texture set the aspect.
+                    img_size: (!real_ok).then_some((640, 480)),
                     origin: None,
                     exif: None,
                 },
@@ -5018,24 +5094,27 @@ mod ui_tests {
     #[test]
     #[ignore = "generates a doc screenshot (needs wgpu)"]
     fn doc_screenshot_duplicates_tab() {
-        let (_tmp, store) = seeded_store(3);
-        let plan = plan_exact_duplicates(&store, &["repo".to_string()], |_| {}).unwrap();
+        let (repo, (_tmp, store)) = match seeded_media_store() {
+            Some(s) => ("Automatic Upload".to_string(), s),
+            None => ("repo".to_string(), seeded_store(3)),
+        };
+        let plan = plan_exact_duplicates(&store, std::slice::from_ref(&repo), |_| {}).unwrap();
         let mut view = DupesView::new();
         view.repos_loaded = true;
         view.repos = vec![RepoSel {
-            name: "repo".into(),
+            name: repo.clone(),
             included: true,
             read_only: false,
             is_main: false,
         }];
-        view.result_names = vec!["repo".to_string()];
+        view.result_names = vec![repo];
         view.results = Some(Results::Exact(plan));
         view.quick_delete = true;
 
         let store_ui = Arc::clone(&store);
         let mut init = false;
         let mut harness = Harness::builder()
-            .with_size(egui::vec2(1120.0, 620.0))
+            .with_size(egui::vec2(1120.0, 900.0))
             .wgpu()
             .build_ui_state(
                 move |ui, view: &mut DupesView| {
@@ -5049,6 +5128,12 @@ mod ui_tests {
                 view,
             );
         harness.run();
+        // Card thumbnails decode on background workers and upload over frames;
+        // pump the harness so the grid shows real photos, not placeholders.
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            harness.step();
+        }
         let img = harness.render().expect("wgpu render failed");
         let out = doc_screenshot_path("duplicates_tab.png");
         img.save(&out).expect("save png");
@@ -5062,32 +5147,51 @@ mod ui_tests {
     fn doc_screenshot_lightbox_compare() {
         let dir = tempfile::tempdir().unwrap();
         dedup_core::thumbnail::set_cache_dir(dir.path().join("thumbs"));
+        // Real photos when doc media is available (the A/B compare then shows
+        // genuine images, not gradients); synthetic gradients otherwise.
+        let real: [&str; 3] = [
+            "IMG_2019_field.jpg",
+            "wallpaper_spacehulk.jpg",
+            "bebop_blue.jpg",
+        ];
         let mut group: DupeGroup = Vec::new();
         for i in 0..3u8 {
-            let rel = format!("photo{i}.png");
+            let (rel, real_ok) = if crate::doc_media::available() {
+                let name = real[i as usize];
+                (
+                    name.to_string(),
+                    crate::doc_media::place(name, &dir.path().join(name)),
+                )
+            } else {
+                (format!("photo{i}.png"), false)
+            };
             let path = dir.path().join(&rel);
-            image::RgbImage::from_fn(640, 480, |x, y| {
-                image::Rgb([x as u8, y as u8, (i as u32 * 60) as u8])
-            })
-            .save(&path)
-            .unwrap();
+            if !real_ok {
+                image::RgbImage::from_fn(640, 480, |x, y| {
+                    image::Rgb([x as u8, y as u8, (i as u32 * 60) as u8])
+                })
+                .save(&path)
+                .unwrap();
+            }
             let mut hash = [0u8; 32];
             hash[0] = i;
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(1000);
             group.push(DupeFile {
                 repo: "r".into(),
                 repo_root: dir.path().to_string_lossy().into_owned(),
                 rel_path: rel,
                 entry: dedup_core::store::FileEntry {
-                    size: 1000,
+                    size,
                     hash,
                     modified_ms: 0,
                     missing: false,
-                    mime: Some("image/png".into()),
+                    mime: Some(if real_ok { "image/jpeg" } else { "image/png" }.into()),
                     img_fingerprint: None,
                     video_hash: None,
                     pdf_hash: None,
                     audio: None,
-                    img_size: Some((640, 480)),
+                    // Real media: let the decoded texture set the aspect.
+                    img_size: (!real_ok).then_some((640, 480)),
                     origin: None,
                     exif: None,
                 },
@@ -5124,9 +5228,10 @@ mod ui_tests {
             .apply(&ctx, &store2, Act::OpenLightbox(0, 0));
         harness.run();
         harness.get_by_label_contains("SHOW B").click();
-        for _ in 0..12 {
+        // Both sides decode off-thread; pump enough for the larger side too.
+        for _ in 0..40 {
             harness.run();
-            std::thread::sleep(std::time::Duration::from_millis(30));
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
         harness.run();
         let img = harness.render().expect("wgpu render failed");
@@ -5165,23 +5270,42 @@ mod ui_tests {
                 .expect("run ffmpeg");
             assert!(status.success(), "ffmpeg failed to build {rel}");
         };
-        make("clip0.mp4", "testsrc=duration=1:size=480x360:rate=8");
-        make("clip1.mp4", "testsrc2=duration=1:size=480x360:rate=8");
+        // Real clips when doc media is available (genuine filmstrips and
+        // scrubbed frames); animated test patterns otherwise.
+        let clips: Vec<(String, &str)> = if crate::doc_media::available()
+            && crate::doc_media::place("kitten.mp4", &dir.path().join("kitten.mp4"))
+            && crate::doc_media::place("lynx.webm", &dir.path().join("lynx.webm"))
+        {
+            vec![
+                ("kitten.mp4".into(), "video/mp4"),
+                ("lynx.webm".into(), "video/webm"),
+            ]
+        } else {
+            make("clip0.mp4", "testsrc=duration=1:size=480x360:rate=8");
+            make("clip1.mp4", "testsrc2=duration=1:size=480x360:rate=8");
+            vec![
+                ("clip0.mp4".into(), "video/mp4"),
+                ("clip1.mp4".into(), "video/mp4"),
+            ]
+        };
 
         let mut group: DupeGroup = Vec::new();
-        for (i, rel) in ["clip0.mp4", "clip1.mp4"].iter().enumerate() {
+        for (i, (rel, mime)) in clips.iter().enumerate() {
             let mut hash = [0u8; 32];
             hash[0] = i as u8;
+            let size = std::fs::metadata(dir.path().join(rel))
+                .map(|m| m.len())
+                .unwrap_or(1000);
             group.push(DupeFile {
                 repo: "r".into(),
                 repo_root: dir.path().to_string_lossy().into_owned(),
                 rel_path: rel.to_string(),
                 entry: dedup_core::store::FileEntry {
-                    size: 1000,
+                    size,
                     hash,
                     modified_ms: 0,
                     missing: false,
-                    mime: Some("video/mp4".into()),
+                    mime: Some((*mime).into()),
                     img_fingerprint: None,
                     video_hash: None,
                     pdf_hash: None,
