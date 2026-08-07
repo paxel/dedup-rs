@@ -5,6 +5,15 @@ Status: ready-for-agent
 Spec produced by a grilling session on 2026-08-06. Every decision below was put to
 the user and chosen by them; the rationale is the reason given at the time.
 
+**Progress (2026-08-06).** Landed: the core classifier `diff::plan_sync_back`
+(new / resurrection, reusing `diff_print`); `theme` blue as the fifth review
+semantic (pairwise-distinct test extended to five, passes untuned); **Slice A** —
+`board::Status::Resurrect` (blue), the `GROUP SYNC BACK` command offered on a
+main with a single-select sink picker, and the REVIEW preview (new rows green,
+resurrection rows blue), screenshot `docs/screenshots/group_sync_back.png`.
+Remaining — **Slice B**: the RUN (batch-promote the new rows, per-row `Apply` to
+resurrect), and the resurrection filter facet.
+
 ## Problem Statement
 
 I keep my main repository backed up to one or more sinks with GROUP SYNC — but

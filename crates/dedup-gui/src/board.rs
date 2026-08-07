@@ -74,6 +74,10 @@ pub enum Status {
     /// Same path, different content (conflict), or same content under a
     /// different name (renamed).
     Differs,
+    /// Content the main deleted (a tombstone) that a sink still holds — pulling
+    /// it back is a resurrection (GROUP SYNC BACK). Its own colour so it is never
+    /// mistaken for a plain add.
+    Resurrect,
     /// The file is not on this side at all — the cell renders empty.
     Absent,
 }
@@ -85,6 +89,7 @@ impl Status {
             Status::OnlyHere => theme::green(),
             Status::WillDelete => theme::red(),
             Status::Differs => theme::amber(),
+            Status::Resurrect => theme::blue(),
             Status::Absent => theme::grey(),
         }
     }
@@ -94,9 +99,10 @@ impl Status {
         match self {
             Status::WillDelete => 0,
             Status::Differs => 1,
-            Status::OnlyHere => 2,
-            Status::Same => 3,
-            Status::Absent => 4,
+            Status::Resurrect => 2,
+            Status::OnlyHere => 3,
+            Status::Same => 4,
+            Status::Absent => 5,
         }
     }
 }

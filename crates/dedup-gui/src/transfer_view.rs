@@ -54,6 +54,10 @@ enum Command {
     /// Push the source (a sync group's main) to some or all of its sinks, each
     /// in its own stored mode. Only offered when the source is a group's main.
     GroupSync,
+    /// Pull one of this group's sinks back into the main: promote content the
+    /// main never had, and offer to resurrect content the main deleted that the
+    /// sink still holds. Only offered when the source is a group's main.
+    GroupSyncBack,
     Diff,
 }
 
@@ -65,6 +69,7 @@ impl Command {
             Command::Sync => "SYNC",
             Command::Mirror => "MIRROR",
             Command::GroupSync => "GROUP SYNC",
+            Command::GroupSyncBack => "GROUP SYNC BACK",
             Command::Diff => "DIFF",
         }
     }
@@ -83,7 +88,11 @@ impl Command {
     fn repo_to_repo(self) -> bool {
         matches!(
             self,
-            Command::Sync | Command::Mirror | Command::GroupSync | Command::Diff
+            Command::Sync
+                | Command::Mirror
+                | Command::GroupSync
+                | Command::GroupSyncBack
+                | Command::Diff
         )
     }
     /// DIFF is a manual side-by-side view rather than a batch run: it has no
@@ -124,6 +133,14 @@ impl Command {
                 "Push the source (this group's main) to the selected sinks below, each in \
                  its own stored mode — ADD ONLY copies and never deletes, MIRROR also \
                  deletes what the main no longer has. The main is never changed.",
+            ),
+            Command::GroupSyncBack => (
+                "Pull a sink's changes back into this main",
+                "Pull one of this group's sinks back into the main: promote content the \
+                 main never had (files you added straight to the backup), and offer to \
+                 bring back content the main deleted that the sink still holds — a \
+                 resurrection, marked in blue, that you choose file by file. Nothing on \
+                 the sink is changed.",
             ),
             Command::Diff => (
                 "Compare the two repos side by side",
@@ -614,6 +631,72 @@ fn build_group_preview(
     })
 }
 
+/// Plan a GROUP SYNC BACK pull of `sink` into `group.main`, off the UI thread.
+/// Rows show the main gaining each file — green ([`board::Status::OnlyHere`]) for
+/// a new promote, blue ([`board::Status::Resurrect`]) for content the main
+/// deleted that the sink still holds. No per-row commands yet (that, and the run,
+/// are the next slice). Reuses [`GroupPreviewData`], carrying `added` = new count
+/// and `removed` = resurrection count for the shared render path.
+fn build_group_back_preview(
+    store: &Store,
+    group: &SyncGroup,
+    sink: &str,
+    filter: Option<&str>,
+) -> Result<GroupPreviewData, String> {
+    let pull = dedup_core::diff::plan_sync_back(store, sink, &group.main, filter)
+        .map_err(|e| e.to_string())?;
+    let (sink_db, sink_base) = open_facts(store, sink);
+    let mut rows = Vec::new();
+    let mut bodies = Vec::new();
+    let (mut new_count, mut resurrect_count) = (0usize, 0usize);
+    for item in &pull {
+        let main_status = match item.kind {
+            dedup_core::diff::PullKind::New => {
+                new_count += 1;
+                board::Status::OnlyHere
+            }
+            dedup_core::diff::PullKind::Resurrection => {
+                resurrect_count += 1;
+                board::Status::Resurrect
+            }
+        };
+        if rows.len() < PREVIEW_CAP {
+            let (meta, body) = board_row(
+                // The main will gain the file; the sink is the source that holds it.
+                SideSpec::at(main_status, &item.rel_path, None),
+                SideSpec::at(
+                    board::Status::Same,
+                    &item.rel_path,
+                    facts_for(sink_db.as_deref(), sink_base.as_deref(), &item.rel_path),
+                )
+                .in_repo(sink),
+                false,
+                Vec::new(),
+            );
+            rows.push(meta);
+            bodies.push(body);
+        }
+    }
+    Ok(GroupPreviewData {
+        group: SyncGroup {
+            main: group.main.clone(),
+            sinks: group
+                .sinks
+                .iter()
+                .filter(|s| s.repo == sink)
+                .cloned()
+                .collect(),
+        },
+        main_header: TransferView::repo_header(store, &group.main),
+        rows,
+        bodies,
+        added: new_count,
+        removed: resurrect_count,
+        sink_count: 1,
+        wholesale_sinks: Vec::new(),
+    })
+}
+
 fn preview_sync(
     store: &Store,
     config: &RunConfig,
@@ -896,7 +979,7 @@ fn prompt_for(config: &RunConfig, copies: usize, deletes: usize) -> Option<Strin
         // SYNC never reaches here either — it has its own confirm text (see
         // `TransferView::raise_group_confirm`), built from a `SyncGroup`, not
         // a `RunConfig` (`capture_run_config` returns `None` for it).
-        Command::Diff | Command::GroupSync => return None,
+        Command::Diff | Command::GroupSync | Command::GroupSyncBack => return None,
     })
 }
 
@@ -944,6 +1027,11 @@ enum Msg {
     GroupPreview {
         result: Result<GroupPreviewData, String>,
         confirm: bool,
+    },
+    /// A finished GROUP SYNC BACK plan (pull a sink into the main), built off the
+    /// UI thread. REVIEW only for now — no run half.
+    GroupBackPreview {
+        result: Result<GroupPreviewData, String>,
     },
     /// A finished GROUP SYNC push, aggregated across every sink pushed.
     GroupDone(Result<GroupSyncResult, String>),
@@ -1136,6 +1224,8 @@ enum Act {
     ToggleSink(String),
     SelectAllSinks,
     SelectNoSinks,
+    /// GROUP SYNC BACK: pick exactly one sink to pull back (single-select).
+    SelectOnlySink(String),
 }
 
 impl TransferView {
@@ -1300,6 +1390,7 @@ impl TransferView {
                     Command::Sync => self.sync_bar(ui, &mut acts),
                     Command::Mirror => self.mirror_bar(ui),
                     Command::GroupSync => self.group_sinks_bar(ui, &mut acts),
+                    Command::GroupSyncBack => self.group_back_sink_bar(ui, &mut acts),
                     _ => {
                         self.dest_bar(ui, &mut acts);
                         match self.destination {
@@ -1629,7 +1720,7 @@ impl TransferView {
         if self.running || self.previewing || self.source.is_none() {
             return false;
         }
-        if self.command == Command::GroupSync {
+        if matches!(self.command, Command::GroupSync | Command::GroupSyncBack) {
             return self.current_group.is_some() && !self.selected_sinks.is_empty();
         }
         match self.destination {
@@ -1641,17 +1732,18 @@ impl TransferView {
     fn command_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         let has_group = self.current_group.is_some();
         let title = if has_group {
-            "COMMAND — COPY, MOVE, SYNC, MIRROR, GROUP SYNC OR DIFF"
+            "COMMAND — COPY, MOVE, SYNC, MIRROR, GROUP SYNC, GROUP SYNC BACK OR DIFF"
         } else {
             "COMMAND — COPY, MOVE, SYNC, MIRROR OR DIFF"
         };
         crate::lcars::section_lcars(ui, title, theme::orange(), |ui| {
             ui.horizontal(|ui| {
                 let mut cmds = vec![Command::Copy, Command::Move, Command::Sync, Command::Mirror];
-                // Only offered when the source is a sync group's main —
-                // GROUP SYNC has nothing to push otherwise.
+                // Only offered when the source is a sync group's main — GROUP SYNC
+                // pushes it to sinks, GROUP SYNC BACK pulls a sink into it.
                 if has_group {
                     cmds.push(Command::GroupSync);
+                    cmds.push(Command::GroupSyncBack);
                 }
                 cmds.push(Command::Diff);
                 for cmd in cmds {
@@ -1915,6 +2007,10 @@ impl TransferView {
                 "Push the source (this group's main) to the sinks selected below, each in its \
                  own stored mode."
             }
+            Command::GroupSyncBack => {
+                "Pull the sink selected below back into the main — promote files it added, and \
+                 choose whether to bring back files the main deleted."
+            }
             Command::Diff => {
                 "Compare the two repos side by side and resolve each difference yourself — \
                  copy, delete, rename or overwrite, one row at a time."
@@ -1948,6 +2044,64 @@ impl TransferView {
     /// includes, defaulting to all of them. Each sink shows its own stored
     /// push mode (set on the Repositories tab, not editable here) so the
     /// selection reads honestly — this panel picks *which* sinks, not *how*.
+    /// GROUP SYNC BACK's sink picker — single-select: you pull one sink back at a
+    /// time (the drive you edited). A multi-sink pull is a semantic not yet taken
+    /// on. Otherwise mirrors GROUP SYNC's sink chips.
+    fn group_back_sink_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        crate::lcars::section_lcars(
+            ui,
+            "SINK — PULL ITS CHANGES BACK INTO THE MAIN",
+            theme::blue(),
+            |ui| {
+                let Some(group) = self.current_group.clone() else {
+                    return;
+                };
+                crate::repo_chip::chip_row(ui, "xfer_back_sink", "", group.sinks.len(), |ui, i| {
+                    let sink = &group.sinks[i];
+                    let mode = match sink.mode {
+                        SyncMode::AddOnly => "ADD ONLY",
+                        SyncMode::Mirror => "MIRROR",
+                    };
+                    let sel = self
+                        .selected_sinks
+                        .first()
+                        .map(|s| s == &sink.repo)
+                        .unwrap_or(false);
+                    let accent = if sink.mode == SyncMode::Mirror {
+                        theme::red()
+                    } else {
+                        theme::blue()
+                    };
+                    let row = ui.horizontal(|ui| {
+                        let chip =
+                            crate::repo_chip::repo_chip(ui, &sink.repo, sel, accent, false, None);
+                        ui.label(
+                            RichText::new(format!("MODE: {mode}"))
+                                .color(accent)
+                                .size(10.0),
+                        );
+                        chip
+                    });
+                    if row
+                        .inner
+                        .name
+                        .explain(
+                            self.verbosity,
+                            "Pull this sink back into the main",
+                            "Compare this sink against the main and pull its changes back: \
+                             promote files the main never had, and choose whether to bring back \
+                             files the main deleted that the sink still holds.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::SelectOnlySink(sink.repo.clone()));
+                    }
+                    row.response
+                });
+            },
+        );
+    }
+
     fn group_sinks_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         crate::lcars::section_lcars(
             ui,
@@ -2720,6 +2874,10 @@ impl TransferView {
                 self.selected_sinks.clear();
                 self.clear_preview();
             }
+            Act::SelectOnlySink(name) => {
+                self.selected_sinks = vec![name];
+                self.clear_preview();
+            }
         }
     }
 
@@ -2822,6 +2980,10 @@ impl TransferView {
             self.spawn_group_preview(store, false);
             return;
         }
+        if self.command == Command::GroupSyncBack {
+            self.spawn_group_back_preview(store);
+            return;
+        }
         // Every other command feeds the review board. Plan off the UI thread.
         if let Some(config) = self.capture_run_config() {
             self.spawn_review_preview(store, config, None);
@@ -2912,6 +3074,58 @@ impl TransferView {
             let result = build_group_preview(&store, &group, filter.as_deref());
             let _ = tx.send(Msg::GroupPreview { result, confirm });
         });
+    }
+
+    /// Plan a GROUP SYNC BACK pull of the single selected sink into the main,
+    /// off the UI thread. REVIEW only — the run is the next slice.
+    fn spawn_group_back_preview(&mut self, store: &Arc<Store>) {
+        let Some(group) = self.current_group.clone() else {
+            return;
+        };
+        let Some(sink) = self.selected_sinks.first().cloned() else {
+            return;
+        };
+        let filter = self.filter_string();
+        let store = Arc::clone(store);
+        let tx = self.tx.clone();
+        self.previewing = true;
+        self.status = Some("planning…".to_string());
+        std::thread::spawn(move || {
+            let result = build_group_back_preview(&store, &group, &sink, filter.as_deref());
+            let _ = tx.send(Msg::GroupBackPreview { result });
+        });
+    }
+
+    /// Fold a finished GROUP SYNC BACK plan into the board: new files to promote
+    /// (green) and resurrection candidates (blue).
+    fn apply_group_back_preview(&mut self, result: Result<GroupPreviewData, String>) {
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
+        };
+        // The 4-slot summary has no resurrection bucket; new files ride the
+        // "only on one side" (green) slot, and the resurrection count is spoken
+        // in the status line and shown as the blue rows themselves.
+        self.preview_totals = [0, outcome.added, 0, 0];
+        self.preview_total = outcome.added + outcome.removed;
+        self.preview_source_header = outcome.main_header.clone();
+        self.preview_target_header = outcome
+            .group
+            .sinks
+            .first()
+            .map(|s| s.repo.clone())
+            .unwrap_or_default();
+        self.wholesale_sinks = Vec::new();
+        self.preview = outcome.rows;
+        self.preview_bodies = outcome.bodies;
+        self.status = Some(format!(
+            "{} new file(s) to promote, {} resurrection candidate(s).",
+            outcome.added, outcome.removed
+        ));
+        self.error = None;
     }
 
     /// Fold a finished GROUP SYNC plan into the board and, if this plan was
@@ -3597,6 +3811,10 @@ impl TransferView {
                     self.previewing = false;
                     self.apply_group_preview(result, confirm);
                 }
+                Msg::GroupBackPreview { result } => {
+                    self.previewing = false;
+                    self.apply_group_back_preview(result);
+                }
                 Msg::GroupDone(result) => {
                     self.running = false;
                     log::info!("group sync finished: {}", result.is_ok());
@@ -3987,6 +4205,170 @@ mod ui_tests {
         assert!(
             h.query_by_label("GROUP SYNC").is_some(),
             "GROUP SYNC is offered when the source is a group's main"
+        );
+    }
+
+    /// Doc screenshot: a GROUP SYNC BACK review board with a green new-file row
+    /// and a blue resurrection row, to `docs/screenshots/group_sync_back.png`.
+    /// `--ignored` (needs wgpu).
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_group_sync_back() {
+        let (_tmp, store) = back_preview_store();
+        let mut view = TransferView::new();
+        view.loaded = true;
+        view.repos = vec!["source".to_string(), "target".to_string()];
+        view.sync_repos(&store);
+        view.source = Some("source".to_string());
+        view.refresh_group(&store);
+        view.command = Command::GroupSyncBack;
+
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1120.0, 940.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut TransferView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::LIGHT);
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), None);
+                },
+                view,
+            );
+        harness.run();
+        harness.get_by_label("REVIEW").click_accesskit();
+        settle_preview(&mut harness);
+        harness.run();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("group_sync_back.png");
+        let img = harness.render().expect("wgpu render failed");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// GROUP SYNC BACK is offered under the same condition as GROUP SYNC — the
+    /// source is a group's main — as its reverse, and is a distinct command.
+    #[test]
+    fn group_sync_back_offered_when_source_is_a_group_main() {
+        let (_tmp, store) = sample_store();
+        store.create_sync_group("grp", "source").expect("group");
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::AddOnly)
+            .expect("sink");
+        let store2 = Arc::clone(&store);
+        let h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+        });
+        assert!(
+            h.query_by_label("GROUP SYNC BACK").is_some(),
+            "GROUP SYNC BACK is offered when the source is a group's main"
+        );
+        assert!(
+            h.query_by_label("GROUP SYNC").is_some(),
+            "and GROUP SYNC (the forward push) is still offered alongside it"
+        );
+    }
+
+    /// A store whose group's sink holds one file the main never saw (new) and
+    /// one the main deleted but the sink still has (resurrection).
+    fn back_preview_store() -> (tempfile::TempDir, Arc<Store>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_at(tmp.path().join("cfg")).unwrap();
+        let src = tmp.path().join("source"); // main
+        let dst = tmp.path().join("target"); // sink
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        // A file that stays on the main, so deleting the next one does not empty
+        // its index (a scan that would empty a repo is refused).
+        std::fs::write(src.join("stays.txt"), b"stays").unwrap();
+        std::fs::write(src.join("deleted.txt"), b"deleted-content").unwrap();
+        std::fs::write(dst.join("deleted.txt"), b"deleted-content").unwrap();
+        std::fs::write(dst.join("added-on-sink.txt"), b"brand-new").unwrap();
+        store.create_repo("source", &src.to_string_lossy()).unwrap();
+        store.create_repo("target", &dst.to_string_lossy()).unwrap();
+        let scan = |repo: &str| {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        };
+        scan("source");
+        scan("target");
+        // The main deletes its copy and rescans → a tombstone the sink outlives.
+        std::fs::remove_file(src.join("deleted.txt")).unwrap();
+        scan("source");
+        store.create_sync_group("grp", "source").unwrap();
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::AddOnly)
+            .unwrap();
+        (tmp, Arc::new(store))
+    }
+
+    /// GROUP SYNC BACK's REVIEW classifies the sink against the main: a file the
+    /// main never had counts as new (promote), a file the main deleted that the
+    /// sink still holds is a resurrection candidate — and both reach the board.
+    #[test]
+    fn group_sync_back_preview_separates_new_and_resurrection() {
+        let (_tmp, store) = back_preview_store();
+        let store2 = Arc::clone(&store);
+        let mut h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+            v.command = Command::GroupSyncBack;
+        });
+        h.get_by_label("REVIEW").click_accesskit();
+        settle_preview(&mut h);
+        assert_eq!(
+            h.state().preview.len(),
+            2,
+            "two rows reach the board: one new, one resurrection"
+        );
+        assert_eq!(
+            h.state().preview_totals[1],
+            1,
+            "one new file to promote (added-on-sink.txt)"
+        );
+        assert!(
+            h.state()
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("1 resurrection candidate"),
+            "status names the resurrection count: {:?}",
+            h.state().status
+        );
+        // The new row is green (OnlyHere on the main side); the resurrection row
+        // is blue (Resurrect) — the classification carried into the board.
+        let statuses: Vec<board::Status> =
+            h.state().preview.iter().map(|r| r.left_status).collect();
+        assert!(
+            statuses.contains(&board::Status::OnlyHere),
+            "a new (green) row: {statuses:?}"
+        );
+        assert!(
+            statuses.contains(&board::Status::Resurrect),
+            "a resurrection (blue) row: {statuses:?}"
+        );
+    }
+
+    #[test]
+    fn group_sync_back_hidden_when_the_source_has_no_group() {
+        let (_tmp, store) = sample_store();
+        let store2 = Arc::clone(&store);
+        let h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+        });
+        assert!(
+            h.query_by_label("GROUP SYNC BACK").is_none(),
+            "GROUP SYNC BACK is hidden when the source has no group"
         );
     }
 
