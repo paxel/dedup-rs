@@ -30,6 +30,8 @@ equivalent of [`diff cp`/`mv`/`rm`](../cli.md#diff).
 - **GROUP SYNC** — push a backup group's main to some or all of its sinks, each in its own
   stored mode. Only offered when SOURCE is a group's main; see [Group sync](#group-sync)
   below.
+- **GROUP SYNC BACK** — the reverse: pull one sink's changes *back* into the main. Also only
+  offered when SOURCE is a group's main; see [Group sync back](#group-sync-back) below.
 - **DIFF** — compare the two repos side by side and resolve the differences yourself, one
   row at a time (see [Diff board](#diff-board) below). Nothing runs as a batch.
 
@@ -141,8 +143,29 @@ entirely — then pushes on a background thread. Sinks are handled independently
 unreachable backup drive does not stop the others, and the main is never changed. The FILTER
 wizard applies here too, narrowing which files count for every selected sink.
 
-To bring a change made *inside* a sink back to the main, use **DIFF** with the sink as
-SOURCE and the main as TARGET.
+## Group sync back
+
+Sometimes the change is on a **sink** — you dropped new files straight onto a backup drive, or
+you deleted something from the main *by mistake* and a backup still has it. **GROUP SYNC BACK**
+pulls one sink back into its main. It appears next to GROUP SYNC when the SOURCE is a group's
+main; you pick **one sink** to reconcile.
+
+![GROUP SYNC BACK: a green new-file row and a blue resurrection row](../screenshots/group_sync_back.png)
+
+REVIEW sorts the sink's files against the main into two kinds:
+
+- **New** (green) — content the main never had. These are your direct edits. **RUN** promotes
+  them all into the main in one batch.
+- **Resurrection** (blue) — content the main once had and **deleted**, that the sink still
+  holds. These are **never** promoted by the batch — resurrecting a file undoes a deletion, and
+  only you know whether that deletion was a mistake or deliberate. Each blue row carries its own
+  **APPLY** to pull *just that file* back, so you recreate the ones you deleted by mistake and
+  leave the rest alone.
+
+Content already in the main is skipped, and a **RESURRECTIONS ONLY** toggle above the rows hides
+everything but the blue ones when you want to focus on what would come back. Nothing on the sink
+is ever changed. Note that a **MIRROR** sink deletes any direct edits on the next push, so run
+GROUP SYNC BACK *before* you push again.
 
 ## Review and run
 

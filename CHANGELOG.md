@@ -6,6 +6,11 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 ### Added
 
+- **Pull a backup's changes back into the main.** A new **GROUP SYNC BACK** command (the reverse
+  of GROUP SYNC) reconciles one sink into its main: files you added straight to the backup are
+  **promoted** in a batch (green), while files the main **deleted** that the sink still holds are
+  shown as **resurrection** candidates (a new blue mark) and never auto-promoted — you pull each
+  one back on its own, so you recreate a mistaken deletion without silently undoing a real one.
 - **Read a document, and compare what two documents say.** On the viewer's **Text** tab, a
   PDF, Word/OpenDocument file, spreadsheet, presentation, or email now shows its **extracted
   words** instead of a hex dump. Comparing two documents lines up their content **side by side**

@@ -671,7 +671,9 @@ fn build_group_back_preview(
                 )
                 .in_repo(sink),
                 false,
-                Vec::new(),
+                // Each row can be pulled on its own — the only way to opt a
+                // resurrection in, and a way to promote a single new file.
+                vec![board::Cmd::Apply],
             );
             rows.push(meta);
             bodies.push(body);
@@ -1029,9 +1031,10 @@ enum Msg {
         confirm: bool,
     },
     /// A finished GROUP SYNC BACK plan (pull a sink into the main), built off the
-    /// UI thread. REVIEW only for now — no run half.
+    /// UI thread. `confirm` raises the RUN confirmation once the real counts land.
     GroupBackPreview {
         result: Result<GroupPreviewData, String>,
+        confirm: bool,
     },
     /// A finished GROUP SYNC push, aggregated across every sink pushed.
     GroupDone(Result<GroupSyncResult, String>),
@@ -1116,6 +1119,9 @@ pub struct TransferView {
     /// confirmation authorises, captured when its plan landed. PROCEED pushes
     /// *this*, not whatever is selected when the button is clicked.
     pending_group_confirm: Option<SyncGroup>,
+    /// GROUP SYNC BACK's authorised pull, `(main, sink)`, captured when its plan
+    /// landed — the batch promotes only the new files.
+    pending_group_back: Option<(String, String)>,
     /// Whether COPY/MOVE goes into a repo or a picked folder.
     destination: Destination,
     /// Absolute path of the export folder (Destination::Folder).
@@ -1243,6 +1249,7 @@ impl TransferView {
             selected_sinks: Vec::new(),
             wholesale_sinks: Vec::new(),
             pending_group_confirm: None,
+            pending_group_back: None,
             destination: Destination::Repo,
             folder: String::new(),
             select_mode: SelectMode::Exact,
@@ -2809,6 +2816,8 @@ impl TransferView {
                 self.reset_run();
                 if self.command == Command::GroupSync {
                     self.spawn_group_preview(store, true);
+                } else if self.command == Command::GroupSyncBack {
+                    self.spawn_group_back_preview(store, true);
                 } else if let Some(config) = self.capture_run_config() {
                     let confirm = Box::new(config.clone());
                     self.spawn_review_preview(store, config, Some(confirm));
@@ -2818,21 +2827,33 @@ impl TransferView {
                 self.confirm = None;
                 self.pending_confirm = None;
                 self.pending_group_confirm = None;
+                self.pending_group_back = None;
             }
             Act::Confirm => {
                 self.confirm = None;
                 // Run the config/group the confirmation was built for, not
                 // live state.
-                if let Some(group) = self.pending_group_confirm.take() {
+                if let Some((main, sink)) = self.pending_group_back.take() {
+                    self.start_group_back_pull(store, main, sink, None);
+                } else if let Some(group) = self.pending_group_confirm.take() {
                     self.start_group_sync(store, group);
                 } else if let Some(config) = self.pending_confirm.take() {
                     self.start(store, *config, None);
                 }
             }
             Act::ApplyRow(key) => {
-                // A single-row APPLY runs immediately against the config the
-                // board was previewed with — no confirmation, so capture now.
-                if let Some(config) = self.capture_run_config() {
+                // GROUP SYNC BACK has no RunConfig — a row's APPLY pulls just that
+                // file into the main (this is how a single resurrection is opted
+                // in). Every other command runs against the previewed config.
+                if self.command == Command::GroupSyncBack {
+                    if let (Some(group), Some(sink)) = (
+                        self.current_group.clone(),
+                        self.selected_sinks.first().cloned(),
+                    ) {
+                        let only = std::iter::once(key).collect();
+                        self.start_group_back_pull(store, group.main, sink, Some(only));
+                    }
+                } else if let Some(config) = self.capture_run_config() {
                     self.start(store, config, Some(key));
                 }
             }
@@ -2981,7 +3002,7 @@ impl TransferView {
             return;
         }
         if self.command == Command::GroupSyncBack {
-            self.spawn_group_back_preview(store);
+            self.spawn_group_back_preview(store, false);
             return;
         }
         // Every other command feeds the review board. Plan off the UI thread.
@@ -3077,8 +3098,9 @@ impl TransferView {
     }
 
     /// Plan a GROUP SYNC BACK pull of the single selected sink into the main,
-    /// off the UI thread. REVIEW only — the run is the next slice.
-    fn spawn_group_back_preview(&mut self, store: &Arc<Store>) {
+    /// off the UI thread. `confirm` defers the RUN confirmation until the plan
+    /// lands with real counts.
+    fn spawn_group_back_preview(&mut self, store: &Arc<Store>, confirm: bool) {
         let Some(group) = self.current_group.clone() else {
             return;
         };
@@ -3092,13 +3114,18 @@ impl TransferView {
         self.status = Some("planning…".to_string());
         std::thread::spawn(move || {
             let result = build_group_back_preview(&store, &group, &sink, filter.as_deref());
-            let _ = tx.send(Msg::GroupBackPreview { result });
+            let _ = tx.send(Msg::GroupBackPreview { result, confirm });
         });
     }
 
     /// Fold a finished GROUP SYNC BACK plan into the board: new files to promote
-    /// (green) and resurrection candidates (blue).
-    fn apply_group_back_preview(&mut self, result: Result<GroupPreviewData, String>) {
+    /// (green) and resurrection candidates (blue). When `confirm`, raise the RUN
+    /// confirmation for the batch promote (new files only).
+    fn apply_group_back_preview(
+        &mut self,
+        result: Result<GroupPreviewData, String>,
+        confirm: bool,
+    ) {
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -3126,6 +3153,22 @@ impl TransferView {
             outcome.added, outcome.removed
         ));
         self.error = None;
+        if confirm {
+            // The batch promotes only the new files; resurrection is per-row.
+            let sink = outcome
+                .group
+                .sinks
+                .first()
+                .map(|s| s.repo.clone())
+                .unwrap_or_default();
+            self.confirm = Some(format!(
+                "Promote {} new file(s) from sink '{}' into main '{}'? {} resurrection \
+                 candidate(s) are left for you to pull one by one. Nothing on the sink is \
+                 changed.",
+                outcome.added, sink, outcome.group.main, outcome.removed
+            ));
+            self.pending_group_back = Some((outcome.group.main.clone(), sink));
+        }
     }
 
     /// Fold a finished GROUP SYNC plan into the board and, if this plan was
@@ -3212,6 +3255,75 @@ impl TransferView {
     /// progress flows through the same `ChannelDiffProgress` → `run_problems`
     /// path every other command uses; only the terminal aggregation across
     /// sinks is GROUP SYNC's own.
+    /// Run a GROUP SYNC BACK pull of `sink` into `main`. `only = None` is the
+    /// batch: promote every **new** file, deliberately excluding the resurrection
+    /// set (tombstoned content the sink still holds). `only = Some(keys)` pulls
+    /// exactly those rows — how a single resurrection is opted in. Off the UI
+    /// thread; reports through the shared GROUP SYNC done channel.
+    fn start_group_back_pull(
+        &mut self,
+        store: &Arc<Store>,
+        main: String,
+        sink: String,
+        only: Option<std::collections::HashSet<String>>,
+    ) {
+        let filter = self.filter_string();
+        let store = Arc::clone(store);
+        let tx = self.tx.clone();
+        self.cancel = CancellationToken::new();
+        let cancel = self.cancel.clone();
+        self.running = true;
+        self.status = Some(format!("pulling '{sink}' into '{main}'…"));
+        self.clear_preview();
+        self.reset_run();
+
+        std::thread::spawn(move || {
+            let keys: std::collections::HashSet<String> = match only {
+                Some(keys) => keys,
+                None => {
+                    match dedup_core::diff::plan_sync_back(&store, &sink, &main, filter.as_deref())
+                    {
+                        Ok(items) => items
+                            .into_iter()
+                            .filter(|i| i.kind == dedup_core::diff::PullKind::New)
+                            .map(|i| dedup_core::diff::source_key(&i.rel_path))
+                            .collect(),
+                        Err(e) => {
+                            let _ = tx.send(Msg::GroupDone(Err(e.to_string())));
+                            return;
+                        }
+                    }
+                }
+            };
+            let progress = ChannelDiffProgress { tx: tx.clone() };
+            let run = DiffRun::new(&progress, &cancel).with_selection(None, Some(&keys));
+            // Copy sink content the main lacks, scoped to the new files, into the
+            // main at the same relative path; the main is re-indexed by the sync.
+            let result = dedup_core::diff::diff_sync(
+                &store,
+                &sink,
+                &main,
+                true,
+                SyncDelete::None,
+                filter.as_deref(),
+                &run,
+            );
+            let done = match result {
+                Ok(stats) => Ok(GroupSyncResult {
+                    main: main.clone(),
+                    copied: stats.copied,
+                    deleted: 0,
+                    errors: stats.errors,
+                    cancelled: stats.cancelled,
+                    failures: Vec::new(),
+                    skipped: Vec::new(),
+                }),
+                Err(e) => Err(format!("{sink}: {e}")),
+            };
+            let _ = tx.send(Msg::GroupDone(done));
+        });
+    }
+
     fn start_group_sync(&mut self, store: &Arc<Store>, group: SyncGroup) {
         let filter = self.filter_string();
         let store = Arc::clone(store);
@@ -3811,9 +3923,9 @@ impl TransferView {
                     self.previewing = false;
                     self.apply_group_preview(result, confirm);
                 }
-                Msg::GroupBackPreview { result } => {
+                Msg::GroupBackPreview { result, confirm } => {
                     self.previewing = false;
-                    self.apply_group_back_preview(result);
+                    self.apply_group_back_preview(result, confirm);
                 }
                 Msg::GroupDone(result) => {
                     self.running = false;
@@ -4356,6 +4468,127 @@ mod ui_tests {
         assert!(
             statuses.contains(&board::Status::Resurrect),
             "a resurrection (blue) row: {statuses:?}"
+        );
+    }
+
+    /// GROUP SYNC BACK's RUN promotes only the new files into the main; the
+    /// resurrection candidate is never auto-promoted (it is opt-in, per row).
+    #[test]
+    fn group_sync_back_run_promotes_new_but_not_resurrection() {
+        let (tmp, store) = back_preview_store();
+        let store2 = Arc::clone(&store);
+        let mut h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+            v.command = Command::GroupSyncBack;
+        });
+        h.get_by_label("RUN").click_accesskit();
+        settle_preview(&mut h);
+        assert!(
+            h.state().confirm.is_some(),
+            "RUN raises a confirmation once the plan lands"
+        );
+        assert!(
+            h.state()
+                .confirm
+                .as_deref()
+                .unwrap_or_default()
+                .contains("resurrection"),
+            "the confirmation names the resurrection candidates left behind: {:?}",
+            h.state().confirm
+        );
+        h.get_by_label("PROCEED").click_accesskit();
+        for _ in 0..100 {
+            h.step();
+            if !h.state().running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!h.state().running, "the pull finished");
+        let main_dir = tmp.path().join("source");
+        assert!(
+            main_dir.join("added-on-sink.txt").exists(),
+            "the new file was promoted into the main"
+        );
+        assert!(
+            !main_dir.join("deleted.txt").exists(),
+            "the resurrection candidate was NOT auto-promoted (opt-in only)"
+        );
+    }
+
+    /// A single resurrection row's per-row APPLY pulls just that file into the
+    /// main — how a mistakenly-deleted file is recreated from the backup.
+    #[test]
+    fn group_sync_back_per_row_apply_resurrects_one_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_at(tmp.path().join("cfg")).unwrap();
+        let src = tmp.path().join("source");
+        let dst = tmp.path().join("target");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("stays.txt"), b"stays").unwrap();
+        std::fs::write(src.join("deleted.txt"), b"deleted-content").unwrap();
+        std::fs::write(dst.join("deleted.txt"), b"deleted-content").unwrap();
+        store.create_repo("source", &src.to_string_lossy()).unwrap();
+        store.create_repo("target", &dst.to_string_lossy()).unwrap();
+        let scan = |repo: &str| {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        };
+        scan("source");
+        scan("target");
+        std::fs::remove_file(src.join("deleted.txt")).unwrap();
+        scan("source");
+        store.create_sync_group("grp", "source").unwrap();
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::AddOnly)
+            .unwrap();
+        let store = Arc::new(store);
+        // A taller harness than the shared helper, so the single row's APPLY
+        // button is on-screen (the board virtualizes off-screen rows away).
+        let mut view = TransferView::new();
+        view.loaded = true;
+        view.repos = vec!["source".to_string(), "target".to_string()];
+        view.source = Some("source".to_string());
+        view.sync_repos(&store);
+        view.command = Command::GroupSyncBack;
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1120.0, 940.0))
+            .build_ui_state(
+                move |ui, view: &mut TransferView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), None);
+                },
+                view,
+            );
+        h.run();
+        h.get_by_label("REVIEW").click_accesskit();
+        settle_preview(&mut h);
+        // One row (the resurrection); its APPLY pulls just that file.
+        h.get_by_label("APPLY").click_accesskit();
+        for _ in 0..100 {
+            h.step();
+            if !h.state().running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!h.state().running, "the per-row pull finished");
+        assert!(
+            src.join("deleted.txt").exists(),
+            "the resurrection was recreated in the main by its per-row APPLY"
         );
     }
 

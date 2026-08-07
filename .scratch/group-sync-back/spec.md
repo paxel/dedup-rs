@@ -1,6 +1,6 @@
 # GROUP SYNC BACK — pull a sink's changes back to its main
 
-Status: ready-for-agent
+Status: resolved
 
 Spec produced by a grilling session on 2026-08-06. Every decision below was put to
 the user and chosen by them; the rationale is the reason given at the time.
@@ -10,9 +10,13 @@ the user and chosen by them; the rationale is the reason given at the time.
 semantic (pairwise-distinct test extended to five, passes untuned); **Slice A** —
 `board::Status::Resurrect` (blue), the `GROUP SYNC BACK` command offered on a
 main with a single-select sink picker, and the REVIEW preview (new rows green,
-resurrection rows blue), screenshot `docs/screenshots/group_sync_back.png`.
-Remaining — **Slice B**: the RUN (batch-promote the new rows, per-row `Apply` to
-resurrect), and the resurrection filter facet.
+resurrection rows blue), screenshot `docs/screenshots/group_sync_back.png`;
+**Slice B** — the RUN (batch-promote the new files via `diff_sync` scoped to the
+new keys; the main gains them and is re-indexed) and per-row `Apply` to resurrect
+a single file (opt-in), both tested. the **resurrection filter facet** (a `BoardState.resurrection_only` flag +
+`RowMeta::is_resurrection` + a "RESURRECTIONS ONLY" toggle gated on any blue row
+being present, so it never shows on grooming/DIFF). Documented in
+`docs/gui/files.md`. **The feature is complete.**
 
 ## Problem Statement
 

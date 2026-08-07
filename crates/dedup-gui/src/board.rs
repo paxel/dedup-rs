@@ -353,6 +353,12 @@ pub struct RowMeta {
 }
 
 impl RowMeta {
+    /// Whether either side is a resurrection (blue) — content the main deleted
+    /// that a sink still holds. Drives the GROUP SYNC BACK filter.
+    pub fn is_resurrection(&self) -> bool {
+        self.left_status == Status::Resurrect || self.right_status == Status::Resurrect
+    }
+
     /// How tall this row renders. Driven by whichever is taller: the side with
     /// the most names, or the command grid.
     fn height(&self) -> f32 {
@@ -415,6 +421,9 @@ pub struct BoardState {
     pub sort_asc: bool,
     /// Whether the uninteresting unchanged/equal rows are shown.
     pub show_unchanged: bool,
+    /// Whether only resurrection rows are shown (GROUP SYNC BACK) — isolate the
+    /// blue "would bring back deleted content" rows.
+    pub resurrection_only: bool,
     /// Keys of rows the user hid. A hidden row leaves the board and, on a
     /// planned surface, is skipped by RUN. There is deliberately no counter and
     /// no way back: rebuilding the preview is what clears this.
@@ -428,6 +437,7 @@ impl Default for BoardState {
             sort_left: true,
             sort_asc: true,
             show_unchanged: false,
+            resurrection_only: false,
             hidden: std::collections::HashSet::new(),
         }
     }
@@ -496,6 +506,7 @@ impl Index {
     fn build(metas: &[RowMeta], state: &BoardState) -> Self {
         let mut order: Vec<usize> = (0..metas.len())
             .filter(|&i| state.show_unchanged || !metas[i].unchanged)
+            .filter(|&i| !state.resurrection_only || metas[i].is_resurrection())
             .filter(|&i| !state.hidden.contains(&metas[i].key))
             .collect();
         sort_order(&mut order, metas, state);
@@ -632,7 +643,8 @@ pub fn board(
     if !two_sided {
         state.sort_left = true;
     }
-    controls_bar(ui, state, two_sided, view.totals[3] > 0);
+    let any_resurrection = metas.iter().any(|m| m.is_resurrection());
+    controls_bar(ui, state, two_sided, view.totals[3] > 0, any_resurrection);
     headers(ui, &view, metas);
 
     let index = Index::build(metas, state);
@@ -1090,7 +1102,13 @@ fn facts_line(size: u64, modified: i64, facts: Option<&FileFacts>) -> Option<Str
 
 /// The SHOW UNCHANGED toggle and the sort bar. With no column headers to click,
 /// the sort key, the side it reads from and the direction are all explicit.
-fn controls_bar(ui: &mut egui::Ui, state: &mut BoardState, two_sided: bool, any_unchanged: bool) {
+fn controls_bar(
+    ui: &mut egui::Ui,
+    state: &mut BoardState,
+    two_sided: bool,
+    any_unchanged: bool,
+    any_resurrection: bool,
+) {
     ui.horizontal_wrapped(|ui| {
         if any_unchanged {
             let label = format!(
@@ -1101,6 +1119,21 @@ fn controls_bar(ui: &mut egui::Ui, state: &mut BoardState, two_sided: bool, any_
                 .clicked()
             {
                 state.show_unchanged = !state.show_unchanged;
+            }
+            ui.add_space(12.0);
+        }
+        // Only where a blue row can exist (GROUP SYNC BACK) — never on grooming
+        // or DIFF, which never carry one.
+        if any_resurrection {
+            let label = if state.resurrection_only {
+                "ALL ROWS"
+            } else {
+                "RESURRECTIONS ONLY"
+            };
+            if crate::lcars::toggle_button(ui, label, state.resurrection_only, theme::blue())
+                .clicked()
+            {
+                state.resurrection_only = !state.resurrection_only;
             }
             ui.add_space(12.0);
         }
@@ -1488,6 +1521,26 @@ mod tests {
         assert_eq!(Index::build(&metas, &state).order, vec![0, 2]);
         state.show_unchanged = true;
         assert_eq!(Index::build(&metas, &state).order, vec![0, 1, 2]);
+    }
+
+    /// The resurrection filter isolates the blue rows and nothing else.
+    #[test]
+    fn resurrection_only_isolates_blue_rows() {
+        let mut metas: Vec<RowMeta> = (0..3).map(|i| meta(&format!("r{i}"), 1, 1)).collect();
+        // Row 1 is a resurrection (blue); the others are plain adds (green).
+        metas[1].left_status = Status::Resurrect;
+        let mut state = BoardState::default();
+        assert_eq!(
+            Index::build(&metas, &state).order,
+            vec![0, 1, 2],
+            "all rows show by default"
+        );
+        state.resurrection_only = true;
+        assert_eq!(
+            Index::build(&metas, &state).order,
+            vec![1],
+            "the filter leaves only the resurrection row"
+        );
     }
 
     /// Sorting reads the side the user picked, and reverses on demand. This is
