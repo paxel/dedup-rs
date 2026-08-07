@@ -16,8 +16,9 @@ cargo run -- <subcommand> # CLI, e.g. cargo run -- repo ls
 ```
 
 Building the GUI on Linux needs ALSA headers (`libasound2-dev` on Debian/Ubuntu,
-`alsa-lib-devel` on Fedora) for audio preview. Video fingerprinting uses `ffmpeg`/`ffprobe`
-at runtime and degrades gracefully when they are absent.
+`alsa-lib-devel` on Fedora) for audio preview. Video fingerprinting — and the viewer's video
+filmstrip, frame scrub, soundtrack extraction and pitch-preserving playback rates — use
+`ffmpeg`/`ffprobe` at runtime and degrade gracefully when they are absent.
 
 ## What it does
 
@@ -30,7 +31,14 @@ Clicking any file anywhere — a duplicate card, a review-board row, a Browse li
 conflict — opens the **same full-window viewer**: two files side by side, tabbed by
 representation (image, video, audio as spectrograms with gapless A/B playback, editable ID3
 metadata and the full EXIF listing, text/hex for everything else), with the actions of the
-surface you came from. A wrongly rotated scan can be turned and **saved back to disk** —
+surface you came from. A video shows an **aligned filmstrip** per side — frames sampled
+across each clip, so you see its whole shape — and clicking the strip drops a **shared
+proportional playhead**: both sides decode the frame at the same *relative* moment of their
+own duration (shown enlarged, A@t | B@t), so a trimmed or re-encoded copy stays aligned. A
+clip that carries a soundtrack also offers the **Audio** tab: its track is extracted once to
+a cached WAV and compared exactly like a bare audio file, spectrogram and gapless A/B flicker
+included. The audio transport steps through **pitch-preserving speeds** (0.25×–2×), so a
+slowed track still sounds like the recording you are trying to identify. A wrongly rotated scan can be turned and **saved back to disk** —
 in place or as a copy, keeping the file's date (or stamping it from the EXIF capture date).
 Comparing two files, the **Text tab is a full-file, aligned hex diff**: equal bytes line up
 even when one side has an inserted header, differences are marked (a green gap, an amber

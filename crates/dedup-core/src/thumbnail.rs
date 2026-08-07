@@ -30,6 +30,9 @@ pub enum ThumbError {
 
     #[error("image error: {0}")]
     Image(String),
+
+    #[error("audio error: {0}")]
+    Audio(String),
 }
 
 /// Directory holding the thumbnail cache (`~/.cache/dedup/thumbs`, unless
@@ -171,6 +174,92 @@ pub fn video_frame_rgba(
     load_rgba(&out)
 }
 
+/// Cache path for a media file's extracted audio track (`<hex>.wav`).
+pub fn audio_wav_path(hash_hex: &str) -> PathBuf {
+    cache_dir().join(format!("{hash_hex}.wav"))
+}
+
+/// Cache path for the pitch-preserving rate render of a file's audio
+/// (`<hex>-r<NNN>.wav`, `NNN` = the rate in percent: `050` for 0.5×).
+pub fn rate_wav_path(hash_hex: &str, rate_pct: u32) -> PathBuf {
+    cache_dir().join(format!("{hash_hex}-r{rate_pct:03}.wav"))
+}
+
+/// The ffmpeg `atempo` filter chain for a playback rate. A single `atempo`
+/// stage only covers 0.5–2.0×, so rates below 0.5× chain stages: 0.25× is
+/// `atempo=0.5,atempo=0.5`.
+pub fn atempo_filter(rate: f64) -> String {
+    let mut stages = Vec::new();
+    let mut r = rate;
+    while r < 0.5 {
+        stages.push("atempo=0.5".to_string());
+        r /= 0.5;
+    }
+    stages.push(format!("atempo={r}"));
+    stages.join(",")
+}
+
+/// Decode `source`'s audio track to a WAV at `out` via ffmpeg, optionally
+/// through an audio filter. Writes to a temp sibling first so a failed or
+/// interrupted run never leaves a half-written WAV to be "reused" as cached.
+fn extract_wav(source: &Path, out: &Path, filter: Option<&str>) -> Result<(), ThumbError> {
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = out.with_extension("wav.part");
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.args(["-v", "error", "-y", "-i"]).arg(source).arg("-vn");
+    if let Some(f) = filter {
+        cmd.args(["-filter:a", f]);
+    }
+    cmd.args(["-acodec", "pcm_s16le", "-f", "wav"]).arg(&tmp);
+    let ok = cmd.output().map(|o| o.status.success()).unwrap_or(false);
+    let have = ok
+        && std::fs::metadata(&tmp)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
+    if !have {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ThumbError::Audio("audio extraction failed".into()));
+    }
+    std::fs::rename(&tmp, out)?;
+    Ok(())
+}
+
+/// Ensure the audio track of `source` (typically a video) exists as a cached
+/// WAV keyed by content hash, extracting it with ffmpeg if missing. Idempotent:
+/// an existing file is reused, never re-extracted — mirroring
+/// [`ensure_video_frame`]. Fails cleanly without ffmpeg or without an audio
+/// stream, so the caller can simply not offer a soundtrack view.
+pub fn ensure_video_audio(source: &Path, hash_hex: &str) -> Result<PathBuf, ThumbError> {
+    let out = audio_wav_path(hash_hex);
+    if out.exists() {
+        return Ok(out);
+    }
+    extract_wav(source, &out, None)?;
+    Ok(out)
+}
+
+/// Ensure the pitch-preserving `rate_pct`-percent render of `source`'s audio
+/// exists as a cached WAV (`<hex>-r<NNN>.wav`), rendering it once with ffmpeg's
+/// `atempo` filter. The result plays at 1× in an ordinary player yet sounds
+/// like the original at the chosen rate — slowed without dropping an octave.
+/// `source` may be any audio-decodable file (a bare track, an extracted WAV,
+/// or a video container — the video stream is dropped).
+pub fn ensure_audio_rate(
+    source: &Path,
+    hash_hex: &str,
+    rate_pct: u32,
+) -> Result<PathBuf, ThumbError> {
+    let out = rate_wav_path(hash_hex, rate_pct);
+    if out.exists() {
+        return Ok(out);
+    }
+    let filter = atempo_filter(f64::from(rate_pct) / 100.0);
+    extract_wav(source, &out, Some(&filter))?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +316,19 @@ mod tests {
         let (w, h, _) = load_full_rgba(&big, 512).expect("load big");
         assert_eq!(w, 512);
         assert_eq!(h, 256);
+    }
+
+    /// The `atempo` chain is what keeps a slowed track at its original pitch.
+    /// One stage covers 0.5–2.0×; 0.25× has to chain two 0.5× stages — a single
+    /// `atempo=0.25` would be rejected by ffmpeg.
+    #[test]
+    fn atempo_chains_below_half_speed_and_stays_single_above() {
+        assert_eq!(atempo_filter(0.25), "atempo=0.5,atempo=0.5");
+        assert_eq!(atempo_filter(0.5), "atempo=0.5");
+        assert_eq!(atempo_filter(0.75), "atempo=0.75");
+        assert_eq!(atempo_filter(1.0), "atempo=1");
+        assert_eq!(atempo_filter(1.5), "atempo=1.5");
+        assert_eq!(atempo_filter(2.0), "atempo=2");
     }
 
     #[test]

@@ -3719,18 +3719,12 @@ mod ui_tests {
             .apply(&ctx, &store2, Act::OpenLightbox(0, 0));
         harness.run();
 
-        assert_eq!(
-            harness.state().player.snapshot().speed,
-            1.0,
-            "normal rate to begin with"
-        );
+        harness.get_by_label_contains("SPEED 1×");
         harness.get_by_label_contains("SPEED").click();
         harness.run();
-        assert_eq!(
-            harness.state().player.snapshot().speed,
-            2.0,
-            "the control cycles to the next rate"
-        );
+        // The next stop up from the 1× default. The player itself stays at
+        // normal speed — a non-1× stop plays a pitch-preserving pre-render.
+        harness.get_by_label_contains("SPEED 1.5×");
     }
 
     /// that copies 1 and 3 showed identical tags after editing only one.

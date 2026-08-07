@@ -417,6 +417,30 @@ pub fn media_duration_secs(path: &Path) -> Option<f64> {
     probe_duration_secs(path)
 }
 
+/// Whether a media file carries at least one audio stream (needs `ffprobe`).
+/// `false` when ffprobe is unavailable or the probe fails — callers treat that
+/// as "no soundtrack to offer", the same graceful degradation video
+/// fingerprints have without ffmpeg.
+pub fn has_audio_track(path: &Path) -> bool {
+    let Ok(output) = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()
+    else {
+        return false;
+    };
+    output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+}
+
 fn extract_frame(path: &Path, at_secs: f64) -> Option<image::DynamicImage> {
     let output = Command::new("ffmpeg")
         .args(["-v", "error", "-ss"])

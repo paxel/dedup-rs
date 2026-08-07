@@ -21,6 +21,7 @@ mod media_cell;
 mod player;
 mod repo_chip;
 mod run_result;
+mod scrub;
 mod settings;
 mod status;
 mod textdiff;

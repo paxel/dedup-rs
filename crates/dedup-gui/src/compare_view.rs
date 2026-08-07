@@ -31,6 +31,9 @@ use egui::{
 /// Largest texture edge uploaded for a full-resolution preview.
 const MAX_TEXTURE_EDGE: u32 = 8192;
 
+/// Height of the Video tab's filmstrip row.
+const FILMSTRIP_H: f32 = 72.0;
+
 /// One side of a DIFF comparison: its action identity (`repo` + `rel_path`, which
 /// the resulting [`crate::diff_board::BoardAction`] needs) alongside the
 /// viewer-agnostic [`FileFacts`] used to preview and describe it.
@@ -99,6 +102,98 @@ pub(crate) struct MarkPill {
 struct DiffLoaded {
     left: bool,
     image: Option<ColorImage>,
+}
+
+/// Video-side media arriving from worker threads: filmstrip stills, the
+/// extracted soundtrack (plus its spectrogram), scrubbed frames, and finished
+/// pitch-preserving rate renders.
+enum MediaMsg {
+    /// One decoded filmstrip still.
+    FilmFrame {
+        left: bool,
+        idx: usize,
+        image: ColorImage,
+    },
+    /// The side's probed duration, sent once before its stills.
+    FilmMeta {
+        left: bool,
+        duration_secs: Option<f64>,
+    },
+    /// The side's soundtrack: the cached WAV and its length once extracted
+    /// (`None` = no track / no ffmpeg), plus the spectrogram when it decoded.
+    Soundtrack {
+        left: bool,
+        wav: Option<(std::path::PathBuf, u64)>,
+        spec: Option<ColorImage>,
+    },
+    /// The frame decoded at a playhead position. `fraction` identifies which
+    /// click it answers, so a stale decode never overwrites a newer one.
+    ScrubFrame {
+        left: bool,
+        fraction: f32,
+        image: Option<ColorImage>,
+    },
+    /// An `atempo` rate render finished (or failed) for this cache path.
+    RateWav { path: std::path::PathBuf, ok: bool },
+}
+
+/// Everything the viewer holds for one *video* side: the filmstrip, the
+/// extracted soundtrack, and the playhead-scrubbed frame. Reset whenever the
+/// side is pointed at another file.
+#[derive(Default)]
+struct VideoSideState {
+    /// Filmstrip textures by slot; `None` while that still decodes (or when it
+    /// never will — no ffmpeg — which draws as a placeholder slot).
+    film: Vec<Option<TextureHandle>>,
+    /// The clip's probed duration, for the playhead's fraction→timestamp map.
+    duration_secs: Option<f64>,
+    /// Soundtrack: `None` = still probing; `Some(None)` = no track (or no
+    /// ffmpeg); `Some(Some((wav, ms)))` = extracted and ready to play.
+    audio: Option<Option<(std::path::PathBuf, u64)>>,
+    /// Spectrogram of the extracted soundtrack — the Audio tab's texture.
+    spec_tex: Option<TextureHandle>,
+    /// The soundtrack worker has reported (successfully or not).
+    spec_settled: bool,
+    /// The decoded frame at the current playhead, if any.
+    scrub_tex: Option<TextureHandle>,
+    /// The playhead fraction `scrub_tex` (or the decode in flight) answers.
+    scrub_frac: Option<f32>,
+    /// The scrub decode has reported (successfully or not).
+    scrub_settled: bool,
+}
+
+/// A transport action deferred until its audio sources finish rendering (a
+/// video soundtrack still extracting, an `atempo` rate render in flight).
+/// Positions travel as a fraction so re-anchoring works across rate changes,
+/// where the rendered runtimes differ.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PendingPlay {
+    Pair {
+        audible_b: bool,
+        fraction: f32,
+        paused: bool,
+    },
+    Single {
+        left: bool,
+        fraction: f32,
+        paused: bool,
+    },
+}
+
+/// What the transport can play for one side right now, at the chosen rate.
+#[derive(Clone, Debug, PartialEq)]
+enum AudioSrc {
+    /// A playable file: the track itself, a video's extracted soundtrack, or
+    /// the pitch-preserving rate render of either.
+    Ready {
+        hex: String,
+        path: std::path::PathBuf,
+        total_ms: u64,
+    },
+    /// Still extracting or rendering — playable soon.
+    Rendering,
+    /// This side has no sound to play.
+    None,
 }
 
 /// The open ID3 tag editor: which file is being edited (by content hash), the
@@ -247,11 +342,37 @@ pub(crate) struct DiffCompare {
     /// a note (progress / outcome) shown on the Archive tab.
     recover_rx: Option<crossbeam_channel::Receiver<Option<String>>>,
     recover_note: Option<String>,
+    /// Per-side video media (filmstrip, soundtrack, scrubbed frame) and the
+    /// channel its workers report on.
+    video: [VideoSideState; 2],
+    media_tx: Sender<MediaMsg>,
+    media_rx: Receiver<MediaMsg>,
+    /// The shared proportional playhead across both filmstrips — a fraction of
+    /// each side's *own* duration, so unequal clips stay aligned at the same
+    /// relative moment.
+    playhead: Option<f32>,
+    /// The filmstrip slot rects laid out this frame, per side — the Video
+    /// tab's testable geometry.
+    film_rects: [Vec<Rect>; 2],
+    /// The transport's play-rate stop (1× default). Non-1× plays the cached
+    /// pitch-preserving `atempo` renders at 1×, never rodio's pitch-shifting
+    /// `set_speed`.
+    rate: f32,
+    /// The rate the currently loaded playback was started at — part of the
+    /// pair's identity, since the same hexes at another rate are other files.
+    loaded_rate: f32,
+    /// Rate renders confirmed on disk / in flight, so the per-frame source
+    /// resolution neither re-stats nor re-spawns.
+    rate_ready: std::collections::HashSet<std::path::PathBuf>,
+    rate_pending: std::collections::HashSet<std::path::PathBuf>,
+    /// A transport action waiting for its sources to finish rendering.
+    pending_play: Option<PendingPlay>,
 }
 
 impl DiffCompare {
     pub fn new(left: DiffSide, right: DiffSide) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
+        let (media_tx, media_rx) = crossbeam_channel::unbounded();
         let compare = CompareState::new(right.facts.clone());
         Self {
             left,
@@ -300,6 +421,16 @@ impl DiffCompare {
             unlock_failed: false,
             recover_rx: None,
             recover_note: None,
+            video: [VideoSideState::default(), VideoSideState::default()],
+            media_tx,
+            media_rx,
+            playhead: None,
+            film_rects: [Vec::new(), Vec::new()],
+            rate: 1.0,
+            loaded_rate: 1.0,
+            rate_ready: std::collections::HashSet::new(),
+            rate_pending: std::collections::HashSet::new(),
+            pending_play: None,
         }
     }
 
@@ -477,15 +608,42 @@ impl DiffCompare {
     /// Marks belong to the caller; the only write a side can carry is its ID3
     /// tags, and only when its repository is writable.
     pub fn reps(&self) -> (FileRepresentations, FileRepresentations) {
-        let make = |side: &DiffSide| {
-            FileRepresentations::from_facts(
+        let make = |side: &DiffSide, vid: &VideoSideState| {
+            let mut reps = FileRepresentations::from_facts(
                 &side.facts,
                 side.repo.clone(),
                 side.read_only,
                 crate::lightbox::MarkState::Protected,
-            )
+            );
+            if side.facts.is_video() {
+                // The clip's extracted soundtrack: the Audio representation
+                // appears exactly when a track is present (probed off-thread;
+                // no ffmpeg / silent clip → never offered).
+                if let Some(Some((_, ms))) = &vid.audio {
+                    reps.audio = Some(crate::lightbox::AudioRepresentation {
+                        duration_ms: u32::try_from(*ms).ok(),
+                        spectrogram_texture: vid.spec_tex.clone(),
+                        is_playing: false,
+                        seek_position_ms: 0,
+                        can_play: true,
+                    });
+                }
+                if let Some(v) = reps.video.as_mut() {
+                    v.filmstrip_textures = vid.film.iter().flatten().cloned().collect();
+                    v.selected_frame = self
+                        .playhead
+                        .map(|f| crate::scrub::filmstrip_slot(f, crate::scrub::FILMSTRIP_FRAMES));
+                    if let Some(d) = vid.duration_secs {
+                        v.duration_ms = Some((d * 1000.0) as u32);
+                    }
+                }
+            }
+            reps
         };
-        (make(&self.left), make(&self.right))
+        (
+            make(&self.left, &self.video[0]),
+            make(&self.right, &self.video[1]),
+        )
     }
 
     /// Open the ID3 editor on one side: its stored tags as the working copy,
@@ -806,13 +964,40 @@ impl DiffCompare {
     /// texture. This is what keeps a failed decode from spinning "decoding…"
     /// forever (the distinction the old two-pane `settled[]` flags carried).
     fn slot_state(&self, slot: usize) -> SlotState {
-        if self.tex[slot].is_some() {
+        if self.tab_tex(slot).is_some() {
             SlotState::Image
-        } else if self.settled[slot] {
+        } else if self.tab_settled(slot) {
             SlotState::NoPreview
         } else {
             SlotState::Decoding
         }
+    }
+
+    /// The texture behind `slot` on the *current tab*. The Audio tab of a
+    /// video side compares the soundtrack's spectrogram; every other case uses
+    /// the side's primary texture (image, audio-file spectrogram).
+    fn tab_tex(&self, slot: usize) -> Option<&TextureHandle> {
+        if self.spec_mode(slot) {
+            self.video[slot].spec_tex.as_ref()
+        } else {
+            self.tex[slot].as_ref()
+        }
+    }
+
+    /// Whether `slot`'s decode for the current tab has come back (successfully
+    /// or not) — the tab-aware counterpart of `settled`.
+    fn tab_settled(&self, slot: usize) -> bool {
+        if self.spec_mode(slot) {
+            self.video[slot].spec_settled
+        } else {
+            self.settled[slot]
+        }
+    }
+
+    /// This slot shows a video's extracted-soundtrack spectrogram right now.
+    fn spec_mode(&self, slot: usize) -> bool {
+        let side = if slot == 0 { &self.left } else { &self.right };
+        self.tab == RepresentationKind::Audio && side.facts.is_video()
     }
 
     /// A/B compare (zoom / pan / flicker) is available only once *both* sides
@@ -841,6 +1026,14 @@ impl DiffCompare {
     fn spawn_decode(&mut self, ctx: &Context, slot: usize) {
         let is_left = slot == 0;
         let side = if is_left { &self.left } else { &self.right };
+        if side.facts.is_video() {
+            // A video has no single primary still any more — the Video tab
+            // draws the filmstrip, the Audio tab the extracted soundtrack's
+            // spectrogram, each produced by its own workers.
+            self.settled[slot] = true;
+            self.spawn_video_side(ctx, slot);
+            return;
+        }
         if !side.previewable() {
             self.settled[slot] = true;
             return;
@@ -848,8 +1041,6 @@ impl DiffCompare {
         let tx = self.tx.clone();
         let ctx = ctx.clone();
         let path = side.facts.abs_path.clone();
-        let hex = side.facts.hash_hex.clone();
-        let video = side.facts.is_video();
         let audio = side.facts.is_audio();
         std::thread::spawn(move || {
             // Audio has no frame to show, so it is compared as a spectrogram
@@ -858,15 +1049,11 @@ impl DiffCompare {
             let image = if audio {
                 crate::waveform::spec_rgba(&path)
             } else {
-                let decoded = if video {
-                    // One still is enough to tell two clips apart at a glance.
-                    dedup_core::thumbnail::video_frame_rgba(&path, &hex, 0, 1).ok()
-                } else {
-                    dedup_core::thumbnail::load_full_rgba(&path, MAX_TEXTURE_EDGE).ok()
-                };
-                decoded.map(|(w, h, rgba)| {
-                    ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba)
-                })
+                dedup_core::thumbnail::load_full_rgba(&path, MAX_TEXTURE_EDGE)
+                    .ok()
+                    .map(|(w, h, rgba)| {
+                        ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba)
+                    })
             };
             // Only a successful decode has something new to show, so only
             // that wakes the UI; waking on failure would spin repaints for
@@ -880,6 +1067,261 @@ impl DiffCompare {
                 ctx.request_repaint();
             }
         });
+    }
+
+    /// Start a video side's workers: the filmstrip stills (sent one by one, so
+    /// the strip fills in as they decode) and the soundtrack probe → extract →
+    /// spectrogram chain. Both degrade to nothing without ffmpeg — placeholder
+    /// slots, no Audio tab — never an error.
+    fn spawn_video_side(&mut self, ctx: &Context, slot: usize) {
+        let is_left = slot == 0;
+        let side = if is_left { &self.left } else { &self.right };
+        let n = crate::scrub::FILMSTRIP_FRAMES;
+        self.video[slot] = VideoSideState {
+            film: vec![None; n],
+            ..VideoSideState::default()
+        };
+
+        let tx = self.media_tx.clone();
+        let ctx2 = ctx.clone();
+        let path = side.facts.abs_path.clone();
+        let hex = side.facts.hash_hex.clone();
+        std::thread::spawn(move || {
+            let duration_secs = dedup_core::fingerprint::media_duration_secs(&path);
+            let _ = tx.send(MediaMsg::FilmMeta {
+                left: is_left,
+                duration_secs,
+            });
+            for idx in 0..n {
+                if let Ok((w, h, rgba)) =
+                    dedup_core::thumbnail::video_frame_rgba(&path, &hex, idx, n)
+                {
+                    let image = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+                    let _ = tx.send(MediaMsg::FilmFrame {
+                        left: is_left,
+                        idx,
+                        image,
+                    });
+                    ctx2.request_repaint();
+                }
+            }
+            ctx2.request_repaint();
+        });
+
+        let tx = self.media_tx.clone();
+        let ctx2 = ctx.clone();
+        let path = side.facts.abs_path.clone();
+        let hex = side.facts.hash_hex.clone();
+        std::thread::spawn(move || {
+            let wav = dedup_core::fingerprint::has_audio_track(&path)
+                .then(|| dedup_core::thumbnail::ensure_video_audio(&path, &hex).ok())
+                .flatten();
+            let msg = match wav {
+                Some(wav) => {
+                    let ms = dedup_core::fingerprint::media_duration_secs(&wav)
+                        .map(|s| (s * 1000.0) as u64)
+                        .unwrap_or(0);
+                    let spec = crate::waveform::spec_rgba(&wav);
+                    MediaMsg::Soundtrack {
+                        left: is_left,
+                        wav: Some((wav, ms)),
+                        spec,
+                    }
+                }
+                None => MediaMsg::Soundtrack {
+                    left: is_left,
+                    wav: None,
+                    spec: None,
+                },
+            };
+            let _ = tx.send(msg);
+            ctx2.request_repaint();
+        });
+
+        // A playhead already dropped keeps pointing at the same relative
+        // moment of whatever file the side now shows.
+        if let Some(f) = self.playhead {
+            self.spawn_scrub(ctx, slot, f);
+        }
+    }
+
+    /// Decode the frame at playhead `fraction` of this side's own timeline,
+    /// off the UI thread (the `spawn_decode` pattern). The result is shown
+    /// enlarged as one half of `A@t | B@t`.
+    fn spawn_scrub(&mut self, ctx: &Context, slot: usize, fraction: f32) {
+        let is_left = slot == 0;
+        let side = if is_left { &self.left } else { &self.right };
+        if !side.facts.is_video() {
+            return;
+        }
+        let st = &mut self.video[slot];
+        st.scrub_frac = Some(fraction);
+        st.scrub_tex = None;
+        st.scrub_settled = false;
+        let known_duration = st.duration_secs;
+        let tx = self.media_tx.clone();
+        let ctx2 = ctx.clone();
+        let path = side.facts.abs_path.clone();
+        std::thread::spawn(move || {
+            let duration =
+                known_duration.or_else(|| dedup_core::fingerprint::media_duration_secs(&path));
+            let image = duration
+                .and_then(|d| {
+                    let at = crate::scrub::scrub_timestamp_secs(fraction, d);
+                    dedup_core::fingerprint::video_frame(&path, at)
+                })
+                .map(|img| {
+                    let rgba = img.to_rgba8();
+                    ColorImage::from_rgba_unmultiplied(
+                        [rgba.width() as usize, rgba.height() as usize],
+                        rgba.as_raw(),
+                    )
+                });
+            let _ = tx.send(MediaMsg::ScrubFrame {
+                left: is_left,
+                fraction,
+                image,
+            });
+            ctx2.request_repaint();
+        });
+    }
+
+    /// One side of the Video tab: the filmstrip across the top of `pane`, the
+    /// shared playhead marker over it, and the enlarged frame at the playhead
+    /// below. Returns the fraction clicked this frame, if any. A side that is
+    /// no video (a mixed pair) keeps its "no preview" note instead.
+    fn draw_video_side(
+        &mut self,
+        ui: &mut egui::Ui,
+        pane: Rect,
+        slot: usize,
+        verbosity: TooltipVerbosity,
+    ) -> Option<f32> {
+        let side = if slot == 0 { &self.left } else { &self.right };
+        if !side.facts.is_video() {
+            self.film_rects[slot].clear();
+            ui.painter().text(
+                pane.center(),
+                Align2::CENTER_CENTER,
+                side.placeholder(),
+                FontId::proportional(14.0),
+                theme::tan(),
+            );
+            return None;
+        }
+        let n = crate::scrub::FILMSTRIP_FRAMES;
+        let strip = Rect::from_min_size(pane.min, egui::vec2(pane.width(), FILMSTRIP_H));
+        let slot_w = strip.width() / n as f32;
+        let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        let mut rects = Vec::with_capacity(n);
+        for idx in 0..n {
+            let r = Rect::from_min_size(
+                egui::pos2(strip.min.x + idx as f32 * slot_w, strip.min.y),
+                egui::vec2(slot_w, FILMSTRIP_H),
+            )
+            .shrink(1.0);
+            rects.push(r);
+            match self.video[slot].film.get(idx).and_then(Option::as_ref) {
+                Some(tex) => {
+                    let fitted = crate::lightbox::fit_rect(r, tex.size_vec2());
+                    ui.painter_at(r)
+                        .image(tex.id(), fitted, uv, egui::Color32::WHITE);
+                }
+                None => {
+                    // Still decoding — or never will (no ffmpeg): a quiet
+                    // placeholder slot, not an error.
+                    ui.painter().rect_filled(r, 2.0, theme::panel());
+                }
+            }
+        }
+        self.film_rects[slot] = rects;
+        // The shared playhead: one fraction, each side's own timeline.
+        if let Some(f) = self.playhead {
+            let x = strip.min.x + f.clamp(0.0, 1.0) * strip.width();
+            ui.painter().line_segment(
+                [egui::pos2(x, strip.min.y), egui::pos2(x, strip.max.y)],
+                egui::Stroke::new(2.0, theme::amber()),
+            );
+        }
+        let resp = ui
+            .interact(
+                strip,
+                ui.id().with(("video-filmstrip", slot)),
+                egui::Sense::click(),
+            )
+            .explain(
+                verbosity,
+                "Inspect a moment",
+                "Click a spot on the filmstrip to see the frame at that moment of both \
+                 clips, enlarged below. The spot is a fraction of each clip's own length, \
+                 so copies of different length stay aligned.",
+            );
+        let clicked = resp
+            .clicked()
+            .then(|| resp.interact_pointer_pos())
+            .flatten()
+            .map(|p| ((p.x - strip.min.x) / strip.width()).clamp(0.0, 1.0));
+
+        // The enlarged frame at the playhead, in the space below the strip.
+        let below = Rect::from_min_max(egui::pos2(pane.min.x, strip.max.y + 6.0), pane.max);
+        if below.height() < 20.0 {
+            return clicked;
+        }
+        match self.playhead {
+            None => {
+                ui.painter().text(
+                    below.center(),
+                    Align2::CENTER_CENTER,
+                    "Click the filmstrip to inspect a moment",
+                    FontId::proportional(13.0),
+                    theme::hairline(),
+                );
+            }
+            Some(f) => {
+                let st = &self.video[slot];
+                match (&st.scrub_tex, st.scrub_settled) {
+                    (Some(tex), _) => {
+                        let fitted = crate::lightbox::fit_rect(below, tex.size_vec2());
+                        draw_in_pane(ui, below, fitted, &Some(tex.clone()));
+                    }
+                    (None, false) => {
+                        ui.painter().text(
+                            below.center(),
+                            Align2::CENTER_CENTER,
+                            "decoding…",
+                            FontId::proportional(14.0),
+                            theme::tan(),
+                        );
+                    }
+                    (None, true) => {
+                        ui.painter().text(
+                            below.center(),
+                            Align2::CENTER_CENTER,
+                            "No frame could be read at this moment",
+                            FontId::proportional(13.0),
+                            theme::tan(),
+                        );
+                    }
+                }
+                // `A @ 1:00` — the moment in this clip's own timeline.
+                let tag = if slot == 0 { "A" } else { "B" };
+                let label = match self.video[slot].duration_secs {
+                    Some(d) => format!(
+                        "{tag} @ {}",
+                        crate::scrub::format_secs(crate::scrub::scrub_timestamp_secs(f, d))
+                    ),
+                    None => tag.to_string(),
+                };
+                ui.painter().text(
+                    below.min + egui::vec2(6.0, 6.0),
+                    Align2::LEFT_TOP,
+                    label,
+                    FontId::proportional(16.0),
+                    theme::amber(),
+                );
+            }
+        }
+        clicked
     }
 
     /// Forget everything cached about one side — its texture, decoded pixels,
@@ -901,6 +1343,10 @@ impl DiffCompare {
         self.hex_head[slot] = None;
         self.tags[slot] = None;
         self.exif_all[slot] = None;
+        // The video media behind this side is stale too; a deferred transport
+        // action would play the file this side no longer shows.
+        self.video[slot] = VideoSideState::default();
+        self.pending_play = None;
         // The Archive tab lists the *left* side's members; a changed left side
         // invalidates that list and its extraction status.
         if slot == 0 {
@@ -1084,6 +1530,67 @@ impl DiffCompare {
                 self.upload(ctx, slot);
             }
         }
+        while let Ok(msg) = self.media_rx.try_recv() {
+            match msg {
+                MediaMsg::FilmFrame { left, idx, image } => {
+                    let slot = usize::from(!left);
+                    let tex = ctx.load_texture(
+                        format!("diff-film-{slot}-{idx}"),
+                        image,
+                        TextureOptions::LINEAR,
+                    );
+                    if let Some(f) = self.video[slot].film.get_mut(idx) {
+                        *f = Some(tex);
+                    }
+                }
+                MediaMsg::FilmMeta {
+                    left,
+                    duration_secs,
+                } => {
+                    self.video[usize::from(!left)].duration_secs = duration_secs;
+                }
+                MediaMsg::Soundtrack { left, wav, spec } => {
+                    let slot = usize::from(!left);
+                    let st = &mut self.video[slot];
+                    st.audio = Some(wav);
+                    st.spec_tex = spec.map(|image| {
+                        ctx.load_texture(format!("diff-spec-{slot}"), image, TextureOptions::LINEAR)
+                    });
+                    st.spec_settled = true;
+                }
+                MediaMsg::ScrubFrame {
+                    left,
+                    fraction,
+                    image,
+                } => {
+                    let slot = usize::from(!left);
+                    let st = &mut self.video[slot];
+                    // A decode for an older playhead position must not
+                    // overwrite the one answering the current click.
+                    if st.scrub_frac == Some(fraction) {
+                        st.scrub_tex = image.map(|image| {
+                            ctx.load_texture(
+                                format!("diff-scrub-{slot}"),
+                                image,
+                                TextureOptions::LINEAR,
+                            )
+                        });
+                        st.scrub_settled = true;
+                    }
+                }
+                MediaMsg::RateWav { path, ok } => {
+                    self.rate_pending.remove(&path);
+                    if ok {
+                        self.rate_ready.insert(path);
+                    } else {
+                        // The render failed (realistically: no ffmpeg). Snap
+                        // back to 1× so the transport's label and its sound
+                        // agree, and let whatever waited play at normal speed.
+                        self.rate = 1.0;
+                    }
+                }
+            }
+        }
     }
 
     /// Re-apply a side's orientation to its decoded pixels and upload the result.
@@ -1126,7 +1633,16 @@ impl DiffCompare {
     /// The size comes from the indexed image dimensions, else the decoded texture
     /// (video stills carry no stored dimensions), else a 1×1 fallback while pending.
     fn sized(&self, slot: usize) -> (Option<TextureHandle>, Vec2) {
-        let tex = self.tex[slot].clone();
+        let tex = self.tab_tex(slot).cloned();
+        // A video's soundtrack spectrogram has nothing to do with the clip's
+        // pixel dimensions — its own texture size is its layout.
+        if self.spec_mode(slot) {
+            let img = tex
+                .as_ref()
+                .map(|t| t.size_vec2())
+                .unwrap_or(egui::vec2(1.0, 1.0));
+            return (tex, img);
+        }
         let facts = if slot == 0 {
             &self.left.facts
         } else {
@@ -1141,6 +1657,66 @@ impl DiffCompare {
             .or_else(|| tex.as_ref().map(|t| t.size_vec2()))
             .unwrap_or(egui::vec2(1.0, 1.0));
         (tex, img)
+    }
+
+    /// Whether one side has (or is still resolving) a soundtrack the transport
+    /// could play: an audio file, or a video whose track probe hasn't said no.
+    fn side_has_sound(&self, slot: usize) -> bool {
+        let side = if slot == 0 { &self.left } else { &self.right };
+        side.facts.is_audio()
+            || (side.facts.is_video() && !matches!(self.video[slot].audio, Some(None)))
+    }
+
+    /// Resolve what the transport plays for one side at the current rate stop:
+    /// the file itself (audio), its extracted soundtrack (video), or the
+    /// pitch-preserving `atempo` pre-render of either when the rate isn't 1×.
+    /// A missing rate render is kicked off here, once, off the UI thread.
+    fn audio_src(&mut self, ctx: &Context, slot: usize) -> AudioSrc {
+        let side = if slot == 0 { &self.left } else { &self.right };
+        let hex = side.facts.hash_hex.clone();
+        let (path, total_ms) = if side.facts.is_audio() {
+            (
+                side.facts.abs_path.clone(),
+                u64::from(side.facts.audio_ms.unwrap_or(0)),
+            )
+        } else if side.facts.is_video() {
+            match &self.video[slot].audio {
+                Some(Some((wav, ms))) => (wav.clone(), *ms),
+                Some(None) => return AudioSrc::None,
+                None => return AudioSrc::Rendering,
+            }
+        } else {
+            return AudioSrc::None;
+        };
+        if (self.rate - 1.0).abs() < 0.01 {
+            return AudioSrc::Ready {
+                hex,
+                path,
+                total_ms,
+            };
+        }
+        let pct = (self.rate * 100.0).round() as u32;
+        let out = dedup_core::thumbnail::rate_wav_path(&hex, pct);
+        let total_ms = crate::scrub::rated_total_ms(total_ms, self.rate);
+        if self.rate_ready.contains(&out) || out.exists() {
+            self.rate_ready.insert(out.clone());
+            return AudioSrc::Ready {
+                hex,
+                path: out,
+                total_ms,
+            };
+        }
+        if !self.rate_pending.contains(&out) {
+            self.rate_pending.insert(out.clone());
+            let tx = self.media_tx.clone();
+            let ctx2 = ctx.clone();
+            std::thread::spawn(move || {
+                let ok = dedup_core::thumbnail::ensure_audio_rate(&path, &hex, pct).is_ok();
+                let _ = tx.send(MediaMsg::RateWav { path: out, ok });
+                ctx2.request_repaint();
+            });
+        }
+        AudioSrc::Rendering
     }
 
     /// Draw the comparison over the whole window. Returns the user's decision, or
@@ -1283,13 +1859,10 @@ impl DiffCompare {
                         | RepresentationKind::Audio
                         | RepresentationKind::Video
                 );
-                let speed_label = player
-                    .map(|p| {
-                        let r = p.snapshot().speed;
-                        let s = format!("{r:.1}");
-                        s.trim_end_matches('0').trim_end_matches('.').to_string()
-                    })
-                    .unwrap_or_else(|| "1".to_string());
+                let speed_label = {
+                    let s = format!("{:.2}", self.rate);
+                    s.trim_end_matches('0').trim_end_matches('.').to_string()
+                };
 
                 // Title + CLOSE.
                 let top =
@@ -1359,26 +1932,26 @@ impl DiffCompare {
                 // one — an mp3's is Audio, not the Metadata tab that happens to
                 // sort first.
                 let native = || {
-                    offered
-                        .iter()
-                        .copied()
-                        .find(|k| {
-                            matches!(
-                                k,
-                                RepresentationKind::Archive
-                                    | RepresentationKind::Image
-                                    | RepresentationKind::Audio
-                                    | RepresentationKind::Video
-                            )
-                        })
-                        .or_else(|| {
-                            offered
-                                .iter()
-                                .copied()
-                                .find(|k| *k != RepresentationKind::Overview)
-                        })
-                        .or_else(|| offered.first().copied())
-                        .unwrap_or(RepresentationKind::Image)
+                    // Preference order, not enum order: a video's own
+                    // representation is Video — its soundtrack tab sits
+                    // *beside* it, and Audio would otherwise sort first and
+                    // land a clip on its soundtrack.
+                    [
+                        RepresentationKind::Archive,
+                        RepresentationKind::Image,
+                        RepresentationKind::Video,
+                        RepresentationKind::Audio,
+                    ]
+                    .into_iter()
+                    .find(|k| offered.contains(k))
+                    .or_else(|| {
+                        offered
+                            .iter()
+                            .copied()
+                            .find(|k| *k != RepresentationKind::Overview)
+                    })
+                    .or_else(|| offered.first().copied())
+                    .unwrap_or(RepresentationKind::Image)
                 };
                 if self.tab == RepresentationKind::Overview || !offered.contains(&self.tab) {
                     self.tab = native();
@@ -1974,6 +2547,40 @@ impl DiffCompare {
                                 });
                         }
                     }
+                } else if self.tab == RepresentationKind::Video {
+                    // The Video representation: an aligned filmstrip per side
+                    // — each clip's whole shape at a glance — with a shared
+                    // proportional playhead dropped by clicking, enlarged as
+                    // A@t | B@t below. Below the per-side action strip (which
+                    // extends past the titles into the viewport top), like the
+                    // other tabs with their own controls.
+                    let has_switcher = self.can_step_left() || self.can_step_right();
+                    let clearance = if has_switcher { 58.0 } else { 30.0 };
+                    let viewport = Rect::from_min_max(
+                        egui::pos2(viewport.min.x, viewport.min.y + clearance),
+                        viewport.max,
+                    );
+                    let mut clicked: Option<f32> = None;
+                    if two_sided_now {
+                        let (left_pane, right_pane) = compare_split(viewport);
+                        for (slot, pane) in [(0usize, left_pane), (1usize, right_pane)] {
+                            if let Some(f) = self.draw_video_side(ui, pane, slot, verbosity) {
+                                clicked = Some(f);
+                            }
+                        }
+                    } else {
+                        if let Some(f) = self.draw_video_side(ui, viewport, 0, verbosity) {
+                            clicked = Some(f);
+                        }
+                        self.film_rects[1].clear();
+                    }
+                    if let Some(f) = clicked {
+                        self.playhead = Some(f);
+                        self.spawn_scrub(ctx, 0, f);
+                        if two_sided_now {
+                            self.spawn_scrub(ctx, 1, f);
+                        }
+                    }
                 } else if !two_sided_now {
                     // One file, the whole viewport — the hidden side must not
                     // paint a second copy of the same picture.
@@ -2220,8 +2827,19 @@ impl DiffCompare {
                                     // and the tab it belongs to also drives
                                     // the cards behind.
                                     if tab_is_audio && player.is_some() {
+                                        let slot = usize::from(!is_left);
+                                        let has_sound = self.side_has_sound(slot);
                                         ui.horizontal(|ui| {
-                                            if ui.button(format!("PLAY {label}")).clicked() {
+                                            if ui
+                                                .add_enabled(
+                                                    has_sound,
+                                                    egui::Button::new(format!("PLAY {label}")),
+                                                )
+                                                .on_disabled_hover_text(
+                                                    "This clip has no audio track.",
+                                                )
+                                                .clicked()
+                                            {
                                                 play = Some(is_left);
                                             }
                                             if ui.button("PAUSE").clicked() {
@@ -2229,9 +2847,24 @@ impl DiffCompare {
                                             }
                                             if ui
                                                 .button(format!("SPEED {}×", speed_label))
+                                                .explain(
+                                                    verbosity,
+                                                    "Change the playback speed",
+                                                    "Step through the playback speeds \
+                                                     (0.25× – 2×). The pitch is preserved, \
+                                                     so a slowed track still sounds like \
+                                                     itself.",
+                                                )
                                                 .clicked()
                                             {
                                                 cycle_speed = true;
+                                            }
+                                            if self.pending_play.is_some() {
+                                                ui.label(
+                                                    RichText::new("Preparing audio…")
+                                                        .color(theme::lilac())
+                                                        .size(11.0),
+                                                );
                                             }
                                         });
                                     }
@@ -2510,14 +3143,14 @@ impl DiffCompare {
             }
         }
 
-        // Arrow keys: on a two-sided audio pair they flip which copy is audible
-        // (below, gap-free on the loaded pair — re-pointing a side instead would
-        // force a reloading pause, the bug the user originally hit); with the
-        // second side hidden they step the shown file through the pool.
-        let audio_pair =
-            self.two_sided() && self.left.facts.is_audio() && self.right.facts.is_audio();
-        let flip = (arrow_l || arrow_r) && audio_pair;
-        if (arrow_l || arrow_r) && !audio_pair && !self.two_sided() && step.is_none() {
+        // Arrow keys: on a two-sided pair with sound on both sides (bare audio
+        // or a video's soundtrack) they flip which copy is audible (below,
+        // gap-free on the loaded pair — re-pointing a side instead would force
+        // a reloading pause, the bug the user originally hit); with the second
+        // side hidden they step the shown file through the pool.
+        let sound_pair = self.two_sided() && self.side_has_sound(0) && self.side_has_sound(1);
+        let flip = (arrow_l || arrow_r) && sound_pair;
+        if (arrow_l || arrow_r) && !sound_pair && !self.two_sided() && step.is_none() {
             step = Some((true, if arrow_r { 1 } else { -1 }));
         }
 
@@ -2546,137 +3179,226 @@ impl DiffCompare {
 
         // The audio transport, driven strictly through the caller's player —
         // one audio device, owned by the caller whose surface sits behind this
-        // viewer. `snap` is the transport as this frame found it.
+        // viewer. `snap` is the transport as this frame found it. Each side's
+        // source is resolved at the chosen rate stop — the file itself, a
+        // video's extracted soundtrack, or their pitch-preserving `atempo`
+        // renders — and an action whose source is still rendering waits as
+        // `pending_play`, firing the moment it is ready.
         if let Some(p) = player {
             let snap = p.snapshot();
-            let total = u64::from(self.left.facts.audio_ms.unwrap_or(0));
-            let offset = snap.pos_ms.min(total);
-            // Whether the player already holds exactly this (A, B) pair — then
-            // a swap is an instant, gap-free volume flip rather than a reload.
+            // Where playback stands, as a fraction — positions travel as
+            // fractions across rate changes, where the runtimes differ.
+            let frac = if snap.total_ms > 0 {
+                (snap.pos_ms as f32 / snap.total_ms as f32).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            // Whether the player already holds exactly this (A, B) pair *at
+            // the current rate* — then a swap is an instant, gap-free volume
+            // flip rather than a reload. The same hexes at another rate are
+            // other files, hence the rate in the identity.
             let pair_loaded = snap.paired
+                && (self.loaded_rate - self.rate).abs() < 0.01
                 && snap.hex_a.as_deref() == Some(self.left.facts.hash_hex.as_str())
                 && snap.hex_b.as_deref() == Some(self.right.facts.hash_hex.as_str());
-            let (l_hex, l_path) = (
-                self.left.facts.hash_hex.clone(),
-                self.left.facts.abs_path.clone(),
-            );
-            let (r_hex, r_path) = (
-                self.right.facts.hash_hex.clone(),
-                self.right.facts.abs_path.clone(),
-            );
-            // Load both copies into a synced pair, `want_b` audible.
-            let start_pair =
-                |want_b: bool| p.play_pair(&l_hex, &l_path, &r_hex, &r_path, total, offset, want_b);
-            // Anything that already (re)starts playback this frame makes the
-            // keep-pair maintenance below redundant.
-            let mut busy = false;
 
-            // PLAY A / PLAY B: on an audio pair both copies load in sync with
-            // the asked-for side audible, so a later flip is gap-free.
+            // PLAY A / PLAY B: on a pair with sound both copies load in sync
+            // with the asked-for side audible, so a later flip is gap-free.
             if let Some(is_left) = play {
-                busy = true;
-                if audio_pair {
-                    start_pair(!is_left);
+                self.pending_play = Some(if sound_pair {
+                    PendingPlay::Pair {
+                        audible_b: !is_left,
+                        fraction: frac,
+                        paused: false,
+                    }
                 } else {
-                    let side = if is_left { &self.left } else { &self.right };
-                    p.play(
-                        &side.facts.hash_hex,
-                        &side.facts.abs_path,
-                        u64::from(side.facts.audio_ms.unwrap_or(0)),
-                        0,
-                    );
-                }
-                self.audio_active = Some(usize::from(!is_left));
+                    PendingPlay::Single {
+                        left: is_left,
+                        fraction: 0.0,
+                        paused: false,
+                    }
+                });
             }
             if pause {
-                busy = true;
                 p.toggle_pause();
             }
             // P: pause/resume what is loaded, else start playing — the pair
             // when comparing, the shown file alone otherwise.
             if key_p {
-                busy = true;
                 if snap.loaded {
                     p.toggle_pause();
-                } else if audio_pair {
-                    start_pair(false);
-                    self.audio_active = Some(0);
-                } else if self.left.facts.is_audio() {
-                    p.play(&l_hex, &l_path, total, offset);
-                    self.audio_active = Some(0);
+                } else if sound_pair {
+                    self.pending_play = Some(PendingPlay::Pair {
+                        audible_b: false,
+                        fraction: frac,
+                        paused: false,
+                    });
+                } else if self.side_has_sound(0) {
+                    self.pending_play = Some(PendingPlay::Single {
+                        left: true,
+                        fraction: frac,
+                        paused: false,
+                    });
+                }
+            }
+            // SPEED: step to the next stop. Whatever is loaded re-anchors at
+            // the same fraction once the pitch-preserving render is ready —
+            // in a pair both sides render at the chosen rate, staying aligned.
+            if cycle_speed {
+                self.rate = crate::scrub::next_rate(self.rate);
+                if snap.loaded {
+                    self.pending_play = Some(if snap.paired {
+                        PendingPlay::Pair {
+                            audible_b: self.audio_active == Some(1),
+                            fraction: frac,
+                            paused: !snap.playing,
+                        }
+                    } else {
+                        PendingPlay::Single {
+                            left: self.audio_active != Some(1),
+                            fraction: frac,
+                            paused: !snap.playing,
+                        }
+                    });
                 }
             }
             // Arrows on the pair: flip the audible copy, gap-free.
             if flip && snap.loaded {
-                busy = true;
                 let want_b = self.audio_active != Some(1);
                 if pair_loaded {
                     let target = if want_b {
-                        r_hex.as_str()
+                        self.right.facts.hash_hex.as_str()
                     } else {
-                        l_hex.as_str()
+                        self.left.facts.hash_hex.as_str()
                     };
                     if snap.hex.as_deref() != Some(target) {
                         p.flip();
                     }
+                    self.audio_active = Some(usize::from(want_b));
                 } else {
-                    start_pair(want_b);
+                    self.pending_play = Some(PendingPlay::Pair {
+                        audible_b: want_b,
+                        fraction: frac,
+                        paused: !snap.playing,
+                    });
                 }
-                self.audio_active = Some(usize::from(want_b));
                 if self.compare.flicker {
                     self.compare.show_b = want_b;
                 }
             }
             // A flicker swap flips the audio with the picture, gap-free.
-            if swapped && audio_pair && snap.loaded {
-                busy = true;
+            if swapped && sound_pair && snap.loaded {
                 let want_b = self.compare.show_b;
                 if pair_loaded {
                     let target = if want_b {
-                        r_hex.as_str()
+                        self.right.facts.hash_hex.as_str()
                     } else {
-                        l_hex.as_str()
+                        self.left.facts.hash_hex.as_str()
                     };
                     if snap.hex.as_deref() != Some(target) {
                         p.flip();
                     }
+                    self.audio_active = Some(usize::from(want_b));
                 } else {
-                    start_pair(want_b);
+                    self.pending_play = Some(PendingPlay::Pair {
+                        audible_b: want_b,
+                        fraction: frac,
+                        paused: !snap.playing,
+                    });
                 }
-                self.audio_active = Some(usize::from(want_b));
             }
             // Stepping the shown file follows with whatever transport state it
             // was in: playing keeps playing the new copy, a deliberate pause
             // stays paused with the new copy loaded — leaving the previous file
-            // loaded would show one copy and resume another.
+            // loaded would show one copy and resume another. (The step itself
+            // cleared any stale deferred action via `refresh_side`.)
             if let Some((true, _)) = stepped
                 && !self.two_sided()
                 && snap.loaded
-                && self.left.facts.is_audio()
+                && self.side_has_sound(0)
             {
-                busy = true;
-                let t = u64::from(self.left.facts.audio_ms.unwrap_or(0));
-                let at = snap.pos_ms.min(t);
-                let (hex, path) = (&self.left.facts.hash_hex, &self.left.facts.abs_path);
-                if snap.playing {
-                    p.play(hex, path, t, at);
-                } else {
-                    p.load_paused(hex, path, t, at);
-                }
-                self.audio_active = Some(0);
+                self.pending_play = Some(PendingPlay::Single {
+                    left: true,
+                    fraction: frac,
+                    paused: !snap.playing,
+                });
             }
             // Keep the synced pair loaded whenever the pair plays, so flips
-            // stay instant even after a side was stepped to another file.
-            if audio_pair && snap.playing && !pair_loaded && !busy {
-                start_pair(self.audio_active == Some(1));
-            }
-            if cycle_speed {
-                let r = snap.speed;
-                p.set_speed(match r {
-                    r if r < 0.9 => 1.0,
-                    r if r < 1.9 => 2.0,
-                    _ => 0.5,
+            // stay instant even after a side was stepped to another file —
+            // and re-anchor it after a rate change, both sides at the new rate.
+            if sound_pair && snap.playing && !pair_loaded && self.pending_play.is_none() {
+                self.pending_play = Some(PendingPlay::Pair {
+                    audible_b: self.audio_active == Some(1),
+                    fraction: frac,
+                    paused: false,
                 });
+            }
+            // Fire the deferred action the moment its sources are ready
+            // (resolved *after* the actions above, so a rate change this frame
+            // resolves at the new rate). Dropped if a side turns out to have
+            // no sound after all; kept waiting while anything still renders.
+            if let Some(pend) = self.pending_play.take() {
+                let src_a = self.audio_src(ctx, 0);
+                let src_b = self.audio_src(ctx, 1);
+                match pend {
+                    PendingPlay::Pair {
+                        audible_b,
+                        fraction,
+                        paused,
+                    } => match (&src_a, &src_b) {
+                        (
+                            AudioSrc::Ready {
+                                hex: ha,
+                                path: pa,
+                                total_ms,
+                            },
+                            AudioSrc::Ready {
+                                hex: hb, path: pb, ..
+                            },
+                        ) => {
+                            let start = (fraction * *total_ms as f32) as u64;
+                            p.play_pair(ha, pa, hb, pb, *total_ms, start, audible_b);
+                            if paused {
+                                p.toggle_pause();
+                            }
+                            self.loaded_rate = self.rate;
+                            self.audio_active = Some(usize::from(audible_b));
+                        }
+                        (AudioSrc::None, _) | (_, AudioSrc::None) => {}
+                        _ => {
+                            self.pending_play = Some(pend);
+                            ctx.request_repaint_after(std::time::Duration::from_millis(150));
+                        }
+                    },
+                    PendingPlay::Single {
+                        left,
+                        fraction,
+                        paused,
+                    } => {
+                        let src = if left { &src_a } else { &src_b };
+                        match src {
+                            AudioSrc::Ready {
+                                hex,
+                                path,
+                                total_ms,
+                            } => {
+                                let start = (fraction * *total_ms as f32) as u64;
+                                if paused {
+                                    p.load_paused(hex, path, *total_ms, start);
+                                } else {
+                                    p.play(hex, path, *total_ms, start);
+                                }
+                                self.loaded_rate = self.rate;
+                                self.audio_active = Some(usize::from(!left));
+                            }
+                            AudioSrc::None => {}
+                            AudioSrc::Rendering => {
+                                self.pending_play = Some(pend);
+                                ctx.request_repaint_after(std::time::Duration::from_millis(150));
+                            }
+                        }
+                    }
+                }
             }
         }
         picked
@@ -3016,6 +3738,200 @@ mod tests {
         side.facts.hash_hex = hex.to_string();
         side.facts.audio_ms = Some(1000);
         side
+    }
+
+    /// A video side with its own identity, for the Video tab tests. The path
+    /// need not exist: without a decodable clip (or without ffmpeg) the
+    /// filmstrip keeps placeholder slots — the no-crash fallback.
+    fn video_side(name: &str, hex: &str) -> DiffSide {
+        let mut side = diff_side(Some("video/mp4"));
+        side.rel_path = name.to_string();
+        side.facts.abs_path = PathBuf::from(format!("/tmp/{name}"));
+        side.facts.hash_hex = hex.to_string();
+        side
+    }
+
+    /// A video pair lands on the Video representation and lays out the full
+    /// aligned filmstrip — N frame slots per side, in a row, side by side —
+    /// even before (or without) any frame decoding. Asserted as rects, per the
+    /// GUI convention that a label query passes even when clipped.
+    #[test]
+    fn a_video_pair_lands_on_video_with_a_filmstrip_per_side() {
+        let h = rendered(DiffCompare::new(
+            video_side("a.mp4", "aaaa"),
+            video_side("b.mp4", "bbbb"),
+        ));
+        assert_eq!(
+            h.state().tab,
+            RepresentationKind::Video,
+            "a clip's own representation is Video, not its soundtrack"
+        );
+        let n = crate::scrub::FILMSTRIP_FRAMES;
+        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        for slot in [0, 1] {
+            let rects = &h.state().film_rects[slot];
+            assert_eq!(rects.len(), n, "side {slot} lays out {n} frame slots");
+            for w in rects.windows(2) {
+                assert!(
+                    w[0].right() <= w[1].left() + 0.5,
+                    "slots sit in a row without overlap: {w:?}"
+                );
+            }
+            for r in rects {
+                assert!(
+                    r.width() > 20.0 && r.height() > 20.0,
+                    "a slot is a visible frame, not a sliver: {r:?}"
+                );
+                assert!(window.contains_rect(*r), "slots stay on screen: {r:?}");
+            }
+        }
+        let a_right = h.state().film_rects[0].last().expect("A strip").right();
+        let b_left = h.state().film_rects[1].first().expect("B strip").left();
+        assert!(
+            a_right <= b_left,
+            "the two strips sit side by side, A's before B's"
+        );
+    }
+
+    /// Clicking the filmstrip drops the *shared* playhead: one fraction, which
+    /// each side decodes against its own timeline — the proportional-alignment
+    /// wiring on top of the unit-tested mapping in `scrub`.
+    #[test]
+    fn clicking_the_filmstrip_drops_the_shared_playhead() {
+        let mut h = rendered(DiffCompare::new(
+            video_side("a.mp4", "aaaa"),
+            video_side("b.mp4", "bbbb"),
+        ));
+        // The centre of A's fourth slot is 3.5/8 of the strip.
+        let pos = h.state().film_rects[0][3].center();
+        h.event(egui::Event::PointerMoved(pos));
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.step();
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.step();
+        h.step();
+        let f = h
+            .state()
+            .playhead
+            .expect("the click set the shared playhead");
+        assert!(
+            (f - 3.5 / 8.0).abs() < 0.02,
+            "the fraction matches the clicked spot, got {f}"
+        );
+        // Both sides answer the same fraction — the alignment guarantee.
+        assert_eq!(h.state().video[0].scrub_frac, Some(f));
+        assert_eq!(h.state().video[1].scrub_frac, Some(f));
+        // And the representation reports the slot under the playhead.
+        let (l, _) = h.state().reps();
+        assert_eq!(l.video.expect("video rep").selected_frame, Some(3));
+    }
+
+    /// With ffmpeg present, a clip that carries a soundtrack offers the Audio
+    /// representation beside Video — and a silent clip never does. Gated like
+    /// every other ffmpeg test: machines without it skip rather than fail.
+    #[test]
+    fn a_video_with_a_soundtrack_offers_the_audio_tab_and_a_silent_one_does_not() {
+        use egui_kittest::kittest::Queryable;
+        if !dedup_core::fingerprint::ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("dir");
+        let sound = dir.path().join("sound.mp4");
+        let silent = dir.path().join("silent.mp4");
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc=duration=1:size=64x64:rate=5")
+            .args(["-f", "lavfi", "-i"])
+            .arg("sine=frequency=440:duration=1")
+            .args(["-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
+            .arg(&sound)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+            && std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+                .arg("testsrc=duration=1:size=64x64:rate=5")
+                .args(["-pix_fmt", "yuv420p"])
+                .arg(&silent)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+        if !ok {
+            eprintln!("skipping: ffmpeg could not generate the test clips");
+            return;
+        }
+        dedup_core::thumbnail::set_cache_dir(dir.path().join("thumbs"));
+        let side = |path: &std::path::Path, hex: &str| {
+            let mut s = diff_side(Some("video/mp4"));
+            s.rel_path = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            s.facts.abs_path = path.to_path_buf();
+            s.facts.hash_hex = hex.to_string();
+            s
+        };
+        // The soundtrack probe and extraction run off-thread; step the UI
+        // until they settle (bounded — this is not a hang-forever loop).
+        let settle = |h: &mut egui_kittest::Harness<'static, DiffCompare>| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while h.state().video[0].audio.is_none() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the soundtrack probe never settled"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                h.step();
+            }
+        };
+
+        let mut h = rendered(DiffCompare::new(
+            side(&sound, "feed01"),
+            side(&sound, "feed02"),
+        ));
+        settle(&mut h);
+        let (l, _) = h.state().reps();
+        assert!(
+            l.audio.is_some(),
+            "a clip with a soundtrack offers the Audio representation"
+        );
+        assert_eq!(
+            h.state().tab,
+            RepresentationKind::Video,
+            "Video stays the landing tab, Audio sits beside it"
+        );
+        h.run();
+        // The tab is really offered on the bar, not merely present in a struct.
+        h.get_by_label_contains("Audio");
+
+        let mut h = rendered(DiffCompare::new(
+            side(&silent, "feed03"),
+            side(&silent, "feed04"),
+        ));
+        settle(&mut h);
+        assert_eq!(
+            h.state().video[0].audio,
+            Some(None),
+            "the probe found no track"
+        );
+        let (l, _) = h.state().reps();
+        assert!(l.audio.is_none(), "a silent clip offers no Audio tab");
+        assert_eq!(
+            h.query_all_by_label_contains("Audio").count(),
+            0,
+            "and no Audio tab button is drawn"
+        );
     }
 
     /// A side identified by name, for the pool/switcher tests.
@@ -3394,6 +4310,106 @@ mod tests {
         let img = h.render().expect("wgpu render failed");
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../docs/screenshots/render.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Doc screenshot: two clips on the Video tab — a filmstrip per side with
+    /// the shared playhead dropped and the frame at that moment enlarged as
+    /// A@t | B@t — to `docs/screenshots/video-diff.png`. `--ignored` (needs
+    /// wgpu + ffmpeg).
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu + ffmpeg)"]
+    fn doc_screenshot_video_diff() {
+        if !dedup_core::fingerprint::ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let make_clip = |name: &str, src: &str| {
+            let path = tmp.path().join(name);
+            let ok = std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+                .arg(src)
+                .args(["-pix_fmt", "yuv420p"])
+                .arg(&path)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "ffmpeg generated {name}");
+            path
+        };
+        let a = make_clip("a.mp4", "testsrc=duration=4:size=320x180:rate=10");
+        let b = make_clip("b.mp4", "testsrc2=duration=3:size=320x180:rate=10");
+        dedup_core::thumbnail::set_cache_dir(tmp.path().join("thumbs"));
+        let side = |path: &std::path::Path, hex: &str| {
+            let mut s = diff_side(Some("video/mp4"));
+            s.rel_path = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            s.facts.abs_path = path.to_path_buf();
+            s.facts.hash_hex = hex.to_string();
+            s
+        };
+        let mut cmp = DiffCompare::new(side(&a, "shot0a"), side(&b, "shot0b"));
+        cmp.tab = RepresentationKind::Video;
+        let mut init = false;
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 620.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, cmp: &mut DiffCompare| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    cmp.view(&ui.ctx().clone(), TooltipVerbosity::default(), None);
+                },
+                cmp,
+            );
+        h.run();
+        // Let the filmstrip decodes land, then drop the playhead mid-strip.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while h.state().video[0].film.iter().any(Option::is_none)
+            || h.state().video[1].film.iter().any(Option::is_none)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "filmstrips never finished decoding"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            h.step();
+        }
+        let pos = h.state().film_rects[0][5].center();
+        h.event(egui::Event::PointerMoved(pos));
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.step();
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !(h.state().video[0].scrub_settled && h.state().video[1].scrub_settled) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the scrubbed frames never decoded"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            h.step();
+        }
+        h.run();
+        let img = h.render().expect("wgpu render failed");
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/screenshots/video-diff.png");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
