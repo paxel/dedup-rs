@@ -606,7 +606,11 @@ pub fn draw_metadata_column(ui: &mut egui::Ui, source: &Path, body: MetaBody<'_>
                         [56.0, 18.0],
                         egui::Label::new(RichText::new(label).color(theme::tan()).size(12.0)),
                     );
-                    let w = (ui.available_width() - 32.0).max(80.0);
+                    // Reserve a fixed kebab column (whether or not this field has
+                    // one), so every field is the same width and the ⋮ buttons
+                    // line up — and leave clear room inside the clipped column so
+                    // the kebab is never cut at the edge.
+                    let w = (ui.available_width() - 40.0).max(60.0);
                     ui.add(egui::TextEdit::singleline(val).desired_width(w));
                     // Adopt a value from another copy in the group. A "more
                     // options for this field" kebab (⋮), not a directional

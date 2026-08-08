@@ -2548,9 +2548,19 @@ impl DiffCompare {
                         }
                         if let Some(p) = &self.hex_head[0] {
                             let body = p.body.clone();
-                            egui::ScrollArea::both()
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
+                            // Draw into a viewport-clipped child, not the whole
+                            // Area ui — otherwise the dump paints up into the
+                            // tabs and facts strip (the single-view "rendered
+                            // into the headers" bug).
+                            let mut child = ui.new_child(
+                                UiBuilder::new()
+                                    .max_rect(viewport)
+                                    .layout(Layout::top_down(Align::Min)),
+                            );
+                            child.set_clip_rect(viewport);
+                            egui::ScrollArea::both().auto_shrink([false, false]).show(
+                                &mut child,
+                                |ui| {
                                     ui.add(
                                         egui::Label::new(
                                             RichText::new(&body)
@@ -2560,7 +2570,8 @@ impl DiffCompare {
                                         )
                                         .wrap_mode(egui::TextWrapMode::Extend),
                                     );
-                                });
+                                },
+                            );
                         }
                     }
                 } else if self.tab == RepresentationKind::Video {
