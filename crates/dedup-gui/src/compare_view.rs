@@ -2733,6 +2733,19 @@ impl DiffCompare {
                     Rect::from_min_size(egui::pos2(x0, band.min.y), egui::vec2(half, band.height()))
                 };
 
+                // A thin dark rule down the centre gutter — the "this is A, this
+                // is B" helper — from the facts strip through the content to the
+                // action bar. Only when both sides actually show side by side
+                // (a single/flicker view is one file, so no divide).
+                if two_sided && !flicker_active {
+                    let x = inner.center().x;
+                    ui.painter().vline(
+                        x,
+                        titles_top..=action_band.min.y,
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(64)),
+                    );
+                }
+
                 // Top: read-only identity, one block per side.
                 for &is_left in sides {
                     let (side, other) = if is_left {

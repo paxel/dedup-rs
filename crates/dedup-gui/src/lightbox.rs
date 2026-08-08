@@ -509,37 +509,38 @@ const HEX_DUMP_BYTES: usize = 2048;
 pub type ColumnFn<'a, T> = Box<dyn FnOnce(&mut egui::Ui, &mut T) + 'a>;
 
 /// Lay out the lightbox's columns side by side — strictly Left vs. Right, never
-/// stacked (§1.3.2) — sizing each from the parent's own cursor. One entry draws
-/// a single full-width column, which is what a representation only one side
-/// supports must look like (§1.3.1).
+/// stacked (§1.3.2). One entry draws a single full-width column, which is what a
+/// representation only one side supports must look like (§1.3.1).
 ///
-/// Deliberately not `ui.columns`: that hardcodes `top_down_justified`, which
-/// stretches every child widget to the column width instead of its natural size.
-/// Equally not an absolute-rect split, which would overlap the columns inside a
-/// flow layout and let later controls race them for the same row.
-///
-/// `shared` is handed to each column in turn — a cache both sides draw from
-/// (thumbnails, previews) can only be borrowed by one column at a time, so it
-/// travels as an argument rather than being captured twice. Pass `&mut ()` when
-/// there is nothing to share.
+/// Each column is drawn into a **fixed, clipped absolute rect**: column `i` always
+/// sits at the same x, whatever the others contain, and content that would exceed
+/// its half is clipped rather than shoving the next column rightward (and, with a
+/// long path or a wide document line, eventually off-screen — the bug this
+/// replaced). Columns that need to show more than fits scroll within their own
+/// rect. `shared` is handed to each column in turn (a cache both sides draw from
+/// can only be borrowed by one at a time). Pass `&mut ()` when there is nothing
+/// to share.
 pub fn draw_columns<T>(ui: &mut egui::Ui, shared: &mut T, cols: Vec<ColumnFn<'_, T>>) {
     let n = cols.len();
     if n == 0 {
         return;
     }
-    let col_w = (ui.available_width() - COLUMN_GAP * (n as f32 - 1.0)) / n as f32;
-    ui.horizontal_top(|ui| {
-        for (i, col) in cols.into_iter().enumerate() {
-            if i > 0 {
-                ui.add_space(COLUMN_GAP);
-            }
-            ui.allocate_ui_with_layout(
-                egui::vec2(col_w, 0.0),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| col(ui, shared),
-            );
-        }
-    });
+    let full = ui.max_rect();
+    let col_w = (full.width() - COLUMN_GAP * (n as f32 - 1.0)) / n as f32;
+    for (i, col) in cols.into_iter().enumerate() {
+        let x0 = full.min.x + i as f32 * (col_w + COLUMN_GAP);
+        let rect = Rect::from_min_size(egui::pos2(x0, full.min.y), egui::vec2(col_w, full.height()));
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        // Clip to the column so nothing a column draws can escape into its
+        // neighbour or push the layout — the guarantee the flow layout lacked.
+        child.set_clip_rect(rect.intersect(ui.clip_rect()));
+        col(&mut child, shared);
+    }
+    ui.allocate_rect(full, egui::Sense::hover());
 }
 
 /// What a Metadata column's controls asked the caller to do. The caller owns the
