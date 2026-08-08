@@ -529,7 +529,8 @@ pub fn draw_columns<T>(ui: &mut egui::Ui, shared: &mut T, cols: Vec<ColumnFn<'_,
     let col_w = (full.width() - COLUMN_GAP * (n as f32 - 1.0)) / n as f32;
     for (i, col) in cols.into_iter().enumerate() {
         let x0 = full.min.x + i as f32 * (col_w + COLUMN_GAP);
-        let rect = Rect::from_min_size(egui::pos2(x0, full.min.y), egui::vec2(col_w, full.height()));
+        let rect =
+            Rect::from_min_size(egui::pos2(x0, full.min.y), egui::vec2(col_w, full.height()));
         let mut child = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(rect)
