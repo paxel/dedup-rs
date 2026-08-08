@@ -5239,6 +5239,68 @@ mod tests {
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 
+    /// Render one file alone (the second side hidden) on `tab`, DARK, and save
+    /// it — the shared body of the single-view doc screenshots.
+    fn render_single_view(cmp: DiffCompare, name: &str) {
+        let mut init = false;
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1000.0, 620.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, cmp: &mut DiffCompare| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    cmp.view(&ui.ctx().clone(), TooltipVerbosity::default(), None);
+                },
+                cmp,
+            );
+        h.run();
+        let img = h.render().expect("wgpu render failed");
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/screenshots")
+            .join(name);
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Doc screenshot: a single file's Hex tab (no second side), to
+    /// `docs/screenshots/single_hex.png`. Also the regression guard for the
+    /// single-view clip fix — the dump must sit in the viewport, not the
+    /// headers. `--ignored` (needs wgpu).
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_single_hex() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bytes = b"BM\x00\x01config: theme=lcars build=2019 author=unknown\x00\x00".to_vec();
+        bytes.extend((0..512u32).map(|i| (i % 251) as u8));
+        let side = bytes_side(tmp.path(), "firmware.bin", &bytes);
+        let mut cmp = DiffCompare::new_with_pool(side, None, Vec::new());
+        cmp.hide_second();
+        cmp.tab = RepresentationKind::Hex;
+        render_single_view(cmp, "single_hex.png");
+    }
+
+    /// Doc screenshot: a single text file's Text tab (no second side), to
+    /// `docs/screenshots/single_text.png`. `--ignored` (needs wgpu).
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_single_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = b"# Inheritance notes\n\nThis drive came from the loft PC.\n\
+                     - photos/ : holiday scans, 2003-2011\n\
+                     - docs/   : contracts, warranties (some scanned, some PDF)\n\
+                     - the Visa contract appears twice, byte-identical\n\n\
+                     TODO: dedupe against the NAS before archiving.\n";
+        let side = text_side(tmp.path(), "README.md", body);
+        let mut cmp = DiffCompare::new_with_pool(side, None, Vec::new());
+        cmp.hide_second();
+        cmp.tab = RepresentationKind::Text;
+        render_single_view(cmp, "single_text.png");
+    }
+
     /// Hiding the second side gives the first the whole screen — the single-file
     /// analysis case.
     #[test]

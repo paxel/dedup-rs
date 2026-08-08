@@ -126,9 +126,13 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   pills, the DIFF board its OVERWRITE/DELETE commands. A file opens **alone**, filling the
   whole screen; **SHOW B** reveals a second side — always another candidate, never the file
   already shown — and **HIDE B** returns. Each side's top is a **read-only identity block**
-  (bordered repo chip, name, size/date/type), and every control sits in a **fixed action bar
-  along the bottom** — navigate on the left, tools in the middle, the destructive action inset
-  at the right — so a button never shifts under the cursor as the file name changes. With one
+  (bordered repo chip, the **bold file name** led by an accent cap, size/date/type), and every
+  control sits in a **fixed action bar along the bottom** — navigate on the left, tools in the
+  middle, the destructive action inset at the right — so a button never shifts under the cursor
+  as the file name changes. The two sides are split by a **centre divider** and every side keeps
+  a **fixed half**: a long name or a wide document line scrolls or clips within its own half
+  instead of pushing the other side off-screen, and the file name is a **selectable** field that
+  sticks to its end so the whole path can be dragged to the front and copied. With one
   file shown a compact switcher (`‹ 1 / 2 ›`) walks the whole group or listing; with two, each
   side's switcher skips the file the other side shows, and its position counts that side's
   candidates, never the group size. The title says whether you are comparing exact

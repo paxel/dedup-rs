@@ -5303,6 +5303,54 @@ mod ui_tests {
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 
+    /// Doc screenshot: a single file open in the viewer (no second side shown),
+    /// to `docs/screenshots/single_image.png` — the state you land on before
+    /// pressing SHOW B, one image filling the pane. Run with `--ignored`.
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_single_image() {
+        let dir = tempfile::tempdir().unwrap();
+        dedup_core::thumbnail::set_cache_dir(dir.path().join("thumbs"));
+        let group = hero_or_gradient_group(dir.path());
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![group]));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let store2 = Arc::clone(&store);
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 720.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    let _ = (&tmp, &dir);
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        let ctx = egui::Context::default();
+        // Opens on the clicked file alone (the second side stays hidden).
+        harness
+            .state_mut()
+            .apply(&ctx, &store2, Act::OpenLightbox(0, 0));
+        for _ in 0..40 {
+            harness.run();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let img = harness.render().expect("wgpu render failed");
+        let out = doc_screenshot_path("single_image.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
     /// Doc screenshot: two clips A/B compared with the shared frame scrubber, to
     /// `docs/screenshots/video_compare.png`. Builds real clips with ffmpeg and
     /// extracts their stills, so it needs ffmpeg on PATH. Run with `--ignored`.

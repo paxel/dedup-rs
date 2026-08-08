@@ -67,11 +67,14 @@ representation: a photo on Image, a track on Audio, a document on Text.
 ![The viewer comparing a SIMILAR match: a photo and its mirror](../screenshots/lightbox_compare.png)
 
 **Layout.** The top of each side is a read-only **identity block** — a bordered repo chip, the
-file name, and its size / date / type (the bigger size and older date highlighted) — *what the
-file is*. Every control lives in the **fixed action bar along the bottom**: navigation on the
-left, the tab's tools in the middle, and the destructive action inset at the right — *what you
-can do*. Because the controls sit in fixed slots rather than after the (variable-length) file
-name, a button never shifts under the cursor between deciding and clicking.
+**file name** (bold, led by a small LCARS accent cap in the side's colour), and its size / date /
+type (the bigger size and older date highlighted) — *what the file is*. Every control lives in
+the **fixed action bar along the bottom** — *what you can do*. The two sides are separated by a
+**centre divider**, and every part of the layout is **content-independent**: each side keeps a
+fixed half, so a long name or a wide document line is scrolled or clipped within its own half
+rather than shoving the other side off-screen. The file name itself sits in a fixed-width field
+that sticks to the end (the filename and extension) and is **selectable** — drag to the front and
+copy the whole path — so even a very long path never grows the layout.
 
 **What kind of match.** The title says whether you are looking at exact **duplicates** or a
 **SIMILAR** search, and for a similar search it names the threshold — `SIMILAR GROUP (≥ 90%)`.
@@ -91,6 +94,19 @@ click targets) steps through the whole group. With both sides shown, each side's
 the file the other side is showing — the two sides can never be the same file — and the
 position counts that side's candidates, never the group size; a two-copy group then offers no
 switcher at all, because the only other candidate is already on the other side.
+
+### The single-file view
+
+Clicking a card opens the file **alone** — no second side, no divider — the same identity block,
+tab bar and action bar, with one image (or spectrogram, filmstrip, text, hex dump) filling the
+pane. **SHOW B** brings up a comparison. Every tab renders the same whether one file or two are
+shown; a single file simply has nothing to diff against, so it shows its own content.
+
+![A single file open in the viewer — one image, the switcher, no second side](../screenshots/single_image.png)
+
+![A single file's raw bytes on the Hex tab](../screenshots/single_hex.png)
+
+![A single text file on the Text tab](../screenshots/single_text.png)
 
 ### Representation tabs
 
