@@ -3619,18 +3619,43 @@ fn side_strip(ui: &mut egui::Ui, side: &DiffSide, other: &DiffSide, is_left: boo
         crate::repo_chip::repo_chip(ui, &side.repo, false, accent, false, Some(side.read_only));
         ui.add_space(3.0);
         // The file name is the headline of the identity block — which file am I
-        // about to act on — so it is bold and a step larger than the facts
-        // below. Truncated: a deep path must not widen this side into the
-        // other's half.
-        ui.add(
-            egui::Label::new(
-                RichText::new(&side.rel_path)
-                    .color(theme::text())
-                    .size(15.0)
-                    .strong(),
-            )
-            .truncate(),
-        );
+        // about to act on — bold and a step larger than the facts below, led by
+        // a small LCARS accent cap in the side's colour. A very long name never
+        // grows the layout: it lives in a fixed-width horizontal scroll that
+        // sticks to the *end* (the filename + extension you care about), and the
+        // label is selectable, so you can drag to the front and copy the whole
+        // path.
+        ui.horizontal(|ui| {
+            let (cap, _) = ui.allocate_exact_size(egui::vec2(10.0, 20.0), egui::Sense::hover());
+            ui.painter().rect_filled(
+                cap,
+                egui::CornerRadius {
+                    nw: 9,
+                    sw: 9,
+                    ne: 0,
+                    se: 0,
+                },
+                accent,
+            );
+            ui.add_space(6.0);
+            let name_w = ui.available_width().max(40.0);
+            egui::ScrollArea::horizontal()
+                .id_salt(("filename", is_left))
+                .max_width(name_w)
+                .stick_to_right(true)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&side.rel_path)
+                                .color(theme::text())
+                                .size(15.0)
+                                .strong(),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Extend)
+                        .selectable(true),
+                    );
+                });
+        });
         let size_color = if side.facts.size > other.facts.size {
             theme::green()
         } else {
