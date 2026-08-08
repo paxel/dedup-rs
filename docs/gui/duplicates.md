@@ -131,9 +131,10 @@ shown copy, and a deliberate pause stays paused with the new copy loaded, so pla
 file you are actually looking at. `P` toggles play/pause.
 
 **Metadata** shows the file's tags. For MP3/WAV/AIFF that is the ID3 editor: EDIT TAGS opens
-Title/Artist/Album/Year/Track/Genre for that copy, the `>` beside a field offers the value any
-other copy in the group carries (adopt the best one), and SAVE TAGS writes only the tags — the
-audio itself is untouched. `T` jumps straight here with the editor open. A file in a read-only
+Title/Artist/Album/Year/Track/Genre for that copy; a **`⋮` (more-options) button** beside a
+field appears when another copy in the group has a different value, and opens a menu of those
+values to pull one *into* this field (adopt the best one — it never writes to the other side).
+SAVE TAGS writes only the tags — the audio itself is untouched. `T` jumps straight here with the editor open. A file in a read-only
 repository is shown but never editable. For images the tab lists **every EXIF field** the
 file carries — camera, capture date, exposure, GPS, all of it — as recorded; EXIF is not
 edited here. When two files are compared, the fields that **differ** between them are

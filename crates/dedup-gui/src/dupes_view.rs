@@ -1935,6 +1935,11 @@ mod ui_tests {
         "private_media",
     ];
 
+    /// A believable modified-time for the doc-screenshot fixtures (2019-05-10),
+    /// so the identity strip shows a real date instead of the epoch (which read
+    /// as a UI bug).
+    const DOC_MTIME_MS: i64 = 1_557_500_000_000;
+
     /// A temp store pre-populated with `names` as (empty) repos.
     fn sample_store(names: &[&str]) -> (TempDir, Arc<Store>) {
         let tmp = tempfile::tempdir().unwrap();
@@ -3494,7 +3499,7 @@ mod ui_tests {
             entry: dedup_core::store::FileEntry {
                 size: 417,
                 hash,
-                modified_ms: 0,
+                modified_ms: DOC_MTIME_MS,
                 missing: false,
                 mime: Some("audio/mpeg".into()),
                 img_fingerprint: None,
@@ -5181,7 +5186,7 @@ mod ui_tests {
                     h[0] = hash0;
                     h
                 },
-                modified_ms: 0,
+                modified_ms: DOC_MTIME_MS,
                 missing: false,
                 mime: fp.mime.clone(),
                 img_fingerprint: fp.img_fingerprint,
@@ -5230,7 +5235,7 @@ mod ui_tests {
                     entry: dedup_core::store::FileEntry {
                         size: 1000,
                         hash,
-                        modified_ms: 0,
+                        modified_ms: DOC_MTIME_MS,
                         missing: false,
                         mime: Some("image/png".into()),
                         img_fingerprint: None,
@@ -5361,7 +5366,7 @@ mod ui_tests {
                 entry: dedup_core::store::FileEntry {
                     size,
                     hash,
-                    modified_ms: 0,
+                    modified_ms: DOC_MTIME_MS,
                     missing: false,
                     mime: Some((*mime).into()),
                     img_fingerprint: None,
@@ -5492,7 +5497,7 @@ mod ui_tests {
             entry: dedup_core::store::FileEntry {
                 size: 417,
                 hash,
-                modified_ms: 0,
+                modified_ms: DOC_MTIME_MS,
                 missing: false,
                 mime: Some("audio/mpeg".into()),
                 img_fingerprint: None,
@@ -5521,7 +5526,7 @@ mod ui_tests {
             entry: dedup_core::store::FileEntry {
                 size: bytes.len() as u64,
                 hash,
-                modified_ms: 0,
+                modified_ms: DOC_MTIME_MS,
                 missing: false,
                 mime: Some(mime.into()),
                 img_fingerprint: None,

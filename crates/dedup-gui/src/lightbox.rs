@@ -542,41 +542,6 @@ pub fn draw_columns<T>(ui: &mut egui::Ui, shared: &mut T, cols: Vec<ColumnFn<'_,
     });
 }
 
-/// Identifying header of one lightbox column: which file, in which repo, and
-/// whether that repo is read-only.
-pub struct ColumnHead<'a> {
-    pub file_name: &'a str,
-    pub repo: &'a str,
-    pub accent: egui::Color32,
-    pub read_only: bool,
-    /// This column's repo is the main of a sync group.
-    pub is_main: bool,
-    /// The file's absolute path — the column's identity for per-side widget
-    /// state. Not the name or the hash: duplicates routinely share both, and
-    /// two columns under one id share scroll position.
-    pub source: &'a Path,
-}
-
-impl ColumnHead<'_> {
-    fn draw(&self, ui: &mut egui::Ui) {
-        crate::repo_chip::repo_chip(
-            ui,
-            self.repo,
-            false,
-            self.accent,
-            self.is_main,
-            Some(self.read_only),
-        );
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(self.file_name)
-                .color(theme::text())
-                .size(13.0),
-        );
-        ui.add_space(4.0);
-    }
-}
-
 /// What a Metadata column's controls asked the caller to do. The caller owns the
 /// tag state and the disk write, so the column only reports the intent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -619,12 +584,10 @@ pub enum MetaBody<'a> {
 /// One column of the Metadata tab: repo badge + file name, then the file's tag
 /// surface — the ID3 editor for the copy being edited, the stored tags for every
 /// other copy, or an image's EXIF facts.
-pub fn draw_metadata_column(
-    ui: &mut egui::Ui,
-    head: &ColumnHead<'_>,
-    body: MetaBody<'_>,
-) -> MetaAction {
-    head.draw(ui);
+pub fn draw_metadata_column(ui: &mut egui::Ui, source: &Path, body: MetaBody<'_>) -> MetaAction {
+    // No per-column identity header: the viewer's top strip already names the
+    // side (repo chip + path + facts), so a head here would just duplicate it
+    // and collide with the strip above. `source` is only the scroll id.
     let mut action = MetaAction::None;
     match body {
         MetaBody::Editing { tags, options } => {
@@ -644,9 +607,12 @@ pub fn draw_metadata_column(
                     );
                     let w = (ui.available_width() - 32.0).max(80.0);
                     ui.add(egui::TextEdit::singleline(val).desired_width(w));
-                    // Adopt a value from another copy in the group.
+                    // Adopt a value from another copy in the group. A "more
+                    // options for this field" kebab (⋮), not a directional
+                    // caret — the value is pulled *into* this field, never
+                    // pushed to the other side.
                     if !options[i].is_empty() {
-                        ui.menu_button(icon::CARET_RIGHT, |ui| {
+                        ui.menu_button("⋮", |ui| {
                             for o in &options[i] {
                                 if ui.button(RichText::new(o).color(theme::text())).clicked() {
                                     *val = o.clone();
@@ -654,7 +620,7 @@ pub fn draw_metadata_column(
                             }
                         })
                         .response
-                        .on_hover_text("Pick a value from another copy in this group");
+                        .on_hover_text("Use a value from another copy in this group");
                     }
                 });
             }
@@ -737,7 +703,7 @@ pub fn draw_metadata_column(
                 // The full field list can be long; it scrolls in its column
                 // rather than pushing the note (and the strip below) away.
                 egui::ScrollArea::vertical()
-                    .id_salt(head.source)
+                    .id_salt(source)
                     .max_height((ui.available_height() - 64.0).max(80.0))
                     .show(ui, |ui| {
                         for (tag, value) in &fields {
@@ -997,12 +963,13 @@ fn preview_note(preview: &TextPreview) -> String {
 /// scrolled as the new shared position.
 pub fn draw_text_column(
     ui: &mut egui::Ui,
-    head: &ColumnHead<'_>,
+    source: &Path,
     preview: &TextPreview,
     height: f32,
     sync: Option<Vec2>,
 ) -> (egui::Rect, Vec2) {
-    head.draw(ui);
+    // No per-column identity header — the viewer's top strip names the side.
+    // `source` is only the scroll id.
     let note = preview_note(preview);
     ui.label(RichText::new(note).color(theme::lilac()).size(11.0));
     ui.add_space(4.0);
@@ -1022,7 +989,7 @@ pub fn draw_text_column(
     let offset = {
         let ui = &mut child;
         let mut area = egui::ScrollArea::both()
-            .id_salt(head.source)
+            .id_salt(source)
             .auto_shrink([false, false]);
         if let Some(o) = sync {
             area = area.scroll_offset(o);
@@ -1409,23 +1376,20 @@ mod tests {
             truncated: false,
             error: None,
         };
-        let head = ColumnHead {
-            file_name: "long.txt",
-            repo: "r",
-            accent: theme::blue(),
-            read_only: false,
-            is_main: false,
-            source: Path::new("/tmp/r/long.txt"),
-        };
-
         let mut offset = None;
         {
             let mut harness = egui_kittest::Harness::builder()
                 .with_size(egui::vec2(600.0, 400.0))
                 .build_ui(|ui| {
                     offset = Some(
-                        draw_text_column(ui, &head, &preview, 300.0, Some(egui::vec2(0.0, 120.0)))
-                            .1,
+                        draw_text_column(
+                            ui,
+                            Path::new("/tmp/r/long.txt"),
+                            &preview,
+                            300.0,
+                            Some(egui::vec2(0.0, 120.0)),
+                        )
+                        .1,
                     );
                 });
             harness.run();
@@ -1447,21 +1411,14 @@ mod tests {
             truncated: false,
             error: None,
         };
-        let head = ColumnHead {
-            file_name: "long.txt",
-            repo: "r",
-            accent: theme::blue(),
-            read_only: false,
-            is_main: false,
-            source: Path::new("/tmp/r/long.txt"),
-        };
-
         let mut viewport = None;
         {
             let mut harness = egui_kittest::Harness::builder()
                 .with_size(egui::vec2(600.0, 400.0))
                 .build_ui(|ui| {
-                    viewport = Some(draw_text_column(ui, &head, &preview, 300.0, None).0);
+                    viewport = Some(
+                        draw_text_column(ui, Path::new("/tmp/r/long.txt"), &preview, 300.0, None).0,
+                    );
                 });
             harness.run();
         }
