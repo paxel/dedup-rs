@@ -58,8 +58,21 @@ impl DiffSide {
         self.facts.is_image() || self.facts.is_video() || self.facts.is_audio()
     }
 
-    /// What to say when there is no picture to show.
+    /// Whether this side's file is actually on disk right now. A repo on an
+    /// unmounted drive (a closed pcloud, an ejected disk) still has index
+    /// entries, but the paths 404 — so guard before decode/preview/open.
+    pub fn present(&self) -> bool {
+        self.facts.abs_path.exists()
+    }
+
+    /// What to say when there is no picture to show — distinguishing a file that
+    /// is simply not previewable (a document on the Image tab) from one that is
+    /// *gone* (its drive disconnected), so a dropped mount reads as exactly that
+    /// rather than a blank, broken-looking pane.
     pub fn placeholder(&self) -> String {
+        if !self.present() {
+            return "This file isn't present — its drive may be disconnected.".to_string();
+        }
         match self.facts.mime.as_deref() {
             Some(mime) => format!("no preview for {mime}"),
             None => "no preview for this file type".to_string(),
@@ -1049,6 +1062,13 @@ impl DiffCompare {
     fn spawn_decode(&mut self, ctx: &Context, slot: usize) {
         let is_left = slot == 0;
         let side = if is_left { &self.left } else { &self.right };
+        // A file whose drive has gone (unmounted mount, ejected disk) has no
+        // bytes to decode — settle immediately so the pane shows the "not
+        // present" note instead of spinning a decode that will only fail.
+        if !side.present() {
+            self.settled[slot] = true;
+            return;
+        }
         if side.facts.is_video() {
             // A video has no single primary still any more — the Video tab
             // draws the filmstrip, the Audio tab the extracted soundtrack's

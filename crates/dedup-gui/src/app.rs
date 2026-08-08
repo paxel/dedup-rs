@@ -190,6 +190,12 @@ pub struct DedupApp {
     show_settings: bool,
     show_about: bool,
     show_help: bool,
+    /// The Status panel (Warnings + Activity) is open.
+    show_status: bool,
+    /// In-memory diagnostics registry, shared with background workers: startup
+    /// probes and runtime failures file Critical/Warning events here, surfaced
+    /// by the Status button.
+    diag: crate::diagnostics::Diagnostics,
     /// Whether the one-time startup status probe has been kicked off.
     did_initial_status: bool,
     threads: usize,
@@ -240,6 +246,8 @@ impl DedupApp {
             show_settings: false,
             show_about: false,
             show_help: false,
+            show_status: false,
+            diag: crate::diagnostics::Diagnostics::new(),
             did_initial_status: false,
             threads: 0,
             tooltip_verbosity: TooltipVerbosity::default(),
@@ -849,10 +857,13 @@ impl eframe::App for DedupApp {
         // matching palette. Setting the same preference each frame is idempotent.
         ctx.set_theme(self.theme.preference());
         theme::sync_active(&ctx);
-        // One-time startup probe of every repo's location/reachability.
+        // One-time startup probe of every repo's location/reachability, plus a
+        // health check of the environment (audio device, external tools) so the
+        // Status button warns about anything missing before it silently bites.
         if !self.did_initial_status {
             self.did_initial_status = true;
             self.refresh_status(&ctx);
+            self.probe_environment();
         }
 
         // Drain worker messages; a completed job updates the repo's row.
@@ -941,6 +952,29 @@ impl eframe::App for DedupApp {
             if let Some(row) = self.repos.iter_mut().find(|r| r.name == repo) {
                 row.location = Some(location);
             }
+            // A repo whose folder is gone or unreachable files one aggregated
+            // Critical (keyed per repo, so it never floods), dovetailing with
+            // the card's own MISSING/OFFLINE pill; when it comes back the event
+            // clears itself.
+            let key = format!("repo-unreachable:{repo}");
+            match location {
+                Location::Missing => self.diag.push(
+                    crate::diagnostics::Severity::Critical,
+                    &key,
+                    format!("Repository '{repo}' is unreachable"),
+                    "Its folder no longer exists or can't be read — a disconnected drive or an \
+                     unmounted cloud folder looks exactly like this. Its files can't be scanned \
+                     or previewed until it's back; nothing has been deleted.",
+                ),
+                Location::Offline => self.diag.push(
+                    crate::diagnostics::Severity::Critical,
+                    &key,
+                    format!("Repository '{repo}' is offline"),
+                    "A network location that isn't reachable right now. Reconnect it to scan or \
+                     preview its files.",
+                ),
+                Location::Local | Location::Remote => self.diag.clear(&key),
+            }
         }
 
         // Folders dropped onto the window are added as repositories.
@@ -987,6 +1021,9 @@ impl eframe::App for DedupApp {
         }
         if self.show_about {
             self.about_modal(&ctx);
+        }
+        if self.show_status {
+            self.status_panel(&ctx);
         }
         if self.empty_scan_confirm.is_some() {
             self.empty_scan_modal(&ctx);
@@ -1112,6 +1149,34 @@ impl DedupApp {
                             .clicked()
                         {
                             self.show_help = true;
+                        }
+                        // STATUS: the health/activity centre. Its icon carries an
+                        // amber count badge when there are unread warnings, so a
+                        // silent problem (no audio device, missing ffmpeg, a file
+                        // gone) announces itself instead of biting quietly.
+                        let unread = self.diag.unread_count();
+                        let label = if unread > 0 {
+                            format!("{} STATUS ({unread})", icon::LIGHTNING)
+                        } else {
+                            format!("{} STATUS", icon::LIGHTNING)
+                        };
+                        let accent = if unread > 0 {
+                            theme::amber()
+                        } else {
+                            theme::tan()
+                        };
+                        if crate::lcars::action_button(ui, &label, true, accent)
+                            .explain(
+                                self.tooltip_verbosity,
+                                "Warnings and background activity",
+                                "Show health warnings (missing audio device, ffmpeg, unreachable \
+                                 files) and running background work. Each warning can be copied \
+                                 for a bug report.",
+                            )
+                            .clicked()
+                        {
+                            self.show_status = true;
+                            self.diag.mark_all_read();
                         }
                         // The remaining width (left of HELP) holds the scrollable
                         // tab strip, laid out left-to-right in its natural order.
@@ -2459,6 +2524,140 @@ impl DedupApp {
         } else if response.should_close() {
             self.empty_scan_confirm = None;
         }
+    }
+
+    /// Startup health check: probe the audio device and external tools, record
+    /// the system fingerprint for bug reports, and file a Warning for anything
+    /// unavailable so the Status button can surface it.
+    fn probe_environment(&self) {
+        use crate::diagnostics::Severity::Warning;
+        let audio_ok = rodio::OutputStream::try_default().is_ok();
+        self.diag
+            .set_fingerprint(crate::diagnostics::system_fingerprint(audio_ok));
+        if !audio_ok {
+            self.diag.push(
+                Warning,
+                "audio-device",
+                "No audio output device",
+                "Playback is disabled. On Linux this usually means ALSA/PipeWire isn't running, \
+                 or the machine has no audio device.",
+            );
+        }
+        if !dedup_core::fingerprint::ffmpeg_available() {
+            self.diag.push(
+                Warning,
+                "ffmpeg",
+                "ffmpeg not found on PATH",
+                "Video frames, soundtrack extraction and pitch-preserving playback rates all need \
+                 ffmpeg / ffprobe. Install ffmpeg to enable them.",
+            );
+        }
+        if !dedup_core::render::pdftoppm_available() {
+            self.diag.push(
+                Warning,
+                "pdftoppm",
+                "pdftoppm not found on PATH",
+                "The viewer's PDF Render tab needs pdftoppm (from poppler-utils).",
+            );
+        }
+    }
+
+    /// The Status panel: health Warnings (each copyable for a bug report) and a
+    /// Copy-full-report button. Activity is added in a later pass.
+    fn status_panel(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_status;
+        egui::Window::new(
+            RichText::new("STATUS")
+                .color(theme::amber())
+                .size(16.0)
+                .strong(),
+        )
+        .id(Id::new("status-panel"))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_width(560.0)
+        .show(ctx, |ui| {
+            let events = self.diag.events();
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("WARNINGS")
+                        .color(theme::tan())
+                        .size(13.0)
+                        .strong(),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .button(RichText::new("COPY FULL REPORT").color(theme::text()))
+                        .on_hover_text(
+                            "Copy every warning plus system info and the recent log — \
+                                        paste it into a bug report. Nothing is sent anywhere.",
+                        )
+                        .clicked()
+                    {
+                        let tail = Self::recent_log_tail();
+                        ctx.copy_text(self.diag.full_report(tail.as_deref()));
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            if events.is_empty() {
+                ui.label(
+                    RichText::new("No warnings — audio, ffmpeg and pdftoppm are all available.")
+                        .color(theme::green())
+                        .size(12.0),
+                );
+            }
+            for e in &events {
+                let color = match e.severity {
+                    crate::diagnostics::Severity::Critical => theme::red(),
+                    crate::diagnostics::Severity::Warning => theme::amber(),
+                };
+                egui::Frame::new()
+                    .fill(theme::panel())
+                    .stroke(egui::Stroke::new(1.0, color))
+                    .corner_radius(6)
+                    .inner_margin(8)
+                    .outer_margin(egui::Margin {
+                        top: 0,
+                        bottom: 6,
+                        left: 0,
+                        right: 0,
+                    })
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let heading = if e.count > 1 {
+                                format!("{} {}  (×{})", e.severity.label(), e.title, e.count)
+                            } else {
+                                format!("{} {}", e.severity.label(), e.title)
+                            };
+                            ui.label(RichText::new(heading).color(color).size(13.0).strong());
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .button(RichText::new("COPY").color(theme::text()))
+                                    .on_hover_text(
+                                        "Copy this warning + system info for a bug report",
+                                    )
+                                    .clicked()
+                                {
+                                    ctx.copy_text(self.diag.copy_text(&e.title, &e.detail));
+                                }
+                            });
+                        });
+                        ui.label(RichText::new(&e.detail).color(theme::text()).size(12.0));
+                    });
+            }
+        });
+        self.show_status = open;
+    }
+
+    /// The last lines of the current session log, for the Copy-full-report
+    /// payload (bounded so a huge log doesn't swamp the clipboard).
+    fn recent_log_tail() -> Option<String> {
+        let path = dedup_core::logging::current_log()?;
+        let text = std::fs::read_to_string(&path).ok()?;
+        let tail: Vec<&str> = text.lines().rev().take(60).collect();
+        Some(tail.into_iter().rev().collect::<Vec<_>>().join("\n"))
     }
 
     fn about_modal(&mut self, ctx: &egui::Context) {
