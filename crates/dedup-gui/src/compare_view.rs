@@ -312,6 +312,11 @@ pub(crate) struct DiffCompare {
     /// The caller's own headline for the viewer — what these two files are to
     /// the surface that opened it.
     title: String,
+    /// The current pair's perceptual similarity (0–1), when the caller is a
+    /// SIMILAR duplicate search — shown as `A ↔ B N%` so a loosely-matched pair
+    /// explains itself rather than posing as an exact duplicate. `None` for
+    /// exact-duplicate and DIFF callers, which have no similarity score.
+    similarity: Option<f32>,
     /// The open save-confirmation dialog for a turned image, if any: which
     /// side is being saved.
     save_confirm: Option<bool>,
@@ -409,6 +414,7 @@ impl DiffCompare {
             tag_edit: None,
             tag_error: None,
             title: "COMPARE — SAME PATH, DIFFERENT CONTENT".into(),
+            similarity: None,
             save_confirm: None,
             save_exif_date: false,
             save_error: None,
@@ -444,6 +450,24 @@ impl DiffCompare {
     /// Replace the headline — what these two files are to the caller.
     pub fn set_title(&mut self, title: impl Into<String>) {
         self.title = title.into();
+    }
+
+    /// Supply the current pair's perceptual similarity (0–1) for a SIMILAR
+    /// search, shown as `A ↔ B N%`. `None` clears it (exact / DIFF have none).
+    pub fn set_similarity(&mut self, similarity: Option<f32>) {
+        self.similarity = similarity;
+    }
+
+    /// The content hashes of the two files currently shown side by side, or
+    /// `None` when only one side is visible — so a caller can score the pair
+    /// and feed it back via [`Self::set_similarity`].
+    pub fn shown_pair(&self) -> Option<(String, String)> {
+        (self.two_sided() && self.left.facts.abs_path != self.right.facts.abs_path).then(|| {
+            (
+                self.left.facts.hash_hex.clone(),
+                self.right.facts.hash_hex.clone(),
+            )
+        })
     }
 
     /// [`Self::new`] with the candidates each side may be switched between.
@@ -1897,22 +1921,31 @@ impl DiffCompare {
                     pick = Some(DiffPick::Close);
                 }
 
-                // Preview viewport on top, facts / action strip along the bottom.
-                // Guard the viewport bottom so a very short window never inverts
-                // the rect (a full-window modal, but cheap to keep well-formed).
-                // The identifying facts sit with their side, above the images —
-                // so the images get the space the old bottom legend occupied.
-                // Tall enough for the whole facts block plus the mark pill, so
-                // the strip never bleeds into the images below it.
-                const TITLE_H: f32 = 132.0;
+                // Three horizontal bands, top to bottom: a read-only facts strip
+                // (repo chip + path + size/date/type — *what the file is*), the
+                // content viewport (the picture, filmstrip, spectrogram or text),
+                // and a fixed action bar (*what you can do* — navigate · tools ·
+                // delete). Controls live only in the bottom bar, in fixed slots,
+                // so a filename's length never shoves a button under the cursor.
+                // TITLE_H holds facts alone now (no buttons), so it is shorter
+                // than when the strip carried the controls too.
+                const TITLE_H: f32 = 122.0;
+                const ACTION_H: f32 = 34.0;
+                const ACTION_GAP: f32 = 6.0;
                 let tab_h = 30.0;
                 let titles_top = inner.min.y + 32.0 + tab_h;
+                // The content viewport stops above the action bar, which sits
+                // above the one-line hint at the very bottom.
+                let viewport_bottom =
+                    (inner.max.y - 14.0 - ACTION_H - ACTION_GAP).max(titles_top + TITLE_H + 40.0);
                 let viewport = Rect::from_min_max(
                     egui::pos2(inner.min.x, titles_top + TITLE_H),
-                    egui::pos2(
-                        inner.max.x,
-                        (inner.max.y - 18.0).max(titles_top + TITLE_H + 40.0),
-                    ),
+                    egui::pos2(inner.max.x, viewport_bottom),
+                );
+                // The fixed per-side action bar band, just below the viewport.
+                let action_band = Rect::from_min_max(
+                    egui::pos2(inner.min.x, viewport_bottom + ACTION_GAP),
+                    egui::pos2(inner.max.x, viewport_bottom + ACTION_GAP + ACTION_H),
                 );
 
                 // The representation tabs, from the same helper the Duplicates
@@ -2605,7 +2638,7 @@ impl DiffCompare {
                                 &a_tex,
                             );
                             ui.painter().text(
-                                egui::pos2(inner.min.x + 4.0, viewport.max.y + 2.0),
+                                egui::pos2(inner.min.x + 4.0, action_band.max.y + 1.0),
                                 Align2::LEFT_TOP,
                                 "wheel: zoom · drag: pan · Esc close",
                                 FontId::proportional(11.0),
@@ -2646,7 +2679,7 @@ impl DiffCompare {
                         },
                     );
                     ui.painter().text(
-                        egui::pos2(inner.min.x + 4.0, viewport.max.y + 2.0),
+                        egui::pos2(inner.min.x + 4.0, action_band.max.y + 1.0),
                         Align2::LEFT_TOP,
                         "wheel: zoom · drag: pan · Space flicker/swap · Esc close",
                         FontId::proportional(11.0),
@@ -2684,49 +2717,205 @@ impl DiffCompare {
                     }
                 }
 
-                // Facts + actions: one title per side, above its own image.
+                // The read-only facts strip up top, then the fixed action bar
+                // along the bottom. Each side keeps a *fixed* half (not flow
+                // layout), so B's block never drifts when A's is short.
                 let strip = Rect::from_min_max(
                     egui::pos2(inner.min.x, titles_top),
                     egui::pos2(inner.max.x, titles_top + TITLE_H),
                 );
-                // Each side gets a *fixed* half of the strip, aligned with the
-                // pane below it. Flow layout advanced by the other side's used
-                // width, so B's facts drifted mid-window when A's were narrow.
                 let col_w = (strip.width() - 16.0) * 0.5;
                 // In flicker the viewer is single-file: only the shown side (A or
-                // B) carries chrome, full-width, and SWAP flips the image and this
-                // chrome to the other side together — so there is no hidden-side
-                // control to click by accident.
+                // B) carries chrome, full-width, and SWAP flips it across — so
+                // there is no hidden-side control to click by accident.
                 let flicker_active = self.compare.flicker && two_sided && tab_is_media;
                 let shown_is_left = !self.compare.show_b;
-                for is_left in [true, false] {
-                    if !is_left && !two_sided {
-                        continue;
-                    }
-                    if flicker_active && is_left != shown_is_left {
-                        continue;
-                    }
+                let sides: &[bool] = if !two_sided {
+                    &[true]
+                } else if flicker_active {
+                    if shown_is_left { &[true] } else { &[false] }
+                } else {
+                    &[true, false]
+                };
+                // One side's fixed half within a band (the top strip or the
+                // bottom action bar), aligned with the image pane between them.
+                let side_half = |band: Rect, is_left: bool| -> Rect {
                     let full = !two_sided || flicker_active;
-                    let half = if full { strip.width() } else { col_w };
+                    let half = if full { band.width() } else { col_w };
                     let x0 = if full || is_left {
-                        strip.min.x
+                        band.min.x
                     } else {
-                        strip.min.x + col_w + 16.0
+                        band.min.x + col_w + 16.0
                     };
-                    let half_rect = Rect::from_min_size(
-                        egui::pos2(x0, strip.min.y),
-                        egui::vec2(half, strip.height()),
-                    );
+                    Rect::from_min_size(egui::pos2(x0, band.min.y), egui::vec2(half, band.height()))
+                };
+
+                // Top: read-only identity, one block per side.
+                for &is_left in sides {
                     let (side, other) = if is_left {
                         (&self.left, &self.right)
                     } else {
                         (&self.right, &self.left)
                     };
+                    ui.scope_builder(
+                        UiBuilder::new()
+                            .max_rect(side_half(strip, is_left))
+                            .layout(Layout::top_down(Align::Min)),
+                        |ui| side_strip(ui, side, other, is_left),
+                    );
+                }
+
+                // Bottom: the fixed action bar per side — navigate · tools ·
+                // delete. Navigation is left-edge-anchored and the destructive
+                // action is inset from the right edge, so the two controls you
+                // must not confuse sit at opposite ends and never move under the
+                // cursor, whatever the filename's length.
+                for &is_left in sides {
+                    // The Archive tab owns the whole viewport with its own
+                    // controls (extract / unlock); it carries no per-side action
+                    // bar, matching the pre-refactor behavior.
+                    if self.tab == RepresentationKind::Archive {
+                        continue;
+                    }
+                    let bar = side_half(action_band, is_left);
+                    // Split the bar into a left region (navigate + tools) and a
+                    // right region (the destructive action), with a gap between,
+                    // so the two groups can never overlap in a narrow window —
+                    // the destructive control is never buried under the tools
+                    // (the right_to_left overlap trap this layout must avoid).
+                    let del_w = (bar.width() * 0.42).min(240.0);
+                    let nav_rect =
+                        Rect::from_min_max(bar.min, egui::pos2(bar.max.x - del_w - 8.0, bar.max.y));
+                    let del_rect =
+                        Rect::from_min_max(egui::pos2(bar.max.x - del_w, bar.min.y), bar.max);
+                    let side = if is_left { &self.left } else { &self.right };
+                    let label = if is_left { "A" } else { "B" };
                     let can_step = if is_left {
                         self.can_step_left()
                     } else {
                         self.can_step_right()
                     };
+                    // Left group: the compact switcher, the pair's similarity,
+                    // then the tab's own tools.
+                    ui.scope_builder(
+                        UiBuilder::new()
+                            .max_rect(nav_rect)
+                            .layout(Layout::left_to_right(Align::Center)),
+                        |ui| {
+                            if can_step {
+                                if ui
+                                    .button(
+                                        RichText::new(crate::icon::CARET_LEFT).color(theme::text()),
+                                    )
+                                    .on_hover_text("Previous candidate for this side")
+                                    .clicked()
+                                {
+                                    step = Some((is_left, -1));
+                                }
+                                if let Some(pos) = self.switcher_label(is_left) {
+                                    ui.label(RichText::new(pos).color(theme::tan()).size(12.0));
+                                }
+                                if ui
+                                    .button(
+                                        RichText::new(crate::icon::CARET_RIGHT)
+                                            .color(theme::text()),
+                                    )
+                                    .on_hover_text("Next candidate for this side")
+                                    .clicked()
+                                {
+                                    step = Some((is_left, 1));
+                                }
+                            }
+                            // The pair's perceptual similarity, shown once (on
+                            // A's bar): why two different-looking files were
+                            // grouped, and how loosely.
+                            if is_left && let Some(sim) = self.similarity {
+                                ui.label(
+                                    RichText::new(format!("A ↔ B  {}", similarity_label(sim)))
+                                        .color(theme::lilac())
+                                        .size(12.0),
+                                );
+                            }
+                            // Tools belong to the tab and to the side they act
+                            // on — available while comparing, since aligning a
+                            // flipped copy is done by looking at both.
+                            if tab_is_image {
+                                let slot = usize::from(!is_left);
+                                let turned = !self.ops[slot].is_empty();
+                                if ui.button(format!("ROTATE {label}")).clicked() {
+                                    turn = Some((is_left, Orient::RotateCw));
+                                }
+                                if ui.button(format!("MIRROR {label}")).clicked() {
+                                    turn = Some((is_left, Orient::FlipH));
+                                }
+                                let long_help = if side.read_only {
+                                    "Save this side's rotation/mirror as a new copy beside the \
+                                     original. This repo is locked, so the original itself can't \
+                                     be overwritten."
+                                } else {
+                                    "Save this side's rotation/mirror to the file — overwriting \
+                                     it in place or as a new copy; you choose next."
+                                };
+                                if turned
+                                    && ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new(format!("SAVE {label}"))
+                                                    .color(theme::ink_on(theme::amber())),
+                                            )
+                                            .fill(theme::amber()),
+                                        )
+                                        .explain(
+                                            verbosity,
+                                            "Write the turned image to disk",
+                                            long_help,
+                                        )
+                                        .clicked()
+                                {
+                                    open_save = Some(is_left);
+                                }
+                            }
+                            if tab_is_audio && player.is_some() {
+                                let slot = usize::from(!is_left);
+                                let has_sound = self.side_has_sound(slot);
+                                if ui
+                                    .add_enabled(
+                                        has_sound,
+                                        egui::Button::new(format!("PLAY {label}")),
+                                    )
+                                    .on_disabled_hover_text("This clip has no audio track.")
+                                    .clicked()
+                                {
+                                    play = Some(is_left);
+                                }
+                                if ui.button("PAUSE").clicked() {
+                                    pause = true;
+                                }
+                                if ui
+                                    .button(format!("SPEED {}×", speed_label))
+                                    .explain(
+                                        verbosity,
+                                        "Change the playback speed",
+                                        "Step through the playback speeds (0.25× – 2×). The pitch \
+                                         is preserved, so a slowed track still sounds like itself.",
+                                    )
+                                    .clicked()
+                                {
+                                    cycle_speed = true;
+                                }
+                                if self.pending_play.is_some() {
+                                    ui.label(
+                                        RichText::new("Preparing audio…")
+                                            .color(theme::lilac())
+                                            .size(11.0),
+                                    );
+                                }
+                            }
+                        },
+                    );
+                    // Right group, in its own region so it can never overlap the
+                    // tools: the destructive action — the caller's mark pill, or
+                    // DIFF's commands.
                     let mark = self.marks[usize::from(!is_left)];
                     let mark_label = if two_sided && !flicker_active {
                         if is_left { "DELETE A" } else { "DELETE B" }
@@ -2736,140 +2925,14 @@ impl DiffCompare {
                     let picked = ui
                         .scope_builder(
                             UiBuilder::new()
-                                .max_rect(half_rect)
-                                .layout(Layout::left_to_right(Align::Min)),
+                                .max_rect(del_rect)
+                                .layout(Layout::right_to_left(Align::Center)),
                             |ui| {
-                                let picked = side_strip(
-                                    ui,
-                                    side,
-                                    other,
-                                    is_left,
-                                    verbosity,
-                                    mark.map(|m| (mark_label, m)),
-                                    self.tab != RepresentationKind::Archive,
-                                );
-                                // The switcher belongs to its side, and is
-                                // offered only when that side has somewhere
-                                // to go — a pair shows none at all, so it can
-                                // never land on the file the other side has.
-                                let label = if is_left { "A" } else { "B" };
-                                // The control rows stack beside the facts:
-                                // one row chained after another was what
-                                // clipped the rightmost tool off the edge.
-                                ui.vertical(|ui| {
-                                    if can_step {
-                                        let position = self.switcher_label(is_left);
-                                        ui.horizontal(|ui| {
-                                            if ui.button(format!("< PREV {label}")).clicked() {
-                                                step = Some((is_left, -1));
-                                            }
-                                            if let Some(pos) = position {
-                                                ui.label(RichText::new(pos).color(theme::tan()));
-                                            }
-                                            if ui.button(format!("NEXT {label} >")).clicked() {
-                                                step = Some((is_left, 1));
-                                            }
-                                        });
-                                    }
-                                    // Tools belong to the tab, and to the
-                                    // side they act on. Available while
-                                    // comparing — aligning a flipped copy
-                                    // is done by looking at both.
-                                    if tab_is_image {
-                                        let slot = usize::from(!is_left);
-                                        let turned = !self.ops[slot].is_empty();
-                                        ui.horizontal(|ui| {
-                                            if ui.button(format!("ROTATE {label}")).clicked() {
-                                                turn = Some((is_left, Orient::RotateCw));
-                                            }
-                                            if ui.button(format!("MIRROR {label}")).clicked() {
-                                                turn = Some((is_left, Orient::FlipH));
-                                            }
-                                            // A pending turn can always be
-                                            // written — as a new copy even on a
-                                            // locked side (that only adds a
-                                            // file); overwriting the original is
-                                            // the part a lock gates, decided in
-                                            // the save dialog.
-                                            let long_help = if side.read_only {
-                                                "Save this side's rotation/mirror as a new copy \
-                                                 beside the original. This repo is locked, so the \
-                                                 original itself can't be overwritten."
-                                            } else {
-                                                "Save this side's rotation/mirror to the file — \
-                                                 overwriting it in place or as a new copy; you \
-                                                 choose next."
-                                            };
-                                            if turned
-                                                && ui
-                                                    .add(
-                                                        egui::Button::new(
-                                                            RichText::new(format!("SAVE {label}"))
-                                                                .color(theme::ink_on(
-                                                                    theme::amber(),
-                                                                )),
-                                                        )
-                                                        .fill(theme::amber()),
-                                                    )
-                                                    .explain(
-                                                        verbosity,
-                                                        "Write the turned image to disk",
-                                                        long_help,
-                                                    )
-                                                    .clicked()
-                                            {
-                                                open_save = Some(is_left);
-                                            }
-                                        });
-                                    }
-                                    // Audio transport, per side. The caller
-                                    // owns the player — one audio device,
-                                    // and the tab it belongs to also drives
-                                    // the cards behind.
-                                    if tab_is_audio && player.is_some() {
-                                        let slot = usize::from(!is_left);
-                                        let has_sound = self.side_has_sound(slot);
-                                        ui.horizontal(|ui| {
-                                            if ui
-                                                .add_enabled(
-                                                    has_sound,
-                                                    egui::Button::new(format!("PLAY {label}")),
-                                                )
-                                                .on_disabled_hover_text(
-                                                    "This clip has no audio track.",
-                                                )
-                                                .clicked()
-                                            {
-                                                play = Some(is_left);
-                                            }
-                                            if ui.button("PAUSE").clicked() {
-                                                pause = true;
-                                            }
-                                            if ui
-                                                .button(format!("SPEED {}×", speed_label))
-                                                .explain(
-                                                    verbosity,
-                                                    "Change the playback speed",
-                                                    "Step through the playback speeds \
-                                                     (0.25× – 2×). The pitch is preserved, \
-                                                     so a slowed track still sounds like \
-                                                     itself.",
-                                                )
-                                                .clicked()
-                                            {
-                                                cycle_speed = true;
-                                            }
-                                            if self.pending_play.is_some() {
-                                                ui.label(
-                                                    RichText::new("Preparing audio…")
-                                                        .color(theme::lilac())
-                                                        .size(11.0),
-                                                );
-                                            }
-                                        });
-                                    }
-                                });
-                                picked
+                                // Inset the destructive action from the very
+                                // edge — the edge is the effortless "slam to
+                                // it" target, which delete must not be.
+                                ui.add_space(8.0);
+                                side_actions(ui, is_left, verbosity, mark.map(|m| (mark_label, m)))
                             },
                         )
                         .inner;
@@ -3523,40 +3586,22 @@ fn non_colliding_sidecar(dir: &std::path::Path, name: &str) -> std::path::PathBu
     dest
 }
 
-/// One side's facts (repo, path, size / date / type with the bigger-or-older
-/// value highlighted so the difference reads without comparing both numbers) and
-/// its actions — the caller's own: a deletion-mark pill when `mark` is supplied,
-/// else the DIFF board's OVERWRITE / DELETE commands. Returns the chosen action,
-/// if any.
-fn side_strip(
-    ui: &mut egui::Ui,
-    side: &DiffSide,
-    other: &DiffSide,
-    is_left: bool,
-    verbosity: TooltipVerbosity,
-    mark: Option<(&str, MarkPill)>,
-    actions: bool,
-) -> Option<DiffPick> {
-    let mut pick = None;
+/// One side's read-only identity block: a bordered repo chip, the file name, and
+/// its size / date / type — with the bigger-or-older value highlighted so the
+/// difference reads without comparing both numbers. This is *what the file is*;
+/// every action lives in the fixed bottom bar ([`side_actions`]), so the top
+/// strip never carries a button that a long filename could shove.
+fn side_strip(ui: &mut egui::Ui, side: &DiffSide, other: &DiffSide, is_left: bool) {
     ui.vertical(|ui| {
-        // Prefix the repo name with its identicon, so a side's header is
-        // decorated the same way the Text/Metadata columns' repo chips are —
-        // one repo reads with one identity across every tab.
-        ui.horizontal(|ui| {
-            let (icon_rect, _) =
-                ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-            crate::repo_chip::identicon(ui.painter(), icon_rect, &side.repo);
-            ui.label(
-                RichText::new(&side.repo)
-                    .color(if is_left {
-                        theme::orange()
-                    } else {
-                        theme::blue()
-                    })
-                    .size(14.0)
-                    .strong(),
-            );
-        });
+        // The bordered repo chip — the same widget every other tab's repo
+        // selector uses, so one repo reads with one identity everywhere (the
+        // bare identicon+label here used to be the odd one out, unbordered).
+        let accent = if is_left {
+            theme::orange()
+        } else {
+            theme::blue()
+        };
+        crate::repo_chip::repo_chip(ui, &side.repo, false, accent, false, Some(side.read_only));
         // Truncated: a deep path must not widen this side into the other's half.
         ui.add(
             egui::Label::new(
@@ -3601,53 +3646,72 @@ fn side_strip(
             .color(theme::grey())
             .size(12.0),
         );
-        // Some tabs (Archive) own the whole viewport with their own controls;
-        // the strip then shows identifying facts only, no action buttons.
-        if !actions {
-            return;
+    });
+}
+
+/// One side's actions for the fixed bottom bar: the caller's own — a deletion
+/// mark pill when `mark` is supplied (Duplicates), else the DIFF board's
+/// OVERWRITE OTHER / DELETE commands. Drawn in whatever layout the caller sets
+/// (a right-to-left parent right-aligns it against the pane edge). Returns the
+/// chosen action, if any.
+fn side_actions(
+    ui: &mut egui::Ui,
+    is_left: bool,
+    verbosity: TooltipVerbosity,
+    mark: Option<(&str, MarkPill)>,
+) -> Option<DiffPick> {
+    let mut pick = None;
+    // A caller that supplied marks acts through the pill alone.
+    if let Some((label, pill)) = mark {
+        if crate::lightbox::mark_pill(ui, verbosity, label, pill.marked, pill.markable) {
+            pick = Some(DiffPick::ToggleMark { on_left: is_left });
         }
-        ui.add_space(6.0);
-        // A caller that supplied marks acts through the pill alone.
-        if let Some((label, pill)) = mark {
-            if crate::lightbox::mark_pill(ui, verbosity, label, pill.marked, pill.markable) {
-                pick = Some(DiffPick::ToggleMark { on_left: is_left });
-            }
-            return;
+        return pick;
+    }
+    ui.horizontal(|ui| {
+        if ui
+            .add(
+                egui::Button::new(RichText::new("OVERWRITE OTHER").color(theme::black()))
+                    .fill(theme::tan()),
+            )
+            .explain(
+                verbosity,
+                "Replace the other side with this version",
+                "Copy this version over the other repository's file, so both repositories \
+                 hold this one. The other version is gone afterwards.",
+            )
+            .clicked()
+        {
+            pick = Some(DiffPick::Overwrite { from_left: is_left });
         }
-        ui.horizontal(|ui| {
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("OVERWRITE OTHER").color(theme::black()))
-                        .fill(theme::tan()),
-                )
-                .explain(
-                    verbosity,
-                    "Replace the other side with this version",
-                    "Copy this version over the other repository's file, so both repositories \
-                     hold this one. The other version is gone afterwards.",
-                )
-                .clicked()
-            {
-                pick = Some(DiffPick::Overwrite { from_left: is_left });
-            }
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("DELETE").color(theme::ink_on(theme::red())))
-                        .fill(theme::red()),
-                )
-                .explain(
-                    verbosity,
-                    "Delete this version",
-                    "Delete this file from this repository. The other repository's version is \
-                     left alone. This cannot be undone.",
-                )
-                .clicked()
-            {
-                pick = Some(DiffPick::Delete { on_left: is_left });
-            }
-        });
+        if ui
+            .add(
+                egui::Button::new(RichText::new("DELETE").color(theme::ink_on(theme::red())))
+                    .fill(theme::red()),
+            )
+            .explain(
+                verbosity,
+                "Delete this version",
+                "Delete this file from this repository. The other repository's version is \
+                 left alone. This cannot be undone.",
+            )
+            .clicked()
+        {
+            pick = Some(DiffPick::Delete { on_left: is_left });
+        }
     });
     pick
+}
+
+/// Format a 0–1 perceptual similarity as a compact label: `0.94 → "94%"`, and
+/// `≥ 0.995 → "identical"` (visually indistinguishable in practice — the same
+/// vocabulary the Duplicates tab's threshold uses).
+fn similarity_label(similarity: f32) -> String {
+    if similarity >= 0.995 {
+        "identical".to_string()
+    } else {
+        format!("{}%", (similarity.clamp(0.0, 1.0) * 100.0).round() as i32)
+    }
 }
 
 #[cfg(test)]
@@ -3681,6 +3745,20 @@ mod tests {
             "a field only on the right is flagged"
         );
         assert_eq!(diff.len(), 3);
+    }
+
+    /// The per-pair similarity reads as a whole percent, and the near-ceiling
+    /// case as "identical" — the vocabulary that explains why a loosely matched
+    /// pair is grouped without posing as an exact duplicate.
+    #[test]
+    fn similarity_label_reads_as_percent_and_identical() {
+        assert_eq!(similarity_label(0.94), "94%");
+        assert_eq!(similarity_label(0.601), "60%");
+        assert_eq!(similarity_label(0.995), "identical");
+        assert_eq!(similarity_label(1.0), "identical");
+        // Out-of-range input clamps rather than printing nonsense.
+        assert_eq!(similarity_label(1.4), "identical");
+        assert_eq!(similarity_label(-0.3), "0%");
     }
 
     /// The sidecar is human-readable: a header naming the file, then `Tag: value`
@@ -4766,15 +4844,17 @@ mod tests {
         ));
 
         assert_eq!(
-            h.query_all_by_label_contains("NEXT").count(),
+            h.query_all_by_label(crate::icon::CARET_RIGHT).count(),
             2,
-            "one forward control per side"
+            "one compact forward caret per side"
         );
         assert_eq!(
-            h.query_all_by_label_contains("PREV").count(),
+            h.query_all_by_label(crate::icon::CARET_LEFT).count(),
             2,
-            "and one back control per side"
+            "and one back caret per side"
         );
+        // The loud PREV/NEXT pills are gone.
+        assert_eq!(h.query_all_by_label_contains("NEXT").count(), 0);
     }
 
     /// Presence is not function: the control must actually move its side, and
@@ -4793,7 +4873,11 @@ mod tests {
             pool,
         ));
 
-        h.get_by_label_contains("NEXT A").click();
+        // A's forward caret is the first one drawn (A's bar, left to right).
+        {
+            let carets: Vec<_> = h.query_all_by_label(crate::icon::CARET_RIGHT).collect();
+            carets[0].click();
+        }
         h.run();
 
         assert_eq!(
@@ -4852,14 +4936,15 @@ mod tests {
             h.query_by_label("<1 / 2>").is_some(),
             "a single view of a two-copy group offers the switcher"
         );
-        h.get_by_label_contains("NEXT A").click();
+        // Single view → exactly one forward caret, so it is unambiguous.
+        h.get_by_label(crate::icon::CARET_RIGHT).click();
         h.run();
         assert_eq!(h.state().left.rel_path, "b.jpg", "the step lands");
         assert!(
             h.query_by_label("<2 / 2>").is_some(),
             "and the switcher is still there, at the new position"
         );
-        h.get_by_label_contains("NEXT A").click();
+        h.get_by_label(crate::icon::CARET_RIGHT).click();
         h.run();
         assert_eq!(
             h.state().left.rel_path,
@@ -4871,7 +4956,7 @@ mod tests {
         h.get_by_label_contains("SHOW B").click();
         h.run();
         assert_eq!(
-            h.query_all_by_label_contains("NEXT").count(),
+            h.query_all_by_label(crate::icon::CARET_RIGHT).count(),
             0,
             "a two-sided pair offers no switcher at all"
         );
@@ -5163,6 +5248,63 @@ mod tests {
         assert!(
             (other.center().y - first.center().y).abs() < 2.0,
             "tabs share a baseline rather than drifting: {other:?} vs {first:?}"
+        );
+    }
+
+    /// The bottom action bar keeps navigation and the destructive action in
+    /// separate regions: even in a narrow window the DELETE pill stays inside
+    /// the window and never overlaps the side's navigation caret — the fixed
+    /// layout that makes a mis-click between "next" and "delete" impossible.
+    #[test]
+    fn action_bar_keeps_delete_inside_the_window_and_clear_of_nav() {
+        use egui_kittest::kittest::Queryable;
+        let width = 820.0;
+        let mut init = false;
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(width, 700.0))
+            .build_ui_state(
+                move |ui, cmp: &mut DiffCompare| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    // Marks make the destructive control the DELETE A / DELETE B
+                    // pill (rather than the DIFF commands), so it is unambiguous.
+                    let pill = MarkPill {
+                        marked: false,
+                        markable: true,
+                    };
+                    cmp.set_marks(Some(pill), Some(pill));
+                    cmp.view(&ui.ctx().clone(), TooltipVerbosity::default(), None);
+                },
+                DiffCompare::new_with_pool(
+                    named_side("a.jpg"),
+                    Some(named_side("b.jpg")),
+                    vec![
+                        named_side("a.jpg"),
+                        named_side("b.jpg"),
+                        named_side("c.jpg"),
+                    ],
+                ),
+            );
+        h.run();
+
+        let del_a = h.get_by_label_contains("DELETE A").rect();
+        assert!(
+            del_a.max.x <= width && del_a.min.x >= 0.0,
+            "DELETE A stays inside the {width}px window: {del_a:?}"
+        );
+        // A's forward caret (the first one drawn) is the nav control; it must
+        // sit entirely left of DELETE A, never overlapping it.
+        let caret_a = h
+            .query_all_by_label(crate::icon::CARET_RIGHT)
+            .next()
+            .expect("A has a forward caret")
+            .rect();
+        assert!(
+            caret_a.max.x <= del_a.min.x,
+            "the nav caret is clear of the DELETE pill: caret {caret_a:?} vs delete {del_a:?}"
         );
     }
 
@@ -5619,7 +5761,11 @@ mod tests {
         );
 
         for expected in ["<2 / 3>", "<3 / 3>", "<1 / 3>"] {
-            h.get_by_label_contains("NEXT B").click();
+            // B's forward caret is the second one drawn (A's bar, then B's).
+            {
+                let carets: Vec<_> = h.query_all_by_label(crate::icon::CARET_RIGHT).collect();
+                carets[1].click();
+            }
             h.run();
             assert!(
                 h.query_all_by_label(expected).count() > 0,

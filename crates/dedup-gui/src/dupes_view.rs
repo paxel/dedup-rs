@@ -205,6 +205,13 @@ pub struct DupesView {
     /// The open shared viewer ([`crate::compare_view::DiffCompare`]), if any —
     /// the same full-window surface every other caller opens.
     lightbox: Option<crate::compare_view::DiffCompare>,
+    /// The group the open viewer is showing, kept for a SIMILAR search so the
+    /// viewer can be told the *shown pair's* perceptual similarity as the sides
+    /// step. Empty for exact-duplicate results.
+    lightbox_group: DupeGroup,
+    /// Cache of the shown pair's similarity, so it is computed only when the
+    /// sides change rather than every repaint: `(pair hashes, score)`.
+    lightbox_sim: Option<((String, String), Option<f32>)>,
     /// Global audio preview player (one file at a time).
     player: Player,
     /// Tooltip wording for this frame, set at the top of [`Self::show`] from
@@ -248,6 +255,8 @@ impl DupesView {
             confirm: None,
             thumbs: ThumbCache::new(3),
             lightbox: None,
+            lightbox_group: Vec::new(),
+            lightbox_sim: None,
             player: Player::new(),
             verbosity: TooltipVerbosity::default(),
             filter: FilterBuilder::new(),
@@ -1403,6 +1412,41 @@ impl DupesView {
             return;
         };
         lb.set_marks(Some(l_mark), Some(r_mark));
+        // For a SIMILAR search, tell the viewer the shown pair's actual
+        // perceptual similarity, so `A ↔ B N%` explains why two files were
+        // grouped (and how loosely). Computed only when the pair changes (the
+        // viewer repaints continuously), and cleared when one side shows or for
+        // exact-duplicate results (empty group).
+        let pair = lb.shown_pair();
+        let sim = match (&pair, &self.lightbox_sim) {
+            // Same pair as last frame — reuse the cached score.
+            (Some(p), Some((cached, score))) if p == cached => *score,
+            (Some(p), _) => {
+                let entry = |h: &str| {
+                    self.lightbox_group
+                        .iter()
+                        .find(|f| dedup_core::thumbnail::hash_hex(&f.entry.hash) == h)
+                        .map(|f| &f.entry)
+                };
+                let score = entry(&p.0).zip(entry(&p.1)).and_then(|(a, b)| {
+                    let pct = match (a.img_fingerprint, b.img_fingerprint) {
+                        (Some(fa), Some(fb)) => dedup_core::similar::similarity_img(&fa, &fb),
+                        _ => match (a.video_hash, b.video_hash) {
+                            (Some(fa), Some(fb)) => dedup_core::similar::similarity_video(&fa, &fb),
+                            _ => return None,
+                        },
+                    };
+                    Some((pct / 100.0) as f32)
+                });
+                self.lightbox_sim = Some((p.clone(), score));
+                score
+            }
+            (None, _) => {
+                self.lightbox_sim = None;
+                None
+            }
+        };
+        lb.set_similarity(sim);
         match lb.view(ctx, verbosity, Some(&self.player)) {
             Some(crate::compare_view::DiffPick::ToggleMark { on_left }) => {
                 let side = if on_left { &lb.left } else { &lb.right };
@@ -1533,7 +1577,31 @@ impl DupesView {
                         pool,
                     );
                     lb.hide_second();
-                    lb.set_title("COMPARE — DUPLICATE GROUP");
+                    // Say which kind of match this is: exact duplicates, or a
+                    // SIMILAR search at the current threshold (so a loosely
+                    // grouped pair never poses as a byte-for-byte duplicate).
+                    if matches!(self.results, Some(Results::Similar(_))) {
+                        // The percent threshold only governs *perceptual* (image
+                        // / video) matches. PDF and audio similar groups form by
+                        // exact text-hash / duration, so naming a percentage
+                        // there would assert something false — omit it.
+                        let perceptual = group[fi].entry.img_fingerprint.is_some()
+                            || group[fi].entry.video_hash.is_some();
+                        if perceptual {
+                            lb.set_title(format!(
+                                "COMPARE — SIMILAR GROUP (≥ {}%)",
+                                self.threshold.round() as i32
+                            ));
+                        } else {
+                            lb.set_title("COMPARE — SIMILAR GROUP");
+                        }
+                        // Keep the group's entries so the viewer can be told the
+                        // shown pair's actual similarity as the sides change.
+                        self.lightbox_group = group.clone();
+                    } else {
+                        lb.set_title("COMPARE — DUPLICATE GROUP");
+                        self.lightbox_group.clear();
+                    }
                     self.lightbox = Some(lb);
                 }
             }
@@ -3715,7 +3783,13 @@ mod ui_tests {
         // Walk it: each step must land on a new label and wrap after the third,
         // rather than repeating every second click as reported.
         for expected in ["<2 / 3>", "<3 / 3>", "<1 / 3>"] {
-            harness.get_by_label_contains("NEXT B").click();
+            // B's forward caret is the second one drawn (A's bar, then B's).
+            {
+                let carets: Vec<_> = harness
+                    .query_all_by_label(crate::icon::CARET_RIGHT)
+                    .collect();
+                carets[1].click();
+            }
             // Settle until the new candidate fully resolves — the target label
             // present and the member-count labels gone — rather than a fixed
             // step count: under parallel decode load a handful of frames isn't
@@ -4886,56 +4960,7 @@ mod ui_tests {
         let dir = tempfile::tempdir().unwrap();
         // Dedicated cache so the test never writes into the user's real one.
         dedup_core::thumbnail::set_cache_dir(dir.path().join("thumbs"));
-        // Real photos when doc media is available (the A/B compare then shows
-        // genuine images, not gradients); synthetic gradients otherwise.
-        let real: [&str; 3] = [
-            "IMG_2019_field.jpg",
-            "wallpaper_spacehulk.jpg",
-            "bebop_blue.jpg",
-        ];
-        let mut group: DupeGroup = Vec::new();
-        for i in 0..3u8 {
-            let (rel, real_ok) = if crate::doc_media::available() {
-                let name = real[i as usize];
-                (
-                    name.to_string(),
-                    crate::doc_media::place(name, &dir.path().join(name)),
-                )
-            } else {
-                (format!("photo{i}.png"), false)
-            };
-            let path = dir.path().join(&rel);
-            if !real_ok {
-                image::RgbImage::from_fn(640, 480, |x, y| {
-                    image::Rgb([x as u8, y as u8, (i as u32 * 60) as u8])
-                })
-                .save(&path)
-                .unwrap();
-            }
-            let mut hash = [0u8; 32];
-            hash[0] = i;
-            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(1000);
-            group.push(DupeFile {
-                repo: "r".into(),
-                repo_root: dir.path().to_string_lossy().into_owned(),
-                rel_path: rel,
-                entry: dedup_core::store::FileEntry {
-                    size,
-                    hash,
-                    modified_ms: 0,
-                    missing: false,
-                    mime: Some(if real_ok { "image/jpeg" } else { "image/png" }.into()),
-                    img_fingerprint: None,
-                    video_hash: None,
-                    pdf_hash: None,
-                    audio: None,
-                    // Real media: let the decoded texture set the aspect.
-                    img_size: (!real_ok).then_some((640, 480)),
-                    origin: None,
-                    exif: None,
-                },
-            });
-        }
+        let group = hero_or_gradient_group(dir.path());
 
         let mut view = DupesView::new();
         view.repos_loaded = true;
@@ -5140,6 +5165,88 @@ mod ui_tests {
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 
+    /// The SIMILAR-compare fixture: a photo and its mirror (a genuine
+    /// near-duplicate the flip-invariant hash scores high, with real
+    /// fingerprints so the viewer shows the pair's `A ↔ B` score) when doc
+    /// media is available; three synthetic gradients otherwise. Shared by the
+    /// A/B-compare doc screenshot and the manual lightbox render.
+    fn hero_or_gradient_group(dir: &Path) -> DupeGroup {
+        let mut group: DupeGroup = Vec::new();
+        let image_entry = |path: &std::path::Path, hash0: u8| {
+            let fp = dedup_core::fingerprint::compute(path, false);
+            dedup_core::store::FileEntry {
+                size: std::fs::metadata(path).map(|m| m.len()).unwrap_or(1000),
+                hash: {
+                    let mut h = [0u8; 32];
+                    h[0] = hash0;
+                    h
+                },
+                modified_ms: 0,
+                missing: false,
+                mime: fp.mime.clone(),
+                img_fingerprint: fp.img_fingerprint,
+                video_hash: None,
+                pdf_hash: None,
+                audio: None,
+                img_size: fp.img_size,
+                origin: None,
+                exif: None,
+            }
+        };
+        if crate::doc_media::available()
+            && crate::doc_media::place("IMG_2019_field.jpg", &dir.join("IMG_2019_field.jpg"))
+        {
+            let orig = dir.join("IMG_2019_field.jpg");
+            let mirror = dir.join("IMG_2019_field (mirror).jpg");
+            if let Ok(img) = image::open(&orig) {
+                img.fliph().save(&mirror).unwrap();
+            }
+            for (rel, path, h0) in [
+                ("IMG_2019_field.jpg", orig, 1u8),
+                ("IMG_2019_field (mirror).jpg", mirror, 2u8),
+            ] {
+                group.push(DupeFile {
+                    repo: "r".into(),
+                    repo_root: dir.to_string_lossy().into_owned(),
+                    rel_path: rel.to_string(),
+                    entry: image_entry(&path, h0),
+                });
+            }
+        } else {
+            for i in 0..3u8 {
+                let rel = format!("photo{i}.png");
+                let path = dir.join(&rel);
+                image::RgbImage::from_fn(640, 480, |x, y| {
+                    image::Rgb([x as u8, y as u8, (i as u32 * 60) as u8])
+                })
+                .save(&path)
+                .unwrap();
+                let mut hash = [0u8; 32];
+                hash[0] = i;
+                group.push(DupeFile {
+                    repo: "r".into(),
+                    repo_root: dir.to_string_lossy().into_owned(),
+                    rel_path: rel,
+                    entry: dedup_core::store::FileEntry {
+                        size: 1000,
+                        hash,
+                        modified_ms: 0,
+                        missing: false,
+                        mime: Some("image/png".into()),
+                        img_fingerprint: None,
+                        video_hash: None,
+                        pdf_hash: None,
+                        audio: None,
+                        img_size: Some((640, 480)),
+                        origin: None,
+                        exif: None,
+                    },
+                });
+            }
+        }
+        group
+    }
+
     /// Doc screenshot: the lightbox in A/B compare (side-by-side) mode to
     /// `docs/screenshots/lightbox_compare.png`. Run with `--ignored`.
     #[test]
@@ -5147,56 +5254,7 @@ mod ui_tests {
     fn doc_screenshot_lightbox_compare() {
         let dir = tempfile::tempdir().unwrap();
         dedup_core::thumbnail::set_cache_dir(dir.path().join("thumbs"));
-        // Real photos when doc media is available (the A/B compare then shows
-        // genuine images, not gradients); synthetic gradients otherwise.
-        let real: [&str; 3] = [
-            "IMG_2019_field.jpg",
-            "wallpaper_spacehulk.jpg",
-            "bebop_blue.jpg",
-        ];
-        let mut group: DupeGroup = Vec::new();
-        for i in 0..3u8 {
-            let (rel, real_ok) = if crate::doc_media::available() {
-                let name = real[i as usize];
-                (
-                    name.to_string(),
-                    crate::doc_media::place(name, &dir.path().join(name)),
-                )
-            } else {
-                (format!("photo{i}.png"), false)
-            };
-            let path = dir.path().join(&rel);
-            if !real_ok {
-                image::RgbImage::from_fn(640, 480, |x, y| {
-                    image::Rgb([x as u8, y as u8, (i as u32 * 60) as u8])
-                })
-                .save(&path)
-                .unwrap();
-            }
-            let mut hash = [0u8; 32];
-            hash[0] = i;
-            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(1000);
-            group.push(DupeFile {
-                repo: "r".into(),
-                repo_root: dir.path().to_string_lossy().into_owned(),
-                rel_path: rel,
-                entry: dedup_core::store::FileEntry {
-                    size,
-                    hash,
-                    modified_ms: 0,
-                    missing: false,
-                    mime: Some(if real_ok { "image/jpeg" } else { "image/png" }.into()),
-                    img_fingerprint: None,
-                    video_hash: None,
-                    pdf_hash: None,
-                    audio: None,
-                    // Real media: let the decoded texture set the aspect.
-                    img_size: (!real_ok).then_some((640, 480)),
-                    origin: None,
-                    exif: None,
-                },
-            });
-        }
+        let group = hero_or_gradient_group(dir.path());
 
         let mut view = DupesView::new();
         view.repos_loaded = true;

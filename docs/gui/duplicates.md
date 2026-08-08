@@ -64,19 +64,32 @@ Browse, the review boards and Transfer's DIFF all land on this one screen, so it
 identically wherever you came from. It opens on the clicked file alone, on the file's own
 representation: a photo on Image, a track on Audio, a document on Text.
 
-![The viewer in A/B compare mode](../screenshots/lightbox_compare.png)
+![The viewer comparing a SIMILAR match: a photo and its mirror](../screenshots/lightbox_compare.png)
+
+**Layout.** The top of each side is a read-only **identity block** — a bordered repo chip, the
+file name, and its size / date / type (the bigger size and older date highlighted) — *what the
+file is*. Every control lives in the **fixed action bar along the bottom**: navigation on the
+left, the tab's tools in the middle, and the destructive action inset at the right — *what you
+can do*. Because the controls sit in fixed slots rather than after the (variable-length) file
+name, a button never shifts under the cursor between deciding and clicking.
+
+**What kind of match.** The title says whether you are looking at exact **duplicates** or a
+**SIMILAR** search, and for a similar search it names the threshold — `SIMILAR GROUP (≥ 90%)`.
+When two files are shown, the action bar also reads the **pair's own similarity**
+(`A ↔ B 99%`), so a loosely-grouped match never poses as a byte-for-byte duplicate. The shot
+above is a similar match — a photo and its horizontal **mirror**, which the flip-invariant
+perceptual hash scores as near-identical; **MIRROR A** flips one side to line the two up.
 
 **Two sides.** SHOW B reveals a second side — another member of the group, never the file
-already shown — and HIDE B returns the first file to the whole screen. Each side carries its
-own identifying facts (repo, path, size, date, type) and its own mark pill: **DELETE** for a
-single file, **DELETE A** / **DELETE B** while both are shown, each toggling only its own
-copy's mark without closing the viewer. A copy in a read-only repository shows a disabled,
-struck-through `… (Protected)` pill instead.
+already shown — and HIDE B returns the first file to the whole screen. Each side's action bar
+carries its own mark pill: **DELETE** for a single file, **DELETE A** / **DELETE B** while both
+are shown, each toggling only its own copy's mark without closing the viewer. A copy in a
+read-only repository shows a disabled, struck-through `… (Protected)` pill instead.
 
-**Switching copies.** With one file shown, the switcher (`< PREV A`, `<1 / 2>`, `NEXT A >`)
-steps through the whole group. With both sides shown, each side's switcher skips the file
-the other side is showing — the two sides can never be the same file — and the position
-counts that side's candidates, never the group size; a two-copy group then offers no
+**Switching copies.** With one file shown, a compact switcher (`‹ 1 / 2 ›`, the arrows the
+click targets) steps through the whole group. With both sides shown, each side's switcher skips
+the file the other side is showing — the two sides can never be the same file — and the
+position counts that side's candidates, never the group size; a two-copy group then offers no
 switcher at all, because the only other candidate is already on the other side.
 
 ### Representation tabs

@@ -125,10 +125,16 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   of the place you came from: the Duplicates tab offers its DELETE / DELETE A / DELETE B mark
   pills, the DIFF board its OVERWRITE/DELETE commands. A file opens **alone**, filling the
   whole screen; **SHOW B** reveals a second side — always another candidate, never the file
-  already shown — and **HIDE B** returns. With one file shown the switcher walks the whole
-  group or listing; with two, each side's switcher (`< PREV A`, `<1 / 3>`, `NEXT A >`) skips
-  the file the other side shows, and its position counts that side's candidates, never the group
-  size. **Flicker is single-file focus** — one file's facts and its rotate/mirror/save/delete,
+  already shown — and **HIDE B** returns. Each side's top is a **read-only identity block**
+  (bordered repo chip, name, size/date/type), and every control sits in a **fixed action bar
+  along the bottom** — navigate on the left, tools in the middle, the destructive action inset
+  at the right — so a button never shifts under the cursor as the file name changes. With one
+  file shown a compact switcher (`‹ 1 / 2 ›`) walks the whole group or listing; with two, each
+  side's switcher skips the file the other side shows, and its position counts that side's
+  candidates, never the group size. The title says whether you are comparing exact
+  **duplicates** or a **SIMILAR** search (naming the threshold for a perceptual one), and a
+  similar pair shows its own **`A ↔ B N%`** score so a loose match never poses as a byte-for-byte
+  duplicate. **Flicker is single-file focus** — one file's facts and its rotate/mirror/save/delete,
   never both — and **SWAP** flips the image and all of that chrome together; the two panes of a
   byte comparison are **scroll-locked** to the same offset.
 - **A locked ("Protected") repo lets you save a corrected copy.** The lock protects existing
