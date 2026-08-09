@@ -157,7 +157,14 @@ impl Diagnostics {
     pub fn full_report(&self, log_tail: Option<&str>) -> String {
         let inner = self.lock();
         let mut s = String::from("dedup diagnostics report\n========================\n\n");
-        for e in &inner.events {
+        // Critical first, matching the on-screen order (`events`), so the pasted
+        // report reads the same way the user saw it.
+        let mut ordered: Vec<&Stored> = inner.events.iter().collect();
+        ordered.sort_by_key(|e| match e.severity {
+            Severity::Critical => 0,
+            Severity::Warning => 1,
+        });
+        for e in ordered {
             let n = if e.count > 1 {
                 format!(" (x{})", e.count)
             } else {
@@ -183,43 +190,65 @@ impl Diagnostics {
     }
 }
 
-/// Gather a one-line-per-fact system fingerprint for bug reports: the app
-/// version, platform, and which external tools / devices are available. Cheap
-/// probes (each shells out once); called at startup.
-pub fn system_fingerprint(audio_device: bool) -> String {
-    let tool = |name: &str, arg: &str| -> String {
-        match std::process::Command::new(name).arg(arg).output() {
-            Ok(o) if o.status.success() => {
-                let text = String::from_utf8_lossy(&o.stdout);
-                let first = text.lines().next().unwrap_or("").trim();
-                if first.is_empty() {
-                    "present".into()
-                } else {
-                    first.to_string()
-                }
-            }
-            _ => "not found".into(),
+/// The result of the one-time environment probe: availability flags for the
+/// startup warnings, plus a bug-report fingerprint.
+pub struct SystemProbe {
+    pub fingerprint: String,
+    pub audio_ok: bool,
+    pub ffmpeg_ok: bool,
+    pub pdftoppm_ok: bool,
+}
+
+/// Probe the environment **once** — the audio device and each external tool
+/// spawned a single time — and build both the availability flags and the
+/// one-line-per-fact fingerprint. Does blocking device init and process spawns,
+/// so call it **off the UI thread** (it must never run in a paint frame).
+pub fn probe_system() -> SystemProbe {
+    // Run a tool once; `Some(version-line)` means available.
+    let tool = |name: &str, arg: &str| -> Option<String> {
+        let out = std::process::Command::new(name).arg(arg).output().ok()?;
+        if !out.status.success() {
+            return None;
         }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let line = stdout
+            .lines()
+            .next()
+            .or_else(|| stderr.lines().next())
+            .unwrap_or("")
+            .trim();
+        Some(if line.is_empty() {
+            "present".to_string()
+        } else {
+            line.to_string()
+        })
     };
-    let mut s = String::new();
-    s.push_str(&format!("dedup: {}\n", env!("CARGO_PKG_VERSION")));
-    s.push_str(&format!(
-        "os: {} {}\n",
+    let audio_ok = rodio::OutputStream::try_default().is_ok();
+    let ffmpeg = tool("ffmpeg", "-version");
+    let ffprobe = tool("ffprobe", "-version");
+    let pdftoppm = tool("pdftoppm", "-v");
+    let line = |o: &Option<String>| o.clone().unwrap_or_else(|| "not found".to_string());
+    let fingerprint = format!(
+        "dedup: {}\nos: {} {}\naudio output: {}\nffmpeg: {}\nffprobe: {}\npdftoppm: {}\n",
+        env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
-        std::env::consts::ARCH
-    ));
-    s.push_str(&format!(
-        "audio output: {}\n",
-        if audio_device {
+        std::env::consts::ARCH,
+        if audio_ok {
             "available"
         } else {
             "none (playback disabled)"
-        }
-    ));
-    s.push_str(&format!("ffmpeg: {}\n", tool("ffmpeg", "-version")));
-    s.push_str(&format!("ffprobe: {}\n", tool("ffprobe", "-version")));
-    s.push_str(&format!("pdftoppm: {}\n", tool("pdftoppm", "-v")));
-    s
+        },
+        line(&ffmpeg),
+        line(&ffprobe),
+        line(&pdftoppm),
+    );
+    SystemProbe {
+        fingerprint,
+        audio_ok,
+        ffmpeg_ok: ffmpeg.is_some(),
+        pdftoppm_ok: pdftoppm.is_some(),
+    }
 }
 
 #[cfg(test)]

@@ -525,7 +525,10 @@ pub fn draw_columns<T>(ui: &mut egui::Ui, shared: &mut T, cols: Vec<ColumnFn<'_,
     if n == 0 {
         return;
     }
-    let full = ui.max_rect();
+    // Start from the current cursor (not the top of the ui), so anything drawn
+    // before the columns — e.g. the Metadata tab's tag-save error — stays above
+    // them instead of being painted over.
+    let full = ui.available_rect_before_wrap();
     let col_w = (full.width() - COLUMN_GAP * (n as f32 - 1.0)) / n as f32;
     for (i, col) in cols.into_iter().enumerate() {
         let x0 = full.min.x + i as f32 * (col_w + COLUMN_GAP);

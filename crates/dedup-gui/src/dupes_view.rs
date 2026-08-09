@@ -5292,11 +5292,14 @@ mod ui_tests {
         harness.run();
         harness.get_by_label_contains("SHOW B").click();
         // Both sides decode off-thread; pump enough for the larger side too.
+        // `step()` (not `run()`) here: a decode completing mid-frame requests a
+        // repaint, which `run()` would treat as "not settled" and abort on its
+        // 4-step budget — the rest of the file's decode-pumping tests use step.
         for _ in 0..40 {
-            harness.run();
+            harness.step();
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        harness.run();
+        harness.step();
         let img = harness.render().expect("wgpu render failed");
         let out = doc_screenshot_path("lightbox_compare.png");
         img.save(&out).expect("save png");

@@ -60,19 +60,19 @@ impl DiffSide {
 
     /// Whether this side's file is actually on disk right now. A repo on an
     /// unmounted drive (a closed pcloud, an ejected disk) still has index
-    /// entries, but the paths 404 — so guard before decode/preview/open.
+    /// entries, but the paths 404 — so guard before decode/preview/open. This
+    /// does a filesystem `stat`, so it is probed **once** (at decode time and
+    /// cached), never per render frame — a `stat` on a hung mount would freeze
+    /// the UI thread every frame.
     pub fn present(&self) -> bool {
         self.facts.abs_path.exists()
     }
 
-    /// What to say when there is no picture to show — distinguishing a file that
-    /// is simply not previewable (a document on the Image tab) from one that is
-    /// *gone* (its drive disconnected), so a dropped mount reads as exactly that
-    /// rather than a blank, broken-looking pane.
+    /// What to say when there is no picture to show — the type this pane can't
+    /// preview (a document on the Image tab). The distinct "file is gone" note
+    /// is chosen by the viewer from a cached presence flag, not here, so this
+    /// never touches the filesystem.
     pub fn placeholder(&self) -> String {
-        if !self.present() {
-            return "This file isn't present — its drive may be disconnected.".to_string();
-        }
         match self.facts.mime.as_deref() {
             Some(mime) => format!("no preview for {mime}"),
             None => "no preview for this file type".to_string(),
@@ -247,6 +247,10 @@ pub(crate) struct DiffCompare {
     tex: [Option<TextureHandle>; 2],
     /// Whether that side's decode has come back (successfully or not).
     settled: [bool; 2],
+    /// Whether each side's file was on disk at decode time — probed once (a
+    /// `stat`), never per frame, so a hung/disconnected mount can't freeze the
+    /// UI. Drives the "this file isn't present" note.
+    present: [bool; 2],
     tx: Sender<DiffLoaded>,
     rx: Receiver<DiffLoaded>,
     started: bool,
@@ -397,6 +401,7 @@ impl DiffCompare {
             compare,
             tex: [None, None],
             settled: [false, false],
+            present: [true, true],
             tx,
             rx,
             started: false,
@@ -1009,6 +1014,17 @@ impl DiffCompare {
         }
     }
 
+    /// The note for a pane with nothing to show. A file that was gone at decode
+    /// time (cached presence, never re-statted) reads as "isn't present"; every
+    /// other case names the type this pane can't preview.
+    fn no_preview_text(&self, slot: usize) -> String {
+        if !self.present[slot] {
+            return "This file isn't present — its drive may be disconnected.".to_string();
+        }
+        let side = if slot == 0 { &self.left } else { &self.right };
+        side.placeholder()
+    }
+
     /// The texture behind `slot` on the *current tab*. The Audio tab of a
     /// video side compares the soundtrack's spectrogram; every other case uses
     /// the side's primary texture (image, audio-file spectrogram).
@@ -1064,11 +1080,15 @@ impl DiffCompare {
         let side = if is_left { &self.left } else { &self.right };
         // A file whose drive has gone (unmounted mount, ejected disk) has no
         // bytes to decode — settle immediately so the pane shows the "not
-        // present" note instead of spinning a decode that will only fail.
-        if !side.present() {
+        // present" note instead of spinning a decode that will only fail. Probe
+        // presence once here and cache it; the render path must never `stat`.
+        let present = side.present();
+        self.present[slot] = present;
+        if !present {
             self.settled[slot] = true;
             return;
         }
+        let side = if is_left { &self.left } else { &self.right };
         if side.facts.is_video() {
             // A video has no single primary still any more — the Video tab
             // draws the filmstrip, the Audio tab the extracted soundtrack's
@@ -1246,7 +1266,7 @@ impl DiffCompare {
             ui.painter().text(
                 pane.center(),
                 Align2::CENTER_CENTER,
-                side.placeholder(),
+                self.no_preview_text(slot),
                 FontId::proportional(14.0),
                 theme::tan(),
             );
@@ -2663,7 +2683,7 @@ impl DiffCompare {
                             let text = if note == SlotState::Decoding {
                                 "decoding…".to_string()
                             } else {
-                                self.left.placeholder()
+                                self.no_preview_text(0)
                             };
                             ui.painter().text(
                                 viewport.center(),
@@ -2713,11 +2733,10 @@ impl DiffCompare {
                                 draw_in_pane(ui, pane, rect, &tex);
                             }
                             note => {
-                                let side = if slot == 0 { &self.left } else { &self.right };
                                 let text = if note == SlotState::Decoding {
                                     "decoding…".to_string()
                                 } else {
-                                    side.placeholder()
+                                    self.no_preview_text(slot)
                                 };
                                 ui.painter().text(
                                     pane.center(),
@@ -2773,7 +2792,7 @@ impl DiffCompare {
                     ui.painter().vline(
                         x,
                         titles_top..=action_band.min.y,
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(64)),
+                        egui::Stroke::new(1.0, theme::hairline()),
                     );
                 }
 
@@ -6304,13 +6323,25 @@ mod tests {
         assert!(present(None, "b.bin").placeholder().contains("file type"));
 
         // A file that isn't on disk (a disconnected drive) reads as gone, not
-        // as an un-previewable type.
+        // as an un-previewable type. The viewer probes presence once (in
+        // `spawn_decode`) and caches it; the pane's note then comes from
+        // `no_preview_text`, which says "isn't present" rather than naming a
+        // type it could otherwise have previewed.
         let gone = diff_side(Some("application/pdf"));
-        assert!(!gone.present());
+        assert!(!gone.present(), "the default fixture path is not on disk");
+        let mut cmp = DiffCompare::new(diff_side(Some("image/jpeg")), gone);
+        cmp.present[1] = false;
         assert!(
-            gone.placeholder().to_lowercase().contains("isn't present"),
+            cmp.no_preview_text(1).to_lowercase().contains("isn't present"),
             "a missing file says so: {:?}",
-            gone.placeholder()
+            cmp.no_preview_text(1)
+        );
+        // A present-but-un-previewable file still names its type.
+        cmp.present[1] = true;
+        assert!(
+            cmp.no_preview_text(1).contains("application/pdf"),
+            "a present document names the type it cannot preview: {:?}",
+            cmp.no_preview_text(1)
         );
     }
 

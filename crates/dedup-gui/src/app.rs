@@ -863,7 +863,7 @@ impl eframe::App for DedupApp {
         if !self.did_initial_status {
             self.did_initial_status = true;
             self.refresh_status(&ctx);
-            self.probe_environment();
+            self.probe_environment(&ctx);
         }
 
         // Drain worker messages; a completed job updates the repo's row.
@@ -2529,37 +2529,47 @@ impl DedupApp {
     /// Startup health check: probe the audio device and external tools, record
     /// the system fingerprint for bug reports, and file a Warning for anything
     /// unavailable so the Status button can surface it.
-    fn probe_environment(&self) {
+    ///
+    /// The probe blocks (audio device init, one process spawn per tool), so it
+    /// runs on a background thread — never in a paint frame — and requests one
+    /// repaint when it finishes so the Status badge reflects the result. Each
+    /// tool is spawned exactly once (both the availability check and the
+    /// fingerprint reuse the same result).
+    fn probe_environment(&self, ctx: &egui::Context) {
         use crate::diagnostics::Severity::Warning;
-        let audio_ok = rodio::OutputStream::try_default().is_ok();
-        self.diag
-            .set_fingerprint(crate::diagnostics::system_fingerprint(audio_ok));
-        if !audio_ok {
-            self.diag.push(
-                Warning,
-                "audio-device",
-                "No audio output device",
-                "Playback is disabled. On Linux this usually means ALSA/PipeWire isn't running, \
-                 or the machine has no audio device.",
-            );
-        }
-        if !dedup_core::fingerprint::ffmpeg_available() {
-            self.diag.push(
-                Warning,
-                "ffmpeg",
-                "ffmpeg not found on PATH",
-                "Video frames, soundtrack extraction and pitch-preserving playback rates all need \
-                 ffmpeg / ffprobe. Install ffmpeg to enable them.",
-            );
-        }
-        if !dedup_core::render::pdftoppm_available() {
-            self.diag.push(
-                Warning,
-                "pdftoppm",
-                "pdftoppm not found on PATH",
-                "The viewer's PDF Render tab needs pdftoppm (from poppler-utils).",
-            );
-        }
+        let diag = self.diag.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let probe = crate::diagnostics::probe_system();
+            diag.set_fingerprint(probe.fingerprint);
+            if !probe.audio_ok {
+                diag.push(
+                    Warning,
+                    "audio-device",
+                    "No audio output device",
+                    "Playback is disabled. On Linux this usually means ALSA/PipeWire isn't \
+                     running, or the machine has no audio device.",
+                );
+            }
+            if !probe.ffmpeg_ok {
+                diag.push(
+                    Warning,
+                    "ffmpeg",
+                    "ffmpeg not found on PATH",
+                    "Video frames, soundtrack extraction and pitch-preserving playback rates all \
+                     need ffmpeg / ffprobe. Install ffmpeg to enable them.",
+                );
+            }
+            if !probe.pdftoppm_ok {
+                diag.push(
+                    Warning,
+                    "pdftoppm",
+                    "pdftoppm not found on PATH",
+                    "The viewer's PDF Render tab needs pdftoppm (from poppler-utils).",
+                );
+            }
+            ctx.request_repaint();
+        });
     }
 
     /// The Status panel: health Warnings (each copyable for a bug report) and a
