@@ -6277,18 +6277,41 @@ mod tests {
 
     /// A side with a visual (image / video) is compared through the shared
     /// viewer; one without (a document) shows a "no preview" note naming the type
-    /// — not a stuck "decoding…" — and disables compare for the pair.
+    /// — not a stuck "decoding…" — and disables compare for the pair. A file
+    /// whose drive has gone says so instead, distinct from "no preview".
     #[test]
     fn diff_previewability_follows_mime_and_placeholder_names_the_type() {
+        // Previewability is a property of the mime, not the file's presence.
         assert!(diff_side(Some("image/jpeg")).previewable());
         assert!(diff_side(Some("video/mp4")).previewable());
-        let doc = diff_side(Some("application/pdf"));
+
+        // The "no preview, here's the type" note is only right for a file that
+        // *is* present — so the placeholder assertions use real files on disk.
+        let tmp = tempfile::tempdir().unwrap();
+        let present = |mime: Option<&str>, name: &str| {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, b"x").unwrap();
+            let mut s = diff_side(mime);
+            s.facts.abs_path = path;
+            s
+        };
+        let doc = present(Some("application/pdf"), "a.pdf");
         assert!(!doc.previewable(), "a document has no visual to compare");
         assert!(
             doc.placeholder().contains("application/pdf"),
             "the pane names the type it cannot preview"
         );
-        assert!(diff_side(None).placeholder().contains("file type"));
+        assert!(present(None, "b.bin").placeholder().contains("file type"));
+
+        // A file that isn't on disk (a disconnected drive) reads as gone, not
+        // as an un-previewable type.
+        let gone = diff_side(Some("application/pdf"));
+        assert!(!gone.present());
+        assert!(
+            gone.placeholder().to_lowercase().contains("isn't present"),
+            "a missing file says so: {:?}",
+            gone.placeholder()
+        );
     }
 
     /// Two tagged tracks offer the **Metadata** representation from a DIFF row.
