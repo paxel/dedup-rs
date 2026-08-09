@@ -3651,6 +3651,46 @@ fn non_colliding_sidecar(dir: &std::path::Path, name: &str) -> std::path::PathBu
     dest
 }
 
+/// Thickness of the filename frame's right cap and its bottom bar.
+const FRAME_CAP_W: f32 = 8.0;
+const FRAME_FOOT_H: f32 = 4.0;
+
+/// The LCARS "elbow" that underlines a filename: a bar along the bottom that
+/// rises, at the right, into a matching cap — the classic elbow corner. It
+/// carries no title (it is chrome, not a label) and is painted behind the name,
+/// in the side's own accent colour. `rect` is the framed area (the name row plus
+/// the bottom bar).
+fn filename_frame(rect: Rect, accent: egui::Color32) -> Vec<egui::Shape> {
+    const R: u8 = 5; // outer corner radius
+    let right = Rect::from_min_max(egui::pos2(rect.max.x - FRAME_CAP_W, rect.min.y), rect.max);
+    let foot = Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - FRAME_FOOT_H), rect.max);
+    vec![
+        // Bottom bar: rounded on its free left end; the right end runs under the
+        // cap, which overpaints it, so the join reads as a single elbow.
+        egui::Shape::rect_filled(
+            foot,
+            egui::CornerRadius {
+                nw: R,
+                ne: 0,
+                sw: R,
+                se: 0,
+            },
+            accent,
+        ),
+        // Right cap: rounded top-right (free) and bottom-right (the outer elbow).
+        egui::Shape::rect_filled(
+            right,
+            egui::CornerRadius {
+                nw: 0,
+                ne: R,
+                sw: 0,
+                se: R,
+            },
+            accent,
+        ),
+    ]
+}
+
 /// One side's read-only identity block: a bordered repo chip, the file name, and
 /// its size / date / type — with the bigger-or-older value highlighted so the
 /// difference reads without comparing both numbers. This is *what the file is*;
@@ -3669,26 +3709,18 @@ fn side_strip(ui: &mut egui::Ui, side: &DiffSide, other: &DiffSide, is_left: boo
         crate::repo_chip::repo_chip(ui, &side.repo, false, accent, false, Some(side.read_only));
         ui.add_space(3.0);
         // The file name is the headline of the identity block — which file am I
-        // about to act on — bold and a step larger than the facts below, led by
-        // a small LCARS accent cap in the side's colour. A very long name never
-        // grows the layout: it lives in a fixed-width horizontal scroll that
-        // sticks to the *end* (the filename + extension you care about), and the
-        // label is selectable, so you can drag to the front and copy the whole
-        // path.
-        ui.horizontal(|ui| {
-            let (cap, _) = ui.allocate_exact_size(egui::vec2(10.0, 20.0), egui::Sense::hover());
-            ui.painter().rect_filled(
-                cap,
-                egui::CornerRadius {
-                    nw: 9,
-                    sw: 9,
-                    ne: 0,
-                    se: 0,
-                },
-                accent,
-            );
-            ui.add_space(6.0);
-            let name_w = ui.available_width().max(40.0);
+        // about to act on — bold and a step larger than the facts below,
+        // underlined by an LCARS elbow in the side's colour (a bottom bar rising
+        // into a cap on the right). A very long name never grows the layout: it
+        // lives in a fixed-width horizontal scroll — with the right cap reserved
+        // so a long name can't shove it off — that sticks to the *end* (the
+        // filename + extension you care about), and the label is selectable so
+        // you can drag to the front and copy the whole path.
+        let bg = ui.painter().add(egui::Shape::Noop);
+        let full_w = ui.available_width();
+        let row = ui.horizontal(|ui| {
+            ui.add_space(2.0);
+            let name_w = (full_w - FRAME_CAP_W - 10.0).max(40.0);
             egui::ScrollArea::horizontal()
                 .id_salt(("filename", is_left))
                 .max_width(name_w)
@@ -3706,6 +3738,15 @@ fn side_strip(ui: &mut egui::Ui, side: &DiffSide, other: &DiffSide, is_left: boo
                     );
                 });
         });
+        // Span the frame across the whole strip (a short name leaves the row
+        // narrow) and extend it below the text for the bottom bar, then paint it
+        // behind the name.
+        let mut frame = row.response.rect;
+        frame.max.x = frame.min.x + full_w;
+        frame.max.y += FRAME_FOOT_H;
+        ui.painter()
+            .set(bg, egui::Shape::Vec(filename_frame(frame, accent)));
+        ui.add_space(FRAME_FOOT_H + 2.0);
         let size_color = if side.facts.size > other.facts.size {
             theme::green()
         } else {
@@ -6332,7 +6373,9 @@ mod tests {
         let mut cmp = DiffCompare::new(diff_side(Some("image/jpeg")), gone);
         cmp.present[1] = false;
         assert!(
-            cmp.no_preview_text(1).to_lowercase().contains("isn't present"),
+            cmp.no_preview_text(1)
+                .to_lowercase()
+                .contains("isn't present"),
             "a missing file says so: {:?}",
             cmp.no_preview_text(1)
         );
