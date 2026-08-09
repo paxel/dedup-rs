@@ -23,8 +23,30 @@ for a HiDPI display or a projector.
 
 The tab buttons switch views; the current tab is highlighted. On the right:
 
+- **STATUS** opens the health/activity centre (below). Its label carries an amber
+  count when there are unread warnings.
+- **HELP** explains the current tab.
 - **SETTINGS** (cog icon) opens the settings dialog below.
 - **ABOUT** shows the version, license, and contact info.
+
+## Status: warnings and activity
+
+![The Status centre — health warnings and running activity](../screenshots/status_panel.png)
+
+The **Status** button is the one place the app tells you something is wrong or busy —
+so a problem never fails silently. It has two sections:
+
+- **Warnings** — health issues, each **Critical** (red) or **Warning** (amber), never
+  a mere log line. At launch the app probes the things that fail quietly: the **audio
+  output device** (so "no sound, no error" becomes a visible warning), **ffmpeg/ffprobe**
+  (video frames, soundtrack extraction, play-rates), and **pdftoppm** (the Render tab).
+  At runtime, a repository whose folder has gone (a disconnected drive, a closed cloud
+  mount) files one aggregated Critical that clears when it returns. Each warning has a
+  **COPY** button (its message plus a system fingerprint — app version, OS, and which
+  tools/devices are present), and **COPY FULL REPORT** adds every warning and the recent
+  log. Both go to your **clipboard for a bug report — the app sends nothing anywhere**.
+- **Activity** — the heavy background work you can watch and stop: a running or queued
+  **scan** shows here with **CANCEL**, so a long scan can be ended without killing the app.
 
 ## Settings dialog
 

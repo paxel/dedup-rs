@@ -2647,6 +2647,65 @@ impl DedupApp {
                         ui.label(RichText::new(&e.detail).color(theme::text()).size(12.0));
                     });
             }
+
+            // Activity: the heavy background work you can watch and stop — the
+            // answer to "why are the fans blasting?" and the way to end a
+            // runaway scan without killing the whole app.
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new("ACTIVITY")
+                    .color(theme::tan())
+                    .size(13.0)
+                    .strong(),
+            );
+            ui.add_space(4.0);
+            let jobs = self.worker.jobs();
+            if jobs.is_empty() {
+                ui.label(
+                    RichText::new("No background work running.")
+                        .color(theme::grey())
+                        .size(12.0),
+                );
+            } else {
+                let mut cancel: Option<String> = None;
+                for (repo, status, kind) in &jobs {
+                    let verb = match kind {
+                        JobKind::Check => "Checking",
+                        _ => "Scanning",
+                    };
+                    let state = if *status == RepoStatus::Running {
+                        "running"
+                    } else {
+                        "queued"
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("{verb} '{repo}' — {state}"))
+                                .color(theme::text())
+                                .size(12.0),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .button(RichText::new("CANCEL").color(theme::text()))
+                                .on_hover_text("Stop this job. Anything already scanned stays.")
+                                .clicked()
+                            {
+                                cancel = Some(repo.clone());
+                            }
+                        });
+                    });
+                }
+                if let Some(name) = cancel {
+                    // Same path as the repository card's CANCEL: signal a running
+                    // job to stop cooperatively, or drop a still-queued one.
+                    if let Some(token) = self.cancels.get(&name) {
+                        token.cancel();
+                    } else {
+                        self.queue.retain(|(n, _)| n != &name);
+                        self.worker.remove(&name);
+                    }
+                }
+            }
         });
         self.show_status = open;
     }
@@ -3892,6 +3951,67 @@ mod ui_tests {
         harness.run();
         let img = harness.render().expect("wgpu render failed");
         let out = doc_screenshot_path("settings_modal.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// Doc screenshot: the Status centre — health warnings (each copyable) and
+    /// running background work with Cancel — to `docs/screenshots/status_panel.png`.
+    /// `--ignored` (needs wgpu).
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_status_panel() {
+        use crate::diagnostics::Severity::{Critical, Warning};
+        let (_tmp, mut app) = sample_app();
+        app.diag.set_fingerprint(
+            "dedup: 0.1.0\nos: linux x86_64\naudio output: none (playback disabled)\n\
+             ffmpeg: not found\npdftoppm: present",
+        );
+        app.diag.push(
+            Critical,
+            "repo-unreachable:Old Laptop",
+            "Repository 'Old Laptop' is unreachable",
+            "Its folder no longer exists or can't be read — a disconnected drive or an unmounted \
+             cloud folder looks exactly like this. Nothing has been deleted.",
+        );
+        app.diag.push(
+            Warning,
+            "audio-device",
+            "No audio output device",
+            "Playback is disabled. On Linux this usually means ALSA/PipeWire isn't running.",
+        );
+        app.diag.push(
+            Warning,
+            "ffmpeg",
+            "ffmpeg not found on PATH",
+            "Video frames, soundtrack extraction and playback rates need ffmpeg / ffprobe.",
+        );
+        // A running scan so the Activity section shows something to cancel.
+        app.worker.mark_queued("Automatic Upload", JobKind::Update);
+        app.worker.mark_running("Automatic Upload");
+        app.show_status = true;
+
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(620.0, 560.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, app: &mut DedupApp| {
+                    if !init {
+                        icon::install(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
+                        init = true;
+                    }
+                    // Paint the app background so the floating panel reads.
+                    let screen = ui.ctx().content_rect();
+                    ui.painter().rect_filled(screen, 0.0, theme::bg());
+                    app.status_panel(&ui.ctx().clone());
+                },
+                app,
+            );
+        harness.run();
+        let img = harness.render().expect("wgpu render failed");
+        let out = doc_screenshot_path("status_panel.png");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }

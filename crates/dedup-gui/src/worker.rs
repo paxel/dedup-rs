@@ -144,6 +144,23 @@ impl WorkerState {
         self.tracked.get(repo)
     }
 
+    /// A snapshot of every tracked job (queued or running) for the Activity
+    /// view: repo name, whether it is running (vs still queued), and its kind.
+    pub fn jobs(&self) -> Vec<(String, RepoStatus, JobKind)> {
+        let mut out: Vec<_> = self
+            .tracked
+            .iter()
+            .map(|(name, p)| (name.clone(), p.status, p.kind))
+            .collect();
+        // Running before queued, then by name, for a stable list.
+        out.sort_by(|a, b| {
+            (a.1 != RepoStatus::Running)
+                .cmp(&(b.1 != RepoStatus::Running))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        out
+    }
+
     /// Drop a still-queued repo that was cancelled before it started.
     pub fn remove(&mut self, repo: &str) {
         self.tracked.remove(repo);
