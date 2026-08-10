@@ -147,6 +147,14 @@ enum MediaMsg {
     },
     /// An `atempo` rate render finished (or failed) for this cache path.
     RateWav { path: std::path::PathBuf, ok: bool },
+    /// A side's document rasterized to its first page (`None` = it couldn't be
+    /// rendered). `path` is the source it was rendered from, so a result that
+    /// arrives after the side was swapped is dropped instead of shown.
+    RenderPage {
+        left: bool,
+        path: std::path::PathBuf,
+        image: Option<ColorImage>,
+    },
 }
 
 /// Everything the viewer holds for one *video* side: the filmstrip, the
@@ -316,6 +324,10 @@ pub(crate) struct DiffCompare {
     /// when it fails (missing/unrenderable).
     render_tex: [Option<TextureHandle>; 2],
     render_tried: [bool; 2],
+    /// Set while a side's first page is rasterizing on a worker thread, so the
+    /// pane shows "Rendering…" instead of a blank wait. Rendering runs off the UI
+    /// thread because a large PDF takes seconds (and used to freeze the app).
+    render_pending: [bool; 2],
     /// The Hex tab's single-file forced hex dump per side, cached like the text
     /// preview. The two-sided view is the paginated `hexdiff`.
     hex_head: [Option<crate::lightbox::TextPreview>; 2],
@@ -427,6 +439,7 @@ impl DiffCompare {
             stringsdiff_key: None,
             render_tex: [None, None],
             render_tried: [false, false],
+            render_pending: [false, false],
             hex_head: [None, None],
             tag_edit: None,
             tag_error: None,
@@ -847,51 +860,74 @@ impl DiffCompare {
         }
     }
 
-    /// Rasterize a side's document to its first page and hold the texture,
-    /// once. `pdftoppm` runs synchronously (it is fast for a page); the temp PNG
-    /// is dropped after the texture is uploaded. A failure leaves `render_tex`
-    /// empty and `render_tried` set, so the tool is not re-run every frame.
+    /// Start rasterizing a side's document to its first page, once. `pdftoppm`
+    /// runs on a **worker thread** — a large PDF takes seconds to render, and
+    /// doing it inline froze the whole app with no feedback — sending the page
+    /// back as [`MediaMsg::RenderPage`]. `render_tried` guards against re-spawning
+    /// every frame; `render_pending` drives the "Rendering…" note until it lands.
     fn ensure_render(&mut self, ctx: &Context, slot: usize) {
         if self.render_tried[slot] {
             return;
         }
         self.render_tried[slot] = true;
-        let side = if slot == 0 { &self.left } else { &self.right };
-        let Ok(dir) = tempfile::tempdir() else {
-            return;
+        self.render_pending[slot] = true;
+        let left = slot == 0;
+        let path = if left {
+            self.left.facts.abs_path.clone()
+        } else {
+            self.right.facts.abs_path.clone()
         };
-        let pages = dedup_core::render::render_pdf_pages(&side.facts.abs_path, dir.path());
-        if let Some(first) = pages.first()
-            && let Ok((w, h, rgba)) = dedup_core::thumbnail::load_full_rgba(first, 2000)
-        {
-            let image = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
-            self.render_tex[slot] =
-                Some(ctx.load_texture(format!("render{slot}"), image, TextureOptions::LINEAR));
-        }
+        let tx = self.media_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let image = (|| {
+                let dir = tempfile::tempdir().ok()?;
+                let first = dedup_core::render::render_pdf_first_page(&path, dir.path())?;
+                let (w, h, rgba) = dedup_core::thumbnail::load_full_rgba(&first, 2000).ok()?;
+                Some(ColorImage::from_rgba_unmultiplied(
+                    [w as usize, h as usize],
+                    &rgba,
+                ))
+            })();
+            let _ = tx.send(MediaMsg::RenderPage { left, path, image });
+            ctx.request_repaint();
+        });
     }
 
-    /// Draw one side's rendered page fit within `area`, or a note when it could
-    /// not be rasterized.
+    /// Draw one side's rendered page fit within `area`; a "Rendering…" note while
+    /// the worker runs, or a "couldn't be drawn" note when it finished empty.
     fn draw_render_page(&self, ui: &mut egui::Ui, area: Rect, slot: usize) {
-        match &self.render_tex[slot] {
-            Some(tex) => {
-                let sz = tex.size();
-                let (w, h) = (sz[0] as f32, sz[1] as f32);
-                let scale = (area.width() / w).min(area.height() / h).min(4.0);
-                let fit = Rect::from_center_size(area.center(), egui::vec2(w * scale, h * scale));
-                draw_in_pane(ui, area, fit, &self.render_tex[slot]);
-            }
-            None => {
-                ui.painter().text(
-                    area.center(),
-                    Align2::CENTER_CENTER,
-                    "This document could not be drawn to pages — the page renderer \
-                     (poppler) may be missing.",
-                    FontId::proportional(13.0),
-                    theme::hairline(),
-                );
-            }
+        if let Some(tex) = &self.render_tex[slot] {
+            let sz = tex.size();
+            let (w, h) = (sz[0] as f32, sz[1] as f32);
+            let scale = (area.width() / w).min(area.height() / h).min(4.0);
+            let fit = Rect::from_center_size(area.center(), egui::vec2(w * scale, h * scale));
+            draw_in_pane(ui, area, fit, &self.render_tex[slot]);
+            return;
         }
+        let (note, color) = if self.render_pending[slot] {
+            // Keep painting until the page lands (the worker also requests a
+            // repaint, but a dropped wake-up shouldn't strand the note).
+            ui.ctx().request_repaint();
+            (
+                "Rendering the first page… a large document can take a moment.".to_string(),
+                theme::tan(),
+            )
+        } else {
+            (
+                "This document could not be drawn to pages — the page renderer \
+                 (poppler) may be missing."
+                    .to_string(),
+                theme::hairline(),
+            )
+        };
+        ui.painter().text(
+            area.center(),
+            Align2::CENTER_CENTER,
+            note,
+            FontId::proportional(13.0),
+            color,
+        );
     }
 
     /// Render the Text tab's aligned hex diff for a two-sided comparison: build
@@ -1403,6 +1439,7 @@ impl DiffCompare {
         self.strings[slot] = None;
         self.render_tex[slot] = None;
         self.render_tried[slot] = false;
+        self.render_pending[slot] = false;
         self.hex_head[slot] = None;
         self.tags[slot] = None;
         self.exif_all[slot] = None;
@@ -1650,6 +1687,23 @@ impl DiffCompare {
                         // back to 1× so the transport's label and its sound
                         // agree, and let whatever waited play at normal speed.
                         self.rate = 1.0;
+                    }
+                }
+                MediaMsg::RenderPage { left, path, image } => {
+                    let slot = usize::from(!left);
+                    let side = if slot == 0 { &self.left } else { &self.right };
+                    // A page that finished rendering after the side was swapped
+                    // belongs to a file no longer shown — drop it.
+                    if side.facts.abs_path != path {
+                        continue;
+                    }
+                    self.render_pending[slot] = false;
+                    if let Some(image) = image {
+                        self.render_tex[slot] = Some(ctx.load_texture(
+                            format!("render{slot}"),
+                            image,
+                            TextureOptions::LINEAR,
+                        ));
                     }
                 }
             }
@@ -4544,7 +4598,17 @@ mod tests {
                 },
                 cmp,
             );
-        h.run();
+        // Both pages rasterize on worker threads; pump with `step()` (not
+        // `run()` — the "Rendering…" note requests a repaint each frame, which
+        // `run()` would treat as never settling) until both textures land.
+        for _ in 0..100 {
+            if h.state().render_tex.iter().all(Option::is_some) {
+                break;
+            }
+            h.step();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        h.step();
         let img = h.render().expect("wgpu render failed");
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../docs/screenshots/render.png");

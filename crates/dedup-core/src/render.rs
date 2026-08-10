@@ -50,6 +50,31 @@ pub fn render_pdf_pages(pdf: &Path, out_dir: &Path) -> Vec<PathBuf> {
     pages
 }
 
+/// Render only a PDF's **first page** to a single PNG under `out_dir`, returning
+/// its path. `-f 1 -l 1 -singlefile` makes poppler stop after page one instead
+/// of rasterizing the whole document — the difference between ~0.3 s and minutes
+/// on a 200-page book. Returns `None` when `pdftoppm` is unavailable or the page
+/// can't be rendered. This is what the viewer's Render tab uses today (it shows
+/// one page); full multi-page rendering can layer on [`render_pdf_pages`].
+pub fn render_pdf_first_page(pdf: &Path, out_dir: &Path) -> Option<PathBuf> {
+    let prefix = out_dir.join("page");
+    let ok = Command::new("pdftoppm")
+        .args(["-png", "-r", "150", "-f", "1", "-l", "1", "-singlefile"])
+        .arg(pdf)
+        .arg(&prefix)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        return None;
+    }
+    // `-singlefile` writes exactly `<prefix>.png`, with no page-number suffix.
+    let page = out_dir.join("page.png");
+    page.is_file().then_some(page)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,6 +126,37 @@ mod tests {
         assert_eq!(pages.len(), 1, "a one-page PDF renders to one image");
         let bytes = std::fs::read(&pages[0]).unwrap();
         assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "a real PNG was written");
+    }
+
+    #[test]
+    fn first_page_renders_a_single_png() {
+        if !pdftoppm_available() {
+            eprintln!("skipping: pdftoppm not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pdf = dir.path().join("doc.pdf");
+        tiny_pdf(&pdf);
+        let out = tempfile::tempdir().unwrap();
+        let page = render_pdf_first_page(&pdf, out.path()).expect("first page renders");
+        let bytes = std::fs::read(&page).unwrap();
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "a real PNG was written");
+        // `-singlefile` writes exactly one image, no page-number suffix.
+        let pngs = std::fs::read_dir(out.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "png"))
+            .count();
+        assert_eq!(pngs, 1, "only the first page is written");
+    }
+
+    #[test]
+    fn first_page_of_junk_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("notpdf.pdf");
+        std::fs::write(&bad, b"not a pdf").unwrap();
+        let out = tempfile::tempdir().unwrap();
+        assert!(render_pdf_first_page(&bad, out.path()).is_none());
     }
 
     #[test]
