@@ -502,10 +502,16 @@ impl DiffCompare {
 
     /// [`Self::new`] with the candidates each side may be switched between.
     pub fn new_with_pool(left: DiffSide, right: Option<DiffSide>, pool: Vec<DiffSide>) -> Self {
-        // A viewer with no second side still shows the first, full width.
+        // A viewer with no second side still shows the first, full width. The
+        // placeholder B (a clone of A) must never be *shown*, so the second
+        // side starts hidden here rather than trusting every caller to do it.
+        let no_b = right.is_none();
         let right = right.unwrap_or_else(|| left.clone());
         let mut me = Self::new(left, right);
         me.pool = pool;
+        if no_b {
+            me.hide_second();
+        }
         me
     }
 
@@ -557,6 +563,17 @@ impl DiffCompare {
     /// Whether both sides are on screen.
     fn two_sided(&self) -> bool {
         !self.second_hidden
+    }
+
+    /// Whether a second, *different* file exists to compare against: the right
+    /// side already differs from the left, or the pool offers another
+    /// candidate to land B on. A viewer opened on a group of one has no B —
+    /// SHOW B and the pair-referencing actions (OVERWRITE OTHER) are
+    /// meaningless there and are not offered, so the placeholder B (a clone of
+    /// A) can never surface as an A ↔ A "comparison".
+    fn has_b(&self) -> bool {
+        self.right.facts.abs_path != self.left.facts.abs_path
+            || self.has_free_candidate(&self.right, &self.left)
     }
 
     /// Whether the left side has anywhere to go — false for a pair, where the
@@ -1993,6 +2010,9 @@ impl DiffCompare {
                 let mut pick = None;
                 let two_sided = self.two_sided();
                 let two_sided_now = two_sided;
+                // Whether a distinct second file exists at all — a group of one
+                // offers no SHOW B and no pair actions (OVERWRITE OTHER).
+                let has_b = self.has_b();
                 let tab_is_image = self.tab == RepresentationKind::Image;
                 let tab_is_audio = self.tab == RepresentationKind::Audio;
                 // Flicker is a media-only mode (image/audio/video); its controls
@@ -2217,14 +2237,15 @@ impl DiffCompare {
                                 {
                                     back_to_archive = true;
                                 }
-                            } else if ui
-                                .button("SHOW B")
-                                .explain(
-                                    verbosity,
-                                    "Compare against another file",
-                                    "Show a second file beside this one to compare them.",
-                                )
-                                .clicked()
+                            } else if has_b
+                                && ui
+                                    .button("SHOW B")
+                                    .explain(
+                                        verbosity,
+                                        "Compare against another file",
+                                        "Show a second file beside this one to compare them.",
+                                    )
+                                    .clicked()
                             {
                                 show = true;
                             }
@@ -2991,7 +3012,13 @@ impl DiffCompare {
                                 // edge — the edge is the effortless "slam to
                                 // it" target, which delete must not be.
                                 ui.add_space(8.0);
-                                side_actions(ui, is_left, verbosity, mark.map(|m| (mark_label, m)))
+                                side_actions(
+                                    ui,
+                                    is_left,
+                                    verbosity,
+                                    mark.map(|m| (mark_label, m)),
+                                    has_b,
+                                )
                             },
                         )
                         .inner;
@@ -3341,12 +3368,13 @@ impl DiffCompare {
         if hide {
             self.hide_second();
         }
-        if show {
+        if show && self.has_b() {
             self.second_hidden = false;
             // A viewer opened on one file carries a placeholder B (the same
             // file); revealing B must land on another candidate, never on the
             // file A shows — self-comparison is the defect this viewer exists
-            // to make impossible.
+            // to make impossible. (`has_b` above guarantees a candidate exists;
+            // without one SHOW B is not even offered.)
             if self.right.facts.abs_path == self.left.facts.abs_path
                 && let Some(next) = self.stepped(&self.right, &self.left, 1)
             {
@@ -3877,13 +3905,16 @@ fn side_strip(ui: &mut egui::Ui, side: &DiffSide, other: &DiffSide, is_left: boo
 /// One side's actions for the fixed bottom bar: the caller's own — a deletion
 /// mark pill when `mark` is supplied (Duplicates), else the DIFF board's
 /// OVERWRITE OTHER / DELETE commands. Drawn in whatever layout the caller sets
-/// (a right-to-left parent right-aligns it against the pane edge). Returns the
-/// chosen action, if any.
+/// (a right-to-left parent right-aligns it against the pane edge). `has_other`
+/// is whether a second file exists at all — without one the pair-referencing
+/// OVERWRITE OTHER has no "other" and is not drawn. Returns the chosen action,
+/// if any.
 fn side_actions(
     ui: &mut egui::Ui,
     is_left: bool,
     verbosity: TooltipVerbosity,
     mark: Option<(&str, MarkPill)>,
+    has_other: bool,
 ) -> Option<DiffPick> {
     let mut pick = None;
     // A caller that supplied marks acts through the pill alone.
@@ -3894,18 +3925,19 @@ fn side_actions(
         return pick;
     }
     ui.horizontal(|ui| {
-        if ui
-            .add(
-                egui::Button::new(RichText::new("OVERWRITE OTHER").color(theme::black()))
-                    .fill(theme::tan()),
-            )
-            .explain(
-                verbosity,
-                "Replace the other side with this version",
-                "Copy this version over the other repository's file, so both repositories \
-                 hold this one. The other version is gone afterwards.",
-            )
-            .clicked()
+        if has_other
+            && ui
+                .add(
+                    egui::Button::new(RichText::new("OVERWRITE OTHER").color(theme::black()))
+                        .fill(theme::tan()),
+                )
+                .explain(
+                    verbosity,
+                    "Replace the other side with this version",
+                    "Copy this version over the other repository's file, so both repositories \
+                     hold this one. The other version is gone afterwards.",
+                )
+                .clicked()
         {
             pick = Some(DiffPick::Overwrite { from_left: is_left });
         }
@@ -4304,6 +4336,47 @@ mod tests {
         assert_ne!(
             cmp.left.rel_path, cmp.right.rel_path,
             "the two sides can never be the same file"
+        );
+    }
+
+    /// A viewer opened on a group of one has no second file at all: it offers
+    /// neither SHOW B (which could only reveal A beside itself — the A ↔ A
+    /// defect) nor the pair-referencing OVERWRITE OTHER. DELETE, which acts on
+    /// the shown file alone, stays.
+    #[test]
+    fn a_group_of_one_offers_no_second_side() {
+        use egui_kittest::kittest::Queryable;
+        let cmp =
+            DiffCompare::new_with_pool(named_side("only.jpg"), None, vec![named_side("only.jpg")]);
+        let h = rendered(cmp);
+        assert!(
+            h.query_by_label_contains("SHOW B").is_none(),
+            "no second file exists, so there is nothing to show"
+        );
+        assert!(
+            h.query_by_label_contains("HIDE B").is_none(),
+            "the placeholder B never shows, so there is nothing to hide"
+        );
+        assert!(
+            h.query_by_label_contains("OVERWRITE OTHER").is_none(),
+            "there is no other file to overwrite"
+        );
+        assert!(
+            h.query_by_label_contains("DELETE").is_some(),
+            "deleting the shown file alone remains available"
+        );
+
+        // With another candidate in the pool the offer stays: SHOW B lands B
+        // on that candidate, never on A's own file.
+        let cmp = DiffCompare::new_with_pool(
+            named_side("a.jpg"),
+            None,
+            vec![named_side("a.jpg"), named_side("b.jpg")],
+        );
+        let h = rendered(cmp);
+        assert!(
+            h.query_by_label_contains("SHOW B").is_some(),
+            "a real candidate exists — comparing stays on offer"
         );
     }
 
