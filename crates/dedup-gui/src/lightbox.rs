@@ -604,18 +604,23 @@ pub fn draw_metadata_column(ui: &mut egui::Ui, source: &Path, body: MetaBody<'_>
                 ("Track", &mut tags.track),
                 ("Genre", &mut tags.genre),
             ];
+            // One row geometry for all six rows, computed once: label column,
+            // field column, kebab slot. Sizing the field per row from
+            // `available_width` left each row a slightly different width (and
+            // let the kebab overflow the column clip, cutting the pill) — the
+            // fields must line up like a form, so their width is fixed here and
+            // forced with `add_sized`, and the kebab slot ends inside the clip.
+            const LABEL_W: f32 = 56.0;
+            const KEBAB_W: f32 = 36.0;
+            let gap = ui.spacing().item_spacing.x;
+            let field_w = (ui.available_width() - LABEL_W - KEBAB_W - 2.0 * gap - 4.0).max(60.0);
             for (i, (label, val)) in fields.into_iter().enumerate() {
                 ui.horizontal(|ui| {
                     ui.add_sized(
-                        [56.0, 18.0],
+                        [LABEL_W, 18.0],
                         egui::Label::new(RichText::new(label).color(theme::tan()).size(12.0)),
                     );
-                    // Reserve a fixed kebab column (whether or not this field has
-                    // one), so every field is the same width and the ⋮ buttons
-                    // line up — and leave clear room inside the clipped column so
-                    // the kebab is never cut at the edge.
-                    let w = (ui.available_width() - 40.0).max(60.0);
-                    ui.add(egui::TextEdit::singleline(val).desired_width(w));
+                    ui.add_sized([field_w, 18.0], egui::TextEdit::singleline(val));
                     // Adopt a value from another copy in the group. A "more
                     // options for this field" kebab (⋮), not a directional
                     // caret — the value is pulled *into* this field, never
