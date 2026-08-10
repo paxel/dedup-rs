@@ -5791,8 +5791,11 @@ mod ui_tests {
         harness.run();
         harness.get_by_label_contains("Hex").click();
         harness.run();
+        // The page number itself is an editable DragValue, flanked by "page"
+        // and "/ total" captions.
         assert!(
-            harness.query_all_by_label_contains("page 1 /").count() > 0,
+            harness.query_all_by_label_contains("/ 1").count() > 0
+                && harness.query_all_by_label_contains("PREV PAGE").count() > 0,
             "the Hex tab is the paginated hex diff of the two files"
         );
         assert!(

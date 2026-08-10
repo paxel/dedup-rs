@@ -966,17 +966,44 @@ impl DiffCompare {
         let mut go: Option<usize> = None;
         let mut jump_next = false;
         let mut jump_prev = false;
+        // Where the viewer's A|B divider crosses this pane: the page controls
+        // stay in the left half and the diff jumps start in the right half, so
+        // the divider passes between the two groups, never through a button.
+        let mid_x = ui.max_rect().center().x;
         ui.horizontal(|ui| {
             if ui.button("< PREV PAGE").clicked() {
                 go = Some(self.hex_page.saturating_sub(1));
             }
-            ui.label(
-                RichText::new(format!("page {} / {pages}", self.hex_page + 1)).color(theme::tan()),
-            );
+            // The page number is a control, not just a caption: type or drag it
+            // to land on an exact page.
+            let mut page1 = self.hex_page + 1;
+            ui.label(RichText::new("page").color(theme::tan()));
+            let typed = ui
+                .add(egui::DragValue::new(&mut page1).range(1..=pages))
+                .on_hover_text("Type or drag to jump straight to a page.");
+            ui.label(RichText::new(format!("/ {pages}")).color(theme::tan()));
+            if typed.changed() {
+                go = Some(page1.saturating_sub(1));
+            }
             if ui.button("NEXT PAGE >").clicked() && self.hex_page + 1 < pages {
                 go = Some(self.hex_page + 1);
             }
-            ui.add_space(12.0);
+            // A slider for fast, coarse scrolling through a big file — dragging
+            // it sweeps the pages far quicker than stepping.
+            if pages > 1 {
+                ui.add_space(8.0);
+                ui.spacing_mut().slider_width = 160.0;
+                let slid = ui
+                    .add(egui::Slider::new(&mut page1, 1..=pages).show_value(false))
+                    .on_hover_text("Drag to sweep quickly through the whole file.");
+                if slid.changed() {
+                    go = Some(page1.saturating_sub(1));
+                }
+            }
+            // Into the right half (unless a narrow window already pushed the
+            // cursor past it — then just flow on).
+            let cur = ui.cursor().min.x;
+            ui.add_space((mid_x + 8.0 - cur).max(12.0));
             if identical {
                 ui.label(RichText::new("The shown bytes are identical.").color(theme::green()));
             } else {
@@ -2023,7 +2050,10 @@ impl DiffCompare {
                 // tabs that carry tools (image rotate/mirror/save, audio
                 // transport), so the tools never crowd the navigate/delete row —
                 // the clipping the old stacked layout was written to avoid.
-                const TITLE_H: f32 = 142.0;
+                // Two rows per side — repo chip + facts inline, then the file
+                // name — so the strip stays shallow and the content gets the
+                // height (it was 142 when the facts stacked one per line).
+                const TITLE_H: f32 = 78.0;
                 const ACTION_ROW: f32 = 32.0;
                 const ACTION_GAP: f32 = 6.0;
                 const HINT_H: f32 = 14.0;
@@ -3755,12 +3785,52 @@ fn side_strip(ui: &mut egui::Ui, side: &DiffSide, other: &DiffSide, is_left: boo
         // The bordered repo chip — the same widget every other tab's repo
         // selector uses, so one repo reads with one identity everywhere (the
         // bare identicon+label here used to be the odd one out, unbordered).
+        // The file's facts (size · date · type) ride on the same row behind the
+        // chip: they are short, so stacking them each on their own line only
+        // ate viewport height.
         let accent = if is_left {
             theme::orange()
         } else {
             theme::blue()
         };
-        crate::repo_chip::repo_chip(ui, &side.repo, false, accent, false, Some(side.read_only));
+        let size_color = if side.facts.size > other.facts.size {
+            theme::green()
+        } else {
+            theme::text()
+        };
+        // Prefer the *older* copy: in inheritance triage the earlier file is the
+        // more original, so age (not recency) is the "better" cue. Equal dates
+        // green neither side.
+        let date_color = if side.facts.modified_ms < other.facts.modified_ms {
+            theme::green()
+        } else {
+            theme::text()
+        };
+        ui.horizontal(|ui| {
+            crate::repo_chip::repo_chip(ui, &side.repo, false, accent, false, Some(side.read_only));
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format_size(side.facts.size))
+                    .color(size_color)
+                    .size(13.0)
+                    .strong(),
+            );
+            ui.label(
+                RichText::new(format_mtime(side.facts.modified_ms))
+                    .color(date_color)
+                    .size(13.0),
+            );
+            ui.label(
+                RichText::new(
+                    side.facts
+                        .mime
+                        .clone()
+                        .unwrap_or_else(|| "unknown type".into()),
+                )
+                .color(theme::grey())
+                .size(12.0),
+            );
+        });
         ui.add_space(3.0);
         // The file name is the headline of the identity block — which file am I
         // about to act on — bold and a step larger than the facts below,
@@ -3801,41 +3871,6 @@ fn side_strip(ui: &mut egui::Ui, side: &DiffSide, other: &DiffSide, is_left: boo
         ui.painter()
             .set(bg, egui::Shape::Vec(filename_frame(frame, accent)));
         ui.add_space(FRAME_FOOT_H + 2.0);
-        let size_color = if side.facts.size > other.facts.size {
-            theme::green()
-        } else {
-            theme::text()
-        };
-        // Prefer the *older* copy: in inheritance triage the earlier file is the
-        // more original, so age (not recency) is the "better" cue. Equal dates
-        // green neither side.
-        let date_color = if side.facts.modified_ms < other.facts.modified_ms {
-            theme::green()
-        } else {
-            theme::text()
-        };
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(format_size(side.facts.size))
-                .color(size_color)
-                .size(13.0)
-                .strong(),
-        );
-        ui.label(
-            RichText::new(format_mtime(side.facts.modified_ms))
-                .color(date_color)
-                .size(13.0),
-        );
-        ui.label(
-            RichText::new(
-                side.facts
-                    .mime
-                    .clone()
-                    .unwrap_or_else(|| "unknown type".into()),
-            )
-            .color(theme::grey())
-            .size(12.0),
-        );
     });
 }
 
@@ -4218,6 +4253,15 @@ mod tests {
         }
     }
 
+    /// Sync a fixture side's recorded size with the bytes actually on disk, so
+    /// a doc screenshot shows the file's real size instead of the placeholder
+    /// `1 B` the bare [`diff_side`] carries.
+    fn sync_size(side: &mut DiffSide) {
+        if let Ok(m) = std::fs::metadata(&side.facts.abs_path) {
+            side.facts.size = m.len();
+        }
+    }
+
     /// With more than two candidates, each side can be stepped through them —
     /// this is what replaces the single switcher that could walk A onto B.
     #[test]
@@ -4348,6 +4392,7 @@ mod tests {
         let mut side = named_side(name);
         side.facts.abs_path = path;
         side.facts.mime = Some("application/pdf".into());
+        sync_size(&mut side);
         side
     }
 
@@ -4402,6 +4447,7 @@ mod tests {
         let mut side = named_side(name);
         side.facts.abs_path = path;
         side.facts.mime = Some("text/plain".into());
+        sync_size(&mut side);
         side
     }
 
@@ -4463,6 +4509,7 @@ mod tests {
         let mut side = named_side(name);
         side.facts.abs_path = path;
         side.facts.mime = Some("application/octet-stream".into());
+        sync_size(&mut side);
         side
     }
 
@@ -4560,6 +4607,7 @@ mod tests {
         let mut side = named_side(name);
         side.facts.abs_path = path;
         side.facts.mime = Some("message/rfc822".into());
+        sync_size(&mut side);
         side
     }
 
@@ -5312,7 +5360,9 @@ mod tests {
     /// difference is an inserted header — the case the aligned hex diff exists
     /// for.
     fn hex_diff_pair(tmp: &Path) -> DiffCompare {
-        let payload: Vec<u8> = (0..600u32).map(|i| (i % 251) as u8).collect();
+        // Big enough to paginate (8 pages at 40 rows × 16 bytes), so the page
+        // controls — number, slider, diff jumps — have something real to do.
+        let payload: Vec<u8> = (0..5_000u32).map(|i| (i % 251) as u8).collect();
         let pa = tmp.join("a.bin");
         let pb = tmp.join("b.bin");
         std::fs::write(&pa, &payload).unwrap();
@@ -5323,10 +5373,12 @@ mod tests {
         a.facts.abs_path = pa;
         a.facts.hash_hex = "hash-a".into();
         a.facts.mime = Some("application/octet-stream".into());
+        sync_size(&mut a);
         let mut b = named_side("b.bin");
         b.facts.abs_path = pb;
         b.facts.hash_hex = "hash-b".into();
         b.facts.mime = Some("application/octet-stream".into());
+        sync_size(&mut b);
         let mut cmp = DiffCompare::new(a, b);
         cmp.tab = RepresentationKind::Hex;
         cmp
@@ -5339,9 +5391,16 @@ mod tests {
         use egui_kittest::kittest::Queryable;
         let tmp = tempfile::tempdir().unwrap();
         let h = rendered(hex_diff_pair(tmp.path()));
+        // The page number is an editable DragValue between a "page" caption and
+        // a "/ total" caption; the fixture spans 8 pages.
         assert!(
-            h.query_by_label_contains("page 1 /").is_some(),
-            "the hex diff paginates"
+            h.query_by_label_contains("/ 8").is_some(),
+            "the hex diff paginates, naming the page count"
+        );
+        assert!(
+            h.query_by_label_contains("PREV PAGE").is_some()
+                && h.query_by_label_contains("NEXT PAGE").is_some(),
+            "page stepping is offered"
         );
         assert!(
             h.query_by_label_contains("NEXT DIFF").is_some(),

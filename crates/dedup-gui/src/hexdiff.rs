@@ -12,7 +12,7 @@
 use crate::theme;
 use dedup_core::align::{SegmentKind, align};
 use egui::text::{LayoutJob, TextFormat};
-use egui::{Color32, FontId};
+use egui::{Color32, FontId, Rect};
 
 /// Bytes per row, per side.
 const ROW: usize = 16;
@@ -225,56 +225,56 @@ impl HexDiff {
             .height();
         let start = page * ROWS_PER_PAGE;
         let end = (start + ROWS_PER_PAGE).min(self.rows());
+        // Anchor the column split to the centre of the pane we were given —
+        // the same x where the viewer draws its A|B divider — *before* entering
+        // the scroll area. Deriving the split from the scroll content's own
+        // width (as this used to) drifts relative to that divider (the vertical
+        // scrollbar narrows the content), which pushed the right column's
+        // offsets underneath the divider line.
+        let mid = ui.available_rect_before_wrap().center().x;
+        const HALF_GAP: f32 = 7.0;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                // Split each row into two equal, explicitly-sized halves. The
-                // bug this fixes: the left label used to take its natural width
-                // and the right got only whatever was left, which — once the
-                // vertical scrollbar shaved a few pixels — was too little for
-                // the right side, so its ASCII gutter wrapped to a second line
-                // while the left stayed on one. Sizing both sides from the same
-                // half makes the two columns symmetric at any window width; each
-                // side clips its (non-wrapping) row at the column edge, so a hex
-                // dump always reads as a grid.
-                let gap = 8.0;
                 for row in start..end {
                     let is_diff = self
                         .units
                         .get(row * ROW..(row * ROW + ROW).min(self.units.len()))
                         .is_some_and(|c| c.iter().any(|u| u.diff));
-                    let half = ((ui.available_width() - gap) / 2.0).max(10.0);
-                    let resp = ui.horizontal(|ui| {
-                        Self::hex_side(ui, self.side_job(row, true, &font), half, row_h);
-                        ui.add_space(gap);
-                        Self::hex_side(ui, self.side_job(row, false, &font), half, row_h);
-                    });
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), row_h),
+                        egui::Sense::hover(),
+                    );
                     // A faint band marks the differing region as a whole, over
                     // which the per-byte green/amber shows exactly what changed.
                     if is_diff {
                         ui.painter().rect_filled(
-                            resp.response.rect.expand2(egui::vec2(0.0, 1.0)),
+                            rect.expand2(egui::vec2(0.0, 1.0)),
                             0.0,
                             theme::amber().gamma_multiply(0.10),
                         );
                     }
+                    let left = Rect::from_min_max(rect.min, egui::pos2(mid - HALF_GAP, rect.max.y));
+                    let right =
+                        Rect::from_min_max(egui::pos2(mid + HALF_GAP, rect.min.y), rect.max);
+                    Self::hex_side(ui, self.side_job(row, true, &font), left);
+                    Self::hex_side(ui, self.side_job(row, false, &font), right);
                 }
             });
     }
 
-    /// Draw one side's row in a fixed-width column, clipped so a row that would
-    /// overrun its half is cut cleanly at the edge rather than wrapping. A clean
-    /// clip loses fewer forensic bytes than an ellipsis would hide, and keeps the
-    /// two sides aligned.
-    fn hex_side(ui: &mut egui::Ui, job: LayoutJob, w: f32, h: f32) {
-        ui.allocate_ui_with_layout(
-            egui::vec2(w, h),
-            egui::Layout::left_to_right(egui::Align::TOP),
-            |ui| {
-                ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
-                ui.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Extend));
-            },
+    /// Draw one side's row into its fixed column rect, clipped so a row that
+    /// would overrun its half is cut cleanly at the edge rather than wrapping. A
+    /// clean clip loses fewer forensic bytes than an ellipsis would hide, and
+    /// keeps the two sides aligned.
+    fn hex_side(ui: &mut egui::Ui, job: LayoutJob, rect: Rect) {
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::left_to_right(egui::Align::TOP)),
         );
+        child.set_clip_rect(rect.intersect(ui.clip_rect()));
+        child.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Extend));
     }
 }
 
