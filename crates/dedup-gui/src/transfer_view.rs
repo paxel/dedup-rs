@@ -1581,8 +1581,12 @@ impl TransferView {
             });
 
             // TARGET (only when copying/moving into a repo — a folder export has
-            // no target, and GROUP SYNC's targets are the SINKS panel below).
-            if self.destination == Destination::Repo && self.command != Command::GroupSync {
+            // no target, and both GROUP SYNC and GROUP SYNC BACK pick their other
+            // repo in the SINK panel below, not here: GROUP SYNC pushes the main
+            // to its sinks, GROUP SYNC BACK pulls a chosen sink into the main).
+            if self.destination == Destination::Repo
+                && !matches!(self.command, Command::GroupSync | Command::GroupSyncBack)
+            {
                 let tgt: Vec<String> = self
                     .repos
                     .iter()
@@ -4665,6 +4669,28 @@ mod ui_tests {
             h.state().selected_sinks,
             vec!["target".to_string()],
             "every sink is selected by default"
+        );
+    }
+
+    /// GROUP SYNC BACK also hides the single TARGET picker. Like GROUP SYNC it
+    /// picks its other repo in the SINK panel (the sink to pull back), and the
+    /// target is implicitly the group's main — so the picker is unused and used
+    /// to just linger.
+    #[test]
+    fn group_sync_back_hides_target() {
+        let (_tmp, store) = sample_store();
+        store.create_sync_group("grp", "source").expect("group");
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::Mirror)
+            .expect("sink");
+        let store2 = Arc::clone(&store);
+        let h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+            v.command = Command::GroupSyncBack;
+        });
+        assert!(
+            h.query_by_label("TARGET").is_none(),
+            "the single TARGET picker is hidden in GROUP SYNC BACK too"
         );
     }
 
