@@ -114,6 +114,9 @@ pub(crate) struct MarkPill {
 struct DiffLoaded {
     left: bool,
     image: Option<ColorImage>,
+    /// For audio: the amplitude envelope alongside the spectrogram image, so
+    /// the Audio tab's waveform and the Spectrum tab come from one decode.
+    envelope: Option<Vec<f32>>,
 }
 
 /// Video-side media arriving from worker threads: filmstrip stills, the
@@ -132,11 +135,13 @@ enum MediaMsg {
         duration_secs: Option<f64>,
     },
     /// The side's soundtrack: the cached WAV and its length once extracted
-    /// (`None` = no track / no ffmpeg), plus the spectrogram when it decoded.
+    /// (`None` = no track / no ffmpeg), plus the spectrogram and amplitude
+    /// envelope when it decoded.
     Soundtrack {
         left: bool,
         wav: Option<(std::path::PathBuf, u64)>,
         spec: Option<ColorImage>,
+        envelope: Option<Vec<f32>>,
     },
     /// The frame decoded at a playhead position. `fraction` identifies which
     /// click it answers, so a stale decode never overwrites a newer one.
@@ -147,13 +152,21 @@ enum MediaMsg {
     },
     /// An `atempo` rate render finished (or failed) for this cache path.
     RateWav { path: std::path::PathBuf, ok: bool },
-    /// A side's document rasterized to its first page (`None` = it couldn't be
-    /// rendered). `path` is the source it was rendered from, so a result that
-    /// arrives after the side was swapped is dropped instead of shown.
+    /// One rasterized document page (`None` = it couldn't be rendered — past
+    /// the end, or poppler missing). `path` is the source it was rendered
+    /// from, so a result that arrives after the side was swapped is dropped
+    /// instead of shown. `page` is 0-based.
     RenderPage {
         left: bool,
         path: std::path::PathBuf,
+        page: usize,
         image: Option<ColorImage>,
+    },
+    /// A side's probed page count (`None` = `pdfinfo` unavailable/unreadable).
+    RenderMeta {
+        left: bool,
+        path: std::path::PathBuf,
+        pages: Option<usize>,
     },
 }
 
@@ -319,15 +332,26 @@ pub(crate) struct DiffCompare {
     strings: [Option<String>; 2],
     stringsdiff: Option<crate::textdiff::TextDiff>,
     stringsdiff_key: Option<(String, String)>,
-    /// The Render tab's first-page texture per side, rasterized once via
-    /// `pdftoppm`. `render_tried` guards against re-running the tool every frame
-    /// when it fails (missing/unrenderable).
-    render_tex: [Option<TextureHandle>; 2],
-    render_tried: [bool; 2],
-    /// Set while a side's first page is rasterizing on a worker thread, so the
-    /// pane shows "Rendering…" instead of a blank wait. Rendering runs off the UI
-    /// thread because a large PDF takes seconds (and used to freeze the app).
-    render_pending: [bool; 2],
+    /// The Render tab's shared current page (0-based): one control drives both
+    /// sides, so page N sits beside page N and a duplicate-PDF walk stays
+    /// aligned.
+    render_page: usize,
+    /// Rasterized pages, keyed `(slot, page)`. `Some(None)` records a page that
+    /// couldn't be rendered (past the end, or poppler missing) so it is not
+    /// retried every frame. A small FIFO (`render_order`) caps GPU use;
+    /// stepping back a few pages is instant.
+    render_cache: std::collections::HashMap<(usize, usize), Option<TextureHandle>>,
+    render_order: std::collections::VecDeque<(usize, usize)>,
+    /// Pages currently rasterizing on worker threads (never on the UI thread —
+    /// a large PDF takes seconds and used to freeze the app).
+    render_pending: std::collections::HashSet<(usize, usize)>,
+    /// Each side's page count, probed once off-thread (`pdfinfo`); `None` while
+    /// unknown or when the probe can't answer.
+    render_count: [Option<usize>; 2],
+    render_probed: [bool; 2],
+    /// Each side's decoded amplitude envelope — the Audio tab's waveform (a
+    /// bare audio file's own, or a video's extracted soundtrack's).
+    audio_env: [Option<Vec<f32>>; 2],
     /// The Hex tab's single-file forced hex dump per side, cached like the text
     /// preview. The two-sided view is the paginated `hexdiff`.
     hex_head: [Option<crate::lightbox::TextPreview>; 2],
@@ -437,9 +461,13 @@ impl DiffCompare {
             strings: [None, None],
             stringsdiff: None,
             stringsdiff_key: None,
-            render_tex: [None, None],
-            render_tried: [false, false],
-            render_pending: [false, false],
+            render_page: 0,
+            render_cache: std::collections::HashMap::new(),
+            render_order: std::collections::VecDeque::new(),
+            render_pending: std::collections::HashSet::new(),
+            render_count: [None, None],
+            render_probed: [false, false],
+            audio_env: [None, None],
             hex_head: [None, None],
             tag_edit: None,
             tag_error: None,
@@ -877,74 +905,107 @@ impl DiffCompare {
         }
     }
 
-    /// Start rasterizing a side's document to its first page, once. `pdftoppm`
-    /// runs on a **worker thread** — a large PDF takes seconds to render, and
-    /// doing it inline froze the whole app with no feedback — sending the page
-    /// back as [`MediaMsg::RenderPage`]. `render_tried` guards against re-spawning
-    /// every frame; `render_pending` drives the "Rendering…" note until it lands.
+    /// Make sure the shared current page is rasterizing (or cached) for `slot`,
+    /// and that the side's page count has been probed. `pdftoppm` runs on a
+    /// **worker thread** — a large PDF takes seconds per page, and doing it
+    /// inline froze the whole app with no feedback — sending the page back as
+    /// [`MediaMsg::RenderPage`].
     fn ensure_render(&mut self, ctx: &Context, slot: usize) {
-        if self.render_tried[slot] {
-            return;
-        }
-        self.render_tried[slot] = true;
-        self.render_pending[slot] = true;
         let left = slot == 0;
         let path = if left {
             self.left.facts.abs_path.clone()
         } else {
             self.right.facts.abs_path.clone()
         };
+        if !self.render_probed[slot] {
+            self.render_probed[slot] = true;
+            let tx = self.media_tx.clone();
+            let ctx = ctx.clone();
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let pages = dedup_core::render::pdf_page_count(&path);
+                let _ = tx.send(MediaMsg::RenderMeta { left, path, pages });
+                ctx.request_repaint();
+            });
+        }
+        let page = self.render_page;
+        if self.render_cache.contains_key(&(slot, page))
+            || self.render_pending.contains(&(slot, page))
+        {
+            return;
+        }
+        self.render_pending.insert((slot, page));
         let tx = self.media_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let image = (|| {
                 let dir = tempfile::tempdir().ok()?;
-                let first = dedup_core::render::render_pdf_first_page(&path, dir.path())?;
-                let (w, h, rgba) = dedup_core::thumbnail::load_full_rgba(&first, 2000).ok()?;
+                let png = dedup_core::render::render_pdf_page(&path, dir.path(), page + 1)?;
+                let (w, h, rgba) = dedup_core::thumbnail::load_full_rgba(&png, 2000).ok()?;
                 Some(ColorImage::from_rgba_unmultiplied(
                     [w as usize, h as usize],
                     &rgba,
                 ))
             })();
-            let _ = tx.send(MediaMsg::RenderPage { left, path, image });
+            let _ = tx.send(MediaMsg::RenderPage {
+                left,
+                path,
+                page,
+                image,
+            });
             ctx.request_repaint();
         });
     }
 
-    /// Draw one side's rendered page fit within `area`; a "Rendering…" note while
-    /// the worker runs, or a "couldn't be drawn" note when it finished empty.
+    /// Draw one side's rendered current page fit within `area`; a "Rendering…"
+    /// note while the worker runs, "no page N" past that side's end, or a
+    /// "couldn't be drawn" note when rendering failed outright.
     fn draw_render_page(&self, ui: &mut egui::Ui, area: Rect, slot: usize) {
-        if let Some(tex) = &self.render_tex[slot] {
-            let sz = tex.size();
-            let (w, h) = (sz[0] as f32, sz[1] as f32);
-            let scale = (area.width() / w).min(area.height() / h).min(4.0);
-            let fit = Rect::from_center_size(area.center(), egui::vec2(w * scale, h * scale));
-            draw_in_pane(ui, area, fit, &self.render_tex[slot]);
-            return;
+        let page = self.render_page;
+        match self.render_cache.get(&(slot, page)) {
+            Some(Some(tex)) => {
+                let sz = tex.size();
+                let (w, h) = (sz[0] as f32, sz[1] as f32);
+                let scale = (area.width() / w).min(area.height() / h).min(4.0);
+                let fit = Rect::from_center_size(area.center(), egui::vec2(w * scale, h * scale));
+                draw_in_pane(ui, area, fit, &Some(tex.clone()));
+            }
+            Some(None) => {
+                // Rendered and came back empty: past this side's last page
+                // (the shared control follows the longer document), or the
+                // renderer is missing.
+                let note = match self.render_count[slot] {
+                    Some(n) if page >= n => {
+                        format!("This document ends at page {n} — no page {}.", page + 1)
+                    }
+                    _ => "This page could not be drawn — the page renderer (poppler) \
+                         may be missing."
+                        .to_string(),
+                };
+                ui.painter().text(
+                    area.center(),
+                    Align2::CENTER_CENTER,
+                    note,
+                    FontId::proportional(13.0),
+                    theme::hairline(),
+                );
+            }
+            None => {
+                // Keep painting until the page lands (the worker also requests
+                // a repaint, but a dropped wake-up shouldn't strand the note).
+                ui.ctx().request_repaint();
+                ui.painter().text(
+                    area.center(),
+                    Align2::CENTER_CENTER,
+                    format!(
+                        "Rendering page {}… a large document can take a moment.",
+                        page + 1
+                    ),
+                    FontId::proportional(13.0),
+                    theme::tan(),
+                );
+            }
         }
-        let (note, color) = if self.render_pending[slot] {
-            // Keep painting until the page lands (the worker also requests a
-            // repaint, but a dropped wake-up shouldn't strand the note).
-            ui.ctx().request_repaint();
-            (
-                "Rendering the first page… a large document can take a moment.".to_string(),
-                theme::tan(),
-            )
-        } else {
-            (
-                "This document could not be drawn to pages — the page renderer \
-                 (poppler) may be missing."
-                    .to_string(),
-                theme::hairline(),
-            )
-        };
-        ui.painter().text(
-            area.center(),
-            Align2::CENTER_CENTER,
-            note,
-            FontId::proportional(13.0),
-            color,
-        );
     }
 
     /// Render the Text tab's aligned hex diff for a two-sided comparison: build
@@ -1129,7 +1190,10 @@ impl DiffCompare {
     /// This slot shows a video's extracted-soundtrack spectrogram right now.
     fn spec_mode(&self, slot: usize) -> bool {
         let side = if slot == 0 { &self.left } else { &self.right };
-        self.tab == RepresentationKind::Audio && side.facts.is_video()
+        matches!(
+            self.tab,
+            RepresentationKind::Audio | RepresentationKind::Spectrum
+        ) && side.facts.is_video()
     }
 
     /// A/B compare (zoom / pan / flicker) is available only once *both* sides
@@ -1140,6 +1204,20 @@ impl DiffCompare {
             (self.slot_state(0), self.slot_state(1)),
             (SlotState::Image, SlotState::Image)
         )
+    }
+
+    /// Whether flicker can engage on the current tab: both sides hold the
+    /// full-pane visual that flicker swaps. For images (and audio, whose pane
+    /// is its spectrogram) that is the decoded texture; on the Video tab it is
+    /// the two frames decoded at the shared playhead — so flicker offers
+    /// itself as soon as a moment has been picked on the filmstrip.
+    fn flicker_ready(&self) -> bool {
+        match self.tab {
+            RepresentationKind::Video => {
+                self.video[0].scrub_tex.is_some() && self.video[1].scrub_tex.is_some()
+            }
+            _ => self.compare_ready(),
+        }
     }
 
     /// Kick off both decodes once, off the UI thread. A non-previewable side is
@@ -1189,14 +1267,20 @@ impl DiffCompare {
             // Audio has no frame to show, so it is compared as a spectrogram
             // — the same rendering the Duplicates player uses, from the same
             // shared `waveform` module rather than a second implementation.
-            let image = if audio {
-                crate::waveform::spec_rgba(&path)
+            let (image, envelope) = if audio {
+                match crate::waveform::viz_rgba(&path) {
+                    Some((img, env)) => (Some(img), Some(env)),
+                    None => (None, None),
+                }
             } else {
-                dedup_core::thumbnail::load_full_rgba(&path, MAX_TEXTURE_EDGE)
-                    .ok()
-                    .map(|(w, h, rgba)| {
-                        ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba)
-                    })
+                (
+                    dedup_core::thumbnail::load_full_rgba(&path, MAX_TEXTURE_EDGE)
+                        .ok()
+                        .map(|(w, h, rgba)| {
+                            ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba)
+                        }),
+                    None,
+                )
             };
             // Only a successful decode has something new to show, so only
             // that wakes the UI; waking on failure would spin repaints for
@@ -1205,6 +1289,7 @@ impl DiffCompare {
             let _ = tx.send(DiffLoaded {
                 left: is_left,
                 image,
+                envelope,
             });
             if wake {
                 ctx.request_repaint();
@@ -1264,17 +1349,22 @@ impl DiffCompare {
                     let ms = dedup_core::fingerprint::media_duration_secs(&wav)
                         .map(|s| (s * 1000.0) as u64)
                         .unwrap_or(0);
-                    let spec = crate::waveform::spec_rgba(&wav);
+                    let (spec, envelope) = match crate::waveform::viz_rgba(&wav) {
+                        Some((img, env)) => (Some(img), Some(env)),
+                        None => (None, None),
+                    };
                     MediaMsg::Soundtrack {
                         left: is_left,
                         wav: Some((wav, ms)),
                         spec,
+                        envelope,
                     }
                 }
                 None => MediaMsg::Soundtrack {
                     left: is_left,
                     wav: None,
                     spec: None,
+                    envelope: None,
                 },
             };
             let _ = tx.send(msg);
@@ -1327,6 +1417,140 @@ impl DiffCompare {
             });
             ctx2.request_repaint();
         });
+    }
+
+    /// One side of the Audio tab: the amplitude waveform across `pane`, a
+    /// playhead line while this side (or the synced pair) is loaded, and an
+    /// `elapsed / total` readout. Clicking the waveform returns the clicked
+    /// fraction — the caller seeks or starts playback there.
+    fn draw_audio_wave(
+        &self,
+        ui: &mut egui::Ui,
+        pane: Rect,
+        slot: usize,
+        snap: Option<&crate::player::PlayerSnapshot>,
+    ) -> Option<f32> {
+        let side = if slot == 0 { &self.left } else { &self.right };
+        let accent = if slot == 0 {
+            theme::orange()
+        } else {
+            theme::blue()
+        };
+        // A quiet backdrop so the wave reads against any theme.
+        ui.painter().rect_filled(pane, 4.0, theme::panel());
+        let Some(env) = self.audio_env[slot].as_ref() else {
+            let note = if self.side_has_sound(slot) {
+                "decoding waveform…"
+            } else {
+                "This clip has no audio track."
+            };
+            ui.painter().text(
+                pane.center(),
+                Align2::CENTER_CENTER,
+                note,
+                FontId::proportional(13.0),
+                theme::tan(),
+            );
+            return None;
+        };
+        // The wave: one vertical bar per envelope bucket, mirrored around the
+        // midline.
+        let inner = pane.shrink2(egui::vec2(8.0, 14.0));
+        let n = env.len().max(1);
+        let cy = inner.center().y;
+        let half = inner.height() * 0.5;
+        let step = inner.width() / n as f32;
+        for (i, &a) in env.iter().enumerate() {
+            let x = inner.min.x + (i as f32 + 0.5) * step;
+            let h = (a.clamp(0.0, 1.0) * half).max(0.5);
+            ui.painter().line_segment(
+                [egui::pos2(x, cy - h), egui::pos2(x, cy + h)],
+                egui::Stroke::new(step.max(1.0) * 0.7, accent),
+            );
+        }
+        // Where playback stands. The synced pair drives both sides' playheads
+        // (they run the same fraction); a single load drives its own side.
+        let this_hex = side.facts.hash_hex.as_str();
+        let (playhead, audible, playing) = match snap {
+            Some(s) if s.loaded && s.total_ms > 0 => {
+                let here = s.paired
+                    || s.hex_a.as_deref() == Some(this_hex)
+                    || s.hex_b.as_deref() == Some(this_hex)
+                    || s.hex.as_deref() == Some(this_hex);
+                let frac = (s.pos_ms as f32 / s.total_ms as f32).clamp(0.0, 1.0);
+                (
+                    here.then_some(frac),
+                    s.hex.as_deref() == Some(this_hex),
+                    s.playing,
+                )
+            }
+            _ => (None, false, false),
+        };
+        let mut elapsed: Option<u64> = None;
+        if let (Some(f), Some(s)) = (playhead, snap) {
+            let x = inner.min.x + f * inner.width();
+            // The audible side gets the bright playhead; its silent partner a
+            // dimmed one (same position — they run in sync).
+            let color = if audible {
+                theme::red()
+            } else {
+                theme::red().gamma_multiply(0.45)
+            };
+            ui.painter().vline(
+                x,
+                pane.min.y + 4.0..=pane.max.y - 4.0,
+                egui::Stroke::new(2.0, color),
+            );
+            elapsed = Some(s.pos_ms);
+        }
+        // elapsed / total, and a play state marker for "is it actually
+        // playing?" at a glance.
+        let total_ms = side
+            .facts
+            .audio_ms
+            .map(u64::from)
+            .or(snap.filter(|s| s.loaded).map(|s| s.total_ms))
+            .unwrap_or(0);
+        let fmt = |ms: u64| -> String {
+            let secs = ms / 1000;
+            format!("{}:{:02}", secs / 60, secs % 60)
+        };
+        let time = match elapsed {
+            Some(e) => format!(
+                "{} {} / {}",
+                if playing && audible {
+                    "playing"
+                } else if audible {
+                    "paused"
+                } else {
+                    "synced"
+                },
+                fmt(e),
+                fmt(total_ms)
+            ),
+            None => fmt(total_ms),
+        };
+        ui.painter().text(
+            egui::pos2(pane.min.x + 8.0, pane.min.y + 4.0),
+            Align2::LEFT_TOP,
+            time,
+            FontId::proportional(12.0),
+            theme::text(),
+        );
+        // Click to seek (or to start playing from that spot).
+        let resp = ui.interact(
+            pane,
+            ui.id().with(("wave-seek", slot)),
+            egui::Sense::click(),
+        );
+        let resp = resp.on_hover_text("Click to play from this position.");
+        if resp.clicked()
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            let f = ((pos.x - inner.min.x) / inner.width()).clamp(0.0, 1.0);
+            return Some(f);
+        }
+        None
     }
 
     /// One side of the Video tab: the filmstrip across the top of `pane`, the
@@ -1481,9 +1705,12 @@ impl DiffCompare {
         }
         self.text[slot] = None;
         self.strings[slot] = None;
-        self.render_tex[slot] = None;
-        self.render_tried[slot] = false;
-        self.render_pending[slot] = false;
+        self.render_cache.retain(|&(s, _), _| s != slot);
+        self.render_order.retain(|&(s, _)| s != slot);
+        self.render_pending.retain(|&(s, _)| s != slot);
+        self.render_count[slot] = None;
+        self.render_probed[slot] = false;
+        self.audio_env[slot] = None;
         self.hex_head[slot] = None;
         self.tags[slot] = None;
         self.exif_all[slot] = None;
@@ -1667,6 +1894,9 @@ impl DiffCompare {
         while let Ok(loaded) = self.rx.try_recv() {
             let slot = usize::from(!loaded.left);
             self.settled[slot] = true;
+            if loaded.envelope.is_some() {
+                self.audio_env[slot] = loaded.envelope;
+            }
             if let Some(image) = loaded.image {
                 let [w, h] = image.size;
                 self.base_size[slot] = Some((w as u32, h as u32));
@@ -1693,8 +1923,16 @@ impl DiffCompare {
                 } => {
                     self.video[usize::from(!left)].duration_secs = duration_secs;
                 }
-                MediaMsg::Soundtrack { left, wav, spec } => {
+                MediaMsg::Soundtrack {
+                    left,
+                    wav,
+                    spec,
+                    envelope,
+                } => {
                     let slot = usize::from(!left);
+                    if envelope.is_some() {
+                        self.audio_env[slot] = envelope;
+                    }
                     let st = &mut self.video[slot];
                     st.audio = Some(wav);
                     st.spec_tex = spec.map(|image| {
@@ -1733,7 +1971,12 @@ impl DiffCompare {
                         self.rate = 1.0;
                     }
                 }
-                MediaMsg::RenderPage { left, path, image } => {
+                MediaMsg::RenderPage {
+                    left,
+                    path,
+                    page,
+                    image,
+                } => {
                     let slot = usize::from(!left);
                     let side = if slot == 0 { &self.left } else { &self.right };
                     // A page that finished rendering after the side was swapped
@@ -1741,13 +1984,30 @@ impl DiffCompare {
                     if side.facts.abs_path != path {
                         continue;
                     }
-                    self.render_pending[slot] = false;
-                    if let Some(image) = image {
-                        self.render_tex[slot] = Some(ctx.load_texture(
-                            format!("render{slot}"),
+                    self.render_pending.remove(&(slot, page));
+                    let tex = image.map(|image| {
+                        ctx.load_texture(
+                            format!("render{slot}p{page}"),
                             image,
                             TextureOptions::LINEAR,
-                        ));
+                        )
+                    });
+                    self.render_cache.insert((slot, page), tex);
+                    self.render_order.push_back((slot, page));
+                    // A page at 150 DPI is a big texture; keep only a recent
+                    // window so stepping back stays instant without hoarding
+                    // GPU memory.
+                    while self.render_order.len() > 12 {
+                        if let Some(old) = self.render_order.pop_front() {
+                            self.render_cache.remove(&old);
+                        }
+                    }
+                }
+                MediaMsg::RenderMeta { left, path, pages } => {
+                    let slot = usize::from(!left);
+                    let side = if slot == 0 { &self.left } else { &self.right };
+                    if side.facts.abs_path == path {
+                        self.render_count[slot] = pages;
                     }
                 }
             }
@@ -1892,6 +2152,7 @@ impl DiffCompare {
         self.poll(ctx);
 
         let ready = self.compare_ready();
+        let flicker_ready = self.flicker_ready();
         // Esc steps back (flicker → side-by-side → closed); Space drives flicker
         // (enter it, then swap A/B), both only once both sides have decoded.
         // P and the arrows drive the audio transport (guarded so typing in the
@@ -1921,7 +2182,7 @@ impl DiffCompare {
                 self.tag_edit = None;
             } else if self.member_return.is_some() {
                 self.return_to_archive(ctx);
-            } else if ready && self.compare.flicker {
+            } else if flicker_ready && self.compare.flicker {
                 self.compare.flicker = false;
             } else {
                 return Some(DiffPick::Close);
@@ -1940,7 +2201,16 @@ impl DiffCompare {
         // other transport actions after drawing. A hidden second side has
         // nothing to flicker against.
         let mut swapped = false;
-        if space && ready && self.two_sided() {
+        if space
+            && flicker_ready
+            && self.two_sided()
+            && matches!(
+                self.tab,
+                RepresentationKind::Image
+                    | RepresentationKind::Spectrum
+                    | RepresentationKind::Video
+            )
+        {
             if self.compare.flicker {
                 self.compare.show_b = !self.compare.show_b;
                 swapped = true;
@@ -1957,6 +2227,9 @@ impl DiffCompare {
         let mut leave_flicker = false;
         let mut do_swap = false;
         let mut play: Option<bool> = None;
+        // A click on a waveform: (side, fraction) — seek what is loaded, or
+        // start playback at that spot.
+        let mut wave_seek: Option<(bool, f32)> = None;
         let mut pause = false;
         let mut cycle_speed = false;
         let mut show = false;
@@ -2017,10 +2290,13 @@ impl DiffCompare {
                 let tab_is_audio = self.tab == RepresentationKind::Audio;
                 // Flicker is a media-only mode (image/audio/video); its controls
                 // and single-file chrome must never appear on the Text/hex tab.
+                // Flicker/zoom surfaces. Audio is deliberately absent: its tab
+                // is the listening transport (waveform + seek), and its visual
+                // comparison lives on the Spectrum tab.
                 let tab_is_media = matches!(
                     self.tab,
                     RepresentationKind::Image
-                        | RepresentationKind::Audio
+                        | RepresentationKind::Spectrum
                         | RepresentationKind::Video
                 );
                 let speed_label = {
@@ -2173,7 +2449,7 @@ impl DiffCompare {
                             {
                                 hide = true;
                             }
-                            if ready && tab_is_media {
+                            if flicker_ready && tab_is_media {
                                 if self.compare.flicker {
                                     if ui
                                         .button("SIDE BY SIDE")
@@ -2656,19 +2932,85 @@ impl DiffCompare {
                     );
                     self.render_strings(&mut child, two_sided_now);
                 } else if self.tab == RepresentationKind::Render {
-                    // The document rasterized to its first page, shown as it
-                    // looks — one file, or both side by side. Judged by eye; no
-                    // pixel diff, no verdict. (Page navigation and flicker land
-                    // with multi-page support.)
+                    // The document rasterized page by page, shown as it looks —
+                    // one file, or both side by side. Judged by eye; no pixel
+                    // diff, no verdict. One shared page control drives both
+                    // sides, so page N sits beside page N and a duplicate-PDF
+                    // walk stays aligned (a side past its own end says so).
                     let ctx = ui.ctx().clone();
+                    let has_switcher = self.can_step_left() || self.can_step_right();
+                    let clearance = if has_switcher { 58.0 } else { 30.0 };
+                    let controls = Rect::from_min_size(
+                        egui::pos2(viewport.min.x, viewport.min.y + clearance),
+                        egui::vec2(viewport.width(), 26.0),
+                    );
+                    let panes = Rect::from_min_max(
+                        egui::pos2(viewport.min.x, controls.max.y + 4.0),
+                        viewport.max,
+                    );
+                    // The shared control ranges over the longer document.
+                    let total = self.render_count[0]
+                        .into_iter()
+                        .chain(if two_sided_now {
+                            self.render_count[1]
+                        } else {
+                            None
+                        })
+                        .max();
+                    let mut child = ui.new_child(
+                        UiBuilder::new()
+                            .max_rect(controls)
+                            .layout(Layout::left_to_right(Align::Center)),
+                    );
+                    {
+                        let ui = &mut child;
+                        if ui.button("< PREV PAGE").clicked() {
+                            self.render_page = self.render_page.saturating_sub(1);
+                        }
+                        let cap = total.unwrap_or(9_999).max(1);
+                        let mut page1 = self.render_page + 1;
+                        ui.label(RichText::new("page").color(theme::tan()));
+                        let typed = ui
+                            .add(egui::DragValue::new(&mut page1).range(1..=cap))
+                            .on_hover_text("Type or drag to jump straight to a page.");
+                        ui.label(
+                            RichText::new(match total {
+                                Some(n) => format!("/ {n}"),
+                                None => "/ ?".to_string(),
+                            })
+                            .color(theme::tan()),
+                        );
+                        if typed.changed() {
+                            self.render_page = page1.saturating_sub(1);
+                        }
+                        if ui.button("NEXT PAGE >").clicked()
+                            && total.is_none_or(|n| self.render_page + 1 < n)
+                        {
+                            self.render_page += 1;
+                        }
+                        // A slider for sweeping a long document quickly.
+                        if let Some(n) = total
+                            && n > 1
+                        {
+                            ui.add_space(8.0);
+                            ui.spacing_mut().slider_width = 160.0;
+                            let mut page1 = self.render_page + 1;
+                            let slid = ui
+                                .add(egui::Slider::new(&mut page1, 1..=n).show_value(false))
+                                .on_hover_text("Drag to sweep quickly through the pages.");
+                            if slid.changed() {
+                                self.render_page = page1.saturating_sub(1);
+                            }
+                        }
+                    }
                     self.ensure_render(&ctx, 0);
                     if two_sided_now {
                         self.ensure_render(&ctx, 1);
-                        let (left_pane, right_pane) = compare_split(viewport);
+                        let (left_pane, right_pane) = compare_split(panes);
                         self.draw_render_page(ui, left_pane, 0);
                         self.draw_render_page(ui, right_pane, 1);
                     } else {
-                        self.draw_render_page(ui, viewport, 0);
+                        self.draw_render_page(ui, panes, 0);
                     }
                 } else if self.tab == RepresentationKind::Hex {
                     // Raw bytes, always: a hex dump of one file's head, or the
@@ -2733,7 +3075,11 @@ impl DiffCompare {
                         viewport.max,
                     );
                     let mut clicked: Option<f32> = None;
-                    if two_sided_now {
+                    // Flicker on video: one clip's filmstrip + frame fills the
+                    // pane and Space/SWAP flips which — the same in-place
+                    // comparison images get, at the shared playhead.
+                    let video_flicker = self.compare.flicker && two_sided_now;
+                    if two_sided_now && !video_flicker {
                         let (left_pane, right_pane) = compare_split(viewport);
                         for (slot, pane) in [(0usize, left_pane), (1usize, right_pane)] {
                             if let Some(f) = self.draw_video_side(ui, pane, slot, verbosity) {
@@ -2741,10 +3087,11 @@ impl DiffCompare {
                             }
                         }
                     } else {
-                        if let Some(f) = self.draw_video_side(ui, viewport, 0, verbosity) {
+                        let slot = usize::from(video_flicker && self.compare.show_b);
+                        if let Some(f) = self.draw_video_side(ui, viewport, slot, verbosity) {
                             clicked = Some(f);
                         }
-                        self.film_rects[1].clear();
+                        self.film_rects[1 - slot].clear();
                     }
                     if let Some(f) = clicked {
                         self.playhead = Some(f);
@@ -2752,6 +3099,27 @@ impl DiffCompare {
                         if two_sided_now {
                             self.spawn_scrub(ctx, 1, f);
                         }
+                    }
+                } else if self.tab == RepresentationKind::Audio {
+                    // The listening transport: each side's waveform, a click
+                    // seeks, the playhead and times track playback live. The
+                    // zoomable spectrogram comparison lives on the Spectrum
+                    // tab — this surface is for ears, not pixels.
+                    let snap = player.map(|p| p.snapshot());
+                    // Keep the playhead moving while something plays.
+                    if snap.as_ref().is_some_and(|s| s.loaded && s.playing) {
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(100));
+                    }
+                    if two_sided_now {
+                        let (left_pane, right_pane) = compare_split(viewport);
+                        for (slot, pane) in [(0usize, left_pane), (1usize, right_pane)] {
+                            if let Some(f) = self.draw_audio_wave(ui, pane, slot, snap.as_ref()) {
+                                wave_seek = Some((slot == 0, f));
+                            }
+                        }
+                    } else if let Some(f) = self.draw_audio_wave(ui, viewport, 0, snap.as_ref()) {
+                        wave_seek = Some((true, f));
                     }
                 } else if !two_sided_now {
                     // One file, the whole viewport — the hidden side must not
@@ -3012,12 +3380,19 @@ impl DiffCompare {
                                 // edge — the edge is the effortless "slam to
                                 // it" target, which delete must not be.
                                 ui.add_space(8.0);
+                                let (ro, other_ro) = if is_left {
+                                    (self.left.read_only, self.right.read_only)
+                                } else {
+                                    (self.right.read_only, self.left.read_only)
+                                };
                                 side_actions(
                                     ui,
                                     is_left,
                                     verbosity,
                                     mark.map(|m| (mark_label, m)),
                                     has_b,
+                                    ro,
+                                    other_ro,
                                 )
                             },
                         )
@@ -3458,6 +3833,26 @@ impl DiffCompare {
                         paused: false,
                     }
                 });
+            }
+            // A waveform click: seek whatever is loaded, or start playback at
+            // exactly that spot (the pair when comparing sound with sound, so
+            // a later flip stays gap-free).
+            if let Some((is_left, f)) = wave_seek {
+                if snap.loaded {
+                    p.seek_fraction(f);
+                } else if sound_pair {
+                    self.pending_play = Some(PendingPlay::Pair {
+                        audible_b: !is_left,
+                        fraction: f,
+                        paused: false,
+                    });
+                } else if self.side_has_sound(usize::from(!is_left)) {
+                    self.pending_play = Some(PendingPlay::Single {
+                        left: is_left,
+                        fraction: f,
+                        paused: false,
+                    });
+                }
             }
             if pause {
                 p.toggle_pause();
@@ -3915,6 +4310,8 @@ fn side_actions(
     verbosity: TooltipVerbosity,
     mark: Option<(&str, MarkPill)>,
     has_other: bool,
+    read_only: bool,
+    other_read_only: bool,
 ) -> Option<DiffPick> {
     let mut pick = None;
     // A caller that supplied marks acts through the pill alone.
@@ -3925,35 +4322,48 @@ fn side_actions(
         return pick;
     }
     ui.horizontal(|ui| {
-        if has_other
-            && ui
-                .add(
-                    egui::Button::new(RichText::new("OVERWRITE OTHER").color(theme::black()))
-                        .fill(theme::tan()),
+        // OVERWRITE replaces the *other* side's existing file, so it is the
+        // other repo's lock that gates it; DELETE loses this side's file, so
+        // this repo's lock gates that. Locked = disabled with the reason on
+        // hover — unlocking happens on the repo's padlock.
+        if has_other {
+            let btn = egui::Button::new(RichText::new("OVERWRITE OTHER").color(theme::black()))
+                .fill(theme::tan());
+            let resp = ui.add_enabled(!other_read_only, btn);
+            let resp = if other_read_only {
+                resp.on_disabled_hover_text(
+                    "The other repository is locked — unlock it (its padlock) to allow \
+                     overwriting its files.",
                 )
-                .explain(
+            } else {
+                resp.explain(
                     verbosity,
                     "Replace the other side with this version",
                     "Copy this version over the other repository's file, so both repositories \
                      hold this one. The other version is gone afterwards.",
                 )
-                .clicked()
-        {
-            pick = Some(DiffPick::Overwrite { from_left: is_left });
+            };
+            if resp.clicked() {
+                pick = Some(DiffPick::Overwrite { from_left: is_left });
+            }
         }
-        if ui
-            .add(
-                egui::Button::new(RichText::new("DELETE").color(theme::ink_on(theme::red())))
-                    .fill(theme::red()),
+        let btn = egui::Button::new(RichText::new("DELETE").color(theme::ink_on(theme::red())))
+            .fill(theme::red());
+        let resp = ui.add_enabled(!read_only, btn);
+        let resp = if read_only {
+            resp.on_disabled_hover_text(
+                "This repository is locked — unlock it (its padlock) to allow deleting \
+                 its files.",
             )
-            .explain(
+        } else {
+            resp.explain(
                 verbosity,
                 "Delete this version",
                 "Delete this file from this repository. The other repository's version is \
                  left alone. This cannot be undone.",
             )
-            .clicked()
-        {
+        };
+        if resp.clicked() {
             pick = Some(DiffPick::Delete { on_left: is_left });
         }
     });
@@ -4336,6 +4746,48 @@ mod tests {
         assert_ne!(
             cmp.left.rel_path, cmp.right.rel_path,
             "the two sides can never be the same file"
+        );
+    }
+
+    /// The audio split: the Audio tab is the listening transport and the
+    /// Spectrum tab the zoomable visual — an audio pair offers both.
+    #[test]
+    fn an_audio_pair_offers_audio_and_spectrum_tabs() {
+        let cmp = DiffCompare::new(diff_side(Some("audio/mpeg")), diff_side(Some("audio/mpeg")));
+        let (l, r) = cmp.reps();
+        let kinds = crate::lightbox::tab_kinds(&l, Some(&r));
+        assert!(kinds.contains(&RepresentationKind::Audio));
+        assert!(
+            kinds.contains(&RepresentationKind::Spectrum),
+            "the spectrogram comparison has its own tab"
+        );
+        let img = DiffCompare::new(diff_side(Some("image/png")), diff_side(Some("image/png")));
+        let (l, r) = img.reps();
+        assert!(
+            !crate::lightbox::tab_kinds(&l, Some(&r)).contains(&RepresentationKind::Spectrum),
+            "no Spectrum tab without audio"
+        );
+    }
+
+    /// Video flicker readiness: it engages only once both sides hold a frame
+    /// at the shared playhead — before any filmstrip click there is nothing to
+    /// flicker between, and the mode is not offered.
+    #[test]
+    fn video_flicker_waits_for_both_scrub_frames() {
+        let mut cmp = DiffCompare::new(video_side("a.mp4", "aa"), video_side("b.mp4", "bb"));
+        cmp.tab = RepresentationKind::Video;
+        assert!(
+            !cmp.flicker_ready(),
+            "no playhead yet — nothing to flicker between"
+        );
+        let ctx = Context::default();
+        let img = ColorImage::new([4, 4], vec![egui::Color32::BLACK; 16]);
+        cmp.video[0].scrub_tex = Some(ctx.load_texture("t0", img.clone(), TextureOptions::LINEAR));
+        assert!(!cmp.flicker_ready(), "one frame is not a comparison");
+        cmp.video[1].scrub_tex = Some(ctx.load_texture("t1", img, TextureOptions::LINEAR));
+        assert!(
+            cmp.flicker_ready(),
+            "both frames at the playhead — flicker can engage"
         );
     }
 
@@ -4723,7 +5175,8 @@ mod tests {
         // `run()` — the "Rendering…" note requests a repaint each frame, which
         // `run()` would treat as never settling) until both textures land.
         for _ in 0..100 {
-            if h.state().render_tex.iter().all(Option::is_some) {
+            let cached = |slot| matches!(h.state().render_cache.get(&(slot, 0)), Some(Some(_)));
+            if cached(0) && cached(1) {
                 break;
             }
             h.step();
@@ -6085,7 +6538,15 @@ mod tests {
             "a transport control per side"
         );
         h.get_by_label_contains("PLAY B").click();
-        h.run();
+        // `step()`, not `run()`: while audio plays the live playhead requests
+        // a repaint every frame, which `run()` treats as never settling.
+        for _ in 0..20 {
+            h.step();
+            if player.snapshot().loaded {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
         assert_eq!(
             player.snapshot().hex.as_deref(),
             Some("bbbb"),

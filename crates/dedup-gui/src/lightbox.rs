@@ -25,6 +25,9 @@ pub enum RepresentationKind {
     Metadata,
     Image,
     Audio,
+    // The audio spectrogram as a zoomable image — the visual fingerprint
+    // comparison, split out so the Audio tab stays a listening transport.
+    Spectrum,
     Video,
     Text,
     // A document rasterized to page images — how it looks. Offered for PDFs,
@@ -46,6 +49,7 @@ impl RepresentationKind {
             Self::Metadata => "Metadata",
             Self::Image => "Image",
             Self::Audio => "Audio",
+            Self::Spectrum => "Spectrum",
             Self::Video => "Video",
             Self::Text => "Text",
             Self::Render => "Render",
@@ -61,6 +65,7 @@ impl RepresentationKind {
             Self::Metadata => icon::PENCIL,
             Self::Image => icon::IMAGE,
             Self::Audio => icon::LIGHTNING,
+            Self::Spectrum => icon::IMAGE,
             Self::Video => icon::IMAGE,
             Self::Text => icon::SEARCH,
             Self::Render => icon::IMAGE,
@@ -395,6 +400,7 @@ impl FileRepresentations {
         }
         if self.audio.is_some() {
             kinds.push(RepresentationKind::Audio);
+            kinds.push(RepresentationKind::Spectrum);
         }
         if self.video.is_some() {
             kinds.push(RepresentationKind::Video);

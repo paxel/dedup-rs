@@ -354,7 +354,21 @@ impl BulkOp {
     }
 }
 
-fn diff_metas(rows: &[RepoDiffRow]) -> Vec<board::RowMeta> {
+/// Whether a board command is allowed under the session locks: commands that
+/// delete or overwrite a side's *existing* files need that side unlocked;
+/// additions (copies), renames, compare and hide are always allowed.
+fn cmd_allowed(cmd: board::Cmd, left_ro: bool, right_ro: bool) -> bool {
+    use board::Cmd;
+    match cmd {
+        Cmd::DeleteLeft | Cmd::DeleteAllLeft | Cmd::KeepOneLeft | Cmd::OverwriteLeft => !left_ro,
+        Cmd::DeleteRight | Cmd::DeleteAllRight | Cmd::KeepOneRight | Cmd::OverwriteRight => {
+            !right_ro
+        }
+        _ => true,
+    }
+}
+
+fn diff_metas(rows: &[RepoDiffRow], left_ro: bool, right_ro: bool) -> Vec<board::RowMeta> {
     use board::{Cmd, Status};
     use dedup_core::diff::DiffRelation as R;
     rows.iter()
@@ -403,6 +417,10 @@ fn diff_metas(rows: &[RepoDiffRow]) -> Vec<board::RowMeta> {
                 ),
             };
             cmds.push(Cmd::Hide);
+            // The review shows only the buttons the session locks allow — a
+            // command that would delete or overwrite in a locked repo is left
+            // out, not shown disabled (unlock the repo's padlock to get it).
+            cmds.retain(|&c| cmd_allowed(c, left_ro, right_ro));
             let first = |files: &[dedup_core::diff::DiffFile]| files.first().cloned();
             board::RowMeta {
                 key: format!(
@@ -462,11 +480,19 @@ fn diff_action(
     match cmd {
         // The row body opens the shared viewer — the law: clicking any file
         // anywhere shows it. Same destination COMPARE used to reach, now without
-        // a command competing for row space.
-        Cmd::OpenRow | Cmd::Compare => Some(BoardAction::Inspect {
-            left_rel: left?,
-            right_rel: right?,
-        }),
+        // a command competing for row space. A row with only one side opens
+        // that file alone (it used to open nothing — `?` on the absent side
+        // swallowed the click).
+        Cmd::OpenRow | Cmd::Compare => {
+            if left.is_none() && right.is_none() {
+                None
+            } else {
+                Some(BoardAction::Inspect {
+                    left_rel: left,
+                    right_rel: right,
+                })
+            }
+        }
         Cmd::CopyRight => Some(BoardAction::Copy {
             from_left: true,
             rel_path: left?,
@@ -671,9 +697,13 @@ fn build_group_back_preview(
                 )
                 .in_repo(sink),
                 false,
-                // Each row can be pulled on its own — the only way to opt a
-                // resurrection in, and a way to promote a single new file.
-                vec![board::Cmd::Apply],
+                // Each row is a triage decision: `< COPY` pulls this one file
+                // into the main (the only way to opt a resurrection in, and a
+                // way to promote a single new file), `DELETE R` removes it from
+                // the sink instead — everything in the sink is either worth
+                // promoting or worth purging. (DELETE R is withheld at render
+                // time while the sink is locked.)
+                vec![board::Cmd::CopyLeft, board::Cmd::DeleteRight],
             );
             rows.push(meta);
             bodies.push(body);
@@ -1201,6 +1231,9 @@ pub struct TransferView {
     verbosity: TooltipVerbosity,
     /// Decodes the review board's row thumbnails; polled once per frame.
     thumbs: ThumbCache,
+    /// The app-wide repo lock registry (see [`crate::locks`]): which repos'
+    /// existing files may be deleted or overwritten this session.
+    locks: crate::locks::RepoLocks,
 }
 
 enum Act {
@@ -1232,6 +1265,12 @@ enum Act {
     SelectNoSinks,
     /// GROUP SYNC BACK: pick exactly one sink to pull back (single-select).
     SelectOnlySink(String),
+    /// GROUP SYNC BACK: delete one file (by sink-relative path) from the sink —
+    /// the "not worth promoting, not worth keeping" half of the triage.
+    DeleteSinkRow(String),
+    /// Open one existing file `(repo, rel_path)` from a preview row in the
+    /// single-file INSPECT viewer (planned counterparts may not exist yet).
+    OpenPreviewRow(String, String),
 }
 
 impl TransferView {
@@ -1289,7 +1328,16 @@ impl TransferView {
             rx,
             verbosity: TooltipVerbosity::default(),
             thumbs: ThumbCache::new(3),
+            locks: crate::locks::RepoLocks::new(),
         }
+    }
+
+    /// Construct wired to the app's shared lock registry, so a repo unlocked
+    /// here is unlocked on every tab (and vice versa).
+    pub fn new_with_locks(locks: crate::locks::RepoLocks) -> Self {
+        let mut me = Self::new();
+        me.locks = locks;
+        me
     }
 
     /// The SIMILAR folder-export similarity threshold (percent), persisted
@@ -1562,7 +1610,7 @@ impl TransferView {
                     sel,
                     theme::orange(),
                     mains.contains(name),
-                    None,
+                    Some(self.locks.read_only(name)),
                 );
                 if chip
                     .name
@@ -1577,6 +1625,7 @@ impl TransferView {
                 {
                     acts.push(Act::PickSource(name.clone()));
                 }
+                self.locks.handle_badge(chip.lock, self.verbosity, name);
                 chip.outer
             });
 
@@ -1603,7 +1652,7 @@ impl TransferView {
                         sel,
                         theme::blue(),
                         mains.contains(name),
-                        None,
+                        Some(self.locks.read_only(name)),
                     );
                     if chip
                         .name
@@ -1617,6 +1666,7 @@ impl TransferView {
                     {
                         acts.push(Act::PickTarget(name.clone()));
                     }
+                    self.locks.handle_badge(chip.lock, self.verbosity, name);
                     chip.outer
                 });
             }
@@ -1671,7 +1721,7 @@ impl TransferView {
                         sel,
                         theme::lilac(),
                         mains.contains(name),
-                        None,
+                        Some(self.locks.read_only(name)),
                     );
                     if chip
                         .name
@@ -1684,6 +1734,7 @@ impl TransferView {
                     {
                         acts.push(Act::ToggleExtraRef(name.clone()));
                     }
+                    self.locks.handle_badge(chip.lock, self.verbosity, name);
                     chip.outer
                 });
             }
@@ -2084,8 +2135,14 @@ impl TransferView {
                         theme::blue()
                     };
                     let row = ui.horizontal(|ui| {
-                        let chip =
-                            crate::repo_chip::repo_chip(ui, &sink.repo, sel, accent, false, None);
+                        let chip = crate::repo_chip::repo_chip(
+                            ui,
+                            &sink.repo,
+                            sel,
+                            accent,
+                            false,
+                            Some(self.locks.read_only(&sink.repo)),
+                        );
                         ui.label(
                             RichText::new(format!("MODE: {mode}"))
                                 .color(accent)
@@ -2107,6 +2164,8 @@ impl TransferView {
                     {
                         acts.push(Act::SelectOnlySink(sink.repo.clone()));
                     }
+                    self.locks
+                        .handle_badge(row.inner.lock, self.verbosity, &sink.repo);
                     row.response
                 });
             },
@@ -2168,8 +2227,14 @@ impl TransferView {
                     // from that rect, so a label drawn outside it would never be
                     // budgeted and the row would overrun the available width.
                     let row = ui.horizontal(|ui| {
-                        let chip =
-                            crate::repo_chip::repo_chip(ui, &sink.repo, sel, accent, false, None);
+                        let chip = crate::repo_chip::repo_chip(
+                            ui,
+                            &sink.repo,
+                            sel,
+                            accent,
+                            false,
+                            Some(self.locks.read_only(&sink.repo)),
+                        );
                         // Same wording as the sink's mode pill on the Repositories tab.
                         ui.label(
                             RichText::new(format!("MODE: {mode}"))
@@ -2178,19 +2243,37 @@ impl TransferView {
                         );
                         chip
                     });
+                    // A MIRROR push can delete this sink's existing files, so a
+                    // locked MIRROR sink cannot be included — the padlock next
+                    // to it says why, and unlocking it re-enables the toggle.
+                    // ADD ONLY sinks only ever gain files, so the lock does not
+                    // bar them.
+                    let barred = sink.mode == SyncMode::Mirror && self.locks.read_only(&sink.repo);
+                    let (hover, hover_verbose) = if barred {
+                        (
+                            "Locked MIRROR sink — unlock it to include it in the push",
+                            "This sink pushes in MIRROR mode, which can delete its existing \
+                             files, and it is locked. Click its padlock to unlock it if you \
+                             want the push to include it.",
+                        )
+                    } else {
+                        (
+                            "Include this sink in the push",
+                            "Toggle whether this sink is included when GROUP SYNC runs. Its mode \
+                             (ADD ONLY / MIRROR) is set on the Repositories tab.",
+                        )
+                    };
                     if row
                         .inner
                         .name
-                        .explain(
-                            self.verbosity,
-                            "Include this sink in the push",
-                            "Toggle whether this sink is included when GROUP SYNC runs. Its mode \
-                         (ADD ONLY / MIRROR) is set on the Repositories tab.",
-                        )
+                        .explain(self.verbosity, hover, hover_verbose)
                         .clicked()
+                        && !barred
                     {
                         acts.push(Act::ToggleSink(sink.repo.clone()));
                     }
+                    self.locks
+                        .handle_badge(row.inner.lock, self.verbosity, &sink.repo);
                     row.response
                 });
                 ui.label(
@@ -2312,6 +2395,52 @@ impl TransferView {
     /// Whether the *current* run would delete on-disk data: MOVE and MIRROR
     /// always do, and SYNC does only when DELETE MISSING is on. Drives the red
     /// accent on the confirm dialog.
+    /// Why the session locks bar this RUN, if they do. A command is barred only
+    /// when the operation *as a whole* would delete or overwrite existing files
+    /// in a locked repo — additions are always allowed (see [`crate::locks`]).
+    fn lock_block(&self) -> Option<String> {
+        match self.command {
+            Command::Mirror => {
+                let t = self.target.as_deref()?;
+                self.locks.read_only(t).then(|| {
+                    format!("MIRROR can delete files in '{t}' — unlock it (its padlock) to run.")
+                })
+            }
+            Command::Move => {
+                let s = self.source.as_deref()?;
+                self.locks.read_only(s).then(|| {
+                    format!("MOVE removes files from '{s}' — unlock it (its padlock) to run.")
+                })
+            }
+            Command::Sync if self.sync_delete_missing => {
+                let t = self.target.as_deref()?;
+                self.locks.read_only(t).then(|| {
+                    format!(
+                        "SYNC with DELETE MISSING can delete files in '{t}' — unlock it or \
+                         turn DELETE MISSING off."
+                    )
+                })
+            }
+            Command::GroupSync => {
+                // Locked MIRROR sinks are excluded from the push; the run is
+                // barred only when that leaves nothing to push to.
+                let group = self.current_group.as_ref()?;
+                let any_eligible = group.sinks.iter().any(|s| {
+                    self.selected_sinks.contains(&s.repo)
+                        && !(s.mode == SyncMode::Mirror && self.locks.read_only(&s.repo))
+                });
+                (!self.selected_sinks.is_empty() && !any_eligible).then(|| {
+                    "Every selected sink is a locked MIRROR sink — unlock one (its padlock) \
+                     or select an ADD ONLY sink."
+                        .to_string()
+                })
+            }
+            // COPY / SYNC (add-only) / GROUP SYNC BACK's batch promote only ever
+            // add files; DIFF changes nothing by itself.
+            _ => None,
+        }
+    }
+
     fn destructive_run(&self) -> bool {
         self.command.destructive()
             || (self.command == Command::Sync && self.sync_delete_missing)
@@ -2352,17 +2481,23 @@ impl TransferView {
                 }
                 let run = egui::Button::new(RichText::new("RUN").color(theme::black()))
                     .fill(theme::amber());
-                if ui
-                    .add_enabled(ready, run)
-                    .explain(
+                // The session locks can bar the whole run (e.g. MIRROR into a
+                // locked target). The disabled button's hover says exactly why
+                // and which padlock to click.
+                let lock_block = self.lock_block();
+                let resp = ui.add_enabled(ready && lock_block.is_none(), run);
+                let resp = if let Some(why) = &lock_block {
+                    resp.on_disabled_hover_text(why.clone())
+                } else {
+                    resp.explain(
                         self.verbosity,
                         "Run the command",
                         "Run the selected command (COPY/MOVE) on a background thread, \
                          after a confirmation dialog. Progress, the current file, and a \
                          running count are shown live.",
                     )
-                    .clicked()
-                {
+                };
+                if resp.clicked() {
                     acts.push(Act::Ask);
                 }
                 if self.running {
@@ -2484,7 +2619,15 @@ impl TransferView {
                 );
                 return;
             }
-            let metas = diff_metas(&self.diff_rows);
+            let left_ro = self
+                .source
+                .as_deref()
+                .is_none_or(|r| self.locks.read_only(r));
+            let right_ro = self
+                .target
+                .as_deref()
+                .is_none_or(|r| self.locks.read_only(r));
+            let metas = diff_metas(&self.diff_rows, left_ro, right_ro);
             // Facts are looked up per visible row rather than carried on the
             // rows: `DiffFile` has only a path, size and date, and the board
             // asks for a body only for what is on screen.
@@ -2610,28 +2753,67 @@ impl TransferView {
         // row names its own sink and offers no commands (the rows themselves
         // carry an empty command set).
         let group_sync = self.command == Command::GroupSync;
+        let group_back = self.command == Command::GroupSyncBack;
         let (left_role, right_role) = if group_sync {
             ("MAIN", "SINKS")
+        } else if group_back {
+            ("MAIN", "SINK")
         } else {
             ("SOURCE", "TARGET")
         };
         let bodies = std::mem::take(&mut self.preview_bodies);
+        // The review shows only the buttons the session locks allow: while the
+        // whole command is barred (e.g. MOVE with a locked source), each row's
+        // APPLY is withheld; while the back-sync sink is locked, its DELETE R
+        // is withheld (the promote `< COPY` only adds and always stays). HIDE
+        // stays either way, and unlocking the padlock brings the rest back.
+        let strip_apply = self.lock_block().is_some();
+        let strip_del_r = self.command == Command::GroupSyncBack
+            && self
+                .selected_sinks
+                .first()
+                .is_some_and(|s| self.locks.read_only(s));
+        let lock_filtered: Vec<board::RowMeta>;
+        let metas: &[board::RowMeta] = if strip_apply || strip_del_r {
+            lock_filtered = self
+                .preview
+                .iter()
+                .map(|m| {
+                    let mut m = m.clone();
+                    m.cmds.retain(|&c| {
+                        !(strip_apply && c == board::Cmd::Apply)
+                            && !(strip_del_r && c == board::Cmd::DeleteRight)
+                    });
+                    m
+                })
+                .collect();
+            &lock_filtered
+        } else {
+            &self.preview
+        };
         let action = board::board(
             ui,
             &mut self.preview_board,
-            &self.preview,
+            metas,
             board::BoardView {
                 left_role,
                 left_repo: self.source.as_deref().unwrap_or(""),
-                left_is_main: group_sync,
+                left_is_main: group_sync || group_back,
                 left_path: &self.preview_source_header,
                 // Transfer is always two-sided (source → target/folder/sinks).
                 right: Some(board::RightHeader {
                     role: right_role,
                     // GROUP SYNC's right side spans several repos, so the
-                    // header names none of them — each row carries its own chip.
+                    // header names none of them — each row carries its own
+                    // chip. GROUP SYNC BACK's right side is the one selected
+                    // sink, named with a full chip like every other header.
                     repo: if group_sync {
                         ""
+                    } else if group_back {
+                        self.selected_sinks
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or("")
                     } else {
                         self.target.as_deref().unwrap_or("")
                     },
@@ -2650,10 +2832,39 @@ impl TransferView {
         );
         self.preview_bodies = bodies;
         if let Some(a) = action
-            && a.cmd == board::Cmd::Apply
             && let Some(meta) = self.preview.get(a.row)
         {
-            acts.push(Act::ApplyRow(meta.key.clone()));
+            match a.cmd {
+                // APPLY (planned previews) and the back-sync `< COPY` promote
+                // both run just this row.
+                board::Cmd::Apply | board::Cmd::CopyLeft => {
+                    acts.push(Act::ApplyRow(meta.key.clone()));
+                }
+                // The back-sync triage's other half: purge the file from the
+                // sink instead of promoting it.
+                board::Cmd::DeleteRight => {
+                    if let Some(rel) = meta.right_paths.first() {
+                        acts.push(Act::DeleteSinkRow(rel.clone()));
+                    }
+                }
+                // Clicking the row opens the file that actually exists — the
+                // sink's copy on a back-sync board, the source's otherwise (a
+                // planned target file may not be on disk yet).
+                board::Cmd::OpenRow => {
+                    let (repo, rel) = if self.command == Command::GroupSyncBack {
+                        (
+                            self.selected_sinks.first().cloned(),
+                            meta.right_paths.first().cloned(),
+                        )
+                    } else {
+                        (self.source.clone(), meta.left_paths.first().cloned())
+                    };
+                    if let (Some(repo), Some(rel)) = (repo, rel) {
+                        acts.push(Act::OpenPreviewRow(repo, rel));
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -2850,6 +3061,8 @@ impl TransferView {
                 // file into the main (this is how a single resurrection is opted
                 // in). Every other command runs against the previewed config.
                 if self.command == Command::GroupSyncBack {
+                    // A back-sync promote only *adds* to the main, so no lock
+                    // can bar it.
                     if let (Some(group), Some(sink)) = (
                         self.current_group.clone(),
                         self.selected_sinks.first().cloned(),
@@ -2857,10 +3070,50 @@ impl TransferView {
                         let only = std::iter::once(key).collect();
                         self.start_group_back_pull(store, group.main, sink, Some(only));
                     }
-                } else if let Some(config) = self.capture_run_config() {
+                } else if self.lock_block().is_none()
+                    && let Some(config) = self.capture_run_config()
+                {
+                    // Never act past the lock, even from a preview built before
+                    // the repo was re-locked.
                     self.start(store, config, Some(key));
                 }
             }
+            Act::DeleteSinkRow(rel) => {
+                // Back-sync triage: this sink file is wanted neither in the
+                // main nor in the sink. Deleting existing data needs the sink
+                // unlocked — the button is withheld while locked, and this
+                // re-check means a stale frame can never slip past the lock.
+                let Some(sink) = self.selected_sinks.first().cloned() else {
+                    return;
+                };
+                if self.locks.read_only(&sink) {
+                    return;
+                }
+                let deleted = store
+                    .get_repo(&sink)
+                    .map_err(|e| e.to_string())
+                    .and_then(|meta| {
+                        let path = std::path::PathBuf::from(&meta.abs_path).join(&rel);
+                        match std::fs::remove_file(&path) {
+                            Ok(()) => Ok(()),
+                            // Already gone — removing the index entry is still right.
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                            Err(e) => Err(format!("could not delete {}: {e}", path.display())),
+                        }
+                    })
+                    .and_then(|()| {
+                        store
+                            .remove_file_entry(&sink, &rel)
+                            .map_err(|e| e.to_string())
+                    });
+                match deleted {
+                    // The plan changed on disk: rebuild the preview so the row
+                    // disappears with correct counts.
+                    Ok(()) => self.run_preview(store),
+                    Err(e) => self.error = Some(e),
+                }
+            }
+            Act::OpenPreviewRow(repo, rel) => self.open_single(store, &repo, &rel),
             Act::SetPairing(pairing) => {
                 self.pairing = pairing;
                 self.clear_preview();
@@ -2868,7 +3121,7 @@ impl TransferView {
             Act::Board(crate::diff_board::BoardAction::Inspect {
                 left_rel,
                 right_rel,
-            }) => self.open_inspect(store, &left_rel, &right_rel),
+            }) => self.open_inspect(store, left_rel.as_deref(), right_rel.as_deref()),
             // A follow-up question is board state, not a file operation: it
             // opens the modal rather than running anything.
             Act::Board(crate::diff_board::BoardAction::OpenPopup { row, on_left, kind }) => {
@@ -3085,6 +3338,11 @@ impl TransferView {
                 .sinks
                 .into_iter()
                 .filter(|s| self.selected_sinks.contains(&s.repo))
+                // A locked MIRROR sink is never pushed to — MIRROR can delete
+                // its existing files, and the lock forbids that. (The include
+                // toggle already bars it; this is the backstop for a sink
+                // locked after being selected.)
+                .filter(|s| !(s.mode == SyncMode::Mirror && self.locks.read_only(&s.repo)))
                 .collect(),
         };
         if group.sinks.is_empty() {
@@ -3491,7 +3749,12 @@ impl TransferView {
 
     /// Open the side-by-side comparison for a conflicting row: both versions
     /// of the same path, with everything needed to judge them.
-    fn open_inspect(&mut self, store: &Arc<Store>, left_rel: &str, right_rel: &str) {
+    fn open_inspect(
+        &mut self,
+        store: &Arc<Store>,
+        left_rel: Option<&str>,
+        right_rel: Option<&str>,
+    ) {
         let (Some(source), Some(target)) = (self.source.clone(), self.target.clone()) else {
             return;
         };
@@ -3503,10 +3766,15 @@ impl TransferView {
                 repo: repo.to_string(),
                 rel_path: rel.to_string(),
                 facts: FileFacts::from_entry(&entry, abs_path),
-                read_only: true,
+                // The real session lock, not a hardcoded "protected" — the
+                // viewer's DELETE/OVERWRITE honor the same registry as
+                // everything else.
+                read_only: self.locks.read_only(repo),
             })
         };
-        match (side(&source, left_rel), side(&target, right_rel)) {
+        let left = left_rel.and_then(|rel| side(&source, rel));
+        let right = right_rel.and_then(|rel| side(&target, rel));
+        match (left, right) {
             (Some(left), Some(right)) => {
                 // A DIFF row offers exactly these two files, so the pool is the
                 // pair itself and neither side renders a switcher — there is
@@ -3515,7 +3783,43 @@ impl TransferView {
                 self.inspect = Some(DiffCompare::new_with_pool(left, Some(right), pool));
                 self.error = None;
             }
-            _ => self.error = Some("Could not read both versions of that file.".to_string()),
+            // An only-on-one-side row: open that file alone. There is no pair,
+            // so the viewer is a single-file INSPECT (no SHOW B, no pair
+            // actions).
+            (Some(only), None) | (None, Some(only)) => {
+                let mut lb = DiffCompare::new_with_pool(only.clone(), None, vec![only]);
+                lb.set_title("INSPECT");
+                self.inspect = Some(lb);
+                self.error = None;
+            }
+            (None, None) => {
+                self.error = Some("Could not read that row's file.".to_string());
+            }
+        }
+    }
+
+    /// Open one indexed file in the single-file INSPECT viewer (a preview row's
+    /// existing side — the planned counterpart may not be on disk yet).
+    fn open_single(&mut self, store: &Arc<Store>, repo: &str, rel: &str) {
+        let side = (|| -> Option<DiffSide> {
+            let meta = store.get_repo(repo).ok()?;
+            let entry = store.get_file_entry(repo, rel).ok().flatten()?;
+            let abs_path = PathBuf::from(&meta.abs_path).join(rel);
+            Some(DiffSide {
+                repo: repo.to_string(),
+                rel_path: rel.to_string(),
+                facts: FileFacts::from_entry(&entry, abs_path),
+                read_only: self.locks.read_only(repo),
+            })
+        })();
+        match side {
+            Some(side) => {
+                let mut lb = DiffCompare::new_with_pool(side.clone(), None, vec![side]);
+                lb.set_title("INSPECT");
+                self.inspect = Some(lb);
+                self.error = None;
+            }
+            None => self.error = Some("Could not read that row's file.".to_string()),
         }
     }
 
@@ -4030,6 +4334,100 @@ impl TransferView {
 mod ui_tests {
     use dedup_core::diff::{DiffFile, DiffRelation};
 
+    /// The session locks bar exactly the runs that would lose existing data:
+    /// MIRROR needs the target unlocked, MOVE the source; COPY and the
+    /// back-sync promote only add, so no lock ever bars them.
+    #[test]
+    fn lock_blocks_only_loss_operations() {
+        let mut v = TransferView::new();
+        v.source = Some("src".into());
+        v.target = Some("tgt".into());
+
+        v.command = Command::Mirror;
+        assert!(v.lock_block().is_some(), "MIRROR into a locked target");
+        v.locks.toggle("tgt");
+        assert!(
+            v.lock_block().is_none(),
+            "unlocking the target frees MIRROR"
+        );
+
+        v.command = Command::Move;
+        assert!(v.lock_block().is_some(), "MOVE from a locked source");
+        v.locks.toggle("src");
+        assert!(v.lock_block().is_none(), "unlocking the source frees MOVE");
+
+        v.locks.toggle("src");
+        v.locks.toggle("tgt"); // both locked again
+        v.command = Command::Copy;
+        assert!(v.lock_block().is_none(), "COPY only adds — never barred");
+        v.command = Command::Sync;
+        assert!(v.lock_block().is_none(), "plain SYNC only adds");
+        v.sync_delete_missing = true;
+        assert!(
+            v.lock_block().is_some(),
+            "SYNC with DELETE MISSING can delete in the locked target"
+        );
+        v.command = Command::GroupSyncBack;
+        assert!(
+            v.lock_block().is_none(),
+            "the back-sync batch promote only adds to the main"
+        );
+    }
+
+    /// Clicking an only-on-one-side row opens its single file — it used to
+    /// open nothing at all (the absent side's `?` swallowed the click), which
+    /// made a 2250-row one-sided diff completely uninspectable.
+    #[test]
+    fn a_one_sided_diff_row_opens_a_single_inspect() {
+        use crate::diff_board::BoardAction;
+        use board::Cmd;
+        let rows = vec![
+            drow(DiffRelation::OnlyLeft, vec![dfile("l.pdf", 1, 0)], vec![]),
+            drow(DiffRelation::OnlyRight, vec![], vec![dfile("r.jpg", 2, 0)]),
+        ];
+        assert_eq!(
+            diff_action(&rows, 0, Cmd::OpenRow),
+            Some(BoardAction::Inspect {
+                left_rel: Some("l.pdf".into()),
+                right_rel: None,
+            }),
+            "an only-left row opens the left file alone"
+        );
+        assert_eq!(
+            diff_action(&rows, 1, Cmd::OpenRow),
+            Some(BoardAction::Inspect {
+                left_rel: None,
+                right_rel: Some("r.jpg".into()),
+            }),
+            "an only-right row opens the right file alone"
+        );
+    }
+
+    /// The review board renders only the commands the locks allow: a locked
+    /// side loses its deletes/overwrites, and unlocking restores them.
+    #[test]
+    fn diff_rows_withhold_commands_for_locked_sides() {
+        use board::Cmd;
+        let rows = vec![drow(
+            DiffRelation::Conflict,
+            vec![dfile("a", 1, 0)],
+            vec![dfile("a", 2, 0)],
+        )];
+        // Left unlocked, right locked: right-side loss commands are withheld.
+        let metas = diff_metas(&rows, false, true);
+        assert!(metas[0].cmds.contains(&Cmd::DeleteLeft));
+        assert!(metas[0].cmds.contains(&Cmd::OverwriteLeft));
+        assert!(!metas[0].cmds.contains(&Cmd::DeleteRight));
+        assert!(
+            !metas[0].cmds.contains(&Cmd::OverwriteRight),
+            "overwriting the locked right side would lose its existing file"
+        );
+        assert!(
+            metas[0].cmds.contains(&Cmd::Compare) && metas[0].cmds.contains(&Cmd::Hide),
+            "non-destructive commands stay"
+        );
+    }
+
     fn dfile(rel: &str, size: u64, ms: i64) -> DiffFile {
         DiffFile {
             rel_path: rel.to_string(),
@@ -4055,7 +4453,7 @@ mod ui_tests {
             vec![dfile("b.jpg", 500, 20), dfile("a.jpg", 900, 10)],
             vec![dfile("c.jpg", 700, 30)],
         )];
-        let metas = diff_metas(&rows);
+        let metas = diff_metas(&rows, false, false);
         assert_eq!(metas[0].left_size, 500, "the first left file's size");
         assert_eq!(metas[0].left_modified, 20);
         assert_eq!(metas[0].right_size, 700);
@@ -4096,27 +4494,39 @@ mod ui_tests {
     #[test]
     fn diff_rows_offer_the_commands_their_relation_allows() {
         use board::Cmd;
-        let only_left = diff_metas(&[drow(DiffRelation::OnlyLeft, vec![dfile("a", 1, 0)], vec![])]);
+        let only_left = diff_metas(
+            &[drow(DiffRelation::OnlyLeft, vec![dfile("a", 1, 0)], vec![])],
+            false,
+            false,
+        );
         assert_eq!(
             only_left[0].cmds,
             vec![Cmd::CopyRight, Cmd::DeleteLeft, Cmd::Hide]
         );
 
-        let conflict = diff_metas(&[drow(
-            DiffRelation::Conflict,
-            vec![dfile("a", 1, 0)],
-            vec![dfile("a", 2, 0)],
-        )]);
+        let conflict = diff_metas(
+            &[drow(
+                DiffRelation::Conflict,
+                vec![dfile("a", 1, 0)],
+                vec![dfile("a", 2, 0)],
+            )],
+            false,
+            false,
+        );
         assert!(conflict[0].cmds.contains(&Cmd::Compare));
         assert!(conflict[0].cmds.contains(&Cmd::OverwriteRight));
 
         // A side holding several names is narrowed down before it can be
         // renamed, so that side offers KEEP 1 / DEL ALL instead of RENAME.
-        let multi = diff_metas(&[drow(
-            DiffRelation::Renamed,
-            vec![dfile("a", 1, 0), dfile("b", 1, 0)],
-            vec![dfile("c", 1, 0)],
-        )]);
+        let multi = diff_metas(
+            &[drow(
+                DiffRelation::Renamed,
+                vec![dfile("a", 1, 0), dfile("b", 1, 0)],
+                vec![dfile("c", 1, 0)],
+            )],
+            false,
+            false,
+        );
         assert!(multi[0].cmds.contains(&Cmd::KeepOneLeft));
         assert!(!multi[0].cmds.contains(&Cmd::RenameLeft));
         assert!(
@@ -4125,11 +4535,15 @@ mod ui_tests {
         );
 
         // Equal rows are unchanged and offer nothing but HIDE.
-        let equal = diff_metas(&[drow(
-            DiffRelation::Equal,
-            vec![dfile("a", 1, 0)],
-            vec![dfile("a", 1, 0)],
-        )]);
+        let equal = diff_metas(
+            &[drow(
+                DiffRelation::Equal,
+                vec![dfile("a", 1, 0)],
+                vec![dfile("a", 1, 0)],
+            )],
+            false,
+            false,
+        );
         assert!(equal[0].unchanged);
         assert_eq!(equal[0].cmds, vec![Cmd::Hide]);
     }
@@ -4520,8 +4934,97 @@ mod ui_tests {
         );
     }
 
-    /// A single resurrection row's per-row APPLY pulls just that file into the
-    /// main — how a mistakenly-deleted file is recreated from the backup.
+    /// The back-sync row's other half: DELETE R purges the file from the sink
+    /// (disk + index) and the preview rebuilds without it. And the button obeys
+    /// the sink's lock: locked (the default) means no DELETE R at all.
+    #[test]
+    fn group_sync_back_delete_r_purges_the_sink_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_at(tmp.path().join("cfg")).unwrap();
+        let src = tmp.path().join("source");
+        let dst = tmp.path().join("target");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("stays.txt"), b"stays").unwrap();
+        std::fs::write(dst.join("stays.txt"), b"stays").unwrap();
+        std::fs::write(dst.join("junk.txt"), b"junk-only-on-sink").unwrap();
+        store.create_repo("source", &src.to_string_lossy()).unwrap();
+        store.create_repo("target", &dst.to_string_lossy()).unwrap();
+        let scan = |repo: &str| {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        };
+        scan("source");
+        scan("target");
+        store.create_sync_group("grp", "source").unwrap();
+        store
+            .add_sync_sink("grp", "target", dedup_core::store::SyncMode::AddOnly)
+            .unwrap();
+        let store = Arc::new(store);
+        let mut view = TransferView::new();
+        view.loaded = true;
+        view.repos = vec!["source".to_string(), "target".to_string()];
+        view.source = Some("source".to_string());
+        view.sync_repos(&store);
+        view.command = Command::GroupSyncBack;
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1120.0, 940.0))
+            .build_ui_state(
+                move |ui, view: &mut TransferView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), None);
+                },
+                view,
+            );
+        h.run();
+        h.get_by_label("REVIEW").click_accesskit();
+        settle_preview(&mut h);
+        // The sink is locked (the default): no DELETE R is offered, the
+        // promote stays.
+        assert!(
+            h.query_by_label("DELETE R").is_none(),
+            "a locked sink offers no deletion"
+        );
+        assert!(
+            h.query_by_label("< COPY").is_some(),
+            "promoting (an addition to the main) is never barred"
+        );
+        // Unlock the sink: DELETE R appears; clicking it purges the file.
+        h.state_mut().locks.toggle("target");
+        h.run();
+        h.get_by_label("DELETE R").click_accesskit();
+        settle_preview(&mut h);
+        assert!(
+            !tmp.path().join("target").join("junk.txt").exists(),
+            "the sink file is deleted from disk"
+        );
+        assert!(
+            store
+                .get_file_entry("target", "junk.txt")
+                .unwrap()
+                .is_none(),
+            "and its index entry is gone"
+        );
+        assert!(
+            h.state().preview.is_empty(),
+            "the rebuilt preview has nothing left to promote"
+        );
+    }
+
+    /// A single resurrection row's per-row `< COPY` pulls just that file into
+    /// the main — how a mistakenly-deleted file is recreated from the backup.
     #[test]
     fn group_sync_back_per_row_apply_resurrects_one_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4580,8 +5083,8 @@ mod ui_tests {
         h.run();
         h.get_by_label("REVIEW").click_accesskit();
         settle_preview(&mut h);
-        // One row (the resurrection); its APPLY pulls just that file.
-        h.get_by_label("APPLY").click_accesskit();
+        // One row (the resurrection); its `< COPY` pulls just that file.
+        h.get_by_label("< COPY").click_accesskit();
         for _ in 0..100 {
             h.step();
             if !h.state().running {
@@ -4815,6 +5318,9 @@ mod ui_tests {
         let mut h = transfer_harness(Arc::clone(&store), move |v| {
             v.sync_repos(&store2);
             v.command = Command::GroupSync;
+            // A locked MIRROR sink is excluded from the push outright — unlock
+            // it so the push is attempted and the empty-main refusal can fire.
+            v.locks.toggle("target");
         });
         h.get_by_label("REVIEW").click_accesskit();
         settle_preview(&mut h);
@@ -5365,6 +5871,10 @@ mod ui_tests {
         view.source = Some("source".to_string());
         view.target = Some("target".to_string());
         view.command = Command::Diff;
+        // These tests exercise the full command set; the session locks (which
+        // withhold deletes/overwrites on locked repos) are covered separately.
+        view.locks.toggle("source");
+        view.locks.toggle("target");
         view.preview_source_header = "/repos/source".to_string();
         view.preview_target_header = "/repos/target".to_string();
         let file = |rel: &str, size: u64| dedup_core::diff::DiffFile {
@@ -5984,7 +6494,7 @@ mod ui_tests {
                 right: vec![dfile("same.txt", 1, 0)],
             },
         ];
-        let metas = diff_metas(&v.diff_rows);
+        let metas = diff_metas(&v.diff_rows, false, false);
         let listed = v.listed_diff_rows(&metas);
         let offered = v.offered_bulk_ops(&listed);
 
@@ -6022,7 +6532,7 @@ mod ui_tests {
                 right: vec![],
             },
         ];
-        let metas = diff_metas(&v.diff_rows);
+        let metas = diff_metas(&v.diff_rows, false, false);
         v.preview_board.hidden.insert(metas[1].key.clone());
 
         let listed = v.listed_diff_rows(&metas);
@@ -6067,7 +6577,7 @@ mod ui_tests {
         });
         h.run();
 
-        let metas = diff_metas(&h.state().diff_rows);
+        let metas = diff_metas(&h.state().diff_rows, false, false);
         let listed = h.state().listed_diff_rows(&metas);
         let plan = h.state().bulk_plan(BulkOp::CopyMissingRight, &listed);
         assert_eq!(plan.len(), 2, "both left-only files are planned");

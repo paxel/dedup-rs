@@ -18,6 +18,7 @@ mod id3tags;
 mod imgedit;
 mod lcars;
 pub mod lightbox;
+mod locks;
 mod media_cell;
 mod player;
 mod repo_chip;

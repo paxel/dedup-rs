@@ -6,12 +6,23 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 ### Added
 
+- **One lock per repository protects its existing files everywhere.** Every repository starts
+  **locked** each launch; the padlock on its chip — on every tab — toggles it. A lock means the
+  repo's existing files cannot be deleted or overwritten from anywhere in the app: those buttons
+  are withheld or disabled (with the reason on hover), MIRROR/MOVE runs that would lose data in a
+  locked repo won't start, and a locked MIRROR sink can't be included in a GROUP SYNC push.
+  **Adding files to a locked repo is always allowed** — the lock protects what exists, it never
+  blocks gaining data. Unlocking is a per-session declaration that loss is acceptable there:
+  destructive actions then run without further questions (batch runs keep their plan summaries).
 - **A Status centre, so the app never fails silently.** A top-right **STATUS** button (with an
   amber unread badge) opens a health/activity panel. At launch it probes the things that break
   quietly — the **audio output device** (so "no sound and no error" is now a visible warning),
   **ffmpeg/ffprobe**, and **pdftoppm** — and files a **Warning** for anything missing. A
   repository whose folder has gone (a disconnected drive, a closed cloud mount) files one
-  **Critical** that clears when it returns. Each entry has a **Copy** button (message + a system
+  **Critical** that clears when it returns. Every warning says **since when** it has been true
+  (first seen, kept across repeats — "offline since Tuesday" stays Tuesday), and each can be
+  **dismissed** with its trashcan (or all at once with **Clear all**; anything still wrong
+  refiles on its next detection). Each entry has a **Copy** button (message + a system
   fingerprint) and there's **Copy full report** (adds the recent log) for bug tickets — clipboard
   only, nothing is sent anywhere. An **Activity** section lists running/queued **scans** with
   **Cancel**, so a long scan can be stopped without killing the app.
@@ -37,12 +48,16 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   share: black, a slate, a logo). Clicking the strip drops a **shared playhead** that decodes
   the exact frame of *both* clips at that moment, enlarged side by side (A@t | B@t). The
   playhead is **proportional** — a fraction of each clip's own length — so a trimmed or
-  re-encoded copy stays aligned at the same relative moment instead of drifting.
-- **Hear a video's soundtrack, and compare two.** A video that carries an audio track
-  offers the viewer's **Audio** tab (silent clips don't): its soundtrack is extracted once to a
-  cached WAV and treated exactly like a bare audio file — spectrogram compare, playback, and
-  the gapless A/B flicker where both sides play in sync with only one audible. Needs `ffmpeg`;
-  without it the tab simply isn't offered.
+  re-encoded copy stays aligned at the same relative moment instead of drifting. Once a moment
+  is picked, **FLICKER** swaps the two clips' frames in place (Space toggles), the same
+  in-place comparison images get.
+- **Listen on the Audio tab, compare on the Spectrum tab.** The viewer's **Audio** tab is a
+  real transport: each side's **waveform** with a moving **playhead**, an **elapsed / total**
+  readout, and **click-to-seek** — click anywhere in the wave to play from that spot (on a
+  pair, both sides stay in sync with one audible). The **Spectrum** tab holds the zoomable
+  **spectrogram** comparison — the visual fingerprint — with the zoom/pan/flicker the other
+  image tabs have. A video with an audio track gets both tabs for its extracted soundtrack
+  (silent clips don't; needs `ffmpeg`).
 - **Slow a track down without changing its pitch.** The viewer's audio transport has discrete
   speed stops — **0.25 / 0.5 / 0.75 / 1 / 1.5 / 2×** — that preserve pitch, so a slowed
   recording still sounds like itself while you confirm two tracks are the same take. The chosen
@@ -53,6 +68,10 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   **promoted** in a batch (green), while files the main **deleted** that the sink still holds are
   shown as **resurrection** candidates (a blue mark) and never auto-promoted — you pull each
   one back on its own, so you recreate a mistaken deletion without silently undoing a real one.
+  Each row is a full triage decision: **`< COPY`** pulls that one file into the main, and
+  **`DELETE R`** removes it from the sink instead (shown only while the sink is unlocked) —
+  everything the sink holds is either worth promoting or worth purging, in one pass. Clicking a
+  row opens the file itself in the viewer.
 - **Read a document, and compare what two documents say.** On the viewer's **Text** tab, a
   PDF, Word/OpenDocument file, spreadsheet, presentation, or email shows its **extracted
   words** instead of a hex dump. Comparing two documents lines up their content **side by side**
@@ -60,10 +79,13 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   characters differ — so you can see whether two copies say the same thing. Nothing is declared
   identical; a document with no extractable text (scanned, encrypted, or empty) says so.
   Word/Office documents keep their paragraph breaks, so their content diffs line by line.
-- **See a PDF as it looks, side by side.** A **Render** tab rasterizes a PDF to its page and
-  shows it — the document's appearance, not its extracted words. Comparing two, their pages sit
-  side by side to judge by eye (no pixel diff, no "same" verdict — different rendering makes that
-  meaningless). Needs `pdftoppm` (poppler) at runtime; absent it, the tab just doesn't appear.
+- **See a PDF as it looks, side by side — page by page.** A **Render** tab rasterizes a PDF's
+  pages on demand and shows them — the document's appearance, not its extracted words. One
+  shared page control (prev/next, an editable page number, and a slider for sweeping) drives
+  **both** sides, so page N sits beside page N and a duplicate-PDF walk stays aligned; a side
+  past its own end says so. Pages render in the background — a huge book never freezes the
+  app — and recent pages are kept so stepping back is instant. Needs `pdftoppm` (poppler) at
+  runtime; absent it, the tab just doesn't appear.
 - **Separate Text and Hex tabs.** The viewer's **Text** tab shows *readable* content
   only — a document's extracted words or a plain-text file's text (two text files diff as
   content, aligned, not as bytes) — while the **Hex** tab shows the raw bytes of *every* file

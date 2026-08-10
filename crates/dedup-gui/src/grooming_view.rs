@@ -259,6 +259,9 @@ pub struct GroomingView {
     inspect: Option<crate::compare_view::DiffCompare>,
     /// Decodes the review board's row thumbnails; polled once per frame.
     thumbs: ThumbCache,
+    /// The app-wide repo lock registry (see [`crate::locks`]): which repos'
+    /// existing files may be deleted or overwritten this session.
+    locks: crate::locks::RepoLocks,
 }
 
 enum Act {
@@ -326,7 +329,16 @@ impl GroomingView {
             verbosity: TooltipVerbosity::default(),
             inspect: None,
             thumbs: ThumbCache::new(3),
+            locks: crate::locks::RepoLocks::new(),
         }
+    }
+
+    /// Construct wired to the app's shared lock registry, so a repo unlocked
+    /// here is unlocked on every tab (and vice versa).
+    pub fn new_with_locks(locks: crate::locks::RepoLocks) -> Self {
+        let mut me = Self::new();
+        me.locks = locks;
+        me
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, verbosity: TooltipVerbosity) {
@@ -498,7 +510,7 @@ impl GroomingView {
                     sel,
                     theme::orange(),
                     mains.contains(name),
-                    None,
+                    Some(self.locks.read_only(name)),
                 );
                 if chip
                     .name
@@ -512,6 +524,7 @@ impl GroomingView {
                 {
                     acts.push(Act::PickSource(name.clone()));
                 }
+                self.locks.handle_badge(chip.lock, self.verbosity, name);
                 chip.outer
             });
             // DUPEPOOL: the repos to check the source against, lilac when on.
@@ -554,7 +567,7 @@ impl GroomingView {
                     sel,
                     theme::lilac(),
                     mains.contains(name),
-                    None,
+                    Some(self.locks.read_only(name)),
                 );
                 if chip
                     .name
@@ -568,6 +581,7 @@ impl GroomingView {
                 {
                     acts.push(Act::TogglePool(name.clone()));
                 }
+                self.locks.handle_badge(chip.lock, self.verbosity, name);
                 chip.outer
             });
         });
@@ -832,7 +846,7 @@ impl GroomingView {
                         sel,
                         theme::orange(),
                         mains.contains(name),
-                        None,
+                        Some(self.locks.read_only(name)),
                     );
                     if chip
                         .name
@@ -841,6 +855,7 @@ impl GroomingView {
                     {
                         acts.push(Act::PickRepo(name.clone()));
                     }
+                    self.locks.handle_badge(chip.lock, self.verbosity, name);
                     chip.outer
                 });
                 ui.label(RichText::new(hint).color(theme::lilac()).size(11.0));
@@ -874,16 +889,22 @@ impl GroomingView {
                 let run =
                     egui::Button::new(RichText::new("RUN").color(theme::ink_on(theme::red())))
                         .fill(theme::red());
-                if ui
-                    .add_enabled(ready, run)
-                    .explain(
+                // The session lock bars a run that would change the groomed
+                // repo's existing files; the disabled button says which
+                // padlock to click.
+                let lock_block = self.lock_block();
+                let resp = ui.add_enabled(ready && lock_block.is_none(), run);
+                let resp = if let Some(why) = &lock_block {
+                    resp.on_disabled_hover_text(why.clone())
+                } else {
+                    resp.explain(
                         self.verbosity,
                         "Run the command",
                         "Run the selected command on a background thread, after a \
                          confirmation dialog.",
                     )
-                    .clicked()
-                {
+                };
+                if resp.clicked() {
                     acts.push(Act::Ask);
                 }
                 if self.running {
@@ -917,10 +938,28 @@ impl GroomingView {
             return;
         }
         let bodies = std::mem::take(&mut self.preview_bodies);
+        // The review shows only the buttons the session locks allow: while the
+        // groomed repo is locked, the per-row APPLY (a deletion/move) is
+        // withheld — HIDE stays, and unlocking the padlock brings APPLY back.
+        let lock_filtered: Vec<board::RowMeta>;
+        let metas: &[board::RowMeta] = if self.lock_block().is_some() {
+            lock_filtered = self
+                .preview
+                .iter()
+                .map(|m| {
+                    let mut m = m.clone();
+                    m.cmds.retain(|c| *c != board::Cmd::Apply);
+                    m
+                })
+                .collect();
+            &lock_filtered
+        } else {
+            &self.preview
+        };
         let action = board::board(
             ui,
             &mut self.board_state,
-            &self.preview,
+            metas,
             board::BoardView {
                 left_role: "SOURCE",
                 left_repo: "",
@@ -1054,6 +1093,24 @@ impl GroomingView {
         }
     }
 
+    /// Why the session locks bar this RUN, if they do. Every grooming command
+    /// except PRUNE deletes or moves the groomed repo's existing files, so it
+    /// needs that repo unlocked. PRUNE only drops index records of files that
+    /// are already gone — the index is not the data the lock protects.
+    fn lock_block(&self) -> Option<String> {
+        let repo = match self.command {
+            Command::Dedupe => self.source.as_deref()?,
+            Command::Prune => return None,
+            _ => self.repo.as_deref()?,
+        };
+        self.locks.read_only(repo).then(|| {
+            format!(
+                "{} changes existing files in '{repo}' — unlock it (its padlock) to run.",
+                self.command.label()
+            )
+        })
+    }
+
     fn filter_string(&self) -> Option<String> {
         self.filter.filter_string()
     }
@@ -1133,7 +1190,7 @@ impl GroomingView {
                         repo: repo.to_string(),
                         rel_path: rel.to_string(),
                         facts: crate::media_cell::FileFacts::from_entry(&entry, abs),
-                        read_only: true,
+                        read_only: self.locks.read_only(repo),
                     })
                 };
                 let right = self.pool.iter().find_map(|repo| side(repo, &right_rel));
@@ -1230,7 +1287,13 @@ impl GroomingView {
                 self.confirm = None;
                 self.start(store, None);
             }
-            Act::ApplyRow(key) => self.start(store, Some(key)),
+            Act::ApplyRow(key) => {
+                // A preview built before the repo was re-locked could still
+                // carry APPLY buttons for a frame — never act past the lock.
+                if self.lock_block().is_none() {
+                    self.start(store, Some(key));
+                }
+            }
             Act::CancelRun => self.cancel.cancel(),
         }
     }

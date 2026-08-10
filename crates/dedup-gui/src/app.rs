@@ -230,6 +230,9 @@ impl DedupApp {
     pub fn new(store: Arc<Store>) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
         let (status_tx, status_rx) = crossbeam_channel::unbounded();
+        // One lock registry for the whole app: a repo unlocked on any tab is
+        // unlocked on every tab, for this session only.
+        let locks = crate::locks::RepoLocks::new();
         let mut app = Self {
             store,
             tab: Tab::Repositories,
@@ -259,11 +262,11 @@ impl DedupApp {
             cancels: HashMap::new(),
             status_tx,
             status_rx,
-            dupes: DupesView::new(),
-            transfer: TransferView::new(),
-            grooming: GroomingView::new(),
+            dupes: DupesView::new_with_locks(locks.clone()),
+            transfer: TransferView::new_with_locks(locks.clone()),
+            grooming: GroomingView::new_with_locks(locks.clone()),
             groups: Vec::new(),
-            browse: crate::browse_view::BrowseView::new(),
+            browse: crate::browse_view::BrowseView::new_with_locks(locks),
             saved_settings: crate::settings::Settings::default(),
             window_size: None,
         };
@@ -970,7 +973,7 @@ impl eframe::App for DedupApp {
                     crate::diagnostics::Severity::Critical,
                     &key,
                     format!("Repository '{repo}' is offline"),
-                    "A network location that isn't reachable right now. Reconnect it to scan or \
+                    "A network location that isn't reachable. Reconnect it to scan or \
                      preview its files.",
                 ),
                 Location::Local | Location::Remote => self.diag.clear(&key),
@@ -2608,6 +2611,17 @@ impl DedupApp {
                         let tail = Self::recent_log_tail();
                         ctx.copy_text(self.diag.full_report(tail.as_deref()));
                     }
+                    if !events.is_empty()
+                        && ui
+                            .button(RichText::new("CLEAR ALL").color(theme::text()))
+                            .on_hover_text(
+                                "Dismiss every warning. Anything still wrong will \
+                                 reappear when it is detected again.",
+                            )
+                            .clicked()
+                    {
+                        self.diag.clear_all();
+                    }
                 });
             });
             ui.add_space(4.0);
@@ -2644,6 +2658,16 @@ impl DedupApp {
                             ui.label(RichText::new(heading).color(color).size(13.0).strong());
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui
+                                    .button(RichText::new(crate::icon::TRASH).color(theme::text()))
+                                    .on_hover_text(
+                                        "Dismiss this warning. If it is detected again it \
+                                         will come back.",
+                                    )
+                                    .clicked()
+                                {
+                                    self.diag.clear(&e.key);
+                                }
+                                if ui
                                     .button(RichText::new("COPY").color(theme::text()))
                                     .on_hover_text(
                                         "Copy this warning + system info for a bug report",
@@ -2654,6 +2678,16 @@ impl DedupApp {
                                 }
                             });
                         });
+                        // When it started, not "right now": a drive that has
+                        // been gone since Tuesday should say so.
+                        ui.label(
+                            RichText::new(format!(
+                                "since {}",
+                                crate::util::format_mtime(e.since_ms)
+                            ))
+                            .color(theme::grey())
+                            .size(11.0),
+                        );
                         ui.label(RichText::new(&e.detail).color(theme::text()).size(12.0));
                     });
             }

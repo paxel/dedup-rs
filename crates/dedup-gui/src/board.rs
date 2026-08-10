@@ -818,12 +818,18 @@ fn draw_row(
         match line {
             Line::Sides(left_cmd, right_cmd) => {
                 // Each half keeps its own column, so a row offering only the
-                // right-hand command still draws it on the right.
+                // right-hand command still draws it on the right — but only
+                // when the centre actually has two columns. A board whose rows
+                // are all one-sided (GROUP SYNC BACK) reserves a single
+                // column, and drawing at column 1 there would land the button
+                // on top of the right-hand cell.
+                let two_cols = centre >= CMD_W * 2.0;
                 for (col, maybe) in [(0, left_cmd), (1, right_cmd)] {
-                    if let Some(cmd) = maybe
-                        && cmd_button(ui, slot(col, n), cmd, hide_skips_run).clicked()
-                    {
-                        clicked = Some(cmd);
+                    if let Some(cmd) = maybe {
+                        let col = if two_cols { col } else { 0 };
+                        if cmd_button(ui, slot(col, n), cmd, hide_skips_run).clicked() {
+                            clicked = Some(cmd);
+                        }
                     }
                 }
             }
@@ -939,7 +945,34 @@ fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view:
             ui.add(egui::Label::new(job).truncate()).on_hover_text(path);
         }
         if let Some(line) = facts_line(view.size, view.modified, view.body.facts.as_ref()) {
-            ui.add(egui::Label::new(RichText::new(line).color(theme::tan()).size(10.5)).truncate());
+            // An empty file is useless — copying or promoting it preserves
+            // nothing — so its "0 B" is called out in heavy red rather than
+            // blending into the facts line.
+            let text: egui::WidgetText = if view.size == 0 && line.starts_with("0 B") {
+                let mut job = egui::text::LayoutJob::default();
+                job.append(
+                    "0 B",
+                    0.0,
+                    egui::TextFormat {
+                        font_id: egui::FontId::proportional(11.5),
+                        color: theme::red(),
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    &line["0 B".len()..],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: egui::FontId::proportional(10.5),
+                        color: theme::tan(),
+                        ..Default::default()
+                    },
+                );
+                job.into()
+            } else {
+                RichText::new(line).color(theme::tan()).size(10.5).into()
+            };
+            ui.add(egui::Label::new(text).truncate());
         }
     });
 }
@@ -1876,6 +1909,30 @@ mod tests {
                 "at {width}px APPLY (right {:.1}) overlaps the right cell \
                  (starts {:.1})",
                 apply.right(),
+                right.left(),
+            );
+        }
+    }
+
+    /// The same invariant for *side* commands on a one-column centre: a
+    /// GROUP SYNC BACK row carries only right-side commands (`< COPY`,
+    /// `DELETE R`), so the centre reserves one column — and the buttons must
+    /// use it, not phantom column 1 on top of the sink cell.
+    #[test]
+    fn one_sided_row_commands_fit_a_one_column_centre() {
+        use egui_kittest::kittest::Queryable;
+        let mut row = diff_row("backsync");
+        row.left_paths = vec!["main/song.mp3".to_string()];
+        row.right_paths = vec!["sink/ZZZSINK.mp3".to_string()];
+        row.cmds = vec![Cmd::CopyLeft, Cmd::DeleteRight];
+        let harness = render(1280.0, vec![row]);
+        let right = harness.get_by_label_contains("ZZZSINK").rect();
+        for label in ["< COPY", "DELETE R"] {
+            let r = harness.get_by_label(label).rect();
+            assert!(
+                r.right() <= right.left() + 0.5,
+                "{label} (right {:.1}) overlaps the sink cell (starts {:.1})",
+                r.right(),
                 right.left(),
             );
         }

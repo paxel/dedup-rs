@@ -158,9 +158,13 @@ REVIEW sorts the sink's files against the main into two kinds:
   them all into the main in one batch.
 - **Resurrection** (blue) — content the main once had and **deleted**, that the sink still
   holds. These are **never** promoted by the batch — resurrecting a file undoes a deletion, and
-  only you know whether that deletion was a mistake or deliberate. Each blue row carries its own
-  **APPLY** to pull *just that file* back, so you recreate the ones you deleted by mistake and
-  leave the rest alone.
+  only you know whether that deletion was a mistake or deliberate.
+
+Each row is a full triage decision: **`< COPY`** pulls *just that file* into the main (the only
+way a resurrection comes back), and **`DELETE R`** removes it from the sink instead — for the
+files that turn out to be worth neither keeping nor promoting. `DELETE R` appears only while the
+sink is **unlocked** (its padlock in the SINK panel); promoting is never barred, because adding
+to the main loses nothing. Clicking a row opens the file itself in the viewer.
 
 Content already in the main is skipped, and a **RESURRECTIONS ONLY** toggle above the rows hides
 everything but the blue ones when you want to focus on what would come back. Nothing on the sink

@@ -84,12 +84,11 @@ enum Mode {
     Similar,
 }
 
-/// A repo's participation in the current search.
+/// A repo's participation in the current search. (Whether it is read-only
+/// lives in the app-wide [`crate::locks::RepoLocks`] registry, not here.)
 struct RepoSel {
     name: String,
     included: bool,
-    /// Read-only repos are never selected for deletion.
-    read_only: bool,
     /// This repo is the main of a sync group — badged wherever it is named.
     is_main: bool,
 }
@@ -224,6 +223,9 @@ pub struct DupesView {
     /// it, built on FIND. Drives the read-only "evidence rows" (this content
     /// also lives inside a zip) and the tiered delete-safety warning.
     archive_evidence: HashMap<(u64, [u8; 32]), Vec<dedup_core::archive::ArchiveOccurrence>>,
+    /// The app-wide repo lock registry (see [`crate::locks`]): which repos'
+    /// existing files may be deleted this session.
+    locks: crate::locks::RepoLocks,
 }
 
 impl DupesView {
@@ -261,7 +263,16 @@ impl DupesView {
             verbosity: TooltipVerbosity::default(),
             filter: FilterBuilder::new(),
             archive_evidence: HashMap::new(),
+            locks: crate::locks::RepoLocks::new(),
         }
+    }
+
+    /// Construct wired to the app's shared lock registry, so a repo unlocked
+    /// here is unlocked on every tab (and vice versa).
+    pub fn new_with_locks(locks: crate::locks::RepoLocks) -> Self {
+        let mut me = Self::new();
+        me.locks = locks;
+        me
     }
 
     /// The similarity slider position (persisted across launches).
@@ -479,7 +490,6 @@ impl DupesView {
                         let old = prev.iter().find(|r| r.name == name);
                         RepoSel {
                             included: old.map(|r| r.included).unwrap_or(false),
-                            read_only: old.map(|r| r.read_only).unwrap_or(true),
                             is_main: mains.contains(&name),
                             name,
                         }
@@ -536,13 +546,14 @@ impl DupesView {
     /// response (its rect feeds the wrap packing in [`repo_chip::chip_row`]).
     fn repo_chip(&self, ui: &mut egui::Ui, i: usize, acts: &mut Vec<Act>) -> egui::Response {
         let repo = &self.repos[i];
+        let read_only = self.locks.read_only(&repo.name);
         let chip = crate::repo_chip::repo_chip(
             ui,
             &repo.name,
             repo.included,
             theme::orange(),
             repo.is_main,
-            Some(repo.read_only),
+            Some(read_only),
         );
         if chip
             .name
@@ -559,20 +570,9 @@ impl DupesView {
         }
         if let Some(lock) = chip.lock {
             // Closed padlock = read-only (protected); open padlock = deletable.
-            let (hover, hover_verbose) = if repo.read_only {
-                (
-                    "Locked: files here are protected from deletion — click to allow deleting",
-                    "This repo is read-only: none of its files are ever preselected or \
-                     deletable, even by auto-resolve. Click to unlock the whole repo for \
-                     deletion.",
-                )
-            } else {
-                (
-                    "Unlocked: files here can be deleted — click to protect",
-                    "This repo is unlocked: its files can be marked and deleted like any \
-                     other. Click to protect it (read-only) again.",
-                )
-            };
+            // One session-wide lock per repo: toggling it here changes what
+            // every tab allows (see `crate::locks`).
+            let (hover, hover_verbose) = crate::locks::RepoLocks::hover_copy(read_only);
             if lock.explain(self.verbosity, hover, hover_verbose).clicked() {
                 acts.push(Act::ToggleRo(i));
             }
@@ -1521,10 +1521,10 @@ impl DupesView {
                 }
             }
             Act::ToggleRo(i) => {
-                if let Some(r) = self.repos.get_mut(i) {
-                    r.read_only = !r.read_only;
-                    if r.read_only {
-                        let name = r.name.clone();
+                if let Some(r) = self.repos.get(i) {
+                    let name = r.name.clone();
+                    self.locks.toggle(&name);
+                    if self.locks.read_only(&name) {
                         self.marked.retain(|(repo, _)| repo != &name);
                         // A repo turned read-only starts fully locked again.
                         self.unlocked.retain(|(repo, _)| repo != &name);
@@ -1740,7 +1740,7 @@ impl DupesView {
     fn read_only_names(&self) -> HashSet<String> {
         self.repos
             .iter()
-            .filter(|r| r.read_only)
+            .filter(|r| self.locks.read_only(&r.name))
             .map(|r| r.name.clone())
             .collect()
     }
@@ -1890,7 +1890,7 @@ impl DupesView {
     }
 
     fn repo_is_ro(&self, name: &str) -> bool {
-        self.repos.iter().any(|r| r.name == name && r.read_only)
+        self.locks.read_only(name)
     }
 
     /// Contents (named by a loose file's path) that a delete of the marked set
@@ -2008,13 +2008,15 @@ mod ui_tests {
             ["A", "B"]
         );
         assert!(
-            view.repos.iter().all(|r| !r.included && r.read_only),
+            view.repos
+                .iter()
+                .all(|r| !r.included && view.locks.read_only(&r.name)),
             "repos default to excluded + read-only"
         );
         // The user includes A and unlocks it (a non-default state to preserve).
         let a = view.repos.iter_mut().find(|r| r.name == "A").unwrap();
         a.included = true;
-        a.read_only = false;
+        view.locks.toggle("A");
         // A new repo C is registered, then the tab is re-synced.
         let dir = tmp.path().join("C");
         std::fs::create_dir_all(&dir).unwrap();
@@ -2022,7 +2024,7 @@ mod ui_tests {
         view.sync_repos(&store);
         let get = |n: &str| {
             let r = view.repos.iter().find(|r| r.name == n).unwrap();
-            (r.included, r.read_only)
+            (r.included, view.locks.read_only(&r.name))
         };
         assert_eq!(
             get("A"),
@@ -2726,16 +2728,15 @@ mod ui_tests {
             RepoSel {
                 name: "w".into(),
                 included: true,
-                read_only: false,
                 is_main: false,
             },
             RepoSel {
                 name: "ro".into(),
                 included: true,
-                read_only: true,
                 is_main: false,
             },
         ];
+        view.locks.toggle("w");
         view.results = Some(Results::Similar(vec![
             vec![dfile("w", "a"), dfile("w", "b")], // worse "b" is writable → marked
             vec![dfile("w", "c"), dfile("ro", "d")], // worse "d" is read-only → not marked
@@ -2761,17 +2762,16 @@ mod ui_tests {
     fn group_bulk_buttons_mark_and_hide() {
         let mut view = DupesView::new();
         view.repos_loaded = true;
+        view.locks.toggle("w");
         view.repos = vec![
             RepoSel {
                 name: "w".into(),
                 included: true,
-                read_only: false,
                 is_main: false,
             },
             RepoSel {
                 name: "ro".into(),
                 included: true,
-                read_only: true,
                 is_main: false,
             },
         ];
@@ -2842,7 +2842,6 @@ mod ui_tests {
         view.repos = vec![RepoSel {
             name: "ro".into(),
             included: true,
-            read_only: true,
             is_main: false,
         }];
         view.results = Some(Results::Similar(vec![vec![
@@ -2905,17 +2904,16 @@ mod ui_tests {
     fn right_click_menu_unlocks_a_read_only_file() {
         let mut view = DupesView::new();
         view.repos_loaded = true;
+        view.locks.toggle("w");
         view.repos = vec![
             RepoSel {
                 name: "w".into(),
                 included: true,
-                read_only: false,
                 is_main: false,
             },
             RepoSel {
                 name: "ro".into(),
                 included: true,
-                read_only: true,
                 is_main: false,
             },
         ];
@@ -3015,6 +3013,9 @@ mod ui_tests {
         let group: DupeGroup = (0..3).map(image_file).collect();
 
         let mut view = DupesView::new();
+        // The registry defaults every repo to locked; these fixtures
+        // exercise marking/editing, which needs "r" unlocked.
+        view.locks.toggle("r");
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group.clone()]));
 
@@ -3516,6 +3517,9 @@ mod ui_tests {
         };
 
         let mut view = DupesView::new();
+        // The registry defaults every repo to locked; these fixtures
+        // exercise marking/editing, which needs "r" unlocked.
+        view.locks.toggle("r");
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![vec![file]]));
 
@@ -3938,6 +3942,9 @@ mod ui_tests {
         let b_key = key(&group[1]);
 
         let mut view = DupesView::new();
+        // The registry defaults every repo to locked; these fixtures
+        // exercise marking/editing, which needs "r" unlocked.
+        view.locks.toggle("r");
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
         let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
@@ -4122,6 +4129,9 @@ mod ui_tests {
         let group: DupeGroup = vec![mk("a.mp3", "Alpha", 0), mk("b.mp3", "Beta", 1)];
 
         let mut view = DupesView::new();
+        // The registry defaults every repo to locked; these fixtures
+        // exercise marking/editing, which needs "r" unlocked.
+        view.locks.toggle("r");
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
 
@@ -4219,6 +4229,9 @@ mod ui_tests {
         let group: DupeGroup = vec![mk("one.mp3", "Take One", 0), mk("two.mp3", "Take Two", 1)];
 
         let mut view = DupesView::new();
+        // The registry defaults every repo to locked; these fixtures
+        // exercise marking/editing, which needs "r" unlocked.
+        view.locks.toggle("r");
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
 
@@ -4281,6 +4294,9 @@ mod ui_tests {
         let b_key = key(&group[1]); // A is index 0 → B defaults to index 1
 
         let mut view = DupesView::new();
+        // The registry defaults every repo to locked; these fixtures
+        // exercise marking/editing, which needs "r" unlocked.
+        view.locks.toggle("r");
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
 
@@ -4402,9 +4418,9 @@ mod ui_tests {
         view.repos = vec![RepoSel {
             name: "r".into(),
             included: true,
-            read_only: false,
             is_main: false,
         }];
+        view.locks.toggle("r");
         view.unlocked.insert(k.clone());
         view.apply(&ctx, &store, Act::ToggleRo(0));
         assert!(
@@ -4502,9 +4518,9 @@ mod ui_tests {
         view.repos = vec![RepoSel {
             name: "repo".into(),
             included: true,
-            read_only: false,
             is_main: false,
         }];
+        view.locks.toggle("repo");
         view.result_names = vec!["repo".to_string()];
         view.results = Some(Results::Exact(plan));
         view.quick_delete = true;
@@ -4876,9 +4892,9 @@ mod ui_tests {
         view.repos = vec![RepoSel {
             name: "repo".into(),
             included: true,
-            read_only: false,
             is_main: false,
         }];
+        view.locks.toggle("repo");
         view.result_names = vec!["repo".to_string()];
         view.results = Some(Results::Exact(plan));
         view.quick_delete = true;
@@ -4917,7 +4933,6 @@ mod ui_tests {
         view.repos = vec![RepoSel {
             name: "ro".into(),
             included: true,
-            read_only: true,
             is_main: false,
         }];
         view.results = Some(Results::Similar(vec![vec![
@@ -5134,9 +5149,9 @@ mod ui_tests {
         view.repos = vec![RepoSel {
             name: repo.clone(),
             included: true,
-            read_only: false,
             is_main: false,
         }];
+        view.locks.toggle(&repo);
         view.result_names = vec![repo];
         view.results = Some(Results::Exact(plan));
         view.quick_delete = true;
@@ -5604,6 +5619,9 @@ mod ui_tests {
         let mp3 = dir.path().join("a.mp3");
 
         let mut view = DupesView::new();
+        // The registry defaults every repo to locked; these fixtures
+        // exercise marking/editing, which needs "r" unlocked.
+        view.locks.toggle("r");
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
         let mut harness = lightbox_harness(view, egui::vec2(1200.0, 800.0));
@@ -5675,6 +5693,9 @@ mod ui_tests {
             tagged_mp3(dir.path(), "b.mp3", 2, "Beta"),
         ];
         let mut view = DupesView::new();
+        // The registry defaults every repo to locked; these fixtures
+        // exercise marking/editing, which needs "r" unlocked.
+        view.locks.toggle("r");
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
         let mut harness = lightbox_harness(view, egui::vec2(1000.0, 720.0));
@@ -5706,6 +5727,7 @@ mod ui_tests {
         let flac = plain_file(dir.path(), "b.flac", 3, "audio/flac", b"fLaC\0\0\0\0");
         let group: DupeGroup = vec![tagged_mp3(dir.path(), "a.mp3", 1, "Alpha"), flac];
         let mut view = DupesView::new();
+        view.locks.toggle("r");
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
         let mut harness = lightbox_harness(view, egui::vec2(1000.0, 720.0));
@@ -5731,7 +5753,6 @@ mod ui_tests {
         view.repos = vec![RepoSel {
             name: "r".into(),
             included: true,
-            read_only: true,
             is_main: false,
         }];
         view.results = Some(Results::Similar(vec![group]));

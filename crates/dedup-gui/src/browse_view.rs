@@ -222,6 +222,9 @@ pub struct BrowseView {
     audio_tags: Option<(String, Option<crate::id3tags::Tags>)>,
     /// Inline ID3 tag editor, open for the previewed audio file.
     tag_edit: Option<BrowseTagEdit>,
+    /// The app-wide repo lock registry (see [`crate::locks`]): which repos'
+    /// existing files may be deleted or overwritten this session.
+    locks: crate::locks::RepoLocks,
 }
 
 /// The in-progress ID3 edit for the previewed audio file.
@@ -272,7 +275,16 @@ impl BrowseView {
             spec_tex: None,
             audio_tags: None,
             tag_edit: None,
+            locks: crate::locks::RepoLocks::new(),
         }
+    }
+
+    /// Construct wired to the app's shared lock registry, so a repo unlocked
+    /// here is unlocked on every tab (and vice versa).
+    pub fn new_with_locks(locks: crate::locks::RepoLocks) -> Self {
+        let mut me = Self::new();
+        me.locks = locks;
+        me
     }
 
     /// Sync the repo list with the store, keeping the currently browsed repo if
@@ -531,7 +543,7 @@ impl BrowseView {
                         sel,
                         theme::amber(),
                         mains.contains(name),
-                        None,
+                        Some(self.locks.read_only(name)),
                     );
                     if chip
                         .name
@@ -544,6 +556,7 @@ impl BrowseView {
                     {
                         picked = Some(name.clone());
                     }
+                    self.locks.handle_badge(chip.lock, self.verbosity, name);
                     chip.outer
                 });
             },
@@ -1069,10 +1082,11 @@ impl BrowseView {
                                 origin: None,
                                 exif: None,
                             });
+                        let read_only = self.locks.read_only(&repo);
                         let side = crate::compare_view::DiffSide {
                             repo,
                             rel_path: sel.rel.clone(),
-                            read_only: false,
+                            read_only,
                             facts,
                         };
                         // One file, so no second side and no switcher. Browsing
@@ -1081,6 +1095,10 @@ impl BrowseView {
                         let mut lb =
                             crate::compare_view::DiffCompare::new_with_pool(side, None, Vec::new());
                         lb.hide_second();
+                        // A single file under inspection — never "COMPARE —
+                        // SAME PATH, DIFFERENT CONTENT", which describes a
+                        // DIFF pair this view does not have.
+                        lb.set_title("INSPECT");
                         self.lightbox = Some(lb);
                     }
                 } else {

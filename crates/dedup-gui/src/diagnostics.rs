@@ -35,10 +35,15 @@ impl Severity {
 #[derive(Clone, Debug)]
 pub struct Event {
     pub severity: Severity,
+    /// The dedup key — also what the panel's per-event dismiss removes.
+    pub key: String,
     pub title: String,
     pub detail: String,
     /// How many times this same event has fired (a deduped repeat bumps it).
     pub count: u32,
+    /// When this event was **first** seen (epoch ms) — a repeat bumps the
+    /// count but keeps the origin, so "offline since 16:23" stays honest.
+    pub since_ms: i64,
 }
 
 struct Stored {
@@ -48,6 +53,15 @@ struct Stored {
     detail: String,
     count: u32,
     unread: bool,
+    since_ms: i64,
+}
+
+/// Now, as epoch milliseconds (the unit the app's date formatter takes).
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[derive(Default)]
@@ -101,13 +115,22 @@ impl Diagnostics {
                 detail: detail.into(),
                 count: 1,
                 unread: true,
+                since_ms: now_ms(),
             });
         }
     }
 
-    /// Clear an event by key (e.g. a repo root came back). No-op if absent.
+    /// Clear an event by key — a repo root came back, or the user dismissed it
+    /// from the panel. No-op if absent; a dismissed condition that is detected
+    /// again refiles as a fresh event.
     pub fn clear(&self, key: &str) {
         self.lock().events.retain(|e| e.key != key);
+    }
+
+    /// Clear every event (the panel's CLEAR ALL). Anything still wrong refiles
+    /// on its next detection.
+    pub fn clear_all(&self) {
+        self.lock().events.clear();
     }
 
     /// A snapshot of all events, Critical first, for the UI to render.
@@ -118,9 +141,11 @@ impl Diagnostics {
             .iter()
             .map(|e| Event {
                 severity: e.severity,
+                key: e.key.clone(),
                 title: e.title.clone(),
                 detail: e.detail.clone(),
                 count: e.count,
+                since_ms: e.since_ms,
             })
             .collect();
         // Critical before Warning; stable within a severity (insertion order).
@@ -171,9 +196,10 @@ impl Diagnostics {
                 String::new()
             };
             s.push_str(&format!(
-                "[{}] {}{n}\n    {}\n",
+                "[{}] {}{n} — since {}\n    {}\n",
                 e.severity.label(),
                 e.title,
+                crate::util::format_mtime(e.since_ms),
                 e.detail
             ));
         }
@@ -292,6 +318,23 @@ mod tests {
         // A fresh repeat re-flags unread.
         d.push(Severity::Warning, "a", "A", "again");
         assert_eq!(d.unread_count(), 1);
+    }
+
+    #[test]
+    fn a_repeat_keeps_the_first_seen_time_and_clear_all_empties() {
+        let d = Diagnostics::new();
+        d.push(Severity::Critical, "off:R", "R offline", "gone");
+        let first = d.events()[0].since_ms;
+        assert!(first > 0, "a fresh event is stamped with now");
+        d.push(Severity::Critical, "off:R", "R offline", "still gone");
+        assert_eq!(
+            d.events()[0].since_ms,
+            first,
+            "a repeat keeps the origin — 'offline since Tuesday' stays Tuesday"
+        );
+        d.push(Severity::Warning, "audio", "No audio", "");
+        d.clear_all();
+        assert!(d.events().is_empty(), "CLEAR ALL empties the panel");
     }
 
     #[test]

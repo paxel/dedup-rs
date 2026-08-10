@@ -74,7 +74,12 @@ pub enum BoardAction {
         rel_paths: Vec<String>,
     },
     /// Not a file operation: open the two versions side by side.
-    Inspect { left_rel: String, right_rel: String },
+    /// Open the shared viewer on this row's file(s). One side may be absent —
+    /// an only-on-one-side row opens as a single-file INSPECT view.
+    Inspect {
+        left_rel: Option<String>,
+        right_rel: Option<String>,
+    },
     /// Not a file operation: a row's button needs a follow-up answer first.
     /// Carries the row it came from, so the popup knows which row it acts on.
     OpenPopup {

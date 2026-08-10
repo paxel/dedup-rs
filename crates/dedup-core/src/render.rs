@@ -50,16 +50,16 @@ pub fn render_pdf_pages(pdf: &Path, out_dir: &Path) -> Vec<PathBuf> {
     pages
 }
 
-/// Render only a PDF's **first page** to a single PNG under `out_dir`, returning
-/// its path. `-f 1 -l 1 -singlefile` makes poppler stop after page one instead
-/// of rasterizing the whole document — the difference between ~0.3 s and minutes
-/// on a 200-page book. Returns `None` when `pdftoppm` is unavailable or the page
-/// can't be rendered. This is what the viewer's Render tab uses today (it shows
-/// one page); full multi-page rendering can layer on [`render_pdf_pages`].
-pub fn render_pdf_first_page(pdf: &Path, out_dir: &Path) -> Option<PathBuf> {
+/// Render exactly **one page** (1-based) of a PDF to a single PNG under
+/// `out_dir`, returning its path. `-f N -l N -singlefile` makes poppler stop
+/// after that page instead of rasterizing the whole document — the difference
+/// between ~0.3 s and minutes on a 200-page book. Returns `None` when
+/// `pdftoppm` is unavailable, the page doesn't exist, or it can't be rendered.
+pub fn render_pdf_page(pdf: &Path, out_dir: &Path, page: usize) -> Option<PathBuf> {
     let prefix = out_dir.join("page");
+    let n = page.max(1).to_string();
     let ok = Command::new("pdftoppm")
-        .args(["-png", "-r", "150", "-f", "1", "-l", "1", "-singlefile"])
+        .args(["-png", "-r", "150", "-f", &n, "-l", &n, "-singlefile"])
         .arg(pdf)
         .arg(&prefix)
         .stdout(Stdio::null())
@@ -71,8 +71,32 @@ pub fn render_pdf_first_page(pdf: &Path, out_dir: &Path) -> Option<PathBuf> {
         return None;
     }
     // `-singlefile` writes exactly `<prefix>.png`, with no page-number suffix.
-    let page = out_dir.join("page.png");
-    page.is_file().then_some(page)
+    let out = out_dir.join("page.png");
+    out.is_file().then_some(out)
+}
+
+/// Render only a PDF's **first page** — [`render_pdf_page`] at page 1.
+pub fn render_pdf_first_page(pdf: &Path, out_dir: &Path) -> Option<PathBuf> {
+    render_pdf_page(pdf, out_dir, 1)
+}
+
+/// How many pages a PDF has, via `pdfinfo` (ships with poppler alongside
+/// `pdftoppm`). `None` when the tool is unavailable or the file is not a
+/// readable PDF — the caller then steps pages blind and relies on
+/// [`render_pdf_page`] returning `None` past the end.
+pub fn pdf_page_count(pdf: &Path) -> Option<usize> {
+    let out = Command::new("pdfinfo")
+        .arg(pdf)
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .find_map(|l| l.strip_prefix("Pages:"))
+        .and_then(|v| v.trim().parse().ok())
 }
 
 #[cfg(test)]
@@ -148,6 +172,27 @@ mod tests {
             .filter(|e| e.path().extension().is_some_and(|x| x == "png"))
             .count();
         assert_eq!(pngs, 1, "only the first page is written");
+    }
+
+    #[test]
+    fn page_past_the_end_is_none_and_count_reads_pages() {
+        if !pdftoppm_available() {
+            eprintln!("skipping: pdftoppm not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pdf = dir.path().join("doc.pdf");
+        tiny_pdf(&pdf);
+        let out = tempfile::tempdir().unwrap();
+        assert!(
+            render_pdf_page(&pdf, out.path(), 2).is_none(),
+            "a one-page PDF has no page 2"
+        );
+        // pdfinfo may be absent even where pdftoppm exists; only assert the
+        // value when the probe answers at all.
+        if let Some(n) = pdf_page_count(&pdf) {
+            assert_eq!(n, 1, "the fixture is one page");
+        }
     }
 
     #[test]

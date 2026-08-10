@@ -133,9 +133,12 @@ photograph from the same date — or, when the image carries an EXIF capture dat
 stamp the file's date from EXIF instead. An overwrite re-indexes the file immediately, so its
 new content identity is never stale.
 
-**Audio** compares as spectrograms — frequency-vs-time, far more telling than a flat waveform
-— with a transport per side: **PLAY A** / **PLAY B**, **PAUSE**, and a cycling **SPEED** pill
-that steps through **0.25 / 0.5 / 0.75 / 1 / 1.5 / 2×**. The speed is **pitch-preserving**: a
+**Audio** is the listening transport: each side's **waveform** with a moving playhead and an
+**elapsed / total** readout — **click anywhere in the wave to play from that spot** — plus
+**PLAY A** / **PLAY B**, **PAUSE**, and a cycling **SPEED** pill that steps through
+**0.25 / 0.5 / 0.75 / 1 / 1.5 / 2×**. The **Spectrum** tab beside it holds the zoomable
+**spectrogram** comparison (frequency-vs-time, the visual fingerprint), with the same
+zoom/pan/FLICKER the Image tab has. The speed is **pitch-preserving**: a
 slowed passage still sounds like the recording rather than dropping an octave, so it stays
 recognizable while small differences between two takes become audible (the slowed track is
 pre-rendered once with ffmpeg's `atempo` and cached, so the first use of a speed costs a beat
@@ -172,10 +175,13 @@ empty) says so plainly. Raw bytes are not here — they have their own **Hex** t
 
 ![The Text tab comparing two documents' extracted content](../screenshots/content_diff.png)
 
-**Render** shows a **PDF** rasterized to its page — the document as it actually *looks*, not its
-extracted words. Comparing two, their pages sit side by side to be judged by eye: there is no
-automated pixel diff and no "same" verdict, because different rendering (fonts, antialiasing)
-makes pixel equality meaningless. It's the visual counterpart to the Text tab's content diff —
+**Render** shows a **PDF** rasterized page by page — the document as it actually *looks*, not
+its extracted words. One shared page control (**prev/next**, an editable page number, and a
+slider for sweeping a long document) drives **both** sides, so page N sits beside page N and a
+duplicate-PDF walk stays aligned; a side past its own last page says so. Pages render in the
+background, so even a huge book never freezes the app. Comparing two, their pages sit side by
+side to be judged by eye: there is no automated pixel diff and no "same" verdict, because
+different rendering (fonts, antialiasing) makes pixel equality meaningless. It's the visual counterpart to the Text tab's content diff —
 one reads the words, the other shows the page. Requires `pdftoppm` (poppler) at runtime; without
 it the tab simply doesn't appear, the same way video needs `ffmpeg`.
 
@@ -214,7 +220,7 @@ is instant after first build.
 
 A clip that carries an audio track also offers the **Audio** tab beside Video: its soundtrack
 is extracted once to a cached WAV and then compared exactly like a bare audio file —
-spectrogram, playback, pitch-preserving speeds and the gapless A/B flicker — so you can tell
+waveform transport, spectrogram, playback and pitch-preserving speeds — so you can tell
 whether two clips share the same footage, the same sound, or neither. (Extraction needs
 `ffmpeg`; a silent clip, or a machine without ffmpeg, simply offers no Audio tab.) Full-speed
 *watching* still lives on the OPEN (external app) path — the in-app tools augment the OS

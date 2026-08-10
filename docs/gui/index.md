@@ -41,12 +41,31 @@ so a problem never fails silently. It has two sections:
   output device** (so "no sound, no error" becomes a visible warning), **ffmpeg/ffprobe**
   (video frames, soundtrack extraction, play-rates), and **pdftoppm** (the Render tab).
   At runtime, a repository whose folder has gone (a disconnected drive, a closed cloud
-  mount) files one aggregated Critical that clears when it returns. Each warning has a
-  **COPY** button (its message plus a system fingerprint — app version, OS, and which
-  tools/devices are present), and **COPY FULL REPORT** adds every warning and the recent
-  log. Both go to your **clipboard for a bug report — the app sends nothing anywhere**.
+  mount) files one aggregated Critical that clears when it returns. Every warning says
+  **since when** it has been true (first seen — a repeat doesn't reset it), and each can be
+  dismissed with its trashcan, or all at once with **CLEAR ALL** (anything still wrong comes
+  back when it is detected again). Each warning has a **COPY** button (its message plus a
+  system fingerprint — app version, OS, and which tools/devices are present), and
+  **COPY FULL REPORT** adds every warning and the recent log. Both go to your **clipboard
+  for a bug report — the app sends nothing anywhere**.
 - **Activity** — the heavy background work you can watch and stop: a running or queued
   **scan** shows here with **CANCEL**, so a long scan can be ended without killing the app.
+
+## Repository locks
+
+Every repository starts **locked** at each launch. The padlock on a repo's chip — the same
+chip on every tab — shows and toggles it: **closed blue = protected, open = unlocked**.
+
+A lock protects the repo's **existing files**: while locked, nothing in the app can delete or
+overwrite them — those buttons are withheld or disabled with the reason on hover, a MIRROR or
+MOVE that would lose data there won't run, and a locked MIRROR sink can't be included in a
+GROUP SYNC push. **Adding files to a locked repo is always allowed** — the lock guards what
+exists, it never blocks gaining data.
+
+Unlocking is a per-session, per-repo declaration that losing data there is acceptable: from
+then on destructive actions run **without further questions** (batch operations still show
+their plan first — that's workflow, not a nag). Locks are deliberately not remembered across
+launches; consenting to loss is a fresh choice each session.
 
 ## Settings dialog
 
