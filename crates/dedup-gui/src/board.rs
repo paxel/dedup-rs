@@ -836,9 +836,19 @@ fn draw_row(
                         }
                     }
                 }
-                // A lone one is centred across them.
+                // A lone one is centred within the whole centre region, which
+                // may be one *or* two columns wide. Centre it against `centre`;
+                // translating by CMD_W/2 assumed two columns and pushed a lone
+                // command off a one-column centre into the right-hand cell.
                 None => {
-                    let at = slot(0, n).translate(egui::vec2(CMD_W / 2.0, 0.0));
+                    let btn_w = CMD_W - 8.0;
+                    let at = egui::Rect::from_min_size(
+                        egui::pos2(
+                            grid_left + (centre - btn_w) / 2.0,
+                            row.top() + n as f32 * CMD_H,
+                        ),
+                        egui::vec2(btn_w, BTN_H),
+                    );
                     if cmd_button(ui, at, first, hide_skips_run).clicked() {
                         clicked = Some(first);
                     }
@@ -1839,6 +1849,34 @@ mod tests {
                 "{label} spills out of its row: bottom {:.1} is below the next row's \
                  top {next_row_top:.1}",
                 r.bottom()
+            );
+        }
+    }
+
+    /// **A lone row-level command must stay inside the centre region.** GROUP
+    /// SYNC BACK's promote/resurrect rows carry a single `APPLY`, drawn centred.
+    /// It used to be translated half a column (as if two columns existed), which
+    /// on a one-column centre pushed it into the right cell — the overlap the bug
+    /// report showed, APPLY landing on the target thumbnail. With no thumbnail on
+    /// the right (unresolved facts) the right path label's left edge *is* the
+    /// right cell's left edge, so APPLY's right edge must not cross it.
+    #[test]
+    fn a_lone_row_command_does_not_overlap_the_right_cell() {
+        use egui_kittest::kittest::Queryable;
+        for width in [900.0_f32, 1280.0, 1920.0] {
+            let mut row = diff_row("promote");
+            row.left_paths = vec!["source/promote.jpg".to_string()];
+            row.right_paths = vec!["target/ZZZTARGET.jpg".to_string()];
+            row.cmds = vec![Cmd::Apply];
+            let harness = render(width, vec![row]);
+            let apply = harness.get_by_label("APPLY").rect();
+            let right = harness.get_by_label_contains("ZZZTARGET").rect();
+            assert!(
+                apply.right() <= right.left() + 0.5,
+                "at {width}px APPLY (right {:.1}) overlaps the right cell \
+                 (starts {:.1})",
+                apply.right(),
+                right.left(),
             );
         }
     }
