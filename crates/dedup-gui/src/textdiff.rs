@@ -154,29 +154,47 @@ impl TextDiff {
                         .size(11.0),
                     );
                 }
+                let gap = 12.0;
                 for row in &self.rows {
-                    let left = Self::side_job(&row.left, &font);
-                    let right = Self::side_job(&row.right, &font);
-                    let resp = ui.horizontal_top(|ui| {
-                        let gap = 12.0;
-                        let col_w = ((ui.available_width() - gap) / 2.0).max(40.0);
-                        ui.vertical(|ui| {
-                            ui.set_width(col_w);
-                            ui.add(egui::Label::new(left).wrap());
-                        });
-                        ui.add_space(gap);
-                        ui.vertical(|ui| {
-                            ui.set_width(col_w);
-                            ui.add(egui::Label::new(right).wrap());
-                        });
-                    });
+                    // Two equal columns. Each side is laid out to `col_w` up
+                    // front — its own galley, already wrapped, which egui then
+                    // paints without re-flowing — and placed in a child ui at its
+                    // column's x. Laying the galley out ourselves is what keeps a
+                    // long line wrapping *inside* its column: `set_width` on a
+                    // vertical nested in a horizontal did not bound the label's
+                    // wrap width, so lines never wrapped and instead ran under the
+                    // centre divider and off the far edge. A `Label` (not a bare
+                    // painted galley) keeps the text in the accessibility tree, so
+                    // it stays queryable in tests and by screen readers.
+                    let full = ui.available_width();
+                    let col_w = ((full - gap) / 2.0).max(40.0);
+                    let mut left = Self::side_job(&row.left, &font);
+                    let mut right = Self::side_job(&row.right, &font);
+                    left.wrap.max_width = col_w;
+                    right.wrap.max_width = col_w;
+                    let left = ui.ctx().fonts_mut(|f| f.layout_job(left));
+                    let right = ui.ctx().fonts_mut(|f| f.layout_job(right));
+                    let row_h = left.rect.height().max(right.rect.height());
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(full, row_h), egui::Sense::hover());
                     if row.changed {
-                        ui.painter().rect_filled(
-                            resp.response.rect,
-                            0.0,
-                            theme::amber().gamma_multiply(0.08),
-                        );
+                        ui.painter()
+                            .rect_filled(rect, 0.0, theme::amber().gamma_multiply(0.08));
                     }
+                    let mut col = |x: f32, galley: std::sync::Arc<egui::Galley>| {
+                        let at = egui::Rect::from_min_size(
+                            egui::pos2(x, rect.min.y),
+                            egui::vec2(col_w, row_h),
+                        );
+                        let mut child = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(at)
+                                .layout(egui::Layout::top_down(egui::Align::Min)),
+                        );
+                        child.add(egui::Label::new(galley));
+                    };
+                    col(rect.min.x, left);
+                    col(rect.min.x + col_w + gap, right);
                 }
                 if self.truncated {
                     ui.label(
