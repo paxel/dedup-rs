@@ -2576,6 +2576,18 @@ impl DedupApp {
                     "The viewer's PDF Render tab needs pdftoppm (from poppler-utils).",
                 );
             }
+            // The Render gate reads this flag per file; office documents
+            // offer the tab only once the probe has said soffice runs.
+            crate::lightbox::set_soffice_available(probe.soffice_ok);
+            if !probe.soffice_ok {
+                diag.push(
+                    Warning,
+                    "soffice",
+                    "LibreOffice (soffice) not found on PATH",
+                    "Office and legacy documents (Word, spreadsheets, .doc, .rtf) can't be \
+                     shown as rendered pages without it. Install LibreOffice to enable them.",
+                );
+            }
             ctx.request_repaint();
         });
     }
@@ -2632,9 +2644,11 @@ impl DedupApp {
             ui.add_space(4.0);
             if events.is_empty() {
                 ui.label(
-                    RichText::new("No warnings — audio, ffmpeg and pdftoppm are all available.")
-                        .color(theme::green())
-                        .size(12.0),
+                    RichText::new(
+                        "No warnings — audio, ffmpeg, pdftoppm and LibreOffice are all available.",
+                    )
+                    .color(theme::green())
+                    .size(12.0),
                 );
             }
             for e in &events {

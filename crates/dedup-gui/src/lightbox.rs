@@ -217,9 +217,10 @@ impl MarkState {
 #[derive(Clone, Debug)]
 pub struct ArchiveRepresentation {}
 
-/// A document (currently PDF) can be rasterized to page images and looked at as
-/// it renders. The pages are produced lazily by the viewer (external tool), so
-/// this only records the capability.
+/// A document (PDF directly; office and legacy formats via LibreOffice) can be
+/// rasterized to page images and looked at as it renders. The pages are
+/// produced lazily by the viewer (external tools), so this only records the
+/// capability.
 #[derive(Clone, Debug)]
 pub struct RenderRepresentation {}
 
@@ -257,6 +258,22 @@ pub fn has_readable_text(facts: &FileFacts) -> bool {
     facts.mime.as_deref().is_some_and(|m| {
         dedup_core::fingerprint::is_extractable_document(m) || m.starts_with("text/")
     })
+}
+
+/// Whether headless LibreOffice was found by the startup probe. Office and
+/// legacy documents offer a Render tab only when it can actually rasterize
+/// them; a PDF's Render tab is independent of this. Written once by the probe
+/// thread — reading it never blocks a paint frame.
+static SOFFICE_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record the startup probe's `soffice` verdict (see [`soffice_available`]).
+pub fn set_soffice_available(ok: bool) {
+    SOFFICE_OK.store(ok, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether office/legacy documents can be rendered (probe said `soffice` runs).
+pub fn soffice_available() -> bool {
+    SOFFICE_OK.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl FileRepresentations {
@@ -353,11 +370,16 @@ impl FileRepresentations {
             None
         };
 
-        // A PDF can be rasterized to page images and looked at as it renders.
-        let render = if facts.mime.as_deref() == Some("application/pdf") {
-            Some(RenderRepresentation {})
-        } else {
-            None
+        // A PDF can be rasterized to page images directly; an office or
+        // legacy document (.doc, RTF) via LibreOffice, when the probe found
+        // it. Render deliberately covers formats Text can't extract — a 1998
+        // .doc is exactly the file that must be judged by eye.
+        let render = match facts.mime.as_deref() {
+            Some("application/pdf") => Some(RenderRepresentation {}),
+            Some(m) if dedup_core::render::office_renderable(m) && soffice_available() => {
+                Some(RenderRepresentation {})
+            }
+            _ => None,
         };
 
         Self {

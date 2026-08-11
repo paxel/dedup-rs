@@ -1,11 +1,14 @@
 //! Rasterizing a document to page images for the viewer's Render tab — the
 //! document shown as it *looks*. External-tool based, like video via `ffmpeg`:
-//! a PDF is rendered with `pdftoppm` (poppler). Absent the tool, rendering
-//! yields nothing and the caller simply omits the tab. Best-effort throughout:
-//! a failure is an empty result, never an error.
+//! a PDF is rendered with `pdftoppm` (poppler); an office or legacy document
+//! is first converted to PDF with headless LibreOffice (`soffice`), then
+//! rendered the same way. Absent a tool, rendering yields nothing and the
+//! caller simply omits the tab. Best-effort throughout: a failure is an empty
+//! result, never an error.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// Whether `pdftoppm` (poppler) is runnable — probed like
 /// [`crate::fingerprint::ffmpeg_available`].
@@ -78,6 +81,78 @@ pub fn render_pdf_page(pdf: &Path, out_dir: &Path, page: usize) -> Option<PathBu
 /// Render only a PDF's **first page** — [`render_pdf_page`] at page 1.
 pub fn render_pdf_first_page(pdf: &Path, out_dir: &Path) -> Option<PathBuf> {
     render_pdf_page(pdf, out_dir, 1)
+}
+
+/// Whether headless LibreOffice (`soffice`) is runnable — probed like
+/// [`pdftoppm_available`]. Its cold start is slow, so probe once and keep the
+/// answer rather than asking per frame.
+pub fn soffice_available() -> bool {
+    Command::new("soffice")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// MIME types the Render tab can rasterize **via LibreOffice**: everything the
+/// text extractor reads as an office document, plus the legacy formats the
+/// extractor can't — binary Word (`.doc`) and RTF. Render exists precisely for
+/// what text extraction can't faithfully show, so the legacy set is *wider*
+/// than the Text tab's.
+pub fn office_renderable(mime: &str) -> bool {
+    crate::fingerprint::is_office_doc(mime)
+        || matches!(mime, "application/msword" | "application/rtf" | "text/rtf")
+}
+
+/// Convert a document to PDF with headless LibreOffice, returning the PDF's
+/// path under `out_dir`. Runs `soffice` with an **isolated user profile**
+/// (without it, soffice attaches to any running LibreOffice instance and
+/// silently does nothing) and kills it after 60 s — a wedged conversion must
+/// not leak processes. `None` when `soffice` is unavailable, times out, or
+/// rejects the file.
+pub fn convert_to_pdf(doc: &Path, out_dir: &Path) -> Option<PathBuf> {
+    // The profile lives inside `out_dir`, so it shares the caller's cleanup.
+    let profile = out_dir.join("soffice-profile");
+    std::fs::create_dir_all(&profile).ok()?;
+    let mut child = Command::new("soffice")
+        .arg(format!(
+            "-env:UserInstallation=file://{}",
+            profile.display()
+        ))
+        .args([
+            "--headless",
+            "--norestore",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+        ])
+        .arg(out_dir)
+        .arg(doc)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let ok = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+    if !ok {
+        return None;
+    }
+    let pdf = out_dir.join(doc.file_stem()?).with_extension("pdf");
+    pdf.is_file().then_some(pdf)
 }
 
 /// How many pages a PDF has, via `pdfinfo` (ships with poppler alongside
@@ -202,6 +277,59 @@ mod tests {
         std::fs::write(&bad, b"not a pdf").unwrap();
         let out = tempfile::tempdir().unwrap();
         assert!(render_pdf_first_page(&bad, out.path()).is_none());
+    }
+
+    /// The LibreOffice set: every extractable office format plus the legacy
+    /// ones only rendering can show (`.doc`, RTF) — and nothing else.
+    #[test]
+    fn office_renderable_covers_office_and_legacy_formats() {
+        assert!(office_renderable(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        ));
+        assert!(office_renderable("application/vnd.oasis.opendocument.text"));
+        assert!(office_renderable("application/msword"), "legacy .doc");
+        assert!(office_renderable("application/rtf"));
+        assert!(office_renderable("text/rtf"));
+        assert!(
+            !office_renderable("application/pdf"),
+            "PDF renders directly"
+        );
+        assert!(!office_renderable("image/jpeg"));
+        assert!(!office_renderable("text/plain"));
+    }
+
+    /// Headless LibreOffice converts a document to a PDF that poppler then
+    /// accepts. Gated on `soffice` being installed, like the ffmpeg-gated
+    /// video tests.
+    #[test]
+    fn converts_a_document_to_a_renderable_pdf() {
+        if !soffice_available() {
+            eprintln!("skipping: soffice not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let doc = dir.path().join("note.rtf");
+        std::fs::write(&doc, b"{\\rtf1\\ansi Hello from the render test}").unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let pdf = convert_to_pdf(&doc, out.path()).expect("soffice converts an RTF");
+        assert_eq!(pdf.file_name().unwrap(), "note.pdf");
+        if pdftoppm_available() {
+            let pages = tempfile::tempdir().unwrap();
+            assert!(
+                render_pdf_first_page(&pdf, pages.path()).is_some(),
+                "the converted PDF rasterizes"
+            );
+        }
+    }
+
+    /// A missing source converts to `None` — with or without soffice on the
+    /// machine, failure is an empty result, never a panic or a leak.
+    #[test]
+    fn missing_input_converts_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("never-existed.doc");
+        let out = tempfile::tempdir().unwrap();
+        assert!(convert_to_pdf(&gone, out.path()).is_none());
     }
 
     #[test]

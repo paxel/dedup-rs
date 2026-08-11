@@ -223,6 +223,7 @@ pub struct SystemProbe {
     pub audio_ok: bool,
     pub ffmpeg_ok: bool,
     pub pdftoppm_ok: bool,
+    pub soffice_ok: bool,
 }
 
 /// Probe the environment **once** — the audio device and each external tool
@@ -254,9 +255,11 @@ pub fn probe_system() -> SystemProbe {
     let ffmpeg = tool("ffmpeg", "-version");
     let ffprobe = tool("ffprobe", "-version");
     let pdftoppm = tool("pdftoppm", "-v");
+    let soffice = tool("soffice", "--version");
     let line = |o: &Option<String>| o.clone().unwrap_or_else(|| "not found".to_string());
     let fingerprint = format!(
-        "dedup: {}\nos: {} {}\naudio output: {}\nffmpeg: {}\nffprobe: {}\npdftoppm: {}\n",
+        "dedup: {}\nos: {} {}\naudio output: {}\nffmpeg: {}\nffprobe: {}\npdftoppm: {}\n\
+         soffice: {}\n",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
         std::env::consts::ARCH,
@@ -268,12 +271,14 @@ pub fn probe_system() -> SystemProbe {
         line(&ffmpeg),
         line(&ffprobe),
         line(&pdftoppm),
+        line(&soffice),
     );
     SystemProbe {
         fingerprint,
         audio_ok,
         ffmpeg_ok: ffmpeg.is_some(),
         pdftoppm_ok: pdftoppm.is_some(),
+        soffice_ok: soffice.is_some(),
     }
 }
 

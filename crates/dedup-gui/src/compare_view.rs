@@ -168,6 +168,14 @@ enum MediaMsg {
         path: std::path::PathBuf,
         pages: Option<usize>,
     },
+    /// An office side's LibreOffice conversion finished: the produced PDF
+    /// (session-cached by content hash), or `None` when soffice failed or is
+    /// missing. `path` is the *source* document, for staleness matching.
+    OfficePdf {
+        left: bool,
+        path: std::path::PathBuf,
+        pdf: Option<std::path::PathBuf>,
+    },
     /// One pairing's extracted document text — both sides' previews and their
     /// pre-built content diff — produced on a worker thread, because parsing a
     /// large PDF takes seconds and used to freeze the window. `key` is the
@@ -364,6 +372,11 @@ pub(crate) struct DiffCompare {
     /// unknown or when the probe can't answer.
     render_count: [Option<usize>; 2],
     render_probed: [bool; 2],
+    /// An office side's conversion to PDF (LibreOffice, session-cached by
+    /// content hash): `None` = not tried, `Some(None)` = failed, `Some(Some)`
+    /// = ready to rasterize. A PDF side never uses this.
+    office_pdf: [Option<Option<std::path::PathBuf>>; 2],
+    office_pending: [bool; 2],
     /// Each side's decoded amplitude envelope — the Audio tab's waveform (a
     /// bare audio file's own, or a video's extracted soundtrack's).
     audio_env: [Option<Vec<f32>>; 2],
@@ -483,6 +496,8 @@ impl DiffCompare {
             render_pending: std::collections::HashSet::new(),
             render_count: [None, None],
             render_probed: [false, false],
+            office_pdf: [None, None],
+            office_pending: [false, false],
             audio_env: [None, None],
             hex_head: [None, None],
             tag_edit: None,
@@ -953,25 +968,106 @@ impl DiffCompare {
         }
     }
 
-    /// Make sure the shared current page is rasterizing (or cached) for `slot`,
-    /// and that the side's page count has been probed. `pdftoppm` runs on a
-    /// **worker thread** — a large PDF takes seconds per page, and doing it
-    /// inline froze the whole app with no feedback — sending the page back as
-    /// [`MediaMsg::RenderPage`].
+    /// The session-wide cache of office documents converted to PDF, keyed by
+    /// content hash — LibreOffice takes seconds per conversion, so each
+    /// document converts **once per session** no matter how often a viewer
+    /// opens it. Lives in a temp dir removed when the app exits.
+    fn office_cache_dir() -> Option<&'static std::path::Path> {
+        static DIR: std::sync::OnceLock<Option<tempfile::TempDir>> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| tempfile::tempdir().ok())
+            .as_ref()
+            .map(|d| d.path())
+    }
+
+    /// Whether this side needs a LibreOffice conversion before it can render
+    /// (an office/legacy document rather than a PDF).
+    fn is_office_side(&self, slot: usize) -> bool {
+        let side = if slot == 0 { &self.left } else { &self.right };
+        side.facts
+            .mime
+            .as_deref()
+            .is_some_and(dedup_core::render::office_renderable)
+    }
+
+    /// Convert one office side to PDF on a worker thread (or adopt the
+    /// session-cached conversion instantly), reporting via
+    /// [`MediaMsg::OfficePdf`]. LibreOffice takes seconds — the "Preparing…"
+    /// note holds the pane meanwhile.
+    fn spawn_office_convert(&mut self, ctx: &Context, slot: usize) {
+        if self.office_pending[slot] || self.office_pdf[slot].is_some() {
+            return;
+        }
+        let side = if slot == 0 { &self.left } else { &self.right };
+        let src = side.facts.abs_path.clone();
+        let hash = side.facts.hash_hex.clone();
+        let Some(cache) = Self::office_cache_dir() else {
+            self.office_pdf[slot] = Some(None);
+            return;
+        };
+        let cached = cache.join(format!("{hash}.pdf"));
+        if cached.is_file() {
+            self.office_pdf[slot] = Some(Some(cached));
+            return;
+        }
+        self.office_pending[slot] = true;
+        let left = slot == 0;
+        let cache = cache.to_path_buf();
+        let tx = self.media_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            // Convert into a job-private dir, then move the product to its
+            // hash-keyed cache name — a half-written PDF must never be
+            // adopted by a concurrent viewer.
+            let pdf = (|| {
+                let job = tempfile::tempdir_in(&cache).ok()?;
+                let out = dedup_core::render::convert_to_pdf(&src, job.path())?;
+                std::fs::rename(&out, &cached).ok()?;
+                Some(cached)
+            })();
+            let _ = tx.send(MediaMsg::OfficePdf {
+                left,
+                path: src,
+                pdf,
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Make sure this side's current page is rasterizing (or cached), and that
+    /// its page count has been probed. `pdftoppm` runs on a **worker thread** —
+    /// a large PDF takes seconds per page, and doing it inline froze the whole
+    /// app with no feedback — sending the page back as [`MediaMsg::RenderPage`].
+    /// An office side first converts to PDF (LibreOffice, worker thread, cached
+    /// per session); until that lands there is nothing to rasterize yet.
     fn ensure_render(&mut self, ctx: &Context, slot: usize) {
         let left = slot == 0;
-        let path = if left {
+        let src = if left {
             self.left.facts.abs_path.clone()
         } else {
             self.right.facts.abs_path.clone()
+        };
+        // What pdftoppm actually reads: the file itself for a PDF, the
+        // session-cached conversion for an office document.
+        let pdf = if self.is_office_side(slot) {
+            match &self.office_pdf[slot] {
+                Some(Some(p)) => p.clone(),
+                Some(None) => return,
+                None => {
+                    self.spawn_office_convert(ctx, slot);
+                    return;
+                }
+            }
+        } else {
+            src.clone()
         };
         if !self.render_probed[slot] {
             self.render_probed[slot] = true;
             let tx = self.media_tx.clone();
             let ctx = ctx.clone();
-            let path = path.clone();
+            let path = src.clone();
+            let pdf = pdf.clone();
             std::thread::spawn(move || {
-                let pages = dedup_core::render::pdf_page_count(&path);
+                let pages = dedup_core::render::pdf_page_count(&pdf);
                 let _ = tx.send(MediaMsg::RenderMeta { left, path, pages });
                 ctx.request_repaint();
             });
@@ -988,7 +1084,7 @@ impl DiffCompare {
         std::thread::spawn(move || {
             let image = (|| {
                 let dir = tempfile::tempdir().ok()?;
-                let png = dedup_core::render::render_pdf_page(&path, dir.path(), page + 1)?;
+                let png = dedup_core::render::render_pdf_page(&pdf, dir.path(), page + 1)?;
                 let (w, h, rgba) = dedup_core::thumbnail::load_full_rgba(&png, 2000).ok()?;
                 Some(ColorImage::from_rgba_unmultiplied(
                     [w as usize, h as usize],
@@ -997,7 +1093,7 @@ impl DiffCompare {
             })();
             let _ = tx.send(MediaMsg::RenderPage {
                 left,
-                path,
+                path: src,
                 page,
                 image,
             });
@@ -1007,8 +1103,36 @@ impl DiffCompare {
 
     /// Draw one side's rendered current page fit within `area`; a "Rendering…"
     /// note while the worker runs, "no page N" past that side's end, or a
-    /// "couldn't be drawn" note when rendering failed outright.
+    /// "couldn't be drawn" note when rendering failed outright. An office side
+    /// first says it is converting (or that the conversion failed).
     fn draw_render_page(&self, ui: &mut egui::Ui, area: Rect, slot: usize) {
+        if self.is_office_side(slot) {
+            match &self.office_pdf[slot] {
+                Some(Some(_)) => {}
+                Some(None) => {
+                    ui.painter().text(
+                        area.center(),
+                        Align2::CENTER_CENTER,
+                        "This document could not be converted for page rendering.",
+                        FontId::proportional(13.0),
+                        theme::hairline(),
+                    );
+                    return;
+                }
+                None => {
+                    ui.ctx().request_repaint();
+                    ui.painter().text(
+                        area.center(),
+                        Align2::CENTER_CENTER,
+                        "Preparing the document… the first view converts it, \
+                         which can take a while.",
+                        FontId::proportional(13.0),
+                        theme::tan(),
+                    );
+                    return;
+                }
+            }
+        }
         let page = self.render_page[slot];
         match self.render_cache.get(&(slot, page)) {
             Some(Some(tex)) => {
@@ -1818,6 +1942,8 @@ impl DiffCompare {
         self.render_pending.retain(|&(s, _)| s != slot);
         self.render_count[slot] = None;
         self.render_probed[slot] = false;
+        self.office_pdf[slot] = None;
+        self.office_pending[slot] = false;
         self.audio_env[slot] = None;
         self.hex_head[slot] = None;
         self.tags[slot] = None;
@@ -2117,6 +2243,16 @@ impl DiffCompare {
                     let side = if slot == 0 { &self.left } else { &self.right };
                     if side.facts.abs_path == path {
                         self.render_count[slot] = pages;
+                    }
+                }
+                MediaMsg::OfficePdf { left, path, pdf } => {
+                    let slot = usize::from(!left);
+                    let side = if slot == 0 { &self.left } else { &self.right };
+                    self.office_pending[slot] = false;
+                    // A conversion finishing after the side was swapped
+                    // answers a file no longer shown — drop it.
+                    if side.facts.abs_path == path {
+                        self.office_pdf[slot] = Some(pdf);
                     }
                 }
                 MediaMsg::DocText {
@@ -5089,6 +5225,35 @@ mod tests {
                 .contains(&RepresentationKind::Render),
             "an image is not rasterized to pages — no Render tab"
         );
+    }
+
+    /// An office (or legacy .doc) side offers the Render tab only once the
+    /// startup probe found LibreOffice — without the converter the tab could
+    /// only ever fail. A PDF's Render tab does not depend on it.
+    #[test]
+    fn office_documents_offer_render_only_with_libreoffice() {
+        let offers_render = |mime: &str| {
+            let mut side = named_side("doc.bin");
+            side.facts.mime = Some(mime.into());
+            DiffCompare::new_with_pool(side, None, Vec::new())
+                .reps()
+                .0
+                .available_kinds()
+                .contains(&RepresentationKind::Render)
+        };
+        const DOCX: &str =
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+        crate::lightbox::set_soffice_available(false);
+        assert!(!offers_render(DOCX), "no converter, no office Render tab");
+        assert!(!offers_render("application/msword"));
+        crate::lightbox::set_soffice_available(true);
+        assert!(offers_render(DOCX), "probe found soffice — tab appears");
+        assert!(
+            offers_render("application/msword"),
+            "legacy .doc renders too"
+        );
+        assert!(offers_render("application/rtf"));
+        crate::lightbox::set_soffice_available(false);
     }
 
     /// Comparing two documents on the Render tab, **each side has its own page
