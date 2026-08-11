@@ -183,6 +183,11 @@ empty) says so plainly. Raw bytes are not here — they have their own **Hex** t
 
 ![The Text tab comparing two documents' extracted content](../screenshots/content_diff.png)
 
+A document with no extractable text (scanned, encrypted, or empty) says so instead of
+pretending to be blank:
+
+![A readable file beside a document with nothing to extract](../screenshots/lightbox_text.png)
+
 **Render** shows a **PDF** rasterized page by page — the document as it actually *looks*, not
 its extracted words. One shared page control (**prev/next**, an editable page number, and a
 slider for sweeping a long document) drives **both** sides, so page N sits beside page N and a

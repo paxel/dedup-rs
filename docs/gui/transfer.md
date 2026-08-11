@@ -174,7 +174,10 @@ GROUP SYNC BACK *before* you push again.
 ## Review and run
 
 - **REVIEW** shows the first matching transfers (up to a limit) and a total count, without
-  touching disk, on the shared [review board](index.md#the-review-board). Each side carries a
+  touching disk, on the shared [review board](index.md#the-review-board).
+
+  ![A COPY preview on the review board](../screenshots/transfer_review_board.png)
+ Each side carries a
   thumbnail (image, video still, audio fingerprint, or a text file's first
   lines — hover the small cell to read the whole preview) and the file's size, dimensions or
   duration, and date — the same info as a Duplicate card. Per row, **APPLY** runs just that

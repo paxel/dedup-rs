@@ -2243,6 +2243,81 @@ mod tests {
         );
     }
 
+    /// Real on-disk files + facts for the doc boards, so every row shows a
+    /// live preview cell (image thumbnail / text head) instead of nothing —
+    /// the whole point of the board screenshots.
+    fn doc_bodies(dir: &std::path::Path) -> Vec<RowBody> {
+        let img = |name: &str, hue: u8| -> FileFacts {
+            let path = dir.join(name);
+            // A real JPEG (RGB — the JPEG encoder refuses RGBA), because the
+            // decoder picks its format from the file extension.
+            let mut im = image::RgbImage::new(64, 48);
+            for (x, y, p) in im.enumerate_pixels_mut() {
+                *p = image::Rgb([hue.saturating_add(x as u8 * 2), 60 + y as u8 * 3, 160]);
+            }
+            im.save(&path).unwrap();
+            FileFacts {
+                size: 2_048_000,
+                modified_ms: 1_700_000_000_000,
+                missing: false,
+                mime: Some("image/png".into()),
+                img_size: Some((4032, 3024)),
+                audio_ms: None,
+                audio_seed: None,
+                hash_hex: format!("doc-{name}"),
+                abs_path: path,
+                origin: None,
+                exif: None,
+            }
+        };
+        let txt = |name: &str, body: &str| -> FileFacts {
+            let path = dir.join(name);
+            std::fs::write(&path, body).unwrap();
+            FileFacts {
+                size: body.len() as u64,
+                modified_ms: 1_700_000_000_000,
+                missing: false,
+                mime: Some("text/plain".into()),
+                img_size: None,
+                audio_ms: None,
+                audio_seed: None,
+                hash_hex: format!("doc-{name}"),
+                abs_path: path,
+                origin: None,
+                exif: None,
+            }
+        };
+        let side = |f: FileFacts| SideBody {
+            facts: Some(f),
+            repo: None,
+            repo_is_main: false,
+        };
+        vec![
+            // renamed pair: the same photo under two names.
+            RowBody {
+                left: side(img("holiday_v2.jpg", 90)),
+                right: side(img("holiday.jpg", 90)),
+            },
+            // multi-name row: photo on the left, its best copy right.
+            RowBody {
+                left: side(img("photo.jpg", 10)),
+                right: side(img("IMG_0042.jpg", 10)),
+            },
+            // one-sided text file.
+            RowBody {
+                left: side(txt(
+                    "notes.txt",
+                    "Inheritance triage
+
+- scan the NAS
+- keep originals
+- purge re-encodes",
+                )),
+                right: SideBody::default(),
+            },
+        ]
+    }
+
     /// Doc screenshot: the unified board with a DIFF-shaped row (8 commands), a
     /// two-command row and a multi-name row, to `docs/screenshots/board.png`.
     #[test]
@@ -2272,20 +2347,32 @@ mod tests {
         let mut renamed = diff_row("holiday");
         renamed.left_paths = vec!["a/b/holiday_v2.jpg".into()];
         renamed.right_paths = vec!["a/b/holiday.jpg".into()];
-        let metas = vec![renamed, multi, simple];
+        let mut metas = vec![renamed, multi, simple];
+        // A believable date, not the epoch (an epoch-0 doc image reads as a bug).
+        for m in &mut metas {
+            m.left_modified = 1_700_000_000_000;
+            m.right_modified = 1_700_060_000_000;
+        }
 
+        let dir = tempfile::tempdir().unwrap();
+        dedup_core::thumbnail::set_cache_dir(dir.path().join("thumbs"));
+        let bodies = doc_bodies(dir.path());
         let mut init = false;
+        // The thumbnail cache must live across frames (a fresh one per frame
+        // re-requests forever and no texture ever lands) — it rides in the
+        // harness state beside the board state.
         let mut harness = egui_kittest::Harness::builder()
             .with_size(egui::vec2(1200.0, 680.0))
             .wgpu()
             .build_ui_state(
-                move |ui, state: &mut BoardState| {
+                move |ui, (state, thumbs): &mut (BoardState, ThumbCache)| {
                     if !init {
                         crate::icon::install(ui.ctx());
                         crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
-                    let mut thumbs = ThumbCache::new(4);
+                    let _ = &dir;
+                    thumbs.poll(&ui.ctx().clone());
                     board(
                         ui,
                         state,
@@ -2306,14 +2393,16 @@ mod tests {
                             full_len: 3,
                             hide_skips_run: false,
                         },
-                        &mut thumbs,
-                        &mut |_| RowBody::default(),
+                        thumbs,
+                        &mut |i| bodies.get(i).cloned().unwrap_or_default(),
                     );
                 },
-                BoardState::default(),
+                (BoardState::default(), ThumbCache::new(2)),
             );
-        harness.run();
-        harness.run();
+        for _ in 0..40 {
+            harness.step();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
         let img = harness.render().expect("wgpu render failed");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
         std::fs::create_dir_all(&dir).expect("screenshot dir");
@@ -2342,20 +2431,28 @@ mod tests {
             let mut renamed = diff_row("holiday");
             renamed.left_paths = vec!["a/b/holiday_v2.jpg".into()];
             renamed.right_paths = vec!["a/b/holiday.jpg".into()];
-            let metas = vec![renamed, multi, simple];
+            let mut metas = vec![renamed, multi, simple];
+            for m in &mut metas {
+                m.left_modified = 1_700_000_000_000;
+                m.right_modified = 1_700_060_000_000;
+            }
 
+            let dir = tempfile::tempdir().unwrap();
+            dedup_core::thumbnail::set_cache_dir(dir.path().join("thumbs"));
+            let bodies = doc_bodies(dir.path());
             let mut init = false;
             let mut harness = egui_kittest::Harness::builder()
                 .with_size(egui::vec2(1000.0, 620.0))
                 .wgpu()
                 .build_ui_state(
-                    move |ui, state: &mut BoardState| {
+                    move |ui, (state, thumbs): &mut (BoardState, ThumbCache)| {
                         if !init {
                             crate::icon::install(ui.ctx());
                             crate::theme::apply(ui.ctx(), palette);
                             init = true;
                         }
-                        let mut thumbs = ThumbCache::new(4);
+                        let _ = &dir;
+                        thumbs.poll(&ui.ctx().clone());
                         board(
                             ui,
                             state,
@@ -2376,14 +2473,16 @@ mod tests {
                                 full_len: 3,
                                 hide_skips_run: false,
                             },
-                            &mut thumbs,
-                            &mut |_| RowBody::default(),
+                            thumbs,
+                            &mut |i| bodies.get(i).cloned().unwrap_or_default(),
                         );
                     },
-                    BoardState::default(),
+                    (BoardState::default(), ThumbCache::new(2)),
                 );
-            harness.run();
-            harness.run();
+            for _ in 0..40 {
+                harness.step();
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
             harness.render().expect("wgpu render failed")
         }
 

@@ -2365,12 +2365,51 @@ mod ui_tests {
     fn doc_screenshot_groom_purge_board() {
         let (_tmp, store) = sample_store();
         let mut h = grooming_harness(store, Command::Purge);
+        // Real bytes behind each row, so the cells show byte-view previews
+        // under their red WILL DELETE veils instead of empty space.
+        let dir = tempfile::tempdir().unwrap();
+        dedup_core::thumbnail::set_cache_dir(dir.path().join("thumbs"));
         {
             let paths: Vec<String> = (0..6).map(|i| format!("cache/file{i}.db")).collect();
             seed_purge(h.state_mut(), &paths);
+            let v = h.state_mut();
+            v.preview_bodies = paths
+                .iter()
+                .enumerate()
+                .map(|(i, rel)| {
+                    let name = rel.rsplit('/').next().unwrap_or(rel);
+                    let path = dir.path().join(name);
+                    let bytes: Vec<u8> = (0..4096u32)
+                        .map(|b| ((b / 64 + i as u32) % 5 * 53) as u8)
+                        .collect();
+                    std::fs::write(&path, &bytes).unwrap();
+                    board::RowBody {
+                        left: board::SideBody {
+                            facts: Some(crate::media_cell::FileFacts {
+                                size: bytes.len() as u64,
+                                modified_ms: 1_700_000_000_000,
+                                missing: false,
+                                mime: Some("application/octet-stream".into()),
+                                img_size: None,
+                                audio_ms: None,
+                                audio_seed: None,
+                                hash_hex: format!("purge-{i}"),
+                                abs_path: path,
+                                origin: None,
+                                exif: None,
+                            }),
+                            repo: None,
+                            repo_is_main: false,
+                        },
+                        right: board::SideBody::default(),
+                    }
+                })
+                .collect();
         }
-        h.run();
-        h.run();
+        for _ in 0..40 {
+            h.step();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
         let img = h.render().expect("wgpu render failed");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
         std::fs::create_dir_all(&dir).expect("screenshot dir");

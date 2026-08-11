@@ -6378,7 +6378,99 @@ mod ui_tests {
     #[test]
     #[ignore = "generates a doc screenshot (needs wgpu)"]
     fn doc_screenshot_diff_board() {
-        let mut h = diff_harness();
+        // A fully live DIFF: real repos, really scanned, so every row carries
+        // real facts — image thumbnails, text heads and byte views under the
+        // status veils, including a genuine WAS DELETED tombstone row.
+        let tmp = tempfile::tempdir().unwrap();
+        dedup_core::thumbnail::set_cache_dir(tmp.path().join("thumbs"));
+        let store = Store::open_at(tmp.path().join("cfg")).unwrap();
+        let src = tmp.path().join("source");
+        let dst = tmp.path().join("target");
+        std::fs::create_dir_all(src.join("a/b")).unwrap();
+        std::fs::create_dir_all(dst.join("a/b")).unwrap();
+        let jpg = |hue: u8| -> Vec<u8> {
+            // A real JPEG (RGB) — the decoder picks its format from the file
+            // extension, so the bytes must match the name.
+            let im = image::RgbImage::from_fn(64, 48, |x, y| {
+                image::Rgb([hue.saturating_add(x as u8 * 2), 70 + y as u8 * 3, 170])
+            });
+            let mut buf = Vec::new();
+            image::DynamicImage::ImageRgb8(im)
+                .write_to(
+                    &mut std::io::Cursor::new(&mut buf),
+                    image::ImageFormat::Jpeg,
+                )
+                .unwrap();
+            buf
+        };
+        // Renamed: identical photo under two names.
+        std::fs::write(src.join("a/b/holiday_v2.jpg"), jpg(90)).unwrap();
+        std::fs::write(dst.join("a/b/holiday.jpg"), jpg(90)).unwrap();
+        // Only-left text, only-right opaque blob.
+        std::fs::write(
+            src.join("notes.txt"),
+            "Inheritance triage
+
+- scan the NAS
+- keep originals",
+        )
+        .unwrap();
+        let blob: Vec<u8> = (0..4096u32).map(|i| (i % 5 * 53) as u8).collect();
+        std::fs::write(dst.join("exports.db"), &blob).unwrap();
+        // Tombstone: the target once held this and deleted it.
+        std::fs::write(src.join("was_deleted.txt"), b"resurrect-me?").unwrap();
+        std::fs::write(dst.join("was_deleted.txt"), b"resurrect-me?").unwrap();
+        store.create_repo("source", &src.to_string_lossy()).unwrap();
+        store.create_repo("target", &dst.to_string_lossy()).unwrap();
+        let scan = |repo: &str| {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        };
+        scan("source");
+        scan("target");
+        std::fs::remove_file(dst.join("was_deleted.txt")).unwrap();
+        scan("target");
+        let store = Arc::new(store);
+        let mut view = TransferView::new();
+        view.loaded = true;
+        view.repos = vec!["source".to_string(), "target".to_string()];
+        view.source = Some("source".to_string());
+        view.target = Some("target".to_string());
+        view.command = Command::Diff;
+        // Unlocked, so the full command vocabulary shows.
+        view.locks.toggle("source");
+        view.locks.toggle("target");
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1120.0, 1250.0))
+            .wgpu()
+            .build_ui_state(
+                move |ui, view: &mut TransferView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), None);
+                },
+                view,
+            );
+        h.run();
+        h.get_by_label("REVIEW").click_accesskit();
+        settle_preview(&mut h);
+        // Extra frames so the row previews (thumbnails, text heads, byte
+        // views) land before the render.
+        for _ in 0..40 {
+            h.step();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../docs/screenshots/transfer_diff_board.png");
         let img = h.render().expect("wgpu render failed");
@@ -6445,6 +6537,43 @@ mod ui_tests {
     #[ignore = "generates a doc screenshot (needs wgpu)"]
     fn doc_screenshot_transfer_review_board() {
         let mut h = review_harness();
+        // Real files behind the rows, so every cell shows a live preview —
+        // an image thumbnail under the green NEW veil, a byte view under the
+        // red WILL DELETE veil, a text head on the unchanged row.
+        let dir = tempfile::tempdir().unwrap();
+        dedup_core::thumbnail::set_cache_dir(dir.path().join("thumbs"));
+        let facts = |name: &str, mime: &str, bytes: &[u8]| -> FileFacts {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            FileFacts {
+                size: bytes.len() as u64,
+                modified_ms: 1_700_000_000_000,
+                missing: false,
+                mime: Some(mime.to_string()),
+                img_size: None,
+                audio_ms: None,
+                audio_seed: None,
+                hash_hex: format!("doc-{name}"),
+                abs_path: path,
+                origin: None,
+                exif: None,
+            }
+        };
+        let mut png = Vec::new();
+        {
+            // Real JPEG bytes under the .jpg name — the decoder trusts the
+            // extension.
+            let im = image::RgbImage::from_fn(64, 48, |x, y| {
+                image::Rgb([120 + (x as u8), 80 + (y as u8 * 2), 190])
+            });
+            image::DynamicImage::ImageRgb8(im)
+                .write_to(
+                    &mut std::io::Cursor::new(&mut png),
+                    image::ImageFormat::Jpeg,
+                )
+                .unwrap();
+        }
+        let tmp_bytes: Vec<u8> = (0..4096u32).map(|i| (i % 7 * 37) as u8).collect();
         // Seed one of each status and reveal unchanged, so the PNG shows the full
         // side-by-side vocabulary (added / removed / unchanged / absent).
         {
@@ -6454,19 +6583,38 @@ mod ui_tests {
             v.preview_total = 3;
             let (metas, bodies): (Vec<_>, Vec<_>) = [
                 board_row(
-                    SideSpec::at(board::Status::Same, "holiday.jpg", None),
+                    SideSpec::at(
+                        board::Status::Same,
+                        "holiday.jpg",
+                        Some(facts("holiday.jpg", "image/png", &png)),
+                    ),
                     SideSpec::at(board::Status::OnlyHere, "holiday.jpg", None),
                     false,
                     planned_cmds(),
                 ),
                 board_row(
-                    SideSpec::at(board::Status::WillDelete, "old.tmp", None),
+                    SideSpec::at(
+                        board::Status::WillDelete,
+                        "old.tmp",
+                        Some(facts("old.tmp", "application/octet-stream", &tmp_bytes)),
+                    ),
                     SideSpec::absent(),
                     false,
                     planned_cmds(),
                 ),
                 board_row(
-                    SideSpec::at(board::Status::Same, "notes.txt", None),
+                    SideSpec::at(
+                        board::Status::Same,
+                        "notes.txt",
+                        Some(facts(
+                            "notes.txt",
+                            "text/plain",
+                            b"Inheritance triage
+
+- scan the NAS
+- keep originals",
+                        )),
+                    ),
                     SideSpec::at(board::Status::Same, "notes.txt", None),
                     true,
                     planned_cmds(),
@@ -6477,8 +6625,10 @@ mod ui_tests {
             v.preview = metas;
             v.preview_bodies = bodies;
         }
-        h.run();
-        h.run();
+        for _ in 0..40 {
+            h.step();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
         std::fs::create_dir_all(&dir).expect("screenshot dir");
         let out = dir.join("transfer_review_board.png");

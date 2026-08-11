@@ -100,7 +100,7 @@ unlocking for deletion should be a fresh, conscious choice each session.
 Every preview and reconcile view renders on one shared board, so it reads the same wherever it
 appears.
 
-![A PURGE preview on the review board](../screenshots/groom_purge_board.png)
+![The review board: previews, status veils and the command column](../screenshots/board.png)
 
 - **Three regions.** A mini-overview of the left-hand file, a centre column of commands, and —
   when there is one — the right-hand file. The left and right stay pinned to the window edges.
@@ -120,6 +120,8 @@ appears.
   one-way: press REVIEW again to start over.
 - **Sorting** is the bar above the board — which side to read, then the key (path, size, date
   or status), then the direction. Large previews scroll rather than paging.
+
+![A PURGE preview on the review board](../screenshots/groom_purge_board.png)
 
 ## Document formats read as text
 
