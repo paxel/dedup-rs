@@ -1310,13 +1310,20 @@ impl DiffCompare {
     /// Whether flicker can engage on the current tab: both sides hold the
     /// full-pane visual that flicker swaps. For images (and audio, whose pane
     /// is its spectrogram) that is the decoded texture; on the Video tab it is
-    /// the two frames decoded at the shared playhead — so flicker offers
-    /// itself as soon as a moment has been picked on the filmstrip.
+    /// the two frames decoded at the shared playhead; on the Render tab it is
+    /// each side's rasterized **current page** — flicker swaps the pages the
+    /// user has lined up, so a subtle layout change jumps out.
     fn flicker_ready(&self) -> bool {
         match self.tab {
             RepresentationKind::Video => {
                 self.video[0].scrub_tex.is_some() && self.video[1].scrub_tex.is_some()
             }
+            RepresentationKind::Render => (0..2).all(|slot| {
+                matches!(
+                    self.render_cache.get(&(slot, self.render_page[slot])),
+                    Some(Some(_))
+                )
+            }),
             _ => self.compare_ready(),
         }
     }
@@ -2329,6 +2336,7 @@ impl DiffCompare {
                 RepresentationKind::Image
                     | RepresentationKind::Spectrum
                     | RepresentationKind::Video
+                    | RepresentationKind::Render
             )
         {
             if self.compare.flicker {
@@ -2408,16 +2416,17 @@ impl DiffCompare {
                 let has_b = self.has_b();
                 let tab_is_image = self.tab == RepresentationKind::Image;
                 let tab_is_audio = self.tab == RepresentationKind::Audio;
-                // Flicker is a media-only mode (image/audio/video); its controls
-                // and single-file chrome must never appear on the Text/hex tab.
-                // Flicker/zoom surfaces. Audio is deliberately absent: its tab
-                // is the listening transport (waveform + seek), and its visual
-                // comparison lives on the Spectrum tab.
+                // Flicker is a visual-compare mode (image/spectrum/video, and
+                // rendered pages); its controls and single-file chrome must
+                // never appear on the Text/hex tab. Audio is deliberately
+                // absent: its tab is the listening transport (waveform +
+                // seek), and its visual comparison lives on the Spectrum tab.
                 let tab_is_media = matches!(
                     self.tab,
                     RepresentationKind::Image
                         | RepresentationKind::Spectrum
                         | RepresentationKind::Video
+                        | RepresentationKind::Render
                 );
                 let speed_label = {
                     let s = format!("{:.2}", self.rate);
@@ -3070,7 +3079,18 @@ impl DiffCompare {
                         egui::pos2(viewport.min.x, controls.max.y + 4.0),
                         viewport.max,
                     );
-                    if two_sided_now {
+                    let render_flicker = self.compare.flicker && two_sided_now;
+                    if render_flicker {
+                        // Flicker: the shown side's current page fills the
+                        // whole pane, its advancer full-width above; Space
+                        // swaps to the other side's current page in place, so
+                        // a subtle layout change jumps out.
+                        let slot = usize::from(self.compare.show_b);
+                        self.render_advancer(ui, controls, slot);
+                        self.ensure_render(&ctx, 0);
+                        self.ensure_render(&ctx, 1);
+                        self.draw_render_page(ui, panes, slot);
+                    } else if two_sided_now {
                         let (left_ctrl, right_ctrl) = compare_split(controls);
                         self.render_advancer(ui, left_ctrl, 0);
                         self.render_advancer(ui, right_ctrl, 1);
@@ -4863,6 +4883,37 @@ mod tests {
         assert!(
             cmp.flicker_ready(),
             "both frames at the playhead — flicker can engage"
+        );
+    }
+
+    /// Render flicker readiness: it engages only once **both** sides' current
+    /// pages are rasterized — and follows the pages each advancer stands on,
+    /// so what flickers is exactly what the user lined up.
+    #[test]
+    fn render_flicker_waits_for_both_current_pages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cmp = DiffCompare::new(
+            pdf_side(tmp.path(), "a.pdf", (0.9, 0.2, 0.2)),
+            pdf_side(tmp.path(), "b.pdf", (0.2, 0.2, 0.9)),
+        );
+        cmp.tab = RepresentationKind::Render;
+        assert!(
+            !cmp.flicker_ready(),
+            "no page rendered yet — nothing to swap"
+        );
+        let ctx = Context::default();
+        let img = ColorImage::new([4, 4], vec![egui::Color32::BLACK; 16]);
+        let tex = |n: &str| Some(ctx.load_texture(n, img.clone(), TextureOptions::LINEAR));
+        cmp.render_cache.insert((0, 0), tex("p0"));
+        assert!(!cmp.flicker_ready(), "one page is not a comparison");
+        cmp.render_cache.insert((1, 0), tex("p1"));
+        assert!(cmp.flicker_ready(), "both current pages ready — flicker on");
+        // Advance one side to a page not yet rendered: flicker must wait for
+        // the page actually shown, not any cached predecessor.
+        cmp.render_page[1] = 3;
+        assert!(
+            !cmp.flicker_ready(),
+            "the advanced side's current page is not rendered yet"
         );
     }
 
