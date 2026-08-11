@@ -46,6 +46,8 @@ size, reclaimable bytes) and one card per file:
 - **from `<repo>`** — if this file's provenance is known (it was copied/synced in from
   another repo).
 - Audio files get inline **PLAY/PAUSE** + a seek bar (see [Audio preview](#audio-preview)).
+- Text files preview their **first lines** right on the card — two copies of a note or a
+  config read apart at a glance, without opening either.
 - The best copy is starred **BEST**.
 - **KEEP / DELETE** toggles this copy's mark. Nothing is deleted until you press DELETE
   MARKED (or DELETE NOW under Quick Delete).

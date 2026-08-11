@@ -94,6 +94,12 @@ impl FileFacts {
             .is_some_and(dedup_core::fingerprint::is_audio_mime)
     }
 
+    /// Plain readable text (`text/*`) — the kind whose card preview shows its
+    /// first lines.
+    pub fn is_textual(&self) -> bool {
+        self.mime.as_deref().is_some_and(|m| m.starts_with("text/"))
+    }
+
     /// A browsable container (zip/tar/tar.gz), detected by name or MIME.
     pub fn is_archive(&self) -> bool {
         let name = self
@@ -253,6 +259,53 @@ pub fn media_cell(
         return Some(resp);
     }
 
+    // Text files: the first lines of the file, drawn as a tiny page — far more
+    // telling than a mime badge when the duplicates are notes, configs or code.
+    // The head is read on the thumbnail worker pool and cached (`None` until it
+    // lands), so the paint path never touches the disk — a hung network mount
+    // cannot stall a frame.
+    if facts.is_textual() {
+        let thumb_rect = egui::Rect::from_min_size(ui.next_widget_position(), egui::vec2(w, h));
+        if ui.is_rect_visible(thumb_rect)
+            && let Some(head) = thumbs.get_text_head(&facts.hash_hex, facts.abs_path.as_path())
+        {
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 6.0, theme::panel());
+            painter.rect_stroke(
+                rect,
+                6.0,
+                egui::Stroke::new(1.0, theme::hairline()),
+                egui::StrokeKind::Inside,
+            );
+            let font = egui::FontId::monospace(9.0);
+            let line_h = 11.0;
+            let pad = 7.0;
+            let mut y = rect.min.y + pad;
+            for line in head.lines() {
+                if y + line_h > rect.max.y - pad {
+                    break;
+                }
+                painter.text(
+                    egui::pos2(rect.min.x + pad, y),
+                    egui::Align2::LEFT_TOP,
+                    line,
+                    font.clone(),
+                    theme::text(),
+                );
+                y += line_h;
+            }
+            // A small row cell fits only a corner of the head; hovering it
+            // shows the whole preview at a readable size.
+            let resp = if h < 60.0 {
+                resp.on_hover_text(RichText::new(&head).monospace().size(11.0))
+            } else {
+                resp
+            };
+            return Some(resp);
+        }
+    }
+
     // Placeholder for non-media or not-yet-ready thumbnails.
     let label = facts.mime.clone().unwrap_or_else(|| "file".into());
     egui::Frame::new()
@@ -335,6 +388,53 @@ mod tests {
         assert!(facts("audio/mpeg").is_audio());
         let txt = facts("text/plain");
         assert!(!txt.is_image() && !txt.is_video() && !txt.is_audio());
+        assert!(txt.is_textual() && facts("text/markdown").is_textual());
+        assert!(!facts("application/pdf").is_textual());
+    }
+
+    /// A text file's card cell becomes a clickable first-lines preview once the
+    /// background head-read lands; until then it stays the plain placeholder
+    /// (which returns `None`) — the paint path never reads the file itself.
+    #[test]
+    fn text_card_previews_first_lines_once_loaded() {
+        struct State {
+            thumbs: ThumbCache,
+            facts: FileFacts,
+            clickable: bool,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recipe.txt");
+        std::fs::write(&path, "Fritata\n\n1. eggs\n2. pan\n").unwrap();
+        let mut f = facts("text/plain");
+        f.abs_path = path;
+        let state = State {
+            thumbs: ThumbCache::new(1),
+            facts: f,
+            clickable: false,
+        };
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(400.0, 300.0))
+            .build_ui_state(
+                move |ui, state: &mut State| {
+                    state.thumbs.poll(&ui.ctx().clone());
+                    let resp = media_cell(ui, &mut state.thumbs, &state.facts, MediaStyle::card());
+                    state.clickable = resp.is_some();
+                },
+                state,
+            );
+        // (No "still placeholder" assertion after the first frame — the worker
+        // can win that race on a tiny local file, and that's fine.)
+        for _ in 0..100 {
+            harness.step();
+            if harness.state().clickable {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            harness.state().clickable,
+            "once the head-read lands the cell draws the preview and is clickable"
+        );
     }
 
     #[test]

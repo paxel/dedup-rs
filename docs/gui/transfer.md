@@ -175,7 +175,8 @@ GROUP SYNC BACK *before* you push again.
 
 - **REVIEW** shows the first matching transfers (up to a limit) and a total count, without
   touching disk, on the shared [review board](index.md#the-review-board). Each side carries a
-  thumbnail (image, video still or audio fingerprint) and the file's size, dimensions or
+  thumbnail (image, video still, audio fingerprint, or a text file's first
+  lines — hover the small cell to read the whole preview) and the file's size, dimensions or
   duration, and date — the same info as a Duplicate card. Per row, **APPLY** runs just that
   transfer now and **HIDE** drops it from the board and from what RUN will do. REVIEW and RUN
   are mutually exclusive — starting a run clears the review and vice versa.

@@ -6380,13 +6380,17 @@ mod ui_tests {
     }
 
     /// Pump frames until the DIFF preview worker has delivered its result.
-    /// REVIEW plans off the UI thread now, so the click's own `run()` returns
+    /// REVIEW plans off the UI thread now, so the click's own frame returns
     /// before the rows arrive; the tiny test repos finish near-instantly.
+    /// `step()` rather than `run()`: freshly arrived rows kick off thumbnail /
+    /// text-head reads whose completion requests a repaint, which `run()`
+    /// would treat as "never settles".
     fn settle_preview(h: &mut Harness<'static, TransferView>) {
         for _ in 0..100 {
-            h.run();
+            h.step();
             if !h.state().previewing {
-                h.run();
+                h.step();
+                h.step();
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
