@@ -39,14 +39,15 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   pattern (identical content looks identical) with the **extension in big colour-coded
   letters** across the middle, the same hue for the same extension everywhere. All previews
   load in the background; the interface never waits on a disk.
-- **File state is painted on the preview itself.** A translucent veil with a bold word over
-  the card/row preview: red **WILL DELETE** on what a plan removes, amber **MISSING** when the
-  file is gone from disk, green **NEW** on content only one side has, and blue **WAS DELETED**
-  when the receiving repository once held exactly this content and deleted it — every
-  repository remembers what it deleted (until PRUNE), so a COPY/SYNC/DIFF/GROUP SYNC preview
-  warns before you silently resurrect a deletion (a plain COPY's engine even refuses to; that
-  refusal used to be invisible, now it's a blue row). A conflicting target path shows **the
-  occupying file itself** on the other side of the row — you judge by looking at both files.
+- **File state is painted on the preview — and a cell only talks about itself.** If a side
+  has a file, its cell shows that file's preview, veiled only with its *own* state: red
+  **WILL DELETE** on a file a plan removes, amber **MISSING** when it is gone from disk. The
+  side a file will *arrive* at shows the incoming file's preview under green **NEW**; a side
+  that once held exactly this content and deleted it shows a blue **WAS DELETED** tombstone
+  cell — every repository remembers what it deleted (until PRUNE), so a COPY/SYNC/DIFF/GROUP
+  SYNC preview warns before you silently resurrect a deletion (a plain COPY's engine even
+  refuses to; that refusal used to be invisible, now it's a visible row). A conflicting
+  target path shows **the occupying file itself** — you judge by looking at both files.
 - **Bigger review previews.** Review-board rows grew their preview cell (48 → 64 px) with more
   breathing room, so text and image previews on the board are actually readable.
 - **Transfer** tab: copy, move or sync files between repos or into a dated folder, filtered by MIME/name/size; **GROUP SYNC** pushes a backup group's main to some or all of its sinks (each in its own ADD ONLY/MIRROR mode) when the source is a group's main; plus **DIFF**, a per-row side-by-side reconcile of two repositories.

@@ -238,6 +238,10 @@ struct SideSpec {
     /// Only set when the board's side spans several repos (GROUP SYNC's sinks),
     /// where each row names its own.
     repo: Option<String>,
+    /// This side's own status veil (the golden rule: a cell only talks about
+    /// itself) — green NEW where a file arrives, red WILL DELETE on the file a
+    /// plan removes, blue WAS DELETED where this side deleted the content.
+    overlay: Option<crate::media_cell::CellOverlay>,
 }
 
 impl SideSpec {
@@ -250,11 +254,27 @@ impl SideSpec {
             path: Some(path.to_string()),
             facts,
             repo: None,
+            overlay: None,
         }
     }
     fn in_repo(mut self, repo: &str) -> Self {
         self.repo = Some(repo.to_string());
         self
+    }
+    fn veiled(mut self, overlay: crate::media_cell::CellOverlay) -> Self {
+        self.overlay = Some(overlay);
+        self
+    }
+    /// A tombstone side: no file, no path — just the blue "this side deleted
+    /// exactly this content" cell.
+    fn tombstone() -> Self {
+        Self {
+            status: Some(board::Status::Resurrect),
+            path: None,
+            facts: None,
+            repo: None,
+            overlay: Some(crate::media_cell::CellOverlay::WasDeleted),
+        }
     }
 }
 
@@ -293,11 +313,13 @@ fn board_row(
             facts: left.facts,
             repo: left.repo,
             repo_is_main: false,
+            overlay: left.overlay,
         },
         right: board::SideBody {
             facts: right.facts,
             repo: right.repo,
             repo_is_main: false,
+            overlay: right.overlay,
         },
     };
     (meta, body)
@@ -378,26 +400,28 @@ fn diff_metas(rows: &[RepoDiffRow], left_ro: bool, right_ro: bool) -> Vec<board:
             };
             let (left_status, right_status, mut cmds) = match row.relation {
                 R::Equal => (Status::Same, Status::Same, Vec::new()),
-                // An only-on-one-side file whose content the *other* repo once
-                // held and deleted is a resurrection candidate, not merely
-                // "new" — blue, with the WAS DELETED veil on its preview, so
-                // copying it across is an informed decision.
+                // The golden rule: the holder's cell shows its file plain (its
+                // green path already says "only here"). When the *other* repo
+                // once held this content and deleted it, that side — not the
+                // living file — is marked Resurrect: it renders a blue
+                // WAS DELETED tombstone cell, and copying across becomes an
+                // informed decision.
                 R::OnlyLeft => (
+                    Status::OnlyHere,
                     if row.deleted_in_right {
                         Status::Resurrect
                     } else {
-                        Status::OnlyHere
+                        Status::Absent
                     },
-                    Status::Absent,
                     vec![Cmd::CopyRight, Cmd::DeleteLeft],
                 ),
                 R::OnlyRight => (
-                    Status::Absent,
                     if row.deleted_in_left {
                         Status::Resurrect
                     } else {
-                        Status::OnlyHere
+                        Status::Absent
                     },
+                    Status::OnlyHere,
                     vec![Cmd::CopyLeft, Cmd::DeleteRight],
                 ),
                 R::Renamed => {
@@ -625,21 +649,22 @@ fn build_group_preview(
             added += 1;
             if rows.len() < PREVIEW_CAP {
                 // A push can also resurrect: content this sink deleted that
-                // the main still holds comes back. Blue veil, same vocabulary
-                // as everywhere else.
+                // the main still holds comes back. Golden rule: the main's
+                // cell stays plain (unchanged); the *sink's* cell shows the
+                // incoming preview — green NEW, or blue WAS DELETED when the
+                // push would bring back what this sink deleted.
                 let resurrect = copy_resurrects(main_db.as_deref(), sink_idx.as_ref(), rel);
-                let main_status = if resurrect {
-                    board::Status::Resurrect
+                let facts = facts_for(main_db.as_deref(), main_base.as_deref(), rel);
+                let (arrive_status, veil) = if resurrect {
+                    (board::Status::Resurrect, CO_WAS_DELETED)
                 } else {
-                    board::Status::Same
+                    (board::Status::OnlyHere, CO_NEW)
                 };
                 let (meta, body) = board_row(
-                    SideSpec::at(
-                        main_status,
-                        rel,
-                        facts_for(main_db.as_deref(), main_base.as_deref(), rel),
-                    ),
-                    SideSpec::at(board::Status::OnlyHere, rel, None).in_repo(&sink.repo),
+                    SideSpec::at(board::Status::Same, rel, facts.clone()),
+                    SideSpec::at(arrive_status, rel, facts)
+                        .in_repo(&sink.repo)
+                        .veiled(veil),
                     false,
                     Vec::new(),
                 );
@@ -657,7 +682,8 @@ fn build_group_preview(
                         rel,
                         facts_for(sink_db.as_deref(), sink_base.as_deref(), rel),
                     )
-                    .in_repo(&sink.repo),
+                    .in_repo(&sink.repo)
+                    .veiled(CO_WILL_DELETE),
                     false,
                     Vec::new(),
                 );
@@ -709,18 +735,19 @@ fn build_group_back_preview(
             }
         };
         if rows.len() < PREVIEW_CAP {
+            let sink_facts = facts_for(sink_db.as_deref(), sink_base.as_deref(), &item.rel_path);
+            let veil = match item.kind {
+                dedup_core::diff::PullKind::New => CO_NEW,
+                dedup_core::diff::PullKind::Resurrection => CO_WAS_DELETED,
+            };
             let (meta, body) = board_row(
-                // The main will gain the file; the sink is the source that holds it.
-                SideSpec::at(main_status, &item.rel_path, None),
-                // The sink side carries the same status: it is the side with
-                // the actual file (and preview), so the green NEW / blue
-                // WAS DELETED veil lands on something visible.
-                SideSpec::at(
-                    main_status,
-                    &item.rel_path,
-                    facts_for(sink_db.as_deref(), sink_base.as_deref(), &item.rel_path),
-                )
-                .in_repo(sink),
+                // Golden rule: the main *receives* — its cell shows the
+                // incoming file's preview under green NEW (or blue
+                // WAS DELETED for a resurrection: the main deleted this).
+                // The sink's own cell shows its file plain; nothing happens
+                // to the sink on a promote.
+                SideSpec::at(main_status, &item.rel_path, sink_facts.clone()).veiled(veil),
+                SideSpec::at(board::Status::Same, &item.rel_path, sink_facts).in_repo(sink),
                 false,
                 // Each row is a triage decision: `< COPY` pulls this one file
                 // into the main (the only way to opt a resurrection in, and a
@@ -781,6 +808,10 @@ fn copy_resurrects(
     dedup_core::store::content_tombstoned(idx, entry.size, &entry.hash)
 }
 
+const CO_NEW: crate::media_cell::CellOverlay = crate::media_cell::CellOverlay::New;
+const CO_WAS_DELETED: crate::media_cell::CellOverlay = crate::media_cell::CellOverlay::WasDeleted;
+const CO_WILL_DELETE: crate::media_cell::CellOverlay = crate::media_cell::CellOverlay::WillDelete;
+
 fn preview_sync(
     store: &Store,
     config: &RunConfig,
@@ -811,25 +842,24 @@ fn preview_sync(
         .take(PREVIEW_CAP)
         .map(|rel| {
             // SYNC copies by content the target *currently* lacks — including
-            // content it deliberately deleted. Such a copy silently undoes a
-            // deletion, so the row wears the blue WAS DELETED veil (it still
-            // runs — the veil informs, it does not block).
+            // content it deliberately deleted, which silently undoes a
+            // deletion. The golden rule: the source cell shows its file plain
+            // (nothing happens to it); the *receiving* cell shows the incoming
+            // file's preview under green NEW — or blue WAS DELETED when the
+            // copy resurrects (it still runs; the veil informs).
             let resurrect = copy_resurrects(src_db.as_deref(), tgt_idx.as_ref(), rel);
             if resurrect {
                 resurrections += 1;
             }
-            let src_status = if resurrect {
-                board::Status::Resurrect
+            let facts = facts_for(src_db.as_deref(), src_base.as_deref(), rel);
+            let (arrive_status, veil) = if resurrect {
+                (board::Status::Resurrect, CO_WAS_DELETED)
             } else {
-                board::Status::Same
+                (board::Status::OnlyHere, CO_NEW)
             };
             board_row(
-                SideSpec::at(
-                    src_status,
-                    rel,
-                    facts_for(src_db.as_deref(), src_base.as_deref(), rel),
-                ),
-                SideSpec::at(board::Status::OnlyHere, rel, None),
+                SideSpec::at(board::Status::Same, rel, facts.clone()),
+                SideSpec::at(arrive_status, rel, facts).veiled(veil),
                 false,
                 planned_cmds(),
             )
@@ -846,7 +876,8 @@ fn preview_sync(
                 board::Status::WillDelete,
                 rel,
                 facts_for(tgt_db.as_deref(), tgt_base.as_deref(), rel),
-            ),
+            )
+            .veiled(CO_WILL_DELETE),
             false,
             planned_cmds(),
         );
@@ -917,13 +948,17 @@ fn preview_repo(
                     } else {
                         format!("{subdir}/{rel_path}")
                     };
+                    let facts = facts_for(src_db.as_deref(), src_base.as_deref(), rel_path);
+                    // Golden rule: the receiving cell shows the incoming
+                    // file's preview under green NEW; a MOVE's source file
+                    // wears red WILL DELETE (its own fate — it leaves).
+                    let mut left = SideSpec::at(source_state, rel_path, facts.clone());
+                    if config.move_files {
+                        left = left.veiled(CO_WILL_DELETE);
+                    }
                     let (meta, body) = board_row(
-                        SideSpec::at(
-                            source_state,
-                            rel_path,
-                            facts_for(src_db.as_deref(), src_base.as_deref(), rel_path),
-                        ),
-                        SideSpec::at(board::Status::OnlyHere, &to, None),
+                        left,
+                        SideSpec::at(board::Status::OnlyHere, &to, facts).veiled(CO_NEW),
                         false,
                         planned_cmds(),
                     );
@@ -960,13 +995,16 @@ fn preview_repo(
             DiffItem::DeletedInReference { rel_path } => {
                 skipped_deleted += 1;
                 if rows.len() < PREVIEW_CAP {
+                    // Golden rule: the source file exists and nothing happens
+                    // to it — plain preview. The *target* side tells its own
+                    // story: a blue tombstone cell, no preview (no file).
                     let (meta, body) = board_row(
                         SideSpec::at(
-                            board::Status::Resurrect,
+                            board::Status::Same,
                             rel_path,
                             facts_for(src_db.as_deref(), src_base.as_deref(), rel_path),
                         ),
-                        SideSpec::absent(),
+                        SideSpec::tombstone(),
                         false,
                         vec![board::Cmd::Hide],
                     );
@@ -2812,16 +2850,32 @@ impl TransferView {
                     let row = &rows[i];
                     let side = |files: &[dedup_core::diff::DiffFile],
                                 db: Option<&redb::Database>,
-                                base: Option<&str>| {
+                                base: Option<&str>,
+                                deleted_here: bool| {
                         board::SideBody {
                             facts: files.first().and_then(|f| facts_for(db, base, &f.rel_path)),
                             repo: None,
                             repo_is_main: false,
+                            // Golden rule: a side with no file but a tombstone
+                            // for this content tells its own story — a blue
+                            // WAS DELETED cell. The living file stays plain.
+                            overlay: (files.is_empty() && deleted_here)
+                                .then_some(crate::media_cell::CellOverlay::WasDeleted),
                         }
                     };
                     board::RowBody {
-                        left: side(&row.left, ldb.as_deref(), lbase.as_deref()),
-                        right: side(&row.right, rdb.as_deref(), rbase.as_deref()),
+                        left: side(
+                            &row.left,
+                            ldb.as_deref(),
+                            lbase.as_deref(),
+                            row.deleted_in_left,
+                        ),
+                        right: side(
+                            &row.right,
+                            rdb.as_deref(),
+                            rbase.as_deref(),
+                            row.deleted_in_right,
+                        ),
                     }
                 },
             );
@@ -4500,6 +4554,31 @@ mod ui_tests {
                 right_rel: Some("r.jpg".into()),
             }),
             "an only-right row opens the right file alone"
+        );
+    }
+
+    /// The golden rule in DIFF: the living file's side stays plain
+    /// (`OnlyHere`); the side that deleted this content wears `Resurrect` —
+    /// it renders as the blue WAS DELETED tombstone cell, never as a veil
+    /// over the surviving copy.
+    #[test]
+    fn tombstones_mark_the_side_that_deleted_not_the_survivor() {
+        let mut row = drow(DiffRelation::OnlyLeft, vec![dfile("a.txt", 1, 0)], vec![]);
+        row.deleted_in_right = true;
+        let metas = diff_metas(&[row], false, false);
+        assert_eq!(
+            metas[0].left_status,
+            board::Status::OnlyHere,
+            "the living file is not the one with a story"
+        );
+        assert_eq!(
+            metas[0].right_status,
+            board::Status::Resurrect,
+            "the side that deleted the content carries the state"
+        );
+        assert!(
+            metas[0].is_resurrection(),
+            "and the RESURRECTIONS ONLY filter still catches the row"
         );
     }
 
@@ -6581,41 +6660,40 @@ mod ui_tests {
             v.preview_board.show_unchanged = true;
             v.preview_totals = [1, 1, 0, 1];
             v.preview_total = 3;
+            let holiday = facts("holiday.jpg", "image/png", &png);
+            let notes = facts(
+                "notes.txt",
+                "text/plain",
+                b"Inheritance triage
+
+- scan the NAS
+- keep originals",
+            );
             let (metas, bodies): (Vec<_>, Vec<_>) = [
+                // A planned copy: source plain, the incoming file green on
+                // the receiving side (the golden rule).
                 board_row(
-                    SideSpec::at(
-                        board::Status::Same,
-                        "holiday.jpg",
-                        Some(facts("holiday.jpg", "image/png", &png)),
-                    ),
-                    SideSpec::at(board::Status::OnlyHere, "holiday.jpg", None),
+                    SideSpec::at(board::Status::Same, "holiday.jpg", Some(holiday.clone())),
+                    SideSpec::at(board::Status::OnlyHere, "holiday.jpg", Some(holiday))
+                        .veiled(crate::media_cell::CellOverlay::New),
                     false,
                     planned_cmds(),
                 ),
+                // A sync deletion: the doomed target file wears its own fate.
                 board_row(
+                    SideSpec::absent(),
                     SideSpec::at(
                         board::Status::WillDelete,
                         "old.tmp",
                         Some(facts("old.tmp", "application/octet-stream", &tmp_bytes)),
-                    ),
-                    SideSpec::absent(),
+                    )
+                    .veiled(crate::media_cell::CellOverlay::WillDelete),
                     false,
                     planned_cmds(),
                 ),
                 board_row(
-                    SideSpec::at(
-                        board::Status::Same,
-                        "notes.txt",
-                        Some(facts(
-                            "notes.txt",
-                            "text/plain",
-                            b"Inheritance triage
-
-- scan the NAS
-- keep originals",
-                        )),
-                    ),
-                    SideSpec::at(board::Status::Same, "notes.txt", None),
+                    SideSpec::at(board::Status::Same, "notes.txt", Some(notes.clone())),
+                    SideSpec::at(board::Status::Same, "notes.txt", Some(notes)),
                     true,
                     planned_cmds(),
                 ),

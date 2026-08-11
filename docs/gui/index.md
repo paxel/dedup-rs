@@ -109,10 +109,13 @@ appears.
   `COPY >` sits beside `< COPY` and `DELETE L` beside `DELETE R`. Commands that act on the row
   as a whole — `COMPARE`, `APPLY`, `HIDE` — are centred. Only the commands that apply to a row
   are drawn, and a row is as tall as its content needs.
-- **State is painted on the preview.** Each row's thumbnail wears its status as a veil with
-  a bold word: red **WILL DELETE**, amber **MISSING**, green **NEW**, blue **WAS DELETED**
-  (the other repository once held exactly this content and deleted it — copying it would
-  resurrect that deletion). Conflicts show the occupying file itself on the other side.
+- **A cell only ever talks about itself.** If a side has a file, its cell shows that file's
+  preview — always — veiled only with the side's *own* state: red **WILL DELETE** on a file a
+  plan removes, amber **MISSING** when it is gone from disk. The side a file will *arrive* at
+  shows the incoming file's preview under green **NEW**; a side that once held exactly this
+  content and deleted it shows a blue **WAS DELETED** tombstone cell (no file, no preview) —
+  copying across would resurrect that deletion. Conflicts show the occupying file itself.
+  Rows where neither side has a living file don't appear at all.
 - **Path colour says what will happen.** Grey means unchanged or equal on both sides, green
   exists only on this side (or will be added), red will be deleted, amber differs — the same
   path with different content, or the same content under a different name.

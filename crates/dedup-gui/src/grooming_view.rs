@@ -1445,6 +1445,8 @@ impl GroomingView {
                         let body = board::RowBody {
                             left: board::SideBody {
                                 facts,
+                                // Its own fate, painted on its own preview.
+                                overlay: Some(crate::media_cell::CellOverlay::WillDelete),
                                 ..Default::default()
                             },
                             right: board::SideBody::default(),
@@ -1511,10 +1513,17 @@ impl GroomingView {
                         };
                         let body = board::RowBody {
                             left: board::SideBody {
-                                facts,
+                                facts: facts.clone(),
+                                overlay: Some(crate::media_cell::CellOverlay::WillDelete),
                                 ..Default::default()
                             },
-                            right: board::SideBody::default(),
+                            // Golden rule: the arriving side shows the file
+                            // that will be there — the same file, new path.
+                            right: board::SideBody {
+                                facts,
+                                overlay: Some(crate::media_cell::CellOverlay::New),
+                                ..Default::default()
+                            },
                         };
                         (meta, body)
                     })
@@ -2400,6 +2409,7 @@ mod ui_tests {
                             }),
                             repo: None,
                             repo_is_main: false,
+                            overlay: Some(crate::media_cell::CellOverlay::WillDelete),
                         },
                         right: board::SideBody::default(),
                     }

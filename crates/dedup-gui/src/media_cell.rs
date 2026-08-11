@@ -463,6 +463,17 @@ pub fn media_cell(
     None
 }
 
+/// A bare status cell for a side with **no file**: the veil and word alone in
+/// the thumbnail slot (a tombstone — "this content was deleted here"). No
+/// preview, per the golden rule: no file, no preview.
+pub fn paint_overlay_cell(painter: &egui::Painter, rect: egui::Rect, overlay: Option<CellOverlay>) {
+    if overlay.is_none() {
+        return;
+    }
+    painter.rect_filled(rect, 6.0, theme::panel());
+    paint_overlay(painter, rect, overlay, false);
+}
+
 /// The status veil: a translucent wash of the status colour over the whole
 /// cell with the state word big and unmissable across the middle — visible from
 /// across the room, exactly because it sits on top of the file's own preview.

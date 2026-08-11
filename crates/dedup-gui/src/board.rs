@@ -383,6 +383,13 @@ pub struct SideBody {
     pub repo: Option<String>,
     /// Whether that repo is a sync-group main, for its chip badge.
     pub repo_is_main: bool,
+    /// The status veil for **this side's own cell** — the golden rule: a cell
+    /// shows its file's preview and may only ever talk about itself. Green NEW
+    /// on the side a file will *arrive* at (with the incoming preview), red
+    /// WILL DELETE on the file a plan removes, blue WAS DELETED on the side
+    /// that deleted this content (a bare tombstone cell when nothing arrives).
+    /// A missing file veils itself amber regardless.
+    pub overlay: Option<crate::media_cell::CellOverlay>,
 }
 
 /// Both sides' renderable content for one row.
@@ -899,7 +906,25 @@ fn cmd_button(ui: &mut egui::Ui, at: egui::Rect, cmd: Cmd, hide_skips_run: bool)
 /// side renders nothing but still claims its rect, so the centre column stays
 /// put.
 fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view: SideView) {
-    if view.status == Status::Absent || view.paths.is_empty() {
+    // A side with no file and no story stays empty. A side with no file but a
+    // story about itself (it deleted this content) draws a bare tombstone
+    // cell below.
+    if view.paths.is_empty() && view.body.overlay.is_none() {
+        return;
+    }
+    if view.status == Status::Absent && view.body.overlay.is_none() {
+        return;
+    }
+    if view.paths.is_empty() {
+        // Tombstone: no file, no preview (the golden rule), just the state —
+        // a veiled empty cell in the thumbnail slot.
+        let mut cell = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(Layout::left_to_right(Align::Min)),
+        );
+        let (r, _) = cell.allocate_exact_size(egui::vec2(THUMB, THUMB), egui::Sense::hover());
+        crate::media_cell::paint_overlay_cell(cell.painter(), r, view.body.overlay);
         return;
     }
     let mut cell = ui.new_child(
@@ -910,22 +935,14 @@ fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view:
     let cell = &mut cell;
     let mut text_width = rect.width();
     if let Some(f) = &view.body.facts {
-        // The cell wears its row's status: red WILL DELETE over what a plan
-        // removes, blue WAS DELETED over a resurrection candidate, green NEW
-        // over content only this side has — the state is visible on the
-        // preview itself, not only in the path colour. (A missing file veils
-        // itself amber MISSING inside `media_cell`, overriding these.)
-        let overlay = match view.status {
-            Status::WillDelete => Some(crate::media_cell::CellOverlay::WillDelete),
-            Status::Resurrect => Some(crate::media_cell::CellOverlay::WasDeleted),
-            Status::OnlyHere => Some(crate::media_cell::CellOverlay::New),
-            _ => None,
-        };
+        // The golden rule: this cell shows this side's preview, veiled only
+        // with **its own** state — the row builders decide that per side (a
+        // missing file veils itself amber inside `media_cell` regardless).
         let _ = media_cell(
             cell,
             thumbs,
             f,
-            MediaStyle::row(THUMB).with_overlay(overlay),
+            MediaStyle::row(THUMB).with_overlay(view.body.overlay),
         );
         text_width -= THUMB + cell.spacing().item_spacing.x;
     }
@@ -2139,6 +2156,7 @@ mod tests {
                                 facts: None,
                                 repo: Some(bodies[i].1.to_string()),
                                 repo_is_main: false,
+                                overlay: None,
                             },
                         },
                     );
@@ -2291,6 +2309,7 @@ mod tests {
             facts: Some(f),
             repo: None,
             repo_is_main: false,
+            overlay: None,
         };
         vec![
             // renamed pair: the same photo under two names.
