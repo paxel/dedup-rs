@@ -378,14 +378,26 @@ fn diff_metas(rows: &[RepoDiffRow], left_ro: bool, right_ro: bool) -> Vec<board:
             };
             let (left_status, right_status, mut cmds) = match row.relation {
                 R::Equal => (Status::Same, Status::Same, Vec::new()),
+                // An only-on-one-side file whose content the *other* repo once
+                // held and deleted is a resurrection candidate, not merely
+                // "new" — blue, with the WAS DELETED veil on its preview, so
+                // copying it across is an informed decision.
                 R::OnlyLeft => (
-                    Status::OnlyHere,
+                    if row.deleted_in_right {
+                        Status::Resurrect
+                    } else {
+                        Status::OnlyHere
+                    },
                     Status::Absent,
                     vec![Cmd::CopyRight, Cmd::DeleteLeft],
                 ),
                 R::OnlyRight => (
                     Status::Absent,
-                    Status::OnlyHere,
+                    if row.deleted_in_left {
+                        Status::Resurrect
+                    } else {
+                        Status::OnlyHere
+                    },
                     vec![Cmd::CopyLeft, Cmd::DeleteRight],
                 ),
                 R::Renamed => {
@@ -601,6 +613,7 @@ fn build_group_preview(
         }
         // Deletions carry the sink's file, so their facts come from the sink index.
         let (sink_db, sink_base) = open_facts(store, &sink.repo);
+        let sink_idx = content_idx(sink_db.as_deref());
         // The sink rides in the row's own repo chip rather than being folded
         // into the path — `format!("{sink}: {rel}")` made sorting by path sort
         // by sink name, and a rel-path containing ": " was ambiguous.
@@ -611,9 +624,18 @@ fn build_group_preview(
         for rel in &plan.copies {
             added += 1;
             if rows.len() < PREVIEW_CAP {
+                // A push can also resurrect: content this sink deleted that
+                // the main still holds comes back. Blue veil, same vocabulary
+                // as everywhere else.
+                let resurrect = copy_resurrects(main_db.as_deref(), sink_idx.as_ref(), rel);
+                let main_status = if resurrect {
+                    board::Status::Resurrect
+                } else {
+                    board::Status::Same
+                };
                 let (meta, body) = board_row(
                     SideSpec::at(
-                        board::Status::Same,
+                        main_status,
                         rel,
                         facts_for(main_db.as_deref(), main_base.as_deref(), rel),
                     ),
@@ -690,8 +712,11 @@ fn build_group_back_preview(
             let (meta, body) = board_row(
                 // The main will gain the file; the sink is the source that holds it.
                 SideSpec::at(main_status, &item.rel_path, None),
+                // The sink side carries the same status: it is the side with
+                // the actual file (and preview), so the green NEW / blue
+                // WAS DELETED veil lands on something visible.
                 SideSpec::at(
-                    board::Status::Same,
+                    main_status,
                     &item.rel_path,
                     facts_for(sink_db.as_deref(), sink_base.as_deref(), &item.rel_path),
                 )
@@ -729,6 +754,33 @@ fn build_group_back_preview(
     })
 }
 
+/// The target's content index (for tombstone probes), read once per preview;
+/// `None` when the target repo can't be opened — everything then reads as
+/// "not a resurrection".
+type ContentIdx =
+    std::collections::HashMap<dedup_core::store::ContentKey, dedup_core::store::ContentState>;
+
+fn content_idx(db: Option<&redb::Database>) -> Option<ContentIdx> {
+    db.and_then(|db| dedup_core::store::read_content_index(db).ok())
+}
+
+/// Whether copying `rel` (a live source file) into the target would resurrect
+/// content the target once held and deleted — i.e. the target index knows the
+/// content only as tombstones. Best-effort: unreadable indexes read as "no".
+fn copy_resurrects(
+    src_db: Option<&redb::Database>,
+    tgt_idx: Option<&ContentIdx>,
+    rel: &str,
+) -> bool {
+    let (Some(src), Some(idx)) = (src_db, tgt_idx) else {
+        return false;
+    };
+    let Ok(Some(entry)) = dedup_core::store::get_entry(src, rel) else {
+        return false;
+    };
+    dedup_core::store::content_tombstoned(idx, entry.size, &entry.hash)
+}
+
 fn preview_sync(
     store: &Store,
     config: &RunConfig,
@@ -751,14 +803,29 @@ fn preview_sync(
     // A copy: source keeps the file (unchanged), target gains it (added). A
     // delete: the source no longer has it (absent), the target loses it
     // (removed). Capped.
+    let tgt_idx = content_idx(tgt_db.as_deref());
+    let mut resurrections = 0usize;
     let (mut rows, mut bodies): (Vec<_>, Vec<_>) = plan
         .copies
         .iter()
         .take(PREVIEW_CAP)
         .map(|rel| {
+            // SYNC copies by content the target *currently* lacks — including
+            // content it deliberately deleted. Such a copy silently undoes a
+            // deletion, so the row wears the blue WAS DELETED veil (it still
+            // runs — the veil informs, it does not block).
+            let resurrect = copy_resurrects(src_db.as_deref(), tgt_idx.as_ref(), rel);
+            if resurrect {
+                resurrections += 1;
+            }
+            let src_status = if resurrect {
+                board::Status::Resurrect
+            } else {
+                board::Status::Same
+            };
             board_row(
                 SideSpec::at(
-                    board::Status::Same,
+                    src_status,
                     rel,
                     facts_for(src_db.as_deref(), src_base.as_deref(), rel),
                 ),
@@ -787,7 +854,7 @@ fn preview_sync(
         bodies.push(body);
     }
     let verb = config.command.label();
-    let status = if delete == SyncDelete::None {
+    let mut status = if delete == SyncDelete::None {
         format!("{verb}: {} to copy.", plan.copies.len())
     } else {
         format!(
@@ -796,6 +863,11 @@ fn preview_sync(
             plan.deletes.len()
         )
     };
+    if resurrections > 0 {
+        status.push_str(&format!(
+            " {resurrections} would bring back content the target deleted (blue rows)."
+        ));
+    }
     Ok(ReviewPreviewData {
         rows,
         bodies,
@@ -832,6 +904,7 @@ fn preview_repo(
     let (tgt_db, tgt_base) = open_facts(store, target);
     let mut acted = 0usize;
     let mut unchanged = 0usize;
+    let mut skipped_deleted = 0usize;
     let mut rows: Vec<board::RowMeta> = Vec::new();
     let mut bodies: Vec<board::RowBody> = Vec::new();
     for item in &items {
@@ -879,7 +952,28 @@ fn preview_repo(
                     bodies.push(body);
                 }
             }
-            DiffItem::DeletedInReference { .. } => {}
+            // The copy engine refuses content the target once held and
+            // deleted (copying it would resurrect a deletion). That refusal
+            // used to be silent — the file simply never arrived. Now it is a
+            // visible blue row: the file's preview under a WAS DELETED veil,
+            // informational only (no APPLY — the engine will not copy it).
+            DiffItem::DeletedInReference { rel_path } => {
+                skipped_deleted += 1;
+                if rows.len() < PREVIEW_CAP {
+                    let (meta, body) = board_row(
+                        SideSpec::at(
+                            board::Status::Resurrect,
+                            rel_path,
+                            facts_for(src_db.as_deref(), src_base.as_deref(), rel_path),
+                        ),
+                        SideSpec::absent(),
+                        false,
+                        vec![board::Cmd::Hide],
+                    );
+                    rows.push(meta);
+                    bodies.push(body);
+                }
+            }
         }
     }
     // A move both removes from source and adds to target; a copy only adds.
@@ -889,6 +983,15 @@ fn preview_repo(
     } else {
         [0, acted, 0, unchanged]
     };
+    let mut status = format!(
+        "{acted} match the {}.",
+        config.command.label().to_lowercase()
+    );
+    if skipped_deleted > 0 {
+        status.push_str(&format!(
+            " {skipped_deleted} skipped — the target deleted that content (blue rows)."
+        ));
+    }
     Ok(ReviewPreviewData {
         rows,
         bodies,
@@ -897,10 +1000,7 @@ fn preview_repo(
         preview_totals,
         source_header: TransferView::repo_header(store, &config.source),
         target_header: TransferView::repo_header(store, target),
-        status: format!(
-            "{acted} match the {}.",
-            config.command.label().to_lowercase()
-        ),
+        status,
     })
 }
 
@@ -4441,6 +4541,8 @@ mod ui_tests {
             relation,
             left,
             right,
+            deleted_in_right: false,
+            deleted_in_left: false,
         }
     }
 
@@ -5887,16 +5989,22 @@ mod ui_tests {
                 relation: dedup_core::diff::DiffRelation::OnlyLeft,
                 left: vec![file("holiday.jpg", 2048)],
                 right: Vec::new(),
+                deleted_in_right: false,
+                deleted_in_left: false,
             },
             RepoDiffRow {
                 relation: dedup_core::diff::DiffRelation::Renamed,
                 left: vec![file("old-name.txt", 12)],
                 right: vec![file("new-name.txt", 12)],
+                deleted_in_right: false,
+                deleted_in_left: false,
             },
             RepoDiffRow {
                 relation: dedup_core::diff::DiffRelation::Equal,
                 left: vec![file("notes.txt", 15)],
                 right: vec![file("notes.txt", 15)],
+                deleted_in_right: false,
+                deleted_in_left: false,
             },
         ];
         view.preview_total = 2;
@@ -6491,11 +6599,15 @@ mod ui_tests {
                 relation: DiffRelation::OnlyLeft,
                 left: vec![dfile("only_left.txt", 1, 0)],
                 right: vec![],
+                deleted_in_right: false,
+                deleted_in_left: false,
             },
             RepoDiffRow {
                 relation: DiffRelation::Equal,
                 left: vec![dfile("same.txt", 1, 0)],
                 right: vec![dfile("same.txt", 1, 0)],
+                deleted_in_right: false,
+                deleted_in_left: false,
             },
         ];
         let metas = diff_metas(&v.diff_rows, false, false);
@@ -6529,11 +6641,15 @@ mod ui_tests {
                 relation: DiffRelation::OnlyLeft,
                 left: vec![dfile("keep.txt", 1, 0)],
                 right: vec![],
+                deleted_in_right: false,
+                deleted_in_left: false,
             },
             RepoDiffRow {
                 relation: DiffRelation::OnlyLeft,
                 left: vec![dfile("skip.txt", 1, 0)],
                 right: vec![],
+                deleted_in_right: false,
+                deleted_in_left: false,
             },
         ];
         let metas = diff_metas(&v.diff_rows, false, false);
@@ -6571,11 +6687,15 @@ mod ui_tests {
                     relation: DiffRelation::OnlyLeft,
                     left: vec![dfile("holiday.jpg", 15, 0)],
                     right: vec![],
+                    deleted_in_right: false,
+                    deleted_in_left: false,
                 },
                 RepoDiffRow {
                     relation: DiffRelation::OnlyLeft,
                     left: vec![dfile("notes.txt", 15, 0)],
                     right: vec![],
+                    deleted_in_right: false,
+                    deleted_in_left: false,
                 },
             ];
         });

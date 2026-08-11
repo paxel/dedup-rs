@@ -30,7 +30,17 @@ the disk, so it shows exactly what has been scanned.
 
 Selecting a file fills the dock at the bottom-right: a **preview** (a real thumbnail for
 images and video, a spectrogram for audio), the file's facts (size, type, date), and its
-**TAGS**. From here you can:
+**TAGS**.
+
+Selecting a file also starts a quiet **folder read-ahead**: the rest of the folder's
+previews are generated in the background, nearest to your selection first, and the files
+themselves are warmed within a budget (≤ 256 MB per file, ~2 GB per folder) so a cloud
+mount like pCloud pulls them into its local cache — stepping through a folder stays
+instant instead of waiting on the network per file. Your own clicks always take priority,
+and changing folder (or leaving the tab) cancels the read-ahead immediately. It runs only
+in the normal folder view, not in a flattened listing.
+
+From here you can:
 
 - **add a tag** — type a label and **Add**; tags are free-form and stored in the index, so
   they survive rescans and drive the filter and the Duplicates/Grooming triage.

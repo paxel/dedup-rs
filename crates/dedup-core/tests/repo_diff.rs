@@ -203,6 +203,46 @@ fn deleted_files_drop_out_of_the_diff() -> TestResult {
     Ok(())
 }
 
+/// An only-on-one-side row whose content the *other* repo once held and
+/// deleted is flagged — the DIFF board paints it blue WAS DELETED instead of
+/// green NEW, because copying it across would resurrect a deletion.
+#[test]
+fn one_sided_rows_flag_content_the_other_side_deleted() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.left, "kept-only-here.txt", b"never-on-right")?;
+    Sandbox::write(&sb.left, "they-deleted-it.txt", b"tombstoned-content")?;
+    Sandbox::write(&sb.right, "they-deleted-it.txt", b"tombstoned-content")?;
+    // A survivor on the right, so the rescan after the deletion doesn't trip
+    // the "would empty the index" unmounted-drive guard.
+    Sandbox::write(&sb.right, "survivor.txt", b"still-here")?;
+    sb.update_both()?;
+    // The right side deletes its copy and rescans: a tombstone remains.
+    std::fs::remove_file(sb.right.join("they-deleted-it.txt"))?;
+    sb.update_both()?;
+
+    for pairing in [DiffPairing::ByHash, DiffPairing::ByPath] {
+        let rows = sb.diff(pairing)?;
+        let row = |name: &str| {
+            rows.iter()
+                .find(|r| paths(&r.left) == [name])
+                .unwrap_or_else(|| panic!("{pairing:?}: no row for {name}"))
+        };
+        let fresh = row("kept-only-here.txt");
+        assert_eq!(fresh.relation, DiffRelation::OnlyLeft);
+        assert!(
+            !fresh.deleted_in_right,
+            "{pairing:?}: content the right never had is plain only-left"
+        );
+        let ghost = row("they-deleted-it.txt");
+        assert_eq!(ghost.relation, DiffRelation::OnlyLeft);
+        assert!(
+            ghost.deleted_in_right,
+            "{pairing:?}: the right holds a tombstone of this content"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn plan_sync_back_separates_new_from_resurrection() -> TestResult {
     // LEFT is the sink, RIGHT is the main.

@@ -1781,6 +1781,7 @@ impl DiffCompare {
         let facts = crate::media_cell::FileFacts {
             size,
             modified_ms: 0,
+            missing: false,
             mime: fp.mime,
             img_size: fp.img_size,
             audio_ms: fp.audio.as_ref().map(|a| a.duration_ms),
@@ -6980,6 +6981,7 @@ mod tests {
                 // A believable date (2019-05-10) so doc screenshots built from
                 // this helper show a real date, not the epoch.
                 modified_ms: 1_557_500_000_000,
+                missing: false,
                 mime: mime.map(str::to_string),
                 img_size: None,
                 audio_ms: None,

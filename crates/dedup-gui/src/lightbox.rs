@@ -1236,6 +1236,7 @@ mod tests {
         let facts = FileFacts {
             size: 1024,
             modified_ms: 1000,
+            missing: false,
             mime: Some("image/png".to_string()),
             img_size: Some((800, 600)),
             audio_ms: None,
@@ -1295,6 +1296,7 @@ mod tests {
         let audio = |mime: &str| FileFacts {
             size: 417,
             modified_ms: 0,
+            missing: false,
             mime: Some(mime.to_string()),
             img_size: None,
             audio_ms: Some(1000),

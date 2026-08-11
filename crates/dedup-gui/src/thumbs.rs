@@ -15,6 +15,11 @@ const TEXTURE_CAPACITY: usize = 200;
 const HEAD_CAPACITY: usize = 512;
 /// How much of a text file's head is read for its card preview.
 const HEAD_BYTES: usize = 4096;
+/// How much of a file's head feeds the byte-view bitmap, and its fixed grid
+/// (4:3, one byte per pixel; identical content → identical pattern).
+const BYTE_VIEW_BYTES: usize = BYTE_VIEW_W * BYTE_VIEW_H;
+const BYTE_VIEW_W: usize = 128;
+const BYTE_VIEW_H: usize = 96;
 /// How many lines of that head a card preview keeps.
 const HEAD_LINES: usize = 12;
 
@@ -26,6 +31,12 @@ enum Job {
     VideoFrame { idx: usize, count: usize },
     /// The first lines of a text file, for the card preview.
     TextHead,
+    /// The file's head bytes as a greyscale bitmap — the universal fallback
+    /// preview for files with no dedicated renderer.
+    ByteView,
+    /// A PDF's first page as a small image (async pdftoppm; fails without
+    /// poppler, and the caller falls back to the byte view).
+    PdfPage,
 }
 
 struct Request {
@@ -80,6 +91,28 @@ impl ThumbCache {
                         }
                         continue;
                     }
+                    if let Job::ByteView = req.job {
+                        match byte_view_image(&req.source) {
+                            Some(img) => {
+                                let _ = dec_tx.send(Decoded::Ready(req.key, img));
+                            }
+                            None => {
+                                let _ = dec_tx.send(Decoded::Failed(req.key));
+                            }
+                        }
+                        continue;
+                    }
+                    if let Job::PdfPage = req.job {
+                        match pdf_page_image(&req.source) {
+                            Some(img) => {
+                                let _ = dec_tx.send(Decoded::Ready(req.key, img));
+                            }
+                            None => {
+                                let _ = dec_tx.send(Decoded::Failed(req.key));
+                            }
+                        }
+                        continue;
+                    }
                     let result = match req.job {
                         Job::Image => dedup_core::thumbnail::get_rgba(&req.source, &req.hex),
                         Job::VideoFrame { idx, count } => dedup_core::thumbnail::video_frame_rgba(
@@ -88,7 +121,9 @@ impl ThumbCache {
                             idx,
                             count,
                         ),
-                        Job::TextHead => unreachable!("handled above"),
+                        Job::TextHead | Job::ByteView | Job::PdfPage => {
+                            unreachable!("handled above")
+                        }
                     };
                     match result {
                         Ok((w, h, rgba)) => {
@@ -204,6 +239,21 @@ impl ThumbCache {
         None
     }
 
+    /// Fetch the byte-view bitmap (head bytes as greyscale) for `hex`,
+    /// requesting generation if not cached. `None` while pending or failed.
+    pub fn get_byte_view(&mut self, hex: &str, source: &Path) -> Option<TextureHandle> {
+        let key = format!("{hex}-b");
+        self.get_keyed(key, hex, source, Job::ByteView)
+    }
+
+    /// Fetch the PDF first-page mini-render for `hex`. `None` while pending —
+    /// and forever when poppler is absent or the file is unrenderable; the
+    /// caller simply falls through to the byte view either way.
+    pub fn get_pdf_page(&mut self, hex: &str, source: &Path) -> Option<TextureHandle> {
+        let key = format!("{hex}-p");
+        self.get_keyed(key, hex, source, Job::PdfPage)
+    }
+
     fn get_keyed(
         &mut self,
         key: String,
@@ -248,6 +298,57 @@ impl ThumbCache {
     }
 }
 
+/// Render a file's head bytes as a greyscale bitmap: one byte per pixel on a
+/// fixed 128×96 grid, row-major. Identical content yields an identical pattern
+/// — two duplicates *look* the same — and different formats show their
+/// characteristic texture (compressed noise, structured records, padding runs).
+/// A short file leaves the tail dark; `None` when the file cannot be read.
+fn byte_view_image(path: &Path) -> Option<ColorImage> {
+    use std::io::Read;
+    let mut buf = vec![0u8; BYTE_VIEW_BYTES];
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match f.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(_) => return None,
+        }
+    }
+    if filled == 0 {
+        return None;
+    }
+    let mut rgba = vec![0u8; BYTE_VIEW_W * BYTE_VIEW_H * 4];
+    for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+        // Bytes past the end stay near-black, reading as "the file ends here".
+        let v = if i < filled { buf[i] } else { 8 };
+        // Lift the floor a touch so a zero-heavy header still shows structure
+        // against the pure-black card background.
+        let g = 24u8.saturating_add((v as u16 * 200 / 255) as u8);
+        px[0] = g;
+        px[1] = g;
+        px[2] = g;
+        px[3] = 255;
+    }
+    Some(ColorImage::from_rgba_unmultiplied(
+        [BYTE_VIEW_W, BYTE_VIEW_H],
+        &rgba,
+    ))
+}
+
+/// Rasterize a PDF's first page to a small image for its card preview, via the
+/// same poppler pipeline the Render tab uses. `None` without poppler or when
+/// the file is not a renderable PDF.
+fn pdf_page_image(path: &Path) -> Option<ColorImage> {
+    let dir = tempfile::tempdir().ok()?;
+    let png = dedup_core::render::render_pdf_page(path, dir.path(), 1)?;
+    let (w, h, rgba) = dedup_core::thumbnail::load_full_rgba(&png, 512).ok()?;
+    Some(ColorImage::from_rgba_unmultiplied(
+        [w as usize, h as usize],
+        &rgba,
+    ))
+}
+
 /// Read the first lines of a text file for its card preview: up to
 /// [`HEAD_BYTES`] from the head, lossy UTF-8, the first [`HEAD_LINES`] lines
 /// with blank runs collapsed. `None` when the file cannot be read or holds no
@@ -285,6 +386,35 @@ fn read_text_head(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The byte view is deterministic per content and marks EOF: two files
+    /// with the same head render identical bitmaps, and a short file leaves
+    /// the tail near-black instead of garbage.
+    #[test]
+    fn byte_view_is_deterministic_and_marks_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.db");
+        let b = dir.path().join("b.db");
+        let bytes: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&a, &bytes).unwrap();
+        std::fs::write(&b, &bytes).unwrap();
+        let ia = byte_view_image(&a).expect("readable");
+        let ib = byte_view_image(&b).expect("readable");
+        assert_eq!(ia.pixels, ib.pixels, "same head bytes, same picture");
+        assert_eq!(ia.size, [BYTE_VIEW_W, BYTE_VIEW_H]);
+        // The written 2 KiB fill only the first pixels; the rest is the dark
+        // EOF floor (uniform), visibly different from the data region.
+        let tail = ia.pixels[BYTE_VIEW_BYTES - 1];
+        assert_eq!(
+            ia.pixels[BYTE_VIEW_BYTES - 100],
+            tail,
+            "the tail past EOF is a uniform floor"
+        );
+        assert!(
+            byte_view_image(&dir.path().join("missing.bin")).is_none(),
+            "an unreadable file yields no bitmap"
+        );
+    }
 
     /// The text-head pipeline: a request comes back through `poll` with the
     /// file's first lines, cached for every later frame; a missing file fails

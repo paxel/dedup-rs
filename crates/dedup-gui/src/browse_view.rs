@@ -225,6 +225,13 @@ pub struct BrowseView {
     /// The app-wide repo lock registry (see [`crate::locks`]): which repos'
     /// existing files may be deleted or overwritten this session.
     locks: crate::locks::RepoLocks,
+    /// Generation counter for the folder read-ahead worker: bumping it makes
+    /// the running worker stop at its next check (folder change, tab exit).
+    prefetch_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Which `(repo, dir)` the current read-ahead worker was spawned for, so a
+    /// frame doesn't respawn it (selection moves within the folder don't
+    /// restart it either — it already covers the whole folder).
+    prefetch_key: Option<(String, String)>,
 }
 
 /// The in-progress ID3 edit for the previewed audio file.
@@ -276,6 +283,19 @@ impl BrowseView {
             audio_tags: None,
             tag_edit: None,
             locks: crate::locks::RepoLocks::new(),
+            prefetch_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            prefetch_key: None,
+        }
+    }
+
+    /// Stop the folder read-ahead worker (called when leaving the tab — the
+    /// disk belongs to whatever the user is doing now).
+    pub fn cancel_prefetch(&mut self) {
+        // Idempotent: only bump the generation while a worker might be alive,
+        // so calling this every frame off-tab costs nothing.
+        if self.prefetch_key.take().is_some() {
+            self.prefetch_gen
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -404,6 +424,109 @@ impl BrowseView {
     }
 
     /// The listing for the current mode (tree or flattened).
+    /// Spawn (once per `(repo, dir)`) the read-ahead worker over the current
+    /// folder's files, ordered nearest-first from the selection at spawn time.
+    /// For each file it generates the on-disk preview cache (image thumbnail /
+    /// video still — the same cache the UI's thumbnail workers read, so a
+    /// later selection hits it instantly) and then warms the file itself by
+    /// reading it end to end (≤ 256 MB per file, ~2 GB per folder), which
+    /// pulls a FUSE/cloud mount's copy into its local cache. One worker, low
+    /// urgency, cancelled by generation bump the moment the folder changes.
+    fn maybe_prefetch(&mut self, files: &[FileRow]) {
+        use std::sync::atomic::Ordering;
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let Some(root) = self.roots.get(&repo).cloned() else {
+            return;
+        };
+        if files.is_empty() {
+            return;
+        }
+        let dir = self.cur.join("/");
+        let key = (repo, dir);
+        if self.prefetch_key.as_ref() == Some(&key) {
+            return;
+        }
+        // Invalidate any previous worker, then claim this folder.
+        let generation = self.prefetch_gen.fetch_add(1, Ordering::Relaxed) + 1;
+        self.prefetch_key = Some(key);
+        // Nearest-first from the current selection: the order the user would
+        // realistically step through.
+        let sel = self.file_sel.min(files.len().saturating_sub(1));
+        let mut order: Vec<usize> = Vec::with_capacity(files.len());
+        let mut lo = sel as isize;
+        let mut hi = sel as isize + 1;
+        while lo >= 0 || (hi as usize) < files.len() {
+            if lo >= 0 {
+                order.push(lo as usize);
+                lo -= 1;
+            }
+            if (hi as usize) < files.len() {
+                order.push(hi as usize);
+                hi += 1;
+            }
+        }
+        let jobs: Vec<(std::path::PathBuf, String, String, u64)> = order
+            .into_iter()
+            .map(|i| {
+                let f = &files[i];
+                (
+                    std::path::Path::new(&root).join(&f.rel),
+                    dedup_core::thumbnail::hash_hex(&f.hash),
+                    f.mime.clone(),
+                    f.size,
+                )
+            })
+            .collect();
+        let gen_flag = std::sync::Arc::clone(&self.prefetch_gen);
+        std::thread::spawn(move || {
+            const WARM_FILE_CAP: u64 = 256 * 1024 * 1024;
+            const WARM_TOTAL_CAP: u64 = 2 * 1024 * 1024 * 1024;
+            let cancelled = || gen_flag.load(Ordering::Relaxed) != generation;
+            let mut warmed: u64 = 0;
+            for (path, hex, mime, size) in jobs {
+                if cancelled() {
+                    return;
+                }
+                // 1. Preview into the shared on-disk cache.
+                if mime.starts_with("image/") {
+                    let _ = dedup_core::thumbnail::get_rgba(&path, &hex);
+                } else if mime.starts_with("video/") {
+                    let _ = dedup_core::thumbnail::video_frame_rgba(
+                        &path,
+                        &hex,
+                        crate::media_cell::VIDEO_STRIP / 2,
+                        crate::media_cell::VIDEO_STRIP,
+                    );
+                }
+                if cancelled() {
+                    return;
+                }
+                // 2. Warm the bytes themselves (budgeted), in chunks so a
+                // cancel lands mid-file rather than after it.
+                if size <= WARM_FILE_CAP && warmed + size <= WARM_TOTAL_CAP {
+                    use std::io::Read;
+                    if let Ok(mut f) = std::fs::File::open(&path) {
+                        let mut buf = vec![0u8; 4 * 1024 * 1024];
+                        loop {
+                            if cancelled() {
+                                return;
+                            }
+                            match f.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => warmed += n as u64,
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                }
+                // Low urgency: give any user-initiated I/O the right of way.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+    }
+
     fn current_listing(&self, filter: &FileFilter) -> (Vec<String>, Vec<FileRow>) {
         if self.flatten {
             self.flat_listing(filter)
@@ -684,6 +807,16 @@ impl BrowseView {
         // you navigate, so changing directory never reflows the page — only the
         // user's splitter drags resize anything.
         let sel = files.get(self.file_sel).cloned();
+        // Folder read-ahead: warm this folder's previews (and, within a
+        // budget, the files themselves) in the background, so stepping
+        // through neighbours is instant — the difference between a shitty
+        // and a good app on a cloud mount. Non-flat only: a flattened repo
+        // is one giant listing, not a folder you're about to walk.
+        if self.flatten {
+            self.cancel_prefetch();
+        } else {
+            self.maybe_prefetch(&files);
+        }
 
         egui::Panel::bottom("browse_hint")
             .show_separator_line(false)
@@ -1073,6 +1206,7 @@ impl BrowseView {
                             .unwrap_or_else(|| crate::media_cell::FileFacts {
                                 size: sel.size,
                                 modified_ms: sel.modified_ms,
+                                missing: false,
                                 mime: Some(sel.mime.clone()),
                                 img_size: None,
                                 audio_ms: None,
@@ -1988,6 +2122,57 @@ mod tests {
     use egui_kittest::kittest::Queryable;
     use std::sync::Arc;
 
+    /// The folder read-ahead generates the same on-disk thumbnails the UI's
+    /// preview workers read — stepping onto a neighbour then hits a warm
+    /// cache. Cancellation stops the worker (no further cache writes).
+    #[test]
+    fn prefetch_fills_the_thumbnail_cache_for_folder_images() {
+        let tmp = tempfile::tempdir().unwrap();
+        dedup_core::thumbnail::set_cache_dir(tmp.path().join("thumbs"));
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut rows = Vec::new();
+        for (i, name) in ["a.png", "b.png"].iter().enumerate() {
+            let img = image::RgbaImage::from_pixel(8, 8, image::Rgba([i as u8 * 90, 40, 200, 255]));
+            img.save(root.join(name)).unwrap();
+            let mut hash = [0u8; 32];
+            hash[0] = i as u8 + 1;
+            rows.push(FileRow {
+                rel: name.to_string(),
+                name: name.to_string(),
+                size: 300,
+                mime: "image/png".into(),
+                modified_ms: 0,
+                hash,
+                info: String::new(),
+                tags: String::new(),
+                tag_list: Vec::new(),
+            });
+        }
+        let mut v = BrowseView::new();
+        v.repo = Some("r".into());
+        v.roots
+            .insert("r".into(), root.to_string_lossy().into_owned());
+        v.maybe_prefetch(&rows);
+        let cache = dedup_core::thumbnail::cache_dir();
+        let count = || std::fs::read_dir(&cache).map(|d| d.count()).unwrap_or(0);
+        for _ in 0..200 {
+            if count() >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            count() >= 2,
+            "both neighbours' thumbnails are cached in the background"
+        );
+        v.cancel_prefetch();
+        assert!(
+            v.prefetch_key.is_none(),
+            "cancel forgets the folder claim so a return re-spawns"
+        );
+    }
+
     fn entry() -> FileEntry {
         FileEntry {
             size: 100,
@@ -2804,6 +2989,7 @@ mod tests {
                 facts: crate::media_cell::FileFacts {
                     size: 100,
                     modified_ms: 0,
+                    missing: false,
                     mime: Some("image/png".into()),
                     img_size: None,
                     audio_ms: None,

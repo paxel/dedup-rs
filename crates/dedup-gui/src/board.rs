@@ -33,7 +33,7 @@ use crate::util::{format_mtime, format_size};
 use egui::{Align, Layout, RichText};
 
 /// Longest edge of a row thumbnail.
-const THUMB: f32 = 48.0;
+const THUMB: f32 = 64.0;
 /// Height of one path line inside a side cell.
 const LINE_H: f32 = 17.0;
 /// Height of a command button and the stride between button lines.
@@ -49,7 +49,7 @@ const CMD_H: f32 = BTN_H + CMD_GAP;
 /// Width of one command button.
 const CMD_W: f32 = 104.0;
 /// Vertical padding above and below a row's content.
-const ROW_PAD: f32 = 6.0;
+const ROW_PAD: f32 = 8.0;
 /// Smallest a side region may become before the board stops shrinking it and
 /// simply clips at the window edge.
 const SIDE_MIN: f32 = THUMB + 90.0;
@@ -910,7 +910,23 @@ fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view:
     let cell = &mut cell;
     let mut text_width = rect.width();
     if let Some(f) = &view.body.facts {
-        let _ = media_cell(cell, thumbs, f, MediaStyle::row(THUMB));
+        // The cell wears its row's status: red WILL DELETE over what a plan
+        // removes, blue WAS DELETED over a resurrection candidate, green NEW
+        // over content only this side has — the state is visible on the
+        // preview itself, not only in the path colour. (A missing file veils
+        // itself amber MISSING inside `media_cell`, overriding these.)
+        let overlay = match view.status {
+            Status::WillDelete => Some(crate::media_cell::CellOverlay::WillDelete),
+            Status::Resurrect => Some(crate::media_cell::CellOverlay::WasDeleted),
+            Status::OnlyHere => Some(crate::media_cell::CellOverlay::New),
+            _ => None,
+        };
+        let _ = media_cell(
+            cell,
+            thumbs,
+            f,
+            MediaStyle::row(THUMB).with_overlay(overlay),
+        );
         text_width -= THUMB + cell.spacing().item_spacing.x;
     }
     cell.vertical(|ui| {

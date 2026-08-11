@@ -1334,6 +1334,12 @@ pub struct RepoDiffRow {
     pub relation: DiffRelation,
     pub left: Vec<DiffFile>,
     pub right: Vec<DiffFile>,
+    /// An `OnlyLeft` row's content survives in the *right* repo only as
+    /// tombstones — the right side once held exactly this and deleted it, so
+    /// copying it right would resurrect a deletion.
+    pub deleted_in_right: bool,
+    /// The mirror for `OnlyRight` rows against the left repo.
+    pub deleted_in_left: bool,
 }
 
 impl RepoDiffRow {
@@ -1405,14 +1411,23 @@ fn rows_by_hash(
 ) -> Result<Vec<RepoDiffRow>, StoreError> {
     let mut left = live_files_by_content(left_db)?;
     let right = live_files_by_content(right_db)?;
+    // Tombstone knowledge for the one-sided rows (one pass per side).
+    let left_idx = store::read_content_index(left_db)?;
+    let right_idx = store::read_content_index(right_db)?;
     let mut rows = Vec::new();
     for (key, right_files) in right {
         let left_files = left.remove(&key).unwrap_or_default();
-        rows.push(hash_row(left_files, right_files));
+        let mut row = hash_row(left_files, right_files);
+        if row.relation == DiffRelation::OnlyRight {
+            row.deleted_in_left = store::content_tombstoned(&left_idx, key.0, &key.1);
+        }
+        rows.push(row);
     }
-    // Whatever the right side never had is left-only.
-    for (_, left_files) in left {
-        rows.push(hash_row(left_files, Vec::new()));
+    // Whatever the right side never had is left-only — or had and deleted.
+    for (key, left_files) in left {
+        let mut row = hash_row(left_files, Vec::new());
+        row.deleted_in_right = store::content_tombstoned(&right_idx, key.0, &key.1);
+        rows.push(row);
     }
     Ok(rows)
 }
@@ -1438,6 +1453,8 @@ fn hash_row(left: Vec<DiffFile>, right: Vec<DiffFile>) -> RepoDiffRow {
         relation,
         left,
         right,
+        deleted_in_right: false,
+        deleted_in_left: false,
     }
 }
 
@@ -1470,6 +1487,8 @@ fn rows_by_path(
         };
     let mut left = live(left_db)?;
     let right = live(right_db)?;
+    let left_idx = store::read_content_index(left_db)?;
+    let right_idx = store::read_content_index(right_db)?;
     let mut rows = Vec::new();
     for (path, (right_file, right_key)) in right {
         match left.remove(&path) {
@@ -1481,19 +1500,25 @@ fn rows_by_path(
                 },
                 left: vec![left_file],
                 right: vec![right_file],
+                deleted_in_right: false,
+                deleted_in_left: false,
             }),
             None => rows.push(RepoDiffRow {
                 relation: DiffRelation::OnlyRight,
                 left: Vec::new(),
                 right: vec![right_file],
+                deleted_in_right: false,
+                deleted_in_left: store::content_tombstoned(&left_idx, right_key.0, &right_key.1),
             }),
         }
     }
-    for (_, (left_file, _)) in left {
+    for (_, (left_file, left_key)) in left {
         rows.push(RepoDiffRow {
             relation: DiffRelation::OnlyLeft,
             left: vec![left_file],
             right: Vec::new(),
+            deleted_in_right: store::content_tombstoned(&right_idx, left_key.0, &left_key.1),
+            deleted_in_left: false,
         });
     }
     Ok(rows)

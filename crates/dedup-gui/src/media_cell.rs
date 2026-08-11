@@ -41,6 +41,9 @@ pub(crate) fn fmt_ms(ms: u64) -> String {
 pub struct FileFacts {
     pub size: u64,
     pub modified_ms: i64,
+    /// The index says this file's path no longer holds it (a tombstone) — the
+    /// cell veils itself MISSING without any caller wiring.
+    pub missing: bool,
     pub mime: Option<String>,
     pub img_size: Option<(u32, u32)>,
     pub audio_ms: Option<u32>,
@@ -62,6 +65,7 @@ impl FileFacts {
         Self {
             size: entry.size,
             modified_ms: entry.modified_ms,
+            missing: entry.missing,
             mime: entry.mime.clone(),
             img_size: entry.img_size,
             audio_ms: entry.audio.as_ref().map(|a| a.duration_ms),
@@ -145,6 +149,42 @@ pub fn facts_for(db: Option<&redb::Database>, base: Option<&str>, rel: &str) -> 
     ))
 }
 
+/// A status veil painted over a cell's preview: a translucent wash in the
+/// status colour with the state in big bold letters — deletion, absence and
+/// resurrection read at a glance without hiding *what* file they concern.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellOverlay {
+    /// A plan will delete this file.
+    WillDelete,
+    /// The file is gone from disk (its index entry is a tombstone).
+    Missing,
+    /// The receiving repo once held exactly this content and deleted it —
+    /// copying it would resurrect a deletion.
+    WasDeleted,
+    /// Content only on this side / about to be added.
+    New,
+}
+
+impl CellOverlay {
+    fn label(self) -> &'static str {
+        match self {
+            Self::WillDelete => "WILL DELETE",
+            Self::Missing => "MISSING",
+            Self::WasDeleted => "WAS DELETED",
+            Self::New => "NEW",
+        }
+    }
+
+    fn color(self) -> egui::Color32 {
+        match self {
+            Self::WillDelete => theme::red(),
+            Self::Missing => theme::amber(),
+            Self::WasDeleted => theme::blue(),
+            Self::New => theme::green(),
+        }
+    }
+}
+
 /// How large to draw a media cell and whether it captions itself.
 #[derive(Clone, Copy)]
 pub struct MediaStyle {
@@ -154,6 +194,9 @@ pub struct MediaStyle {
     /// glyph. The Duplicate cards do; the compact review rows carry those in
     /// their own facts line instead.
     pub captions: bool,
+    /// A status veil to paint over whatever the cell shows (see
+    /// [`CellOverlay`]). A missing file veils itself regardless.
+    pub overlay: Option<CellOverlay>,
 }
 
 impl MediaStyle {
@@ -163,6 +206,7 @@ impl MediaStyle {
             width: 160.0,
             height: 120.0,
             captions: true,
+            overlay: None,
         }
     }
 
@@ -172,7 +216,14 @@ impl MediaStyle {
             width: edge,
             height: edge,
             captions: false,
+            overlay: None,
         }
+    }
+
+    /// The same style with a status veil.
+    pub fn with_overlay(mut self, overlay: Option<CellOverlay>) -> Self {
+        self.overlay = overlay;
+        self
     }
 }
 
@@ -186,6 +237,14 @@ pub fn media_cell(
     style: MediaStyle,
 ) -> Option<Response> {
     let (w, h) = (style.width, style.height);
+    // A missing file veils itself; otherwise the caller's status wins. Painted
+    // over whatever the cell shows — including a stale cached thumbnail, which
+    // is deliberate: "this (red-veiled photo) is what the plan deletes".
+    let overlay = if facts.missing {
+        Some(CellOverlay::Missing)
+    } else {
+        style.overlay
+    };
     if facts.is_image() || facts.is_video() {
         // Only fetch a texture for an on-screen cell: a virtualized table or a
         // long card list can lay out far more thumbnails than the GPU cache
@@ -218,6 +277,7 @@ pub fn media_cell(
                     egui::Stroke::new(1.0, theme::hairline()),
                     egui::StrokeKind::Inside,
                 );
+                paint_overlay(ui.painter(), resp.rect, overlay, style.captions);
                 return Some(resp);
             }
         }
@@ -256,6 +316,7 @@ pub fn media_cell(
                 theme::tan(),
             );
         }
+        paint_overlay(&painter, rect, overlay, style.captions);
         return Some(resp);
     }
 
@@ -295,6 +356,7 @@ pub fn media_cell(
                 );
                 y += line_h;
             }
+            paint_overlay(&painter, rect, overlay, style.captions);
             // A small row cell fits only a corner of the head; hovering it
             // shows the whole preview at a readable size.
             let resp = if h < 60.0 {
@@ -302,13 +364,85 @@ pub fn media_cell(
             } else {
                 resp
             };
+            // The same accessible name the placeholder's overlay carries, so
+            // "the way into the viewer" reads consistently for tests and
+            // screen readers whatever the cell happens to show.
+            resp.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "OPEN PREVIEW")
+            });
+            return Some(resp);
+        }
+    }
+
+    // PDFs: a real first-page mini-render via the async poppler pipeline.
+    // While it renders (or forever, without poppler) they fall through to the
+    // byte view below like every other opaque file.
+    let is_pdf = facts.mime.as_deref() == Some("application/pdf");
+    if is_pdf {
+        let thumb_rect = egui::Rect::from_min_size(ui.next_widget_position(), egui::vec2(w, h));
+        if ui.is_rect_visible(thumb_rect)
+            && let Some(tex) = thumbs.get_pdf_page(&facts.hash_hex, facts.abs_path.as_path())
+        {
+            let mut image = egui::Image::new(egui::load::SizedTexture::from_handle(&tex))
+                .max_height(h)
+                .corner_radius(6)
+                .sense(egui::Sense::click());
+            if !style.captions {
+                image = image.max_width(w);
+            }
+            let resp = ui.add(image);
+            ui.painter().rect_stroke(
+                resp.rect,
+                6,
+                egui::Stroke::new(1.0, theme::hairline()),
+                egui::StrokeKind::Inside,
+            );
+            paint_overlay(ui.painter(), resp.rect, overlay, style.captions);
+            resp.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "OPEN PREVIEW")
+            });
+            return Some(resp);
+        }
+    }
+
+    // The universal fallback: the file's head bytes as a greyscale bitmap
+    // (identical content → identical pattern) with the extension across the
+    // middle, colour-hashed like the repo identicons so ".db" is the same hue
+    // everywhere. Generated on the worker pool; until it lands (or when the
+    // file cannot be read) the typed placeholder below stands in.
+    if !facts.is_image() && !facts.is_video() && !facts.is_audio() && !facts.is_textual() {
+        let thumb_rect = egui::Rect::from_min_size(ui.next_widget_position(), egui::vec2(w, h));
+        if ui.is_rect_visible(thumb_rect)
+            && let Some(tex) = thumbs.get_byte_view(&facts.hash_hex, facts.abs_path.as_path())
+        {
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+            let painter = ui.painter_at(rect);
+            painter.image(
+                tex.id(),
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            painter.rect_stroke(
+                rect,
+                6.0,
+                egui::Stroke::new(1.0, theme::hairline()),
+                egui::StrokeKind::Inside,
+            );
+            // Under a status veil the extension yields the centre to the
+            // status word and shrinks into the corner.
+            paint_extension_badge(&painter, rect, facts, style.captions, overlay.is_none());
+            paint_overlay(&painter, rect, overlay, style.captions);
+            resp.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "OPEN PREVIEW")
+            });
             return Some(resp);
         }
     }
 
     // Placeholder for non-media or not-yet-ready thumbnails.
     let label = facts.mime.clone().unwrap_or_else(|| "file".into());
-    egui::Frame::new()
+    let frame = egui::Frame::new()
         .fill(theme::panel())
         .corner_radius(6)
         .inner_margin(if style.captions { 18.0 } else { 6.0 })
@@ -325,7 +459,77 @@ pub fn media_cell(
                 }
             });
         });
+    paint_overlay(ui.painter(), frame.response.rect, overlay, style.captions);
     None
+}
+
+/// The status veil: a translucent wash of the status colour over the whole
+/// cell with the state word big and unmissable across the middle — visible from
+/// across the room, exactly because it sits on top of the file's own preview.
+fn paint_overlay(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    overlay: Option<CellOverlay>,
+    large: bool,
+) {
+    let Some(overlay) = overlay else {
+        return;
+    };
+    let color = overlay.color();
+    painter.rect_filled(rect, 6.0, color.gamma_multiply(0.22));
+    painter.rect_stroke(
+        rect,
+        6.0,
+        egui::Stroke::new(2.0, color),
+        egui::StrokeKind::Inside,
+    );
+    let font = egui::FontId::proportional(if large { 17.0 } else { 10.0 });
+    let galley = painter.layout_no_wrap(overlay.label().to_string(), font, color);
+    let pos = rect.center() - galley.size() / 2.0;
+    let chip = egui::Rect::from_min_size(pos, galley.size()).expand(if large { 5.0 } else { 2.0 });
+    painter.rect_filled(chip, 4.0, egui::Color32::from_black_alpha(170));
+    painter.galley(pos, galley, color);
+}
+
+/// The big centred extension over a byte-view bitmap (".db", ".exe"), in a hue
+/// hashed from the extension itself — the same extension is the same colour on
+/// every card — on a dark chip so it reads over the byte noise.
+fn paint_extension_badge(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    facts: &FileFacts,
+    large: bool,
+    centered: bool,
+) {
+    let ext = facts
+        .abs_path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
+        .unwrap_or_else(|| "?".to_string());
+    let hue = (theme::name_hash(&ext) % 360) as f32;
+    let (sat, light) = if theme::is_dark() {
+        (0.55, 0.70)
+    } else {
+        (0.60, 0.42)
+    };
+    let color = theme::hsl(hue, sat, light);
+    let size = match (large, centered) {
+        (true, true) => 26.0,
+        (true, false) => 13.0,
+        (false, true) => 13.0,
+        (false, false) => 9.0,
+    };
+    let font = egui::FontId::proportional(size);
+    let galley = painter.layout_no_wrap(ext, font, color);
+    let pos = if centered {
+        rect.center() - galley.size() / 2.0
+    } else {
+        // Tucked into the top-left, leaving the centre to the status word.
+        rect.min + egui::vec2(6.0, 5.0)
+    };
+    let chip = egui::Rect::from_min_size(pos, galley.size()).expand(if large { 6.0 } else { 3.0 });
+    painter.rect_filled(chip, 4.0, egui::Color32::from_black_alpha(150));
+    painter.galley(pos, galley, color);
 }
 
 /// Paint a deterministic "fingerprint" glyph for an audio file from its first
@@ -370,6 +574,7 @@ mod tests {
         FileFacts {
             size: 4_200_000,
             modified_ms: 0,
+            missing: false,
             mime: Some(mime.to_string()),
             img_size: None,
             audio_ms: None,
@@ -390,6 +595,49 @@ mod tests {
         assert!(!txt.is_image() && !txt.is_video() && !txt.is_audio());
         assert!(txt.is_textual() && facts("text/markdown").is_textual());
         assert!(!facts("application/pdf").is_textual());
+    }
+
+    /// An opaque file's card cell becomes the clickable byte-view bitmap once
+    /// the background read lands (with the extension badge painted over it);
+    /// until then it is the placeholder, which returns `None`.
+    #[test]
+    fn opaque_card_gets_a_byte_view_once_loaded() {
+        struct State {
+            thumbs: ThumbCache,
+            facts: FileFacts,
+            clickable: bool,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        std::fs::write(&path, vec![0xA5u8; 4096]).unwrap();
+        let mut f = facts("application/octet-stream");
+        f.abs_path = path;
+        let state = State {
+            thumbs: ThumbCache::new(1),
+            facts: f,
+            clickable: false,
+        };
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(400.0, 300.0))
+            .build_ui_state(
+                move |ui, state: &mut State| {
+                    state.thumbs.poll(&ui.ctx().clone());
+                    let resp = media_cell(ui, &mut state.thumbs, &state.facts, MediaStyle::card());
+                    state.clickable = resp.is_some();
+                },
+                state,
+            );
+        for _ in 0..100 {
+            harness.step();
+            if harness.state().clickable {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            harness.state().clickable,
+            "the byte view landed and the cell is clickable"
+        );
     }
 
     /// A text file's card cell becomes a clickable first-lines preview once the

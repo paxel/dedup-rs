@@ -109,6 +109,10 @@ appears.
   `COPY >` sits beside `< COPY` and `DELETE L` beside `DELETE R`. Commands that act on the row
   as a whole — `COMPARE`, `APPLY`, `HIDE` — are centred. Only the commands that apply to a row
   are drawn, and a row is as tall as its content needs.
+- **State is painted on the preview.** Each row's thumbnail wears its status as a veil with
+  a bold word: red **WILL DELETE**, amber **MISSING**, green **NEW**, blue **WAS DELETED**
+  (the other repository once held exactly this content and deleted it — copying it would
+  resurrect that deletion). Conflicts show the occupying file itself on the other side.
 - **Path colour says what will happen.** Grey means unchanged or equal on both sides, green
   exists only on this side (or will be added), red will be deleted, amber differs — the same
   path with different content, or the same content under a different name.

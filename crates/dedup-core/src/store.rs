@@ -1781,6 +1781,21 @@ pub fn get_paths_by_size_hash(
     Ok(paths)
 }
 
+/// Whether `state` says this content survives only as **tombstones** — the
+/// index has seen it, but every path that ever held it is marked missing
+/// (deleted). This is the "was deleted here" signal: copying such content
+/// back in would resurrect a deletion. Probe with a [`read_content_index`]
+/// map (`BY_SIZE_HASH` cannot answer this — it indexes live paths only).
+pub fn content_tombstoned(
+    index: &std::collections::HashMap<ContentKey, ContentState>,
+    size: u64,
+    hash: &[u8; 32],
+) -> bool {
+    index
+        .get(&(size, *hash))
+        .is_some_and(|s| s.missing && !s.present)
+}
+
 /// The subset of a [`FileEntry`] the update scan needs for change detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanEntry {

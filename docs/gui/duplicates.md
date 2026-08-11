@@ -48,6 +48,12 @@ size, reclaimable bytes) and one card per file:
 - Audio files get inline **PLAY/PAUSE** + a seek bar (see [Audio preview](#audio-preview)).
 - Text files preview their **first lines** right on the card — two copies of a note or a
   config read apart at a glance, without opening either.
+- PDFs show their **actual first page** (rendered in the background; needs poppler, falls
+  back gracefully). Any other file — a database, an executable, an unknown blob — shows a
+  **byte view**: its head bytes as a greyscale pattern with the extension in big colour-coded
+  letters. Identical content produces an identical pattern, so two duplicates *look* the same.
+- A file that is gone from disk wears an amber **MISSING** veil over its (cached) preview —
+  what vanished stays recognisable.
 - The best copy is starred **BEST**.
 - **KEEP / DELETE** toggles this copy's mark. Nothing is deleted until you press DELETE
   MARKED (or DELETE NOW under Quick Delete).
