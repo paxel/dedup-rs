@@ -347,10 +347,10 @@ pub(crate) struct DiffCompare {
     strings: [Option<String>; 2],
     stringsdiff: Option<crate::textdiff::TextDiff>,
     stringsdiff_key: Option<(String, String)>,
-    /// The Render tab's shared current page (0-based): one control drives both
-    /// sides, so page N sits beside page N and a duplicate-PDF walk stays
-    /// aligned.
-    render_page: usize,
+    /// The Render tab's current page per side (0-based). Each side has its
+    /// own advancer: when one copy has an extra front page, the user lines
+    /// the two up by hand — the tool never pairs pages for them.
+    render_page: [usize; 2],
     /// Rasterized pages, keyed `(slot, page)`. `Some(None)` records a page that
     /// couldn't be rendered (past the end, or poppler missing) so it is not
     /// retried every frame. A small FIFO (`render_order`) caps GPU use;
@@ -477,7 +477,7 @@ impl DiffCompare {
             strings: [None, None],
             stringsdiff: None,
             stringsdiff_key: None,
-            render_page: 0,
+            render_page: [0, 0],
             render_cache: std::collections::HashMap::new(),
             render_order: std::collections::VecDeque::new(),
             render_pending: std::collections::HashSet::new(),
@@ -976,7 +976,7 @@ impl DiffCompare {
                 ctx.request_repaint();
             });
         }
-        let page = self.render_page;
+        let page = self.render_page[slot];
         if self.render_cache.contains_key(&(slot, page))
             || self.render_pending.contains(&(slot, page))
         {
@@ -1009,7 +1009,7 @@ impl DiffCompare {
     /// note while the worker runs, "no page N" past that side's end, or a
     /// "couldn't be drawn" note when rendering failed outright.
     fn draw_render_page(&self, ui: &mut egui::Ui, area: Rect, slot: usize) {
-        let page = self.render_page;
+        let page = self.render_page[slot];
         match self.render_cache.get(&(slot, page)) {
             Some(Some(tex)) => {
                 let sz = tex.size();
@@ -1020,7 +1020,7 @@ impl DiffCompare {
             }
             Some(None) => {
                 // Rendered and came back empty: past this side's last page
-                // (the shared control follows the longer document), or the
+                // (stepping is blind when the page count is unknown), or the
                 // renderer is missing.
                 let note = match self.render_count[slot] {
                     Some(n) if page >= n => {
@@ -1052,6 +1052,59 @@ impl DiffCompare {
                     FontId::proportional(13.0),
                     theme::tan(),
                 );
+            }
+        }
+    }
+
+    /// One side's page advancer within `area`: step buttons, a type-to-jump
+    /// page entry, that side's own page count, and a sweep slider once the
+    /// count is known. Each side steps independently — when one copy has an
+    /// extra front page, the user lines the two up by hand, and the counts
+    /// standing side by side are themselves information.
+    fn render_advancer(&mut self, ui: &mut egui::Ui, area: Rect, slot: usize) {
+        let mut child = ui.new_child(
+            UiBuilder::new()
+                .max_rect(area)
+                .layout(Layout::left_to_right(Align::Center)),
+        );
+        let ui = &mut child;
+        let total = self.render_count[slot];
+        if ui.button("< PREV").clicked() {
+            self.render_page[slot] = self.render_page[slot].saturating_sub(1);
+        }
+        let cap = total.unwrap_or(9_999).max(1);
+        let mut page1 = self.render_page[slot] + 1;
+        ui.label(RichText::new("page").color(theme::tan()));
+        let typed = ui
+            .add(egui::DragValue::new(&mut page1).range(1..=cap))
+            .on_hover_text("Type or drag to jump straight to a page.");
+        ui.label(
+            RichText::new(match total {
+                Some(n) => format!("/ {n}"),
+                None => "/ ?".to_string(),
+            })
+            .color(theme::tan()),
+        );
+        if typed.changed() {
+            self.render_page[slot] = page1.saturating_sub(1);
+        }
+        if ui.button("NEXT >").clicked() && total.is_none_or(|n| self.render_page[slot] + 1 < n) {
+            self.render_page[slot] += 1;
+        }
+        // A slider for sweeping a long document quickly, sized to what is
+        // left of this side's band.
+        if let Some(n) = total
+            && n > 1
+        {
+            ui.add_space(8.0);
+            let room = (area.max.x - ui.cursor().min.x - 12.0).clamp(40.0, 160.0);
+            ui.spacing_mut().slider_width = room;
+            let mut page1 = self.render_page[slot] + 1;
+            let slid = ui
+                .add(egui::Slider::new(&mut page1, 1..=n).show_value(false))
+                .on_hover_text("Drag to sweep quickly through the pages.");
+            if slid.changed() {
+                self.render_page[slot] = page1.saturating_sub(1);
             }
         }
     }
@@ -3002,9 +3055,10 @@ impl DiffCompare {
                 } else if self.tab == RepresentationKind::Render {
                     // The document rasterized page by page, shown as it looks —
                     // one file, or both side by side. Judged by eye; no pixel
-                    // diff, no verdict. One shared page control drives both
-                    // sides, so page N sits beside page N and a duplicate-PDF
-                    // walk stays aligned (a side past its own end says so).
+                    // diff, no verdict. Each side has its **own** page advancer
+                    // (its count named beside it), so an extra front page on
+                    // one copy can be lined up by hand — the tool never guesses
+                    // which page maps to which.
                     let ctx = ui.ctx().clone();
                     let has_switcher = self.can_step_left() || self.can_step_right();
                     let clearance = if has_switcher { 58.0 } else { 30.0 };
@@ -3016,68 +3070,20 @@ impl DiffCompare {
                         egui::pos2(viewport.min.x, controls.max.y + 4.0),
                         viewport.max,
                     );
-                    // The shared control ranges over the longer document.
-                    let total = self.render_count[0]
-                        .into_iter()
-                        .chain(if two_sided_now {
-                            self.render_count[1]
-                        } else {
-                            None
-                        })
-                        .max();
-                    let mut child = ui.new_child(
-                        UiBuilder::new()
-                            .max_rect(controls)
-                            .layout(Layout::left_to_right(Align::Center)),
-                    );
-                    {
-                        let ui = &mut child;
-                        if ui.button("< PREV PAGE").clicked() {
-                            self.render_page = self.render_page.saturating_sub(1);
-                        }
-                        let cap = total.unwrap_or(9_999).max(1);
-                        let mut page1 = self.render_page + 1;
-                        ui.label(RichText::new("page").color(theme::tan()));
-                        let typed = ui
-                            .add(egui::DragValue::new(&mut page1).range(1..=cap))
-                            .on_hover_text("Type or drag to jump straight to a page.");
-                        ui.label(
-                            RichText::new(match total {
-                                Some(n) => format!("/ {n}"),
-                                None => "/ ?".to_string(),
-                            })
-                            .color(theme::tan()),
-                        );
-                        if typed.changed() {
-                            self.render_page = page1.saturating_sub(1);
-                        }
-                        if ui.button("NEXT PAGE >").clicked()
-                            && total.is_none_or(|n| self.render_page + 1 < n)
-                        {
-                            self.render_page += 1;
-                        }
-                        // A slider for sweeping a long document quickly.
-                        if let Some(n) = total
-                            && n > 1
-                        {
-                            ui.add_space(8.0);
-                            ui.spacing_mut().slider_width = 160.0;
-                            let mut page1 = self.render_page + 1;
-                            let slid = ui
-                                .add(egui::Slider::new(&mut page1, 1..=n).show_value(false))
-                                .on_hover_text("Drag to sweep quickly through the pages.");
-                            if slid.changed() {
-                                self.render_page = page1.saturating_sub(1);
-                            }
-                        }
-                    }
-                    self.ensure_render(&ctx, 0);
                     if two_sided_now {
+                        let (left_ctrl, right_ctrl) = compare_split(controls);
+                        self.render_advancer(ui, left_ctrl, 0);
+                        self.render_advancer(ui, right_ctrl, 1);
+                        // Ensure *after* the advancers, so a just-turned page
+                        // starts rasterizing in this same frame.
+                        self.ensure_render(&ctx, 0);
                         self.ensure_render(&ctx, 1);
                         let (left_pane, right_pane) = compare_split(panes);
                         self.draw_render_page(ui, left_pane, 0);
                         self.draw_render_page(ui, right_pane, 1);
                     } else {
+                        self.render_advancer(ui, controls, 0);
+                        self.ensure_render(&ctx, 0);
                         self.draw_render_page(ui, panes, 0);
                     }
                 } else if self.tab == RepresentationKind::Hex {
@@ -5031,6 +5037,37 @@ mod tests {
                 .available_kinds()
                 .contains(&RepresentationKind::Render),
             "an image is not rasterized to pages — no Render tab"
+        );
+    }
+
+    /// Comparing two documents on the Render tab, **each side has its own page
+    /// advancer** — two full control sets, one per half — so an extra front
+    /// page on one copy can be lined up by hand (the tool never pairs pages).
+    #[test]
+    fn each_render_side_has_its_own_page_advancer() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cmp = DiffCompare::new_with_pool(
+            pdf_side(tmp.path(), "a.pdf", (0.9, 0.2, 0.2)),
+            Some(pdf_side(tmp.path(), "b.pdf", (0.2, 0.2, 0.9))),
+            Vec::new(),
+        );
+        cmp.tab = RepresentationKind::Render;
+        let h = rendered(cmp);
+        let prevs: Vec<_> = h.query_all_by_label("< PREV").map(|n| n.rect()).collect();
+        assert_eq!(prevs.len(), 2, "one page advancer per side");
+        let (a, b) = if prevs[0].left() < prevs[1].left() {
+            (prevs[0], prevs[1])
+        } else {
+            (prevs[1], prevs[0])
+        };
+        assert!(
+            (a.top() - b.top()).abs() < 2.0,
+            "the two advancers sit on one line"
+        );
+        assert!(
+            a.right() < b.left(),
+            "the advancers keep to their own halves — no overlap"
         );
     }
 
