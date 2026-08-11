@@ -75,16 +75,16 @@ and date, with the commands between them.
 
 - **BY HASH** — files are matched by content, so the same photo under two names is a single
   row. Same content at the same path is *equal*; same content under different names offers
-  **RENAME L** / **RENAME R** (renaming that side to the other's name); content only one side
-  has offers **COPY >** / **< COPY** to send it across and **DELETE L** / **DELETE R** to drop
-  it where it is. Where two names differ, the differing characters are highlighted on each
+  **RENAME** on each side (renaming that side's file to the other's name); content only one
+  side has offers a **COPY** into the side that lacks it and a **DELETE** on the side that
+  holds it. Where two names differ, the differing characters are highlighted on each
   side, so you can see at a glance whether the difference is a suffix, a counter or a
   different extension. The comparison ignores the folder the files sit in, and an inserted
   character marks only itself rather than everything after it.
 - **BY PATH** — files are matched by their path inside the repo. Same path with the same
   content is *equal*; same path with different content is a conflict, offering
-  **OVERWRITE >** / **< OVERWRITE** (replace the other side's file with this one) and
-  **DELETE L** / **DELETE R**. Clicking the row opens the two versions in the viewer.
+  **OVERWRITE** on each side (replacing that side's file with the other's) and **DELETE** on
+  each side. Clicking the row opens the two versions in the viewer.
 
 Above the board, **ALL LISTED** offers bulk actions for reconciling large repositories:
 **COPY MISSING >** / **< COPY MISSING** send everything only one side has to the other, and
@@ -108,8 +108,8 @@ leaves without changing anything.
 ![DIFF compare — two versions of the same path side by side](../screenshots/diff_compare.png)
 
 When one side holds the same content under several names, that side is narrowed down first:
-**DEL ALL L** / **DEL ALL R** drops every copy on that side (after confirming) and
-**KEEP 1 L** / **KEEP 1 R** asks which copy to keep and deletes the others. When the *other*
+**DEL ALL** drops every copy on that side (after confirming) and
+**KEEP 1** asks which copy to keep and deletes the others. When the *other*
 side offers several names, RENAME asks which name to take. After every action the board
 re-compares the two repos, so the row's commands always reflect the current state.
 
@@ -161,8 +161,8 @@ REVIEW sorts the sink's files against the main into two kinds:
   only you know whether that deletion was a mistake or deliberate.
 
 Each row is a full triage decision: **`< COPY`** pulls *just that file* into the main (the only
-way a resurrection comes back), and **`DELETE R`** removes it from the sink instead — for the
-files that turn out to be worth neither keeping nor promoting. `DELETE R` appears only while the
+way a resurrection comes back), and **`DELETE`** on the sink's side removes it there instead —
+for the files that turn out to be worth neither keeping nor promoting. It appears only while the
 sink is **unlocked** (its padlock in the SINK panel); promoting is never barred, because adding
 to the main loses nothing. Clicking a row opens the file itself in the viewer.
 

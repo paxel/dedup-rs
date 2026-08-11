@@ -110,11 +110,15 @@ appears.
 
 - **Three regions.** A mini-overview of the left-hand file, a centre column of commands, and —
   when there is one — the right-hand file. The left and right stay pinned to the window edges.
-- **Commands act where they point.** A command for the left-hand file sits in the left slot,
-  one for the right in the right slot, and a command and its mirror share a line, so
-  `COPY >` sits beside `< COPY` and `DELETE L` beside `DELETE R`. Commands that act on the row
-  as a whole — `COMPARE`, `APPLY`, `HIDE` — are centred. Only the commands that apply to a row
-  are drawn, and a row is as tall as its content needs.
+- **A command sits on the side it changes.** The command column is split down a midline into
+  two half-columns, faintly tinted in each side's colour: everything in the left half changes
+  the left file, everything in the right half the right file — `DELETE` in the left half
+  deletes the left file, no suffix needed. A command never crosses the midline, and an empty
+  half means exactly that: nothing happens to that side. Copies and overwrites sit on the side
+  they *fill* (`< COPY` in the left half pulls the right file across), with the arrow naming
+  where the file flows from. A command and its mirror share a line, and commands that act on
+  the row as a whole — `COMPARE`, `APPLY`, `HIDE` — are centred below. Only the commands that
+  apply to a row are drawn, and a row is as tall as its content needs.
 - **A cell only ever talks about itself.** If a side has a file, its cell shows that file's
   preview — always — veiled only with the side's *own* state: red **WILL DELETE** on a file a
   plan removes, amber **MISSING** when it is gone from disk. The side a file will *arrive* at

@@ -50,6 +50,11 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   target path shows **the occupying file itself** — you judge by looking at both files.
 - **Bigger review previews.** Review-board rows grew their preview cell (48 → 64 px) with more
   breathing room, so text and image previews on the board are actually readable.
+- **Side-enforced commands.** The review board's command column is split down a midline into
+  two half-columns tinted in each side's colour: a command always sits on the side whose file
+  it changes, so `DELETE`, `RENAME`, `KEEP 1` and `DEL ALL` need no L/R suffix — the column
+  says it. Copies and overwrites sit on the receiving side, their arrow naming where the file
+  flows from, and an empty half-column means nothing happens to that side.
 - **Transfer** tab: copy, move or sync files between repos or into a dated folder, filtered by MIME/name/size; **GROUP SYNC** pushes a backup group's main to some or all of its sinks (each in its own ADD ONLY/MIRROR mode) when the source is a group's main; plus **DIFF**, a per-row side-by-side reconcile of two repositories.
 - **Grooming** tab: dedupe against other repos, purge by filter, remove empty directories, reorganize by path templates, and prune missing records.
 - **Browse** tab: directory-based index browser for one repo with tag annotations. A

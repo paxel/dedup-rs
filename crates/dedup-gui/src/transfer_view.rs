@@ -5172,20 +5172,21 @@ mod ui_tests {
         h.run();
         h.get_by_label("REVIEW").click_accesskit();
         settle_preview(&mut h);
-        // The sink is locked (the default): no DELETE R is offered, the
+        // The sink is locked (the default): no DELETE is offered, the
         // promote stays.
         assert!(
-            h.query_by_label("DELETE R").is_none(),
+            h.query_by_label("DELETE").is_none(),
             "a locked sink offers no deletion"
         );
         assert!(
             h.query_by_label("< COPY").is_some(),
             "promoting (an addition to the main) is never barred"
         );
-        // Unlock the sink: DELETE R appears; clicking it purges the file.
+        // Unlock the sink: DELETE appears in the sink's half-column; clicking
+        // it purges the file.
         h.state_mut().locks.toggle("target");
         h.run();
-        h.get_by_label("DELETE R").click_accesskit();
+        h.get_by_label("DELETE").click_accesskit();
         settle_preview(&mut h);
         assert!(
             !tmp.path().join("target").join("junk.txt").exists(),
@@ -6144,22 +6145,22 @@ mod ui_tests {
             0,
             "equal rows are hidden by default"
         );
-        // A one-sided row offers a copy across and a delete here; the command
-        // names its direction, so it never collides with the COPY command in
-        // the bar above.
+        // A one-sided row offers a copy across and a delete here; the arrowed
+        // copy never collides with the COPY command in the bar above.
         assert_eq!(
             h.get_all_by_label("COPY >").count(),
             1,
             "the row offers to copy the left-only file across"
         );
         assert!(
-            h.query_by_label("DELETE L").is_some(),
+            h.query_by_label("DELETE").is_some(),
             "or delete it where it is"
         );
-        assert!(
-            h.query_by_label("RENAME L").is_some() && h.query_by_label("RENAME R").is_some(),
-            "a renamed pair can be resolved from either side, and each command \
-             names the side it acts on"
+        assert_eq!(
+            h.query_all_by_label("RENAME").count(),
+            2,
+            "a renamed pair can be resolved from either side, one RENAME per \
+             half-column"
         );
         // Each side's facts line carries its size.
         assert!(
@@ -6249,7 +6250,7 @@ mod ui_tests {
             .expect("plan diff");
         }
         h.run();
-        h.get_by_label("KEEP 1 L").click();
+        h.get_by_label("KEEP 1").click();
         h.run();
         // The popup lists all three copies; keep b.txt.
         assert!(

@@ -227,18 +227,18 @@ impl Cmd {
             Cmd::Hide => "HIDE",
             Cmd::CopyRight => "COPY >",
             Cmd::CopyLeft => "< COPY",
-            Cmd::DeleteLeft => "DELETE L",
-            Cmd::DeleteRight => "DELETE R",
+            // Single-side commands carry no L/R suffix: the button's column
+            // *is* the side, enforced by `side()`. Copies and overwrites keep
+            // their arrow because it names the provenance — the file flows in
+            // from the other side.
+            Cmd::DeleteLeft | Cmd::DeleteRight => "DELETE",
             Cmd::Compare => "COMPARE",
             Cmd::OpenRow => "OPEN",
             Cmd::OverwriteRight => "OVERWRITE >",
             Cmd::OverwriteLeft => "< OVERWRITE",
-            Cmd::RenameLeft => "RENAME L",
-            Cmd::RenameRight => "RENAME R",
-            Cmd::KeepOneLeft => "KEEP 1 L",
-            Cmd::KeepOneRight => "KEEP 1 R",
-            Cmd::DeleteAllLeft => "DEL ALL L",
-            Cmd::DeleteAllRight => "DEL ALL R",
+            Cmd::RenameLeft | Cmd::RenameRight => "RENAME",
+            Cmd::KeepOneLeft | Cmd::KeepOneRight => "KEEP 1",
+            Cmd::DeleteAllLeft | Cmd::DeleteAllRight => "DEL ALL",
         }
     }
 
@@ -260,20 +260,23 @@ impl Cmd {
         }
     }
 
-    /// Which side of the board this command acts on. Drives its column in the
-    /// centre grid: left-hand commands sit in the left slot, right-hand ones in
-    /// the right, so the grid mirrors the regions either side of it.
+    /// Which side of the board this command's **effect lands on** — the side
+    /// whose files change. Drives its column in the centre grid, and it is a
+    /// hard rule: a button never crosses the midline, so the column alone says
+    /// which file is renamed, deleted, or written. Copies and overwrites sit on
+    /// the *receiving* side (where the new file appears), matching the status
+    /// veil that side's cell shows in a preview.
     fn side(self) -> Side {
         match self {
-            Cmd::CopyRight
+            Cmd::CopyLeft
             | Cmd::DeleteLeft
-            | Cmd::OverwriteRight
+            | Cmd::OverwriteLeft
             | Cmd::RenameLeft
             | Cmd::KeepOneLeft
             | Cmd::DeleteAllLeft => Side::Left,
-            Cmd::CopyLeft
+            Cmd::CopyRight
             | Cmd::DeleteRight
-            | Cmd::OverwriteLeft
+            | Cmd::OverwriteRight
             | Cmd::RenameRight
             | Cmd::KeepOneRight
             | Cmd::DeleteAllRight => Side::Right,
@@ -596,12 +599,14 @@ fn sort_order(order: &mut [usize], metas: &[RowMeta], state: &BoardState) {
 /// this board offers, so `C` is constant down the whole board and a command
 /// never moves between rows.
 fn centre_width(metas: &[RowMeta]) -> f32 {
-    // Two columns as soon as any row pairs a left and a right command; a board
-    // whose commands all act on the row as a whole needs only one.
+    // Two columns as soon as any row carries a *side* command — even a lone
+    // one. Its half-column never collapses, because the empty other half is
+    // itself information: nothing happens to that side. Only a board whose
+    // commands all act on the row as a whole needs a single column.
     let paired = metas.iter().any(|m| {
-        layout(&m.cmds).iter().any(|l| {
-            matches!(l, Line::Sides(Some(_), Some(_))) || matches!(l, Line::Centre(_, Some(_)))
-        })
+        layout(&m.cmds)
+            .iter()
+            .any(|l| matches!(l, Line::Sides(..)) || matches!(l, Line::Centre(_, Some(_))))
     });
     CMD_W * if paired { 2.0 } else { 1.0 } + 8.0
 }
@@ -821,22 +826,47 @@ fn draw_row(
             egui::vec2(CMD_W - 8.0, BTN_H),
         )
     };
-    for (n, line) in layout(&meta.cmds).into_iter().enumerate() {
+    let lines = layout(&meta.cmds);
+    // The side-command lines sit between two tinted half-columns split by a
+    // hard midline: left half = effects on the left file, right half = the
+    // right file. The tint uses each side's accent, so the column teaches the
+    // same left/right colour language as the headers, and an empty half stays
+    // visibly empty — nothing happens to that side.
+    let n_sides = lines
+        .iter()
+        .take_while(|l| matches!(l, Line::Sides(..)))
+        .count();
+    if n_sides > 0 && centre >= CMD_W * 2.0 {
+        let bottom = row.top() + n_sides as f32 * CMD_H - CMD_GAP + 2.0;
+        let half = |x0: f32, accent: egui::Color32| {
+            let r = egui::Rect::from_min_max(
+                egui::pos2(x0, row.top() - 2.0),
+                egui::pos2(x0 + CMD_W - 2.0, bottom),
+            );
+            ui.painter()
+                .rect_filled(r, 6.0, accent.gamma_multiply(0.07));
+        };
+        half(grid_left + 1.0, theme::orange());
+        half(grid_left + CMD_W + 1.0, theme::blue());
+        ui.painter().vline(
+            grid_left + CMD_W,
+            (row.top() - 2.0)..=bottom,
+            egui::Stroke::new(1.0, theme::hairline()),
+        );
+    }
+    for (n, line) in lines.into_iter().enumerate() {
         match line {
             Line::Sides(left_cmd, right_cmd) => {
-                // Each half keeps its own column, so a row offering only the
-                // right-hand command still draws it on the right — but only
-                // when the centre actually has two columns. A board whose rows
-                // are all one-sided (GROUP SYNC BACK) reserves a single
-                // column, and drawing at column 1 there would land the button
-                // on top of the right-hand cell.
-                let two_cols = centre >= CMD_W * 2.0;
+                // Each half keeps its own column unconditionally — a row
+                // offering only a right-hand command draws it on the right and
+                // leaves the left half empty. `centre_width` reserves two
+                // columns whenever any row has a side command, so the slots
+                // always exist.
                 for (col, maybe) in [(0, left_cmd), (1, right_cmd)] {
-                    if let Some(cmd) = maybe {
-                        let col = if two_cols { col } else { 0 };
-                        if cmd_button(ui, slot(col, n), cmd, hide_skips_run).clicked() {
-                            clicked = Some(cmd);
-                        }
+                    if let Some(cmd) = maybe
+                        && cmd_button(ui, slot(col, n), cmd, hide_skips_run).clicked()
+                    {
+                        clicked = Some(cmd);
                     }
                 }
             }
@@ -1782,8 +1812,9 @@ mod tests {
         );
     }
 
-    /// A command and its mirror image share a line: `COPY >` beside `< COPY`,
-    /// `DELETE L` beside `DELETE R`. Left-hand commands take the left slot.
+    /// A command and its mirror image share a line, each in the column of the
+    /// side its **effect lands on**: `< COPY` (fills the left file) in the left
+    /// slot, `COPY >` (fills the right) in the right.
     #[test]
     fn mirrored_commands_share_a_line_left_in_the_left_slot() {
         let lines = layout(&[
@@ -1799,8 +1830,8 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                Line::Sides(Some(Cmd::CopyRight), Some(Cmd::CopyLeft)),
-                Line::Sides(Some(Cmd::OverwriteRight), Some(Cmd::OverwriteLeft)),
+                Line::Sides(Some(Cmd::CopyLeft), Some(Cmd::CopyRight)),
+                Line::Sides(Some(Cmd::OverwriteLeft), Some(Cmd::OverwriteRight)),
                 Line::Sides(Some(Cmd::DeleteLeft), Some(Cmd::DeleteRight)),
                 Line::Centre(Cmd::Compare, Some(Cmd::Hide)),
             ]
@@ -1820,7 +1851,7 @@ mod tests {
         assert_eq!(
             scrambled,
             vec![
-                Line::Sides(Some(Cmd::CopyRight), Some(Cmd::CopyLeft)),
+                Line::Sides(Some(Cmd::CopyLeft), Some(Cmd::CopyRight)),
                 Line::Sides(Some(Cmd::DeleteLeft), Some(Cmd::DeleteRight)),
             ],
             "order in, order out is not how pairing works"
@@ -1828,7 +1859,7 @@ mod tests {
     }
 
     /// A half-pair keeps its own side's column instead of sliding across, so a
-    /// right-hand command never appears under the left region.
+    /// command affecting the right file never appears under the left region.
     #[test]
     fn a_lone_command_keeps_its_own_side() {
         assert_eq!(
@@ -1838,7 +1869,8 @@ mod tests {
         );
         assert_eq!(
             layout(&[Cmd::CopyRight]),
-            vec![Line::Sides(Some(Cmd::CopyRight), None)]
+            vec![Line::Sides(None, Some(Cmd::CopyRight))],
+            "a copy that fills the right side sits in the right slot"
         );
     }
 
@@ -1924,8 +1956,7 @@ mod tests {
             for label in [
                 "COPY >",
                 "< COPY",
-                "DELETE L",
-                "DELETE R",
+                "DELETE",
                 "COMPARE",
                 "OVERWRITE >",
                 "< OVERWRITE",
@@ -1965,20 +1996,24 @@ mod tests {
         for label in [
             "COPY >",
             "< COPY",
-            "DELETE L",
-            "DELETE R",
+            "DELETE",
             "COMPARE",
             "OVERWRITE >",
             "< OVERWRITE",
             "HIDE",
         ] {
-            let r = harness.get_by_label(label).rect();
-            assert!(
-                r.bottom() <= next_row_top + 0.5,
-                "{label} spills out of its row: bottom {:.1} is below the next row's \
-                 top {next_row_top:.1}",
-                r.bottom()
-            );
+            let mut found = false;
+            for node in harness.query_all_by_label(label) {
+                found = true;
+                let r = node.rect();
+                assert!(
+                    r.bottom() <= next_row_top + 0.5,
+                    "{label} spills out of its row: bottom {:.1} is below the next row's \
+                     top {next_row_top:.1}",
+                    r.bottom()
+                );
+            }
+            assert!(found, "the command {label} was not drawn");
         }
     }
 
@@ -2010,26 +2045,33 @@ mod tests {
         }
     }
 
-    /// The same invariant for *side* commands on a one-column centre: a
-    /// GROUP SYNC BACK row carries only right-side commands (`< COPY`,
-    /// `DELETE R`), so the centre reserves one column — and the buttons must
-    /// use it, not phantom column 1 on top of the sink cell.
+    /// **A command never crosses the midline.** A GROUP SYNC BACK row offers
+    /// `< COPY` (fills the main, on the left) and `DELETE` on the sink — the
+    /// centre reserves both half-columns even though each line is one-sided,
+    /// each button keeps its own half, and neither overlaps the sink cell.
     #[test]
-    fn one_sided_row_commands_fit_a_one_column_centre() {
+    fn one_sided_commands_keep_their_own_half_of_the_centre() {
         use egui_kittest::kittest::Queryable;
         let mut row = diff_row("backsync");
         row.left_paths = vec!["main/song.mp3".to_string()];
         row.right_paths = vec!["sink/ZZZSINK.mp3".to_string()];
         row.cmds = vec![Cmd::CopyLeft, Cmd::DeleteRight];
         let harness = render(1280.0, vec![row]);
-        let right = harness.get_by_label_contains("ZZZSINK").rect();
-        for label in ["< COPY", "DELETE R"] {
-            let r = harness.get_by_label(label).rect();
+        let sink = harness.get_by_label_contains("ZZZSINK").rect();
+        let copy = harness.get_by_label("< COPY").rect();
+        let delete = harness.get_by_label("DELETE").rect();
+        assert!(
+            copy.right() <= delete.left() + 0.5,
+            "< COPY (right {:.1}) must stay in the left half, DELETE (left {:.1}) in the right",
+            copy.right(),
+            delete.left(),
+        );
+        for (label, r) in [("< COPY", copy), ("DELETE", delete)] {
             assert!(
-                r.right() <= right.left() + 0.5,
+                r.right() <= sink.left() + 0.5,
                 "{label} (right {:.1}) overlaps the sink cell (starts {:.1})",
                 r.right(),
-                right.left(),
+                sink.left(),
             );
         }
     }
@@ -2040,20 +2082,21 @@ mod tests {
     fn all_of_a_rows_commands_are_drawn() {
         use egui_kittest::kittest::Queryable;
         let harness = render(1280.0, vec![diff_row("one")]);
-        for label in [
-            "COPY >",
-            "< COPY",
-            "DELETE L",
-            "DELETE R",
-            "COMPARE",
-            "OVERWRITE >",
-            "< OVERWRITE",
-            "HIDE",
+        for (label, count) in [
+            ("COPY >", 1),
+            ("< COPY", 1),
+            // Both sides offer a delete; the shared label is disambiguated by
+            // the column each button sits in.
+            ("DELETE", 2),
+            ("COMPARE", 1),
+            ("OVERWRITE >", 1),
+            ("< OVERWRITE", 1),
+            ("HIDE", 1),
         ] {
             assert_eq!(
                 harness.query_all_by_label(label).count(),
-                1,
-                "{label} must be drawn exactly once for a single eight-command row"
+                count,
+                "{label} must be drawn exactly {count}× for a single eight-command row"
             );
         }
     }
@@ -2064,11 +2107,9 @@ mod tests {
     fn mirrored_commands_render_at_the_same_height_and_side() {
         use egui_kittest::kittest::Queryable;
         let harness = render(1280.0, vec![diff_row("one")]);
-        for (left, right) in [
-            ("COPY >", "< COPY"),
-            ("DELETE L", "DELETE R"),
-            ("OVERWRITE >", "< OVERWRITE"),
-        ] {
+        // Copies and overwrites sit on the side they *fill*: `< COPY` pulls the
+        // right file into the left repo, so it is the left slot.
+        for (left, right) in [("< COPY", "COPY >"), ("< OVERWRITE", "OVERWRITE >")] {
             let l = harness.get_by_label(left).rect();
             let r = harness.get_by_label(right).rect();
             assert!(
@@ -2083,6 +2124,20 @@ mod tests {
                 l.right(),
                 r.left()
             );
+        }
+        // The two DELETE buttons share a label; the pair must still straddle
+        // the midline at one height.
+        let mut deletes: Vec<egui::Rect> = harness
+            .query_all_by_label("DELETE")
+            .map(|n| n.rect())
+            .collect();
+        deletes.sort_by(|a, b| a.left().total_cmp(&b.left()));
+        match deletes.as_slice() {
+            [l, r] => {
+                assert!((l.top() - r.top()).abs() < 0.5, "DELETEs share a line");
+                assert!(l.right() <= r.left(), "one DELETE per half-column");
+            }
+            other => panic!("expected two DELETE buttons, got {}", other.len()),
         }
     }
 
