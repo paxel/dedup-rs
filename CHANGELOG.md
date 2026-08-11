@@ -17,7 +17,8 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 - **A Status centre, so the app never fails silently.** A top-right **STATUS** button (with an
   amber unread badge) opens a health/activity panel. At launch it probes the things that break
   quietly — the **audio output device** (so "no sound and no error" is now a visible warning),
-  **ffmpeg/ffprobe**, and **pdftoppm** — and files a **Warning** for anything missing. A
+  **ffmpeg/ffprobe**, **pdftoppm**, and **LibreOffice** — and files a **Warning** for anything
+  missing. A
   repository whose folder has gone (a disconnected drive, a closed cloud mount) files one
   **Critical** that clears when it returns. Every warning says **since when** it has been true
   (first seen, kept across repeats — "offline since Tuesday" stays Tuesday), and each can be
@@ -111,13 +112,21 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   characters differ — so you can see whether two copies say the same thing. Nothing is declared
   identical; a document with no extractable text (scanned, encrypted, or empty) says so.
   Word/Office documents keep their paragraph breaks, so their content diffs line by line.
-- **See a PDF as it looks, side by side — page by page.** A **Render** tab rasterizes a PDF's
-  pages on demand and shows them — the document's appearance, not its extracted words. One
-  shared page control (prev/next, an editable page number, and a slider for sweeping) drives
-  **both** sides, so page N sits beside page N and a duplicate-PDF walk stays aligned; a side
-  past its own end says so. Pages render in the background — a huge book never freezes the
-  app — and recent pages are kept so stepping back is instant. Needs `pdftoppm` (poppler) at
-  runtime; absent it, the tab just doesn't appear.
+  Extraction runs in the background — a slow-to-parse PDF shows a short note for a moment
+  instead of freezing the window.
+- **See a document as it looks, side by side — page by page.** A **Render** tab rasterizes a
+  document's pages on demand and shows them — its appearance, not its extracted words. A PDF
+  renders directly; Word, spreadsheets, presentations, OpenDocument — and the legacy formats
+  the Text tab can't read, **`.doc` and `.rtf`** — convert in the background via headless
+  LibreOffice first (once per session per document). **Each side has its own page control**
+  (prev/next, an editable page number beside that side's own page count, and a slider for
+  sweeping), so an extra front page on one copy is lined up by hand — the counts are stated,
+  and the tool never guesses which page maps to which. **FLICKER** (or `space`) swaps the two
+  lined-up pages in place, so a shifted paragraph or changed figure jumps out. Pages render in
+  the background — a huge book never freezes the app — and recent pages are kept so stepping
+  back is instant. Needs `pdftoppm` (poppler) at runtime, plus LibreOffice for the non-PDF
+  formats; absent a tool, the affected tab just doesn't appear (and the Status centre says
+  why).
 - **Separate Text and Hex tabs.** The viewer's **Text** tab shows *readable* content
   only — a document's extracted words or a plain-text file's text (two text files diff as
   content, aligned, not as bytes) — while the **Hex** tab shows the raw bytes of *every* file

@@ -122,7 +122,8 @@ A file can be looked at in more than one way, so the viewer is tabbed by *repres
 The tab bar offers every representation at least one side has — **Image**, **Video**,
 **Audio**, **Metadata**, **Text**, **Render**, **Strings**, **Hex** — a photo has no Audio tab, an
 untagged FLAC no Metadata tab, **Text** only a file with readable words, and **Render** only a
-PDF; but **Strings** and **Hex** are offered for every file. Selecting a tab draws only the
+document that can be drawn as pages (a PDF, or an office/legacy file when LibreOffice is
+installed); but **Strings** and **Hex** are offered for every file. Selecting a tab draws only the
 column(s) whose file supports it, always
 left (A) against right (B), never stacked. If a side steps to a copy that lacks the current
 representation, the viewer drops back to the pair's own representation.
@@ -179,7 +180,9 @@ file, its text as written. One file shows its content; comparing two, their cont
 other; a line only one side has leaves the other blank (**green**); a line that changed shows
 both versions with the differing characters marked (**amber**). Nothing is declared "the same" —
 identical content simply shows no marks. A document that yields no text (scanned, encrypted, or
-empty) says so plainly. Raw bytes are not here — they have their own **Hex** tab.
+empty) says so plainly. Extraction runs in the background — a slow-to-parse PDF shows a short
+note for a moment instead of freezing the app. Raw bytes are not here — they have their own
+**Hex** tab.
 
 ![The Text tab comparing two documents' extracted content](../screenshots/content_diff.png)
 
@@ -188,15 +191,22 @@ pretending to be blank:
 
 ![A readable file beside a document with nothing to extract](../screenshots/lightbox_text.png)
 
-**Render** shows a **PDF** rasterized page by page — the document as it actually *looks*, not
-its extracted words. One shared page control (**prev/next**, an editable page number, and a
-slider for sweeping a long document) drives **both** sides, so page N sits beside page N and a
-duplicate-PDF walk stays aligned; a side past its own last page says so. Pages render in the
-background, so even a huge book never freezes the app. Comparing two, their pages sit side by
-side to be judged by eye: there is no automated pixel diff and no "same" verdict, because
-different rendering (fonts, antialiasing) makes pixel equality meaningless. It's the visual counterpart to the Text tab's content diff —
-one reads the words, the other shows the page. Requires `pdftoppm` (poppler) at runtime; without
-it the tab simply doesn't appear, the same way video needs `ffmpeg`.
+**Render** shows a **document** rasterized page by page — as it actually *looks*, not its
+extracted words. A PDF renders directly; a Word, spreadsheet, presentation or OpenDocument
+file — and the legacy formats the Text tab can't read, **`.doc` and `.rtf`** — is first
+converted in the background (the first view takes a moment; after that the conversion is
+reused for the whole session). Comparing two, **each side has its own page control**
+(**prev/next**, an editable page number beside that side's own page count, and a slider for
+sweeping a long document), so when one copy has an extra front page you line the two up
+yourself — the tool states the counts and never guesses which page maps to which. Pages
+render in the background, so even a huge book never freezes the app. The lined-up pages are
+judged by eye: **FLICKER** (or `space`) swaps the current A page and current B page in place,
+making a shifted paragraph or a changed figure jump out; there is no automated pixel diff and
+no "same" verdict, because different rendering (fonts, antialiasing) makes pixel equality
+meaningless. It's the visual counterpart to the Text tab's content diff — one reads the
+words, the other shows the page. Requires `pdftoppm` (poppler) at runtime, and LibreOffice
+(`soffice`) for the non-PDF formats; without a tool the affected tab simply doesn't appear,
+the same way video needs `ffmpeg`.
 
 ![Two PDFs rendered to pages, side by side on the Render tab](../screenshots/render.png)
 

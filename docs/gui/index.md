@@ -39,7 +39,8 @@ so a problem never fails silently. It has two sections:
 - **Warnings** — health issues, each **Critical** (red) or **Warning** (amber), never
   a mere log line. At launch the app probes the things that fail quietly: the **audio
   output device** (so "no sound, no error" becomes a visible warning), **ffmpeg/ffprobe**
-  (video frames, soundtrack extraction, play-rates), and **pdftoppm** (the Render tab).
+  (video frames, soundtrack extraction, play-rates), **pdftoppm** (the Render tab), and
+  **LibreOffice** (rendering office and legacy documents as pages).
   At runtime, a repository whose folder has gone (a disconnected drive, a closed cloud
   mount) files one aggregated Critical that clears when it returns. Every warning says
   **since when** it has been true (first seen — a repeat doesn't reset it), and each can be
@@ -153,8 +154,10 @@ is needed for it.
 | Plain text | any `text/*` — `.txt`, `.md`, `.csv`, `.html`, `.json`, source code, logs |
 
 Legacy binary `.doc` (Word 97–2003) is **not** among them — only the modern OOXML/OpenDocument
-containers are. Everything else (images, audio, video, archives, unknown binaries) is compared
-by its own means — a perceptual fingerprint, or its raw bytes — never as text.
+containers are. A `.doc` or `.rtf` can still be *looked at* as rendered pages in the viewer's
+Render tab (via LibreOffice) — it just can't be read as text. Everything else (images, audio,
+video, archives, unknown binaries) is compared by its own means — a perceptual fingerprint, or
+its raw bytes — never as text.
 
 ## What's not here
 

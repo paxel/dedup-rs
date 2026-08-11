@@ -1,6 +1,6 @@
 # Document comparison lenses — Text · Render · Strings · Hex
 
-Status: ready-for-agent
+Status: resolved
 
 Spec synthesized 2026-08-04 from two grilling sessions ("support for other file
 formats and text view", "about text rendering") plus the first implemented slice
@@ -34,8 +34,8 @@ a faithful lens and none of them a verdict:
   looks. Comparing two, they sit side by side, each side with its **own page
   advancer**, and **flicker** swaps the current pages so subtle differences jump
   out. Judged by eye: no automated pixel diff, no page-pairing guess, no sameness
-  verdict. **[partial]** (PDF first-page render, side by side, ships now; office
-  formats, multi-page navigation, and flicker are follow-ups.)
+  verdict. **[done]** (PDF directly; office and legacy formats via headless
+  LibreOffice; per-side advancers; flicker on the current pages.)
 - **Strings** — the **printable character runs** embedded in any file's bytes (the
   `strings`-style view the Browse tab already has), now available in the viewer
   too, and comparable. **[done]**
@@ -150,9 +150,10 @@ keep-versus-delete, and never declares two things "the same."** The removed
   ("Text"/"Hex"/"Image"/"Metadata"/"Strings") because the kittest label query
   panics on multiple matches. **[done]**
 - **Extraction runs on demand and is cached** by content hash in the viewer, so it
-  runs once per pairing, never per frame. The target is a **worker thread** (the UI
-  thread never blocks); the first slice runs it synchronously, matching the existing
-  text-preview, and threading is a follow-up. **[partial]**
+  runs once per pairing, never per frame. It runs on a **worker thread** (the UI
+  thread never blocks): one job per pairing extracts both sides *and* builds the
+  content diff, keyed by content-hash pair so a stale result is dropped; a short
+  wait note holds the pane meanwhile. **[done]**
 - **Office paragraph structure.** The office extractor currently joins runs with
   spaces, so a Word/Office file extracts as one long line and its content diff
   degenerates to a single wrapped row. Teaching the office text reader to emit a
@@ -167,17 +168,17 @@ keep-versus-delete, and never declares two things "the same."** The removed
   reused by the Browse preview and the new viewer Strings tab.)
 - **Render is rasterize-to-images, compared by eye.** A core function rasterizes a
   document to page images by shelling out — `pdftoppm` for PDF, headless LibreOffice
-  (`--convert-to pdf`) then rasterize for office formats — mirroring the existing
-  external-tool pattern (ffmpeg). Absent tools ⇒ no Render tab, no error. The tab
-  reuses the image compare surface (texture, zoom/pan, flicker) but adds an
+  (`--convert-to pdf`, isolated user profile, 60 s kill switch) then rasterize for
+  office formats — mirroring the existing external-tool pattern (ffmpeg). Absent
+  tools ⇒ no Render tab, no error — and the Status centre's startup probe names the
+  missing tool. The Render **format set is wider than Text's**: everything the
+  extractor reads *plus* legacy `.doc` and `.rtf`, because Render exists precisely
+  for what text extraction can't faithfully show. Conversions are cached per
+  content hash for the session; pages render lazily per (side, page) with
+  `pdftoppm -f N -l N`; each side's count comes from `pdfinfo` once. The tab has an
   **independent per-side page advancer**; flicker swaps the *current* A page against
   the *current* B page. The machine never pairs pages or diffs pixels; it states the
-  page counts and lets the user align and judge. **[partial]** — shipped:
-  `render::render_pdf_pages` (PDF via `pdftoppm`, tool-gated) and a `Render` tab for
-  `application/pdf` showing the **first page**, one file or two side by side,
-  synchronously (fast, no async needed). Deferred: office via headless LibreOffice
-  (needs the async channel, since it is multi-second), multi-page navigation with the
-  per-side page advancer, and flicker.
+  page counts and lets the user align and judge. **[done]**
 - **The tab split is last.** Splitting the dual-purpose Text tab into independent
   **Hex** (every file), **Strings** (every file), and **Text** (readable text: documents
   + plain text) tabs is done *after* Text/Strings/Render each have content, so the tab
@@ -247,5 +248,8 @@ codebase; prefer them, add functions at them rather than new seam types:
   (Browse now reuses it), and the viewer **Strings** tab (single-file runs and a two-file
   aligned diff), and the **Render** tab (PDF first page, one file or two side by side, via
   `pdftoppm`), and the Hex/Strings/Text **tab split** (Text = readable text only; Hex always).
-  Remaining: office rendering + multi-page navigation + flicker (needs headless LibreOffice and
-  the async channel), and worker-threaded extraction.
+  The final slice (2026-08-11) closed the remainders: worker-threaded extraction (one job per
+  pairing, diff built off-thread), per-side page advancers with lazy per-page rendering and
+  `pdfinfo` counts, flicker on the current pages, and office/legacy rendering via headless
+  LibreOffice with a session conversion cache and a Status-centre probe. Nothing remains open
+  in this effort.
