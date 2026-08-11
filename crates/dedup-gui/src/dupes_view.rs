@@ -1245,6 +1245,18 @@ impl DupesView {
                         acts.push(Act::Reveal(file.absolute_path()));
                         ui.close();
                     }
+                    if ui
+                        .button(format!("{} COPY NAME", icon::COPY))
+                        .explain(
+                            self.verbosity,
+                            "Copy this file's path to the clipboard",
+                            "Copy the repository-relative path, e.g. to search another                              repository for the same name.",
+                        )
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(file.rel_path.clone());
+                        ui.close();
+                    }
                 });
             });
     }

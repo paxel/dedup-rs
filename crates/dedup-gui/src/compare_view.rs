@@ -4274,7 +4274,7 @@ fn side_strip(ui: &mut egui::Ui, side: &DiffSide, other: &DiffSide, is_left: boo
                 .max_width(name_w)
                 .stick_to_right(true)
                 .show(ui, |ui| {
-                    ui.add(
+                    let resp = ui.add(
                         egui::Label::new(
                             RichText::new(&side.rel_path)
                                 .color(theme::text())
@@ -4284,6 +4284,7 @@ fn side_strip(ui: &mut egui::Ui, side: &DiffSide, other: &DiffSide, is_left: boo
                         .wrap_mode(egui::TextWrapMode::Extend)
                         .selectable(true),
                     );
+                    crate::util::copy_menu(&resp, &side.rel_path);
                 });
         });
         // Span the frame across the whole strip (a short name leaves the row

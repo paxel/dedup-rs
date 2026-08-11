@@ -975,7 +975,8 @@ fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view:
                 view.status.color(),
                 ui,
             );
-            ui.add(egui::Label::new(job).truncate()).on_hover_text(path);
+            let path_resp = ui.add(egui::Label::new(job).truncate()).on_hover_text(path);
+            crate::util::copy_menu(&path_resp, path);
         }
         if let Some(line) = facts_line(view.size, view.modified, view.body.facts.as_ref()) {
             // An empty file is useless — copying or promoting it preserves
@@ -1257,31 +1258,93 @@ fn headers(ui: &mut egui::Ui, view: &BoardView, metas: &[RowMeta]) {
             view.left_repo,
             view.left_is_main,
             view.left_path,
+            theme::orange(),
         );
         ui.add_space(centre);
         if let Some(right) = &view.right {
-            header_cell(ui, side, right.role, right.repo, right.is_main, right.path);
+            header_cell(
+                ui,
+                side,
+                right.role,
+                right.repo,
+                right.is_main,
+                right.path,
+                theme::blue(),
+            );
         }
     });
 }
 
-fn header_cell(ui: &mut egui::Ui, width: f32, role: &str, repo: &str, is_main: bool, path: &str) {
+fn header_cell(
+    ui: &mut egui::Ui,
+    width: f32,
+    role: &str,
+    repo: &str,
+    is_main: bool,
+    path: &str,
+    accent: egui::Color32,
+) {
     ui.allocate_ui_with_layout(egui::vec2(width, 0.0), Layout::top_down(Align::Min), |ui| {
         ui.set_width(width);
         ui.label(RichText::new(role).color(theme::text()).size(11.0).strong());
         if !repo.is_empty() {
-            crate::repo_chip::repo_chip(ui, repo, false, theme::orange(), is_main, None);
+            crate::repo_chip::repo_chip(ui, repo, false, accent, is_main, None);
         }
         if !path.is_empty() {
-            ui.add(
-                egui::Label::new(
-                    RichText::new(elide_left(path, 44))
-                        .color(theme::hairline())
-                        .size(10.0),
+            // The repo path as the column's *title*: the inverse of the
+            // viewer's filename elbow — the bar runs along the TOP and falls
+            // into the cap on the right, in the side's accent.
+            const CAP_W: f32 = 8.0;
+            const BAR_H: f32 = 4.0;
+            const R: u8 = 5;
+            let bg = ui.painter().add(egui::Shape::Noop);
+            let full_w = ui.available_width();
+            ui.add_space(BAR_H + 2.0);
+            let row = ui.horizontal(|ui| {
+                ui.add_space(2.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(elide_left(path, 44))
+                            .color(theme::text())
+                            .size(10.5),
+                    )
+                    .truncate(),
                 )
-                .truncate(),
-            )
-            .on_hover_text(path);
+                .on_hover_text(path);
+                ui.add_space(CAP_W + 4.0);
+            });
+            let mut frame = row.response.rect;
+            frame.max.x = frame.min.x + full_w;
+            frame.min.y -= BAR_H;
+            let head =
+                egui::Rect::from_min_max(frame.min, egui::pos2(frame.max.x, frame.min.y + BAR_H));
+            let cap =
+                egui::Rect::from_min_max(egui::pos2(frame.max.x - CAP_W, frame.min.y), frame.max);
+            ui.painter().set(
+                bg,
+                egui::Shape::Vec(vec![
+                    egui::Shape::rect_filled(
+                        head,
+                        egui::CornerRadius {
+                            nw: R,
+                            ne: 0,
+                            sw: R,
+                            se: 0,
+                        },
+                        accent,
+                    ),
+                    egui::Shape::rect_filled(
+                        cap,
+                        egui::CornerRadius {
+                            nw: 0,
+                            ne: R,
+                            sw: 0,
+                            se: R,
+                        },
+                        accent,
+                    ),
+                ]),
+            );
         }
     });
 }

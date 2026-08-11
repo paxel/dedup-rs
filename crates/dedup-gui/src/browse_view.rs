@@ -133,6 +133,8 @@ enum Preview {
 struct FileRow {
     rel: String,
     name: String,
+    /// A tombstone: the index remembers it, the disk no longer holds it.
+    missing: bool,
     size: u64,
     mime: String,
     modified_ms: i64,
@@ -173,6 +175,10 @@ pub struct BrowseView {
     /// Flatten mode: hide the dirs pane and list every matching file under the
     /// current directory recursively (with its sub-path as the name).
     flatten: bool,
+    /// Also list files the index remembers but the disk no longer holds
+    /// (tombstones), in blue — how you find where a deleted file's siblings
+    /// live, or whether an online repo holds what an offline listing named.
+    show_deleted: bool,
     /// Batch "add tag to selected" input.
     batch_input: String,
     focus: Pane,
@@ -257,6 +263,7 @@ impl BrowseView {
             sel_rel: None,
             selected: std::collections::HashSet::new(),
             flatten: false,
+            show_deleted: false,
             batch_input: String::new(),
             focus: Pane::Dirs,
             scroll_file: false,
@@ -347,9 +354,9 @@ impl BrowseView {
         match store.open_repo_db(repo) {
             Ok(db) => {
                 let _ = for_each_file_entry(&db, |rel, entry| {
-                    if !entry.missing {
-                        entries.push((rel.to_string(), entry));
-                    }
+                    // Tombstones stay in memory; whether they are *listed* is
+                    // the SHOW DELETED toggle's per-frame decision.
+                    entries.push((rel.to_string(), entry));
                     Ok(())
                 });
             }
@@ -384,6 +391,9 @@ impl BrowseView {
             if rest.is_empty() {
                 continue;
             }
+            if entry.missing && !self.show_deleted {
+                continue;
+            }
             match rest.split_once('/') {
                 // A subdir is shown only if this descendant matches, so a subdir
                 // survives iff at least one file beneath it matches.
@@ -413,6 +423,9 @@ impl BrowseView {
         };
         let mut files = Vec::new();
         for (rel, entry) in &self.entries {
+            if entry.missing && !self.show_deleted {
+                continue;
+            }
             let Some(rest) = rel.strip_prefix(&prefix) else {
                 continue;
             };
@@ -469,6 +482,7 @@ impl BrowseView {
         }
         let jobs: Vec<(std::path::PathBuf, String, String, u64)> = order
             .into_iter()
+            .filter(|&i| !files[i].missing)
             .map(|i| {
                 let f = &files[i];
                 (
@@ -548,6 +562,7 @@ impl BrowseView {
         FileRow {
             rel: rel.to_string(),
             name: name.to_string(),
+            missing: entry.missing,
             size: entry.size,
             mime: entry.mime.clone().unwrap_or_default(),
             modified_ms: entry.modified_ms,
@@ -741,6 +756,19 @@ impl BrowseView {
                     self.sel_rel = None;
                     self.selected.clear();
                 }
+                if pill_toggle(ui, self.show_deleted, "Show deleted")
+                    .explain(
+                        self.verbosity,
+                        "Also list files this repo remembers but no longer holds (blue)",
+                        "Include deleted files the index still remembers, in blue. Useful \
+                         to check whether a file named on an offline or old listing ever \
+                         lived here — and where. Works with Flatten and the filter.",
+                    )
+                    .clicked()
+                {
+                    self.show_deleted = !self.show_deleted;
+                    self.file_sel = 0;
+                }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     egui::ScrollArea::horizontal()
                         .auto_shrink([false, true])
@@ -824,7 +852,8 @@ impl BrowseView {
             .show(ui, |ui| {
                 shortcut_bar(
                     ui,
-                    "Up/Down move · Left parent · Right enter dir · Tab switch pane",
+                    "Up/Down move · Left parent · Right enter dir · Tab switch pane · \
+                     right-click a name to copy it",
                 );
             });
 
@@ -1013,7 +1042,15 @@ impl BrowseView {
                     // Highlight every multi-selected row, plus the cursor.
                     row.set_selected(i == file_sel || selected.contains(&f.rel));
                     row.col(|ui| {
-                        ui.add(egui::Label::new(&f.name).truncate());
+                        // Tombstones read blue — the resurrection colour: the
+                        // repo remembers this file, the disk no longer has it.
+                        let text = if f.missing {
+                            egui::RichText::new(&f.name).color(theme::blue())
+                        } else {
+                            egui::RichText::new(&f.name)
+                        };
+                        let resp = ui.add(egui::Label::new(text).truncate());
+                        crate::util::copy_menu(&resp, &f.rel);
                     });
                     row.col(|ui| {
                         ui.monospace(format_size(f.size));
@@ -1151,6 +1188,29 @@ impl BrowseView {
         height: f32,
         hex_view: bool,
     ) {
+        // A tombstone has nothing on disk to preview: state the fact plainly
+        // (with the closest thing we have to a deletion date — the file's own
+        // last-modified, and "recorded gone" being the last scan).
+        if sel.missing {
+            ui.add_space(8.0);
+            ui.colored_label(
+                theme::blue(),
+                "This file was deleted — the index remembers it, the disk no longer holds it.",
+            );
+            ui.colored_label(
+                theme::tan(),
+                format!(
+                    "Recorded missing at the last scan · last modified {}",
+                    crate::util::format_mtime(sel.modified_ms)
+                ),
+            );
+            ui.colored_label(
+                theme::hairline(),
+                "Its size, type and hash are above — search another repository for the \
+                 same content to find a surviving copy.",
+            );
+            return;
+        }
         // Forced hex/strings mode (or an inherently text/unknown file) renders the
         // cached body; media renders straight from its background cache.
         if hex_view {
@@ -2138,6 +2198,7 @@ mod tests {
             let mut hash = [0u8; 32];
             hash[0] = i as u8 + 1;
             rows.push(FileRow {
+                missing: false,
                 rel: name.to_string(),
                 name: name.to_string(),
                 size: 300,
@@ -2190,10 +2251,46 @@ mod tests {
         }
     }
 
+    /// SHOW DELETED: tombstones stay out of the listing by default and appear
+    /// (flagged) when toggled — in the tree and flattened alike.
+    #[test]
+    fn show_deleted_toggle_lists_tombstones() {
+        let mut v = BrowseView::new();
+        let mut live = entry();
+        live.mime = Some("text/plain".into());
+        let mut dead = entry();
+        dead.missing = true;
+        dead.mime = Some("text/plain".into());
+        v.entries = vec![
+            ("keep.txt".to_string(), live),
+            ("gone.txt".to_string(), dead),
+        ];
+        let filter = FileFilter::parse(None).unwrap();
+        let (_, files) = v.listing(&filter);
+        assert_eq!(
+            files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            ["keep.txt"],
+            "tombstones hidden by default"
+        );
+        v.show_deleted = true;
+        let (_, files) = v.listing(&filter);
+        let mut names: Vec<_> = files.iter().map(|f| f.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["gone.txt", "keep.txt"]);
+        assert!(
+            files.iter().any(|f| f.name == "gone.txt" && f.missing),
+            "the tombstone row knows it is one (drawn blue)"
+        );
+        v.flatten = true;
+        let (_, files) = v.flat_listing(&filter);
+        assert_eq!(files.len(), 2, "flatten honours the toggle too");
+    }
+
     fn frow(name: &str, size: u64, mime: &str, modified_ms: i64) -> FileRow {
         FileRow {
             rel: name.into(),
             name: name.into(),
+            missing: false,
             size,
             mime: mime.into(),
             modified_ms,

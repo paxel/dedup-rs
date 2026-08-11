@@ -51,6 +51,12 @@ so a problem never fails silently. It has two sections:
 - **Activity** — the heavy background work you can watch and stop: a running or queued
   **scan** shows here with **CANCEL**, so a long scan can be ended without killing the app.
 
+## Copying names and paths
+
+Any file name or path label — on cards, review rows, the Browse table, or the viewer's
+filename — can be **right-clicked → Copy**, so grabbing a name to search another
+repository never requires a keyboard shortcut.
+
 ## Repository locks
 
 Every repository starts **locked** at each launch. The padlock on a repo's chip — the same

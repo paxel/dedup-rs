@@ -26,6 +26,14 @@ the disk, so it shows exactly what has been scanned.
   under the current folder, recursively — the way to act on a whole subtree at once, or to see
   everything of one kind the filter selects regardless of where it sits.
 
+## Deleted files
+
+The **Show deleted** toggle (next to Flatten) also lists files this repository *remembers*
+but no longer holds — tombstones, in **blue**. Selecting one states the fact in the dock
+(with its last-modified date; "recorded missing" means the last scan noticed it gone).
+This is how you check whether a file named on an offline or old listing ever lived here —
+it works together with Flatten and the filter, so you can sweep the whole repo for a name.
+
 ## The preview / detail dock
 
 Selecting a file fills the dock at the bottom-right: a **preview** (a real thumbnail for

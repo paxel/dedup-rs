@@ -133,6 +133,20 @@ pub fn or_log_default<T: Default, E: std::fmt::Display>(result: Result<T, E>, wh
     }
 }
 
+/// Attach a right-click **Copy** context menu to a widget's response, copying
+/// `text` to the clipboard. Any label carrying a path or name goes through
+/// this, so grabbing a filename to search elsewhere never needs a shortcut.
+pub fn copy_menu(resp: &egui::Response, text: &str) {
+    // Labels don't sense clicks by default; a context menu still works because
+    // egui tracks secondary clicks on the response's rect via interact below.
+    let resp = resp.clone().interact(egui::Sense::click());
+    resp.context_menu(|ui| {
+        if ui.button("Copy").clicked() {
+            ui.ctx().copy_text(text.to_string());
+        }
+    });
+}
+
 #[cfg(test)]
 mod explain_tests {
     use super::*;
