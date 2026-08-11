@@ -168,6 +168,16 @@ enum MediaMsg {
         path: std::path::PathBuf,
         pages: Option<usize>,
     },
+    /// One pairing's extracted document text — both sides' previews and their
+    /// pre-built content diff — produced on a worker thread, because parsing a
+    /// large PDF takes seconds and used to freeze the window. `key` is the
+    /// content-hash pair the job answers, so a result that lands after a side
+    /// was stepped elsewhere is dropped instead of shown.
+    DocText {
+        key: (String, String),
+        previews: Box<[crate::lightbox::TextPreview; 2]>,
+        diff: Box<crate::textdiff::TextDiff>,
+    },
 }
 
 /// Everything the viewer holds for one *video* side: the filmstrip, the
@@ -327,6 +337,11 @@ pub(crate) struct DiffCompare {
     /// rebuilds only when a side changes.
     textdiff: Option<crate::textdiff::TextDiff>,
     textdiff_key: Option<(String, String)>,
+    /// The content-hash pair an extraction job is currently answering on a
+    /// worker thread, so a frame never spawns the same job twice. Extraction
+    /// (and the diff build) runs off the UI thread — a slow PDF must not
+    /// freeze the app.
+    text_pending: Option<(String, String)>,
     /// The Strings tab's per-side printable runs (joined, one per line) and, when
     /// comparing, their aligned diff — cached like the text diff.
     strings: [Option<String>; 2],
@@ -458,6 +473,7 @@ impl DiffCompare {
             hex_page: 0,
             textdiff: None,
             textdiff_key: None,
+            text_pending: None,
             strings: [None, None],
             stringsdiff: None,
             stringsdiff_key: None,
@@ -826,38 +842,70 @@ impl DiffCompare {
         }
     }
 
-    /// Render the Text tab's aligned content diff for two documents: build (and
-    /// cache under the two content hashes) the line-aligned diff of both sides'
-    /// extracted text, then show it. No verdict is drawn — two identical
-    /// documents simply show no marks.
-    fn render_text_diff(&mut self, ui: &mut egui::Ui) {
-        for slot in [0usize, 1usize] {
-            if self.text[slot].is_none() {
-                let side = if slot == 0 { &self.left } else { &self.right };
-                self.text[slot] = Some(document_preview(&side.facts));
-            }
-        }
-        let key = (
+    /// The content-hash pair identifying the current left/right files — the
+    /// cache key for extracted text and its diff.
+    fn text_key(&self) -> (String, String) {
+        (
             self.left.facts.hash_hex.clone(),
             self.right.facts.hash_hex.clone(),
-        );
-        if self.textdiff_key.as_ref() != Some(&key) {
-            let td = {
-                let a = self.text[0]
-                    .as_ref()
-                    .map(|t| t.body.as_str())
-                    .unwrap_or_default();
-                let b = self.text[1]
-                    .as_ref()
-                    .map(|t| t.body.as_str())
-                    .unwrap_or_default();
-                crate::textdiff::TextDiff::build(a, b)
-            };
-            self.textdiff = Some(td);
-            self.textdiff_key = Some(key);
+        )
+    }
+
+    /// Make sure the current pairing's extracted text (and its content diff)
+    /// is being produced on a **worker thread** — parsing a large PDF takes
+    /// seconds and doing it in the paint frame froze the whole app. Results
+    /// land via [`MediaMsg::DocText`], keyed so a stale job is dropped.
+    fn ensure_doc_text(&mut self, ctx: &Context) {
+        let key = self.text_key();
+        let ready = self.text[0].is_some()
+            && self.text[1].is_some()
+            && self.textdiff_key.as_ref() == Some(&key);
+        if ready || self.text_pending.as_ref() == Some(&key) {
+            return;
         }
-        if let Some(td) = &self.textdiff {
+        self.text_pending = Some(key.clone());
+        let (lf, rf) = (self.left.facts.clone(), self.right.facts.clone());
+        let tx = self.media_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let a = document_preview(&lf);
+            let b = document_preview(&rf);
+            let diff = crate::textdiff::TextDiff::build(&a.body, &b.body);
+            let _ = tx.send(MediaMsg::DocText {
+                key,
+                previews: Box::new([a, b]),
+                diff: Box::new(diff),
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    /// The centred "still working" note shown while a worker extracts the
+    /// current pairing's text. Deliberately names no tab.
+    fn doc_text_wait_note(ui: &mut egui::Ui, area: Rect) {
+        ui.ctx().request_repaint();
+        ui.painter().text(
+            area.center(),
+            Align2::CENTER_CENTER,
+            "Reading the document… a large file can take a moment.",
+            FontId::proportional(13.0),
+            theme::tan(),
+        );
+    }
+
+    /// Render the Text tab's aligned content diff for two documents: show the
+    /// line-aligned diff of both sides' extracted text, built off the UI
+    /// thread and cached under the two content hashes. No verdict is drawn —
+    /// two identical documents simply show no marks.
+    fn render_text_diff(&mut self, ui: &mut egui::Ui) {
+        let key = self.text_key();
+        if self.textdiff_key.as_ref() == Some(&key)
+            && let Some(td) = &self.textdiff
+        {
             td.show(ui);
+        } else {
+            let area = ui.max_rect();
+            Self::doc_text_wait_note(ui, area);
         }
     }
 
@@ -2011,6 +2059,24 @@ impl DiffCompare {
                         self.render_count[slot] = pages;
                     }
                 }
+                MediaMsg::DocText {
+                    key,
+                    previews,
+                    diff,
+                } => {
+                    if self.text_pending.as_ref() == Some(&key) {
+                        self.text_pending = None;
+                    }
+                    // An extraction that finished after a side was stepped
+                    // elsewhere answers files no longer shown — drop it.
+                    if key != self.text_key() {
+                        continue;
+                    }
+                    let [a, b] = *previews;
+                    self.text = [Some(a), Some(b)];
+                    self.textdiff = Some(*diff);
+                    self.textdiff_key = Some(key);
+                }
             }
         }
     }
@@ -2842,6 +2908,10 @@ impl DiffCompare {
                     // Readable text: a document's extracted words, or a plain-text
                     // file's raw text — one file, or an aligned content diff when
                     // comparing two. Raw bytes live on the Hex tab now, never here.
+                    // Extraction (and the diff build) always runs on a worker
+                    // thread; until it lands, a short wait note holds the pane.
+                    let ctx = ui.ctx().clone();
+                    self.ensure_doc_text(&ctx);
                     if two_sided_now {
                         // Below the per-side action strip (which extends past the
                         // titles into the viewport top) so the diff's own controls
@@ -2858,13 +2928,10 @@ impl DiffCompare {
                                 .layout(Layout::top_down(Align::Min)),
                         );
                         self.render_text_diff(&mut child);
+                    } else if self.text[0].is_none() {
+                        // The worker is still extracting this side's words.
+                        Self::doc_text_wait_note(ui, viewport);
                     } else {
-                        for slot in [0usize, 1usize] {
-                            if self.text[slot].is_none() {
-                                let side = if slot == 0 { &self.left } else { &self.right };
-                                self.text[slot] = Some(document_preview(&side.facts));
-                            }
-                        }
                         let (lt, rt) = (
                             self.text[0].as_ref().cloned(),
                             self.text[1].as_ref().cloned(),
