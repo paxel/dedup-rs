@@ -3026,10 +3026,11 @@ impl TransferView {
                 // Clicking the row opens the file that actually exists — the
                 // sink's copy on a back-sync board, the source's otherwise (a
                 // planned target file may not be on disk yet). A row with no
-                // source side at all — a SYNC/MIRROR *deletion* row — falls
-                // back to the target's file: those are exactly the rows worth
+                // source side at all — a deletion row — falls back to the
+                // right side's file: those are exactly the rows worth
                 // inspecting before data is lost, so a click must never be a
-                // no-op.
+                // no-op. On a GROUP SYNC board several sinks share the right
+                // side, so the repo comes from the row's own chip.
                 board::Cmd::OpenRow => {
                     let (repo, rel) = if self.command == Command::GroupSyncBack {
                         (
@@ -3039,7 +3040,12 @@ impl TransferView {
                     } else if let Some(rel) = meta.left_paths.first() {
                         (self.source.clone(), Some(rel.clone()))
                     } else {
-                        (self.target.clone(), meta.right_paths.first().cloned())
+                        let repo = self
+                            .preview_bodies
+                            .get(a.row)
+                            .and_then(|b| b.right.repo.clone())
+                            .or_else(|| self.target.clone());
+                        (repo, meta.right_paths.first().cloned())
                     };
                     if let (Some(repo), Some(rel)) = (repo, rel) {
                         acts.push(Act::OpenPreviewRow(repo, rel));
