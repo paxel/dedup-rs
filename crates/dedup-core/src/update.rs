@@ -201,8 +201,10 @@ fn walk_and_split(
                 continue;
             }
         };
+        // Rel paths are stored with `/` separators on every OS — the index is
+        // portable, and every lookup/join in the codebase assumes it.
         let rel = match entry.path().strip_prefix(root) {
-            Ok(rel) => rel.to_string_lossy().into_owned(),
+            Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
             Err(_) => continue,
         };
         let modified_ms = metadata.modified().ok().map(system_time_to_ms).unwrap_or(0);
