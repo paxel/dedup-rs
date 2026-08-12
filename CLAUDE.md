@@ -9,8 +9,8 @@ cargo build
 cargo run                        # GUI (the CLI binary delegates to dedup-gui when run without args)
 cargo run -- <subcommand>        # CLI, e.g. cargo run -- repo ls
 cargo test                       # all tests
-cargo test -p dedup-core --test diff_ops          # one integration test file
-cargo test -p dedup-gui filter_ui                 # GUI tests matching a name
+cargo test -p dedup-rs-core --test diff_ops          # one integration test file
+cargo test -p dedup-rs-gui filter_ui                 # GUI tests matching a name
 cargo fmt --check                # must pass before work is done
 cargo clippy -- -D warnings      # must be clean (zero warnings)
 ```
@@ -19,12 +19,15 @@ Building `dedup-gui` on Linux needs ALSA headers (`libasound2-dev` on Debian/Ubu
 
 GUI rendering is verified by `#[ignore]`d render tests that write a PNG for you to look at — `doc_screenshot_*` (into `docs/screenshots/`) and `render_*` (into `target/`). There is no pixel-diff baseline: it was renderer-specific, so it could only ever pass on the machine that generated it. Run them explicitly:
 ```bash
-cargo test -p dedup-gui doc_screenshot -- --ignored
+cargo test -p dedup-rs-gui doc_screenshot -- --ignored
 ```
 
 ## Architecture
 
-Three-crate workspace with strict boundaries (see `AGENTS.md`):
+Three-crate workspace with strict boundaries (see `AGENTS.md`). The **package names** are
+`dedup-rs-core` / `dedup-rs-cli` / `dedup-rs-gui` (the short names are taken on crates.io) —
+use those with `-p` — while directories, lib targets (`dedup_core`, `dedup_gui`) and the
+`dedup` binary keep the short names:
 
 - **`crates/dedup-core`** — pure domain logic: redb store, scanning/hashing, perceptual fingerprints, duplicate/diff/similarity operations. MUST NOT import `egui`, `eframe`, or `clap`. Long-running operations are plain functions taking a `&Store` plus a `Progress` callback trait; errors use `thiserror`.
 - **`crates/dedup-cli`** — `clap` subcommands with `indicatif` progress; `anyhow` at the entry point. Invoked without a subcommand it launches the GUI.

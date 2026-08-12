@@ -1577,7 +1577,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7eed2c4702fa172d1ce21078faa7c5203e69f5394d48cc436d25928394a867a2"
 
 [[package]]
-name = "dedup-cli"
+name = "dedup-rs-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1585,8 +1585,8 @@ dependencies = [
  "chrono",
  "clap",
  "ctrlc",
- "dedup-core",
- "dedup-gui",
+ "dedup-rs-core",
+ "dedup-rs-gui",
  "indicatif",
  "log",
  "predicates",
@@ -1594,7 +1594,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "dedup-core"
+name = "dedup-rs-core"
 version = "0.1.0"
 dependencies = [
  "argon2",
@@ -1627,12 +1627,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "dedup-gui"
+name = "dedup-rs-gui"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "crossbeam-channel",
- "dedup-core",
+ "dedup-rs-core",
  "eframe",
  "egui",
  "egui_extras",

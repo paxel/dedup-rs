@@ -31,6 +31,15 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   is disconnected (a closed cloud folder, an ejected disk), the pane says **"This file isn't
   present — its drive may be disconnected"** instead of a blank preview.
 - CLI (`dedup <command>`) and LCARS desktop app (`dedup` with no arguments).
+- **Installable on all three desktop OSes.** Every release ships prebuilt artifacts: a
+  Debian `.deb` and a plain tarball for Linux, a zip for Windows with **two executables**
+  (`dedup.exe`, the console CLI, and `dedup-gui.exe`, which opens the app without a console
+  window — the double-click target), and for macOS a drag-to-Applications **`dedup.app`
+  bundle in a `.dmg`** (unsigned: right-click → Open on first launch) plus a plain tarball,
+  for Apple silicon and Intel. Package channels track releases automatically:
+  `brew install paxel/tap/dedup`, a Scoop bucket for Windows, and
+  `cargo install dedup-rs-cli` from crates.io (the binary is `dedup`). External tools stay
+  optional everywhere — ffmpeg, poppler and LibreOffice unlock their features when present.
 - **Repositories** tab: create, rename, relocate, duplicate, remove and scan repositories, with per-repo stats and MIME breakdown.
 - **Duplicates** tab: find exact or perceptually-similar duplicates across selected repos, review as file cards with a best-copy pick, and delete the rest; image/video/audio previews and a zoom/pan lightbox with A/B compare.
 - **Every file gets a preview.** Text files show their **first lines** right on the card

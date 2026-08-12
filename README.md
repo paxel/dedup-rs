@@ -1,5 +1,7 @@
 # dedup-rs
 
+[![CI](https://github.com/paxel/dedup-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/paxel/dedup-rs/actions/workflows/ci.yml)
+
 A high-performance, native Rust file-deduplication tool with both a desktop GUI and a
 fast command-line interface, packaged as a single self-contained binary.
 
@@ -7,6 +9,28 @@ Content identity is always size + BLAKE3 hash — paths never matter — with pe
 perceptual fingerprints (image, video, PDF/office/text, audio) for near-duplicate search.
 It is a three-crate workspace: `dedup-core` (domain logic), `dedup-cli` (`clap` CLI), and
 `dedup-gui` (an `egui`/`eframe` LCARS-styled desktop app), backed by a `redb` embedded store.
+
+## Installing
+
+Every release ships prebuilt binaries on the
+[releases page](https://github.com/paxel/dedup-rs/releases); the package channels below
+track them automatically.
+
+| OS      | Channel                                                                                   |
+| ------- | ----------------------------------------------------------------------------------------- |
+| Linux   | `.deb` from the releases page, or the plain `dedup-<ver>-linux-x86_64.tar.gz`             |
+| macOS   | `brew install paxel/tap/dedup`, or the `.dmg` (a drag-to-Applications app bundle)         |
+| Windows | `scoop bucket add paxel https://github.com/paxel/scoop-bucket` then `scoop install dedup` |
+| Any     | `cargo install dedup-rs-cli` (builds from source; binary is `dedup`)                      |
+
+The macOS builds are **unsigned**: on first launch, right-click the app → **Open** to get
+past Gatekeeper (once; afterwards it opens normally). The Windows zip carries two
+executables — `dedup.exe` (the CLI, console) and `dedup-gui.exe` (the app, no console
+window; the double-click target).
+
+Optional tools unlock extra features at runtime and the app degrades gracefully without
+them: `ffmpeg` (video), `poppler` (PDF page rendering), LibreOffice (office/legacy document
+rendering).
 
 ## Building & running
 
@@ -78,10 +102,10 @@ The same operations are available headless via `dedup <command>`.
 
 - [**CLI Reference**](docs/cli.md) — every command, in depth, with examples.
 - [**GUI Guide**](docs/gui/index.md) — a walkthrough of every tab and control, with screenshots.
-- [**Releasing & hosting**](docs/hosting.md) — packaging and the per-release workflow.
+- [**Releasing**](docs/releasing.md) — the tag-driven release workflow and its one-time setup.
 - [**Agent Guidelines**](AGENTS.md) — Rust patterns, error-handling policy, and coding standards.
 - [**Changelog**](CHANGELOG.md) — record of user-facing changes.
 
 ## License
 
-Apache-2.0.
+MIT.

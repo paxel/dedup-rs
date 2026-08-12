@@ -5115,6 +5115,31 @@ mod tests {
         h
     }
 
+    /// [`rendered`] for views that legitimately keep repainting (a Render pane
+    /// waiting on a rasterizer worker): a fixed number of steps instead of
+    /// `run`, which panics on sustained repaints.
+    fn rendered_steps(
+        cmp: DiffCompare,
+        steps: usize,
+    ) -> egui_kittest::Harness<'static, DiffCompare> {
+        let mut init = false;
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1200.0, 800.0))
+            .build_ui_state(
+                move |ui, cmp: &mut DiffCompare| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    cmp.view(&ui.ctx().clone(), TooltipVerbosity::default(), None);
+                },
+                cmp,
+            );
+        h.run_steps(steps);
+        h
+    }
+
     /// A `.docx` side on disk whose single paragraph is `word`.
     fn docx_side(dir: &Path, name: &str, word: &str) -> DiffSide {
         use std::io::Write;
@@ -5269,7 +5294,9 @@ mod tests {
             Vec::new(),
         );
         cmp.tab = RepresentationKind::Render;
-        let h = rendered(cmp);
+        // The Render pane repaints while its rasterizer workers run; step a
+        // fixed number of frames instead of running to quiescence.
+        let h = rendered_steps(cmp, 4);
         let prevs: Vec<_> = h.query_all_by_label("< PREV").map(|n| n.rect()).collect();
         assert_eq!(prevs.len(), 2, "one page advancer per side");
         let (a, b) = if prevs[0].left() < prevs[1].left() {

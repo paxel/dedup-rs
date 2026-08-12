@@ -130,7 +130,7 @@ license_line=$(head -1 LICENSE 2>/dev/null || echo "See the project LICENSE file
 install -Dm644 /dev/stdin "$pkgdir/usr/share/doc/dedup/copyright" <<EOF
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: dedup-rs
-Source: https://sr.ht/~yourusername/dedup-rs
+Source: https://github.com/paxel/dedup-rs
 
 Files: *
 Copyright: Patrick Zimmer <taum@tuta.io>

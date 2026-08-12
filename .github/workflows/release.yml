@@ -1,0 +1,224 @@
+# Release on tag: `git tag v0.1.0 && git push --tags` produces everything.
+#
+#   gate            — the full Linux gate once more (fmt, clippy, all tests)
+#   build-linux     — .deb (packaging/mkdeb.sh --release) + binary tar.gz
+#   build-windows   — zip with dedup.exe (console) and dedup-gui.exe (GUI)
+#   build-macos     — binary tar.gz + unsigned dedup.app in a .dmg, per arch
+#   release         — GitHub Release, notes = the CHANGELOG section for the tag
+#   publish-crates  — crates.io in dependency order (core → gui → cli)
+#   channels        — Homebrew formula + Scoop manifest pushed to the tap/bucket
+#
+# One-time setup (repository secrets):
+#   CARGO_REGISTRY_TOKEN — crates.io API token (publish scope)
+#   CHANNEL_PAT          — PAT with push access to paxel/homebrew-tap and
+#                          paxel/scoop-bucket
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: Gate (Linux, full)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev pkg-config \
+            mesa-vulkan-drivers libvulkan1 \
+            ffmpeg poppler-utils
+      - name: Tag matches the crate version
+        run: |
+          ver=$(grep -m1 '^version' crates/dedup-cli/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          tag=${GITHUB_REF_NAME#v}
+          [ "$ver" = "$tag" ] || { echo "tag v$tag != crate version $ver" >&2; exit 1; }
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  build-linux:
+    name: Linux artifacts
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev pkg-config dpkg-dev lintian
+      - name: Build .deb (also builds the release binary)
+        run: packaging/mkdeb.sh --release --out dist
+      - name: Binary tarball
+        run: |
+          ver=${GITHUB_REF_NAME#v}
+          tar -C target/release -czf "dist/dedup-${ver}-linux-x86_64.tar.gz" dedup
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+
+  build-windows:
+    name: Windows artifacts
+    needs: gate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binaries
+        run: cargo build --release -p dedup-rs-cli -p dedup-rs-gui
+      - name: Zip (console dedup.exe + GUI dedup-gui.exe)
+        shell: pwsh
+        run: |
+          $ver = $env:GITHUB_REF_NAME.TrimStart("v")
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path target/release/dedup.exe, `
+                                 target/release/dedup-gui.exe, `
+                                 LICENSE `
+                           -DestinationPath "dist/dedup-$ver-windows-x86_64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  build-macos:
+    name: macOS artifacts (${{ matrix.arch }})
+    needs: gate
+    strategy:
+      matrix:
+        include:
+          - runner: macos-latest
+            arch: arm64
+          - runner: macos-13
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release -p dedup-rs-cli
+      - name: Tarball + app bundle + dmg
+        run: |
+          ver=${GITHUB_REF_NAME#v}
+          mkdir -p dist
+          tar -C target/release -czf "dist/dedup-${ver}-macos-${{ matrix.arch }}.tar.gz" dedup
+          packaging/mkapp.sh target/release/dedup "$ver" dist
+          rm -rf dist/dedup.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/*
+
+  release:
+    name: GitHub Release
+    needs: [build-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release notes from the CHANGELOG section
+        run: |
+          ver=${GITHUB_REF_NAME#v}
+          awk -v ver="$ver" '
+            $0 ~ "^## \\[" ver "\\]" { grab = 1; next }
+            grab && (/^## \[/ || /^---/) { exit }
+            grab { print }
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "Release $ver." > notes.md
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "dedup $GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            dist/*
+
+  publish-crates:
+    name: crates.io (core → gui → cli)
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
+      - name: Publish in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish -p dedup-rs-core
+          sleep 30
+          cargo publish -p dedup-rs-gui
+          sleep 30
+          cargo publish -p dedup-rs-cli
+
+  channels:
+    name: Homebrew tap + Scoop bucket
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Render formula and manifest from the templates
+        run: |
+          ver=${GITHUB_REF_NAME#v}
+          sha() { sha256sum "dist/$1" | cut -d' ' -f1; }
+          mkdir -p out
+          sed -e "s/{{VERSION}}/$ver/g" \
+              -e "s/{{SHA_MACOS_ARM64}}/$(sha dedup-$ver-macos-arm64.tar.gz)/" \
+              -e "s/{{SHA_MACOS_X86_64}}/$(sha dedup-$ver-macos-x86_64.tar.gz)/" \
+              -e "s/{{SHA_LINUX_X86_64}}/$(sha dedup-$ver-linux-x86_64.tar.gz)/" \
+              packaging/homebrew/dedup.rb.tmpl > out/dedup.rb
+          sed -e "s/{{VERSION}}/$ver/g" \
+              -e "s/{{SHA_WINDOWS_X86_64}}/$(sha dedup-$ver-windows-x86_64.zip)/" \
+              packaging/scoop/dedup.json.tmpl > out/dedup.json
+      - name: Push to the tap
+        env:
+          GH_TOKEN: ${{ secrets.CHANNEL_PAT }}
+        run: |
+          ver=${GITHUB_REF_NAME#v}
+          git config --global user.name "dedup-release-bot"
+          git config --global user.email "taum@tuta.io"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/paxel/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp out/dedup.rb tap/Formula/dedup.rb
+          git -C tap add Formula/dedup.rb
+          git -C tap commit -m "dedup $ver"
+          git -C tap push
+      - name: Push to the bucket
+        env:
+          GH_TOKEN: ${{ secrets.CHANNEL_PAT }}
+        run: |
+          ver=${GITHUB_REF_NAME#v}
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/paxel/scoop-bucket.git" bucket
+          mkdir -p bucket/bucket
+          cp out/dedup.json bucket/bucket/dedup.json
+          git -C bucket add bucket/dedup.json
+          git -C bucket commit -m "dedup $ver"
+          git -C bucket push
