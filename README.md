@@ -16,13 +16,14 @@ Every release ships prebuilt binaries on the
 [releases page](https://github.com/paxel/dedup-rs/releases); the package channels below
 track them automatically.
 
-| OS      | Channel                                                                                   |
-| ------- | ----------------------------------------------------------------------------------------- |
-| Linux   | `brew install paxel/tap/dedup`, the `.deb` from the releases page, or the plain tarball   |
-| macOS   | `brew install paxel/tap/dedup`, or the `.dmg` (a drag-to-Applications app bundle)         |
-| Windows | `scoop bucket add paxel https://github.com/paxel/scoop-bucket` then `scoop install dedup` |
-| Any     | `cargo install dedup-rs-cli` (builds from source; binary is `dedup`)                      |
+| OS      | Channel                                                                                    |
+| ------- | ------------------------------------------------------------------------------------------ |
+| Linux   | `brew install paxel/tap/dedup`, or the `.deb`, AppImage or plain tarball (x86_64 + arm64)  |
+| macOS   | `brew install paxel/tap/dedup`, or the `.dmg` (a drag-to-Applications app bundle)          |
+| Windows | `scoop bucket add paxel https://github.com/paxel/scoop-bucket` then `scoop install dedup`  |
+| Any     | `cargo install dedup-rs-cli` (builds from source; binary is `dedup`)                       |
 
+The AppImage runs on any distribution after a one-time `chmod +x`.
 The macOS builds are **unsigned**: on first launch, right-click the app → **Open** to get
 past Gatekeeper (once; afterwards it opens normally). The Windows zip carries two
 executables — `dedup.exe` (the CLI, console) and `dedup-gui.exe` (the app, no console

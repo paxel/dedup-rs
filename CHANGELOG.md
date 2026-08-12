@@ -17,8 +17,10 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   parent of the last folder you picked — never back at the home directory — and the memory
   survives restarts. Dialogs with an obvious anchor (exporting into a chosen target) start
   there instead.
-- **Linux arm64 builds.** Releases now also ship a Debian `.deb` and a binary tarball for
-  arm64 Linux, alongside the existing x86_64 artifacts.
+- **Linux arm64 builds, and an AppImage.** Releases now also ship arm64 Linux artifacts
+  alongside the existing x86_64 ones, and both architectures gain a distribution-independent
+  **AppImage** download — `chmod +x`, run, no install — next to the `.deb` and the plain
+  tarball.
 
 ### Fixed
 

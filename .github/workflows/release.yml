@@ -85,6 +85,8 @@ jobs:
         run: |
           ver=${RELEASE_TAG#v}
           tar -C target/release -czf "dist/dedup-${ver}-linux-${{ matrix.arch }}.tar.gz" dedup
+      - name: AppImage (reuses the release binary)
+        run: packaging/mkappimage.sh --release --out dist --no-build
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.arch }}

@@ -17,8 +17,9 @@ The `Release` GitHub Actions workflow:
 1. **Gate** — the full Linux check once more: `cargo fmt --check`, clippy with zero
    warnings, the complete test suite (software Vulkan, ffmpeg, poppler installed).
 2. **Artifacts**
-   - Linux: `dedup_<ver>_amd64.deb` (via `packaging/mkdeb.sh --release`) and
-     `dedup-<ver>-linux-x86_64.tar.gz`.
+   - Linux (x86_64 and arm64): `dedup_<ver>_<arch>.deb` (via
+     `packaging/mkdeb.sh --release`), `dedup-<ver>-linux-<arch>.tar.gz`, and
+     `dedup-<ver>-linux-<arch>.AppImage` (via `packaging/mkappimage.sh --release`).
    - Windows: `dedup-<ver>-windows-x86_64.zip` holding `dedup.exe` (console CLI) and
      `dedup-gui.exe` (windows-subsystem GUI, the double-click target).
    - macOS (arm64 and x86_64): `dedup-<ver>-macos-<arch>.tar.gz` and an **unsigned**
