@@ -2,7 +2,7 @@
 # Published as `dedup-rs-gui` (the shorter names are taken on crates.io);
 # the lib target keeps the `dedup_gui` name so imports stay unchanged.
 name = "dedup-rs-gui"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "LCARS-styled egui desktop app of dedup-rs, a forensic data-inheritance triage tool"
 license = "MIT"
@@ -19,7 +19,7 @@ name = "dedup-gui"
 path = "src/bin/dedup_gui.rs"
 
 [dependencies]
-dedup-rs-core = { path = "../dedup-core", version = "0.1.1" }
+dedup-rs-core = { path = "../dedup-core", version = "0.1.2" }
 redb = "2.1"
 eframe = "0.35"
 egui = "0.35"
