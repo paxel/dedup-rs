@@ -308,6 +308,16 @@ impl DupesView {
             self.sync_repos(store);
         }
 
+        // A repo can be re-locked from any tab's padlock (the lock registry is
+        // app-wide); marks made while it was open must not survive that, or
+        // DELETE ALL MARKED would delete from a repo the user just protected.
+        // Per-file unlock overrides are the one deliberate exception.
+        {
+            let ro = self.read_only_names();
+            self.marked
+                .retain(|k| !ro.contains(&k.0) || self.unlocked.contains(k));
+        }
+
         let mut acts: Vec<Act> = Vec::new();
 
         // Grid keyboard shortcuts — skipped while a lightbox or confirm modal
@@ -1886,6 +1896,13 @@ impl DupesView {
         keys: Vec<FileKey>,
         follow: DeleteFollow,
     ) {
+        // Final gate against the app-wide locks: a repo re-locked from another
+        // tab after these keys were marked must not lose files, whatever path
+        // queued the delete. Per-file unlock overrides still pass.
+        let keys: Vec<FileKey> = keys
+            .into_iter()
+            .filter(|k| !self.repo_is_ro(&k.0) || self.unlocked.contains(k))
+            .collect();
         if self.busy.is_some() || keys.is_empty() {
             return;
         }

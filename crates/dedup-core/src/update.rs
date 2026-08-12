@@ -202,9 +202,21 @@ fn walk_and_split(
             }
         };
         // Rel paths are stored with `/` separators on every OS — the index is
-        // portable, and every lookup/join in the codebase assumes it.
+        // portable, and every lookup/join in the codebase assumes it. Joined
+        // per component, NOT via a blanket `\ → /` replace: on Unix a file
+        // may legally be *named* `a\b.txt`, and rewriting that would corrupt
+        // its index key.
         let rel = match entry.path().strip_prefix(root) {
-            Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+            Ok(rel) => {
+                let mut s = String::new();
+                for part in rel.components() {
+                    if !s.is_empty() {
+                        s.push('/');
+                    }
+                    s.push_str(&part.as_os_str().to_string_lossy());
+                }
+                s
+            }
             Err(_) => continue,
         };
         let modified_ms = metadata.modified().ok().map(system_time_to_ms).unwrap_or(0);

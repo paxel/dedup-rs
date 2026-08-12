@@ -835,7 +835,15 @@ fn preview_sync(
     // delete: the source no longer has it (absent), the target loses it
     // (removed). Capped.
     let tgt_idx = content_idx(tgt_db.as_deref());
-    let mut resurrections = 0usize;
+    // The resurrection count is a *whole-plan* safety number (the status line
+    // reports whole-plan totals): counted over every copy, never just the
+    // capped preview rows, or a big plan would hide exactly the warning the
+    // tombstones exist to raise. It is an in-memory map probe — cheap.
+    let resurrections = plan
+        .copies
+        .iter()
+        .filter(|rel| copy_resurrects(src_db.as_deref(), tgt_idx.as_ref(), rel))
+        .count();
     let (mut rows, mut bodies): (Vec<_>, Vec<_>) = plan
         .copies
         .iter()
@@ -848,9 +856,6 @@ fn preview_sync(
             // file's preview under green NEW — or blue WAS DELETED when the
             // copy resurrects (it still runs; the veil informs).
             let resurrect = copy_resurrects(src_db.as_deref(), tgt_idx.as_ref(), rel);
-            if resurrect {
-                resurrections += 1;
-            }
             let facts = facts_for(src_db.as_deref(), src_base.as_deref(), rel);
             let (arrive_status, veil) = if resurrect {
                 (board::Status::Resurrect, CO_WAS_DELETED)
@@ -3003,15 +3008,21 @@ impl TransferView {
                 }
                 // Clicking the row opens the file that actually exists — the
                 // sink's copy on a back-sync board, the source's otherwise (a
-                // planned target file may not be on disk yet).
+                // planned target file may not be on disk yet). A row with no
+                // source side at all — a SYNC/MIRROR *deletion* row — falls
+                // back to the target's file: those are exactly the rows worth
+                // inspecting before data is lost, so a click must never be a
+                // no-op.
                 board::Cmd::OpenRow => {
                     let (repo, rel) = if self.command == Command::GroupSyncBack {
                         (
                             self.selected_sinks.first().cloned(),
                             meta.right_paths.first().cloned(),
                         )
+                    } else if let Some(rel) = meta.left_paths.first() {
+                        (self.source.clone(), Some(rel.clone()))
                     } else {
-                        (self.source.clone(), meta.left_paths.first().cloned())
+                        (self.target.clone(), meta.right_paths.first().cloned())
                     };
                     if let (Some(repo), Some(rel)) = (repo, rel) {
                         acts.push(Act::OpenPreviewRow(repo, rel));

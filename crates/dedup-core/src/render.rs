@@ -116,11 +116,19 @@ pub fn convert_to_pdf(doc: &Path, out_dir: &Path) -> Option<PathBuf> {
     // The profile lives inside `out_dir`, so it shares the caller's cleanup.
     let profile = out_dir.join("soffice-profile");
     std::fs::create_dir_all(&profile).ok()?;
+    // A proper file URL on every OS: `file:///C:/Users/...` on Windows
+    // (backslashes and the bare `file://C:\` form are misparsed, silently
+    // losing the profile isolation), `file:///tmp/...` on Unix.
+    let profile_url = format!(
+        "file:///{}",
+        profile
+            .display()
+            .to_string()
+            .replace('\\', "/")
+            .trim_start_matches('/')
+    );
     let mut child = Command::new("soffice")
-        .arg(format!(
-            "-env:UserInstallation=file://{}",
-            profile.display()
-        ))
+        .arg(format!("-env:UserInstallation={profile_url}"))
         .args([
             "--headless",
             "--norestore",

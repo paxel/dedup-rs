@@ -59,7 +59,7 @@ else
 fi
 
 # --- build -------------------------------------------------------------------
-build_flags=(--release -p dedup-cli --locked)
+build_flags=(--release -p dedup-rs-cli --locked)
 [ -n "$TARGET" ] && build_flags+=(--target "$TARGET")
 if [ "$DO_BUILD" -eq 1 ]; then
   echo "mkdeb: building dedup ($MODE, version $ver${TARGET:+, target $TARGET})…"

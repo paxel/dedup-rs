@@ -253,6 +253,29 @@ fn update_unknown_repo_fails() -> TestResult {
     Ok(())
 }
 
+/// On Unix a backslash is an ordinary filename character; the scan's
+/// separator normalization must not rewrite it (that would index a path the
+/// disk doesn't have). Windows can't create such a name, so unix-only.
+#[cfg(unix)]
+#[test]
+fn a_unix_filename_containing_a_backslash_keeps_it() -> TestResult {
+    let tempdir = tempfile::tempdir()?;
+    let (store, data) = setup(tempdir.path())?;
+    write(&data, "a\\b.txt", b"legal name")?;
+
+    let stats = update_repo(&store, "test", 1, &NoProgress, &CancellationToken::new())?;
+    assert_eq!(stats.added, 1);
+    assert!(
+        store.get_file_entry("test", "a\\b.txt")?.is_some(),
+        "the backslash is part of the name, not a separator"
+    );
+    assert!(
+        store.get_file_entry("test", "a/b.txt")?.is_none(),
+        "no rewritten twin appears"
+    );
+    Ok(())
+}
+
 // chmod-based: on Windows there is no mode-bit way to make a file unreadable,
 // so this scenario is asserted on unix only.
 #[cfg(unix)]

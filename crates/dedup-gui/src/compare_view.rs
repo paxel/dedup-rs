@@ -971,12 +971,18 @@ impl DiffCompare {
     /// The session-wide cache of office documents converted to PDF, keyed by
     /// content hash — LibreOffice takes seconds per conversion, so each
     /// document converts **once per session** no matter how often a viewer
-    /// opens it. Lives in a temp dir removed when the app exits.
+    /// opens it. A **fixed, well-known** temp path (not a random TempDir in a
+    /// static, whose Drop never runs): the app deletes it on exit via
+    /// [`remove_office_cache`], and a leftover from a crashed session is
+    /// swept by the same call on the next clean exit — converted copies of
+    /// the user's documents must not accumulate on disk.
     fn office_cache_dir() -> Option<&'static std::path::Path> {
-        static DIR: std::sync::OnceLock<Option<tempfile::TempDir>> = std::sync::OnceLock::new();
-        DIR.get_or_init(|| tempfile::tempdir().ok())
-            .as_ref()
-            .map(|d| d.path())
+        static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| {
+            let dir = office_cache_path();
+            std::fs::create_dir_all(&dir).ok().map(|_| dir)
+        })
+        .as_deref()
     }
 
     /// Whether this side needs a LibreOffice conversion before it can render
@@ -2248,10 +2254,13 @@ impl DiffCompare {
                 MediaMsg::OfficePdf { left, path, pdf } => {
                     let slot = usize::from(!left);
                     let side = if slot == 0 { &self.left } else { &self.right };
-                    self.office_pending[slot] = false;
                     // A conversion finishing after the side was swapped
-                    // answers a file no longer shown — drop it.
+                    // answers a file no longer shown — drop it *entirely*.
+                    // Clearing `office_pending` on a stale message would
+                    // re-arm ensure_render and race a second conversion of
+                    // the current file against the one already in flight.
                     if side.facts.abs_path == path {
+                        self.office_pending[slot] = false;
                         self.office_pdf[slot] = Some(pdf);
                     }
                 }
@@ -4064,11 +4073,21 @@ impl DiffCompare {
                     }
                 });
             }
-            // A waveform click: seek whatever is loaded, or start playback at
-            // exactly that spot (the pair when comparing sound with sound, so
-            // a later flip stays gap-free).
+            // A waveform click: seek what is loaded — but only when the
+            // loaded audio is actually one of *this viewer's* files. The
+            // player is shared (a Duplicates card track deliberately keeps
+            // playing under an open viewer), and seeking an unrelated track
+            // to the clicked spot would move audio the user isn't looking
+            // at. Anything else starts playback at exactly that spot (the
+            // pair when comparing sound with sound, so a later flip stays
+            // gap-free).
             if let Some((is_left, f)) = wave_seek {
-                if snap.loaded {
+                let ours = pair_loaded
+                    || (snap.loaded
+                        && snap.hex.as_deref().is_some_and(|h| {
+                            h == self.left.facts.hash_hex || h == self.right.facts.hash_hex
+                        }));
+                if ours {
                     p.seek_fraction(f);
                 } else if sound_pair {
                     self.pending_play = Some(PendingPlay::Pair {
@@ -4285,6 +4304,20 @@ fn save_actions(read_only: bool, has_edits: bool) -> SaveActions {
         copy: has_edits,
         overwrite: has_edits && !read_only,
     }
+}
+
+/// The fixed location of the office-conversion cache (see
+/// [`DiffCompare::office_cache_dir`]).
+fn office_cache_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("dedup-office-cache")
+}
+
+/// Delete the office-conversion cache — converted PDFs of the user's own
+/// documents, which must not outlive the session. Called on app exit; the
+/// fixed path means a leftover from a crashed session is swept by the next
+/// clean exit too. Best-effort: a vanished dir is already success.
+pub fn remove_office_cache() {
+    let _ = std::fs::remove_dir_all(office_cache_path());
 }
 
 /// The Text tab's single-file body for one side: a document's *extracted* words

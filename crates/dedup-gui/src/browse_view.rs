@@ -1049,8 +1049,11 @@ impl BrowseView {
                         } else {
                             egui::RichText::new(&f.name)
                         };
-                        let resp = ui.add(egui::Label::new(text).truncate());
-                        crate::util::copy_menu(&resp, &f.rel);
+                        // The label stays click-passive: a click-sensing
+                        // widget here would win the hit test and steal row
+                        // selection on the filename — the row's most natural
+                        // click target. Copy hangs off the whole row instead.
+                        ui.add(egui::Label::new(text).truncate());
                     });
                     row.col(|ui| {
                         ui.monospace(format_size(f.size));
@@ -1070,6 +1073,10 @@ impl BrowseView {
                             annotation_chip(ui, tag, ChipMode::Display);
                         }
                     });
+                    // Right-click anywhere in the row copies its rel path
+                    // (the row already senses clicks; no extra interact that
+                    // could shadow selection).
+                    crate::util::copy_menu(&row.response(), &f.rel);
                     if row.response().clicked() {
                         clicked_row = Some(i);
                     }

@@ -1088,6 +1088,9 @@ impl eframe::App for DedupApp {
         // Flush the final window size (and any current control values) so the
         // next launch reopens where the user left it.
         self.current_settings().save(self.store.config_dir());
+        // Converted-office-PDF cache: the user's documents must not outlive
+        // the session on disk (this also sweeps a crashed session's leftover).
+        crate::compare_view::remove_office_cache();
     }
 }
 
