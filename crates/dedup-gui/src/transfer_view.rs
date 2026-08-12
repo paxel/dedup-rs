@@ -3371,6 +3371,9 @@ impl TransferView {
             .set_parent(frame)
             .pick_folder()
         {
+            // Contextually anchored to the target root, but still feeds the
+            // global picker memory.
+            crate::util::remember_picked_dir(&dir);
             match dir.strip_prefix(&target_root) {
                 Ok(rel) => {
                     self.subdir = rel.to_string_lossy().replace('\\', "/");
@@ -3387,8 +3390,18 @@ impl TransferView {
     /// Open the native folder dialog and store the picked absolute path as the
     /// export folder (Destination::Folder).
     fn browse_folder(&mut self, frame: &eframe::Frame) {
-        // Start the dialog in the current folder if it is a real directory.
-        let start = Some(self.folder.clone()).filter(|f| Path::new(f).is_dir());
+        // Start in the current export folder when set; else at the parent of
+        // the last selection anywhere (the shared picker memory) — never
+        // dumped back at the home directory.
+        let start = Some(self.folder.clone())
+            .filter(|f| Path::new(f).is_dir())
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                crate::util::last_picked_dir().and_then(|last| {
+                    let p = last.parent().map(|p| p.to_path_buf()).unwrap_or(last);
+                    p.is_dir().then_some(p)
+                })
+            });
         // Run the native picker modally, parented to our window, so it grabs
         // focus and a second one can't be opened while it's up.
         let mut dialog = rfd::FileDialog::new()
@@ -3398,6 +3411,7 @@ impl TransferView {
             dialog = dialog.set_directory(dir);
         }
         if let Some(dir) = dialog.pick_folder() {
+            crate::util::remember_picked_dir(&dir);
             self.folder = dir.to_string_lossy().into_owned();
             self.error = None;
             self.clear_preview();

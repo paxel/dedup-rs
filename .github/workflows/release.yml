@@ -184,15 +184,25 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
-      - name: Publish in dependency order
+      - name: Publish in dependency order (skipping versions already on the index)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          cargo publish -p dedup-rs-core
-          sleep 30
-          cargo publish -p dedup-rs-gui
-          sleep 30
-          cargo publish -p dedup-rs-cli
+          ver=${RELEASE_TAG#v}
+          publish() {
+            # A crates.io version is immutable — republishing is a hard error,
+            # so a rerun after a partial publish must skip what already landed.
+            if curl -fsSL -A "dedup-rs-release-workflow" \
+                 "https://crates.io/api/v1/crates/$1/${ver}" >/dev/null 2>&1; then
+              echo "$1 ${ver} already on crates.io — skipping"
+            else
+              cargo publish -p "$1"
+              sleep 30
+            fi
+          }
+          publish dedup-rs-core
+          publish dedup-rs-gui
+          publish dedup-rs-cli
 
   channels:
     name: Homebrew tap + Scoop bucket

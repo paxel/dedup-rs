@@ -93,6 +93,10 @@ launches; consenting to loss is a fresh choice each session.
   colour here is semantic — red means a file will be deleted — so an update never silently
   repaints an existing user's vocabulary, least of all on a light desktop.
 
+Folder pickers everywhere open at the **parent of the folder you last picked** — never back
+at your home directory — and that memory survives restarts. Dialogs with an obvious anchor
+(exporting into a chosen target) start there instead.
+
 These settings persist across launches, written to `gui_settings.json` in the config
 directory (`$XDG_CONFIG_HOME/dedup`, or `~/.config/dedup` by default) the moment they change.
 A settings file written before the light appearance existed loads as Dark, so upgrading never

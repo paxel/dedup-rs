@@ -41,6 +41,16 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   `cargo install dedup-rs-cli` from crates.io (the binary is `dedup`). External tools stay
   optional everywhere — ffmpeg, poppler and LibreOffice unlock their features when present.
 - **Repositories** tab: create, rename, relocate, duplicate, remove and scan repositories, with per-repo stats and MIME breakdown.
+  Each repository can be **marked remote** (your own judgement that it lives on a slow NFS or
+  cloud mount — never auto-detected), and **UPDATE LOCAL** rescans everything *except* the
+  marked ones: the quick everyday rescan. The finished-scan summary states the hash work
+  explicitly ("hashed N file(s), X MB"), so a slow scan shows whether the time went to
+  hashing or just to walking a slow mount. Adding a backup to a group opens its editor
+  directly under the ADD REPO button that summoned it.
+- **Folder pickers remember where you were.** Every "choose a folder" dialog opens at the
+  parent of the last folder you picked — never back at the home directory — and the memory
+  survives restarts. Dialogs with an obvious anchor (exporting into a chosen target) start
+  there instead.
 - **Duplicates** tab: find exact or perceptually-similar duplicates across selected repos, review as file cards with a best-copy pick, and delete the rest; image/video/audio previews and a zoom/pan lightbox with A/B compare.
 - **Every file gets a preview.** Text files show their **first lines** right on the card
   (review rows show a mini version — hover it for the full head). PDFs show their **actual

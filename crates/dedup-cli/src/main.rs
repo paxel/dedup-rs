@@ -837,12 +837,14 @@ fn update_repos(
         let stats = update_repo_authorized(store, &name, threads, &progress, &cancel, force)?;
         progress.finish();
         println!(
-            "  added: {}, updated: {}, unchanged: {}, missing: {}, errors: {}, hashed: {}",
+            "  added: {}, updated: {}, unchanged: {}, missing: {}, errors: {}, \
+             hashed: {} file(s) / {}",
             stats.added,
             stats.updated,
             stats.unchanged,
             stats.marked_missing,
             stats.errors,
+            stats.added + stats.updated,
             format_size(stats.hashed_bytes)
         );
         if stats.cancelled {

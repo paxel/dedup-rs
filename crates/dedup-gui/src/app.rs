@@ -60,6 +60,8 @@ struct RepoRow {
     location: Option<Location>,
     /// Index freshness, from the last CHECK.
     freshness: Freshness,
+    /// User-flagged: root on a slow/remote mount — UPDATE LOCAL skips it.
+    remote: bool,
 }
 
 /// Where a native folder-picker result should be routed, since the pick is
@@ -110,8 +112,13 @@ enum Edit {
 enum Action {
     Update(String),
     UpdateAll,
+    /// Queue an UPDATE / SCAN for every repo *not* flagged remote — the fast
+    /// everyday rescan that leaves slow mounts alone.
+    UpdateLocal,
     Check(String),
     RefreshStatus,
+    /// Flip a repo's user-set remote flag (slow mount; UPDATE LOCAL skips it).
+    ToggleRemote(String),
     Cancel(String),
     BeginRename(String),
     BeginRelocate(String),
@@ -279,6 +286,7 @@ impl DedupApp {
             .set_threshold(settings.transfer_similarity_threshold);
         app.tooltip_verbosity = settings.tooltip_verbosity;
         app.theme = settings.theme;
+        crate::util::seed_last_picked_dir(settings.last_picked_dir.as_deref().map(Into::into));
         app.saved_settings = settings;
         app.reload_all();
         app
@@ -293,6 +301,8 @@ impl DedupApp {
             tooltip_verbosity: self.tooltip_verbosity,
             theme: self.theme,
             window_size: self.window_size,
+            last_picked_dir: crate::util::last_picked_dir()
+                .map(|p| p.to_string_lossy().into_owned()),
         }
     }
 
@@ -368,6 +378,7 @@ impl DedupApp {
                         last,
                         location,
                         freshness,
+                        remote: meta.remote,
                     });
                 }
                 self.repos = rows;
@@ -616,6 +627,34 @@ impl DedupApp {
                     self.enqueue(name, JobKind::Update);
                 }
             }
+            Action::UpdateLocal => {
+                // UPDATE ALL minus repos the user flagged remote (slow
+                // mounts); the same unreachable skip applies.
+                let names: Vec<String> = self
+                    .repos
+                    .iter()
+                    .filter(|r| !r.remote && r.location.is_none_or(|l| l.reachable()))
+                    .map(|r| r.name.clone())
+                    .collect();
+                for name in names {
+                    self.enqueue(name, JobKind::Update);
+                }
+            }
+            Action::ToggleRemote(name) => {
+                let now = self
+                    .repos
+                    .iter()
+                    .find(|r| r.name == name)
+                    .is_some_and(|r| r.remote);
+                match self.store.set_repo_remote(&name, !now) {
+                    Ok(()) => {
+                        if let Some(row) = self.repos.iter_mut().find(|r| r.name == name) {
+                            row.remote = !now;
+                        }
+                    }
+                    Err(e) => self.load_error = Some(format!("Could not save the flag: {e}")),
+                }
+            }
             Action::Check(name) => self.enqueue(name, JobKind::Check),
             Action::RefreshStatus => {
                 // Re-probe location/reachability, and run a freshness CHECK on
@@ -824,11 +863,19 @@ impl DedupApp {
                 // Run the native picker modally, parented to our window: it grabs
                 // focus and the app can't spawn a second one while it's open.
                 // This blocks the UI thread until the user picks or cancels.
-                if let Some(dir) = rfd::FileDialog::new()
+                // Starts at the parent of the last selection (any picker, any
+                // session) instead of dumping the user back at the home dir.
+                let mut dialog = rfd::FileDialog::new()
                     .set_title("Choose a folder")
-                    .set_parent(frame)
-                    .pick_folder()
-                {
+                    .set_parent(frame);
+                if let Some(last) = crate::util::last_picked_dir() {
+                    let start = last.parent().map(|p| p.to_path_buf()).unwrap_or(last);
+                    if start.is_dir() {
+                        dialog = dialog.set_directory(start);
+                    }
+                }
+                if let Some(dir) = dialog.pick_folder() {
+                    crate::util::remember_picked_dir(&dir);
                     self.route_picked_folder(target, dir);
                 }
             }
@@ -895,9 +942,20 @@ impl eframe::App for DedupApp {
                             format!("cancelled — added {}, updated {}", s.added, s.updated)
                         }
                         Ok(s) => {
+                            // The hash work stated explicitly: "hashed 0 files"
+                            // on a slow scan proves the time went to the walk,
+                            // not to hashing — the diagnostic the counts alone
+                            // don't give (added/updated are the hashed ones).
                             let mut text = format!(
-                                "added {}, updated {}, unchanged {}, missing {}, errors {}",
-                                s.added, s.updated, s.unchanged, s.marked_missing, s.errors
+                                "added {}, updated {}, unchanged {}, missing {}, errors {} — \
+                                 hashed {} file(s), {}",
+                                s.added,
+                                s.updated,
+                                s.unchanged,
+                                s.marked_missing,
+                                s.errors,
+                                s.added + s.updated,
+                                crate::util::format_size(s.hashed_bytes)
                             );
                             // The scan saw an empty directory where the index
                             // held files. Usually a drive that did not mount —
@@ -1077,7 +1135,8 @@ impl eframe::App for DedupApp {
             || current.transfer_similarity_threshold
                 != self.saved_settings.transfer_similarity_threshold
             || current.tooltip_verbosity != self.saved_settings.tooltip_verbosity
-            || current.theme != self.saved_settings.theme;
+            || current.theme != self.saved_settings.theme
+            || current.last_picked_dir != self.saved_settings.last_picked_dir;
         if control_changed {
             current.save(self.store.config_dir());
             self.saved_settings = current;
@@ -1310,6 +1369,27 @@ impl DedupApp {
                 {
                     actions.push(Action::UpdateAll);
                 }
+                    // Same, minus repos flagged REMOTE — the everyday rescan
+                    // that leaves slow mounts alone.
+                    let any_local = self.repos.iter().any(|r| !r.remote);
+                    let update_local = egui::Button::new(
+                        RichText::new(format!("{} UPDATE LOCAL", icon::REFRESH))
+                            .color(theme::black()),
+                    )
+                    .fill(theme::amber());
+                    if ui
+                        .add_enabled(any_local, update_local)
+                        .explain(
+                            self.tooltip_verbosity,
+                            "Scan every repository not marked remote",
+                            "Queue an UPDATE / SCAN for every repository except the ones \
+                             marked remote, one at a time — the quick everyday rescan that \
+                             leaves slow network or cloud mounts alone.",
+                        )
+                        .clicked()
+                    {
+                        actions.push(Action::UpdateLocal);
+                    }
                     // Re-probe every repo's location/reachability (filesystem only, no
                     // db access), so it is fine to run any time.
                     let refresh = egui::Button::new(
@@ -1467,6 +1547,80 @@ impl DedupApp {
                 actions.push(Action::Ungroup(group_name.clone()));
             }
         });
+        // The add-sink editor opens on the row directly below the ADD REPO
+        // button that summoned it — never up on the main's card, where the
+        // fields looked like they belonged to something else.
+        if let Some(Edit::AddSink {
+            main: edit_main,
+            group: edit_group,
+            dest,
+            path,
+        }) = &mut self.edit
+            && edit_main == main
+        {
+            ui.horizontal(|ui| {
+                ui.add_space(16.0);
+                ui.label(RichText::new("ADD SINK → NAME").color(theme::green()));
+                ui.add(egui::TextEdit::singleline(dest).desired_width(140.0))
+                    .explain(
+                        verbosity,
+                        "New repository's name",
+                        "Name for the new backup repository. It starts as a copy of this \
+                         group's main index, pointed at the folder you choose.",
+                    );
+                ui.label(RichText::new("PATH").color(theme::green()));
+                if ui
+                    .button(
+                        RichText::new(format!("{} CHOOSE…", icon::FOLDER_OPEN))
+                            .color(theme::black()),
+                    )
+                    .explain(
+                        verbosity,
+                        "Pick a folder",
+                        "Open a native folder picker to choose where the new backup \
+                         repository's files live.",
+                    )
+                    .clicked()
+                {
+                    actions.push(Action::ChooseFolder(FolderTarget::AddSink));
+                }
+                ui.add(
+                    egui::TextEdit::singleline(path)
+                        .desired_width(240.0)
+                        .hint_text("/backup/repo/path"),
+                )
+                .explain(
+                    verbosity,
+                    "New repository's folder",
+                    "On-disk folder the new backup repository will point at. The main \
+                     is left completely unchanged.",
+                );
+                if ui
+                    .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::black()))
+                    .explain(
+                        verbosity,
+                        "Add this backup",
+                        "Clone the main's index into the new repository at the chosen \
+                         path and add it to this group as a sink.",
+                    )
+                    .clicked()
+                {
+                    actions.push(Action::CommitAddSink {
+                        group: edit_group.clone(),
+                        main: edit_main.clone(),
+                        dest: dest.trim().to_string(),
+                        path: path.trim().to_string(),
+                    });
+                }
+                if ui
+                    .button(RichText::new(icon::X).color(theme::black()))
+                    .explain(verbosity, "Cancel", "Discard and close the editor.")
+                    .clicked()
+                {
+                    actions.push(Action::CancelEdit);
+                }
+            });
+        }
         if group.sinks.is_empty() {
             return;
         }
@@ -1829,76 +1983,6 @@ impl DedupApp {
                 });
                 return;
             }
-            Some(Edit::AddSink {
-                main,
-                group,
-                dest,
-                path,
-            }) if *main == row.name => {
-                let verbosity = self.tooltip_verbosity;
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("ADD SINK → NAME").color(theme::green()));
-                    ui.add(egui::TextEdit::singleline(dest).desired_width(140.0))
-                        .explain(
-                            verbosity,
-                            "New repository's name",
-                            "Name for the new backup repository. It starts as a copy of this \
-                             group's main index, pointed at the folder you choose.",
-                        );
-                    ui.label(RichText::new("PATH").color(theme::green()));
-                    if ui
-                        .button(
-                            RichText::new(format!("{} CHOOSE…", icon::FOLDER_OPEN))
-                                .color(theme::black()),
-                        )
-                        .explain(
-                            verbosity,
-                            "Pick a folder",
-                            "Open a native folder picker to choose where the new backup \
-                             repository's files live.",
-                        )
-                        .clicked()
-                    {
-                        actions.push(Action::ChooseFolder(FolderTarget::AddSink));
-                    }
-                    ui.add(
-                        egui::TextEdit::singleline(path)
-                            .desired_width(240.0)
-                            .hint_text("/backup/repo/path"),
-                    )
-                    .explain(
-                        verbosity,
-                        "New repository's folder",
-                        "On-disk folder the new backup repository will point at. The main \
-                         is left completely unchanged.",
-                    );
-                    if ui
-                        .button(RichText::new(format!("{} OK", icon::CHECK)).color(theme::black()))
-                        .explain(
-                            verbosity,
-                            "Add this backup",
-                            "Clone the main's index into the new repository at the chosen \
-                             path and add it to this group as a sink.",
-                        )
-                        .clicked()
-                    {
-                        actions.push(Action::CommitAddSink {
-                            group: group.clone(),
-                            main: main.clone(),
-                            dest: dest.trim().to_string(),
-                            path: path.trim().to_string(),
-                        });
-                    }
-                    if ui
-                        .button(RichText::new(icon::X).color(theme::black()))
-                        .explain(verbosity, "Cancel", "Discard and close the editor.")
-                        .clicked()
-                    {
-                        actions.push(Action::CancelEdit);
-                    }
-                });
-                return;
-            }
             Some(Edit::ConfirmDelete { name }) if *name == row.name => {
                 let verbosity = self.tooltip_verbosity;
                 ui.horizontal(|ui| {
@@ -1972,6 +2056,35 @@ impl DedupApp {
                 .clicked()
             {
                 actions.push(Action::Check(row.name.clone()));
+            }
+            // The user's own judgement of the mount's speed — never detected
+            // (the LOCAL/REMOTE status pill is the probe's opinion; this flag
+            // is deliberately worded differently).
+            let remote_btn = if row.remote {
+                egui::Button::new(
+                    RichText::new("MARKED REMOTE").color(theme::ink_on(theme::blue())),
+                )
+                .fill(theme::blue())
+            } else {
+                egui::Button::new(RichText::new("MARK REMOTE").color(theme::black()))
+            };
+            if ui
+                .add(remote_btn)
+                .explain(
+                    self.tooltip_verbosity,
+                    if row.remote {
+                        "Marked as a slow mount — UPDATE LOCAL skips this repository"
+                    } else {
+                        "Mark this repository as living on a slow mount"
+                    },
+                    "Whether this repository's folder lives on a slow network or cloud \
+                     mount, by your own judgement. Marked repositories are skipped by \
+                     the UPDATE LOCAL button; everything else works the same. Click to \
+                     flip.",
+                )
+                .clicked()
+            {
+                actions.push(Action::ToggleRemote(row.name.clone()));
             }
             if ui
                 .button(RichText::new(format!("{} RENAME", icon::PENCIL)).color(theme::black()))
@@ -3533,6 +3646,41 @@ mod ui_tests {
             );
         harness.run();
         harness
+    }
+
+    /// Every repo card carries the LOCAL/REMOTE flag button, the toolbar offers
+    /// UPDATE LOCAL, and a repo flagged remote in the registry renders REMOTE
+    /// after a reload — the store→row→card wiring end to end.
+    #[test]
+    fn remote_flag_renders_and_update_local_is_offered() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, app) = sample_app();
+        let mut harness = render_repos(app);
+        assert!(
+            harness.query_by_label_contains("UPDATE LOCAL").is_some(),
+            "the everyday rescan button is on the toolbar"
+        );
+        // Two sample repos → two unmarked flags, none marked yet.
+        assert_eq!(harness.query_all_by_label("MARK REMOTE").count(), 2);
+        assert!(harness.query_by_label("MARKED REMOTE").is_none());
+
+        // Flag one repo in the registry and reload the rows: its card flips.
+        harness
+            .state_mut()
+            .store
+            .set_repo_remote("Videos", true)
+            .unwrap();
+        harness.state_mut().reload_all();
+        harness.run();
+        assert!(
+            harness.query_by_label("MARKED REMOTE").is_some(),
+            "the flagged repo's card reads MARKED REMOTE"
+        );
+        assert_eq!(
+            harness.query_all_by_label("MARK REMOTE").count(),
+            1,
+            "the other repo stays unmarked"
+        );
     }
 
     /// An ungrouped repo offers MAKE MAIN; with no groups yet, no group controls

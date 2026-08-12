@@ -133,6 +133,53 @@ pub fn or_log_default<T: Default, E: std::fmt::Display>(result: Result<T, E>, wh
     }
 }
 
+/// The folder last picked in any native folder dialog, process-wide — seeded
+/// from the persisted settings at startup, read back into them on save. Kept
+/// here (not threaded through every view) because pickers open from surfaces
+/// that don't otherwise know about settings.
+static LAST_PICKED_DIR: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// Seed the picker memory from the persisted settings (startup).
+pub fn seed_last_picked_dir(dir: Option<std::path::PathBuf>) {
+    *LAST_PICKED_DIR.lock().unwrap_or_else(|e| e.into_inner()) = dir;
+}
+
+/// The remembered last-picked folder, for persisting back into the settings.
+pub fn last_picked_dir() -> Option<std::path::PathBuf> {
+    LAST_PICKED_DIR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Record a dialog selection into the picker memory.
+pub fn remember_picked_dir(dir: &std::path::Path) {
+    *LAST_PICKED_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.to_path_buf());
+}
+
+/// Open a native folder picker that starts at the **parent of the last
+/// selection** (any picker, any session) instead of the home directory, and
+/// remembers whatever is picked. Pickers with a smarter contextual anchor set
+/// their own start directory and only *record* into this memory.
+pub fn pick_folder_remembered() -> Option<std::path::PathBuf> {
+    let mut dialog = rfd::FileDialog::new();
+    if let Some(last) = last_picked_dir() {
+        let start = match last.parent() {
+            Some(p) if p.as_os_str().is_empty() => last.clone(),
+            Some(p) => p.to_path_buf(),
+            None => last.clone(),
+        };
+        if start.is_dir() {
+            dialog = dialog.set_directory(start);
+        }
+    }
+    let picked = dialog.pick_folder();
+    if let Some(p) = &picked {
+        remember_picked_dir(p);
+    }
+    picked
+}
+
 /// Attach a right-click **Copy** context menu to a widget's response, copying
 /// `text` to the clipboard. Any label carrying a path or name goes through
 /// this, so grabbing a filename to search elsewhere never needs a shortcut.

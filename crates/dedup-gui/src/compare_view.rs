@@ -846,7 +846,7 @@ impl DiffCompare {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "metadata".to_string());
-        let Some(dir) = rfd::FileDialog::new().pick_folder() else {
+        let Some(dir) = crate::util::pick_folder_remembered() else {
             return;
         };
         let text = metadata_sidecar(&base, &fields);
@@ -2063,7 +2063,7 @@ impl DiffCompare {
     /// the next scan. The source archive is never modified; collisions never
     /// overwrite. Records a status line for the Archive tab.
     fn extract_to_picked_folder(&mut self, member: Option<dedup_core::archive::ArchiveEntry>) {
-        let Some(dir) = rfd::FileDialog::new().pick_folder() else {
+        let Some(dir) = crate::util::pick_folder_remembered() else {
             return;
         };
         let f = &self.left.facts;

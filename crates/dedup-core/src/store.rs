@@ -158,12 +158,54 @@ impl From<redb::CompactionError> for StoreError {
     }
 }
 
+/// Registry value version for [`RepoMeta`]. Postcard is positional, so adding
+/// a field is a new version with a [`decode_repo_meta`] migration — exactly
+/// the [`decode_sync_group`] discipline. Version 2 added `remote`.
+const REPO_META_VERSION: u8 = 2;
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RepoMeta {
     pub abs_path: String,
     pub created: u64,
     pub hash_algo: String,
     pub schema_ver: u8,
+    /// User-flagged: this repo's root lives on a slow/remote mount (cloud,
+    /// NFS) — bulk actions like "scan all local" skip it. Never auto-detected;
+    /// the flag is the user's own judgement.
+    pub remote: bool,
+}
+
+/// Version-1 [`RepoMeta`] layout (no `remote` flag). Kept so pre-upgrade
+/// registries stay readable; see [`decode_repo_meta`].
+#[derive(Serialize, Deserialize)]
+struct RepoMetaV1 {
+    abs_path: String,
+    created: u64,
+    hash_algo: String,
+    schema_ver: u8,
+}
+
+/// Decode a stored [`RepoMeta`], migrating a version-1 value (which predates
+/// the `remote` flag) to `remote: false`. Re-saving writes the current
+/// [`REPO_META_VERSION`].
+fn decode_repo_meta(bytes: &[u8]) -> Result<RepoMeta, StoreError> {
+    match bytes.first() {
+        Some(&REPO_META_VERSION) => deserialize_value(REPO_META_VERSION, bytes),
+        Some(&SCHEMA_VERSION) => {
+            let v1: RepoMetaV1 = deserialize_value(SCHEMA_VERSION, bytes)?;
+            Ok(RepoMeta {
+                abs_path: v1.abs_path,
+                created: v1.created,
+                hash_algo: v1.hash_algo,
+                schema_ver: v1.schema_ver,
+                remote: false,
+            })
+        }
+        other => Err(StoreError::SchemaVersionMismatch {
+            expected: REPO_META_VERSION,
+            found: other.copied().unwrap_or(0),
+        }),
+    }
 }
 
 /// How the main is pushed to one sink. Chosen per sink, so a group can mirror
@@ -718,8 +760,9 @@ impl Store {
             created,
             hash_algo: "BLAKE3".to_string(),
             schema_ver: SCHEMA_VERSION,
+            remote: false,
         };
-        let serialized = serialize_value(SCHEMA_VERSION, &meta)?;
+        let serialized = serialize_value(REPO_META_VERSION, &meta)?;
 
         // Check and insert within one write transaction so a concurrent create
         // cannot slip in between; the check also runs before the repo database
@@ -753,9 +796,26 @@ impl Store {
         let read_txn = self.registry.begin_read()?;
         let table = read_txn.open_table(REPOS)?;
         match table.get(name)? {
-            Some(guard) => deserialize_value(SCHEMA_VERSION, guard.value()),
+            Some(guard) => decode_repo_meta(guard.value()),
             None => Err(StoreError::NotFound(name.to_string())),
         }
+    }
+
+    /// Flip a repo's user-set **remote** flag (slow mount; bulk scans skip it).
+    pub fn set_repo_remote(&self, name: &str, remote: bool) -> Result<(), StoreError> {
+        let write_txn = self.registry.begin_write()?;
+        {
+            let mut table = write_txn.open_table(REPOS)?;
+            let mut meta = match table.get(name)? {
+                Some(guard) => decode_repo_meta(guard.value())?,
+                None => return Err(StoreError::NotFound(name.to_string())),
+            };
+            meta.remote = remote;
+            let serialized = serialize_value(REPO_META_VERSION, &meta)?;
+            table.insert(name, serialized.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
     }
 
     pub fn list_repos(&self) -> Result<Vec<(String, RepoMeta, RepoStats)>, StoreError> {
@@ -766,7 +826,7 @@ impl Store {
         for item in table.iter()? {
             let (name_guard, val_guard) = item?;
             let name = name_guard.value().to_string();
-            let meta: RepoMeta = deserialize_value(SCHEMA_VERSION, val_guard.value())?;
+            let meta: RepoMeta = decode_repo_meta(val_guard.value())?;
             let stats = self.get_repo_stats(&name)?;
             repos.push((name, meta, stats));
         }
@@ -1104,7 +1164,7 @@ impl Store {
                 Some(guard) => guard.value().to_vec(),
                 None => return Err(StoreError::NotFound(name.to_string())),
             };
-            deserialize_value::<RepoMeta>(SCHEMA_VERSION, &meta_bytes)?
+            decode_repo_meta(&meta_bytes)?
         };
 
         let abs_path = std::path::Path::new(new_path);
@@ -1117,7 +1177,7 @@ impl Store {
         };
 
         meta.abs_path = abs_path_str;
-        let serialized = serialize_value(SCHEMA_VERSION, &meta)?;
+        let serialized = serialize_value(REPO_META_VERSION, &meta)?;
 
         {
             let mut reg_table = reg_write_txn.open_table(REPOS)?;
@@ -1156,8 +1216,11 @@ impl Store {
                 .as_secs(),
             hash_algo: source_meta.hash_algo,
             schema_ver: source_meta.schema_ver,
+            // A duplicate points at a *new* path; whether that mount is slow
+            // is a fresh judgement, so it starts unflagged.
+            remote: false,
         };
-        let serialized = serialize_value(SCHEMA_VERSION, &meta)?;
+        let serialized = serialize_value(REPO_META_VERSION, &meta)?;
 
         // Byte-copy the source index (a redb file at rest is self-consistent);
         // this carries FILES, the BY_* indexes, META, and MIME_STATS verbatim.
@@ -1880,6 +1943,41 @@ mod tests {
         // A current (v2) value round-trips unchanged.
         let bytes2 = serialize_value(SYNC_GROUP_VERSION, &group)?;
         assert_eq!(decode_sync_group(&bytes2)?, group);
+        Ok(())
+    }
+
+    /// A version-1 repo meta predates the `remote` flag. Decoding it now must
+    /// yield `remote: false` (the standing rule that store-format changes ship
+    /// with a legacy-decode test), and the flag must survive a set/get.
+    #[test]
+    fn v1_repo_meta_decodes_as_local_and_the_flag_round_trips()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let v1 = RepoMetaV1 {
+            abs_path: "/data/pile".to_string(),
+            created: 1_700_000_000,
+            hash_algo: "BLAKE3".to_string(),
+            schema_ver: SCHEMA_VERSION,
+        };
+        let bytes = serialize_value(SCHEMA_VERSION, &v1)?;
+        let meta = decode_repo_meta(&bytes)?;
+        assert_eq!(meta.abs_path, "/data/pile");
+        assert!(!meta.remote, "a pre-flag registry entry reads as local");
+
+        // A current value round-trips unchanged.
+        let bytes2 = serialize_value(REPO_META_VERSION, &meta)?;
+        assert_eq!(decode_repo_meta(&bytes2)?, meta);
+
+        // And the flag persists through the store API.
+        let tmp = tempfile::tempdir()?;
+        let store = Store::open_at(tmp.path().to_path_buf())?;
+        let data = tmp.path().join("repo");
+        std::fs::create_dir_all(&data)?;
+        store.create_repo("r", &data.to_string_lossy())?;
+        assert!(!store.get_repo("r")?.remote, "new repos start local");
+        store.set_repo_remote("r", true)?;
+        assert!(store.get_repo("r")?.remote, "the flag sticks");
+        store.set_repo_remote("r", false)?;
+        assert!(!store.get_repo("r")?.remote, "and flips back");
         Ok(())
     }
 

@@ -12,6 +12,8 @@ subcommand](../cli.md#repo).
   a scan is running elsewhere in the app.
 - **UPDATE ALL** — queues an UPDATE / SCAN for every registered repository, one at a time.
   Already up-to-date repos finish almost instantly.
+- **UPDATE LOCAL** — the same, minus every repository **marked remote** (see below): the
+  quick everyday rescan that leaves slow network or cloud mounts alone.
 - **REFRESH STATUS** — re-checks every repository's location/reachability and whether its
   index is stale (a dry-run — no hashing, no writes). This is what produces the LOCAL /
   REMOTE / OFFLINE / MISSING and UP TO DATE / UPDATE REQUIRED pills on each card.
@@ -44,6 +46,11 @@ Status pills:
   Fast on a repeat run since unchanged files are skipped.
 - **CHECK** — dry-run: report new/changed/missing counts without hashing or writing
   anything. Use this to see if UPDATE / SCAN has real work to do.
+- **MARK REMOTE** / **MARKED REMOTE** — your own judgement that this repository's folder
+  lives on a slow mount (NFS, cloud). Marked repositories are skipped by **UPDATE LOCAL**;
+  everything else works the same. Deliberately never auto-detected — an NFS mount can look
+  local to a probe — and distinct from the LOCAL/REMOTE *status pill*, which only reports
+  where the probe thinks the folder is.
 - **RENAME** — change the repository's registry name in place; the on-disk folder is not
   moved.
 - **RELOCATE** — point the repository at a different on-disk folder, keeping its existing
@@ -55,7 +62,9 @@ Status pills:
 
 A repository mid-scan or mid-check shows a spinner, live progress (a bar with percent/count
 for hashing, a file/dir count while scanning), and a CANCEL button — cancelling a scan keeps
-whatever was already hashed committed to the index.
+whatever was already hashed committed to the index. The finished-scan line states the hash
+work explicitly — "hashed N file(s), X MB" — so a slow scan explains itself: `hashed 0` means
+the time went to walking the folder (a slow mount), not to hashing.
 
 ## Sync groups
 

@@ -61,6 +61,10 @@ pub struct Settings {
     /// Last window inner size in logical points `[w, h]`, restored next launch
     /// (`None` until the window has been sized once).
     pub window_size: Option<[f32; 2]>,
+    /// The folder the user last picked in any native folder dialog. Every
+    /// picker without a smarter contextual anchor opens at this selection's
+    /// **parent**, instead of dumping the user back at the home directory.
+    pub last_picked_dir: Option<String>,
 }
 
 impl Default for Settings {
@@ -72,6 +76,7 @@ impl Default for Settings {
             tooltip_verbosity: TooltipVerbosity::default(),
             theme: ThemeChoice::default(),
             window_size: None,
+            last_picked_dir: None,
         }
     }
 }
@@ -115,6 +120,7 @@ mod tests {
             tooltip_verbosity: TooltipVerbosity::Verbose,
             theme: ThemeChoice::Light,
             window_size: Some([1280.0, 800.0]),
+            last_picked_dir: Some("/data/inherited/pile".to_string()),
         };
         s.save(dir.path());
         assert_eq!(Settings::load(dir.path()), s);

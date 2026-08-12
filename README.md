@@ -18,7 +18,7 @@ track them automatically.
 
 | OS      | Channel                                                                                   |
 | ------- | ----------------------------------------------------------------------------------------- |
-| Linux   | `.deb` from the releases page, or the plain `dedup-<ver>-linux-x86_64.tar.gz`             |
+| Linux   | `brew install paxel/tap/dedup`, the `.deb` from the releases page, or the plain tarball   |
 | macOS   | `brew install paxel/tap/dedup`, or the `.dmg` (a drag-to-Applications app bundle)         |
 | Windows | `scoop bucket add paxel https://github.com/paxel/scoop-bucket` then `scoop install dedup` |
 | Any     | `cargo install dedup-rs-cli` (builds from source; binary is `dedup`)                      |
