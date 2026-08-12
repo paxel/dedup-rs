@@ -59,7 +59,7 @@ Prefer integration tests over manual binary runs: core behavior is verified in `
 
 ### Issue tracker
 
-Issues and specs live as markdown files under `.scratch/<feature-slug>/` in this repo. See `docs/agents/issue-tracker.md`.
+Issues and specs live as GitHub issues on `paxel/dedup-rs` (via the `gh` CLI); `.scratch/` holds the pre-GitHub archive. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
