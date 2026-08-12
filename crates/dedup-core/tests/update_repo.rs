@@ -253,6 +253,9 @@ fn update_unknown_repo_fails() -> TestResult {
     Ok(())
 }
 
+// chmod-based: on Windows there is no mode-bit way to make a file unreadable,
+// so this scenario is asserted on unix only.
+#[cfg(unix)]
 #[test]
 fn unreadable_files_are_reported_and_skipped() -> TestResult {
     let tempdir = tempfile::tempdir()?;

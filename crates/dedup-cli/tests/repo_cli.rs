@@ -26,6 +26,10 @@ impl Sandbox {
     fn dedup(&self) -> Result<Command, Box<dyn std::error::Error>> {
         let mut cmd = Command::cargo_bin("dedup")?;
         cmd.env("HOME", self.home.path());
+        // The registry honours $XDG_CONFIG_HOME *before* $HOME — and CI
+        // runners export it, so without pinning it every test would share
+        // (and fight over the lock of) one registry database.
+        cmd.env("XDG_CONFIG_HOME", self.home.path().join(".config"));
         Ok(cmd)
     }
 
