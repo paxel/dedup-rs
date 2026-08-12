@@ -17,9 +17,19 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Releasing from the Actions UI: Run workflow → type the tag. The same
+  # pipeline runs either way; RELEASE_TAG resolves to the typed tag or the
+  # pushed one. `gh release create` makes the tag at HEAD when it doesn't
+  # exist yet, so the button alone can cut a release.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.2)"
+        required: true
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
   gate:
@@ -41,7 +51,7 @@ jobs:
       - name: Tag matches the crate version
         run: |
           ver=$(grep -m1 '^version' crates/dedup-cli/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          tag=${GITHUB_REF_NAME#v}
+          tag=${RELEASE_TAG#v}
           [ "$ver" = "$tag" ] || { echo "tag v$tag != crate version $ver" >&2; exit 1; }
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -64,7 +74,7 @@ jobs:
         run: packaging/mkdeb.sh --release --out dist
       - name: Binary tarball
         run: |
-          ver=${GITHUB_REF_NAME#v}
+          ver=${RELEASE_TAG#v}
           tar -C target/release -czf "dist/dedup-${ver}-linux-x86_64.tar.gz" dedup
       - uses: actions/upload-artifact@v4
         with:
@@ -84,7 +94,7 @@ jobs:
       - name: Zip (console dedup.exe + GUI dedup-gui.exe)
         shell: pwsh
         run: |
-          $ver = $env:GITHUB_REF_NAME.TrimStart("v")
+          $ver = $env:RELEASE_TAG.TrimStart("v")
           New-Item -ItemType Directory -Force dist | Out-Null
           Compress-Archive -Path target/release/dedup.exe, `
                                  target/release/dedup-gui.exe, `
@@ -117,7 +127,7 @@ jobs:
         run: cargo build --release -p dedup-rs-cli
       - name: Tarball + app bundle + dmg
         run: |
-          ver=${GITHUB_REF_NAME#v}
+          ver=${RELEASE_TAG#v}
           mkdir -p dist
           tar -C target/release -czf "dist/dedup-${ver}-macos-${{ matrix.arch }}.tar.gz" dedup
           packaging/mkapp.sh target/release/dedup "$ver" dist
@@ -141,7 +151,7 @@ jobs:
           merge-multiple: true
       - name: Release notes from the CHANGELOG section
         run: |
-          ver=${GITHUB_REF_NAME#v}
+          ver=${RELEASE_TAG#v}
           awk -v ver="$ver" '
             $0 ~ "^## \\[" ver "\\]" { grab = 1; next }
             grab && (/^## \[/ || /^---/) { exit }
@@ -152,13 +162,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release edit "$GITHUB_REF_NAME" \
-              --title "dedup $GITHUB_REF_NAME" --notes-file notes.md
-            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" \
+              --title "dedup $RELEASE_TAG" --notes-file notes.md
+            gh release upload "$RELEASE_TAG" dist/* --clobber
           else
-            gh release create "$GITHUB_REF_NAME" \
-              --title "dedup $GITHUB_REF_NAME" \
+            gh release create "$RELEASE_TAG" \
+              --title "dedup $RELEASE_TAG" \
               --notes-file notes.md \
               dist/*
           fi
@@ -196,7 +206,7 @@ jobs:
           merge-multiple: true
       - name: Render formula and manifest from the templates
         run: |
-          ver=${GITHUB_REF_NAME#v}
+          ver=${RELEASE_TAG#v}
           sha() { sha256sum "dist/$1" | cut -d' ' -f1; }
           mkdir -p out
           sed -e "s/{{VERSION}}/$ver/g" \
@@ -211,7 +221,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.CHANNEL_PAT }}
         run: |
-          ver=${GITHUB_REF_NAME#v}
+          ver=${RELEASE_TAG#v}
           git config --global user.name "dedup-release-bot"
           git config --global user.email "taum@tuta.io"
           git clone "https://x-access-token:${GH_TOKEN}@github.com/paxel/homebrew-tap.git" tap
@@ -224,7 +234,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.CHANNEL_PAT }}
         run: |
-          ver=${GITHUB_REF_NAME#v}
+          ver=${RELEASE_TAG#v}
           git clone "https://x-access-token:${GH_TOKEN}@github.com/paxel/scoop-bucket.git" bucket
           mkdir -p bucket/bucket
           cp out/dedup.json bucket/bucket/dedup.json
