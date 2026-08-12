@@ -9,12 +9,19 @@
 # baseline, not three).
 name: CI
 
+# Push covers the working branches; pull_request covers forks. A push that
+# also belongs to an open same-repo PR would run twice — the concurrency
+# group below collapses that.
 on:
   push:
+    branches: ["**"]
   pull_request:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # head_ref (the branch) for PR events, ref for pushes — so a push to a
+  # branch with an open PR shares one group and the duplicate run is
+  # cancelled instead of burning a second full matrix.
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -40,9 +47,9 @@ jobs:
       - name: Format
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   windows:
     name: Windows (build + core/cli tests)
@@ -52,9 +59,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build workspace
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
       - name: Core and CLI tests
-        run: cargo test -p dedup-rs-core -p dedup-rs-cli
+        run: cargo test --locked -p dedup-rs-core -p dedup-rs-cli
 
   macos:
     name: macOS (build + core/cli tests)
@@ -64,6 +71,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build workspace
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
       - name: Core and CLI tests
-        run: cargo test -p dedup-rs-core -p dedup-rs-cli
+        run: cargo test --locked -p dedup-rs-core -p dedup-rs-cli

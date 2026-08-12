@@ -234,6 +234,9 @@ pub struct BrowseView {
     /// Generation counter for the folder read-ahead worker: bumping it makes
     /// the running worker stop at its next check (folder change, tab exit).
     prefetch_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Whether a read-ahead worker may still be running (cleared by
+    /// [`Self::cancel_prefetch`]; the folder claim below survives it).
+    prefetch_alive: bool,
     /// Which `(repo, dir)` the current read-ahead worker was spawned for, so a
     /// frame doesn't respawn it (selection moves within the folder don't
     /// restart it either — it already covers the whole folder).
@@ -291,16 +294,21 @@ impl BrowseView {
             tag_edit: None,
             locks: crate::locks::RepoLocks::new(),
             prefetch_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            prefetch_alive: false,
             prefetch_key: None,
         }
     }
 
     /// Stop the folder read-ahead worker (called when leaving the tab — the
-    /// disk belongs to whatever the user is doing now).
+    /// disk belongs to whatever the user is doing now). The folder keeps its
+    /// claim in `prefetch_key`: coming back to the same folder must NOT warm
+    /// it all over again (that re-read gigabytes on every tab return); only
+    /// entering a *different* folder spawns a new worker.
     pub fn cancel_prefetch(&mut self) {
         // Idempotent: only bump the generation while a worker might be alive,
         // so calling this every frame off-tab costs nothing.
-        if self.prefetch_key.take().is_some() {
+        if self.prefetch_alive {
+            self.prefetch_alive = false;
             self.prefetch_gen
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -464,6 +472,7 @@ impl BrowseView {
         // Invalidate any previous worker, then claim this folder.
         let generation = self.prefetch_gen.fetch_add(1, Ordering::Relaxed) + 1;
         self.prefetch_key = Some(key);
+        self.prefetch_alive = true;
         // Nearest-first from the current selection: the order the user would
         // realistically step through.
         let sel = self.file_sel.min(files.len().saturating_sub(1));
@@ -1293,14 +1302,7 @@ impl BrowseView {
                         // One file, so no second side and no switcher. Browsing
                         // the whole listing as a pool wants the file list, which
                         // the preview dock does not hold — noted for later.
-                        let mut lb =
-                            crate::compare_view::DiffCompare::new_with_pool(side, None, Vec::new());
-                        lb.hide_second();
-                        // A single file under inspection — never "COMPARE —
-                        // SAME PATH, DIFFERENT CONTENT", which describes a
-                        // DIFF pair this view does not have.
-                        lb.set_title("INSPECT");
-                        self.lightbox = Some(lb);
+                        self.lightbox = Some(crate::compare_view::DiffCompare::inspect(side));
                     }
                 } else {
                     placeholder(ui, "decoding…");
@@ -2234,10 +2236,21 @@ mod tests {
             count() >= 2,
             "both neighbours' thumbnails are cached in the background"
         );
+        // Cancel stops the worker but KEEPS the folder claim: coming back to
+        // the same folder must not warm gigabytes all over again — only a
+        // different folder spawns a new worker.
         v.cancel_prefetch();
+        assert!(!v.prefetch_alive, "the worker is told to stop");
         assert!(
-            v.prefetch_key.is_none(),
-            "cancel forgets the folder claim so a return re-spawns"
+            v.prefetch_key.is_some(),
+            "the folder claim survives, so a tab return does not re-warm"
+        );
+        let gen_before = v.prefetch_gen.load(std::sync::atomic::Ordering::Relaxed);
+        v.maybe_prefetch(&rows);
+        assert_eq!(
+            v.prefetch_gen.load(std::sync::atomic::Ordering::Relaxed),
+            gen_before,
+            "returning to the same folder spawns nothing"
         );
     }
 

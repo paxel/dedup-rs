@@ -619,6 +619,17 @@ impl DiffCompare {
         self.second_hidden = true;
     }
 
+    /// The canonical **single-file INSPECT** viewer: one side filling the
+    /// window, no second pane, no pool, titled INSPECT. Every surface that
+    /// opens one file goes through here, so the variants cannot drift apart
+    /// (they had — three hand-rolled copies with differing pools).
+    pub fn inspect(side: DiffSide) -> Self {
+        let mut lb = Self::new_with_pool(side, None, Vec::new());
+        lb.hide_second();
+        lb.set_title("INSPECT");
+        lb
+    }
+
     /// Whether both sides are on screen.
     fn two_sided(&self) -> bool {
         !self.second_hidden
@@ -1749,10 +1760,8 @@ impl DiffCompare {
             .map(u64::from)
             .or(snap.filter(|s| s.loaded).map(|s| s.total_ms))
             .unwrap_or(0);
-        let fmt = |ms: u64| -> String {
-            let secs = ms / 1000;
-            format!("{}:{:02}", secs / 60, secs % 60)
-        };
+        // One formatter app-wide: past an hour this reads 1:15:03, never 75:03.
+        let fmt = crate::media_cell::fmt_ms;
         let time = match elapsed {
             Some(e) => format!(
                 "{} {} / {}",

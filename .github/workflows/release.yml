@@ -54,13 +54,22 @@ jobs:
           tag=${RELEASE_TAG#v}
           [ "$ver" = "$tag" ] || { echo "tag v$tag != crate version $ver" >&2; exit 1; }
       - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
 
   build-linux:
-    name: Linux artifacts
+    name: Linux artifacts (${{ matrix.arch }})
     needs: gate
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          # Native arm64 runner (free for public repos) — restores the arm64
+          # coverage the retired sr.ht manifest used to provide.
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -75,10 +84,10 @@ jobs:
       - name: Binary tarball
         run: |
           ver=${RELEASE_TAG#v}
-          tar -C target/release -czf "dist/dedup-${ver}-linux-x86_64.tar.gz" dedup
+          tar -C target/release -czf "dist/dedup-${ver}-linux-${{ matrix.arch }}.tar.gz" dedup
       - uses: actions/upload-artifact@v4
         with:
-          name: linux
+          name: linux-${{ matrix.arch }}
           path: dist/*
 
   build-windows:
@@ -90,7 +99,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release binaries
-        run: cargo build --release -p dedup-rs-cli -p dedup-rs-gui
+        run: cargo build --release --locked -p dedup-rs-cli -p dedup-rs-gui
       - name: Zip (console dedup.exe + GUI dedup-gui.exe)
         shell: pwsh
         run: |
@@ -124,7 +133,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
-        run: cargo build --release -p dedup-rs-cli
+        run: cargo build --release --locked -p dedup-rs-cli
       - name: Tarball + app bundle + dmg
         run: |
           ver=${RELEASE_TAG#v}
@@ -196,7 +205,7 @@ jobs:
                  "https://crates.io/api/v1/crates/$1/${ver}" >/dev/null 2>&1; then
               echo "$1 ${ver} already on crates.io — skipping"
             else
-              cargo publish -p "$1"
+              cargo publish --locked -p "$1"
               sleep 30
             fi
           }

@@ -43,10 +43,12 @@ pub fn filmstrip_slot(fraction: f32, count: usize) -> usize {
     ((fraction.clamp(0.0, 1.0) * count as f32) as usize).min(count - 1)
 }
 
-/// `m:ss` display of a timestamp, for the enlarged frame's `A @ 1:00` label.
+/// Clock display of a timestamp, for the enlarged frame's `A @ 1:00` label —
+/// one formatter app-wide ([`crate::media_cell::fmt_ms`]), so a film past an
+/// hour reads `1:15:03`, never `75:03`.
 pub fn format_secs(secs: f64) -> String {
-    let s = secs.max(0.0).round() as u64;
-    format!("{}:{:02}", s / 60, s % 60)
+    // Round to whole seconds first (59.6 s reads 1:00, as before).
+    crate::media_cell::fmt_ms(secs.max(0.0).round() as u64 * 1000)
 }
 
 #[cfg(test)]

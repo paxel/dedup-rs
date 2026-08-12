@@ -263,17 +263,27 @@ pub fn has_readable_text(facts: &FileFacts) -> bool {
 /// Whether headless LibreOffice was found by the startup probe. Office and
 /// legacy documents offer a Render tab only when it can actually rasterize
 /// them; a PDF's Render tab is independent of this. Written once by the probe
-/// thread — reading it never blocks a paint frame.
-static SOFFICE_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// thread — reading it never blocks a paint frame. Tri-state, **optimistic
+/// while unknown**: a viewer opened in the seconds before the probe answers
+/// still offers the tab (a conversion attempt then fails gracefully with a
+/// note), instead of silently withholding it for the session's first file.
+static SOFFICE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(UNKNOWN);
+const UNKNOWN: u8 = 0;
+const PRESENT: u8 = 1;
+const ABSENT: u8 = 2;
 
 /// Record the startup probe's `soffice` verdict (see [`soffice_available`]).
 pub fn set_soffice_available(ok: bool) {
-    SOFFICE_OK.store(ok, std::sync::atomic::Ordering::Relaxed);
+    SOFFICE_STATE.store(
+        if ok { PRESENT } else { ABSENT },
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
-/// Whether office/legacy documents can be rendered (probe said `soffice` runs).
+/// Whether office/legacy documents can offer rendering: the probe found
+/// `soffice`, or it simply hasn't answered yet (optimistic).
 pub fn soffice_available() -> bool {
-    SOFFICE_OK.load(std::sync::atomic::Ordering::Relaxed)
+    SOFFICE_STATE.load(std::sync::atomic::Ordering::Relaxed) != ABSENT
 }
 
 impl FileRepresentations {

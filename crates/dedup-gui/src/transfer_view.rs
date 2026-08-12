@@ -1316,6 +1316,15 @@ pub struct TransferView {
     /// The shared FILTER wizard (conditions, presets, suggestions, live count).
     filter: FilterBuilder,
     preview: Vec<board::RowMeta>,
+    /// Monotonic generation of `preview`, bumped on every reassignment — the
+    /// cache key for `lock_filtered`.
+    preview_gen: u64,
+    /// Cached lock-filtered copy of `preview` (APPLY / back-sync DELETE
+    /// withheld while the relevant repo is locked), rebuilt only when the rows
+    /// or the lock verdicts change. Locks are the default state, so without
+    /// this cache every frame deep-cloned up to 10,000 rows.
+    lock_filtered: Vec<board::RowMeta>,
+    lock_filtered_key: Option<(bool, bool, u64)>,
     /// Thumbnails and facts for `preview`, kept index-aligned with it: the board
     /// resolves a row's body only for the rows actually on screen.
     preview_bodies: Vec<board::RowBody>,
@@ -1442,6 +1451,9 @@ impl TransferView {
             subdir: String::new(),
             filter: FilterBuilder::new(),
             preview: Vec::new(),
+            preview_gen: 0,
+            lock_filtered: Vec::new(),
+            lock_filtered_key: None,
             pairing: DiffPairing::ByHash,
             diff_rows: Vec::new(),
             board_state: crate::diff_board::BoardState::default(),
@@ -2932,21 +2944,26 @@ impl TransferView {
                 .selected_sinks
                 .first()
                 .is_some_and(|s| self.locks.read_only(s));
-        let lock_filtered: Vec<board::RowMeta>;
         let metas: &[board::RowMeta] = if strip_apply || strip_del_r {
-            lock_filtered = self
-                .preview
-                .iter()
-                .map(|m| {
-                    let mut m = m.clone();
-                    m.cmds.retain(|&c| {
-                        !(strip_apply && c == board::Cmd::Apply)
-                            && !(strip_del_r && c == board::Cmd::DeleteRight)
-                    });
-                    m
-                })
-                .collect();
-            &lock_filtered
+            // Rebuilt only when the rows or the lock verdicts change — locks
+            // are the default, so this used to deep-clone every row per frame.
+            let key = (strip_apply, strip_del_r, self.preview_gen);
+            if self.lock_filtered_key != Some(key) {
+                self.lock_filtered = self
+                    .preview
+                    .iter()
+                    .map(|m| {
+                        let mut m = m.clone();
+                        m.cmds.retain(|&c| {
+                            !(strip_apply && c == board::Cmd::Apply)
+                                && !(strip_del_r && c == board::Cmd::DeleteRight)
+                        });
+                        m
+                    })
+                    .collect();
+                self.lock_filtered_key = Some(key);
+            }
+            &self.lock_filtered
         } else {
             &self.preview
         };
@@ -3329,6 +3346,7 @@ impl TransferView {
         self.pending_group_confirm = None;
         self.wholesale_sinks.clear();
         self.preview.clear();
+        self.preview_gen += 1;
         self.diff_rows.clear();
         // A popup (and an open comparison) belongs to the rows it was opened
         // from.
@@ -3588,6 +3606,7 @@ impl TransferView {
             .unwrap_or_default();
         self.wholesale_sinks = Vec::new();
         self.preview = outcome.rows;
+        self.preview_gen += 1;
         self.preview_bodies = outcome.bodies;
         self.status = Some(format!(
             "{} new file(s) to promote, {} resurrection candidate(s).",
@@ -3641,6 +3660,7 @@ impl TransferView {
         // The board sorts through its own index; the caller just hands over the
         // rows and their bodies, index-aligned.
         self.preview = outcome.rows;
+        self.preview_gen += 1;
         self.preview_bodies = outcome.bodies;
         self.status = Some(format!(
             "{} file(s) to copy, {} to delete across {} sink(s).",
@@ -3861,6 +3881,7 @@ impl TransferView {
         self.preview_source_header = data.source_header;
         self.preview_target_header = data.target_header;
         self.preview = data.rows;
+        self.preview_gen += 1;
         self.preview_bodies = data.bodies;
         self.status = Some(data.status);
         self.error = None;
@@ -3966,9 +3987,7 @@ impl TransferView {
             // so the viewer is a single-file INSPECT (no SHOW B, no pair
             // actions).
             (Some(only), None) | (None, Some(only)) => {
-                let mut lb = DiffCompare::new_with_pool(only.clone(), None, vec![only]);
-                lb.set_title("INSPECT");
-                self.inspect = Some(lb);
+                self.inspect = Some(DiffCompare::inspect(only));
                 self.error = None;
             }
             (None, None) => {
@@ -3993,9 +4012,7 @@ impl TransferView {
         })();
         match side {
             Some(side) => {
-                let mut lb = DiffCompare::new_with_pool(side.clone(), None, vec![side]);
-                lb.set_title("INSPECT");
-                self.inspect = Some(lb);
+                self.inspect = Some(DiffCompare::inspect(side));
                 self.error = None;
             }
             None => self.error = Some("Could not read that row's file.".to_string()),
