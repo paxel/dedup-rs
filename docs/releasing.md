@@ -3,7 +3,7 @@
 A release is one command:
 
 ```bash
-git tag v0.2.0 && git push --tags
+git tag v0.2.1 && git push --tags
 ```
 
 The tag must equal the crate version in the workspace (the release workflow refuses
