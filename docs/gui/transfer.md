@@ -152,13 +152,18 @@ main; you pick **one sink** to reconcile.
 
 ![GROUP SYNC BACK: a green new-file row and a blue resurrection row](../screenshots/group_sync_back.png)
 
-REVIEW sorts the sink's files against the main into two kinds:
+REVIEW sorts the sink's files against the main into three kinds:
 
 - **New** (green) — content the main never had. These are your direct edits. **RUN** promotes
   them all into the main in one batch.
 - **Resurrection** (blue) — content the main once had and **deleted**, that the sink still
   holds. These are **never** promoted by the batch — resurrecting a file undoes a deletion, and
   only you know whether that deletion was a mistake or deliberate.
+- **Path conflict** (amber) — the main has a **different file at that exact path**, so a plain
+  promote is impossible (nothing is ever overwritten silently). The main's cell shows its own
+  occupying file, so you judge by looking at both. The row offers **`< OVERWRITE`** — replace
+  the main's file with the sink's — shown only while the **main** is unlocked, since it deletes
+  the main's current version. The batch never touches these rows.
 
 Each row is a full triage decision: **`< COPY`** pulls *just that file* into the main (the only
 way a resurrection comes back), and **`DELETE`** on the sink's side removes it there instead —

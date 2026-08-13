@@ -700,6 +700,7 @@ fn build_group_preview(
         bodies,
         added,
         removed,
+        conflicts: 0,
         sink_count,
         wholesale_sinks,
     })
@@ -720,43 +721,68 @@ fn build_group_back_preview(
     let pull = dedup_core::diff::plan_sync_back(store, sink, &group.main, filter)
         .map_err(|e| e.to_string())?;
     let (sink_db, sink_base) = open_facts(store, sink);
+    let (main_db, main_base) = open_facts(store, &group.main);
     let mut rows = Vec::new();
     let mut bodies = Vec::new();
-    let (mut new_count, mut resurrect_count) = (0usize, 0usize);
+    let (mut new_count, mut resurrect_count, mut conflict_count) = (0usize, 0usize, 0usize);
     for item in &pull {
-        let main_status = match item.kind {
-            dedup_core::diff::PullKind::New => {
-                new_count += 1;
-                board::Status::OnlyHere
-            }
-            dedup_core::diff::PullKind::Resurrection => {
-                resurrect_count += 1;
-                board::Status::Resurrect
+        // The main may hold a *different* file at this exact path (the pull is
+        // planned by content, not path). A plain promote would be refused —
+        // the engine never overwrites — so the row must show the collision.
+        let main_facts = facts_for(main_db.as_deref(), main_base.as_deref(), &item.rel_path);
+        let conflict = main_facts.as_ref().is_some_and(|f| !f.missing);
+        let main_status = if conflict {
+            conflict_count += 1;
+            board::Status::Differs
+        } else {
+            match item.kind {
+                dedup_core::diff::PullKind::New => {
+                    new_count += 1;
+                    board::Status::OnlyHere
+                }
+                dedup_core::diff::PullKind::Resurrection => {
+                    resurrect_count += 1;
+                    board::Status::Resurrect
+                }
             }
         };
         if rows.len() < PREVIEW_CAP {
             let sink_facts = facts_for(sink_db.as_deref(), sink_base.as_deref(), &item.rel_path);
-            let veil = match item.kind {
-                dedup_core::diff::PullKind::New => CO_NEW,
-                dedup_core::diff::PullKind::Resurrection => CO_WAS_DELETED,
+            let (meta, body) = if conflict {
+                board_row(
+                    // Golden rule: a conflicting target path shows the
+                    // occupying file itself — you judge by looking at both.
+                    SideSpec::at(main_status, &item.rel_path, main_facts),
+                    SideSpec::at(board::Status::Differs, &item.rel_path, sink_facts).in_repo(sink),
+                    false,
+                    // Replacing the main's file is destructive, so it is its
+                    // own explicit command, never a side effect of `< COPY`
+                    // (withheld at render time while the main is locked).
+                    vec![board::Cmd::OverwriteLeft, board::Cmd::DeleteRight],
+                )
+            } else {
+                let veil = match item.kind {
+                    dedup_core::diff::PullKind::New => CO_NEW,
+                    dedup_core::diff::PullKind::Resurrection => CO_WAS_DELETED,
+                };
+                board_row(
+                    // Golden rule: the main *receives* — its cell shows the
+                    // incoming file's preview under green NEW (or blue
+                    // WAS DELETED for a resurrection: the main deleted this).
+                    // The sink's own cell shows its file plain; nothing happens
+                    // to the sink on a promote.
+                    SideSpec::at(main_status, &item.rel_path, sink_facts.clone()).veiled(veil),
+                    SideSpec::at(board::Status::Same, &item.rel_path, sink_facts).in_repo(sink),
+                    false,
+                    // Each row is a triage decision: `< COPY` pulls this one file
+                    // into the main (the only way to opt a resurrection in, and a
+                    // way to promote a single new file), `DELETE R` removes it from
+                    // the sink instead — everything in the sink is either worth
+                    // promoting or worth purging. (DELETE R is withheld at render
+                    // time while the sink is locked.)
+                    vec![board::Cmd::CopyLeft, board::Cmd::DeleteRight],
+                )
             };
-            let (meta, body) = board_row(
-                // Golden rule: the main *receives* — its cell shows the
-                // incoming file's preview under green NEW (or blue
-                // WAS DELETED for a resurrection: the main deleted this).
-                // The sink's own cell shows its file plain; nothing happens
-                // to the sink on a promote.
-                SideSpec::at(main_status, &item.rel_path, sink_facts.clone()).veiled(veil),
-                SideSpec::at(board::Status::Same, &item.rel_path, sink_facts).in_repo(sink),
-                false,
-                // Each row is a triage decision: `< COPY` pulls this one file
-                // into the main (the only way to opt a resurrection in, and a
-                // way to promote a single new file), `DELETE R` removes it from
-                // the sink instead — everything in the sink is either worth
-                // promoting or worth purging. (DELETE R is withheld at render
-                // time while the sink is locked.)
-                vec![board::Cmd::CopyLeft, board::Cmd::DeleteRight],
-            );
             rows.push(meta);
             bodies.push(body);
         }
@@ -776,6 +802,7 @@ fn build_group_back_preview(
         bodies,
         added: new_count,
         removed: resurrect_count,
+        conflicts: conflict_count,
         sink_count: 1,
         wholesale_sinks: Vec::new(),
     })
@@ -1224,6 +1251,10 @@ struct GroupPreviewData {
     bodies: Vec<board::RowBody>,
     added: usize,
     removed: usize,
+    /// Back-sync only: pull candidates whose path in the main is occupied by
+    /// different content — resolved per row with `< OVERWRITE`, never by the
+    /// batch promote.
+    conflicts: usize,
     sink_count: usize,
     /// Sinks the plan would empty of their current contents, `(sink, live)`.
     wholesale_sinks: Vec<(String, u64)>,
@@ -1237,6 +1268,9 @@ struct GroupSyncResult {
     main: String,
     copied: u64,
     deleted: u64,
+    /// Copies refused because the target path holds different content — a
+    /// silent 0-copied run otherwise looks like nothing happened.
+    skipped_files: u64,
     errors: u64,
     cancelled: bool,
     /// Sinks that failed outright, as ready-to-display `"sink: error"` lines.
@@ -1324,7 +1358,7 @@ pub struct TransferView {
     /// or the lock verdicts change. Locks are the default state, so without
     /// this cache every frame deep-cloned up to 10,000 rows.
     lock_filtered: Vec<board::RowMeta>,
-    lock_filtered_key: Option<(bool, bool, u64)>,
+    lock_filtered_key: Option<(bool, bool, bool, u64)>,
     /// Thumbnails and facts for `preview`, kept index-aligned with it: the board
     /// resolves a row's body only for the rows actually on screen.
     preview_bodies: Vec<board::RowBody>,
@@ -1408,6 +1442,9 @@ enum Act {
     CancelRun,
     /// Apply a single review row immediately (its namespaced key).
     ApplyRow(String),
+    /// GROUP SYNC BACK: replace the main's file at this rel path with the
+    /// sink's — the explicit resolution of a path conflict.
+    OverwriteMainRow(String),
     SetPairing(DiffPairing),
     /// Execute a single DIFF board row action.
     Board(crate::diff_board::BoardAction),
@@ -2944,10 +2981,18 @@ impl TransferView {
                 .selected_sinks
                 .first()
                 .is_some_and(|s| self.locks.read_only(s));
-        let metas: &[board::RowMeta] = if strip_apply || strip_del_r {
+        // Overwriting the main's conflicting file deletes existing data there,
+        // so the command needs the *main* unlocked (a promote only adds and
+        // stays available).
+        let strip_ovr_l = self.command == Command::GroupSyncBack
+            && self
+                .current_group
+                .as_ref()
+                .is_none_or(|g| self.locks.read_only(&g.main));
+        let metas: &[board::RowMeta] = if strip_apply || strip_del_r || strip_ovr_l {
             // Rebuilt only when the rows or the lock verdicts change — locks
             // are the default, so this used to deep-clone every row per frame.
-            let key = (strip_apply, strip_del_r, self.preview_gen);
+            let key = (strip_apply, strip_del_r, strip_ovr_l, self.preview_gen);
             if self.lock_filtered_key != Some(key) {
                 self.lock_filtered = self
                     .preview
@@ -2957,6 +3002,7 @@ impl TransferView {
                         m.cmds.retain(|&c| {
                             !(strip_apply && c == board::Cmd::Apply)
                                 && !(strip_del_r && c == board::Cmd::DeleteRight)
+                                && !(strip_ovr_l && c == board::Cmd::OverwriteLeft)
                         });
                         m
                     })
@@ -3021,6 +3067,13 @@ impl TransferView {
                 board::Cmd::DeleteRight => {
                     if let Some(rel) = meta.right_paths.first() {
                         acts.push(Act::DeleteSinkRow(rel.clone()));
+                    }
+                }
+                // A back-sync path conflict's explicit resolution: replace the
+                // main's file with the sink's.
+                board::Cmd::OverwriteLeft => {
+                    if let Some(rel) = meta.right_paths.first() {
+                        acts.push(Act::OverwriteMainRow(rel.clone()));
                     }
                 }
                 // Clicking the row opens the file that actually exists — the
@@ -3264,6 +3317,26 @@ impl TransferView {
                     // Never act past the lock, even from a preview built before
                     // the repo was re-locked.
                     self.start(store, config, Some(key));
+                }
+            }
+            Act::OverwriteMainRow(rel) => {
+                // Replacing an existing main file is destructive: the button is
+                // withheld while the main is locked, and this re-check means a
+                // stale frame can never slip past the lock.
+                let (Some(group), Some(sink)) = (
+                    self.current_group.clone(),
+                    self.selected_sinks.first().cloned(),
+                ) else {
+                    return;
+                };
+                if self.locks.read_only(&group.main) {
+                    return;
+                }
+                match dedup_core::diff::overwrite_file(store, &sink, &rel, &group.main, &rel) {
+                    // The conflict is resolved on disk: rebuild the preview so
+                    // the row disappears with correct counts.
+                    Ok(()) => self.run_preview(store),
+                    Err(e) => self.error = Some(e.to_string()),
                 }
             }
             Act::DeleteSinkRow(rel) => {
@@ -3599,10 +3672,11 @@ impl TransferView {
             }
         };
         // The 4-slot summary has no resurrection bucket; new files ride the
-        // "only on one side" (green) slot, and the resurrection count is spoken
-        // in the status line and shown as the blue rows themselves.
-        self.preview_totals = [0, outcome.added, 0, 0];
-        self.preview_total = outcome.added + outcome.removed;
+        // "only on one side" (green) slot, path conflicts the "differs" (amber)
+        // slot, and the resurrection count is spoken in the status line and
+        // shown as the blue rows themselves.
+        self.preview_totals = [0, outcome.added, outcome.conflicts, 0];
+        self.preview_total = outcome.added + outcome.removed + outcome.conflicts;
         self.preview_source_header = outcome.main_header.clone();
         self.preview_target_header = outcome
             .group
@@ -3614,23 +3688,40 @@ impl TransferView {
         self.preview = outcome.rows;
         self.preview_gen += 1;
         self.preview_bodies = outcome.bodies;
+        let conflicts_line = if outcome.conflicts > 0 {
+            format!(
+                ", {} path conflict(s) — the main has a different file at that path",
+                outcome.conflicts
+            )
+        } else {
+            String::new()
+        };
         self.status = Some(format!(
-            "{} new file(s) to promote, {} resurrection candidate(s).",
+            "{} new file(s) to promote, {} resurrection candidate(s){conflicts_line}.",
             outcome.added, outcome.removed
         ));
         self.error = None;
         if confirm {
-            // The batch promotes only the new files; resurrection is per-row.
+            // The batch promotes only the new files; resurrection and path
+            // conflicts are per-row decisions.
             let sink = outcome
                 .group
                 .sinks
                 .first()
                 .map(|s| s.repo.clone())
                 .unwrap_or_default();
+            let conflicts_note = if outcome.conflicts > 0 {
+                format!(
+                    " {} conflicting path(s) are left for a per-row < OVERWRITE.",
+                    outcome.conflicts
+                )
+            } else {
+                String::new()
+            };
             self.confirm = Some(format!(
                 "Promote {} new file(s) from sink '{}' into main '{}'? {} resurrection \
-                 candidate(s) are left for you to pull one by one. Nothing on the sink is \
-                 changed.",
+                 candidate(s) are left for you to pull one by one.{conflicts_note} Nothing on \
+                 the sink is changed.",
                 outcome.added, sink, outcome.group.main, outcome.removed
             ));
             self.pending_group_back = Some((outcome.group.main.clone(), sink));
@@ -3780,6 +3871,7 @@ impl TransferView {
                     main: main.clone(),
                     copied: stats.copied,
                     deleted: 0,
+                    skipped_files: stats.skipped,
                     errors: stats.errors,
                     cancelled: stats.cancelled,
                     failures: Vec::new(),
@@ -3811,7 +3903,7 @@ impl TransferView {
             }
             let progress = ChannelDiffProgress { tx: tx.clone() };
             let run = DiffRun::new(&progress, &cancel);
-            let (mut copied, mut deleted, mut errors) = (0u64, 0u64, 0u64);
+            let (mut copied, mut deleted, mut skipped_files, mut errors) = (0u64, 0u64, 0u64, 0u64);
             let mut failures = Vec::new();
             let mut skipped = Vec::new();
             let mut cancelled = false;
@@ -3833,6 +3925,7 @@ impl TransferView {
                     Ok(stats) => {
                         copied += stats.copied;
                         deleted += stats.deleted;
+                        skipped_files += stats.skipped;
                         errors += stats.errors;
                         cancelled |= stats.cancelled;
                     }
@@ -3843,6 +3936,7 @@ impl TransferView {
                 main: group.main,
                 copied,
                 deleted,
+                skipped_files,
                 errors,
                 cancelled,
                 failures,
@@ -4451,6 +4545,17 @@ impl TransferView {
                             .cancelled(r.cancelled)
                             .problems(std::mem::take(&mut self.run_problems))
                             .problems(r.failures);
+                            // A promote refused because the path is taken must
+                            // never look like "nothing happened".
+                            if r.skipped_files > 0 {
+                                report = report.count("skipped", r.skipped_files).note(format!(
+                                    "{} file(s) were not copied: the target already has a \
+                                     different file at that exact path. The review board \
+                                     marks these rows as conflicts — resolve each with \
+                                     < OVERWRITE (or DELETE R).",
+                                    r.skipped_files
+                                ));
+                            }
                             if !r.skipped.is_empty() {
                                 report = report.note(format!(
                                     "{} sink(s) were never pushed and are now stale: {}",
@@ -5115,6 +5220,90 @@ mod ui_tests {
         assert!(
             statuses.contains(&board::Status::Resurrect),
             "a resurrection (blue) row: {statuses:?}"
+        );
+    }
+
+    /// A pull candidate whose path the main occupies with *different* content
+    /// is a conflict: the main cell shows its own occupying file (amber
+    /// DIFFERS — the golden rule), the row offers `< OVERWRITE` instead of a
+    /// `< COPY` the engine would silently refuse, and running it replaces the
+    /// main's file — but only while the main is unlocked.
+    #[test]
+    fn group_sync_back_path_conflict_offers_overwrite() {
+        let (tmp, store) = back_preview_store();
+        std::fs::write(tmp.path().join("target").join("photo.jpg"), b"sink-version").unwrap();
+        std::fs::write(
+            tmp.path().join("source").join("photo.jpg"),
+            b"main-version!",
+        )
+        .unwrap();
+        for repo in ["source", "target"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        }
+        let store2 = Arc::clone(&store);
+        let mut h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+            v.command = Command::GroupSyncBack;
+        });
+        h.get_by_label("REVIEW").click_accesskit();
+        settle_preview(&mut h);
+
+        let (i, conflict) = h
+            .state()
+            .preview
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.left_status == board::Status::Differs)
+            .map(|(i, r)| (i, r.clone()))
+            .expect("the occupied path surfaces as a conflict row");
+        assert!(
+            conflict.cmds.contains(&board::Cmd::OverwriteLeft),
+            "a conflict resolves via < OVERWRITE: {:?}",
+            conflict.cmds
+        );
+        assert!(
+            !conflict.cmds.contains(&board::Cmd::CopyLeft),
+            "no < COPY the engine would refuse"
+        );
+        assert_eq!(
+            h.state().preview_bodies[i]
+                .left
+                .facts
+                .as_ref()
+                .map(|f| f.size),
+            Some(b"main-version!".len() as u64),
+            "the main cell shows the occupying file itself"
+        );
+        assert_eq!(
+            h.state().preview_totals[2],
+            1,
+            "the conflict rides the amber (differs) slot"
+        );
+
+        // Locked main (the session default): the handler re-checks and no-ops.
+        let rel = conflict.right_paths.first().unwrap().clone();
+        h.state_mut()
+            .apply(&store, None, Act::OverwriteMainRow(rel.clone()));
+        assert_eq!(
+            std::fs::read(tmp.path().join("source").join("photo.jpg")).unwrap(),
+            b"main-version!",
+            "a locked main is never overwritten"
+        );
+
+        h.state().locks.toggle("source");
+        h.state_mut()
+            .apply(&store, None, Act::OverwriteMainRow(rel));
+        assert_eq!(
+            std::fs::read(tmp.path().join("source").join("photo.jpg")).unwrap(),
+            b"sink-version",
+            "OVERWRITE replaces the main's file with the sink's"
         );
     }
 

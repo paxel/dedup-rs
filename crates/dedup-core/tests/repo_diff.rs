@@ -515,3 +515,71 @@ fn row_actions_reject_unknown_files_and_escaping_paths() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn single_row_promote_copies_the_selected_new_file() -> TestResult {
+    // The GUI's back-sync `< COPY`: promote exactly one New file by running
+    // diff_sync sink→main with a one-key `only` selection.
+    use dedup_core::diff::{DiffRun, SyncDelete, diff_sync, source_key};
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.right, "shared.txt", b"shared")?;
+    Sandbox::write(&sb.left, "shared.txt", b"shared")?;
+    Sandbox::write(&sb.left, "2023/11/photo.jpg", b"jpeg-bytes")?;
+    sb.update_both()?;
+
+    let plan = plan_sync_back(&sb.store, "LEFT", "RIGHT", None)?;
+    assert_eq!(plan.len(), 1, "one New candidate");
+    assert_eq!(plan[0].rel_path, "2023/11/photo.jpg");
+
+    let only: std::collections::HashSet<String> = [source_key(&plan[0].rel_path)].into();
+    let cancel = CancellationToken::new();
+    let run =
+        DiffRun::new(&dedup_core::diff::NoDiffProgress, &cancel).with_selection(None, Some(&only));
+    let stats = diff_sync(
+        &sb.store,
+        "LEFT",
+        "RIGHT",
+        true,
+        SyncDelete::None,
+        None,
+        &run,
+    )?;
+    assert_eq!(stats.copied, 1, "the selected file is promoted");
+    assert!(
+        sb.right.join("2023/11/photo.jpg").exists(),
+        "the file landed in the main"
+    );
+    Ok(())
+}
+
+#[test]
+fn promote_onto_occupied_path_is_skipped_not_copied() -> TestResult {
+    // Sink holds content the main never saw, but the main has a *different*
+    // file at the same relative path: the plan calls it New, the copy engine
+    // refuses to overwrite — the run must surface that as skipped.
+    use dedup_core::diff::{DiffRun, SyncDelete, diff_sync, source_key};
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.left, "2023/photo.jpg", b"original-bytes")?;
+    Sandbox::write(&sb.right, "2023/photo.jpg", b"edited-bytes")?;
+    sb.update_both()?;
+
+    let plan = plan_sync_back(&sb.store, "LEFT", "RIGHT", None)?;
+    assert_eq!(plan.len(), 1, "the sink's variant is New to the main");
+
+    let only: std::collections::HashSet<String> = [source_key(&plan[0].rel_path)].into();
+    let cancel = CancellationToken::new();
+    let run =
+        DiffRun::new(&dedup_core::diff::NoDiffProgress, &cancel).with_selection(None, Some(&only));
+    let stats = diff_sync(
+        &sb.store,
+        "LEFT",
+        "RIGHT",
+        true,
+        SyncDelete::None,
+        None,
+        &run,
+    )?;
+    assert_eq!(stats.copied, 0, "occupied path is never overwritten");
+    assert_eq!(stats.skipped, 1, "and the refusal is counted as skipped");
+    Ok(())
+}

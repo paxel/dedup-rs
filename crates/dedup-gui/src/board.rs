@@ -799,7 +799,7 @@ fn draw_row(
         egui::Rect::from_min_size(egui::pos2(x, row.top()), egui::vec2(w, row.height()))
     };
 
-    side_cell(
+    if side_cell(
         ui,
         thumbs,
         region(row.left(), side),
@@ -812,7 +812,11 @@ fn draw_row(
             multi_repo: false,
             counterpart: &meta.right_paths,
         },
-    );
+    ) {
+        // The thumbnail senses clicks itself (it sits over the row's click
+        // region), so its click is the row click: open the viewer.
+        clicked = Some(Cmd::OpenRow);
+    }
 
     // The command grid sits on a CMD_W × CMD_H lattice, so the row draws exactly
     // the height `RowMeta::height` reserved for it.
@@ -900,8 +904,8 @@ fn draw_row(
         }
     }
 
-    if two_sided {
-        side_cell(
+    if two_sided
+        && side_cell(
             ui,
             thumbs,
             region(grid_left + centre, side),
@@ -914,7 +918,10 @@ fn draw_row(
                 multi_repo,
                 counterpart: &meta.left_paths,
             },
-        );
+        )
+        && clicked.is_none()
+    {
+        clicked = Some(Cmd::OpenRow);
     }
     clicked
 }
@@ -934,16 +941,19 @@ fn cmd_button(ui: &mut egui::Ui, at: egui::Rect, cmd: Cmd, hide_skips_run: bool)
 /// One side's mini-overview, drawn into `rect`: an optional repo chip, the
 /// thumbnail, every path this side holds, and a compact facts line. An absent
 /// side renders nothing but still claims its rect, so the centre column stays
-/// put.
-fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view: SideView) {
+/// put. Returns whether the thumbnail was clicked: `media_cell` senses clicks
+/// itself, so it sits *over* the row's own click region — dropping its
+/// response would make exactly the picture the dead spot of an otherwise
+/// clickable row.
+fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view: SideView) -> bool {
     // A side with no file and no story stays empty. A side with no file but a
     // story about itself (it deleted this content) draws a bare tombstone
     // cell below.
     if view.paths.is_empty() && view.body.overlay.is_none() {
-        return;
+        return false;
     }
     if view.status == Status::Absent && view.body.overlay.is_none() {
-        return;
+        return false;
     }
     if view.paths.is_empty() {
         // Tombstone: no file, no preview (the golden rule), just the state —
@@ -955,7 +965,7 @@ fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view:
         );
         let (r, _) = cell.allocate_exact_size(egui::vec2(THUMB, THUMB), egui::Sense::hover());
         crate::media_cell::paint_overlay_cell(cell.painter(), r, view.body.overlay);
-        return;
+        return false;
     }
     let mut cell = ui.new_child(
         egui::UiBuilder::new()
@@ -964,16 +974,18 @@ fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view:
     );
     let cell = &mut cell;
     let mut text_width = rect.width();
+    let mut thumb_clicked = false;
     if let Some(f) = &view.body.facts {
         // The golden rule: this cell shows this side's preview, veiled only
         // with **its own** state — the row builders decide that per side (a
         // missing file veils itself amber inside `media_cell` regardless).
-        let _ = media_cell(
+        thumb_clicked = media_cell(
             cell,
             thumbs,
             f,
             MediaStyle::row(THUMB).with_overlay(view.body.overlay),
-        );
+        )
+        .is_some_and(|r| r.clicked());
         text_width -= THUMB + cell.spacing().item_spacing.x;
     }
     cell.vertical(|ui| {
@@ -1039,6 +1051,7 @@ fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view:
             ui.add(egui::Label::new(text).truncate());
         }
     });
+    thumb_clicked
 }
 
 /// Byte ranges of `a` that do not appear in the corresponding place of `b`,
@@ -1418,6 +1431,117 @@ fn summary(ui: &mut egui::Ui, totals: [usize; 4]) {
 
 #[cfg(test)]
 mod tests {
+
+    /// The thumbnail senses clicks itself, so it sits on top of the row's own
+    /// click region — its click must surface as OpenRow, not vanish into a
+    /// dead spot (it did: the picture was the one part of a row you could not
+    /// click).
+    #[test]
+    fn a_thumbnail_click_opens_the_row() {
+        use super::*;
+        use egui_kittest::kittest::Queryable;
+
+        let facts = crate::media_cell::FileFacts {
+            size: 5_080_000,
+            modified_ms: 0,
+            missing: false,
+            mime: Some("image/jpeg".to_string()),
+            img_size: Some((3072, 4080)),
+            audio_ms: None,
+            audio_seed: None,
+            hash_hex: "deadbeef".to_string(),
+            abs_path: std::path::PathBuf::from("/nonexistent/one.jpg"),
+            origin: None,
+            exif: None,
+        };
+        let body = RowBody {
+            left: SideBody {
+                facts: Some(facts.clone()),
+                repo: None,
+                repo_is_main: false,
+                overlay: None,
+            },
+            right: SideBody {
+                facts: Some(facts),
+                repo: None,
+                repo_is_main: false,
+                overlay: None,
+            },
+        };
+        let metas = vec![diff_row("one")];
+        let mut init = false;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 700.0))
+            .build_ui_state(
+                move |ui, state: &mut (BoardState, Option<Cmd>)| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    let mut thumbs = ThumbCache::new(4);
+                    if let Some(a) = board(
+                        ui,
+                        &mut state.0,
+                        &metas,
+                        BoardView {
+                            left_role: "SOURCE",
+                            left_repo: "photos",
+                            left_is_main: false,
+                            left_path: "/mnt/photos",
+                            right: Some(RightHeader {
+                                role: "TARGET",
+                                repo: "backup",
+                                is_main: false,
+                                path: "/mnt/backup",
+                                multi_repo: false,
+                            }),
+                            totals: [0, 1, 0, 0],
+                            full_len: 1,
+                            hide_skips_run: true,
+                        },
+                        &mut thumbs,
+                        &mut |_| body.clone(),
+                    ) {
+                        state.1 = Some(a.cmd);
+                    }
+                },
+                (BoardState::default(), None),
+            );
+        harness.run_steps(3);
+
+        // The left cell lays out [thumb][paths]; aim at the thumbnail square
+        // just left of the leftmost path label (the path shows on both sides,
+        // so pick the left cell's by position).
+        let label = harness
+            .get_all_by_label_contains("one.jpg")
+            .map(|n| n.rect())
+            .min_by(|a, b| a.left().total_cmp(&b.left()))
+            .unwrap_or(egui::Rect::NOTHING);
+        let pos = egui::pos2(label.left() - 8.0 - THUMB / 2.0, label.top() + THUMB / 2.0);
+        harness.event(egui::Event::PointerMoved(pos));
+        harness.step();
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.step();
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.run_steps(2);
+
+        assert_eq!(
+            harness.state().1,
+            Some(Cmd::OpenRow),
+            "clicking the picture opens the row"
+        );
+    }
 
     /// The law reaches the boards: clicking a row body opens the shared viewer.
     /// Rows therefore carry no COMPARE command — it would be a second door.

@@ -657,23 +657,13 @@ impl DedupApp {
             }
             Action::Check(name) => self.enqueue(name, JobKind::Check),
             Action::RefreshStatus => {
-                // Re-probe location/reachability, and run a freshness CHECK on
-                // every reachable repo — the status analog of UPDATE ALL. Repos
-                // already known to need an update are skipped (re-checking would
-                // only confirm what the pill already shows).
+                // Re-probe location/reachability only. It used to also enqueue
+                // a freshness CHECK (a full directory walk) on every reachable
+                // repo — on slow cloud mounts that spawned exactly the
+                // uninvited scans the remote flag exists to prevent, and users
+                // pressing this after reconnecting a drive just wanted the
+                // OFFLINE pill cleared. Staleness stays with CHECK / UPDATE.
                 self.refresh_status(ctx);
-                let names: Vec<String> = self
-                    .repos
-                    .iter()
-                    .filter(|r| {
-                        r.location.is_none_or(|l| l.reachable())
-                            && !matches!(r.freshness, Freshness::Stale { .. })
-                    })
-                    .map(|r| r.name.clone())
-                    .collect();
-                for name in names {
-                    self.enqueue(name, JobKind::Check);
-                }
             }
             Action::Cancel(name) => {
                 if let Some(token) = self.cancels.get(&name) {
@@ -1398,17 +1388,17 @@ impl DedupApp {
                     )
                     .fill(theme::lilac());
                     if ui
-                    .add_enabled(!self.repos.is_empty(), refresh)
-                    .explain(
-                        self.tooltip_verbosity,
-                        "Re-check location and staleness",
-                        "Re-check every repository's location and reachability, and whether its \
-                     index is stale (dry-run — no hashing, no writes).",
-                    )
-                    .clicked()
-                {
-                    actions.push(Action::RefreshStatus);
-                }
+                        .add_enabled(!self.repos.is_empty(), refresh)
+                        .explain(
+                            self.tooltip_verbosity,
+                            "Re-check reachability",
+                            "Re-check every repository's location and reachability — a reconnected \
+                     drive turns reachable again. No files are read.",
+                        )
+                        .clicked()
+                    {
+                        actions.push(Action::RefreshStatus);
+                    }
                     if busy {
                         ui.label(
                             RichText::new("· busy: a scan is running")

@@ -14,9 +14,10 @@ subcommand](../cli.md#repo).
   Already up-to-date repos finish almost instantly.
 - **UPDATE LOCAL** — the same, minus every repository **marked remote** (see below): the
   quick everyday rescan that leaves slow network or cloud mounts alone.
-- **REFRESH STATUS** — re-checks every repository's location/reachability and whether its
-  index is stale (a dry-run — no hashing, no writes). This is what produces the LOCAL /
-  REMOTE / OFFLINE / MISSING and UP TO DATE / UPDATE REQUIRED pills on each card.
+- **REFRESH STATUS** — re-checks every repository's location/reachability, so a
+  reconnected drive turns reachable again. No files are read; freshness stays with
+  CHECK / UPDATE. This is what produces the LOCAL / REMOTE / OFFLINE / MISSING pills
+  on each card.
 
 ## Repository cards
 
