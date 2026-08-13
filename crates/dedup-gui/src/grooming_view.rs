@@ -2428,6 +2428,222 @@ mod ui_tests {
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
 
+    /// Two scanned repos with real content for behavior tests: "a" (groomed)
+    /// holds a duplicate of pool content, a unique file, purgeable junk and an
+    /// empty directory tree; "b" is the dupe pool.
+    fn seeded_store() -> (tempfile::TempDir, Arc<Store>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_at(tmp.path().join("cfg")).unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir_all(a.join("empty/nested")).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("dup.txt"), b"shared-content").unwrap();
+        std::fs::write(a.join("unique.txt"), b"only-in-a").unwrap();
+        std::fs::write(a.join("junk.tmp"), b"cache junk").unwrap();
+        std::fs::write(b.join("kept.txt"), b"shared-content").unwrap();
+        store.create_repo("a", &a.to_string_lossy()).unwrap();
+        store.create_repo("b", &b.to_string_lossy()).unwrap();
+        for repo in ["a", "b"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        }
+        (tmp, Arc::new(store))
+    }
+
+    /// Step until the background run finishes (never `run()` — the running
+    /// spinner repaints forever and would blow kittest's settle cap).
+    fn wait_done(h: &mut Harness<'static, GroomingView>) {
+        for _ in 0..600 {
+            h.step();
+            if !h.state().running {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the grooming run never finished");
+    }
+
+    /// DEDUPE end to end: REVIEW plans exactly the pool-covered file, RUN is
+    /// inert while the source is locked (the session default), and after
+    /// unlocking PROCEED deletes only that file from disk.
+    #[test]
+    fn dedupe_runs_after_unlock_and_deletes_only_covered_files() {
+        let (tmp, store) = seeded_store();
+        let mut h = grooming_harness(Arc::clone(&store), Command::Dedupe);
+        h.state_mut().source = Some("a".to_string());
+        h.state_mut().pool = vec!["b".to_string()];
+        h.run();
+        h.get_by_label("REVIEW").click_accesskit();
+        wait_done(&mut h);
+        assert_eq!(
+            h.state().preview_total,
+            1,
+            "exactly the pool-covered file is planned"
+        );
+
+        // Locked source: RUN never reaches a confirmation.
+        h.get_by_label("RUN").click_accesskit();
+        h.step();
+        h.step();
+        assert!(
+            h.state().confirm.is_none(),
+            "a locked repo blocks the run: {:?}",
+            h.state().confirm
+        );
+
+        h.state().locks.toggle("a");
+        h.run();
+        h.get_by_label("RUN").click_accesskit();
+        for _ in 0..100 {
+            h.step();
+            if h.state().confirm.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(h.state().confirm.is_some(), "RUN asks before deleting");
+        h.step(); // draw the freshly-raised modal before querying it
+        h.get_by_label("PROCEED").click_accesskit();
+        wait_done(&mut h);
+        let a = tmp.path().join("a");
+        assert!(!a.join("dup.txt").exists(), "the duplicate was deleted");
+        assert!(a.join("unique.txt").exists(), "unique content stays");
+        assert!(a.join("junk.tmp").exists(), "non-duplicate content stays");
+        assert!(
+            tmp.path().join("b").join("kept.txt").exists(),
+            "the pool is never changed"
+        );
+    }
+
+    /// PURGE deletes exactly the filter's matches — and an empty filter
+    /// matches nothing, so the repo can never be purged by accident.
+    #[test]
+    fn purge_deletes_only_filter_matches() {
+        let (tmp, store) = seeded_store();
+        let mut h = grooming_harness(Arc::clone(&store), Command::Purge);
+        h.state_mut().repo = Some("a".to_string());
+        h.state_mut().filter.set_expression("name:*.tmp");
+        h.state().locks.toggle("a");
+        h.run();
+        h.get_by_label("REVIEW").click_accesskit();
+        wait_done(&mut h);
+        assert_eq!(h.state().preview_total, 1, "only the junk file matches");
+        h.get_by_label("RUN").click_accesskit();
+        for _ in 0..100 {
+            h.step();
+            if h.state().confirm.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        h.step(); // draw the freshly-raised modal before querying it
+        h.get_by_label("PROCEED").click_accesskit();
+        wait_done(&mut h);
+        let a = tmp.path().join("a");
+        assert!(!a.join("junk.tmp").exists(), "the match was purged");
+        assert!(a.join("dup.txt").exists(), "non-matches stay");
+        assert!(a.join("unique.txt").exists(), "non-matches stay");
+    }
+
+    /// EMPTY DIRS removes the whole empty tree bottom-up and keeps the root
+    /// and every indexed file.
+    #[test]
+    fn empty_dirs_removes_the_empty_tree_only() {
+        let (tmp, store) = seeded_store();
+        let mut h = grooming_harness(Arc::clone(&store), Command::EmptyDirs);
+        h.state_mut().repo = Some("a".to_string());
+        h.state().locks.toggle("a");
+        h.run();
+        h.get_by_label("RUN").click_accesskit();
+        for _ in 0..100 {
+            h.step();
+            if h.state().confirm.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        h.step(); // draw the freshly-raised modal before querying it
+        h.get_by_label("PROCEED").click_accesskit();
+        wait_done(&mut h);
+        let a = tmp.path().join("a");
+        assert!(!a.join("empty").exists(), "the empty tree is gone");
+        assert!(a.exists(), "the repo root is kept");
+        assert!(a.join("dup.txt").exists(), "files are untouched");
+    }
+
+    /// PRUNE drops the records of files deleted from disk and reports the
+    /// count; the surviving files' records stay.
+    #[test]
+    fn prune_forgets_missing_records() {
+        let (tmp, store) = seeded_store();
+        // Delete one file and rescan: its record is now "missing".
+        std::fs::remove_file(tmp.path().join("a").join("unique.txt")).unwrap();
+        dedup_core::update::update_repo(
+            &store,
+            "a",
+            1,
+            &dedup_core::update::NoProgress,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let mut h = grooming_harness(Arc::clone(&store), Command::Prune);
+        h.state_mut().repo = Some("a".to_string());
+        h.run();
+        h.get_by_label("RUN").click_accesskit();
+        for _ in 0..100 {
+            h.step();
+            if h.state().confirm.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        h.step(); // draw the freshly-raised modal before querying it
+        h.get_by_label("PROCEED").click_accesskit();
+        wait_done(&mut h);
+        let status = h.state().status.clone().unwrap_or_default();
+        assert!(
+            status.contains("Pruned 1"),
+            "one missing record is pruned: {status}"
+        );
+    }
+
+    /// ORGANIZE presets round-trip through disk: saving the current rules and
+    /// reloading in a fresh view yields the same named preset, and applying it
+    /// restores the rules.
+    #[test]
+    fn organize_presets_roundtrip_and_apply() {
+        let (_tmp, store) = seeded_store();
+        let mut view = GroomingView::new();
+        // Edit the default rule in place (a fresh view already has one).
+        view.rules[0].template = "{year}/{month}/{o-name}".to_string();
+        view.rules[0].filter.set_expression("mime:image");
+        view.store_preset(&store);
+        assert_eq!(view.presets.len(), 1, "the preset was stored");
+
+        let mut fresh = GroomingView::new();
+        fresh.load_presets(&store);
+        assert_eq!(fresh.presets.len(), 1, "the preset survives a restart");
+        assert_eq!(fresh.presets[0].rules.len(), 1);
+        assert_eq!(
+            fresh.presets[0].rules[0].template,
+            "{year}/{month}/{o-name}"
+        );
+        assert_eq!(fresh.presets[0].rules[0].filter, "mime:image");
+
+        // Applying the preset replaces the live rules with the saved ones.
+        fresh.rules.clear();
+        fresh.apply(&store, Act::ApplyPreset(0));
+        assert_eq!(fresh.rules.len(), 1, "the preset's rules are applied");
+        assert_eq!(fresh.rules[0].template, "{year}/{month}/{o-name}");
+    }
+
     /// Manual visual check of the reworked ORGANIZE layout (nested collapsible
     /// rules, inline delete): `cargo test -p dedup-gui organize_snapshot -- --ignored`.
     #[test]

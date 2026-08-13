@@ -611,7 +611,9 @@ impl DedupApp {
         }
     }
 
-    fn apply(&mut self, ctx: &egui::Context, frame: &eframe::Frame, action: Action) {
+    // `frame` is the picker dialog's parent window; `None` in tests, which
+    // never open a dialog (the same pattern TransferView::apply uses).
+    fn apply(&mut self, ctx: &egui::Context, frame: Option<&eframe::Frame>, action: Action) {
         match action {
             Action::Update(name) => self.enqueue(name, JobKind::Update),
             Action::UpdateAll => {
@@ -855,9 +857,10 @@ impl DedupApp {
                 // This blocks the UI thread until the user picks or cancels.
                 // Starts at the parent of the last selection (any picker, any
                 // session) instead of dumping the user back at the home dir.
-                let mut dialog = rfd::FileDialog::new()
-                    .set_title("Choose a folder")
-                    .set_parent(frame);
+                let mut dialog = rfd::FileDialog::new().set_title("Choose a folder");
+                if let Some(frame) = frame {
+                    dialog = dialog.set_parent(frame);
+                }
                 if let Some(last) = crate::util::last_picked_dir() {
                     let start = last.parent().map(|p| p.to_path_buf()).unwrap_or(last);
                     if start.is_dir() {
@@ -1091,7 +1094,7 @@ impl eframe::App for DedupApp {
             self.add_modal(&ctx, &mut actions);
         }
         for action in actions {
-            self.apply(&ctx, frame, action);
+            self.apply(&ctx, Some(frame), action);
         }
 
         // Completions (drained above) free the running slot; the actions loop
@@ -3467,6 +3470,33 @@ mod ui_tests {
             update_repo(&store, name, 1, &NoProgress, &CancellationToken::new()).unwrap();
         }
         (tmp, DedupApp::new(store))
+    }
+
+    /// REFRESH STATUS re-probes reachability only: no CHECK job is queued and
+    /// no directory walk starts. It used to also enqueue a freshness check per
+    /// reachable repo — pressing it after reconnecting a drive buried the user
+    /// in scans to cancel.
+    #[test]
+    fn refresh_status_probes_without_queueing_scans() {
+        let (_tmp, mut app) = sample_app();
+        let ctx = egui::Context::default();
+        app.apply(&ctx, None, Action::RefreshStatus);
+        assert!(
+            app.queue.is_empty(),
+            "reachability refresh queues no jobs: {:?}",
+            app.queue
+        );
+        // The probes themselves still run: every repo reports a location.
+        for _ in 0..2 {
+            let (name, loc) = app
+                .status_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("a probe result per repo");
+            assert!(loc.reachable(), "'{name}' is a plain local dir");
+        }
+        // Contrast: an explicit CHECK still queues real work.
+        app.apply(&ctx, None, Action::Check("Videos".to_string()));
+        assert_eq!(app.queue.len(), 1, "CHECK queues exactly its own job");
     }
 
     /// Returning to the Repositories tab must re-read the registry, so counts

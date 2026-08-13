@@ -56,6 +56,13 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      # Coverage is a release ratchet: the floor is the last release's line
+      # coverage (rounded down) — raise it when coverage rises, never lower it.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
+      - name: Coverage floor
+        run: cargo tarpaulin --workspace --engine llvm --timeout 300 --fail-under 76
 
   build-linux:
     name: Linux artifacts (${{ matrix.arch }})

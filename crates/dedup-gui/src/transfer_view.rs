@@ -5223,6 +5223,47 @@ mod ui_tests {
         );
     }
 
+    /// A run whose copies were refused (occupied target paths) must say so:
+    /// the result modal counts the skips and explains the collision. A run
+    /// reporting only "copied 0" looked like a bug — because it was
+    /// indistinguishable from one.
+    #[test]
+    fn group_done_with_refused_copies_reports_skips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let mut h = transfer_harness(Arc::clone(&store), |_| {});
+        h.state()
+            .tx
+            .send(Msg::GroupDone(Ok(GroupSyncResult {
+                main: "photos".to_string(),
+                copied: 0,
+                deleted: 0,
+                skipped_files: 2,
+                errors: 0,
+                cancelled: false,
+                failures: Vec::new(),
+                skipped: Vec::new(),
+            })))
+            .unwrap();
+        h.run();
+        let status = h.state().status.clone().unwrap_or_default();
+        assert!(
+            status.contains("skipped 2"),
+            "the headline counts the refused copies: {status}"
+        );
+        // The modal spells out why.
+        use egui_kittest::kittest::Queryable;
+        assert!(
+            h.query_by_label_contains("different file at that exact path")
+                .is_some(),
+            "the modal explains the collision"
+        );
+        assert!(
+            h.query_by_label_contains("OVERWRITE").is_some(),
+            "and points at the board's per-row resolution"
+        );
+    }
+
     /// A pull candidate whose path the main occupies with *different* content
     /// is a conflict: the main cell shows its own occupying file (amber
     /// DIFFERS — the golden rule), the row offers `< OVERWRITE` instead of a
@@ -5349,6 +5390,56 @@ mod ui_tests {
         assert!(
             !main_dir.join("deleted.txt").exists(),
             "the resurrection candidate was NOT auto-promoted (opt-in only)"
+        );
+    }
+
+    /// End to end: a batch promote that hits an occupied path leaves the
+    /// main's file alone and reports the refusal — the engine's skip count
+    /// travels through the worker into the status line, not into silence.
+    #[test]
+    fn group_sync_back_run_reports_refused_conflict_copies() {
+        let (tmp, store) = back_preview_store();
+        std::fs::write(tmp.path().join("target").join("photo.jpg"), b"sink-version").unwrap();
+        std::fs::write(
+            tmp.path().join("source").join("photo.jpg"),
+            b"main-version!",
+        )
+        .unwrap();
+        for repo in ["source", "target"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        }
+        let store2 = Arc::clone(&store);
+        let mut h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+            v.command = Command::GroupSyncBack;
+        });
+        h.get_by_label("RUN").click_accesskit();
+        settle_preview(&mut h);
+        h.get_by_label("PROCEED").click_accesskit();
+        for _ in 0..100 {
+            h.step();
+            if !h.state().running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!h.state().running, "the pull finished");
+        assert_eq!(
+            std::fs::read(tmp.path().join("source").join("photo.jpg")).unwrap(),
+            b"main-version!",
+            "the batch never overwrites the main's conflicting file"
+        );
+        let status = h.state().status.clone().unwrap_or_default();
+        assert!(
+            status.contains("skipped 1"),
+            "the refusal is reported, not swallowed: {status}"
         );
     }
 

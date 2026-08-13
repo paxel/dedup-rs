@@ -15,7 +15,10 @@ give its heading the release date in the same commit that gets tagged.
 The `Release` GitHub Actions workflow:
 
 1. **Gate** — the full Linux check once more: `cargo fmt --check`, clippy with zero
-   warnings, the complete test suite (software Vulkan, ffmpeg, poppler installed).
+   warnings, the complete test suite (software Vulkan, ffmpeg, poppler installed), and a
+   **coverage floor**: `cargo tarpaulin --fail-under <N>`, where N is the last release's
+   line coverage rounded down. The floor is a ratchet — raise it when coverage rises,
+   never lower it to make a release pass.
 2. **Artifacts**
    - Linux (x86_64 and arm64): `dedup_<ver>_<arch>.deb` (via
      `packaging/mkdeb.sh --release`), `dedup-<ver>-linux-<arch>.tar.gz`, and
