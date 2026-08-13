@@ -235,7 +235,7 @@ impl Default for Player {
 
 /// Append a decoded file to `sink`, seeking to `start_ms`. Returns whether a
 /// source was actually loaded.
-fn load(sink: &rodio::Sink, path: &Path, start_ms: u64) -> bool {
+fn load(sink: &rodio::Player, path: &Path, start_ms: u64) -> bool {
     sink.clear();
     if let Ok(file) = std::fs::File::open(path)
         && let Ok(decoder) = rodio::Decoder::new(BufReader::new(file))
@@ -250,28 +250,63 @@ fn load(sink: &rodio::Sink, path: &Path, start_ms: u64) -> bool {
     }
 }
 
+/// The audio device connection: the OS output stream and the two playback
+/// channels feeding its mixer. Rebuilt as a unit when the stream dies.
+struct Output {
+    /// Keeps the OS stream alive; playback stops when this drops.
+    _stream: rodio::MixerDeviceSink,
+    a: rodio::Player,
+    b: rodio::Player,
+}
+
+/// Open the default output. `dead` is raised by the stream's error callback —
+/// ALSA reports EPIPE ("broken pipe") when the device disappears under a live
+/// stream (suspend/resume, output switch, audio-server restart), once per
+/// callback tick forever; rodio's default callback would print each one, so
+/// this logs the first and only flags the rest.
+fn open_output(dead: &Arc<AtomicBool>) -> Option<Output> {
+    dead.store(false, Ordering::Relaxed);
+    let flag = Arc::clone(dead);
+    let mut stream = rodio::DeviceSinkBuilder::from_default_device()
+        .ok()?
+        .with_error_callback(move |err| {
+            if !flag.swap(true, Ordering::Relaxed) {
+                eprintln!("audio output lost ({err}); will reconnect on next play");
+            }
+        })
+        .open_stream()
+        .ok()?;
+    stream.log_on_drop(false);
+    let a = rodio::Player::connect_new(stream.mixer());
+    let b = rodio::Player::connect_new(stream.mixer());
+    Some(Output {
+        _stream: stream,
+        a,
+        b,
+    })
+}
+
 fn audio_thread(rx: Receiver<Cmd>, shared: Arc<Shared>) {
-    // Open the default output once (kept alive for the thread's lifetime).
-    // Absent a device, the sinks are None and every command is a no-op — the
-    // optimistic UI state set by the caller stands.
-    let stream = rodio::OutputStream::try_default().ok();
-    let sink_a = stream
-        .as_ref()
-        .and_then(|(_, handle)| rodio::Sink::try_new(handle).ok());
-    let sink_b = stream
-        .as_ref()
-        .and_then(|(_, handle)| rodio::Sink::try_new(handle).ok());
+    // The output is opened lazily at the first Play/PlayPair and reopened when
+    // the stream has died since. An idle app must hold no device stream at
+    // all: an open ALSA stream dies with the device (suspend, output switch,
+    // audio-server restart) and a dead one busy-spins — a session that never
+    // plays anything must never be exposed to that. Absent a device, `out`
+    // stays None and every command is a no-op — the optimistic UI state set by
+    // the caller stands.
+    let dead = Arc::new(AtomicBool::new(false));
+    let mut out: Option<Output> = None;
     // Whether a source was actually appended for the current A channel. Guards
     // end-of-track detection so a file that failed to decode (or a missing one)
     // is not immediately reported as "finished".
     let mut has_a = false;
 
     // Apply pair volumes from the shared `active_b` flag (only one audible).
-    let apply_volumes = |shared: &Shared| {
-        if let (Some(a), Some(b)) = (&sink_a, &sink_b) {
+    let apply_volumes = |out: &Option<Output>, shared: &Shared| {
+        if let Some(o) = out {
             let b_on = shared.active_b.load(Ordering::Relaxed);
-            a.set_volume(if b_on { 0.0 } else { 1.0 });
-            b.set_volume(if b_on { 1.0 } else { 0.0 });
+            o.a.set_volume(if b_on { 0.0 } else { 1.0 });
+            o.b.set_volume(if b_on { 1.0 } else { 0.0 });
         }
     };
 
@@ -283,19 +318,20 @@ fn audio_thread(rx: Receiver<Cmd>, shared: Arc<Shared>) {
                 start_ms,
                 paused,
             }) => {
-                if let Some(b) = &sink_b {
-                    b.clear();
+                if out.is_none() || dead.load(Ordering::Relaxed) {
+                    out = open_output(&dead);
                 }
                 has_a = false;
-                if let Some(a) = &sink_a {
-                    a.set_volume(1.0);
-                    if load(a, &path, start_ms) {
+                if let Some(o) = &out {
+                    o.b.clear();
+                    o.a.set_volume(1.0);
+                    if load(&o.a, &path, start_ms) {
                         // Always `play()` first: a rodio sink starts paused only
                         // if told to, and pausing after play leaves it primed at
                         // the right position for an instant resume.
-                        a.play();
+                        o.a.play();
                         if paused {
-                            a.pause();
+                            o.a.pause();
                         }
                         has_a = true;
                     }
@@ -309,50 +345,65 @@ fn audio_thread(rx: Receiver<Cmd>, shared: Arc<Shared>) {
                 total_ms,
                 start_ms,
             }) => {
+                if out.is_none() || dead.load(Ordering::Relaxed) {
+                    out = open_output(&dead);
+                }
                 has_a = false;
-                if let (Some(a), Some(b)) = (&sink_a, &sink_b) {
-                    has_a = load(a, &path_a, start_ms);
-                    let _ = load(b, &path_b, start_ms);
-                    apply_volumes(&shared);
-                    a.play();
-                    b.play();
+                if let Some(o) = &out {
+                    has_a = load(&o.a, &path_a, start_ms);
+                    let _ = load(&o.b, &path_b, start_ms);
+                    apply_volumes(&out, &shared);
+                    o.a.play();
+                    o.b.play();
                 }
                 shared.total_ms.store(total_ms, Ordering::Relaxed);
                 shared.pos_ms.store(start_ms, Ordering::Relaxed);
             }
-            Ok(Cmd::Flip) => apply_volumes(&shared),
+            Ok(Cmd::Flip) => apply_volumes(&out, &shared),
             Ok(Cmd::TogglePause) => {
-                for s in [&sink_a, &sink_b].into_iter().flatten() {
-                    if s.is_paused() {
-                        s.play();
-                    } else {
-                        s.pause();
+                if let Some(o) = &out {
+                    for s in [&o.a, &o.b] {
+                        if s.is_paused() {
+                            s.play();
+                        } else {
+                            s.pause();
+                        }
                     }
-                }
-                if let Some(a) = &sink_a {
-                    shared.playing.store(!a.is_paused(), Ordering::Relaxed);
+                    shared.playing.store(!o.a.is_paused(), Ordering::Relaxed);
                 }
             }
             Ok(Cmd::Seek(f)) => {
                 let total = shared.total_ms.load(Ordering::Relaxed);
                 let pos = Duration::from_millis((f as f64 * total as f64) as u64);
-                for s in [&sink_a, &sink_b].into_iter().flatten() {
-                    let _ = s.try_seek(pos);
+                if let Some(o) = &out {
+                    for s in [&o.a, &o.b] {
+                        let _ = s.try_seek(pos);
+                    }
                 }
             }
             Ok(Cmd::Stop) => {
                 has_a = false;
-                for s in [&sink_a, &sink_b].into_iter().flatten() {
-                    s.clear();
+                if let Some(o) = &out {
+                    o.a.clear();
+                    o.b.clear();
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
 
+        // A stream whose device died busy-spins in cpal's ALSA event loop (poll
+        // fails, error callback, immediate retry — a core pinned at 100%).
+        // Dropping it is the only way to stop that; the next play reopens.
+        if dead.load(Ordering::Relaxed) && out.is_some() {
+            out = None;
+            has_a = false;
+            shared.playing.store(false, Ordering::Relaxed);
+        }
+
         // Track position and natural end-of-track off the A sink (the pair plays
         // in sync). Only meaningful with a real device.
-        if let Some(a) = &sink_a
+        if let Some(a) = out.as_ref().map(|o| &o.a)
             && shared.loaded.load(Ordering::Relaxed)
         {
             shared

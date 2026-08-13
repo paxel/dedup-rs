@@ -10,3 +10,6 @@ Categories=Utility;FileTools;
 # Wayland/KDE matches the running window's app_id (set via with_app_id("dedup"))
 # to this file for the taskbar/titlebar icon; keep both equal to "dedup".
 StartupWMClass=dedup
+# Claims the file for the GUI's own menu registration (menu_entry.rs), which
+# refreshes launchers carrying this key and never touches ones without it.
+X-Dedup-Managed=true

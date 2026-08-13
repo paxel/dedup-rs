@@ -17,6 +17,11 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   parent of the last folder you picked — never back at the home directory — and the memory
   survives restarts. Dialogs with an obvious anchor (exporting into a chosen target) start
   there instead.
+- **The app puts itself in the Linux application menu.** However dedup was installed —
+  brew, tarball, AppImage, or a plain binary — launching the GUI once registers its
+  launcher and icon in your user menu (and gives the window its proper Wayland icon).
+  The entry follows the binary if it moves, and a launcher you wrote yourself is never
+  touched.
 - **Linux arm64 builds, and an AppImage.** Releases now also ship arm64 Linux artifacts
   alongside the existing x86_64 ones, and both architectures gain a distribution-independent
   **AppImage** download — `chmod +x`, run, no install — next to the `.deb` and the plain
@@ -24,6 +29,13 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 ### Fixed
 
+- **Losing the audio device no longer floods the terminal or pins a core — and playback
+  comes back.** When the output device disappears under a live stream (suspend/resume,
+  switching outputs, an audio-server restart), the app used to print an ALSA error line
+  endlessly, keep one CPU core at 100% retrying the dead stream, and stay silent until
+  restart — even in a session that never played audio, since the output stream was held
+  open from launch. Now the device is only opened when something actually plays, a loss
+  is stated once, the dead stream is released, and the next play reconnects.
 - On a **GROUP SYNC** preview with several sinks, clicking a deletion row now opens that
   row's own sink's file; it used to open the file from the wrong repository.
 - Returning to the **Browse** tab no longer re-warms the folder you were in: the read-ahead

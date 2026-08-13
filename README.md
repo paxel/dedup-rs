@@ -23,7 +23,9 @@ track them automatically.
 | Windows | `scoop bucket add paxel https://github.com/paxel/scoop-bucket` then `scoop install dedup`  |
 | Any     | `cargo install dedup-rs-cli` (builds from source; binary is `dedup`)                       |
 
-The AppImage runs on any distribution after a one-time `chmod +x`.
+The AppImage runs on any distribution after a one-time `chmod +x`. On Linux the GUI
+registers its own application-menu entry and icon the first time it runs, whichever way
+it was installed.
 The macOS builds are **unsigned**: on first launch, right-click the app → **Open** to get
 past Gatekeeper (once; afterwards it opens normally). The Windows zip carries two
 executables — `dedup.exe` (the CLI, console) and `dedup-gui.exe` (the app, no console

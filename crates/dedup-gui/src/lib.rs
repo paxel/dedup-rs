@@ -20,6 +20,8 @@ mod lcars;
 pub mod lightbox;
 mod locks;
 mod media_cell;
+#[cfg(target_os = "linux")]
+mod menu_entry;
 mod player;
 mod repo_chip;
 mod run_result;
@@ -54,6 +56,11 @@ pub fn run(ui_scale: Option<f32>) -> Result<(), String> {
         ),
     }
     let store = Arc::new(Store::open().map_err(|e| e.to_string())?);
+
+    // A brew/tarball/AppImage install has no menu entry or Wayland icon until
+    // something writes them; do it in the background, never blocking startup.
+    #[cfg(target_os = "linux")]
+    std::thread::spawn(menu_entry::register);
 
     // Load the persisted settings once: the last window size (so the app opens
     // where it was left) and the appearance preference (so the very first frame

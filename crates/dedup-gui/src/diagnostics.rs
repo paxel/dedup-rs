@@ -251,7 +251,14 @@ pub fn probe_system() -> SystemProbe {
             line.to_string()
         })
     };
-    let audio_ok = rodio::OutputStream::try_default().is_ok();
+    let audio_ok = match rodio::DeviceSinkBuilder::open_default_sink() {
+        Ok(mut sink) => {
+            // Probe only — silence the drop notice rodio would print.
+            sink.log_on_drop(false);
+            true
+        }
+        Err(_) => false,
+    };
     let ffmpeg = tool("ffmpeg", "-version");
     let ffprobe = tool("ffprobe", "-version");
     let pdftoppm = tool("pdftoppm", "-v");

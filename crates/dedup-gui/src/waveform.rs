@@ -172,7 +172,7 @@ fn extract_viz(path: &Path) -> Option<AudioViz> {
     use rodio::Source;
     let file = std::fs::File::open(path).ok()?;
     let decoder = rodio::Decoder::new(std::io::BufReader::new(file)).ok()?;
-    let channels = decoder.channels().max(1) as usize;
+    let channels = usize::from(decoder.channels().get());
 
     // Envelope: fine peaks that fold (halve resolution) when they hit the cap.
     let env_cap = WAVE_BUCKETS * 8;
@@ -206,7 +206,8 @@ fn extract_viz(path: &Path) -> Option<AudioViz> {
     let mut any = false;
 
     for sample in decoder {
-        acc += f32::from(sample) * (1.0 / 32768.0);
+        // rodio 0.22 decoders yield normalized f32 samples (was i16 pre-0.21).
+        acc += sample;
         ch_i += 1;
         if ch_i < channels {
             continue;
