@@ -6985,9 +6985,11 @@ mod ui_tests {
 
         h.state_mut().start_bulk(&store, plan);
         // Wait for the worker rather than polling a fixed budget — the fixed
-        // budget was a known flake in this file.
+        // budget was a known flake in this file. `step`, not `run`: the board
+        // shows a spinner while the worker runs, so `run()` panics with
+        // "exceeded max_steps" on a runner slow enough to still be busy.
         for _ in 0..600 {
-            h.run();
+            h.step();
             if !h.state().running {
                 break;
             }
