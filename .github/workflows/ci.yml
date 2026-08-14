@@ -51,6 +51,33 @@ jobs:
       - name: Tests
         run: cargo test --workspace --locked
 
+  # Feeds the README's Coveralls badge. Main-only: coverage on every branch
+  # push would double CI time for a number nobody reads off a branch.
+  coverage:
+    name: Coverage (Coveralls)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System dependencies (ALSA link dep, software Vulkan, gated tools)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev pkg-config \
+            mesa-vulkan-drivers libvulkan1 \
+            ffmpeg poppler-utils
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
+      - name: Measure line coverage
+        run: cargo tarpaulin --workspace --engine llvm --timeout 300 --out Lcov
+      - name: Upload to Coveralls
+        uses: coverallsapp/github-action@v2
+        with:
+          file: lcov.info
+
   windows:
     name: Windows (build + core/cli tests)
     runs-on: windows-latest
