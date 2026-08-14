@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/paxel/dedup-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/paxel/dedup-rs/actions/workflows/ci.yml)
 [![Coverage](https://coveralls.io/repos/github/paxel/dedup-rs/badge.svg?branch=main)](https://coveralls.io/github/paxel/dedup-rs?branch=main)
+[![crates.io](https://img.shields.io/crates/v/dedup-rs-cli.svg)](https://crates.io/crates/dedup-rs-cli)
 
 A high-performance, native Rust file-deduplication tool with both a desktop GUI and a
 fast command-line interface, packaged as a single self-contained binary.
