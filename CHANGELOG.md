@@ -6,6 +6,12 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 ### Fixed
 
+- **Dropping folders onto the window now works on Wayland desktops.** The
+  windowing library implements no drag-and-drop on Wayland at all, so dropped
+  folders never reached the app. On a Wayland session that also offers an
+  XWayland display the GUI now uses the X11 backend, where drag-and-drop
+  works; set `DEDUP_WAYLAND=1` to keep the native Wayland backend (crisper
+  fractional scaling) without drag-and-drop.
 - **A review row with a real file on both sides always opens the side-by-side
   compare.** Clicking a GROUP SYNC BACK path-conflict row used to open only the
   sink's copy, leaving the main's occupying file unseen — exactly the pair the
