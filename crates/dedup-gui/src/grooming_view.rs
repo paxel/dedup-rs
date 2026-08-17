@@ -265,9 +265,11 @@ pub struct GroomingView {
 }
 
 enum Act {
-    /// Open the shared comparison on a DEDUPE row: the file about to go, beside
-    /// the copy that makes it redundant.
-    Inspect(String, String),
+    /// Open the shared viewer on a review row: the acted-on file, beside its
+    /// counterpart when one exists — a DEDUPE row's redundant copy opens the
+    /// comparison, a one-sided row (PURGE/PRUNE, an ORGANIZE relocation of the
+    /// same file) opens the single-file view.
+    Inspect(String, Option<String>),
     SetCommand(Command),
     PickSource(String),
     TogglePool(String),
@@ -990,11 +992,12 @@ impl GroomingView {
                 }
             }
             Some(a) if a.cmd == board::Cmd::OpenRow => {
-                if let Some(meta) = self.preview.get(a.row) {
-                    let (left, right) = (meta.left_paths.clone(), meta.right_paths.clone());
-                    if let (Some(l), Some(r)) = (left.first(), right.first()) {
-                        acts.push(Act::Inspect(l.clone(), r.clone()));
-                    }
+                // Every row opens: with its counterpart when the row has one
+                // (DEDUPE), as the single file otherwise — never a no-op.
+                if let Some(meta) = self.preview.get(a.row)
+                    && let Some(l) = meta.left_paths.first()
+                {
+                    acts.push(Act::Inspect(l.clone(), meta.right_paths.first().cloned()));
                 }
             }
             _ => {}
@@ -1176,10 +1179,18 @@ impl GroomingView {
     fn apply(&mut self, store: &Arc<Store>, act: Act) {
         match act {
             Act::Inspect(left_rel, right_rel) => {
-                // Left is the file DEDUPE would delete, in the source repo;
-                // right is the copy that makes it redundant, held by one of the
-                // pool repos — whichever actually has that path.
-                let Some(source) = self.source.clone() else {
+                // Left is the file the command acts on, in the repo the
+                // current command works with (DEDUPE's source, everyone
+                // else's single repo); right is the copy that makes a DEDUPE
+                // row redundant, held by one of the pool repos — whichever
+                // actually has that path. With a counterpart the viewer opens
+                // as the comparison; without one (PURGE/PRUNE, an ORGANIZE
+                // move of the same file) the single file opens alone.
+                let left_repo = match self.command {
+                    Command::Dedupe => self.source.clone(),
+                    _ => self.repo.clone(),
+                };
+                let Some(left_repo) = left_repo else {
                     return;
                 };
                 let side = |repo: &str, rel: &str| {
@@ -1193,14 +1204,31 @@ impl GroomingView {
                         read_only: self.locks.read_only(repo),
                     })
                 };
-                let right = self.pool.iter().find_map(|repo| side(repo, &right_rel));
-                match (side(&source, &left_rel), right) {
+                // Only a DEDUPE row's right path names a second file (the pool
+                // copy). An ORGANIZE row's right path is the same file's
+                // future home — there is nothing else to compare against.
+                let counterpart_rel = match self.command {
+                    Command::Dedupe => right_rel,
+                    _ => None,
+                };
+                let has_counterpart = counterpart_rel.is_some();
+                let right = counterpart_rel
+                    .and_then(|rel| self.pool.iter().find_map(|repo| side(repo, &rel)));
+                match (side(&left_repo, &left_rel), right) {
                     (Some(l), Some(r)) => {
                         self.inspect = Some(crate::compare_view::DiffCompare::new(l, r));
                     }
-                    _ => {
+                    // A row that promises a counterpart must not quietly open
+                    // one file — say what went wrong instead.
+                    (Some(_), None) if has_counterpart => {
                         self.error =
                             Some("Could not read both copies to compare them.".to_string());
+                    }
+                    (Some(only), None) => {
+                        self.inspect = Some(crate::compare_view::DiffCompare::inspect(only));
+                    }
+                    (None, _) => {
+                        self.error = Some("Could not read that row's file.".to_string());
                     }
                 }
             }
@@ -1886,6 +1914,46 @@ mod ui_tests {
             );
         harness.run();
         harness
+    }
+
+    /// A one-sided review row opens the single-file viewer on click: a PURGE
+    /// row has no counterpart at all, and an ORGANIZE row's right path is the
+    /// same file's future home — neither may be a dead click or an error.
+    #[test]
+    fn one_sided_rows_open_the_single_file_viewer() {
+        let (tmp, store) = sample_store();
+        std::fs::write(tmp.path().join("a").join("junk.txt"), b"junk").unwrap();
+        dedup_core::update::update_repo(
+            &store,
+            "a",
+            1,
+            &dedup_core::update::NoProgress,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let mut h = grooming_harness(Arc::clone(&store), Command::Purge);
+        h.state_mut().repo = Some("a".to_string());
+        h.state_mut()
+            .apply(&store, Act::Inspect("junk.txt".to_string(), None));
+        assert!(
+            h.state().inspect.is_some(),
+            "a PURGE row opens the file alone: {:?}",
+            h.state().error
+        );
+        assert!(h.state().error.is_none());
+
+        h.state_mut().inspect = None;
+        h.state_mut().command = Command::Organize;
+        h.state_mut().apply(
+            &store,
+            Act::Inspect("junk.txt".to_string(), Some("2026/junk.txt".to_string())),
+        );
+        assert!(
+            h.state().inspect.is_some(),
+            "an ORGANIZE row opens the file alone: {:?}",
+            h.state().error
+        );
+        assert!(h.state().error.is_none());
     }
 
     /// The number keys switch commands (mirroring the segmented selector).

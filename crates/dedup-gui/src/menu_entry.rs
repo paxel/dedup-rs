@@ -51,14 +51,32 @@ fn data_home() -> Option<PathBuf> {
 
 /// What the launcher should execute: the AppImage file itself when running
 /// from one (`$APPIMAGE` — the mount point the binary actually runs from is
-/// gone after exit), otherwise the running executable.
+/// gone after exit), otherwise the running executable — via the stable brew
+/// symlink when the binary lives in a Homebrew Cellar.
 fn exec_path() -> Option<PathBuf> {
     if let Some(ai) = std::env::var_os("APPIMAGE")
         && !ai.is_empty()
     {
         return Some(PathBuf::from(ai));
     }
-    std::env::current_exe().ok()
+    let exe = std::env::current_exe().ok()?;
+    Some(stable_brew_path(&exe).unwrap_or(exe))
+}
+
+/// The stable `<prefix>/bin/<name>` symlink for a binary running out of a
+/// Homebrew Cellar, verified to point back at that binary; `None` for
+/// everything else. `current_exe` resolves to the *versioned* Cellar
+/// directory (`…/Cellar/dedup/0.3.0/bin/dedup`), which the next
+/// `brew upgrade` deletes — a launcher pinned there dies with it, and a dead
+/// launcher can never self-heal, because the app it would start is gone.
+/// Brew repoints `<prefix>/bin` on every upgrade, so that path stays alive.
+fn stable_brew_path(exe: &Path) -> Option<PathBuf> {
+    let prefix = exe
+        .ancestors()
+        .find(|a| a.file_name() == Some("Cellar".as_ref()))?
+        .parent()?;
+    let candidate = prefix.join("bin").join(exe.file_name()?);
+    (fs::canonicalize(&candidate).ok()? == fs::canonicalize(exe).ok()?).then_some(candidate)
 }
 
 /// Write icon and launcher under `data_home` for `exec`. Returns whether
@@ -217,6 +235,41 @@ mod tests {
             foreign,
             "a launcher without our marker is never overwritten"
         );
+    }
+
+    /// A binary in a versioned Cellar directory registers the brew prefix's
+    /// stable `bin` symlink — the one path a `brew upgrade` keeps alive — and
+    /// anything else registers as itself.
+    #[test]
+    fn brew_cellar_binary_registers_the_stable_bin_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cellar_bin = dir.path().join("Cellar/dedup/0.3.0/bin");
+        fs::create_dir_all(&cellar_bin).expect("mkdir cellar");
+        let exe = cellar_bin.join("dedup");
+        fs::write(&exe, b"binary").expect("write exe");
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).expect("mkdir bin");
+        // Brew's relative link: bin/dedup -> ../Cellar/dedup/0.3.0/bin/dedup
+        std::os::unix::fs::symlink("../Cellar/dedup/0.3.0/bin/dedup", bin.join("dedup"))
+            .expect("symlink");
+        assert_eq!(
+            stable_brew_path(&exe),
+            Some(bin.join("dedup")),
+            "the launcher points at the symlink brew repoints on upgrade"
+        );
+
+        // A prefix whose bin symlink names a *different* binary is not ours.
+        let foreign = dir.path().join("Cellar/other/1.0/bin");
+        fs::create_dir_all(&foreign).expect("mkdir foreign");
+        fs::write(foreign.join("dedup"), b"other").expect("write foreign");
+        assert_eq!(
+            stable_brew_path(&foreign.join("dedup")),
+            None,
+            "a bin symlink pointing elsewhere is not claimed"
+        );
+
+        // No Cellar in the path: register the binary itself.
+        assert_eq!(stable_brew_path(Path::new("/usr/local/bin/dedup")), None);
     }
 
     #[test]

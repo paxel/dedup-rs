@@ -153,6 +153,10 @@ impl Command {
     }
 }
 
+/// One side of a review row as `(repo, rel_path)` — `None` when that side
+/// names no file.
+type RowSide = Option<(String, String)>;
+
 /// Where a COPY/MOVE lands: into another repo, or into a plain folder.
 #[derive(PartialEq, Clone, Copy)]
 enum Destination {
@@ -1457,9 +1461,14 @@ enum Act {
     /// GROUP SYNC BACK: delete one file (by sink-relative path) from the sink —
     /// the "not worth promoting, not worth keeping" half of the triage.
     DeleteSinkRow(String),
-    /// Open one existing file `(repo, rel_path)` from a preview row in the
-    /// single-file INSPECT viewer (planned counterparts may not exist yet).
-    OpenPreviewRow(String, String),
+    /// Open a preview row's file(s), each side as `(repo, rel_path)`: the
+    /// side-by-side compare when both sides hold a real file (a back-sync
+    /// path conflict, an unchanged pair), the single-file INSPECT otherwise
+    /// (planned counterparts may not exist yet).
+    OpenPreviewPair {
+        left: RowSide,
+        right: RowSide,
+    },
 }
 
 impl TransferView {
@@ -3076,37 +3085,45 @@ impl TransferView {
                         acts.push(Act::OverwriteMainRow(rel.clone()));
                     }
                 }
-                // Clicking the row opens the file that actually exists — the
-                // sink's copy on a back-sync board, the source's otherwise (a
-                // planned target file may not be on disk yet). A row with no
-                // source side at all — a deletion row — falls back to the
-                // right side's file: those are exactly the rows worth
-                // inspecting before data is lost, so a click must never be a
-                // no-op. On a GROUP SYNC board several sinks share the right
-                // side, so the repo comes from the row's own chip.
+                // Clicking the row hands over *both* sides: whenever left and
+                // right each hold a real file (a back-sync path conflict, an
+                // unchanged pair) the viewer opens as the side-by-side
+                // compare; a side whose file only exists in the plan (a
+                // planned target file may not be on disk yet) resolves to
+                // nothing and the click falls back to the single file that
+                // does exist — never a no-op. On a GROUP SYNC board several
+                // sinks share the right side, so the repo comes from the
+                // row's own chip.
                 board::Cmd::OpenRow => {
-                    let (repo, rel) = if self.command == Command::GroupSyncBack {
-                        (
-                            self.selected_sinks.first().cloned(),
-                            meta.right_paths.first().cloned(),
-                        )
-                    } else if let Some(rel) = meta.left_paths.first() {
-                        (self.source.clone(), Some(rel.clone()))
-                    } else {
-                        let repo = self
-                            .preview_bodies
-                            .get(a.row)
-                            .and_then(|b| b.right.repo.clone())
-                            .or_else(|| self.target.clone());
-                        (repo, meta.right_paths.first().cloned())
-                    };
-                    if let (Some(repo), Some(rel)) = (repo, rel) {
-                        acts.push(Act::OpenPreviewRow(repo, rel));
+                    let (left, right) = self.preview_row_pair(a.row, meta);
+                    if left.is_some() || right.is_some() {
+                        acts.push(Act::OpenPreviewPair { left, right });
                     }
                 }
                 _ => {}
             }
         }
+    }
+
+    /// The `(repo, rel_path)` each side of a preview row hands the viewer on a
+    /// click. On a GROUP SYNC board several sinks share the right side, so the
+    /// repo comes from the row's own chip; GROUP SYNC BACK's right side is the
+    /// one selected sink.
+    fn preview_row_pair(&self, row: usize, meta: &board::RowMeta) -> (RowSide, RowSide) {
+        let left = self.source.clone().zip(meta.left_paths.first().cloned());
+        let right_repo = self
+            .preview_bodies
+            .get(row)
+            .and_then(|b| b.right.repo.clone())
+            .or_else(|| {
+                if self.command == Command::GroupSyncBack {
+                    self.selected_sinks.first().cloned()
+                } else {
+                    self.target.clone()
+                }
+            });
+        let right = right_repo.zip(meta.right_paths.first().cloned());
+        (left, right)
     }
 
     /// A repo's absolute path for a review-table column header, falling back to
@@ -3374,7 +3391,7 @@ impl TransferView {
                     Err(e) => self.error = Some(e),
                 }
             }
-            Act::OpenPreviewRow(repo, rel) => self.open_single(store, &repo, &rel),
+            Act::OpenPreviewPair { left, right } => self.open_pair(store, left, right),
             Act::SetPairing(pairing) => {
                 self.pairing = pairing;
                 self.clear_preview();
@@ -4047,8 +4064,8 @@ impl TransferView {
         }
     }
 
-    /// Open the side-by-side comparison for a conflicting row: both versions
-    /// of the same path, with everything needed to judge them.
+    /// Open the side-by-side comparison for a conflicting DIFF row: both
+    /// versions of the same path, with everything needed to judge them.
     fn open_inspect(
         &mut self,
         store: &Arc<Store>,
@@ -4058,6 +4075,17 @@ impl TransferView {
         let (Some(source), Some(target)) = (self.source.clone(), self.target.clone()) else {
             return;
         };
+        self.open_pair(
+            store,
+            left_rel.map(|rel| (source, rel.to_string())),
+            right_rel.map(|rel| (target, rel.to_string())),
+        );
+    }
+
+    /// The law behind every review click: resolve each side `(repo, rel)` to
+    /// its indexed file, and whenever *both* sides hold one, open the
+    /// side-by-side compare — a single file only when the other side has none.
+    fn open_pair(&mut self, store: &Arc<Store>, left: RowSide, right: RowSide) {
         let side = |repo: &str, rel: &str| -> Option<DiffSide> {
             let meta = store.get_repo(repo).ok()?;
             let entry = store.get_file_entry(repo, rel).ok().flatten()?;
@@ -4072,8 +4100,8 @@ impl TransferView {
                 read_only: self.locks.read_only(repo),
             })
         };
-        let left = left_rel.and_then(|rel| side(&source, rel));
-        let right = right_rel.and_then(|rel| side(&target, rel));
+        let left = left.and_then(|(repo, rel)| side(&repo, &rel));
+        let right = right.and_then(|(repo, rel)| side(&repo, &rel));
         match (left, right) {
             (Some(left), Some(right)) => {
                 // A DIFF row offers exactly these two files, so the pool is the
@@ -4093,29 +4121,6 @@ impl TransferView {
             (None, None) => {
                 self.error = Some("Could not read that row's file.".to_string());
             }
-        }
-    }
-
-    /// Open one indexed file in the single-file INSPECT viewer (a preview row's
-    /// existing side — the planned counterpart may not be on disk yet).
-    fn open_single(&mut self, store: &Arc<Store>, repo: &str, rel: &str) {
-        let side = (|| -> Option<DiffSide> {
-            let meta = store.get_repo(repo).ok()?;
-            let entry = store.get_file_entry(repo, rel).ok().flatten()?;
-            let abs_path = PathBuf::from(&meta.abs_path).join(rel);
-            Some(DiffSide {
-                repo: repo.to_string(),
-                rel_path: rel.to_string(),
-                facts: FileFacts::from_entry(&entry, abs_path),
-                read_only: self.locks.read_only(repo),
-            })
-        })();
-        match side {
-            Some(side) => {
-                self.inspect = Some(DiffCompare::inspect(side));
-                self.error = None;
-            }
-            None => self.error = Some("Could not read that row's file.".to_string()),
         }
     }
 
@@ -5345,6 +5350,95 @@ mod ui_tests {
             std::fs::read(tmp.path().join("source").join("photo.jpg")).unwrap(),
             b"sink-version",
             "OVERWRITE replaces the main's file with the sink's"
+        );
+    }
+
+    /// The point of the review: a back-sync path conflict has a real file on
+    /// BOTH sides, so clicking the row opens the side-by-side compare — never
+    /// one file alone. A promote row's main-side file exists only in the plan,
+    /// so its click still opens the sink's file by itself.
+    #[test]
+    fn group_sync_back_conflict_row_opens_compare_not_single() {
+        let (tmp, store) = back_preview_store();
+        std::fs::write(tmp.path().join("target").join("photo.jpg"), b"sink-version").unwrap();
+        std::fs::write(
+            tmp.path().join("source").join("photo.jpg"),
+            b"main-version!",
+        )
+        .unwrap();
+        for repo in ["source", "target"] {
+            dedup_core::update::update_repo(
+                &store,
+                repo,
+                1,
+                &dedup_core::update::NoProgress,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        }
+        let store2 = Arc::clone(&store);
+        let mut h = transfer_harness(Arc::clone(&store), move |v| {
+            v.sync_repos(&store2);
+            v.command = Command::GroupSyncBack;
+        });
+        h.get_by_label("REVIEW").click_accesskit();
+        settle_preview(&mut h);
+
+        // The conflict row hands both sides to the viewer …
+        let (i, conflict) = h
+            .state()
+            .preview
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.left_status == board::Status::Differs)
+            .map(|(i, r)| (i, r.clone()))
+            .expect("the occupied path surfaces as a conflict row");
+        let (left, right) = h.state().preview_row_pair(i, &conflict);
+        assert_eq!(
+            left,
+            Some(("source".to_string(), "photo.jpg".to_string())),
+            "the main's occupying file is the left side"
+        );
+        assert_eq!(
+            right,
+            Some(("target".to_string(), "photo.jpg".to_string())),
+            "the sink's file is the right side"
+        );
+        h.state_mut()
+            .apply(&store, None, Act::OpenPreviewPair { left, right });
+        // … and both really open: the viewer shows a two-sided compare.
+        assert!(
+            h.state()
+                .inspect
+                .as_ref()
+                .and_then(|v| v.shown_pair())
+                .is_some(),
+            "a conflict row opens the side-by-side compare, not a single file: {:?}",
+            h.state().error
+        );
+
+        // A promote row's main-side file exists only in the plan → the click
+        // falls back to the sink's file alone.
+        h.state_mut().inspect = None;
+        let (j, promote) = h
+            .state()
+            .preview
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.left_status == board::Status::OnlyHere)
+            .map(|(j, r)| (j, r.clone()))
+            .expect("the sink's new file surfaces as a promote row");
+        let (left, right) = h.state().preview_row_pair(j, &promote);
+        h.state_mut()
+            .apply(&store, None, Act::OpenPreviewPair { left, right });
+        let viewer = h
+            .state()
+            .inspect
+            .as_ref()
+            .expect("a promote row still opens the sink's file");
+        assert!(
+            viewer.shown_pair().is_none(),
+            "only one file exists, so the viewer is single-file"
         );
     }
 
