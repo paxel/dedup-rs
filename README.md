@@ -49,6 +49,11 @@ Building the GUI on Linux needs ALSA headers (`libasound2-dev` on Debian/Ubuntu,
 filmstrip, frame scrub, soundtrack extraction and pitch-preserving playback rates — use
 `ffmpeg`/`ffprobe` at runtime and degrade gracefully when they are absent.
 
+On a Wayland desktop the GUI runs on the X11 backend (via XWayland) so that dropping
+folders onto the window works — the windowing library has no Wayland drag-and-drop yet.
+Set `DEDUP_WAYLAND=1` to keep the native Wayland backend (crisper fractional scaling)
+at the cost of drag-and-drop.
+
 ## What it does
 
 - **Repositories** — register directories, scan and hash them on background threads, track per-repo stats. Backup groups are framed together, with the group's **main** badged wherever it is named.

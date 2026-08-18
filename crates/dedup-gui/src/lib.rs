@@ -46,6 +46,10 @@ use std::sync::Arc;
 ///
 /// `ui_scale` (from `--ui-scale`) multiplies the interface size; `None` keeps
 /// the default.
+///
+/// Call this before the process spawns any thread: on Linux it edits the
+/// process environment (see [`prefer_x11_for_drag_and_drop`]), which is only
+/// sound while the process is single-threaded.
 pub fn run(ui_scale: Option<f32>) -> Result<(), String> {
     // Must be the very first thing: it edits the process environment, which
     // is only safe while no other thread exists.
@@ -127,8 +131,9 @@ fn prefer_x11_for_drag_and_drop() {
     if !force_x11(set("WAYLAND_DISPLAY"), set("DISPLAY"), set("DEDUP_WAYLAND")) {
         return;
     }
-    // SAFETY: called first thing in `run`, before any thread is spawned, so
-    // no concurrent read or write of the environment is possible.
+    // SAFETY: `run` requires (and documents) that it is called before the
+    // process spawns any thread, and calls this first — so no concurrent read
+    // or write of the environment is possible.
     unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
 }
 
