@@ -13,4 +13,5 @@ Open work only. Closed items live in `git log`; documentation lives in `docs/`.
 - [ ] Face and object recognition for photos/images.
 - [ ] VLA tagging of files to topics; word clouds for documents.
 - [ ] Metadata extraction for all known formats (ID3 tags already handled).
-- [ ] Plugin support for new formats; an API to externalise features.
+- [ ] Plugin support for new formats; an API to externalise features — specced for 0.5.0 in
+  [#2](https://github.com/paxel/dedup-rs/issues/2) (similarity providers + viewer visualisations).

@@ -1075,6 +1075,14 @@ impl eframe::App for DedupApp {
             Tab::Grooming => self.grooming.show(ui, &self.store, self.tooltip_verbosity),
             Tab::Browse => self.browse.show(ui, &self.store, self.tooltip_verbosity),
         });
+        // A file's SHOW IN BROWSE pick on another tab lands here: switch to the
+        // Browse tab with that file selected in its folder. `reveal` has just
+        // re-synced the view, so the tab-switch sync is already done.
+        if let Some((repo, rel)) = self.dupes.take_browse_request() {
+            self.browse.reveal(&self.store, &repo, &rel);
+            self.tab = Tab::Browse;
+            self.synced_tab = Some(Tab::Browse);
+        }
         if self.show_settings {
             self.settings_modal(&ctx);
         }

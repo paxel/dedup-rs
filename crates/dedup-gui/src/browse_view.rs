@@ -352,6 +352,27 @@ impl BrowseView {
         }
     }
 
+    /// Jump the tab to one file: select its repo, walk to its directory and
+    /// put the cursor on it — the "show this file among its neighbours" entry
+    /// point other tabs use (e.g. a duplicate copy's SHOW IN BROWSE).
+    pub fn reveal(&mut self, store: &Store, repo: &str, rel: &str) {
+        // Fresh repo list first (the caller skips the tab-switch sync); the
+        // repo is set *after*, so even one not offered as a chip (a sync
+        // sink's copy) can still be revealed.
+        self.sync_repos(store);
+        self.repo = Some(repo.to_string());
+        // Loads the index and resets cur/dir_sel/file_sel; the walk below then
+        // lands in the file's own directory.
+        self.load_entries(store, repo);
+        let mut segs: Vec<String> = rel.split('/').map(str::to_string).collect();
+        segs.pop(); // the file name — the cursor, not a directory
+        self.cur = segs;
+        self.sel_rel = Some(rel.to_string());
+        self.selected.clear();
+        self.flatten = false;
+        self.focus = Pane::Files;
+    }
+
     /// Absolute path of the current repo's root, if known.
     fn repo_root(&self) -> Option<&String> {
         self.repo.as_ref().and_then(|r| self.roots.get(r))
@@ -2541,6 +2562,59 @@ mod tests {
         assert!(
             matches!(v.preview, Some(Preview::Media)),
             "without hex_view an image carries no body"
+        );
+    }
+
+    /// `reveal` (another tab's SHOW IN BROWSE) selects the file's repo, walks
+    /// to its directory and puts the cursor on the file — and the selection
+    /// survives the first rendered frame.
+    #[test]
+    fn reveal_jumps_to_the_files_directory_and_selects_it() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let repo_dir = tmp.path().join("R");
+        std::fs::create_dir_all(repo_dir.join("2019")).unwrap();
+        store.create_repo("R", &repo_dir.to_string_lossy()).unwrap();
+        std::fs::write(repo_dir.join("2019/notes.txt"), b"x").unwrap();
+        std::fs::write(repo_dir.join("top.txt"), b"y").unwrap();
+        let mut e = entry();
+        e.mime = Some("text/plain".into());
+        store.update_file_entry("R", "2019/notes.txt", &e).unwrap();
+        store.update_file_entry("R", "top.txt", &e).unwrap();
+
+        let mut view = BrowseView::new();
+        view.reveal(&store, "R", "2019/notes.txt");
+        assert_eq!(view.repo.as_deref(), Some("R"));
+        assert_eq!(view.cur, vec!["2019".to_string()]);
+        assert_eq!(view.sel_rel.as_deref(), Some("2019/notes.txt"));
+
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut BrowseView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    ui.allocate_ui(egui::vec2(ui.available_width(), 600.0), |ui| {
+                        view.show(ui, &store_ui, TooltipVerbosity::default());
+                    });
+                },
+                view,
+            );
+        h.run();
+        assert!(
+            h.query_all_by_label_contains("notes.txt").count() > 0,
+            "the revealed file's directory listing shows it"
+        );
+        assert_eq!(
+            h.state().sel_rel.as_deref(),
+            Some("2019/notes.txt"),
+            "the cursor stays on the revealed file after rendering"
         );
     }
 
