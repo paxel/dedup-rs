@@ -210,6 +210,8 @@ fn decode_repo_meta(bytes: &[u8]) -> Result<RepoMeta, StoreError> {
 
 /// How the main is pushed to one sink. Chosen per sink, so a group can mirror
 /// some backups and only-add to others.
+/// Stored via postcard (variant *index*), so new variants are appended at the
+/// end — inserting or reordering would silently re-mode every stored sink.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyncMode {
     /// Copy content the sink lacks; never delete anything in the sink.
@@ -218,6 +220,18 @@ pub enum SyncMode {
     /// Copy what the sink lacks *and* delete what the main no longer has, so
     /// the sink ends up holding exactly the main's content.
     Mirror,
+    /// Copy what the sink lacks *and* delete sink content the main itself
+    /// deleted (its tombstones), so the sink follows the main's edits.
+    /// Content the main never had stays untouched.
+    ApplyChanges,
+}
+
+impl SyncMode {
+    /// Whether a push in this mode can delete the sink's existing files —
+    /// what the session locks and the empty-main guard care about.
+    pub fn deletes_in_sink(self) -> bool {
+        !matches!(self, SyncMode::AddOnly)
+    }
 }
 
 /// One sink of a group: the backup repository and how the main is pushed to it.

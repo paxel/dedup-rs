@@ -131,8 +131,9 @@ impl Command {
             Command::GroupSync => (
                 "Push this group's main to its sinks",
                 "Push the source (this group's main) to the selected sinks below, each in \
-                 its own stored mode — ADD ONLY copies and never deletes, MIRROR also \
-                 deletes what the main no longer has. The main is never changed.",
+                 its own stored mode — ADD ONLY copies and never deletes, APPLY CHANGES \
+                 also carries the main's own deletions over, MIRROR deletes everything \
+                 the main does not have. The main is never changed.",
             ),
             Command::GroupSyncBack => (
                 "Pull a sink's changes back into this main",
@@ -156,6 +157,25 @@ impl Command {
 /// One side of a review row as `(repo, rel_path)` — `None` when that side
 /// names no file.
 type RowSide = Option<(String, String)>;
+
+/// A sink mode's short label, matching the Repositories tab's mode chips.
+fn sink_mode_label(mode: SyncMode) -> &'static str {
+    match mode {
+        SyncMode::AddOnly => "ADD ONLY",
+        SyncMode::ApplyChanges => "APPLY CHANGES",
+        SyncMode::Mirror => "MIRROR",
+    }
+}
+
+/// A sink mode's accent: red for the modes that can delete in the sink,
+/// blue for the purely additive one.
+fn sink_mode_accent(mode: SyncMode) -> egui::Color32 {
+    if mode.deletes_in_sink() {
+        theme::red()
+    } else {
+        theme::blue()
+    }
+}
 
 /// Where a COPY/MOVE lands: into another repo, or into a plain folder.
 #[derive(PartialEq, Clone, Copy)]
@@ -2321,20 +2341,13 @@ impl TransferView {
                 };
                 crate::repo_chip::chip_row(ui, "xfer_back_sink", "", group.sinks.len(), |ui, i| {
                     let sink = &group.sinks[i];
-                    let mode = match sink.mode {
-                        SyncMode::AddOnly => "ADD ONLY",
-                        SyncMode::Mirror => "MIRROR",
-                    };
+                    let mode = sink_mode_label(sink.mode);
                     let sel = self
                         .selected_sinks
                         .first()
                         .map(|s| s == &sink.repo)
                         .unwrap_or(false);
-                    let accent = if sink.mode == SyncMode::Mirror {
-                        theme::red()
-                    } else {
-                        theme::blue()
-                    };
+                    let accent = sink_mode_accent(sink.mode);
                     let row = ui.horizontal(|ui| {
                         let chip = crate::repo_chip::repo_chip(
                             ui,
@@ -2408,16 +2421,9 @@ impl TransferView {
                 });
                 crate::repo_chip::chip_row(ui, "xfer_sinks", "", group.sinks.len(), |ui, i| {
                     let sink = &group.sinks[i];
-                    let mode = match sink.mode {
-                        SyncMode::AddOnly => "ADD ONLY",
-                        SyncMode::Mirror => "MIRROR",
-                    };
+                    let mode = sink_mode_label(sink.mode);
                     let sel = self.selected_sinks.iter().any(|s| s == &sink.repo);
-                    let accent = if sink.mode == SyncMode::Mirror {
-                        theme::red()
-                    } else {
-                        theme::blue()
-                    };
+                    let accent = sink_mode_accent(sink.mode);
                     // The chip gets the bare repo name: the identicon is hashed from
                     // whatever string it is handed, so folding the mode into the name
                     // gave this sink a different glyph here than on every other tab.
@@ -2444,24 +2450,24 @@ impl TransferView {
                         );
                         chip
                     });
-                    // A MIRROR push can delete this sink's existing files, so a
-                    // locked MIRROR sink cannot be included — the padlock next
-                    // to it says why, and unlocking it re-enables the toggle.
-                    // ADD ONLY sinks only ever gain files, so the lock does not
-                    // bar them.
-                    let barred = sink.mode == SyncMode::Mirror && self.locks.read_only(&sink.repo);
+                    // A MIRROR or APPLY CHANGES push can delete this sink's
+                    // existing files, so a locked sink in those modes cannot
+                    // be included — the padlock next to it says why, and
+                    // unlocking it re-enables the toggle. ADD ONLY sinks only
+                    // ever gain files, so the lock does not bar them.
+                    let barred = sink.mode.deletes_in_sink() && self.locks.read_only(&sink.repo);
                     let (hover, hover_verbose) = if barred {
                         (
-                            "Locked MIRROR sink — unlock it to include it in the push",
-                            "This sink pushes in MIRROR mode, which can delete its existing \
-                             files, and it is locked. Click its padlock to unlock it if you \
-                             want the push to include it.",
+                            "Locked deleting sink — unlock it to include it in the push",
+                            "This sink's push mode can delete its existing files, and it is \
+                             locked. Click its padlock to unlock it if you want the push to \
+                             include it.",
                         )
                     } else {
                         (
                             "Include this sink in the push",
                             "Toggle whether this sink is included when GROUP SYNC runs. Its mode \
-                             (ADD ONLY / MIRROR) is set on the Repositories tab.",
+                             (ADD ONLY / APPLY CHANGES / MIRROR) is set on the Repositories tab.",
                         )
                     };
                     if row
@@ -2623,16 +2629,17 @@ impl TransferView {
                 })
             }
             Command::GroupSync => {
-                // Locked MIRROR sinks are excluded from the push; the run is
-                // barred only when that leaves nothing to push to.
+                // Locked deleting (MIRROR / APPLY CHANGES) sinks are excluded
+                // from the push; the run is barred only when that leaves
+                // nothing to push to.
                 let group = self.current_group.as_ref()?;
                 let any_eligible = group.sinks.iter().any(|s| {
                     self.selected_sinks.contains(&s.repo)
-                        && !(s.mode == SyncMode::Mirror && self.locks.read_only(&s.repo))
+                        && !(s.mode.deletes_in_sink() && self.locks.read_only(&s.repo))
                 });
                 (!self.selected_sinks.is_empty() && !any_eligible).then(|| {
-                    "Every selected sink is a locked MIRROR sink — unlock one (its padlock) \
-                     or select an ADD ONLY sink."
+                    "Every selected sink is locked and its mode deletes — unlock one (its \
+                     padlock) or select an ADD ONLY sink."
                         .to_string()
                 })
             }
@@ -2647,9 +2654,9 @@ impl TransferView {
             || (self.command == Command::Sync && self.sync_delete_missing)
             || (self.command == Command::GroupSync
                 && self.current_group.as_ref().is_some_and(|g| {
-                    g.sinks.iter().any(|s| {
-                        self.selected_sinks.contains(&s.repo) && s.mode == SyncMode::Mirror
-                    })
+                    g.sinks
+                        .iter()
+                        .any(|s| self.selected_sinks.contains(&s.repo) && s.mode.deletes_in_sink())
                 }))
     }
 
@@ -3631,11 +3638,11 @@ impl TransferView {
                 .sinks
                 .into_iter()
                 .filter(|s| self.selected_sinks.contains(&s.repo))
-                // A locked MIRROR sink is never pushed to — MIRROR can delete
-                // its existing files, and the lock forbids that. (The include
-                // toggle already bars it; this is the backstop for a sink
-                // locked after being selected.)
-                .filter(|s| !(s.mode == SyncMode::Mirror && self.locks.read_only(&s.repo)))
+                // A locked deleting sink (MIRROR / APPLY CHANGES) is never
+                // pushed to — those modes can delete its existing files, and
+                // the lock forbids that. (The include toggle already bars it;
+                // this is the backstop for a sink locked after being selected.)
+                .filter(|s| !(s.mode.deletes_in_sink() && self.locks.read_only(&s.repo)))
                 .collect(),
         };
         if group.sinks.is_empty() {
@@ -3799,9 +3806,9 @@ impl TransferView {
             group.main,
             group.sinks.len()
         );
-        if group.sinks.iter().any(|s| s.mode == SyncMode::Mirror) {
+        if group.sinks.iter().any(|s| s.mode.deletes_in_sink()) {
             prompt.push_str(&format!(
-                " and DELETE {deletes} file(s) from the mirror sink(s), which cannot be undone"
+                " and DELETE {deletes} file(s) from the deleting sink(s), which cannot be undone"
             ));
         }
         prompt.push_str(". The main is never changed.");

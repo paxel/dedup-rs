@@ -433,6 +433,57 @@ fn mirror_converges_the_sink_on_the_main() -> TestResult {
     Ok(())
 }
 
+/// APPLY CHANGES follows the main's edits: the sink loses content the main
+/// itself deleted (its tombstone), keeps content the main never had, and
+/// gains what it lacks — the middle ground between ADD ONLY and MIRROR.
+#[test]
+fn apply_changes_propagates_deletions_but_keeps_never_had_content() -> TestResult {
+    let sb = Sandbox::new()?;
+    write(&sb.dir("MAIN"), "a.txt", b"alpha")?;
+    write(&sb.dir("MAIN"), "b.txt", b"beta")?;
+    write(&sb.dir("MAIN"), "dropped.txt", b"dropped")?;
+    write(&sb.dir("SINK1"), "a.txt", b"alpha")?;
+    write(&sb.dir("SINK1"), "dropped.txt", b"dropped")?;
+    write(&sb.dir("SINK1"), "extra.txt", b"only in the sink")?;
+    sb.scan(&["MAIN", "SINK1"])?;
+    // The main deletes dropped.txt and rescans: a tombstone the sink outlives.
+    std::fs::remove_file(sb.dir("MAIN").join("dropped.txt"))?;
+    sb.scan(&["MAIN"])?;
+    sb.store.create_sync_group("offsite", "MAIN")?;
+    sb.store
+        .add_sync_sink("offsite", "SINK1", SyncMode::ApplyChanges)?;
+    let group = sb.store.get_sync_group("offsite")?;
+
+    let plans = plan_group_sync(&sb.store, &group)?;
+    assert_eq!(
+        plans[0].1.copies,
+        ["b.txt"],
+        "the sink still gains what it lacks"
+    );
+    assert_eq!(
+        plans[0].1.deletes,
+        ["dropped.txt"],
+        "only the main's own deletion propagates"
+    );
+
+    let results = run_group_sync(
+        &sb.store,
+        &group,
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
+    )?;
+    let stats = first_stats(results).ok_or("sync failed")?;
+    assert_eq!((stats.copied, stats.deleted), (1, 1));
+    assert_eq!(
+        live_paths(&sb.store, "SINK1")?,
+        ["a.txt", "b.txt", "extra.txt"],
+        "the deletion follows the main; the never-had extra survives"
+    );
+    assert!(!sb.dir("SINK1").join("dropped.txt").exists());
+    // The main is never changed by a push.
+    assert_eq!(live_paths(&sb.store, "MAIN")?, ["a.txt", "b.txt"]);
+    Ok(())
+}
+
 /// The point of per-sink modes: one group, mixed. The MIRROR sink drops what
 /// the main lacks; the ADD ONLY sink keeps its own extra file in the same push.
 #[test]

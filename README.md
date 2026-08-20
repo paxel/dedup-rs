@@ -58,7 +58,7 @@ at the cost of drag-and-drop.
 
 - **Repositories** — register directories, scan and hash them on background threads, track per-repo stats. Backup groups are framed together, with the group's **main** badged wherever it is named.
 - **Duplicates** — find exact or perceptually-similar files across repos and delete the worse copies. A copy's right-click menu can jump straight to it in Browse (**SHOW IN BROWSE**), to judge it by the folder it lives in.
-- **Transfer / DIFF** — copy, move, sync or mirror content between repos, reconcile two repos side by side, or push a backup group's main to its sinks (each ADD ONLY or MIRROR).
+- **Transfer / DIFF** — copy, move, sync or mirror content between repos, reconcile two repos side by side, or push a backup group's main to its sinks (each ADD ONLY, APPLY CHANGES — which also carries the main's own deletions over — or MIRROR).
 - **Grooming** — dedupe, purge by filter, prune missing records, reorganize by path templates.
 
 Clicking any file anywhere — a duplicate card, a review-board row, a Browse listing, a DIFF

@@ -103,7 +103,8 @@ impl Command {
             Command::EmptyDirs => (
                 "Remove empty directories",
                 "Remove every empty directory under the repo's root, bottom-up. The repo \
-                 root itself is kept and indexed files are untouched.",
+                 root itself is kept and indexed files are untouched. On a backup group's \
+                 main, its sinks are cleaned in the same run.",
             ),
             Command::Organize => (
                 "Reorganize files by path templates",
@@ -130,6 +131,10 @@ enum OpResult {
     },
     EmptyDirs {
         removed: u64,
+        /// How many repositories were swept (1, or main + sinks for a group).
+        repos: u64,
+        /// Per-repo failures ("repo: error"), merged into the run report.
+        errors: Vec<String>,
     },
     Organized {
         moved: u64,
@@ -604,7 +609,12 @@ impl GroomingView {
     }
 
     fn empty_dirs_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        self.single_repo_bar(ui, acts, "Remove empty directories under this repo's root.");
+        self.single_repo_bar(
+            ui,
+            acts,
+            "Remove empty directories under this repo's root — a backup group's main is \
+             cleaned together with its sinks.",
+        );
     }
 
     fn prune_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
@@ -1667,9 +1677,29 @@ impl GroomingView {
                 }
                 Command::EmptyDirs => {
                     let Some(repo) = repo else { return };
-                    match delete_empty_dirs(&store, &repo) {
-                        Ok(removed) => OpResult::EmptyDirs { removed },
-                        Err(e) => OpResult::Error(e.to_string()),
+                    // A group main's sinks mirror its tree, so the same stale
+                    // directory skeletons accumulate there — sweep them in the
+                    // same run. Empty directories hold no data, so sink locks
+                    // are not in play; an unreachable sink walks as empty and
+                    // is a harmless no-op.
+                    let mut repos = vec![repo.clone()];
+                    if let Ok(groups) = store.list_sync_groups()
+                        && let Some((_, g)) = groups.into_iter().find(|(_, g)| g.main == repo)
+                    {
+                        repos.extend(g.sinks.into_iter().map(|s| s.repo));
+                    }
+                    let mut removed = 0u64;
+                    let mut errors: Vec<String> = Vec::new();
+                    for r in &repos {
+                        match delete_empty_dirs(&store, r) {
+                            Ok(n) => removed += n,
+                            Err(e) => errors.push(format!("{r}: {e}")),
+                        }
+                    }
+                    OpResult::EmptyDirs {
+                        removed,
+                        repos: repos.len() as u64,
+                        errors,
                     }
                 }
                 Command::Organize => {
@@ -1754,10 +1784,19 @@ impl GroomingView {
                             self.error = None;
                             self.result.open(report);
                         }
-                        OpResult::EmptyDirs { removed } => {
-                            let report = crate::run_result::RunReport::new("Remove empty dirs")
+                        OpResult::EmptyDirs {
+                            removed,
+                            repos,
+                            errors,
+                        } => {
+                            let mut report = crate::run_result::RunReport::new("Remove empty dirs")
                                 .count("removed", removed)
-                                .problems(problems);
+                                .problems(problems.into_iter().chain(errors));
+                            // Only a group sweep names its breadth — a plain
+                            // single-repo run needs no "1 repository" noise.
+                            if repos > 1 {
+                                report = report.count("repositories swept", repos);
+                            }
                             self.status = Some(report.headline());
                             self.error = None;
                             self.result.open(report);
@@ -1954,6 +1993,39 @@ mod ui_tests {
             h.state().error
         );
         assert!(h.state().error.is_none());
+    }
+
+    /// EMPTY DIRS on a backup group's main sweeps its sinks in the same run —
+    /// sinks are not offered as groomable repos, so this is the only way their
+    /// stale directory skeletons get cleaned.
+    #[test]
+    fn empty_dirs_sweeps_a_group_mains_sinks_too() {
+        let (tmp, store) = sample_store();
+        std::fs::create_dir_all(tmp.path().join("a/old/empty")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("b/stale/nested")).unwrap();
+        store.create_sync_group("a", "a").unwrap();
+        store
+            .add_sync_sink("a", "b", dedup_core::store::SyncMode::AddOnly)
+            .unwrap();
+        let mut h = grooming_harness(Arc::clone(&store), Command::EmptyDirs);
+        h.state_mut().repo = Some("a".to_string());
+        h.state_mut().apply(&store, Act::Confirm);
+        for _ in 0..200 {
+            h.step();
+            if !h.state().running && h.state().status.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            !tmp.path().join("a/old").exists(),
+            "the main's empty tree is gone"
+        );
+        assert!(
+            !tmp.path().join("b/stale").exists(),
+            "the sink's empty tree is gone in the same run: {:?}",
+            h.state().status
+        );
     }
 
     /// The number keys switch commands (mirroring the segmented selector).

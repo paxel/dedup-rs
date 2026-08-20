@@ -6,6 +6,17 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 ### Added
 
+- **APPLY CHANGES: a third sink push mode.** Between ADD ONLY and MIRROR: the
+  push copies what the sink lacks *and* deletes from the sink what the main
+  itself deleted — the backup follows the main's edits, while files the main
+  never had stay untouched. Picked per sink on the Repositories tab (the mode
+  pill is now three chips); a locked APPLY CHANGES sink is excluded from the
+  push just like a locked MIRROR sink.
+- **EMPTY DIRS cleans a group's sinks with its main.** Sinks are not offered
+  as groomable repositories, so their stale directory skeletons had no way to
+  be cleaned; running EMPTY DIRS on a backup group's main now sweeps every
+  sink in the same run (empty directories hold no data, so sink locks don't
+  apply), and the run report says how many repositories were swept.
 - **SHOW IN BROWSE on every duplicate copy.** Right-click (or long-press) a
   copy in the Duplicates tab and pick SHOW IN BROWSE: the app switches to the
   Browse tab with that file selected in its folder — judge a duplicate by the
