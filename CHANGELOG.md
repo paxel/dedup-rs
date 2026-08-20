@@ -31,6 +31,14 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   thousands of such groups survived every auto-resolve and only picked up
   marks page by page. It now keeps the protected copy and marks the writable
   duplicate — the same choice the group cards show.
+- **No more dead broken-image cells on review rows.** A file with no preview
+  yet (and audio whose fingerprint failed, e.g. some audiobooks) showed an
+  inert broken-image glyph you could not click. Such audio now falls back to
+  the byte-view preview like other opaque files, and the placeholder shown
+  while any preview is still loading is styled like a real cell (extension
+  chip, no broken glyph) and opens the viewer on click like everything else.
+- **EMPTY DIRS no longer tells you to press a REVIEW button it doesn't have** —
+  its hint now says to press RUN.
 - **DELETE MARKED no longer looks like it deleted only one file.** The
   deletion always worked, but the follow-up re-search instantly replaced the
   "Deleted 45 file(s)" message with the fresh group count while the new first

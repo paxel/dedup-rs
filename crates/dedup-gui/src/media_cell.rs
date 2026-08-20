@@ -4,12 +4,11 @@
 //! cards and the review board both use, so neither grows a downgraded variant of
 //! the other (`AGENTS.md`, memory `ui-consistency: one app`).
 //!
-//! The cell is presentation only: it returns the click [`egui::Response`] (for
-//! the image/video/audio kinds) and lets the caller decide what a click means
-//! and which tooltip to attach. A placeholder (or an off-screen / not-yet-decoded
-//! thumbnail) returns `None`.
+//! The cell is presentation only: it returns the click [`egui::Response`] and
+//! lets the caller decide what a click means and which tooltip to attach.
+//! Every kind of cell is clickable — the placeholder shown while a preview is
+//! still being generated included.
 
-use crate::icon;
 use crate::theme;
 use crate::thumbs::ThumbCache;
 use dedup_core::store::{ExifInfo, FileEntry, Store};
@@ -227,9 +226,10 @@ impl MediaStyle {
     }
 }
 
-/// Draw the media cell for `facts`. Returns the clickable [`Response`] for the
-/// image / video / audio kinds (the caller attaches meaning and tooltip); a
-/// placeholder — or an off-screen or not-yet-decoded thumbnail — returns `None`.
+/// Draw the media cell for `facts`. Returns the clickable [`Response`] (the
+/// caller attaches meaning and tooltip) — every cell is a way into the viewer,
+/// including the placeholder shown while a preview is still being generated.
+/// (`Option` is kept for the callers; only a zero-area slot yields `None`.)
 pub fn media_cell(
     ui: &mut egui::Ui,
     thumbs: &mut ThumbCache,
@@ -286,8 +286,10 @@ pub fn media_cell(
     // Audio: a deterministic fingerprint glyph (identical content → identical
     // glyph), so a cell reads as audio instead of a broken image. A file whose
     // fingerprint failed still carries a duration, so gate on that, not the seed
-    // (which is absent when the fingerprint has no chunk hashes).
-    if facts.is_audio() && facts.audio_ms.is_some() {
+    // (which is absent when the fingerprint has no chunk hashes). Audio with
+    // no duration at all falls through to the byte-view fallback below.
+    let audio_glyph = facts.is_audio() && facts.audio_ms.is_some();
+    if audio_glyph {
         let seed = facts.audio_seed.unwrap_or([0u8; 32]);
         // Leave room under the glyph for the duration caption when captioned.
         let bottom = if style.captions { 24.0 } else { 8.0 };
@@ -410,7 +412,7 @@ pub fn media_cell(
     // middle, colour-hashed like the repo identicons so ".db" is the same hue
     // everywhere. Generated on the worker pool; until it lands (or when the
     // file cannot be read) the typed placeholder below stands in.
-    if !facts.is_image() && !facts.is_video() && !facts.is_audio() && !facts.is_textual() {
+    if !facts.is_image() && !facts.is_video() && !audio_glyph && !facts.is_textual() {
         let thumb_rect = egui::Rect::from_min_size(ui.next_widget_position(), egui::vec2(w, h));
         if ui.is_rect_visible(thumb_rect)
             && let Some(tex) = thumbs.get_byte_view(&facts.hash_hex, facts.abs_path.as_path())
@@ -440,27 +442,34 @@ pub fn media_cell(
         }
     }
 
-    // Placeholder for non-media or not-yet-ready thumbnails.
-    let label = facts.mime.clone().unwrap_or_else(|| "file".into());
-    let frame = egui::Frame::new()
-        .fill(theme::panel())
-        .corner_radius(6)
-        .inner_margin(if style.captions { 18.0 } else { 6.0 })
-        .show(ui, |ui| {
-            ui.set_width(w);
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    RichText::new(icon::IMAGE)
-                        .color(theme::lilac())
-                        .size(if style.captions { 28.0 } else { 18.0 }),
-                );
-                if style.captions {
-                    ui.label(RichText::new(label).color(theme::lilac()).size(11.0));
-                }
-            });
-        });
-    paint_overlay(ui.painter(), frame.response.rect, overlay, style.captions);
-    None
+    // Placeholder while a preview is still being generated (or when the file
+    // cannot be read): the same panel + hairline as every real cell, with the
+    // file's extension chip across the middle — never a broken-image glyph —
+    // and, per the law, still clickable into the viewer.
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 6.0, theme::panel());
+    painter.rect_stroke(
+        rect,
+        6.0,
+        egui::Stroke::new(1.0, theme::hairline()),
+        egui::StrokeKind::Inside,
+    );
+    paint_extension_badge(&painter, rect, facts, style.captions, overlay.is_none());
+    if style.captions
+        && let Some(mime) = &facts.mime
+    {
+        painter.text(
+            egui::pos2(rect.center().x, rect.max.y - 13.0),
+            egui::Align2::CENTER_CENTER,
+            mime,
+            egui::FontId::proportional(11.0),
+            theme::tan(),
+        );
+    }
+    paint_overlay(&painter, rect, overlay, style.captions);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "OPEN PREVIEW"));
+    Some(resp)
 }
 
 /// A bare status cell for a side with **no file**: the veil and word alone in
@@ -610,7 +619,7 @@ mod tests {
 
     /// An opaque file's card cell becomes the clickable byte-view bitmap once
     /// the background read lands (with the extension badge painted over it);
-    /// until then it is the placeholder, which returns `None`.
+    /// until then it is the placeholder — itself clickable too.
     #[test]
     fn opaque_card_gets_a_byte_view_once_loaded() {
         struct State {
@@ -653,7 +662,7 @@ mod tests {
 
     /// A text file's card cell becomes a clickable first-lines preview once the
     /// background head-read lands; until then it stays the plain placeholder
-    /// (which returns `None`) — the paint path never reads the file itself.
+    /// (clickable as well) — the paint path never reads the file itself.
     #[test]
     fn text_card_previews_first_lines_once_loaded() {
         struct State {
@@ -693,6 +702,45 @@ mod tests {
         assert!(
             harness.state().clickable,
             "once the head-read lands the cell draws the preview and is clickable"
+        );
+    }
+
+    /// An audio file whose fingerprint failed (no duration) must never be a
+    /// dead broken-image cell: it is clickable from the very first frame (the
+    /// placeholder senses clicks) and falls through to the byte-view fallback
+    /// instead of the audio glyph it cannot draw.
+    #[test]
+    fn audio_without_duration_is_clickable_from_the_first_frame() {
+        struct State {
+            thumbs: ThumbCache,
+            facts: FileFacts,
+            clickable: bool,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.m4b");
+        std::fs::write(&path, vec![0x5Au8; 4096]).unwrap();
+        let mut f = facts("audio/mp4");
+        f.abs_path = path;
+        assert!(f.is_audio() && f.audio_ms.is_none(), "the fixture's point");
+        let state = State {
+            thumbs: ThumbCache::new(1),
+            facts: f,
+            clickable: false,
+        };
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(400.0, 300.0))
+            .build_ui_state(
+                move |ui, state: &mut State| {
+                    state.thumbs.poll(&ui.ctx().clone());
+                    let resp = media_cell(ui, &mut state.thumbs, &state.facts, MediaStyle::card());
+                    state.clickable = resp.is_some();
+                },
+                state,
+            );
+        harness.step();
+        assert!(
+            harness.state().clickable,
+            "the placeholder itself is clickable — no waiting for a preview"
         );
     }
 

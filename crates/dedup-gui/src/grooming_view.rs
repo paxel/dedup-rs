@@ -946,7 +946,14 @@ impl GroomingView {
     fn preview_panel(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         if self.preview.is_empty() {
             ui.add_space(6.0);
-            ui.colored_label(theme::text(), "Pick a repo and command, then press REVIEW.");
+            // EMPTY DIRS has no review board — its only action is RUN, so the
+            // hint must not send the user hunting for a REVIEW button.
+            let hint = if self.command == Command::EmptyDirs {
+                "Pick a repo, then press RUN."
+            } else {
+                "Pick a repo and command, then press REVIEW."
+            };
+            ui.colored_label(theme::text(), hint);
             return;
         }
         let bodies = std::mem::take(&mut self.preview_bodies);
