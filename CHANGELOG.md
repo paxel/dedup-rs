@@ -22,15 +22,32 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   Browse tab with that file selected in its folder — judge a duplicate by the
   company it keeps (siblings, naming, the directory it lives in) without
   hunting for it by hand.
+- **The Browse preview plays audio.** A selected track gets PLAY/PAUSE, its
+  elapsed time, a seek bar, and a playhead drawn across the waveform or
+  spectrogram. Playback stops when you leave the tab.
+- **Every Browse preview opens the viewer.** Clicking the preview — an audio
+  visual or a text/byte body, not just a picture — opens that file
+  full-window in the shared single-file viewer.
 
 ### Fixed
 
+- **Rows can be selected anywhere in the row, not only on an empty cell.** In
+  the Browse file table (and any other list carrying a right-click Copy menu)
+  clicks over most of a row did nothing: only the gaps between text picked the
+  file. Rows now select wherever you click them.
 - **AUTO-RESOLVE REST no longer leaves read-only-paired groups behind.** In a
   group holding one writable and one read-only copy, auto-resolve could end up
   marking nothing (it tried to mark the protected copy and was refused), so
   thousands of such groups survived every auto-resolve and only picked up
   marks page by page. It now keeps the protected copy and marks the writable
   duplicate — the same choice the group cards show.
+- **`.m4b` audiobooks (and `.m4a`) are recognized as audio.** They live in the
+  same MP4 container as video, so content-sniffing classified them
+  "video/mp4" and they got the video treatment (which cannot work — there is
+  no video stream). Audio-named MP4 files now detect as audio and get the
+  full audio treatment: fingerprint, duration, waveform glyph and playback.
+  Already-indexed audiobooks re-scan automatically on the next repository
+  update — no manual action needed.
 - **No more dead broken-image cells on review rows.** A file with no preview
   yet (and audio whose fingerprint failed, e.g. some audiobooks) showed an
   inert broken-image glyph you could not click. Such audio now falls back to

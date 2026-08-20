@@ -30,6 +30,7 @@
 
 use crate::external;
 use crate::filter_ui::FilterBuilder;
+use crate::player::Player;
 use crate::settings::TooltipVerbosity;
 use crate::theme;
 use crate::thumbs::ThumbCache;
@@ -195,6 +196,9 @@ pub struct BrowseView {
     /// Thumbnails / audio-viz for the preview dock (background decode pools).
     thumbs: ThumbCache,
     waves: WaveCache,
+    /// Audio preview playback for the selected track. One file plays at a time
+    /// app-wide; leaving the tab stops it (see [`Self::stop_audio`]).
+    player: Player,
     /// Cached text/binary preview body, keyed by the rel-path it was built for.
     preview: Option<Preview>,
     preview_key: Option<String>,
@@ -276,6 +280,7 @@ impl BrowseView {
             error: None,
             thumbs: ThumbCache::new(2),
             waves: WaveCache::new(1),
+            player: Player::new(),
             preview: None,
             preview_key: None,
             hex_view: false,
@@ -311,6 +316,14 @@ impl BrowseView {
             self.prefetch_alive = false;
             self.prefetch_gen
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Stop the audio preview (called when leaving the tab — playback belongs
+    /// to the surface you are looking at).
+    pub fn stop_audio(&mut self) {
+        if self.player.is_active() {
+            self.player.stop();
         }
     }
 
@@ -856,6 +869,11 @@ impl BrowseView {
         if self.thumbs.poll(ui.ctx()) || self.waves.poll(ui.ctx()) {
             ui.ctx().request_repaint();
         }
+        // Keep the transport's clock and playhead moving while a track plays.
+        if self.player.is_active() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
+        }
 
         ui.separator();
 
@@ -1085,6 +1103,7 @@ impl BrowseView {
                         // click target. Copy hangs off the whole row instead.
                         ui.add(egui::Label::new(text).truncate());
                     });
+
                     row.col(|ui| {
                         ui.monospace(format_size(f.size));
                     });
@@ -1284,62 +1303,94 @@ impl BrowseView {
                             "Open this file full-window in the lightbox — wheel zoom, drag \
                              pan, F fit, 1 true pixels, Esc closes.",
                         );
-                    if resp.clicked()
-                        && let Some(abs) = abs
-                    {
-                        // The law: clicking any file opens the shared viewer —
-                        // whatever it is, picture or not. The index entry gives
-                        // the viewer the full facts (dimensions, EXIF); the row
-                        // alone stands in if the entry cannot be read. Browse
-                        // is the owner's tab, so its sides are writable.
-                        let repo = self.repo.clone().unwrap_or_default();
-                        let facts = store
-                            .get_file_entry(&repo, &sel.rel)
-                            .ok()
-                            .flatten()
-                            .map(|e| {
-                                crate::media_cell::FileFacts::from_entry(&e, abs.to_path_buf())
-                            })
-                            .unwrap_or_else(|| crate::media_cell::FileFacts {
-                                size: sel.size,
-                                modified_ms: sel.modified_ms,
-                                missing: false,
-                                mime: Some(sel.mime.clone()),
-                                img_size: None,
-                                audio_ms: None,
-                                audio_seed: None,
-                                hash_hex: hash_hex(&sel.hash),
-                                abs_path: abs.to_path_buf(),
-                                origin: None,
-                                exif: None,
-                            });
-                        let read_only = self.locks.read_only(&repo);
-                        let side = crate::compare_view::DiffSide {
-                            repo,
-                            rel_path: sel.rel.clone(),
-                            read_only,
-                            facts,
-                        };
-                        // One file, so no second side and no switcher. Browsing
-                        // the whole listing as a pool wants the file list, which
-                        // the preview dock does not hold — noted for later.
-                        self.lightbox = Some(crate::compare_view::DiffCompare::inspect(side));
+                    if resp.clicked() {
+                        self.open_in_viewer(store, sel, abs);
                     }
                 } else {
                     placeholder(ui, "decoding…");
                 }
             }
-            Cat::Audio => self.audio_preview(ui, sel, abs, height),
-            Cat::Text | Cat::Other => self.draw_preview_body(ui),
+            Cat::Audio => self.audio_preview(ui, store, sel, abs, height),
+            // The law: clicking any file anywhere opens the shared viewer.
+            // A text or byte preview is a file too, so its body is one big
+            // click target like the picture above.
+            Cat::Text | Cat::Other => {
+                let resp = ui
+                    .scope(|ui| self.draw_preview_body(ui))
+                    .response
+                    .interact(egui::Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .explain(
+                        self.verbosity,
+                        "Open in the viewer",
+                        "Open this file full-window in the viewer, with its text, hex and \
+                         metadata tabs — Esc closes.",
+                    );
+                if resp.clicked() {
+                    self.open_in_viewer(store, sel, abs);
+                }
+            }
         }
     }
 
-    /// The audio preview: a waveform/spectrogram visual (switchable) on the
-    /// left, and this file's ID3 tags — with an inline editor — on the right.
-    fn audio_preview(&mut self, ui: &mut egui::Ui, sel: &FileRow, abs: Option<&Path>, height: f32) {
+    /// Open `sel` full-window in the one shared viewer
+    /// ([`crate::compare_view::DiffCompare`]) — the single-file INSPECT, since
+    /// Browse has no second file to compare against. The index entry gives the
+    /// viewer the full facts (dimensions, EXIF, audio); the listing row alone
+    /// stands in if the entry cannot be read. Browse is the owner's tab, so
+    /// its side is writable unless the repo's own lock says otherwise.
+    fn open_in_viewer(&mut self, store: &Store, sel: &FileRow, abs: Option<&Path>) {
+        let Some(abs) = abs else { return };
+        let repo = self.repo.clone().unwrap_or_default();
+        let facts = store
+            .get_file_entry(&repo, &sel.rel)
+            .ok()
+            .flatten()
+            .map(|e| crate::media_cell::FileFacts::from_entry(&e, abs.to_path_buf()))
+            .unwrap_or_else(|| crate::media_cell::FileFacts {
+                size: sel.size,
+                modified_ms: sel.modified_ms,
+                missing: false,
+                mime: Some(sel.mime.clone()),
+                img_size: None,
+                audio_ms: None,
+                audio_seed: None,
+                hash_hex: hash_hex(&sel.hash),
+                abs_path: abs.to_path_buf(),
+                origin: None,
+                exif: None,
+            });
+        let read_only = self.locks.read_only(&repo);
+        let side = crate::compare_view::DiffSide {
+            repo,
+            rel_path: sel.rel.clone(),
+            read_only,
+            facts,
+        };
+        // The viewer owns playback once it is open; two players sharing one
+        // output device would talk over each other.
+        self.player.stop();
+        // One file, so no second side and no switcher. Browsing the whole
+        // listing as a pool wants the file list, which the preview dock does
+        // not hold — noted for later.
+        self.lightbox = Some(crate::compare_view::DiffCompare::inspect(side));
+    }
+
+    /// The audio preview: a waveform/spectrogram visual (switchable) with its
+    /// own transport on the left, and this file's ID3 tags — with an inline
+    /// editor — on the right.
+    fn audio_preview(
+        &mut self,
+        ui: &mut egui::Ui,
+        store: &Store,
+        sel: &FileRow,
+        abs: Option<&Path>,
+        height: f32,
+    ) {
         let hex = hash_hex(&sel.hash);
         let viz = abs.and_then(|abs| self.waves.get(&hex, abs));
         let tag_w = 250.0;
+        let mut open_viewer = false;
         ui.horizontal_top(|ui| {
             let vis_w = (ui.available_width() - tag_w - 12.0).max(80.0);
             ui.vertical(|ui| {
@@ -1351,10 +1402,26 @@ impl BrowseView {
                         }
                     }
                 });
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(vis_w, (height - 38.0).max(40.0)),
-                    egui::Sense::hover(),
+                let transport = self.audio_transport(ui, sel, abs, &hex);
+                // Clicking the visual opens the viewer, like clicking the
+                // picture of an image does — the transport above it keeps its
+                // own clicks.
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(vis_w, (height - 38.0 - transport).max(40.0)),
+                    egui::Sense::click(),
                 );
+                if resp
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .explain(
+                        self.verbosity,
+                        "Open in the viewer",
+                        "Open this file full-window in the viewer — spectrogram, tags and \
+                         the full transport. Esc closes.",
+                    )
+                    .clicked()
+                {
+                    open_viewer = true;
+                }
                 let p = ui.painter_at(rect);
                 p.rect_filled(rect, 4.0, theme::panel());
                 match viz {
@@ -1395,9 +1462,100 @@ impl BrowseView {
                         );
                     }
                 }
+                // The playhead over the visual, so the position is read where
+                // the sound is drawn rather than only on the seek bar.
+                let snap = self.player.snapshot();
+                if snap.loaded && snap.hex.as_deref() == Some(hex.as_str()) && snap.total_ms > 0 {
+                    let frac = (snap.pos_ms as f32 / snap.total_ms as f32).clamp(0.0, 1.0);
+                    let x = rect.left() + rect.width() * frac;
+                    p.vline(
+                        x,
+                        rect.top()..=rect.bottom(),
+                        egui::Stroke::new(1.5, theme::amber()),
+                    );
+                }
             });
             ui.vertical(|ui| self.audio_tag_panel(ui, sel, abs, &hex));
         });
+        if open_viewer {
+            self.open_in_viewer(store, sel, abs);
+        }
+    }
+
+    /// Play/pause, elapsed time and a seek bar for the previewed track, drawn
+    /// above its visual. Returns the height it used, so the visual can claim
+    /// the rest of the dock. One file plays at a time app-wide (the player is
+    /// shared), so starting one here stops whatever else was playing.
+    fn audio_transport(
+        &mut self,
+        ui: &mut egui::Ui,
+        sel: &FileRow,
+        abs: Option<&Path>,
+        hex: &str,
+    ) -> f32 {
+        let Some(abs) = abs else { return 0.0 };
+        let snap = self.player.snapshot();
+        let is_current = snap.loaded && snap.hex.as_deref() == Some(hex);
+        let playing = is_current && snap.playing;
+        let total_ms = if is_current {
+            snap.total_ms
+        } else {
+            self.entries
+                .iter()
+                .find(|(rel, _)| rel == &sel.rel)
+                .and_then(|(_, e)| e.audio.as_ref())
+                .map(|a| a.duration_ms as u64)
+                .unwrap_or(0)
+        };
+        let top = ui.next_widget_position().y;
+        ui.horizontal(|ui| {
+            let (label, fill, col) = if playing {
+                ("PAUSE", theme::amber(), theme::black())
+            } else {
+                ("PLAY", theme::panel(), theme::text())
+            };
+            if ui
+                .add(egui::Button::new(RichText::new(label).color(col)).fill(fill))
+                .explain(
+                    self.verbosity,
+                    "Play/pause this track",
+                    "Play this file in the built-in preview player. Only one file plays at \
+                     a time — starting another stops this one. Click again to pause/resume.",
+                )
+                .clicked()
+            {
+                if is_current {
+                    self.player.toggle_pause();
+                } else {
+                    self.player.play(hex, abs, total_ms, 0);
+                }
+            }
+            let pos = if is_current { snap.pos_ms } else { 0 };
+            ui.label(
+                RichText::new(format!(
+                    "{} / {}",
+                    crate::media_cell::fmt_ms(pos),
+                    crate::media_cell::fmt_ms(total_ms)
+                ))
+                .color(theme::tan())
+                .size(11.0),
+            );
+            if is_current && snap.total_ms > 0 {
+                let mut frac = (snap.pos_ms as f32 / snap.total_ms as f32).clamp(0.0, 1.0);
+                if ui
+                    .add(egui::Slider::new(&mut frac, 0.0..=1.0).show_value(false))
+                    .explain(
+                        self.verbosity,
+                        "Seek",
+                        "Drag to seek to a position in this track.",
+                    )
+                    .changed()
+                {
+                    self.player.seek_fraction(frac);
+                }
+            }
+        });
+        (ui.next_widget_position().y - top).max(0.0)
     }
 
     /// Lazily upload (and cache) the previewed file's spectrogram texture.
@@ -2562,6 +2720,147 @@ mod tests {
         assert!(
             matches!(v.preview, Some(Preview::Media)),
             "without hex_view an image carries no body"
+        );
+    }
+
+    /// Clicking a row's *filename* selects that row. egui makes every label a
+    /// click-and-drag target for text selection, and the label sits on top of
+    /// its row — so a cell with text used to swallow the row's own click and
+    /// only an empty column (e.g. TAGS) could pick a file.
+    #[test]
+    fn clicking_a_rows_text_cell_selects_that_row() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let repo_dir = tmp.path().join("R");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        store.create_repo("R", &repo_dir.to_string_lossy()).unwrap();
+        let mut e = entry();
+        e.mime = Some("audio/mpeg".into());
+        for name in ["one.mp3", "two.mp3", "three.mp3"] {
+            std::fs::write(repo_dir.join(name), b"x").unwrap();
+            store.update_file_entry("R", name, &e).unwrap();
+        }
+
+        let mut view = BrowseView::new();
+        view.repo = Some("R".into());
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1000.0, 1000.0))
+            .build_ui_state(
+                move |ui, view: &mut BrowseView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    ui.allocate_ui(egui::vec2(ui.available_width(), 900.0), |ui| {
+                        view.show(ui, &store_ui, TooltipVerbosity::default());
+                    });
+                },
+                view,
+            );
+        h.run();
+        // The listing sorts by name, so the cursor starts on one.mp3: only a
+        // click that really lands moves it to another row.
+        assert_ne!(h.state().sel_rel.as_deref(), Some("two.mp3"));
+        // Taken before the click: once the row is selected the preview dock
+        // names the same file, so the query would match two nodes.
+        let row_y = h.get_by_label_contains("two.mp3").rect().center().y;
+        h.get_by_label_contains("two.mp3").click();
+        h.run();
+        h.run();
+        assert_eq!(
+            h.state().sel_rel.as_deref(),
+            Some("two.mp3"),
+            "clicking the filename cell selects its row"
+        );
+        // Every column, not just the one the text happens to sit in: the whole
+        // row is one click target.
+        for x in [300.0f32, 520.0, 620.0, 760.0, 900.0] {
+            h.state_mut().file_sel = 0;
+            h.run();
+            let at = egui::pos2(x, row_y);
+            h.hover_at(at);
+            for pressed in [true, false] {
+                h.event(egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+            h.run();
+            h.run();
+            assert_eq!(
+                h.state().sel_rel.as_deref(),
+                Some("two.mp3"),
+                "a click at x={x} selects the row it lands on"
+            );
+        }
+    }
+
+    /// An audio selection gets a transport in the preview dock (Browse used to
+    /// show a waveform you could not play), and the whole visual is a way into
+    /// the shared viewer.
+    #[test]
+    fn audio_preview_offers_playback_and_opens_the_viewer() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let repo_dir = tmp.path().join("R");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        store.create_repo("R", &repo_dir.to_string_lossy()).unwrap();
+        std::fs::write(repo_dir.join("song.mp3"), b"not really audio").unwrap();
+        let mut e = entry();
+        e.mime = Some("audio/mpeg".into());
+        store.update_file_entry("R", "song.mp3", &e).unwrap();
+
+        let mut view = BrowseView::new();
+        view.repo = Some("R".into());
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut BrowseView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    ui.allocate_ui(egui::vec2(ui.available_width(), 600.0), |ui| {
+                        view.show(ui, &store_ui, TooltipVerbosity::default());
+                    });
+                },
+                view,
+            );
+        h.run();
+        assert!(
+            h.query_by_label("PLAY").is_some(),
+            "the audio preview carries a PLAY button"
+        );
+        // The visual itself opens the viewer, like an image preview does.
+        assert!(h.state().lightbox.is_none());
+        let sel = h.state().sel_rel.clone().expect("a file is selected");
+        let abs = repo_dir.join(&sel);
+        let row = FileRow {
+            rel: sel,
+            name: "song.mp3".into(),
+            size: 100,
+            mime: "audio/mpeg".into(),
+            info: String::new(),
+            modified_ms: 0,
+            hash: [0u8; 32],
+            missing: false,
+            tags: String::new(),
+            tag_list: Vec::new(),
+        };
+        h.state_mut().open_in_viewer(&store, &row, Some(&abs));
+        assert!(
+            h.state().lightbox.is_some(),
+            "the preview opens the single-file viewer"
         );
     }
 

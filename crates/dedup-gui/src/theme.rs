@@ -292,6 +292,13 @@ fn style_for(palette: Palette) -> Style {
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
 
     style.visuals = v;
+    // Labels never sense clicks for *text* selection. egui's default makes
+    // every label a click-and-drag target, and in a list or table that label
+    // sits on top of its row: the row's own click is swallowed everywhere a
+    // cell has text, so a file could only be picked by hitting a gap (an
+    // empty column). Selecting a row beats selecting a word here; the panes
+    // where reading text is the point opt back in per label.
+    style.interaction.selectable_labels = false;
     style.spacing.button_padding = egui::vec2(12.0, 6.0);
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
     // Solid (non-floating) scrollbars: overflowing lists get a permanent bar

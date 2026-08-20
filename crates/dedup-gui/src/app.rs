@@ -1056,10 +1056,11 @@ impl eframe::App for DedupApp {
         if self.tab != Tab::Duplicates {
             self.dupes.stop_audio();
         }
-        // Folder read-ahead belongs to the Browse tab; elsewhere the disk is
-        // the user's.
+        // Folder read-ahead and the audio preview belong to the Browse tab;
+        // elsewhere the disk (and the speakers) are the user's.
         if self.tab != Tab::Browse {
             self.browse.cancel_prefetch();
+            self.browse.stop_audio();
         }
         // On each tab switch, re-sync the newly-shown view's repo list from the
         // store, so repos added/removed elsewhere appear without a refresh

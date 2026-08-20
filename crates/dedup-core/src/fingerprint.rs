@@ -35,9 +35,29 @@ pub struct Fingerprints {
 /// (`mime_guess`) as a fallback.
 pub fn detect_mime(path: &Path) -> Option<String> {
     if let Ok(Some(kind)) = infer::get_from_path(path) {
-        return Some(kind.mime_type().to_string());
+        let sniffed = kind.mime_type();
+        // The MP4 container carries audio too: an audiobook/.m4a whose major
+        // brand is plain `isom` sniffs as "video/mp4" (so does `file`). When
+        // the container is ambiguous and the *name* says audio, trust the
+        // name — the audio treatment beats a video still that cannot exist.
+        if sniffed == "video/mp4"
+            && let Some(named) = audio_mime_by_name(path)
+        {
+            return Some(named);
+        }
+        return Some(sniffed.to_string());
     }
     mime_guess::from_path(path).first().map(|m| m.to_string())
+}
+
+/// The `audio/*` MIME the file's extension implies (`.m4b` → `audio/m4b`),
+/// `None` for anything not named as audio. The tie-breaker for audio in an
+/// MP4 container, which content-sniffing alone reports as video.
+pub fn audio_mime_by_name(path: &Path) -> Option<String> {
+    mime_guess::from_path(path)
+        .first()
+        .filter(|m| m.type_() == mime_guess::mime::AUDIO)
+        .map(|m| m.to_string())
 }
 
 /// Playlist MIME types that `mime_guess` reports under `audio/` (`.m3u`, `.pls`,
@@ -800,6 +820,34 @@ mod tests {
         jpeg.extend_from_slice(&app1);
         jpeg.extend_from_slice(&[0xFF, 0xD9]); // EOI
         std::fs::write(path, jpeg).unwrap();
+    }
+
+    /// An audiobook (`.m4b`) and a plain `.m4a` live in the same MP4 container
+    /// a video does — the sniffer alone says "video/mp4" for all of them. The
+    /// audio-named ones must detect as audio; a real `.mp4` stays video.
+    #[test]
+    fn mp4_container_audio_detects_as_audio_by_name() {
+        // A minimal `ftyp isom` header — exactly what an audible audiobook
+        // starts with (M4A/M4B only appear among the *compatible* brands).
+        let mut head: Vec<u8> = Vec::new();
+        head.extend_from_slice(&[0x00, 0x00, 0x00, 0x20]);
+        head.extend_from_slice(b"ftypisom");
+        head.extend_from_slice(&[0x00, 0x00, 0x02, 0x00]);
+        head.extend_from_slice(b"iso2mp41M4A M4B ");
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, expect) in [
+            ("book.m4b", "audio/m4b"),
+            ("song.m4a", "audio/m4a"),
+            ("clip.mp4", "video/mp4"),
+        ] {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, &head).unwrap();
+            assert_eq!(
+                detect_mime(&path).as_deref(),
+                Some(expect),
+                "{name} detects as {expect}"
+            );
+        }
     }
 
     /// The Metadata view lists *every* EXIF field, not only the two the index

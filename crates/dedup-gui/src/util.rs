@@ -185,8 +185,20 @@ pub fn pick_folder_remembered() -> Option<std::path::PathBuf> {
 /// this, so grabbing a filename to search elsewhere never needs a shortcut.
 pub fn copy_menu(resp: &egui::Response, text: &str) {
     // Labels don't sense clicks by default; a context menu still works because
-    // egui tracks secondary clicks on the response's rect via interact below.
-    let resp = resp.clone().interact(egui::Sense::click());
+    // egui tracks secondary clicks on the response's rect via `interact`.
+    //
+    // A response that *already* senses clicks must NOT be re-interacted: that
+    // call re-registers the widget under the response's own id with the
+    // response's rect, and a table row's response is the union of its cells
+    // carrying the **first cell's** id. Re-registering bound that id to a rect
+    // with the first column cut out of it, so clicks anywhere in that column
+    // landed on nothing — rows could only be picked by hitting a cell the
+    // union happened to cover (an empty one, usually).
+    let resp = if resp.sense.senses_click() {
+        resp.clone()
+    } else {
+        resp.clone().interact(egui::Sense::click())
+    };
     resp.context_menu(|ui| {
         if ui.button("Copy").clicked() {
             ui.ctx().copy_text(text.to_string());
