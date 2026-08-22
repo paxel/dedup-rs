@@ -71,11 +71,12 @@ the same relative path, and can also delete target files whose content the sourc
 GROUP SYNC replaces the single TARGET with a SINKS picker, and only appears when the SOURCE \
 is a backup group's main (groups are created on the Repositories tab). Each sink pushes in \
 its own stored mode: ADD ONLY copies content it lacks and never deletes, so a sink may keep \
-files the main no longer has; MIRROR also deletes sink content the main does not have, so it \
-ends up holding exactly the main's content — those deletions cannot be undone. REVIEW plans \
-every selected sink and shows what would be copied and deleted, without touching disk; RUN \
-asks for confirmation — naming the sink count and any sink a MIRROR push would empty \
-entirely — then pushes on a background thread. Sinks are handled independently, so one \
+files the main no longer has; APPLY CHANGES also deletes sink content the main itself \
+deleted, so the sink follows the main's edits while keeping what the main never had; MIRROR \
+deletes all sink content the main does not have, so it ends up holding exactly the main's \
+content — deletions cannot be undone. REVIEW plans every selected sink and shows what would \
+be copied and deleted, without touching disk; RUN asks for confirmation — naming the sink \
+count and any sink a push would empty entirely — then pushes on a background thread. Sinks are handled independently, so one \
 unreachable backup drive does not stop the others, and the main is never changed. To bring \
 changes made inside a sink back to the main, use DIFF with the sink as source and the main \
 as target.

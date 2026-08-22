@@ -191,7 +191,10 @@ impl TextDiff {
                                 .max_rect(at)
                                 .layout(egui::Layout::top_down(egui::Align::Min)),
                         );
-                        child.add(egui::Label::new(galley));
+                        // Reading (and copying) the text is the point of this
+                        // pane, so it opts back into egui's text selection,
+                        // which the app-wide style turns off for rows.
+                        child.add(egui::Label::new(galley).selectable(true));
                     };
                     col(rect.min.x, left);
                     col(rect.min.x + col_w + gap, right);

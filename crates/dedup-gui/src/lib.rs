@@ -46,7 +46,16 @@ use std::sync::Arc;
 ///
 /// `ui_scale` (from `--ui-scale`) multiplies the interface size; `None` keeps
 /// the default.
+///
+/// Call this before the process spawns any thread: on Linux it edits the
+/// process environment (see [`prefer_x11_for_drag_and_drop`]), which is only
+/// sound while the process is single-threaded.
 pub fn run(ui_scale: Option<f32>) -> Result<(), String> {
+    // Must be the very first thing: it edits the process environment, which
+    // is only safe while no other thread exists.
+    #[cfg(target_os = "linux")]
+    prefer_x11_for_drag_and_drop();
+
     // Diagnostics only: a log that cannot be opened must not stop the app.
     match dedup_core::logging::init() {
         Ok(path) => log::info!("dedup GUI started; logging to {}", path.display()),
@@ -108,6 +117,33 @@ pub fn run(ui_scale: Option<f32>) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+/// Steer winit onto the X11 backend when a Wayland session also offers an X11
+/// display (XWayland). winit 0.30 implements no drag-and-drop on Wayland at
+/// all — dropped folders never reach the app — while XWayland's XDnD path
+/// works (the compositor bridges native drags). Setting `DEDUP_WAYLAND` to a
+/// non-empty value keeps the native Wayland backend (e.g. for crisper
+/// fractional scaling) at the cost of drag-and-drop. Drop this workaround
+/// once eframe ships a winit with Wayland drag-and-drop
+/// (rust-windowing/winit#4571).
+#[cfg(target_os = "linux")]
+fn prefer_x11_for_drag_and_drop() {
+    let set = |name| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+    if !force_x11(set("WAYLAND_DISPLAY"), set("DISPLAY"), set("DEDUP_WAYLAND")) {
+        return;
+    }
+    // SAFETY: `run` requires (and documents) that it is called before the
+    // process spawns any thread, and calls this first — so no concurrent read
+    // or write of the environment is possible.
+    unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
+}
+
+/// Whether to drop the Wayland display in favour of X11: only when both
+/// displays are available and the user didn't opt back into Wayland.
+#[cfg(target_os = "linux")]
+fn force_x11(wayland: bool, x11: bool, keep_wayland: bool) -> bool {
+    wayland && x11 && !keep_wayland
+}
+
 /// Decode the embedded app icon (two cat heads, one crossed through) into the
 /// RGBA form eframe wants for the window/taskbar icon. Returns `None` if the
 /// bundled PNG ever fails to decode, so a bad asset never blocks startup.
@@ -121,4 +157,22 @@ fn load_icon() -> Option<egui::IconData> {
         width,
         height,
     })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::force_x11;
+
+    /// X11 wins only when a Wayland session also offers an XWayland display
+    /// and the user didn't opt back into Wayland via `DEDUP_WAYLAND`.
+    #[test]
+    fn x11_is_forced_only_with_both_displays_and_no_opt_out() {
+        assert!(
+            force_x11(true, true, false),
+            "Wayland + XWayland: force X11"
+        );
+        assert!(!force_x11(true, false, false), "pure Wayland: keep it");
+        assert!(!force_x11(false, true, false), "plain X11: nothing to do");
+        assert!(!force_x11(true, true, true), "opt-out keeps Wayland");
+    }
 }

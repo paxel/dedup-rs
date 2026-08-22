@@ -103,7 +103,8 @@ impl Command {
             Command::EmptyDirs => (
                 "Remove empty directories",
                 "Remove every empty directory under the repo's root, bottom-up. The repo \
-                 root itself is kept and indexed files are untouched.",
+                 root itself is kept and indexed files are untouched. On a backup group's \
+                 main, its sinks are cleaned in the same run.",
             ),
             Command::Organize => (
                 "Reorganize files by path templates",
@@ -130,6 +131,10 @@ enum OpResult {
     },
     EmptyDirs {
         removed: u64,
+        /// How many repositories were swept (1, or main + sinks for a group).
+        repos: u64,
+        /// Per-repo failures ("repo: error"), merged into the run report.
+        errors: Vec<String>,
     },
     Organized {
         moved: u64,
@@ -265,9 +270,11 @@ pub struct GroomingView {
 }
 
 enum Act {
-    /// Open the shared comparison on a DEDUPE row: the file about to go, beside
-    /// the copy that makes it redundant.
-    Inspect(String, String),
+    /// Open the shared viewer on a review row: the acted-on file, beside its
+    /// counterpart when one exists — a DEDUPE row's redundant copy opens the
+    /// comparison, a one-sided row (PURGE/PRUNE, an ORGANIZE relocation of the
+    /// same file) opens the single-file view.
+    Inspect(String, Option<String>),
     SetCommand(Command),
     PickSource(String),
     TogglePool(String),
@@ -602,7 +609,12 @@ impl GroomingView {
     }
 
     fn empty_dirs_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        self.single_repo_bar(ui, acts, "Remove empty directories under this repo's root.");
+        self.single_repo_bar(
+            ui,
+            acts,
+            "Remove empty directories under this repo's root — a backup group's main is \
+             cleaned together with its sinks.",
+        );
     }
 
     fn prune_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
@@ -934,7 +946,14 @@ impl GroomingView {
     fn preview_panel(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         if self.preview.is_empty() {
             ui.add_space(6.0);
-            ui.colored_label(theme::text(), "Pick a repo and command, then press REVIEW.");
+            // EMPTY DIRS has no review board — its only action is RUN, so the
+            // hint must not send the user hunting for a REVIEW button.
+            let hint = if self.command == Command::EmptyDirs {
+                "Pick a repo, then press RUN."
+            } else {
+                "Pick a repo and command, then press REVIEW."
+            };
+            ui.colored_label(theme::text(), hint);
             return;
         }
         let bodies = std::mem::take(&mut self.preview_bodies);
@@ -990,11 +1009,12 @@ impl GroomingView {
                 }
             }
             Some(a) if a.cmd == board::Cmd::OpenRow => {
-                if let Some(meta) = self.preview.get(a.row) {
-                    let (left, right) = (meta.left_paths.clone(), meta.right_paths.clone());
-                    if let (Some(l), Some(r)) = (left.first(), right.first()) {
-                        acts.push(Act::Inspect(l.clone(), r.clone()));
-                    }
+                // Every row opens: with its counterpart when the row has one
+                // (DEDUPE), as the single file otherwise — never a no-op.
+                if let Some(meta) = self.preview.get(a.row)
+                    && let Some(l) = meta.left_paths.first()
+                {
+                    acts.push(Act::Inspect(l.clone(), meta.right_paths.first().cloned()));
                 }
             }
             _ => {}
@@ -1176,10 +1196,18 @@ impl GroomingView {
     fn apply(&mut self, store: &Arc<Store>, act: Act) {
         match act {
             Act::Inspect(left_rel, right_rel) => {
-                // Left is the file DEDUPE would delete, in the source repo;
-                // right is the copy that makes it redundant, held by one of the
-                // pool repos — whichever actually has that path.
-                let Some(source) = self.source.clone() else {
+                // Left is the file the command acts on, in the repo the
+                // current command works with (DEDUPE's source, everyone
+                // else's single repo); right is the copy that makes a DEDUPE
+                // row redundant, held by one of the pool repos — whichever
+                // actually has that path. With a counterpart the viewer opens
+                // as the comparison; without one (PURGE/PRUNE, an ORGANIZE
+                // move of the same file) the single file opens alone.
+                let left_repo = match self.command {
+                    Command::Dedupe => self.source.clone(),
+                    _ => self.repo.clone(),
+                };
+                let Some(left_repo) = left_repo else {
                     return;
                 };
                 let side = |repo: &str, rel: &str| {
@@ -1193,14 +1221,31 @@ impl GroomingView {
                         read_only: self.locks.read_only(repo),
                     })
                 };
-                let right = self.pool.iter().find_map(|repo| side(repo, &right_rel));
-                match (side(&source, &left_rel), right) {
+                // Only a DEDUPE row's right path names a second file (the pool
+                // copy). An ORGANIZE row's right path is the same file's
+                // future home — there is nothing else to compare against.
+                let counterpart_rel = match self.command {
+                    Command::Dedupe => right_rel,
+                    _ => None,
+                };
+                let has_counterpart = counterpart_rel.is_some();
+                let right = counterpart_rel
+                    .and_then(|rel| self.pool.iter().find_map(|repo| side(repo, &rel)));
+                match (side(&left_repo, &left_rel), right) {
                     (Some(l), Some(r)) => {
                         self.inspect = Some(crate::compare_view::DiffCompare::new(l, r));
                     }
-                    _ => {
+                    // A row that promises a counterpart must not quietly open
+                    // one file — say what went wrong instead.
+                    (Some(_), None) if has_counterpart => {
                         self.error =
                             Some("Could not read both copies to compare them.".to_string());
+                    }
+                    (Some(only), None) => {
+                        self.inspect = Some(crate::compare_view::DiffCompare::inspect(only));
+                    }
+                    (None, _) => {
+                        self.error = Some("Could not read that row's file.".to_string());
                     }
                 }
             }
@@ -1639,9 +1684,29 @@ impl GroomingView {
                 }
                 Command::EmptyDirs => {
                     let Some(repo) = repo else { return };
-                    match delete_empty_dirs(&store, &repo) {
-                        Ok(removed) => OpResult::EmptyDirs { removed },
-                        Err(e) => OpResult::Error(e.to_string()),
+                    // A group main's sinks mirror its tree, so the same stale
+                    // directory skeletons accumulate there — sweep them in the
+                    // same run. Empty directories hold no data, so sink locks
+                    // are not in play; an unreachable sink walks as empty and
+                    // is a harmless no-op.
+                    let mut repos = vec![repo.clone()];
+                    if let Ok(groups) = store.list_sync_groups()
+                        && let Some((_, g)) = groups.into_iter().find(|(_, g)| g.main == repo)
+                    {
+                        repos.extend(g.sinks.into_iter().map(|s| s.repo));
+                    }
+                    let mut removed = 0u64;
+                    let mut errors: Vec<String> = Vec::new();
+                    for r in &repos {
+                        match delete_empty_dirs(&store, r) {
+                            Ok(n) => removed += n,
+                            Err(e) => errors.push(format!("{r}: {e}")),
+                        }
+                    }
+                    OpResult::EmptyDirs {
+                        removed,
+                        repos: repos.len() as u64,
+                        errors,
                     }
                 }
                 Command::Organize => {
@@ -1726,10 +1791,19 @@ impl GroomingView {
                             self.error = None;
                             self.result.open(report);
                         }
-                        OpResult::EmptyDirs { removed } => {
-                            let report = crate::run_result::RunReport::new("Remove empty dirs")
+                        OpResult::EmptyDirs {
+                            removed,
+                            repos,
+                            errors,
+                        } => {
+                            let mut report = crate::run_result::RunReport::new("Remove empty dirs")
                                 .count("removed", removed)
-                                .problems(problems);
+                                .problems(problems.into_iter().chain(errors));
+                            // Only a group sweep names its breadth — a plain
+                            // single-repo run needs no "1 repository" noise.
+                            if repos > 1 {
+                                report = report.count("repositories swept", repos);
+                            }
                             self.status = Some(report.headline());
                             self.error = None;
                             self.result.open(report);
@@ -1886,6 +1960,79 @@ mod ui_tests {
             );
         harness.run();
         harness
+    }
+
+    /// A one-sided review row opens the single-file viewer on click: a PURGE
+    /// row has no counterpart at all, and an ORGANIZE row's right path is the
+    /// same file's future home — neither may be a dead click or an error.
+    #[test]
+    fn one_sided_rows_open_the_single_file_viewer() {
+        let (tmp, store) = sample_store();
+        std::fs::write(tmp.path().join("a").join("junk.txt"), b"junk").unwrap();
+        dedup_core::update::update_repo(
+            &store,
+            "a",
+            1,
+            &dedup_core::update::NoProgress,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let mut h = grooming_harness(Arc::clone(&store), Command::Purge);
+        h.state_mut().repo = Some("a".to_string());
+        h.state_mut()
+            .apply(&store, Act::Inspect("junk.txt".to_string(), None));
+        assert!(
+            h.state().inspect.is_some(),
+            "a PURGE row opens the file alone: {:?}",
+            h.state().error
+        );
+        assert!(h.state().error.is_none());
+
+        h.state_mut().inspect = None;
+        h.state_mut().command = Command::Organize;
+        h.state_mut().apply(
+            &store,
+            Act::Inspect("junk.txt".to_string(), Some("2026/junk.txt".to_string())),
+        );
+        assert!(
+            h.state().inspect.is_some(),
+            "an ORGANIZE row opens the file alone: {:?}",
+            h.state().error
+        );
+        assert!(h.state().error.is_none());
+    }
+
+    /// EMPTY DIRS on a backup group's main sweeps its sinks in the same run —
+    /// sinks are not offered as groomable repos, so this is the only way their
+    /// stale directory skeletons get cleaned.
+    #[test]
+    fn empty_dirs_sweeps_a_group_mains_sinks_too() {
+        let (tmp, store) = sample_store();
+        std::fs::create_dir_all(tmp.path().join("a/old/empty")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("b/stale/nested")).unwrap();
+        store.create_sync_group("a", "a").unwrap();
+        store
+            .add_sync_sink("a", "b", dedup_core::store::SyncMode::AddOnly)
+            .unwrap();
+        let mut h = grooming_harness(Arc::clone(&store), Command::EmptyDirs);
+        h.state_mut().repo = Some("a".to_string());
+        h.state_mut().apply(&store, Act::Confirm);
+        for _ in 0..200 {
+            h.step();
+            if !h.state().running && h.state().status.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            !tmp.path().join("a/old").exists(),
+            "the main's empty tree is gone"
+        );
+        assert!(
+            !tmp.path().join("b/stale").exists(),
+            "the sink's empty tree is gone in the same run: {:?}",
+            h.state().status
+        );
     }
 
     /// The number keys switch commands (mirroring the segmented selector).

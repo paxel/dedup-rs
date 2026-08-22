@@ -274,7 +274,14 @@ impl HexDiff {
                 .layout(egui::Layout::left_to_right(egui::Align::TOP)),
         );
         child.set_clip_rect(rect.intersect(ui.clip_rect()));
-        child.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Extend));
+        // Reading (and copying) the dump is the point of this pane, so it opts
+        // back into egui's text selection, which the app-wide style turns off
+        // for rows.
+        child.add(
+            egui::Label::new(job)
+                .wrap_mode(egui::TextWrapMode::Extend)
+                .selectable(true),
+        );
     }
 }
 

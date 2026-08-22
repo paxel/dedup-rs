@@ -23,8 +23,11 @@ const SYNC_GROUP_VERSION: u8 = 2;
 /// below v5 are flagged stale; v6 added text/CSV hashes, so text files below v6
 /// are flagged stale; v7 added `.eml` email hashes (the v4→v7 layout is
 /// unchanged); v8 grew the video temporal hash from 64 to 512 bits per frame,
-/// so video files below v8 are flagged stale. See [`decode_entry`].
-const ENTRY_VERSION: u8 = 8;
+/// so video files below v8 are flagged stale; v9 reclassified MP4-container
+/// audio (`.m4b`/`.m4a` sniffed as plain "video/mp4") as audio — the layout is
+/// unchanged, and only audio-named "video/mp4" entries below v9 are flagged
+/// stale so they re-fingerprint as audio. See [`decode_entry`].
+const ENTRY_VERSION: u8 = 9;
 
 // Registry table definition
 const REPOS: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("repos");
@@ -210,6 +213,8 @@ fn decode_repo_meta(bytes: &[u8]) -> Result<RepoMeta, StoreError> {
 
 /// How the main is pushed to one sink. Chosen per sink, so a group can mirror
 /// some backups and only-add to others.
+/// Stored via postcard (variant *index*), so new variants are appended at the
+/// end — inserting or reordering would silently re-mode every stored sink.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyncMode {
     /// Copy content the sink lacks; never delete anything in the sink.
@@ -218,6 +223,18 @@ pub enum SyncMode {
     /// Copy what the sink lacks *and* delete what the main no longer has, so
     /// the sink ends up holding exactly the main's content.
     Mirror,
+    /// Copy what the sink lacks *and* delete sink content the main itself
+    /// deleted (its tombstones), so the sink follows the main's edits.
+    /// Content the main never had stays untouched.
+    ApplyChanges,
+}
+
+impl SyncMode {
+    /// Whether a push in this mode can delete the sink's existing files —
+    /// what the session locks and the empty-main guard care about.
+    pub fn deletes_in_sink(self) -> bool {
+        !matches!(self, SyncMode::AddOnly)
+    }
 }
 
 /// One sink of a group: the backup repository and how the main is pushed to it.
@@ -548,6 +565,10 @@ fn deserialize_value<'a, T: Deserialize<'a>>(
 fn decode_entry(bytes: &[u8]) -> Result<(FileEntry, u8), StoreError> {
     match bytes.first() {
         Some(&ENTRY_VERSION) => Ok((deserialize_value(ENTRY_VERSION, bytes)?, ENTRY_VERSION)),
+        // v8 shares the current layout byte-for-byte; only the mime
+        // misclassification of MP4-container audio separates it (the per-mime
+        // stale rules in `read_scan_index` re-scan exactly those files).
+        Some(&8) => Ok((deserialize_value(8, bytes)?, 8)),
         // v4..v7 share one layout with the old 64-bit video hash; decode via
         // FileEntryV7 and drop the incompatible video hash (video → stale).
         Some(&v @ 4..=7) => {
@@ -1879,6 +1900,7 @@ pub fn read_scan_index(
     let mut index = std::collections::HashMap::new();
     for item in files_table.iter()? {
         let (key_guard, val_guard) = item?;
+        let rel = key_guard.value();
         let (entry, version) = decode_entry(val_guard.value())?;
         // Per-mime rescan policy: images below v4 (image-hash + EXIF), and
         // office documents below v5 (their text hash was added at v5). PDFs
@@ -1888,11 +1910,18 @@ pub fn read_scan_index(
             Some(m) if crate::fingerprint::is_office_doc(m) => version < 5,
             Some(m) if m.starts_with("text/") => version < 6,
             Some("message/rfc822") => version < 7,
+            // v9 reclassified MP4-container audio (.m4b/.m4a used to sniff as
+            // plain "video/mp4") — only the audio-named files re-scan, never
+            // the whole video corpus.
+            Some("video/mp4") if version < 9 => {
+                version < 8
+                    || crate::fingerprint::audio_mime_by_name(std::path::Path::new(rel)).is_some()
+            }
             Some(m) if m.starts_with("video/") => version < 8,
             _ => false,
         };
         index.insert(
-            key_guard.value().to_string(),
+            rel.to_string(),
             ScanEntry {
                 size: entry.size,
                 modified_ms: entry.modified_ms,
@@ -2148,6 +2177,54 @@ mod tests {
         let repos = store.list_repos()?;
         assert!(repos.is_empty());
 
+        Ok(())
+    }
+
+    /// Version-8 entries share the current layout and must stay readable
+    /// as-is; only "video/mp4" entries whose *name* says audio (`.m4b`/`.m4a`
+    /// — the mime misclassification v9 fixed) are flagged stale, never the
+    /// whole video corpus.
+    #[test]
+    fn v8_entries_decode_and_only_audio_named_mp4_is_stale()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = Store::open_at(temp_dir.path().to_path_buf())?;
+        let repo_dir = temp_dir.path().join("mock_repo");
+        std::fs::create_dir_all(&repo_dir)?;
+        store.create_repo("legacy", &repo_dir.to_string_lossy())?;
+
+        let mp4 = |hash0: u8| FileEntry {
+            size: 100,
+            hash: [hash0; 32],
+            modified_ms: 123456,
+            missing: false,
+            mime: Some("video/mp4".to_string()),
+            img_fingerprint: None,
+            video_hash: None,
+            pdf_hash: None,
+            audio: None,
+            img_size: None,
+            origin: None,
+            exif: None,
+        };
+        let db = store.open_repo_db("legacy")?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut files = write_txn.open_table(FILES)?;
+            files.insert("book.m4b", serialize_value(8, &mp4(1))?.as_slice())?;
+            files.insert("clip.mp4", serialize_value(8, &mp4(2))?.as_slice())?;
+        }
+        write_txn.commit()?;
+
+        let entry = get_entry(&db, "book.m4b")?.expect("v8 entry decodes");
+        assert_eq!(entry.mime.as_deref(), Some("video/mp4"));
+
+        let index = read_scan_index(&db)?;
+        assert!(
+            index["book.m4b"].stale,
+            "an audio-named v8 mp4 entry re-scans to become audio"
+        );
+        assert!(!index["clip.mp4"].stale, "a real v8 video is left alone");
         Ok(())
     }
 

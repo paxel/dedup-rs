@@ -145,7 +145,7 @@ enum Action {
         group: String,
         repo: String,
     },
-    /// Flip one sink's push mode (ADD ONLY ↔ MIRROR).
+    /// Set one sink's push mode (ADD ONLY / APPLY CHANGES / MIRROR).
     SetSinkMode {
         group: String,
         repo: String,
@@ -1056,10 +1056,11 @@ impl eframe::App for DedupApp {
         if self.tab != Tab::Duplicates {
             self.dupes.stop_audio();
         }
-        // Folder read-ahead belongs to the Browse tab; elsewhere the disk is
-        // the user's.
+        // Folder read-ahead and the audio preview belong to the Browse tab;
+        // elsewhere the disk (and the speakers) are the user's.
         if self.tab != Tab::Browse {
             self.browse.cancel_prefetch();
+            self.browse.stop_audio();
         }
         // On each tab switch, re-sync the newly-shown view's repo list from the
         // store, so repos added/removed elsewhere appear without a refresh
@@ -1075,6 +1076,14 @@ impl eframe::App for DedupApp {
             Tab::Grooming => self.grooming.show(ui, &self.store, self.tooltip_verbosity),
             Tab::Browse => self.browse.show(ui, &self.store, self.tooltip_verbosity),
         });
+        // A file's SHOW IN BROWSE pick on another tab lands here: switch to the
+        // Browse tab with that file selected in its folder. `reveal` has just
+        // re-synced the view, so the tab-switch sync is already done.
+        if let Some((repo, rel)) = self.dupes.take_browse_request() {
+            self.browse.reveal(&self.store, &repo, &rel);
+            self.tab = Tab::Browse;
+            self.synced_tab = Some(Tab::Browse);
+        }
         if self.show_settings {
             self.settings_modal(&ctx);
         }
@@ -2156,33 +2165,49 @@ impl DedupApp {
         if !is_main {
             ui.horizontal(|ui| {
                 if let Some(group) = &sink_group {
-                    // This backup's own push mode — MIRROR deletes what the main
-                    // dropped; ADD ONLY only copies. Click to flip.
-                    let is_mirror = sink_mode == Some(dedup_core::store::SyncMode::Mirror);
-                    let mode_label = if is_mirror {
-                        "MODE: MIRROR"
-                    } else {
-                        "MODE: ADD ONLY"
-                    };
-                    if crate::lcars::toggle_button(ui, mode_label, is_mirror, theme::orange())
-                        .explain(
-                            verbosity,
-                            "How this backup is pushed — click to flip",
-                            "How this backup is pushed. ADD ONLY copies what it lacks; MIRROR \
-                             also deletes from it what the main no longer has. Click to flip.",
-                        )
-                        .clicked()
-                    {
-                        let mode = if is_mirror {
-                            dedup_core::store::SyncMode::AddOnly
-                        } else {
-                            dedup_core::store::SyncMode::Mirror
-                        };
-                        actions.push(Action::SetSinkMode {
-                            group: group.clone(),
-                            repo: row.name.clone(),
-                            mode,
-                        });
+                    // This backup's own push mode, one chip per mode (ordered
+                    // by how much a push may delete): ADD ONLY only copies,
+                    // APPLY CHANGES also carries the main's own deletions
+                    // over, MIRROR deletes everything the main does not have.
+                    use dedup_core::store::SyncMode;
+                    ui.label(RichText::new("MODE:").color(theme::tan()).size(11.0));
+                    for (mode, label, hover, hover_verbose) in [
+                        (
+                            SyncMode::AddOnly,
+                            "ADD ONLY",
+                            "Only copy what this backup lacks",
+                            "Push copies content this backup lacks and never deletes \
+                             anything, so it may keep files the main no longer has.",
+                        ),
+                        (
+                            SyncMode::ApplyChanges,
+                            "APPLY CHANGES",
+                            "Copy what it lacks and carry the main's deletions over",
+                            "Push copies content this backup lacks and also deletes from \
+                             it what the main itself deleted — the backup follows the \
+                             main's edits. Files the main never had stay untouched.",
+                        ),
+                        (
+                            SyncMode::Mirror,
+                            "MIRROR",
+                            "Make this backup hold exactly the main's content",
+                            "Push copies content this backup lacks and deletes everything \
+                             the main does not have, so the backup converges on exactly \
+                             the main's content.",
+                        ),
+                    ] {
+                        let selected = sink_mode == Some(mode);
+                        if crate::lcars::toggle_button(ui, label, selected, theme::orange())
+                            .explain(verbosity, hover, hover_verbose)
+                            .clicked()
+                            && !selected
+                        {
+                            actions.push(Action::SetSinkMode {
+                                group: group.clone(),
+                                repo: row.name.clone(),
+                                mode,
+                            });
+                        }
                     }
                     if ui
                         .button(
@@ -3661,6 +3686,12 @@ mod ui_tests {
                     }
                     let mut actions = Vec::new();
                     app.repositories_view(ui, &mut actions);
+                    // Dispatch like the real update loop, so a test's click
+                    // reaches the store instead of evaporating with the frame.
+                    let ctx = ui.ctx().clone();
+                    for action in actions {
+                        app.apply(&ctx, None, action);
+                    }
                 },
                 app,
             );
@@ -3754,15 +3785,17 @@ mod ui_tests {
             harness.query_by_label_contains("SINK OUT").is_some(),
             "the expanded sink offers SINK OUT"
         );
-        assert!(
-            harness.query_by_label_contains("MODE: ADD ONLY").is_some(),
-            "the sink carries its own mode pill"
-        );
+        for chip in ["ADD ONLY", "APPLY CHANGES", "MIRROR"] {
+            assert!(
+                harness.query_all_by_label_contains(chip).count() >= 1,
+                "the sink offers the {chip} mode chip"
+            );
+        }
     }
 
-    /// A sink's mode pill reflects its own stored mode.
+    /// Clicking a mode chip stores that mode on the sink.
     #[test]
-    fn a_mirror_sink_shows_a_mirror_pill() {
+    fn a_mode_chip_click_sets_the_sink_mode() {
         use egui_kittest::kittest::Queryable;
         let (_tmp, mut app) = sample_app();
         app.store
@@ -3777,9 +3810,21 @@ mod ui_tests {
         harness.get_by_label_contains("Automatic Upload").click();
         harness.run();
         harness.run();
-        assert!(
-            harness.query_by_label_contains("MODE: MIRROR").is_some(),
-            "a MIRROR sink's pill reads MIRROR"
+        harness.get_by_label("APPLY CHANGES").click_accesskit();
+        harness.run();
+        harness.run();
+        let mode = harness
+            .state()
+            .store
+            .list_sync_groups()
+            .expect("groups")
+            .into_iter()
+            .find_map(|(_, g)| g.sinks.into_iter().find(|s| s.repo == "Videos"))
+            .map(|s| s.mode);
+        assert_eq!(
+            mode,
+            Some(SyncMode::ApplyChanges),
+            "the clicked chip's mode is stored on the sink"
         );
     }
 

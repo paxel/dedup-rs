@@ -2,6 +2,60 @@
 
 Historical release notes for `dedup-rs`. The current release lives in [CHANGELOG.md](CHANGELOG.md).
 
+## [0.4.0] - 2026-08-17
+
+### Fixed
+
+- **Dropping folders onto the window now works on Wayland desktops.** The
+  windowing library implements no drag-and-drop on Wayland at all, so dropped
+  folders never reached the app. On a Wayland session that also offers an
+  XWayland display the GUI now uses the X11 backend, where drag-and-drop
+  works; set `DEDUP_WAYLAND=1` to keep the native Wayland backend (crisper
+  fractional scaling) without drag-and-drop.
+- **A review row with a real file on both sides always opens the side-by-side
+  compare.** Clicking a GROUP SYNC BACK path-conflict row used to open only the
+  sink's copy, leaving the main's occupying file unseen — exactly the pair the
+  conflict asks you to judge. Now every review-board click resolves both sides:
+  two existing files open the comparison (path conflicts, unchanged pairs),
+  and only when the other side's file exists solely in the plan does the click
+  fall back to the single-file view.
+- **The menu entry survives a `brew upgrade`.** The self-registered launcher
+  used to pin the versioned Cellar path (`…/Cellar/dedup/0.3.0/bin/dedup`),
+  which the next upgrade deletes — the menu entry then failed until the new
+  binary was started by hand once. A brew-installed binary now registers the
+  stable `<prefix>/bin/dedup` symlink instead, which brew repoints on every
+  upgrade.
+- **One-sided grooming rows open the viewer too.** Clicking a PURGE or PRUNE
+  row did nothing, and an ORGANIZE row could show a spurious "could not read
+  both copies" error; both now open the file in the single-file viewer (an
+  ORGANIZE row's right side is the same file's future home — there is no
+  second file to compare).
+
+## [0.3.0] - 2026-08-14
+
+### Changed
+
+- **REFRESH STATUS only checks reachability now.** It used to also queue a freshness
+  check (a full directory walk) on every reachable repository — pressing it after
+  reconnecting a drive buried you in scans to cancel, exactly the uninvited walking
+  the remote flag exists to prevent. Now it just re-probes every repository's
+  location/reachability and clears stale OFFLINE/MISSING states; staleness checking
+  stays with CHECK and UPDATE.
+
+### Fixed
+
+- **A path collision is shown as a conflict, and gets an explicit OVERWRITE.** When a
+  GROUP SYNC BACK candidate's path in the main is occupied by a *different* file, the
+  row now shows it: the main's cell displays its own occupying file (amber DIFFERS on
+  both sides) and offers **`< OVERWRITE`** — replace the main's file with the sink's,
+  available only while the main is unlocked — instead of a `< COPY` the engine would
+  silently refuse. The status line and RUN confirmation state the conflict count, and
+  if a batch still skips such files, the result dialog now shows the skipped count and
+  explains the collision — a promote that did nothing visible used to look like a bug.
+- **A row's picture is clickable everywhere.** On every review board, clicking a
+  thumbnail now opens the row in the viewer like clicking anywhere else on the row —
+  the picture used to be the one dead spot.
+
 ## [0.2.1] - 2026-08-13
 
 ### Added

@@ -138,6 +138,8 @@ enum Act {
     Relock(FileKey),
     Open(PathBuf),
     Reveal(PathBuf),
+    /// Jump to this file in the Browse tab (handed to `app.rs` to switch tabs).
+    BrowseTo(FileKey),
     /// Open the image lightbox at (group index, member index).
     OpenLightbox(usize, usize),
     /// Play an audio file: (content-hash hex, absolute path, total ms).
@@ -226,6 +228,13 @@ pub struct DupesView {
     /// The app-wide repo lock registry (see [`crate::locks`]): which repos'
     /// existing files may be deleted this session.
     locks: crate::locks::RepoLocks,
+    /// A "SHOW IN BROWSE" pick, for `app.rs` to collect: jump the app to the
+    /// Browse tab with this `(repo, rel_path)` selected in its folder.
+    browse_request: Option<FileKey>,
+    /// A just-finished delete's summary, carried into the follow-up FIND's
+    /// status line — the re-found group count used to overwrite it instantly,
+    /// which read as "nothing was deleted".
+    find_note: Option<String>,
 }
 
 impl DupesView {
@@ -264,7 +273,15 @@ impl DupesView {
             filter: FilterBuilder::new(),
             archive_evidence: HashMap::new(),
             locks: crate::locks::RepoLocks::new(),
+            browse_request: None,
+            find_note: None,
         }
+    }
+
+    /// Take the pending "SHOW IN BROWSE" pick, if any — `app.rs` polls this
+    /// after the tab renders and switches to the Browse tab with it.
+    pub fn take_browse_request(&mut self) -> Option<(String, String)> {
+        self.browse_request.take()
     }
 
     /// Construct wired to the app's shared lock registry, so a repo unlocked
@@ -414,7 +431,12 @@ impl DupesView {
                     match result {
                         Ok(results) => {
                             self.group_heights = vec![0.0; results.len()];
-                            self.status = Some(format!("{} group(s)", results.len()));
+                            let note = self
+                                .find_note
+                                .take()
+                                .map(|n| format!("{n} "))
+                                .unwrap_or_default();
+                            self.status = Some(format!("{note}{} group(s)", results.len()));
                             self.results = Some(results);
                             self.marked.clear();
                             self.unlocked.clear();
@@ -433,7 +455,10 @@ impl DupesView {
                                 dedup_core::archive::members_by_content(store, &refs)
                                     .unwrap_or_default();
                         }
-                        Err(e) => self.error = Some(e),
+                        Err(e) => {
+                            self.find_note = None;
+                            self.error = Some(e);
+                        }
                     }
                 }
                 Msg::AutoProgress { done, total } => {
@@ -458,10 +483,17 @@ impl DupesView {
                     match result {
                         Ok(stats) => match follow {
                             DeleteFollow::Refind => {
-                                self.status = Some(format!(
-                                    "Deleted {} file(s), {} error(s). Re-running search…",
+                                let note = format!(
+                                    "Deleted {} file(s), {} error(s).",
                                     stats.deleted, stats.errors
-                                ));
+                                );
+                                self.status = Some(format!("{note} Re-running search…"));
+                                // Carried into the re-found status line — the
+                                // fresh group count (and the next page's
+                                // default marks) otherwise instantly hid what
+                                // just happened, which read as "only one file
+                                // was deleted".
+                                self.find_note = Some(note);
                                 self.marked.clear();
                                 self.start_find(store, ctx);
                             }
@@ -1256,6 +1288,20 @@ impl DupesView {
                         ui.close();
                     }
                     if ui
+                        .button(format!("{} SHOW IN BROWSE", icon::SEARCH))
+                        .explain(
+                            self.verbosity,
+                            "Jump to this file in the Browse tab",
+                            "Switch to the Browse tab with this file selected in its \
+                             folder, so you can judge it by the company it keeps — \
+                             siblings, naming, and the directory it lives in.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::BrowseTo((file.repo.clone(), file.rel_path.clone())));
+                        ui.close();
+                    }
+                    if ui
                         .button(format!("{} COPY NAME", icon::COPY))
                         .explain(
                             self.verbosity,
@@ -1576,6 +1622,7 @@ impl DupesView {
                     self.error = Some(format!("Show in folder failed: {e}"));
                 }
             }
+            Act::BrowseTo(k) => self.browse_request = Some(k),
             Act::OpenLightbox(gi, fi) => {
                 // The clicked member opens alone (the second side hidden); the
                 // whole group travels as the pool either side steps through.
@@ -1837,9 +1884,17 @@ impl DupesView {
             return;
         }
         let ro = self.read_only_names();
+        // The same protected-first promotion the page view applies before its
+        // default marks: a read-only copy is the kept best, so the writable
+        // duplicate is the one marked. Without it, a group whose ranked best
+        // was the writable copy tried to mark the protected one, marked
+        // nothing, and auto-resolve silently left the group behind — page
+        // after page of survivors that only the per-page default marks caught.
         match &self.results {
             Some(Results::Similar(groups)) => {
-                for group in groups {
+                let mut groups = groups.clone();
+                dedup_core::dupes::promote_protected_first(&mut groups, |f| ro.contains(&f.repo));
+                for group in &groups {
                     for file in group.iter().skip(1) {
                         if !ro.contains(&file.repo) {
                             self.marked.insert(key(file));
@@ -1861,7 +1916,10 @@ impl DupesView {
                     let mut done = 0;
                     for chunk in plan.chunks(AUTO_BATCH) {
                         match load_groups(&store, &names, chunk) {
-                            Ok(groups) => {
+                            Ok(mut groups) => {
+                                dedup_core::dupes::promote_protected_first(&mut groups, |f| {
+                                    ro.contains(&f.repo)
+                                });
                                 for group in &groups {
                                     for file in group.iter().skip(1) {
                                         if !ro.contains(&file.repo) {
@@ -2221,6 +2279,111 @@ mod ui_tests {
         assert!(
             (dup_top - find_top).abs() < 0.75,
             "SIMILAR row misaligned: DUPLICATES top {dup_top} vs FIND top {find_top}"
+        );
+    }
+
+    /// After DELETE MARKED re-runs the search, the status keeps saying what
+    /// was deleted — the fresh group count (and the next page's default marks)
+    /// must not hide the result, which read as "only one file was deleted".
+    #[test]
+    fn delete_summary_survives_the_refind() {
+        let (_tmp, store) = sample_store(&["a"]);
+        let view = DupesView::new();
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default());
+                },
+                view,
+            );
+        h.run();
+        h.state_mut().repos[0].included = true;
+        let tx = h.state().tx.clone();
+        tx.send(Msg::DeleteDone(
+            Ok(DupeDeleteStats {
+                deleted: 45,
+                errors: 0,
+            }),
+            DeleteFollow::Refind,
+        ))
+        .unwrap();
+        for _ in 0..200 {
+            h.step();
+            let settled = h.state().busy.is_none()
+                && h.state()
+                    .status
+                    .as_deref()
+                    .is_some_and(|s| s.contains("group(s)"));
+            if settled {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let status = h.state().status.clone().unwrap_or_default();
+        assert!(
+            status.contains("Deleted 45 file(s), 0 error(s)."),
+            "the re-found status keeps the delete summary: {status}"
+        );
+        assert!(
+            status.contains("group(s)"),
+            "and still reports the fresh group count: {status}"
+        );
+    }
+
+    /// AUTO-RESOLVE applies the same protected-first promotion as the page
+    /// view: when a group's ranked best is the writable copy and the other
+    /// copy is read-only, the writable one is marked (the protected copy is
+    /// the kept best). It used to try the protected copy, mark nothing, and
+    /// leave the whole group behind.
+    #[test]
+    fn auto_resolve_marks_the_writable_copy_when_best_is_writable() {
+        let mut writable = content_file("junk/a.png", 3);
+        writable.repo = "junk".into();
+        let mut protected = content_file("keep/a.png", 3);
+        protected.repo = "keep".into();
+        // Raw ranking puts the writable copy first (best): earlier mtime wins.
+        writable.entry.modified_ms = 1_000;
+        protected.entry.modified_ms = 2_000;
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.repos = vec![
+            RepoSel {
+                included: true,
+                is_main: false,
+                name: "junk".into(),
+            },
+            RepoSel {
+                included: true,
+                is_main: false,
+                name: "keep".into(),
+            },
+        ];
+        view.locks.toggle("junk"); // unlock junk; keep stays read-only
+        view.results = Some(Results::Similar(vec![vec![writable, protected]]));
+
+        let (_tmp, store) = sample_store(&[]);
+        view.start_auto_resolve(&store, &egui::Context::default());
+
+        assert!(
+            view.marked
+                .contains(&("junk".to_string(), "junk/a.png".to_string())),
+            "the writable copy is marked: {:?}",
+            view.marked
+        );
+        assert!(
+            !view
+                .marked
+                .contains(&("keep".to_string(), "keep/a.png".to_string())),
+            "the protected copy is never marked"
         );
     }
 

@@ -8,6 +8,9 @@
 //!
 //! - [`SyncMode::AddOnly`] — copy content the sink lacks and never delete
 //!   anything, so a sink can also hold things the main no longer does.
+//! - [`SyncMode::ApplyChanges`] — additionally delete sink content the main
+//!   itself deleted (its tombstones), so the sink follows the main's edits
+//!   while keeping anything the main never had.
 //! - [`SyncMode::Mirror`] — additionally delete sink content the main does not
 //!   have, so the sink converges on exactly the main's content.
 //!
@@ -79,29 +82,33 @@ pub fn diff_overview(
 pub fn delete_mode(mode: SyncMode) -> SyncDelete {
     match mode {
         SyncMode::AddOnly => SyncDelete::None,
+        // Follow the main's edits: only content the main tombstoned goes.
+        SyncMode::ApplyChanges => SyncDelete::Missing,
         // A content mirror: whatever the main does not have goes.
         SyncMode::Mirror => SyncDelete::Absent,
     }
 }
 
-/// Refuse the whole push when the main holds no indexed files *and any sink
-/// mirrors*.
+/// Refuse the whole push when the main holds no indexed files *and any sink's
+/// mode deletes* (MIRROR or APPLY CHANGES).
 ///
 /// A mirror deletes sink content whose hash the main does not have, so an empty
-/// main means "delete everything". That is almost never what the user wants: it
-/// happens when the main was never scanned, or when its drive failed to mount
-/// and scanned as an empty directory. A group with no mirror sink is exempt.
+/// main means "delete everything"; an APPLY CHANGES push from a main that lost
+/// its files to a failed mount could likewise carry a flood of fresh
+/// tombstones. That is almost never what the user wants: it happens when the
+/// main was never scanned, or when its drive failed to mount and scanned as an
+/// empty directory. A group whose sinks are all ADD ONLY is exempt.
 ///
-/// This fails safe at the group level: a mixed group with even one mirror sink
-/// refuses the *entire* push (including its add-only sinks) rather than push
-/// some sinks from a main that looks broken. An empty main is a strong "stop and
-/// look" signal, so the whole run waits until the main is scanned.
+/// This fails safe at the group level: a mixed group with even one deleting
+/// sink refuses the *entire* push (including its add-only sinks) rather than
+/// push some sinks from a main that looks broken. An empty main is a strong
+/// "stop and look" signal, so the whole run waits until the main is scanned.
 ///
 /// Public so a caller that plans/pushes a *subset* of a group's sinks directly
 /// (bypassing [`plan_group_sync`]/[`run_group_sync`], e.g. to thread through a
 /// filter those two don't accept) can still not lose this refusal.
 pub fn guard_mirror_source(store: &Store, group: &SyncGroup) -> Result<(), DiffError> {
-    if !group.sinks.iter().any(|s| s.mode == SyncMode::Mirror) {
+    if !group.sinks.iter().any(|s| s.mode.deletes_in_sink()) {
         return Ok(());
     }
     // `file_count` is maintained per live entry, so this is a META read rather
@@ -219,6 +226,16 @@ mod tests {
     #[test]
     fn add_only_never_deletes_and_mirror_does() {
         assert_eq!(delete_mode(SyncMode::AddOnly), SyncDelete::None);
+        assert_eq!(delete_mode(SyncMode::ApplyChanges), SyncDelete::Missing);
         assert_eq!(delete_mode(SyncMode::Mirror), SyncDelete::Absent);
+    }
+
+    /// The empty-main guard covers every mode whose push can delete in the
+    /// sink — MIRROR and APPLY CHANGES alike — and exempts pure ADD ONLY.
+    #[test]
+    fn deleting_modes_are_guarded_add_only_is_not() {
+        assert!(!SyncMode::AddOnly.deletes_in_sink());
+        assert!(SyncMode::ApplyChanges.deletes_in_sink());
+        assert!(SyncMode::Mirror.deletes_in_sink());
     }
 }

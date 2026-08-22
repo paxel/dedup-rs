@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/paxel/dedup-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/paxel/dedup-rs/actions/workflows/ci.yml)
 [![Coverage](https://coveralls.io/repos/github/paxel/dedup-rs/badge.svg?branch=main)](https://coveralls.io/github/paxel/dedup-rs?branch=main)
+[![crates.io](https://img.shields.io/crates/v/dedup-rs-cli.svg)](https://crates.io/crates/dedup-rs-cli)
 
 A high-performance, native Rust file-deduplication tool with both a desktop GUI and a
 fast command-line interface, packaged as a single self-contained binary.
@@ -48,11 +49,16 @@ Building the GUI on Linux needs ALSA headers (`libasound2-dev` on Debian/Ubuntu,
 filmstrip, frame scrub, soundtrack extraction and pitch-preserving playback rates — use
 `ffmpeg`/`ffprobe` at runtime and degrade gracefully when they are absent.
 
+On a Wayland desktop the GUI runs on the X11 backend (via XWayland) so that dropping
+folders onto the window works — the windowing library has no Wayland drag-and-drop yet.
+Set `DEDUP_WAYLAND=1` to keep the native Wayland backend (crisper fractional scaling)
+at the cost of drag-and-drop.
+
 ## What it does
 
 - **Repositories** — register directories, scan and hash them on background threads, track per-repo stats. Backup groups are framed together, with the group's **main** badged wherever it is named.
-- **Duplicates** — find exact or perceptually-similar files across repos and delete the worse copies.
-- **Transfer / DIFF** — copy, move, sync or mirror content between repos, reconcile two repos side by side, or push a backup group's main to its sinks (each ADD ONLY or MIRROR).
+- **Duplicates** — find exact or perceptually-similar files across repos and delete the worse copies. A copy's right-click menu can jump straight to it in Browse (**SHOW IN BROWSE**), to judge it by the folder it lives in.
+- **Transfer / DIFF** — copy, move, sync or mirror content between repos, reconcile two repos side by side, or push a backup group's main to its sinks (each ADD ONLY, APPLY CHANGES — which also carries the main's own deletions over — or MIRROR).
 - **Grooming** — dedupe, purge by filter, prune missing records, reorganize by path templates.
 
 Clicking any file anywhere — a duplicate card, a review-board row, a Browse listing, a DIFF
