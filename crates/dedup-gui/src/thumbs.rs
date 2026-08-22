@@ -319,7 +319,9 @@ fn byte_view_image(path: &Path) -> Option<ColorImage> {
         return None;
     }
     let mut rgba = vec![0u8; BYTE_VIEW_W * BYTE_VIEW_H * 4];
-    for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+    // `as_chunks_mut` over `chunks_exact_mut(4)`: the pixel stride is a
+    // constant, and newer clippy rejects the runtime-sized form.
+    for (i, px) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         // Bytes past the end stay near-black, reading as "the file ends here".
         let v = if i < filled { buf[i] } else { 8 };
         // Lift the floor a touch so a zero-heavy header still shows structure
