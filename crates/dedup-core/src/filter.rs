@@ -28,8 +28,10 @@
 //! `name:`, `origin:` and `tag:`); `case:sensitive` states the default
 //! explicitly. Size and date conditions are unaffected either way.
 
-use crate::store::{FileEntry, StoreError, annotations_of_db, for_each_file_entry};
-use std::collections::HashMap;
+use crate::store::{
+    ContentKey, FileEntry, StoreError, accepted_of_db, annotations_of_db, for_each_file_entry,
+};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileFilter {
@@ -49,6 +51,12 @@ pub enum FileFilter {
     /// callers must match through [`AnnotatedFilter`] (or [`FileFilter::matches_tagged`]);
     /// the bare [`FileFilter::matches`] treats every file as untagged.
     Anno(String),
+    /// Matches entries whose content is (`true`) or is not (`false`) accepted
+    /// in their repo (`accepted:yes` / `accepted:no`). Like [`Self::Anno`]
+    /// this reads a separate table, so match through [`AnnotatedFilter`] (or
+    /// [`FileFilter::matches_full`]); the bare [`FileFilter::matches`] treats
+    /// every file as not accepted.
+    Accepted(bool),
     /// Matches entries whose best-known date is >= this epoch-ms.
     TakenAfter(i64),
     /// Matches entries whose best-known date is < this epoch-ms.
@@ -140,9 +148,12 @@ pub enum SizeOp {
 #[derive(thiserror::Error, Debug)]
 pub enum FilterError {
     #[error(
-        "Unknown filter '{0}': expected mime:<substring>, name:<substring>, size:<expr>, origin:<substring>, or tag:<substring>"
+        "Unknown filter '{0}': expected mime:<substring>, name:<substring>, size:<expr>, origin:<substring>, tag:<substring>, or accepted:yes|no"
     )]
     UnknownFilter(String),
+
+    #[error("Invalid accepted filter '{0}': expected accepted:yes or accepted:no")]
+    InvalidAccepted(String),
 
     #[error("Invalid size filter '{0}': expected an integer byte count, e.g. size:>=1000")]
     InvalidSize(String),
@@ -207,8 +218,17 @@ impl FileFilter {
     /// leading text before the first prefix is kept as its own group so
     /// genuinely unknown input is still rejected by `parse_single`.
     fn split_groups(filter: &str) -> Vec<&str> {
-        const PREFIXES: [&str; 9] = [
-            "mime:", "name:", "size:", "origin:", "tag:", "date:", "before:", "after:", "case:",
+        const PREFIXES: [&str; 10] = [
+            "mime:",
+            "name:",
+            "size:",
+            "origin:",
+            "tag:",
+            "accepted:",
+            "date:",
+            "before:",
+            "after:",
+            "case:",
         ];
         let bytes = filter.as_bytes();
         let mut starts: Vec<usize> = Vec::new();
@@ -266,6 +286,13 @@ impl FileFilter {
         if let Some(rest) = filter.strip_prefix("tag:") {
             return Ok(Self::Anno(rest.trim().to_string()));
         }
+        if let Some(rest) = filter.strip_prefix("accepted:") {
+            return match rest.trim().to_ascii_lowercase().as_str() {
+                "yes" | "true" | "1" => Ok(Self::Accepted(true)),
+                "no" | "false" | "0" => Ok(Self::Accepted(false)),
+                _ => Err(FilterError::InvalidAccepted(rest.trim().to_string())),
+            };
+        }
         if let Some(rest) = filter.strip_prefix("date:") {
             let (start, end) = parse_date_span(rest.trim())
                 .ok_or_else(|| FilterError::InvalidDate(rest.trim().to_string()))?;
@@ -308,23 +335,43 @@ impl FileFilter {
         Ok(Self::Size(op, value))
     }
 
-    /// Whether the file matches, treating it as having no annotation tags. Use
-    /// [`Self::matches_tagged`] (or [`AnnotatedFilter`]) when the filter may
-    /// contain a `tag:` condition and the file's tags are available.
+    /// Whether the file matches, treating it as having no annotation tags and
+    /// as not accepted. Use [`Self::matches_full`] (or [`AnnotatedFilter`])
+    /// when the filter may contain a `tag:` or `accepted:` condition.
     pub fn matches(&self, rel_path: &str, entry: &FileEntry) -> bool {
-        self.matches_tagged(rel_path, entry, &[])
+        self.matches_full(rel_path, entry, &[], false)
     }
 
-    /// Whether the file matches, given its annotation `tags`. Identical to
-    /// [`Self::matches`] for filters without a `tag:` condition.
+    /// Whether the file matches, given its annotation `tags` (and treating it
+    /// as not accepted). Identical to [`Self::matches`] for filters without a
+    /// `tag:` condition.
     pub fn matches_tagged(&self, rel_path: &str, entry: &FileEntry, tags: &[String]) -> bool {
-        self.matches_inner(rel_path, entry, tags, false)
+        self.matches_full(rel_path, entry, tags, false)
+    }
+
+    /// Whether the file matches, given its annotation `tags` and whether its
+    /// content is `accepted` in its repo.
+    pub fn matches_full(
+        &self,
+        rel_path: &str,
+        entry: &FileEntry,
+        tags: &[String],
+        accepted: bool,
+    ) -> bool {
+        self.matches_inner(rel_path, entry, tags, accepted, false)
     }
 
     /// The matcher proper. `ci` carries case-insensitivity down from an
     /// enclosing [`Self::NoCase`], so the flag lives in the traversal rather
     /// than in every leaf's data.
-    fn matches_inner(&self, rel_path: &str, entry: &FileEntry, tags: &[String], ci: bool) -> bool {
+    fn matches_inner(
+        &self,
+        rel_path: &str,
+        entry: &FileEntry,
+        tags: &[String],
+        accepted: bool,
+        ci: bool,
+    ) -> bool {
         // Substring test honouring the inherited case mode.
         let has = |haystack: &str, needle: &str| {
             if ci {
@@ -352,6 +399,7 @@ impl FileFilter {
                 .as_ref()
                 .is_some_and(|origin| has(origin, substring)),
             Self::Anno(substring) => tags.iter().any(|t| has(t, substring)),
+            Self::Accepted(want) => accepted == *want,
             Self::TakenAfter(ms) => best_date_ms(entry) >= *ms,
             Self::TakenBefore(ms) => best_date_ms(entry) < *ms,
             Self::Size(op, value) => match op {
@@ -363,9 +411,9 @@ impl FileFilter {
             },
             Self::And(filters) => filters
                 .iter()
-                .all(|f| f.matches_inner(rel_path, entry, tags, ci)),
-            Self::Not(inner) => !inner.matches_inner(rel_path, entry, tags, ci),
-            Self::NoCase(inner) => inner.matches_inner(rel_path, entry, tags, true),
+                .all(|f| f.matches_inner(rel_path, entry, tags, accepted, ci)),
+            Self::Not(inner) => !inner.matches_inner(rel_path, entry, tags, accepted, ci),
+            Self::NoCase(inner) => inner.matches_inner(rel_path, entry, tags, accepted, true),
         }
     }
 
@@ -380,6 +428,17 @@ impl FileFilter {
             _ => false,
         }
     }
+
+    /// Whether this filter (anywhere in its tree) tests the accepted mark, so
+    /// callers know they must load the accepted table to evaluate it.
+    pub fn uses_accepted(&self) -> bool {
+        match self {
+            Self::Accepted(_) => true,
+            Self::And(filters) => filters.iter().any(FileFilter::uses_accepted),
+            Self::Not(inner) | Self::NoCase(inner) => inner.uses_accepted(),
+            _ => false,
+        }
+    }
 }
 
 /// A parsed filter paired with the repo's annotation map, so a streaming caller
@@ -389,30 +448,41 @@ impl FileFilter {
 pub struct AnnotatedFilter<'a> {
     filter: &'a FileFilter,
     annotations: HashMap<String, Vec<String>>,
+    /// The repo's accepted contents, loaded only for an `accepted:` filter.
+    accepted: HashSet<ContentKey>,
 }
 
 impl<'a> AnnotatedFilter<'a> {
-    /// Build the matcher for `filter` against `db`'s annotations table.
+    /// Build the matcher for `filter` against `db`'s annotations (and, when
+    /// the filter asks, accepted) tables.
     pub fn new(db: &redb::Database, filter: &'a FileFilter) -> Result<Self, StoreError> {
         let annotations = if filter.uses_annotations() {
             annotations_of_db(db)?
         } else {
             HashMap::new()
         };
+        let accepted = if filter.uses_accepted() {
+            accepted_of_db(db)?
+        } else {
+            HashSet::new()
+        };
         Ok(Self {
             filter,
             annotations,
+            accepted,
         })
     }
 
-    /// Whether `rel_path`/`entry` matches, resolving its tags from the loaded map.
+    /// Whether `rel_path`/`entry` matches, resolving its tags and accepted
+    /// state from the loaded tables.
     pub fn matches(&self, rel_path: &str, entry: &FileEntry) -> bool {
         let tags = self
             .annotations
             .get(rel_path)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        self.filter.matches_tagged(rel_path, entry, tags)
+        let accepted = self.accepted.contains(&(entry.size, entry.hash));
+        self.filter.matches_full(rel_path, entry, tags, accepted)
     }
 }
 
@@ -731,6 +801,37 @@ mod tests {
         assert!(filter.matches_tagged("a.txt", &e, &["keeper".to_string()]));
         assert!(!filter.matches_tagged("a.txt", &e, &["trash".to_string()]));
         assert!(!filter.matches_tagged("a.txt", &e, &[]));
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_filter_parses_and_matches_the_flag() -> Result<(), FilterError> {
+        let yes = FileFilter::parse(Some("accepted:yes"))?;
+        assert_eq!(yes, FileFilter::Accepted(true));
+        assert!(yes.uses_accepted());
+        assert!(!yes.uses_annotations());
+        let no = FileFilter::parse(Some("accepted:NO"))?;
+        assert_eq!(no, FileFilter::Accepted(false));
+
+        let e = entry(1, None);
+        // The bare `matches` treats every file as not accepted.
+        assert!(!yes.matches("a.txt", &e));
+        assert!(no.matches("a.txt", &e));
+        assert!(yes.matches_full("a.txt", &e, &[], true));
+        assert!(!no.matches_full("a.txt", &e, &[], true));
+        // Negation and combination work like every other facet.
+        let not_yes = FileFilter::parse(Some("!accepted:yes"))?;
+        assert!(not_yes.matches_full("a.txt", &e, &[], false));
+        assert!(!not_yes.matches_full("a.txt", &e, &[], true));
+        let combo = FileFilter::parse(Some("mime:image accepted:yes"))?;
+        assert!(combo.uses_accepted());
+        assert!(combo.matches_full("a.png", &entry(1, Some("image/png")), &[], true));
+        assert!(!combo.matches_full("a.png", &entry(1, Some("image/png")), &[], false));
+
+        assert!(matches!(
+            FileFilter::parse(Some("accepted:maybe")),
+            Err(FilterError::InvalidAccepted(_))
+        ));
         Ok(())
     }
 

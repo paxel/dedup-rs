@@ -3,7 +3,10 @@ use dedup_core::diff::{
     CopyDest, DiffItem, DiffRun, NoDiffProgress, SyncDelete, diff_copy, diff_delete, diff_print,
     diff_sync,
 };
-use dedup_core::dupes::{DupeGroup, delete_duplicates, find_exact_duplicates, wasted_bytes};
+use dedup_core::dupes::{
+    AcceptedIndex, DupeGroup, delete_duplicates, find_exact_duplicates, promote_protected_first,
+    wasted_bytes,
+};
 use dedup_core::similar::find_similar;
 use dedup_core::store::Store;
 use dedup_core::update::{CancellationToken, Progress, ProgressEvent, update_repo_authorized};
@@ -66,6 +69,21 @@ enum Commands {
     Archive {
         #[command(subcommand)]
         command: ArchiveCommands,
+    },
+    /// Accept a content as allowed to repeat inside a repository
+    ///
+    /// Accepted contents (a podcast's per-folder cover.jpg, say) are protected
+    /// from every duplicate deletion in that repo and never auto-marked; with
+    /// no paths, lists the repo's accepted contents. Acceptance is per repo —
+    /// the same content in another repo is still an ordinary duplicate.
+    Accept {
+        /// Repository the files live in
+        repo: String,
+        /// Repo-relative paths whose content to accept (none = list)
+        paths: Vec<String>,
+        /// Withdraw the acceptance instead of granting it
+        #[arg(long)]
+        rm: bool,
     },
 }
 
@@ -368,6 +386,10 @@ fn main() -> anyhow::Result<()> {
             let store = Store::open()?;
             run_archive(&store, command)?;
         }
+        Some(Commands::Accept { repo, paths, rm }) => {
+            let store = Store::open()?;
+            run_accept(&store, &repo, &paths, rm)?;
+        }
         None => {
             println!("Starting GUI...");
             if let Err(e) = dedup_gui::run(cli.ui_scale) {
@@ -519,6 +541,45 @@ fn run_scan(store: &Store, names: Vec<String>, all: bool) -> anyhow::Result<()> 
         "\n{} file(s) flagged (advisory — nothing was modified).",
         flags.len()
     );
+    Ok(())
+}
+
+/// `dedup accept`: grant (or with `rm` withdraw) the accepted mark on the
+/// content of each path, or list the repo's accepted contents when no path
+/// is given. A path must be indexed in the repo — the mark follows content,
+/// so an unindexed file has nothing to accept.
+fn run_accept(store: &Store, repo: &str, paths: &[String], rm: bool) -> anyhow::Result<()> {
+    if paths.is_empty() {
+        let accepted = store.all_accepted(repo)?;
+        let mut keys: Vec<_> = accepted.into_iter().collect();
+        keys.sort();
+        let db = store.open_repo_db(repo)?;
+        for (size, hash) in &keys {
+            let mut holders = dedup_core::store::get_paths_by_size_hash(&db, *size, hash)?;
+            holders.sort();
+            println!("{} ({})", hex(hash), format_size(*size));
+            for rel in holders {
+                println!("  {rel}");
+            }
+        }
+        println!("{} accepted content(s) in '{repo}'.", keys.len());
+        return Ok(());
+    }
+    for rel in paths {
+        let entry = store
+            .get_file_entry(repo, rel)?
+            .ok_or_else(|| anyhow::anyhow!("'{rel}' is not indexed in '{repo}'"))?;
+        if rm {
+            if store.unaccept_content(repo, entry.size, &entry.hash)? {
+                println!("Un-accepted {rel} ({}).", hex(&entry.hash));
+            } else {
+                println!("{rel} was not accepted.");
+            }
+        } else {
+            store.accept_content(repo, entry.size, &entry.hash)?;
+            println!("Accepted {rel} ({}).", hex(&entry.hash));
+        }
+    }
     Ok(())
 }
 
@@ -746,13 +807,16 @@ fn dupes(
         anyhow::bail!("No repositories registered. Use 'dedup repo create <name> <path>' first.");
     }
 
-    let groups: Vec<DupeGroup> = match threshold {
+    let mut groups: Vec<DupeGroup> = match threshold {
         Some(t) if t > 0 => {
             println!("Similarity search (threshold: {}%)", t);
             find_similar(store, &names, f64::from(t), None)?
         }
         _ => find_exact_duplicates(store, &names)?,
     };
+    // An accepted copy is the kept one, exactly as --delete will treat it.
+    let accepted = AcceptedIndex::load(store, &names)?;
+    promote_protected_first(&mut groups, |f| accepted.is_accepted(f));
     let mut total_wasted = 0u64;
     for group in &groups {
         let first = match group.first() {
@@ -767,8 +831,13 @@ fn dupes(
             format_size(wasted_bytes(group))
         );
         for file in group {
+            let mark = if accepted.is_accepted(file) {
+                " [accepted]"
+            } else {
+                ""
+            };
             println!(
-                "  {}: {}/{} (modified: {})",
+                "  {}: {}/{} (modified: {}){mark}",
                 file.repo,
                 file.repo_root,
                 file.rel_path,

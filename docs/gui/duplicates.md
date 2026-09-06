@@ -32,9 +32,33 @@ One chip per registered repository:
 **QUICK DELETE** gives every group its own DELETE NOW button that deletes marked files
 immediately, no confirmation — turn it off to go back to confirming every batch.
 
-Below the results: **AUTO-RESOLVE REST** marks every non-best copy for deletion (skipping
-read-only repos) so you only have to review the marks, and **DELETE MARKED (n)** deletes
+Below the results: **SHOW ACCEPTED** lists the groups whose every copy is
+[accepted](#accepted-content) (hidden by default, with a count of how many are skipped),
+**AUTO-RESOLVE REST** marks every non-best copy for deletion (skipping read-only repos and
+accepted copies) so you only have to review the marks, and **DELETE MARKED (n)** deletes
 everything currently marked, batched per repo in one transaction, behind a confirmation.
+
+## Accepted content
+
+Some duplicates are structure, not clutter: a podcast keeps the same `cover.jpg` in every
+episode folder, a project template ships the same licence file everywhere. **Accepting** a
+content tells the app it may repeat inside that repository:
+
+- Right-click a copy and pick **ACCEPT IN REPO**, or press **ACCEPT GROUP** in the group
+  header to accept the content in every repository the group spans. The mark follows the
+  **content** (size + hash), never the path — the 250 covers of one podcast are settled by one
+  click, and next month's episode folder is accepted already.
+- An accepted copy is protected exactly like one in a read-only repo: never preselected,
+  never marked by AUTO-RESOLVE or MARK ALL, kept by every delete (Grooming DEDUPE and the CLI
+  included), and badged **accepted** on its card. Right-click the badge to **UNLOCK** just
+  that file for deletion (reset on the next FIND) or to **UN-ACCEPT** the content.
+- Acceptance is **per repository**: the same cover in a backup repo is still an ordinary
+  duplicate against the podcast repo's copies.
+- A group whose every copy is accepted has nothing left to decide, so it stays out of the
+  list until **SHOW ACCEPTED** is on — which is also how you find one to **UN-ACCEPT GROUP**.
+  The setting persists across launches.
+- Browse shows the badge in its file panel, and `accepted:yes` / `accepted:no` is a filter
+  condition everywhere; `dedup accept` manages the marks from the CLI.
 
 ## Result groups
 
@@ -59,10 +83,12 @@ size, reclaimable bytes) and one card per file:
   MARKED (or DELETE NOW under Quick Delete).
 - A file in a read-only repo shows a **read-only** badge instead of KEEP/DELETE —
   right-click or long-press it to unlock just that one file (a deliberately inconvenient
-  escape hatch, never bulk-set, reset on the next FIND).
-- Right-click anywhere on a card for **OPEN** (hand the file to the system's default app) and
-  **SHOW IN FOLDER** (reveal it in the file manager) — the full-fidelity escape hatch for
-  any file type, and the designated way to actually play a video full-screen.
+  escape hatch, never bulk-set, reset on the next FIND). An [accepted](#accepted-content)
+  copy shows an **accepted** badge with the same unlock, plus **UN-ACCEPT**.
+- Right-click anywhere on a card for **OPEN** (hand the file to the system's default app),
+  **SHOW IN FOLDER** (reveal it in the file manager), **SHOW IN BROWSE**, and **ACCEPT IN
+  REPO** / **UN-ACCEPT** — the full-fidelity escape hatch for any file type, and the
+  designated way to actually play a video full-screen.
 
 ## The viewer (lightbox)
 

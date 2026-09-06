@@ -1384,6 +1384,12 @@ impl GroomingView {
                 self.preview_source_header = Self::repo_header(store, &source);
                 let pool = self.pool.clone();
                 let ref_slice: Vec<&str> = pool.iter().map(String::as_str).collect();
+                // Contents accepted in the source are allowed to exist there:
+                // the run skips them, so the preview must not promise them.
+                let accepted = crate::util::or_log_default(
+                    store.accepted_paths(&source),
+                    "accepted contents of the source",
+                );
                 dedup_core::diff::diff_print(store, &source, &ref_slice, filter.as_deref())
                     .map(|items| {
                         // Keep the reference path alongside each doomed file: it
@@ -1394,6 +1400,13 @@ impl GroomingView {
                         // longer holds it — so it stays one-sided.
                         let matched: Vec<(String, Option<String>)> = items
                             .into_iter()
+                            .filter(|item| match item {
+                                dedup_core::diff::DiffItem::Equal { rel_path, .. }
+                                | dedup_core::diff::DiffItem::DeletedInReference { rel_path } => {
+                                    !accepted.contains(rel_path)
+                                }
+                                dedup_core::diff::DiffItem::New { .. } => true,
+                            })
                             .filter_map(|item| match item {
                                 dedup_core::diff::DiffItem::Equal {
                                     rel_path,
@@ -2033,6 +2046,47 @@ mod ui_tests {
             "the sink's empty tree is gone in the same run: {:?}",
             h.state().status
         );
+    }
+
+    /// A DEDUPE preview leaves out source files whose content is accepted in
+    /// the source — the run skips them, so the plan must not promise them.
+    #[test]
+    fn dedupe_preview_skips_accepted_source_contents() {
+        let (tmp, store) = sample_store();
+        let entry = |hash: u8| dedup_core::store::FileEntry {
+            size: 10,
+            hash: [hash; 32],
+            modified_ms: 0,
+            missing: false,
+            mime: None,
+            img_fingerprint: None,
+            video_hash: None,
+            pdf_hash: None,
+            audio: None,
+            img_size: None,
+            origin: None,
+            exif: None,
+        };
+        store
+            .update_file_entry("a", "cover.jpg", &entry(1))
+            .unwrap();
+        store.update_file_entry("a", "dupe.txt", &entry(2)).unwrap();
+        store
+            .update_file_entry("b", "cover.jpg", &entry(1))
+            .unwrap();
+        store.update_file_entry("b", "keep.txt", &entry(2)).unwrap();
+        store.accept_content("a", 10, &[1u8; 32]).unwrap();
+
+        let mut h = grooming_harness(Arc::clone(&store), Command::Dedupe);
+        h.state_mut().source = Some("a".to_string());
+        h.state_mut().pool = vec!["b".to_string()];
+        h.state_mut().run_preview(&store);
+        assert_eq!(
+            h.state().preview_total,
+            1,
+            "only the unaccepted duplicate is planned"
+        );
+        let _ = &tmp;
     }
 
     /// The number keys switch commands (mirroring the segmented selector).

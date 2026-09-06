@@ -9,7 +9,7 @@
 //! The first file of each sorted group is the "best" copy — deletion keeps it.
 
 use crate::filter::{AnnotatedFilter, FileFilter};
-use crate::store::{self, FileEntry, Store, StoreError};
+use crate::store::{self, ContentKey, FileEntry, Store, StoreError};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -267,15 +267,121 @@ fn image_area(entry: &FileEntry) -> i64 {
         .unwrap_or(-1)
 }
 
+/// The accepted contents of every searched repo, loaded once so a paged or
+/// streamed caller can ask "is this copy protected?" without touching the
+/// database per file. A member is accepted when its content is accepted in
+/// **its own** repo — acceptance never crosses repos.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AcceptedIndex {
+    by_repo: HashMap<String, HashSet<ContentKey>>,
+}
+
+impl AcceptedIndex {
+    /// Load the accepted sets of `repo_names`.
+    pub fn load(store: &Store, repo_names: &[String]) -> Result<Self, StoreError> {
+        let mut by_repo = HashMap::with_capacity(repo_names.len());
+        for name in repo_names {
+            by_repo.insert(name.clone(), store.all_accepted(name)?);
+        }
+        Ok(Self { by_repo })
+    }
+
+    /// Whether `size`/`hash` is accepted in `repo`.
+    pub fn contains(&self, repo: &str, size: u64, hash: &[u8; 32]) -> bool {
+        self.by_repo
+            .get(repo)
+            .is_some_and(|set| set.contains(&(size, *hash)))
+    }
+
+    /// Whether this copy's content is accepted in its repo.
+    pub fn is_accepted(&self, file: &DupeFile) -> bool {
+        self.contains(&file.repo, file.entry.size, &file.entry.hash)
+    }
+
+    /// Whether every member of the group is accepted (nothing to triage).
+    pub fn all_accepted(&self, group: &DupeGroup) -> bool {
+        !group.is_empty() && group.iter().all(|f| self.is_accepted(f))
+    }
+
+    /// Whether any repo accepts this content (the cheap pre-check before a
+    /// per-repo presence lookup).
+    pub fn any_repo_accepts(&self, size: u64, hash: &[u8; 32]) -> bool {
+        self.by_repo
+            .values()
+            .any(|set| set.contains(&(size, *hash)))
+    }
+
+    /// Record an accept in memory (mirror of [`Store::accept_content`]).
+    pub fn insert(&mut self, repo: &str, size: u64, hash: &[u8; 32]) {
+        self.by_repo
+            .entry(repo.to_string())
+            .or_default()
+            .insert((size, *hash));
+    }
+
+    /// Drop an accept in memory (mirror of [`Store::unaccept_content`]).
+    pub fn remove(&mut self, repo: &str, size: u64, hash: &[u8; 32]) {
+        if let Some(set) = self.by_repo.get_mut(repo) {
+            set.remove(&(size, *hash));
+        }
+    }
+}
+
+/// Whether an exact-duplicate group, known only by its content key, consists
+/// of accepted copies alone: every searched repo that holds the content
+/// accepts it. Cheap when nothing accepts the content; otherwise one index
+/// lookup per repo.
+pub fn key_all_accepted(
+    store: &Store,
+    repo_names: &[String],
+    accepted: &AcceptedIndex,
+    size: u64,
+    hash: &[u8; 32],
+) -> Result<bool, StoreError> {
+    if !accepted.any_repo_accepts(size, hash) {
+        return Ok(false);
+    }
+    for name in repo_names {
+        if accepted.contains(name, size, hash) {
+            continue;
+        }
+        let db = store.open_repo_db(name)?;
+        if !store::get_paths_by_size_hash(&db, size, hash)?.is_empty() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Delete all but the first (best) file of each group from disk and mark the
 /// deleted entries missing — batched into one write transaction per repo.
 /// Files already absent from disk are left untouched, matching the legacy
 /// behavior. Best effort: failures are counted, not fatal.
+///
+/// Accepted copies are never deleted: they are promoted to the kept head of
+/// their group first (see [`promote_protected_first`]), and any further
+/// accepted members are skipped.
 pub fn delete_duplicates(
     store: &Store,
     groups: &[DupeGroup],
 ) -> Result<DupeDeleteStats, StoreError> {
-    let extra: Vec<&DupeFile> = groups.iter().flat_map(|g| g.iter().skip(1)).collect();
+    let names: Vec<String> = {
+        let mut seen: Vec<String> = Vec::new();
+        for f in groups.iter().flatten() {
+            if !seen.contains(&f.repo) {
+                seen.push(f.repo.clone());
+            }
+        }
+        seen
+    };
+    let accepted = AcceptedIndex::load(store, &names)?;
+    let mut groups: Vec<DupeGroup> = groups.to_vec();
+    promote_protected_first(&mut groups, |f| accepted.is_accepted(f));
+    let extra: Vec<&DupeFile> = groups
+        .iter()
+        .flat_map(|g| g.iter().skip(1))
+        .filter(|f| !accepted.is_accepted(f))
+        .collect();
     delete_files(store, &extra)
 }
 

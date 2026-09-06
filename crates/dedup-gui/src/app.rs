@@ -282,6 +282,7 @@ impl DedupApp {
         let settings = crate::settings::Settings::load(app.store.config_dir());
         app.threads = settings.threads;
         app.dupes.set_threshold(settings.similarity_threshold);
+        app.dupes.set_show_accepted(settings.show_accepted);
         app.transfer
             .set_threshold(settings.transfer_similarity_threshold);
         app.tooltip_verbosity = settings.tooltip_verbosity;
@@ -297,6 +298,7 @@ impl DedupApp {
         crate::settings::Settings {
             threads: self.threads,
             similarity_threshold: self.dupes.threshold(),
+            show_accepted: self.dupes.show_accepted(),
             transfer_similarity_threshold: self.transfer.threshold(),
             tooltip_verbosity: self.tooltip_verbosity,
             theme: self.theme,

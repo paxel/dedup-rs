@@ -2,7 +2,7 @@
 
 use redb::{ReadableMultimapTable, ReadableTable};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -58,6 +58,12 @@ const ARCHIVE_PASSWORDS: redb::TableDefinition<&str, &[u8]> =
 /// (Browse tab). Kept out of `FileEntry` since it's mutable user metadata, not
 /// content identity; a file with no tags has no row.
 const ANNOTATIONS: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("annotations");
+/// Content `(size, hash)` → nothing: contents the user *accepted* as allowed
+/// to repeat inside this repo (a podcast's per-folder `cover.jpg`). Keyed like
+/// `BY_SIZE_HASH` so the mark follows the content, never a path; an accepted
+/// content that later disappears keeps its row (a future copy is accepted
+/// again — the whole point). Lazily created; absent → nothing accepted.
+const ACCEPTED: redb::TableDefinition<(u64, &[u8]), ()> = redb::TableDefinition::new("accepted");
 
 #[derive(thiserror::Error, Debug)]
 pub enum StoreError {
@@ -1363,6 +1369,68 @@ impl Store {
         annotations_of_db(&db)
     }
 
+    /// Mark one content as accepted in `repo_name`: it may repeat inside this
+    /// repo, and every copy of it here is protected from duplicate deletion.
+    /// Idempotent.
+    pub fn accept_content(
+        &self,
+        repo_name: &str,
+        size: u64,
+        hash: &[u8; 32],
+    ) -> Result<(), StoreError> {
+        let db = self.open_repo_db(repo_name)?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(ACCEPTED)?;
+            table.insert((size, &hash[..]), ())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Drop the accepted mark on one content in `repo_name`. Returns whether a
+    /// mark existed.
+    pub fn unaccept_content(
+        &self,
+        repo_name: &str,
+        size: u64,
+        hash: &[u8; 32],
+    ) -> Result<bool, StoreError> {
+        let db = self.open_repo_db(repo_name)?;
+        let write_txn = db.begin_write()?;
+        let existed = {
+            let mut table = write_txn.open_table(ACCEPTED)?;
+            table.remove((size, &hash[..]))?.is_some()
+        };
+        write_txn.commit()?;
+        Ok(existed)
+    }
+
+    /// Every accepted content key in `repo_name` (empty if none).
+    pub fn all_accepted(&self, repo_name: &str) -> Result<HashSet<ContentKey>, StoreError> {
+        let db = self.open_repo_db(repo_name)?;
+        accepted_of_db(&db)
+    }
+
+    /// Rel-paths of the non-missing files in `repo_name` whose content is
+    /// accepted there. Empty (without walking the index) when nothing is
+    /// accepted, so callers can filter previews at no cost in the common case.
+    pub fn accepted_paths(&self, repo_name: &str) -> Result<HashSet<String>, StoreError> {
+        let db = self.open_repo_db(repo_name)?;
+        let accepted = accepted_of_db(&db)?;
+        let mut paths = HashSet::new();
+        if accepted.is_empty() {
+            return Ok(paths);
+        }
+        for_each_file_entry(&db, |rel, entry| {
+            if !entry.missing && accepted.contains(&(entry.size, entry.hash)) {
+                paths.insert(rel.to_string());
+            }
+            Ok(())
+        })?;
+        Ok(paths)
+    }
+
     pub fn get_duplicate_groups(&self, repo_name: &str) -> Result<Vec<DuplicateGroup>, StoreError> {
         let db = self.open_repo_db(repo_name)?;
         let read_txn = db.begin_read()?;
@@ -1821,6 +1889,28 @@ pub fn annotations_of_db(
     Ok(out)
 }
 
+/// Every accepted content key in a repo database. Shared by
+/// [`Store::all_accepted`] and by filter matching that resolves `accepted:`.
+pub fn accepted_of_db(db: &redb::Database) -> Result<HashSet<ContentKey>, StoreError> {
+    let read_txn = db.begin_read()?;
+    let mut out = HashSet::new();
+    let table = match read_txn.open_table(ACCEPTED) {
+        Ok(t) => t,
+        // The table is created lazily on first write; absent → nothing accepted.
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(out),
+        Err(e) => return Err(e.into()),
+    };
+    for item in table.iter()? {
+        let (key, _) = item?;
+        let (size, hash) = key.value();
+        let hash: [u8; 32] = hash.try_into().map_err(|_| {
+            StoreError::Deserialization("accepted key with a non-32-byte hash".into())
+        })?;
+        out.insert((size, hash));
+    }
+    Ok(out)
+}
+
 /// Presence state of one content key (size, hash) in a repo.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ContentState {
@@ -2007,6 +2097,54 @@ mod tests {
         assert!(store.get_repo("r")?.remote, "the flag sticks");
         store.set_repo_remote("r", false)?;
         assert!(!store.get_repo("r")?.remote, "and flips back");
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_content_round_trips_and_resolves_paths() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let store = Store::open_at(tmp.path().to_path_buf())?;
+        let repo_dir = tmp.path().join("r");
+        std::fs::create_dir_all(&repo_dir)?;
+        store.create_repo("r", &repo_dir.to_string_lossy())?;
+        let entry = |hash: u8| FileEntry {
+            size: 10,
+            hash: [hash; 32],
+            modified_ms: 0,
+            missing: false,
+            mime: None,
+            img_fingerprint: None,
+            video_hash: None,
+            pdf_hash: None,
+            audio: None,
+            img_size: None,
+            origin: None,
+            exif: None,
+        };
+        store.update_file_entry("r", "a/cover.jpg", &entry(1))?;
+        store.update_file_entry("r", "b/cover.jpg", &entry(1))?;
+        store.update_file_entry("r", "other.jpg", &entry(2))?;
+
+        // Nothing accepted yet (table not even created).
+        assert!(store.all_accepted("r")?.is_empty());
+        assert!(store.accepted_paths("r")?.is_empty());
+
+        store.accept_content("r", 10, &[1; 32])?;
+        store.accept_content("r", 10, &[1; 32])?; // idempotent
+        assert_eq!(store.all_accepted("r")?, HashSet::from([(10, [1u8; 32])]));
+        assert_eq!(
+            store.accepted_paths("r")?,
+            HashSet::from(["a/cover.jpg".to_string(), "b/cover.jpg".to_string()]),
+            "every copy of the accepted content resolves, the other file does not"
+        );
+
+        // An orphan mark (content no longer indexed) is kept, never swept.
+        store.accept_content("r", 99, &[9; 32])?;
+        assert_eq!(store.all_accepted("r")?.len(), 2);
+
+        assert!(store.unaccept_content("r", 10, &[1; 32])?);
+        assert!(!store.unaccept_content("r", 10, &[1; 32])?, "already gone");
+        assert!(store.accepted_paths("r")?.is_empty());
         Ok(())
     }
 

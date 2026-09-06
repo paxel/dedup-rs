@@ -147,6 +147,8 @@ struct FileRow {
     tags: String,
     /// The same tags as a list, for rendering per-tag badges in the cell.
     tag_list: Vec<String>,
+    /// This file's content is accepted as allowed to repeat in the repo.
+    accepted: bool,
 }
 
 pub struct BrowseView {
@@ -220,6 +222,9 @@ pub struct BrowseView {
     /// table can show a tags column and the shared filter's `tag:` condition can
     /// be evaluated. Reloaded alongside `all_tags`.
     annos_map: HashMap<String, Vec<String>>,
+    /// The selected repo's accepted contents (see the Duplicates tab's
+    /// ACCEPT), loaded with the annotations, for the badge and `accepted:`.
+    accepted: std::collections::HashSet<dedup_core::store::ContentKey>,
     verbosity: TooltipVerbosity,
     /// Open full-window viewer for the previewed image/video, if any.
     lightbox: Option<crate::compare_view::DiffCompare>,
@@ -291,6 +296,7 @@ impl BrowseView {
             all_tags: Vec::new(),
             all_tags_repo: None,
             annos_map: HashMap::new(),
+            accepted: std::collections::HashSet::new(),
             verbosity: TooltipVerbosity::default(),
             lightbox: None,
             audio_spec: false,
@@ -339,6 +345,7 @@ impl BrowseView {
     /// it still exists. Called on first show and whenever the tab is re-shown, so
     /// the picker stays fresh without a manual refresh button.
     pub fn sync_repos(&mut self, store: &Store) {
+        self.reload_accepted(store);
         match store.list_repos() {
             Ok(list) => {
                 // Sinks are browsed through their group's main, not directly.
@@ -592,17 +599,24 @@ impl BrowseView {
         }
     }
 
-    /// Whether `rel`/`entry` matches `filter`, resolving any `tag:` condition
-    /// against the repo's in-memory annotation map.
+    /// Whether `rel`/`entry` matches `filter`, resolving any `tag:` or
+    /// `accepted:` condition against the repo's in-memory annotation map and
+    /// accepted set.
     fn matches_filter(&self, filter: &FileFilter, rel: &str, entry: &FileEntry) -> bool {
         let tags = self.annos_map.get(rel).map(Vec::as_slice).unwrap_or(&[]);
-        filter.matches_tagged(rel, entry, tags)
+        filter.matches_full(rel, entry, tags, self.is_accepted(entry))
+    }
+
+    /// Whether this entry's content is accepted in the selected repo.
+    fn is_accepted(&self, entry: &FileEntry) -> bool {
+        self.accepted.contains(&(entry.size, entry.hash))
     }
 
     /// Build one file row from an entry, denormalizing its size/mime/info/tags.
     fn file_row(&self, rel: &str, name: &str, entry: &FileEntry) -> FileRow {
         let tag_list = self.annos_map.get(rel).cloned().unwrap_or_default();
         FileRow {
+            accepted: self.is_accepted(entry),
             rel: rel.to_string(),
             name: name.to_string(),
             missing: entry.missing,
@@ -1825,6 +1839,17 @@ impl BrowseView {
                 .color(theme::hairline())
                 .size(11.0),
         );
+        if sel.accepted {
+            ui.label(
+                RichText::new(format!("{} accepted", crate::icon::CHECK))
+                    .color(theme::lilac())
+                    .size(11.0),
+            )
+            .on_hover_text(
+                "This content is accepted as allowed to repeat in this repository: the \
+                 Duplicates tab never marks its copies, and no duplicate delete removes them.",
+            );
+        }
         ui.add_space(8.0);
 
         // Annotations first — the primary reason to inspect a file here, so the
@@ -2006,6 +2031,20 @@ impl BrowseView {
         }
         self.all_tags = set.into_iter().collect();
         self.annos_map = map;
+        self.reload_accepted(store);
+    }
+
+    /// Load the selected repo's accepted contents. Unlike tags, which are only
+    /// edited here, acceptance changes in the Duplicates tab — so this is
+    /// refreshed on every tab show, not just when the repo changes.
+    fn reload_accepted(&mut self, store: &Store) {
+        self.accepted = match &self.repo {
+            Some(repo) => crate::util::or_log_default(
+                store.all_accepted(repo),
+                "accepted contents for the repo",
+            ),
+            None => std::collections::HashSet::new(),
+        };
     }
 
     /// Add `tag` to the selected file (no-op if blank or already present), then
@@ -2396,6 +2435,7 @@ mod tests {
                 info: String::new(),
                 tags: String::new(),
                 tag_list: Vec::new(),
+                accepted: false,
             });
         }
         let mut v = BrowseView::new();
@@ -2497,6 +2537,7 @@ mod tests {
             info: String::new(),
             tags: String::new(),
             tag_list: Vec::new(),
+            accepted: false,
         }
     }
 
@@ -2638,6 +2679,67 @@ mod tests {
         // A tag with no match prunes everything.
         let none = FileFilter::parse(Some("tag:missing")).unwrap();
         assert!(v.listing(&none).1.is_empty());
+    }
+
+    /// An `accepted:` condition resolves against the repo's accepted set
+    /// (content-keyed, so both copies of an accepted content match), and the
+    /// row carries the flag the detail panel badges.
+    #[test]
+    fn accepted_filter_and_row_flag_follow_content() {
+        let mut v = BrowseView::new();
+        let mut cover = entry();
+        cover.hash = [7u8; 32];
+        v.entries = vec![
+            ("ep1/cover.jpg".into(), cover.clone()),
+            ("ep2/cover.jpg".into(), cover),
+            ("other.png".into(), entry()),
+        ];
+        v.accepted = std::collections::HashSet::from([(100u64, [7u8; 32])]);
+        let names = |files: &[FileRow]| {
+            let mut n: Vec<_> = files.iter().map(|f| f.rel.clone()).collect();
+            n.sort();
+            n
+        };
+
+        v.flatten = true;
+        let (_d, all) = v.flat_listing(&FileFilter::All);
+        assert_eq!(all.len(), 3);
+        let flags: Vec<(String, bool)> = all.iter().map(|f| (f.rel.clone(), f.accepted)).collect();
+        assert!(flags.contains(&("ep1/cover.jpg".to_string(), true)));
+        assert!(flags.contains(&("ep2/cover.jpg".to_string(), true)));
+        assert!(flags.contains(&("other.png".to_string(), false)));
+
+        let yes = FileFilter::parse(Some("accepted:yes")).unwrap();
+        assert_eq!(
+            names(&v.flat_listing(&yes).1),
+            ["ep1/cover.jpg", "ep2/cover.jpg"]
+        );
+        let no = FileFilter::parse(Some("accepted:no")).unwrap();
+        assert_eq!(names(&v.flat_listing(&no).1), ["other.png"]);
+    }
+
+    /// A content accepted in the Duplicates tab shows up here on the next tab
+    /// show (`sync_repos`), without the repo having changed.
+    #[test]
+    fn accepted_set_refreshes_on_tab_show() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_at(tmp.path().join("cfg")).unwrap();
+        let repo_dir = tmp.path().join("R");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        store.create_repo("R", &repo_dir.to_string_lossy()).unwrap();
+
+        let mut v = BrowseView::new();
+        v.repo = Some("R".into());
+        v.entries = vec![("cover.jpg".into(), entry())];
+        v.sync_repos(&store);
+        assert!(!v.listing(&FileFilter::All).1[0].accepted);
+
+        store.accept_content("R", 100, &[0u8; 32]).unwrap();
+        v.sync_repos(&store);
+        assert!(
+            v.listing(&FileFilter::All).1[0].accepted,
+            "the badge follows an acceptance made elsewhere"
+        );
     }
 
     /// Flatten mode lists every file under the current dir recursively, naming
@@ -2856,6 +2958,7 @@ mod tests {
             missing: false,
             tags: String::new(),
             tag_list: Vec::new(),
+            accepted: false,
         };
         h.state_mut().open_in_viewer(&store, &row, Some(&abs));
         assert!(

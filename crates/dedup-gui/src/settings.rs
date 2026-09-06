@@ -50,6 +50,9 @@ pub struct Settings {
     pub threads: usize,
     /// Duplicates-tab similarity slider position (percent).
     pub similarity_threshold: f64,
+    /// Duplicates-tab SHOW ACCEPTED toggle: list groups whose every copy is
+    /// accepted content.
+    pub show_accepted: bool,
     /// Transfer-tab SIMILAR folder-export similarity slider position (percent).
     pub transfer_similarity_threshold: f64,
     /// Hover-tooltip wording: short one-liners or verbose explanations.
@@ -72,6 +75,7 @@ impl Default for Settings {
         Self {
             threads: 0,
             similarity_threshold: 99.0,
+            show_accepted: false,
             transfer_similarity_threshold: 90.0,
             tooltip_verbosity: TooltipVerbosity::default(),
             theme: ThemeChoice::default(),
@@ -116,6 +120,7 @@ mod tests {
         let s = Settings {
             threads: 4,
             similarity_threshold: 97.5,
+            show_accepted: true,
             transfer_similarity_threshold: 88.0,
             tooltip_verbosity: TooltipVerbosity::Verbose,
             theme: ThemeChoice::Light,

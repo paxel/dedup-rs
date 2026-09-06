@@ -16,7 +16,8 @@ Pick a grooming tool with the segmented selector (or the number keys `1`–`5`):
   the surviving copy that makes the local one redundant, so the list reads "this goes, because
   that stays" — and a **COMPARE** button opens the pair in the shared viewer so you can look
   before you delete. Your repo is only ever trimmed of content that is safely held somewhere
-  else.
+  else — and never of content you [accepted](duplicates.md#accepted-content) in it: accepted
+  files are left out of the REVIEW preview and of the run.
 - **PURGE** — delete files in this repo matching a [filter](transfer.md#filter-builder).
   Purge needs at least one condition: with no filter nothing matches and nothing is deleted,
   so you can never empty a repo by leaving the filter blank. Useful for sweeping out a class of

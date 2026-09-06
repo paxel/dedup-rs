@@ -969,6 +969,39 @@ fn delete_reports_progress_counts_matching_stats() -> TestResult {
     Ok(())
 }
 
+/// A content accepted in the source is allowed to exist there: the delete
+/// skips it even though the reference holds the same content.
+#[test]
+fn delete_skips_contents_accepted_in_source() -> TestResult {
+    let sb = Sandbox::new()?;
+    Sandbox::write(&sb.a_root, "cover.jpg", b"cover")?;
+    Sandbox::write(&sb.a_root, "dupe.txt", b"shared")?;
+    Sandbox::write(&sb.b_root, "cover.jpg", b"cover")?;
+    Sandbox::write(&sb.b_root, "keep.txt", b"shared")?;
+    sb.update("A")?;
+    sb.update("B")?;
+    let cover = sb
+        .store
+        .get_file_entry("A", "cover.jpg")?
+        .ok_or("cover.jpg not indexed in A")?;
+    sb.store.accept_content("A", cover.size, &cover.hash)?;
+
+    let stats = diff_delete(
+        &sb.store,
+        "A",
+        &["B"],
+        None,
+        &DiffRun::new(&NoDiffProgress, &CancellationToken::new()),
+    )?;
+    assert_eq!(stats.deleted, 1, "only the unaccepted duplicate goes");
+    assert!(
+        sb.a_root.join("cover.jpg").exists(),
+        "accepted content survives"
+    );
+    assert!(!sb.a_root.join("dupe.txt").exists());
+    Ok(())
+}
+
 #[test]
 fn cancelled_delete_leaves_indexes_consistent_with_disk() -> TestResult {
     let sb = Sandbox::new()?;

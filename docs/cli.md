@@ -39,7 +39,7 @@ Repository lifecycle management.
 | `dedup repo rel <name> <new_path>`                                  | Point a repository at a different folder while keeping its existing index — use after moving the data.                                                                                                                                                                                                                          |
 | `dedup repo cp <source> <dest> <path>`                              | Clone `source`'s entire index into a new repository `dest` at `path`. `source` is left completely unchanged; this is for branching off a snapshot, not moving anything.                                                                                                                                                         |
 | `dedup repo update <name>... \| -a/--all [-t/--threads N] [--force]` | Walk the repository's folder, hash new/changed files (in parallel across `--threads` threads; `0` = one thread per CPU core), and mark vanished files missing. Already-hashed unchanged files are skipped, so a repeat run is fast. Shows live progress and can be cancelled with Ctrl-C — already-hashed files stay committed. A scan that finds **no files at all** over a non-empty index is refused (an unmounted drive looks exactly like this, and an emptied sync-group main would make the next MIRROR push a wipe); pass `--force` to allow it. |
-| `dedup repo dupes <name>... \| -a/--all [--threshold N] [--delete]` | Find exact duplicates, or with `--threshold <1-100>` perceptually similar files (`similarity % = (1 − hamming_distance / bits) × 100`). `--delete` removes every copy except the best one per group.                                                                                                                            |
+| `dedup repo dupes <name>... \| -a/--all [--threshold N] [--delete]` | Find exact duplicates, or with `--threshold <1-100>` perceptually similar files (`similarity % = (1 − hamming_distance / bits) × 100`). `--delete` removes every copy except the best one per group; [accepted](#accept) copies are labelled `[accepted]` and never deleted.                                                    |
 
 Alongside the content hash, `update` computes a perceptual fingerprint by MIME kind: a
 512-bit image hash (rotation/mirror invariant), a 512-bit-per-frame video temporal hash
@@ -143,6 +143,23 @@ Nothing is ever touched, moved, or deleted by this command.
 
 ---
 
+## `accept`
+
+```
+dedup accept <repo> [<path>...] [--rm]
+```
+
+Accept a content as allowed to repeat inside `repo` — a podcast's per-folder `cover.jpg`,
+a licence file every project template ships. Each `<path>` names an indexed file whose
+**content** (size + BLAKE3) is marked; the mark follows the content, so every copy of it in
+the repo, present or future, is covered. Accepted copies are labelled by `repo dupes`, never
+removed by `repo dupes --delete` or `diff rm`, and skipped by the GUI's duplicate triage.
+Acceptance is per repository: the same content in another repo is still an ordinary
+duplicate. `--rm` withdraws the mark; with no paths the command lists the repo's accepted
+contents and the files currently holding them.
+
+---
+
 ## `archive`
 
 ```
@@ -171,6 +188,8 @@ are treated as opaque members (one level deep); encrypted or unreadable archives
 | `name:<substring>`                               | The file's relative path contains this substring (verbatim — internal spaces are preserved, so keep other prefixes out of the value). |
 | `size:<op><bytes>`                               | Size comparison, e.g. `size:>=1000`, `size:<500000`.                                                                                  |
 | `origin:<substring>`                             | The repo the file was copied/synced from (provenance) contains this substring.                                                        |
+| `tag:<substring>`                                | The file carries an annotation tag (Browse tab) containing this substring.                                                            |
+| `accepted:yes` / `accepted:no`                   | The file's content is / is not [accepted](#accept) as allowed to repeat in its repo.                                                  |
 | `date:YYYY[-MM[-DD]]`                            | The file's best-known date (EXIF capture time, else mtime) falls in that year/month/day.                                              |
 | `before:YYYY[-MM[-DD]]` / `after:YYYY[-MM[-DD]]` | Best-known date is strictly before / on-or-after the given point.                                                                     |
 | `case:sensitive` / `case:insensitive`            | Whether text fields match regardless of capitalisation. Sensitive is the default; size and date fields are unaffected.                |

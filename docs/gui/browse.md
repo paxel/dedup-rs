@@ -52,6 +52,9 @@ From here you can:
 
 - **add a tag** — type a label and **Add**; tags are free-form and stored in the index, so
   they survive rescans and drive the filter and the Duplicates/Grooming triage.
+- An **accepted** badge above the tags means this content was accepted in the Duplicates tab
+  as allowed to repeat in this repository (see [Accepted content](duplicates.md#accepted-content));
+  `accepted:yes` / `accepted:no` in the filter lists such files.
 - **Open with default app** — hand the file to the system's default application (the
   full-fidelity escape hatch, and the way to actually watch a video full-speed).
 - **Reveal in file manager** — show the file in its folder on disk.

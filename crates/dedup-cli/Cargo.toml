@@ -2,7 +2,7 @@
 # Published as `dedup-rs-cli` (`dedup-cli` is taken on crates.io); the
 # installed binary is still `dedup`.
 name = "dedup-rs-cli"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "dedup-rs, a forensic data-inheritance triage tool: CLI and desktop app (binary name: dedup)"
 license = "MIT"
@@ -13,8 +13,8 @@ name = "dedup"
 path = "src/main.rs"
 
 [dependencies]
-dedup-rs-core = { path = "../dedup-core", version = "0.5.0" }
-dedup-rs-gui = { path = "../dedup-gui", version = "0.5.0" }
+dedup-rs-core = { path = "../dedup-core", version = "0.6.0" }
+dedup-rs-gui = { path = "../dedup-gui", version = "0.6.0" }
 clap = { version = "4.5", features = ["derive"] }
 chrono = "0.4"
 anyhow = "1.0"

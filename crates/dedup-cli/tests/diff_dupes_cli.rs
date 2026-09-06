@@ -216,6 +216,69 @@ fn dupes_delete_keeps_one_copy() -> TestResult {
     Ok(())
 }
 
+/// `dedup accept` marks a content per repo; `repo dupes` then labels its
+/// copies and `--delete` leaves every one of them alone.
+#[test]
+fn accept_protects_content_from_dupes_delete() -> TestResult {
+    let sb = Sandbox::new()?;
+    sb.write("pod/ep1/cover.jpg", b"cover")?;
+    sb.write("pod/ep2/cover.jpg", b"cover")?;
+    sb.write("pod/a.txt", b"other")?;
+    sb.write("pod/b.txt", b"other")?;
+    sb.repo("pod")?;
+
+    // Nothing accepted yet.
+    sb.dedup()?
+        .args(["accept", "pod"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("0 accepted content(s)"));
+
+    sb.dedup()?
+        .args(["accept", "pod", "ep1/cover.jpg"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Accepted ep1/cover.jpg"));
+    sb.dedup()?
+        .args(["accept", "pod"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ep2/cover.jpg"))
+        .stdout(predicate::str::contains("1 accepted content(s)"));
+
+    // Both covers carry the label (the mark follows content, not the path).
+    sb.dedup()?
+        .args(["repo", "dupes", "pod", "--delete"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("ep1/cover.jpg (modified:")
+                .and(predicate::str::contains("ep2/cover.jpg (modified:")),
+        )
+        .stdout(predicate::str::contains("[accepted]").count(2))
+        .stdout(predicate::str::contains("Deleted 1 duplicate files"));
+    assert!(sb.home.path().join("pod/ep1/cover.jpg").exists());
+    assert!(sb.home.path().join("pod/ep2/cover.jpg").exists());
+
+    // An unindexed path is an error; --rm withdraws the mark.
+    sb.dedup()?
+        .args(["accept", "pod", "nope.jpg"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not indexed"));
+    sb.dedup()?
+        .args(["accept", "pod", "ep2/cover.jpg", "--rm"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Un-accepted ep2/cover.jpg"));
+    sb.dedup()?
+        .args(["accept", "pod"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("0 accepted content(s)"));
+    Ok(())
+}
+
 #[test]
 fn dupes_finds_cross_repo_groups() -> TestResult {
     let sb = Sandbox::new()?;

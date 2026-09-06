@@ -34,14 +34,16 @@ enum FilterKind {
     Name,
     Size,
     Tag,
+    Accepted,
 }
 
 /// Every condition kind, in the order they appear in the type picker.
-const FILTER_KINDS: [FilterKind; 4] = [
+const FILTER_KINDS: [FilterKind; 5] = [
     FilterKind::Mime,
     FilterKind::Name,
     FilterKind::Size,
     FilterKind::Tag,
+    FilterKind::Accepted,
 ];
 
 impl FilterKind {
@@ -51,6 +53,7 @@ impl FilterKind {
             FilterKind::Name => "NAME",
             FilterKind::Size => "SIZE",
             FilterKind::Tag => "TAG",
+            FilterKind::Accepted => "ACCEPTED",
         }
     }
 
@@ -62,6 +65,7 @@ impl FilterKind {
             FilterKind::Name => "name",
             FilterKind::Size => "size",
             FilterKind::Tag => "tag",
+            FilterKind::Accepted => "accepted",
         }
     }
 
@@ -72,6 +76,7 @@ impl FilterKind {
             "name" => Some(FilterKind::Name),
             "size" => Some(FilterKind::Size),
             "tag" => Some(FilterKind::Tag),
+            "accepted" => Some(FilterKind::Accepted),
             _ => None,
         }
     }
@@ -82,6 +87,7 @@ impl FilterKind {
             FilterKind::Name => "*.db or copy_of*",
             FilterKind::Size => ">=1000",
             FilterKind::Tag => "keeper",
+            FilterKind::Accepted => "yes or no",
         }
     }
 }
@@ -124,6 +130,7 @@ struct FilterHistory {
     name: Vec<String>,
     size: Vec<String>,
     tag: Vec<String>,
+    accepted: Vec<String>,
     presets: Vec<FilterPreset>,
 }
 
@@ -134,6 +141,7 @@ impl FilterHistory {
             FilterKind::Name => &self.name,
             FilterKind::Size => &self.size,
             FilterKind::Tag => &self.tag,
+            FilterKind::Accepted => &self.accepted,
         }
     }
 
@@ -143,6 +151,7 @@ impl FilterHistory {
             FilterKind::Name => &mut self.name,
             FilterKind::Size => &mut self.size,
             FilterKind::Tag => &mut self.tag,
+            FilterKind::Accepted => &mut self.accepted,
         }
     }
 
@@ -558,6 +567,12 @@ impl FilterBuilder {
                                     "Filter by tag",
                                     "Match files carrying a tag that contains this text. Add \
                                  tags to files in the Browse tab.",
+                                ),
+                                FilterKind::Accepted => (
+                                    "Filter by accepted content",
+                                    "Match files whose content is accepted as allowed to \
+                                 repeat in the repository (\"yes\") or is not (\"no\"). \
+                                 Accept contents in the Duplicates tab.",
                                 ),
                             };
                             if ui

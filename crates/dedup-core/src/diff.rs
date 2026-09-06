@@ -570,6 +570,8 @@ fn flush_copy(
 
 /// Delete every source file whose content the reference knows about (present
 /// or missing) and mark the deleted entries missing in the source index.
+/// Contents *accepted* in the source (see [`Store::accept_content`]) are
+/// never candidates — they are allowed to exist there.
 ///
 /// The source index is kept in sync as the run proceeds: deleted paths are
 /// marked missing in periodic batches (plus a final flush, applied even on
@@ -585,10 +587,13 @@ pub fn diff_delete(
     let source = open_repo(store, source)?;
     let (_refs, ref_index) = open_references(store, references)?;
 
+    let accepted = store::accepted_of_db(&source.db)?;
     let candidates: Vec<(String, FileEntry)> = collect_source_entries(&source.db, &filter, false)?
         .into_iter()
         .filter(|(rel, entry)| {
-            ref_index.contains_key(&(entry.size, entry.hash)) && run.selected_source(rel)
+            ref_index.contains_key(&(entry.size, entry.hash))
+                && !accepted.contains(&(entry.size, entry.hash))
+                && run.selected_source(rel)
         })
         .collect();
 

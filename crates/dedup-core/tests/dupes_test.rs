@@ -3,8 +3,8 @@
 //! cross-repo grouping). Similarity search is Phase 4 and not covered here.
 
 use dedup_core::dupes::{
-    delete_duplicates, find_exact_duplicates, load_groups, plan_exact_duplicates,
-    retain_matching_keys, wasted_bytes,
+    AcceptedIndex, delete_duplicates, find_exact_duplicates, key_all_accepted, load_groups,
+    plan_exact_duplicates, retain_matching_keys, wasted_bytes,
 };
 use dedup_core::filter::FileFilter;
 use dedup_core::store::{FileEntry, Store};
@@ -158,6 +158,77 @@ fn deletes_duplicates_keeping_the_best_copy() -> TestResult {
         .get_file_entry("repo", "keep.jpg")?
         .ok_or("keep.jpg not indexed")?;
     assert!(!kept.missing);
+    Ok(())
+}
+
+/// Accepted copies are protected: the group keeps every accepted copy (one is
+/// promoted to the kept head), only unaccepted extras go — and a group of
+/// accepted copies alone deletes nothing. Acceptance is per repo: the same
+/// content in another repo is still a deletable duplicate.
+#[test]
+fn delete_duplicates_never_touches_accepted_copies() -> TestResult {
+    let tempdir = tempfile::tempdir()?;
+    let store = Store::open_at(tempdir.path().join("config"))?;
+    for name in ["pod", "bak"] {
+        let root = tempdir.path().join(name);
+        std::fs::create_dir_all(&root)?;
+        store.create_repo(name, &root.to_string_lossy())?;
+    }
+    let pod = tempdir.path().join("pod");
+    let bak = tempdir.path().join("bak");
+    for dir in ["ep1", "ep2", "ep3"] {
+        std::fs::create_dir_all(pod.join(dir))?;
+        std::fs::write(pod.join(dir).join("cover.jpg"), b"cover bytes")?;
+    }
+    std::fs::write(pod.join("stray.jpg"), b"cover bytes")?;
+    std::fs::write(bak.join("cover.jpg"), b"cover bytes")?;
+    update_repo(&store, "pod", 1, &NoProgress, &CancellationToken::new())?;
+    update_repo(&store, "bak", 1, &NoProgress, &CancellationToken::new())?;
+
+    let names = ["pod".to_string(), "bak".to_string()];
+    let groups = find_exact_duplicates(&store, &names)?;
+    assert_eq!(groups.len(), 1);
+    let cover = &groups[0][0].entry;
+    store.accept_content("pod", cover.size, &cover.hash)?;
+
+    // Accept everything in pod: the index answers per repo.
+    let idx = AcceptedIndex::load(&store, &names)?;
+    assert!(idx.contains("pod", cover.size, &cover.hash));
+    assert!(!idx.contains("bak", cover.size, &cover.hash));
+    assert!(!idx.all_accepted(&groups[0]), "bak's copy is not accepted");
+    assert!(!key_all_accepted(
+        &store,
+        &names,
+        &idx,
+        cover.size,
+        &cover.hash
+    )?);
+
+    // Every pod copy — the per-folder covers *and* the stray — is protected;
+    // only bak's copy is deleted.
+    let stats = delete_duplicates(&store, &groups)?;
+    assert_eq!(stats.deleted, 1);
+    assert!(!bak.join("cover.jpg").exists());
+    for dir in ["ep1", "ep2", "ep3"] {
+        assert!(pod.join(dir).join("cover.jpg").exists());
+    }
+    assert!(pod.join("stray.jpg").exists());
+
+    // Now bak accepts it too: the group is entirely accepted, by both the
+    // in-memory group check and the key-only check the paged plan uses.
+    store.accept_content("bak", cover.size, &cover.hash)?;
+    let idx = AcceptedIndex::load(&store, &names)?;
+    let groups = find_exact_duplicates(&store, &names)?;
+    assert!(idx.all_accepted(&groups[0]));
+    assert!(key_all_accepted(
+        &store,
+        &names,
+        &idx,
+        cover.size,
+        &cover.hash
+    )?);
+    let stats = delete_duplicates(&store, &groups)?;
+    assert_eq!(stats.deleted, 0, "a fully accepted group deletes nothing");
     Ok(())
 }
 

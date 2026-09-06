@@ -13,8 +13,8 @@ use crate::thumbs::ThumbCache;
 use crate::util::{ExplainExt, format_mtime, format_size};
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::dupes::{
-    DupeDeleteStats, DupeFile, DupeGroup, DupeGroupKey, delete_paths, load_groups,
-    plan_exact_duplicates, retain_matching_keys, wasted_bytes,
+    AcceptedIndex, DupeDeleteStats, DupeFile, DupeGroup, DupeGroupKey, delete_paths,
+    key_all_accepted, load_groups, plan_exact_duplicates, retain_matching_keys, wasted_bytes,
 };
 use dedup_core::filter::FileFilter;
 use dedup_core::similar::find_similar;
@@ -46,6 +46,15 @@ impl Results {
     }
 }
 
+/// What a FIND hands back: the result set plus the accepted-content index of
+/// the searched repos and which groups consist of accepted copies alone —
+/// both computed on the worker, since the exact plan carries no members.
+struct Found {
+    results: Results,
+    accepted: AcceptedIndex,
+    accepted_groups: HashSet<usize>,
+}
+
 /// A background operation in flight (drives the spinner and disables actions).
 enum Op {
     Find(usize),
@@ -56,7 +65,7 @@ enum Op {
 /// Messages from background operation threads back to the UI.
 enum Msg {
     FindProgress(usize),
-    FindDone(Result<Results, String>),
+    FindDone(Result<Found, String>),
     AutoProgress { done: usize, total: usize },
     AutoDone(Result<Vec<FileKey>, String>),
     DeleteDone(Result<DupeDeleteStats, String>, DeleteFollow),
@@ -155,6 +164,16 @@ enum Act {
     UnmarkGroup(usize),
     /// Dismiss group `gi` from the list until the next FIND.
     HideGroup(usize),
+    /// Accept this copy's content in its repo (every same-repo copy of it
+    /// becomes protected): `(repo, size, hash)`.
+    Accept(String, u64, [u8; 32]),
+    /// Withdraw the acceptance of this content in its repo.
+    Unaccept(String, u64, [u8; 32]),
+    /// Accept group `gi`'s contents in every repo present in it.
+    AcceptGroup(usize),
+    /// Withdraw every acceptance in group `gi`.
+    UnacceptGroup(usize),
+    ToggleShowAccepted,
     AskDelete,
     ConfirmDelete,
     CancelDelete,
@@ -190,6 +209,16 @@ pub struct DupesView {
     /// Group indices the user dismissed with HIDE GROUP; skipped from the list
     /// until the next FIND (a triage aid, not a delete). Reset on FIND.
     hidden: HashSet<usize>,
+    /// The searched repos' accepted contents (see [`AcceptedIndex`]): a copy
+    /// whose content is accepted in its repo is protected like a read-only
+    /// one — never auto-marked, unlockable per file. Loaded on FIND, kept in
+    /// step with ACCEPT / UN-ACCEPT here.
+    accepted: AcceptedIndex,
+    /// Group indices whose every copy is accepted — nothing to triage, so they
+    /// are skipped from the list unless `show_accepted`.
+    accepted_groups: HashSet<usize>,
+    /// Whether fully accepted groups are listed (persisted setting).
+    show_accepted: bool,
     /// When on, per-group DELETE NOW buttons appear and delete immediately.
     quick_delete: bool,
     /// Keys handed to the in-flight delete, applied to `marked` on completion.
@@ -255,6 +284,9 @@ impl DupesView {
             preselected_pages: HashSet::new(),
             resolved: HashSet::new(),
             hidden: HashSet::new(),
+            accepted: AcceptedIndex::default(),
+            accepted_groups: HashSet::new(),
+            show_accepted: false,
             quick_delete: false,
             delete_batch: Vec::new(),
             page: 0,
@@ -300,6 +332,56 @@ impl DupesView {
     /// Restore the similarity slider position from persisted settings.
     pub fn set_threshold(&mut self, threshold: f64) {
         self.threshold = threshold.clamp(50.0, 100.0);
+    }
+
+    /// Whether fully accepted groups are listed (persisted across launches).
+    pub fn show_accepted(&self) -> bool {
+        self.show_accepted
+    }
+
+    /// Restore the SHOW ACCEPTED toggle from persisted settings.
+    pub fn set_show_accepted(&mut self, show: bool) {
+        self.show_accepted = show;
+    }
+
+    /// Whether this copy may be marked for deletion: neither protected by its
+    /// repo's read-only lock nor by an accepted mark on its content — unless
+    /// the user unlocked exactly this file.
+    fn markable(&self, file: &DupeFile) -> bool {
+        (!self.repo_is_ro(&file.repo) && !self.accepted.is_accepted(file))
+            || self.unlocked.contains(&key(file))
+    }
+
+    /// Whether this copy is protected by an accepted mark (its own repo's).
+    fn is_accepted(&self, file: &DupeFile) -> bool {
+        self.accepted.is_accepted(file)
+    }
+
+    /// Re-derive which of the current page's groups are entirely accepted,
+    /// after an ACCEPT / UN-ACCEPT changed the index. A content lives in one
+    /// group per search, so only loaded groups can have changed.
+    fn refresh_accepted_groups_on_page(&mut self) {
+        let Some(page) = self.cached_page else { return };
+        let start = page * PAGE_SIZE;
+        for (i, group) in self.page_groups.iter().enumerate() {
+            if self.accepted.all_accepted(group) {
+                self.accepted_groups.insert(start + i);
+            } else {
+                self.accepted_groups.remove(&(start + i));
+            }
+        }
+    }
+
+    /// The number of fully accepted groups the list is currently skipping.
+    fn accepted_hidden_count(&self) -> usize {
+        if self.show_accepted {
+            0
+        } else {
+            self.accepted_groups
+                .iter()
+                .filter(|gi| !self.resolved.contains(gi) && !self.hidden.contains(gi))
+                .count()
+        }
     }
 
     /// Stop any audio preview (called when leaving the tab).
@@ -429,7 +511,13 @@ impl DupesView {
                 Msg::FindDone(result) => {
                     self.busy = None;
                     match result {
-                        Ok(results) => {
+                        Ok(Found {
+                            results,
+                            accepted,
+                            accepted_groups,
+                        }) => {
+                            self.accepted = accepted;
+                            self.accepted_groups = accepted_groups;
                             self.group_heights = vec![0.0; results.len()];
                             let note = self
                                 .find_note
@@ -728,6 +816,33 @@ impl DupesView {
             ui.horizontal(|ui| {
                 let n = self.marked.len();
                 let idle = self.busy.is_none();
+                // Fully accepted groups hold nothing to triage, so they are
+                // skipped unless asked for — this is also the way back to a
+                // group you want to un-accept.
+                let label = format!("{} SHOW ACCEPTED", icon::CHECK);
+                if crate::lcars::toggle_button(ui, &label, self.show_accepted, theme::lilac())
+                    .explain(
+                        self.verbosity,
+                        "List groups whose every copy is accepted",
+                        "Show groups in which every copy is accepted content. They are \
+                         hidden by default because there is nothing left to decide in \
+                         them; turn this on to find one you want to un-accept.",
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::ToggleShowAccepted);
+                }
+                let hidden_accepted = self.accepted_hidden_count();
+                if hidden_accepted > 0 {
+                    ui.label(
+                        RichText::new(format!(
+                            "{hidden_accepted} accepted group{} hidden",
+                            if hidden_accepted == 1 { "" } else { "s" }
+                        ))
+                        .color(theme::lilac())
+                        .size(12.0),
+                    );
+                }
                 if crate::lcars::action_button(ui, "AUTO-RESOLVE REST", idle, theme::orange())
                     .explain(
                         self.verbosity,
@@ -819,8 +934,12 @@ impl DupesView {
                 let spacing = ui.spacing().item_spacing.y;
                 for gi in start..end {
                     // HIDE GROUP dismisses a group from the list until the next
-                    // FIND — skip it entirely (no card, no reserved space).
-                    if self.hidden.contains(&gi) {
+                    // FIND — skip it entirely (no card, no reserved space). A
+                    // fully accepted group is skipped the same way unless SHOW
+                    // ACCEPTED is on.
+                    if self.hidden.contains(&gi)
+                        || (!self.show_accepted && self.accepted_groups.contains(&gi))
+                    {
                         continue;
                     }
                     // Virtualize: a group we've measured before and that lies
@@ -876,17 +995,23 @@ impl DupesView {
         // falls to the deletable tail (the default mark below then targets the
         // writable copy, not the protected one).
         let ro = self.read_only_names();
-        dedup_core::dupes::promote_protected_first(&mut self.page_groups, |f| ro.contains(&f.repo));
+        let accepted = self.accepted.clone();
+        dedup_core::dupes::promote_protected_first(&mut self.page_groups, |f| {
+            ro.contains(&f.repo) || accepted.is_accepted(f)
+        });
 
         // Default-mark this page's worse (non-best) copies once, so the extras
-        // show DELETE by default. Read-only repos are never marked, and a page
-        // is only preselected once so manual KEEP choices survive a revisit.
+        // show DELETE by default. Protected copies (read-only repo, accepted
+        // content) are never marked — not even when individually unlocked,
+        // since an unlock is a deliberate per-file choice, never a bulk one —
+        // and a page is only preselected once so manual KEEP choices survive
+        // a revisit.
         if self.preselected_pages.insert(page) {
             let keys: Vec<FileKey> = self
                 .page_groups
                 .iter()
                 .flat_map(|g| g.iter().skip(1))
-                .filter(|f| !ro.contains(&f.repo))
+                .filter(|f| !ro.contains(&f.repo) && !accepted.is_accepted(f))
                 .map(key)
                 .collect();
             self.marked.extend(keys);
@@ -947,6 +1072,7 @@ impl DupesView {
         let quick = self.quick_delete;
         let idle = self.busy.is_none();
         let has_marked = group.iter().any(|f| self.marked.contains(&key(f)));
+        let all_accepted = self.accepted.all_accepted(&group);
         egui::Frame::new()
             .fill(theme::panel())
             .corner_radius(theme::PILL)
@@ -995,6 +1121,36 @@ impl DupesView {
                         .clicked()
                     {
                         acts.push(Act::HideGroup(gi));
+                    }
+                    // ACCEPT GROUP marks the content in every repo present, so a
+                    // 250-cover podcast is settled in one click; once every copy
+                    // is accepted the same slot withdraws it.
+                    if all_accepted {
+                        if idle
+                            && crate::repo_chip::small_button(ui, "UN-ACCEPT GROUP", theme::lilac())
+                                .explain(
+                                    self.verbosity,
+                                    "Withdraw the acceptance of this content in every repo here",
+                                    "Un-accept this group's content in every repository it \
+                                 appears in, so its copies count as ordinary duplicates \
+                                 again.",
+                                )
+                                .clicked()
+                        {
+                            acts.push(Act::UnacceptGroup(gi));
+                        }
+                    } else if idle
+                        && crate::repo_chip::small_button(ui, "ACCEPT GROUP", theme::lilac())
+                            .explain(
+                                self.verbosity,
+                                "Accept this content as allowed to repeat in every repo here",
+                                "Accept this group's content in every repository it appears \
+                                 in: every copy becomes protected — never auto-marked, kept \
+                                 by every duplicate delete — until you un-accept it.",
+                            )
+                            .clicked()
+                    {
+                        acts.push(Act::AcceptGroup(gi));
                     }
                     // Quick Delete: one-click removal of this group's marked files.
                     if quick && has_marked {
@@ -1085,8 +1241,13 @@ impl DupesView {
         let k = key(file);
         let marked = self.marked.contains(&k);
         let repo_ro = self.repo_is_ro(&file.repo);
-        let unlocked = repo_ro && self.unlocked.contains(&k);
-        let ro = repo_ro && !unlocked;
+        let accepted = self.is_accepted(file);
+        let unlocked = (repo_ro || accepted) && self.unlocked.contains(&k);
+        // Protected: by the repo's read-only lock, by an accepted mark on the
+        // content, or both — one per-file unlock lifts whichever applies.
+        let ro = (repo_ro || accepted) && !unlocked;
+        let idle = self.busy.is_none();
+        let content = (file.repo.clone(), file.entry.size, file.entry.hash);
         egui::Frame::new()
             .fill(theme::bg())
             .corner_radius(theme::PILL)
@@ -1155,26 +1316,44 @@ impl DupesView {
                                 );
                             }
                             if ro {
-                                // A worse copy inside a protected repo can still be
-                                // unlocked one file at a time, via its context menu
-                                // or a long press (never a plain click).
-                                let resp = ui
-                                    .add(
-                                        egui::Label::new(
-                                            RichText::new("read-only")
-                                                .color(theme::blue())
-                                                .size(11.0),
-                                        )
-                                        .sense(egui::Sense::click()),
+                                // A worse copy inside a protected repo (or an
+                                // accepted content) can still be unlocked one file
+                                // at a time, via its badge's context menu or a
+                                // long press (never a plain click).
+                                let (badge, short, verbose) = if accepted {
+                                    (
+                                        format!("{} accepted", icon::CHECK),
+                                        "Accepted content — right-click or long-press to unlock \
+                                         this file",
+                                        "This content is accepted as allowed to repeat in this \
+                                         repository, so its copies can't be marked for deletion. \
+                                         Right-click to un-accept it, or to unlock just this one \
+                                         file (long-press does the same); running FIND again \
+                                         re-locks it.",
                                     )
-                                    .explain(
-                                        self.verbosity,
+                                } else {
+                                    (
+                                        "read-only".to_string(),
                                         "Right-click or long-press to unlock this file",
                                         "This file is protected by its repo's read-only lock, \
                                          so it can't be marked for deletion. Right-click or \
                                          long-press to unlock just this one file. Running FIND \
                                          again re-locks it.",
-                                    );
+                                    )
+                                };
+                                let color = if accepted {
+                                    theme::lilac()
+                                } else {
+                                    theme::blue()
+                                };
+                                let resp = ui
+                                    .add(
+                                        egui::Label::new(
+                                            RichText::new(badge).color(color).size(11.0),
+                                        )
+                                        .sense(egui::Sense::click()),
+                                    )
+                                    .explain(self.verbosity, short, verbose);
                                 if long_pressed(ui, &resp) {
                                     acts.push(Act::Unlock(k.clone()));
                                 }
@@ -1185,12 +1364,31 @@ impl DupesView {
                                             self.verbosity,
                                             "Unlock this file only",
                                             "Unlock just this file for deletion, without \
-                                             unlocking the whole repo. Reset the next time \
-                                             you run FIND.",
+                                             unlocking the whole repo or un-accepting the \
+                                             content. Reset the next time you run FIND.",
                                         )
                                         .clicked()
                                     {
                                         acts.push(Act::Unlock(k.clone()));
+                                        ui.close();
+                                    }
+                                    if accepted
+                                        && ui
+                                            .add_enabled(
+                                                idle,
+                                                egui::Button::new(format!("{} UN-ACCEPT", icon::X)),
+                                            )
+                                            .explain(
+                                                self.verbosity,
+                                                "Withdraw the acceptance of this content in this repo",
+                                                "Un-accept this content in this repository: \
+                                                 every copy of it here counts as an ordinary \
+                                                 duplicate again.",
+                                            )
+                                            .clicked()
+                                    {
+                                        let (r, sz, h) = content.clone();
+                                        acts.push(Act::Unaccept(r, sz, h));
                                         ui.close();
                                     }
                                 });
@@ -1299,6 +1497,40 @@ impl DupesView {
                         .clicked()
                     {
                         acts.push(Act::BrowseTo((file.repo.clone(), file.rel_path.clone())));
+                        ui.close();
+                    }
+                    let accept_label = if accepted {
+                        format!("{} UN-ACCEPT", icon::X)
+                    } else {
+                        format!("{} ACCEPT IN REPO", icon::CHECK)
+                    };
+                    if ui
+                        .add_enabled(idle, egui::Button::new(accept_label))
+                        .explain(
+                            self.verbosity,
+                            if accepted {
+                                "Withdraw the acceptance of this content in this repo"
+                            } else {
+                                "Accept this content as allowed to repeat in this repo"
+                            },
+                            if accepted {
+                                "Un-accept this content in this repository: every copy of it \
+                                 here counts as an ordinary duplicate again."
+                            } else {
+                                "Accept this content in this repository (a podcast's per-folder \
+                                 cover, say): every copy of it here becomes protected — never \
+                                 auto-marked, kept by every duplicate delete — until you \
+                                 un-accept it. Copies in other repositories are unaffected."
+                            },
+                        )
+                        .clicked()
+                    {
+                        let (r, sz, h) = content.clone();
+                        acts.push(if accepted {
+                            Act::Unaccept(r, sz, h)
+                        } else {
+                            Act::Accept(r, sz, h)
+                        });
                         ui.close();
                     }
                     if ui
@@ -1464,7 +1696,12 @@ impl DupesView {
         let marks = self.lightbox.as_ref().map(|lb| {
             let mark = |side: &crate::compare_view::DiffSide| {
                 let k = (side.repo.clone(), side.rel_path.clone());
-                let markable = !self.repo_is_ro(&side.repo) || self.unlocked.contains(&k);
+                let markable = self
+                    .lightbox_group
+                    .iter()
+                    .find(|f| key(f) == k)
+                    .map(|f| self.markable(f))
+                    .unwrap_or_else(|| !self.repo_is_ro(&side.repo) || self.unlocked.contains(&k));
                 crate::compare_view::MarkPill {
                     marked: self.marked.contains(&k),
                     markable,
@@ -1707,6 +1944,19 @@ impl DupesView {
             Act::HideGroup(gi) => {
                 self.hidden.insert(gi);
             }
+            Act::Accept(repo, size, hash) => self.set_accepted(store, &[(repo, size, hash)], true),
+            Act::Unaccept(repo, size, hash) => {
+                self.set_accepted(store, &[(repo, size, hash)], false)
+            }
+            Act::AcceptGroup(gi) => {
+                let contents = self.group_contents(gi, false);
+                self.set_accepted(store, &contents, true);
+            }
+            Act::UnacceptGroup(gi) => {
+                let contents = self.group_contents(gi, true);
+                self.set_accepted(store, &contents, false);
+            }
+            Act::ToggleShowAccepted => self.show_accepted = !self.show_accepted,
             Act::SetPage(p) => self.page = p,
             Act::AskDelete => {
                 let n = self.marked.len();
@@ -1763,6 +2013,95 @@ impl DupesView {
         self.start_delete(store, ctx, keys, DeleteFollow::Resolve(gi));
     }
 
+    /// The distinct `(repo, size, hash)` contents of group `gi` that are
+    /// (`accepted`) or are not yet accepted in their repo — what ACCEPT GROUP
+    /// / UN-ACCEPT GROUP act on.
+    fn group_contents(&self, gi: usize, accepted: bool) -> Vec<(String, u64, [u8; 32])> {
+        let Some(page) = self.cached_page else {
+            return Vec::new();
+        };
+        let Some(group) = self.page_groups.get(gi.wrapping_sub(page * PAGE_SIZE)) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, u64, [u8; 32])> = Vec::new();
+        for f in group {
+            if self.is_accepted(f) == accepted {
+                let c = (f.repo.clone(), f.entry.size, f.entry.hash);
+                if !out.contains(&c) {
+                    out.push(c);
+                }
+            }
+        }
+        out
+    }
+
+    /// ACCEPT (`accept`) or UN-ACCEPT each content in its repo: persist the
+    /// mark, mirror it in the index, and drop any pending deletion mark and
+    /// per-file unlock on the copies it now protects. Refused while a
+    /// background operation runs, so a running auto-resolve can't mark a copy
+    /// accepted under its feet.
+    fn set_accepted(
+        &mut self,
+        store: &Arc<Store>,
+        contents: &[(String, u64, [u8; 32])],
+        accept: bool,
+    ) {
+        if self.busy.is_some() {
+            return;
+        }
+        let mut changed = 0usize;
+        for (repo, size, hash) in contents {
+            let written = if accept {
+                store.accept_content(repo, *size, hash).map(|()| true)
+            } else {
+                store.unaccept_content(repo, *size, hash)
+            };
+            match written {
+                Ok(_) => {
+                    changed += 1;
+                    if accept {
+                        self.accepted.insert(repo, *size, hash);
+                    } else {
+                        self.accepted.remove(repo, *size, hash);
+                    }
+                }
+                Err(e) => {
+                    self.error = Some(format!("Could not update the accepted mark: {e}"));
+                    break;
+                }
+            }
+        }
+        if changed == 0 {
+            return;
+        }
+        // Protection takes effect immediately: a just-accepted copy sheds its
+        // mark and any per-file unlock (like a repo being re-locked). Only the
+        // contents just accepted — an unlock the user made elsewhere on the
+        // page is theirs to keep.
+        if accept {
+            let protected: Vec<FileKey> = self
+                .page_groups
+                .iter()
+                .flatten()
+                .filter(|f| {
+                    contents
+                        .iter()
+                        .any(|(r, sz, h)| *r == f.repo && *sz == f.entry.size && *h == f.entry.hash)
+                })
+                .map(key)
+                .collect();
+            for k in &protected {
+                self.marked.remove(k);
+                self.unlocked.remove(k);
+            }
+        }
+        self.refresh_accepted_groups_on_page();
+        self.status = Some(format!(
+            "{changed} content(s) {}",
+            if accept { "accepted" } else { "un-accepted" }
+        ));
+    }
+
     /// MARK ALL / MARK NONE for a group: set (`mark`) or clear the deletion mark
     /// on its files. MARK ALL only touches *markable* copies — protected
     /// (read-only, not individually unlocked) copies are never marked.
@@ -1774,11 +2113,7 @@ impl DupesView {
                 return;
             };
             if mark {
-                group
-                    .iter()
-                    .filter(|f| !self.repo_is_ro(&f.repo) || self.unlocked.contains(&key(f)))
-                    .map(key)
-                    .collect()
+                group.iter().filter(|f| self.markable(f)).map(key).collect()
             } else {
                 group.iter().map(key).collect()
             }
@@ -1847,7 +2182,7 @@ impl DupesView {
         let repaint = ctx.clone();
         std::thread::spawn(move || {
             let fref = has_filter.then_some(&filter);
-            let result = match mode {
+            let results = match mode {
                 Mode::Exact => {
                     let tx2 = tx.clone();
                     let r = repaint.clone();
@@ -1872,6 +2207,33 @@ impl DupesView {
                     .map(Results::Similar)
                     .map_err(|e| e.to_string()),
             };
+            let result = results.and_then(|results| {
+                let accepted = AcceptedIndex::load(&store, &names).map_err(|e| e.to_string())?;
+                let mut accepted_groups = HashSet::new();
+                match &results {
+                    Results::Exact(plan) => {
+                        for (i, k) in plan.iter().enumerate() {
+                            if key_all_accepted(&store, &names, &accepted, k.size, &k.hash)
+                                .map_err(|e| e.to_string())?
+                            {
+                                accepted_groups.insert(i);
+                            }
+                        }
+                    }
+                    Results::Similar(groups) => {
+                        for (i, g) in groups.iter().enumerate() {
+                            if accepted.all_accepted(g) {
+                                accepted_groups.insert(i);
+                            }
+                        }
+                    }
+                }
+                Ok(Found {
+                    results,
+                    accepted,
+                    accepted_groups,
+                })
+            });
             let _ = tx.send(Msg::FindDone(result));
             repaint.request_repaint();
         });
@@ -1884,19 +2246,23 @@ impl DupesView {
             return;
         }
         let ro = self.read_only_names();
+        let accepted = self.accepted.clone();
         // The same protected-first promotion the page view applies before its
-        // default marks: a read-only copy is the kept best, so the writable
-        // duplicate is the one marked. Without it, a group whose ranked best
-        // was the writable copy tried to mark the protected one, marked
-        // nothing, and auto-resolve silently left the group behind — page
-        // after page of survivors that only the per-page default marks caught.
+        // default marks: a read-only (or accepted) copy is the kept best, so
+        // the writable duplicate is the one marked. Without it, a group whose
+        // ranked best was the writable copy tried to mark the protected one,
+        // marked nothing, and auto-resolve silently left the group behind —
+        // page after page of survivors that only the per-page default marks
+        // caught.
         match &self.results {
             Some(Results::Similar(groups)) => {
                 let mut groups = groups.clone();
-                dedup_core::dupes::promote_protected_first(&mut groups, |f| ro.contains(&f.repo));
+                dedup_core::dupes::promote_protected_first(&mut groups, |f| {
+                    ro.contains(&f.repo) || accepted.is_accepted(f)
+                });
                 for group in &groups {
                     for file in group.iter().skip(1) {
-                        if !ro.contains(&file.repo) {
+                        if !ro.contains(&file.repo) && !accepted.is_accepted(file) {
                             self.marked.insert(key(file));
                         }
                     }
@@ -1918,11 +2284,11 @@ impl DupesView {
                         match load_groups(&store, &names, chunk) {
                             Ok(mut groups) => {
                                 dedup_core::dupes::promote_protected_first(&mut groups, |f| {
-                                    ro.contains(&f.repo)
+                                    ro.contains(&f.repo) || accepted.is_accepted(f)
                                 });
                                 for group in &groups {
                                     for file in group.iter().skip(1) {
-                                        if !ro.contains(&file.repo) {
+                                        if !ro.contains(&file.repo) && !accepted.is_accepted(file) {
                                             marks.push((file.repo.clone(), file.rel_path.clone()));
                                         }
                                     }
@@ -2885,6 +3251,305 @@ mod ui_tests {
                 exif: None,
             },
         }
+    }
+
+    /// Like [`dfile`], with a chosen content hash byte, so a group can hold
+    /// distinct contents (a similar group) or two groups distinct keys.
+    fn dfile_h(repo: &str, rel: &str, hash: u8) -> DupeFile {
+        let mut f = dfile(repo, rel);
+        f.entry.hash = [hash; 32];
+        f
+    }
+
+    /// A single writable repo `w` selected, with two SIMILAR groups loaded:
+    /// `acc_one.jpg`/`acc_two.jpg` (content 1, accepted in `w`) and
+    /// `acc_c.jpg`/`plain_d.jpg` (contents 2 accepted / 3 not).
+    fn accepted_view() -> DupesView {
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.locks.toggle("w");
+        view.repos = vec![RepoSel {
+            name: "w".into(),
+            included: true,
+            is_main: false,
+        }];
+        view.results = Some(Results::Similar(vec![
+            vec![
+                dfile_h("w", "acc_one.jpg", 1),
+                dfile_h("w", "acc_two.jpg", 1),
+            ],
+            vec![dfile_h("w", "plain_d.jpg", 3), dfile_h("w", "acc_c.jpg", 2)],
+        ]));
+        view.accepted.insert("w", 10, &[1u8; 32]);
+        view.accepted.insert("w", 10, &[2u8; 32]);
+        view.accepted_groups = HashSet::from([0]);
+        view
+    }
+
+    /// An accepted copy is protected like a read-only one: never default-
+    /// marked, skipped by MARK ALL, promoted to the kept best, badged
+    /// "accepted"; a group whose every copy is accepted is skipped from the
+    /// list (and counted) until SHOW ACCEPTED is turned on.
+    #[test]
+    fn accepted_copies_are_protected_and_fully_accepted_groups_hidden() {
+        let mut harness = similar_harness(accepted_view());
+
+        assert!(
+            harness.query_by_label("acc_one.jpg").is_none(),
+            "a fully accepted group renders no card by default"
+        );
+        assert!(
+            harness.query_by_label("1 accepted group hidden").is_some(),
+            "the skipped group is counted"
+        );
+        harness.get_by_label("acc_c.jpg");
+        let marked = harness.state().marked.clone();
+        assert!(
+            marked.contains(&("w".into(), "plain_d.jpg".into()))
+                && !marked.contains(&("w".into(), "acc_c.jpg".into())),
+            "the accepted copy is promoted to best and never default-marked: {marked:?}"
+        );
+        assert!(
+            harness
+                .query_by_label(format!("{} accepted", icon::CHECK).as_str())
+                .is_some(),
+            "the accepted copy carries the badge"
+        );
+
+        harness.get_by_label("MARK NONE").click();
+        harness.run();
+        harness.get_by_label("MARK ALL").click();
+        harness.run();
+        let marked = harness.state().marked.clone();
+        assert_eq!(
+            marked,
+            HashSet::from([("w".to_string(), "plain_d.jpg".to_string())]),
+            "MARK ALL skips the accepted copy"
+        );
+
+        // Auto-resolve marks nothing accepted either.
+        harness.state_mut().marked.clear();
+        harness.get_by_label("AUTO-RESOLVE REST").click();
+        harness.run();
+        assert_eq!(
+            harness.state().marked,
+            HashSet::from([("w".to_string(), "plain_d.jpg".to_string())]),
+        );
+
+        harness.get_by_label_contains("SHOW ACCEPTED").click();
+        harness.run();
+        assert!(harness.state().show_accepted);
+        harness.get_by_label("acc_one.jpg");
+        assert!(
+            harness.query_by_label("1 accepted group hidden").is_none(),
+            "nothing is skipped once accepted groups are shown"
+        );
+        assert!(
+            harness.state().marked.is_empty()
+                || !harness
+                    .state()
+                    .marked
+                    .contains(&("w".into(), "acc_two.jpg".into())),
+            "showing the group does not mark its accepted copies"
+        );
+    }
+
+    /// Accepting one content drops the marks and per-file unlocks of *its*
+    /// copies only; an unlock the user made on another group survives, and
+    /// un-accepting touches neither.
+    #[test]
+    fn accept_scopes_its_cleanup_to_the_accepted_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let repo_dir = tmp.path().join("w");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        store.create_repo("w", &repo_dir.to_string_lossy()).unwrap();
+        let ctx = egui::Context::default();
+
+        let mut view = DupesView::new();
+        view.cached_page = Some(0);
+        view.page_groups = vec![
+            vec![dfile_h("w", "a1", 1), dfile_h("w", "a2", 1)],
+            vec![dfile_h("w", "b1", 2), dfile_h("w", "b2", 2)],
+        ];
+        view.accepted.insert("w", 10, &[2u8; 32]);
+        let a2: FileKey = ("w".into(), "a2".into());
+        let b2: FileKey = ("w".into(), "b2".into());
+        view.marked.insert(a2.clone());
+        view.unlocked.insert(b2.clone()); // an accepted copy, unlocked on purpose
+        view.marked.insert(b2.clone());
+
+        view.apply(&ctx, &store, Act::Accept("w".into(), 10, [1u8; 32]));
+        assert!(
+            !view.marked.contains(&a2),
+            "the accepted content's mark is dropped"
+        );
+        assert!(
+            view.unlocked.contains(&b2) && view.marked.contains(&b2),
+            "another group's unlock survives"
+        );
+        assert_eq!(view.accepted_groups, HashSet::from([0, 1]));
+
+        view.apply(&ctx, &store, Act::Unaccept("w".into(), 10, [2u8; 32]));
+        assert!(
+            view.unlocked.contains(&b2) && view.marked.contains(&b2),
+            "un-accepting changes no marks"
+        );
+        assert_eq!(view.accepted_groups, HashSet::from([0]));
+        assert!(store.all_accepted("w").unwrap().contains(&(10, [1u8; 32])));
+        assert!(!store.all_accepted("w").unwrap().contains(&(10, [2u8; 32])));
+    }
+
+    /// The accepted badge's context menu: UNLOCK lifts the protection for that
+    /// file only, UN-ACCEPT withdraws the content's mark in the store.
+    #[test]
+    fn accepted_badge_menu_unlocks_or_unaccepts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let repo_dir = tmp.path().join("w");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        store.create_repo("w", &repo_dir.to_string_lossy()).unwrap();
+        store.accept_content("w", 10, &[4u8; 32]).unwrap();
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.locks.toggle("w");
+        view.repos = vec![RepoSel {
+            name: "w".into(),
+            included: true,
+            is_main: false,
+        }];
+        view.results = Some(Results::Similar(vec![vec![
+            dfile_h("w", "plain", 3),
+            dfile_h("w", "acc", 4),
+        ]]));
+        view.accepted.insert("w", 10, &[4u8; 32]);
+        let store2 = Arc::clone(&store);
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(700.0, 900.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    view.show(ui, &store2, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        let badge = format!("{} accepted", icon::CHECK);
+
+        harness.get_by_label(&badge).click_secondary();
+        harness.run();
+        harness
+            .get_by_label(&format!("{} UNLOCK for deletion", icon::LOCK_OPEN))
+            .click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .unlocked
+                .contains(&("w".into(), "acc".into())),
+            "UNLOCK lifts the accepted protection for this file"
+        );
+        assert!(
+            harness.query_by_label(&badge).is_none(),
+            "an unlocked copy shows the unlocked badge instead"
+        );
+
+        // Re-lock, then withdraw the acceptance from the badge menu.
+        harness.state_mut().unlocked.clear();
+        harness.run();
+        harness.get_by_label(&badge).click_secondary();
+        harness.run();
+        harness
+            .get_by_label(&format!("{} UN-ACCEPT", icon::X))
+            .click();
+        harness.run();
+        assert!(store.all_accepted("w").unwrap().is_empty());
+        assert!(
+            harness.query_by_label(&badge).is_none(),
+            "the copy is an ordinary duplicate again"
+        );
+    }
+
+    /// ACCEPT GROUP persists the mark in the store, protects every copy at
+    /// once (pending marks dropped), and hides the now fully accepted group;
+    /// UN-ACCEPT GROUP (reachable via SHOW ACCEPTED) reverses it.
+    #[test]
+    fn accept_group_persists_and_unaccept_reverses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let repo_dir = tmp.path().join("w");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        store.create_repo("w", &repo_dir.to_string_lossy()).unwrap();
+
+        let mut view = DupesView::new();
+        view.repos_loaded = true;
+        view.locks.toggle("w");
+        view.repos = vec![RepoSel {
+            name: "w".into(),
+            included: true,
+            is_main: false,
+        }];
+        view.results = Some(Results::Similar(vec![vec![
+            dfile_h("w", "x.jpg", 5),
+            dfile_h("w", "y.jpg", 5),
+        ]]));
+        let store2 = Arc::clone(&store);
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(700.0, 760.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    view.show(ui, &store2, TooltipVerbosity::default());
+                },
+                view,
+            );
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .marked
+                .contains(&("w".into(), "y.jpg".into())),
+            "the worse copy starts marked"
+        );
+
+        harness.get_by_label("ACCEPT GROUP").click();
+        harness.run();
+        assert_eq!(
+            store.all_accepted("w").unwrap(),
+            HashSet::from([(10u64, [5u8; 32])]),
+            "the content is accepted in the repo"
+        );
+        assert!(
+            harness.state().marked.is_empty(),
+            "protection drops the mark"
+        );
+        assert!(harness.state().accepted_groups.contains(&0));
+        assert!(
+            harness.query_by_label("x.jpg").is_none(),
+            "the fully accepted group is hidden"
+        );
+
+        harness.get_by_label_contains("SHOW ACCEPTED").click();
+        harness.run();
+        harness.get_by_label("UN-ACCEPT GROUP").click();
+        harness.run();
+        assert!(store.all_accepted("w").unwrap().is_empty());
+        assert!(!harness.state().accepted_groups.contains(&0));
+        assert!(
+            harness.query_by_label("ACCEPT GROUP").is_some(),
+            "the group is an ordinary duplicate group again"
+        );
     }
 
     fn similar_harness<'a>(view: DupesView) -> Harness<'a, DupesView> {

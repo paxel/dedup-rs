@@ -57,7 +57,7 @@ at the cost of drag-and-drop.
 ## What it does
 
 - **Repositories** — register directories, scan and hash them on background threads, track per-repo stats. Backup groups are framed together, with the group's **main** badged wherever it is named.
-- **Duplicates** — find exact or perceptually-similar files across repos and delete the worse copies. A copy's right-click menu can jump straight to it in Browse (**SHOW IN BROWSE**), to judge it by the folder it lives in.
+- **Duplicates** — find exact or perceptually-similar files across repos and delete the worse copies. A copy's right-click menu can jump straight to it in Browse (**SHOW IN BROWSE**), to judge it by the folder it lives in, or **ACCEPT** its content as allowed to repeat inside that repo (a podcast's per-folder cover): accepted copies are protected from every duplicate delete and their groups stay out of the way.
 - **Transfer / DIFF** — copy, move, sync or mirror content between repos, reconcile two repos side by side, or push a backup group's main to its sinks (each ADD ONLY, APPLY CHANGES — which also carries the main's own deletions over — or MIRROR).
 - **Grooming** — dedupe, purge by filter, prune missing records, reorganize by path templates.
 
@@ -91,8 +91,8 @@ common passwords, or export the hash for hashcat), for archives you hold and are
 When a loose file's content also lives inside an archive, the Duplicates view says so and warns
 before a delete would leave content surviving only inside a zip.
 
-Most surfaces share one **filter** wizard: conditions like `mime:image`, `name:*.db` or
-`size:>=1000` combine with AND, any condition can be inverted with `!` (`!name:*.mp3` —
+Most surfaces share one **filter** wizard: conditions like `mime:image`, `name:*.db`,
+`size:>=1000` or `accepted:yes` combine with AND, any condition can be inverted with `!` (`!name:*.mp3` —
 everything that is not an MP3), and `case:insensitive` (the `Aa` toggle) makes text matching
 ignore capitalisation.
 
