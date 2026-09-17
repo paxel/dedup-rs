@@ -330,7 +330,6 @@ fn board_row(
         left_paths: left.path.into_iter().collect(),
         right_paths: right.path.into_iter().collect(),
         unchanged,
-        note: None,
         cmds,
     };
     let body = board::RowBody {
@@ -371,14 +370,6 @@ enum BulkOp {
     RenameAllLeft,
     /// Rename each right file to the name the left side uses.
     RenameAllRight,
-}
-
-/// What MERGE REST BY NAME remembers between re-plans: the guessed pairs the
-/// user split with UNPAIR, keyed by the two paths, so they are not guessed
-/// again after the next row action refreshes the board.
-#[derive(Default, Clone, Debug)]
-struct NameMerge {
-    excluded: std::collections::HashSet<(String, String)>,
 }
 
 impl BulkOp {
@@ -484,20 +475,6 @@ fn diff_metas(rows: &[RepoDiffRow], left_ro: bool, right_ro: bool) -> Vec<board:
                         Cmd::DeleteRight,
                     ],
                 ),
-                // A guessed pair settles like a conflict — keep one side, or
-                // overwrite one with the other — and can be taken apart again.
-                R::Probable { .. } => (
-                    Status::Differs,
-                    Status::Differs,
-                    vec![
-                        Cmd::Compare,
-                        Cmd::OverwriteRight,
-                        Cmd::OverwriteLeft,
-                        Cmd::DeleteLeft,
-                        Cmd::DeleteRight,
-                        Cmd::Unpair,
-                    ],
-                ),
             };
             cmds.push(Cmd::Hide);
             // The review shows only the buttons the session locks allow — a
@@ -520,10 +497,6 @@ fn diff_metas(rows: &[RepoDiffRow], left_ro: bool, right_ro: bool) -> Vec<board:
                 left_paths: paths(&row.left),
                 right_paths: paths(&row.right),
                 unchanged: row.relation == R::Equal,
-                note: match row.relation {
-                    R::Probable { score } => Some(format!("NAME MATCH {score} %")),
-                    _ => None,
-                },
                 cmds,
             }
         })
@@ -539,7 +512,7 @@ fn diff_totals(rows: &[RepoDiffRow]) -> [usize; 4] {
         match row.relation {
             R::Equal => totals[3] += 1,
             R::OnlyLeft | R::OnlyRight => totals[1] += 1,
-            R::Renamed | R::Conflict | R::Probable { .. } => totals[2] += 1,
+            R::Renamed | R::Conflict => totals[2] += 1,
         }
     }
     totals
@@ -624,7 +597,6 @@ fn diff_action(
         Cmd::KeepOneRight => popup(PopupKind::KeepOne, false),
         Cmd::DeleteAllLeft => popup(PopupKind::ConfirmDeleteAll, true),
         Cmd::DeleteAllRight => popup(PopupKind::ConfirmDeleteAll, false),
-        Cmd::Unpair => Some(BoardAction::Unpair { row: i }),
         // The board handles HIDE itself; APPLY belongs to a planned preview.
         Cmd::Hide | Cmd::Apply => None,
     }
@@ -1426,10 +1398,6 @@ pub struct TransferView {
     /// A bulk action awaiting confirmation: what it is, and every file operation
     /// it would perform.
     bulk_confirm: Option<(BulkOp, Vec<crate::diff_board::BoardAction>)>,
-    /// MERGE REST BY NAME is on for the current comparison: the leftovers are
-    /// paired by name after every (re)plan until the next REVIEW, minus the
-    /// pairs the user took apart with UNPAIR.
-    name_merge: Option<NameMerge>,
     /// Full counts `[to-delete, only-here, differing, unchanged]` for the board
     /// summary; independent of the capped `preview` sample.
     preview_totals: [usize; 4],
@@ -1557,7 +1525,6 @@ impl TransferView {
             board_state: crate::diff_board::BoardState::default(),
             inspect: None,
             bulk_confirm: None,
-            name_merge: None,
             preview_totals: [0; 4],
             preview_source_header: String::new(),
             preview_target_header: String::new(),
@@ -2850,50 +2817,6 @@ impl TransferView {
         plan
     }
 
-    /// MERGE REST BY NAME is offered while there is something to pair on both
-    /// sides and it has not been run for this comparison yet.
-    fn offers_name_merge(&self, listed: &[usize]) -> bool {
-        let has = |want: DiffRelation| listed.iter().any(|&i| self.diff_rows[i].relation == want);
-        self.name_merge.is_none() && has(DiffRelation::OnlyLeft) && has(DiffRelation::OnlyRight)
-    }
-
-    /// Pair the listed leftovers by name (see [`dedup_core::diff::merge_by_name`]),
-    /// rewriting the rows in place. Hidden rows are not candidates — the bar
-    /// acts on what is listed, like every bulk action. Any open popup pointed
-    /// at the old row order and is dropped.
-    fn apply_name_merge(&mut self) {
-        let Some(merge) = &self.name_merge else {
-            return;
-        };
-        let metas = diff_metas(&self.diff_rows, false, false);
-        let listed = self.listed_diff_rows(&metas);
-        let mut eligible = vec![false; self.diff_rows.len()];
-        for i in listed {
-            eligible[i] = true;
-        }
-        let rows = std::mem::take(&mut self.diff_rows);
-        let before = rows.len();
-        self.diff_rows = dedup_core::diff::merge_by_name(rows, &eligible, &merge.excluded);
-        self.board_state.popup = None;
-        let paired = before - self.diff_rows.len();
-        self.status = Some(format!("{paired} pair(s) guessed by name."));
-    }
-
-    /// UNPAIR: put a guessed row's two files back as their own rows and
-    /// remember the pair, so the next re-plan does not guess it again.
-    fn unpair(&mut self, row: usize) {
-        if row >= self.diff_rows.len() {
-            return;
-        }
-        let taken = self.diff_rows.remove(row);
-        if let Some(merge) = &mut self.name_merge {
-            merge.excluded.insert(dedup_core::diff::pair_key(&taken));
-        }
-        let halves = dedup_core::diff::split_probable(taken);
-        self.diff_rows.splice(row..row, halves);
-        self.board_state.popup = None;
-    }
-
     fn preview_panel(&mut self, ui: &mut egui::Ui, store: &Store, acts: &mut Vec<Act>) {
         if self.command.is_diff() {
             if self.diff_rows.is_empty() {
@@ -2930,38 +2853,14 @@ impl TransferView {
             // board, so it reads as acting on the whole list rather than a row.
             let listed = self.listed_diff_rows(&metas);
             let offered = self.offered_bulk_ops(&listed);
-            let offer_merge = self.offers_name_merge(&listed);
-            if !offered.is_empty() || offer_merge {
+            if !offered.is_empty() {
                 let mut want: Option<BulkOp> = None;
-                let mut merge = false;
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         egui::RichText::new("ALL LISTED")
                             .color(theme::lilac())
                             .size(11.0),
                     );
-                    if offer_merge
-                        && ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("MERGE REST BY NAME").color(theme::black()),
-                                )
-                                .fill(theme::amber()),
-                            )
-                            .explain(
-                                self.verbosity,
-                                "Pair leftovers whose names match",
-                                "Guess which files only one side has are the same thing \
-                                 under another name or format, by how alike their names \
-                                 are. A pair is made only when each file is the other's \
-                                 best match. Each guess becomes one row with its score, \
-                                 settled by hand like a conflict — never in bulk — and \
-                                 UNPAIR takes a wrong guess apart. REVIEW starts over.",
-                            )
-                            .clicked()
-                    {
-                        merge = true;
-                    }
                     for op in &offered {
                         if ui
                             .add(
@@ -2989,10 +2888,6 @@ impl TransferView {
                     } else {
                         self.bulk_confirm = Some((op, plan));
                     }
-                }
-                if merge {
-                    self.name_merge = Some(NameMerge::default());
-                    self.apply_name_merge();
                 }
                 ui.add_space(4.0);
             }
@@ -3393,11 +3288,7 @@ impl TransferView {
                     self.browse_subdir(store, frame);
                 }
             }
-            Act::Preview => {
-                // REVIEW is the fresh start: guesses are not carried over.
-                self.name_merge = None;
-                self.run_preview(store)
-            }
+            Act::Preview => self.run_preview(store),
             Act::Ask => {
                 // Plan on a worker thread; the confirmation is raised (for this
                 // captured config) once the plan lands with real counts. DIFF
@@ -3521,8 +3412,6 @@ impl TransferView {
             Act::Board(crate::diff_board::BoardAction::OpenPopup { row, on_left, kind }) => {
                 self.board_state.popup = Some(crate::diff_board::Popup { row, on_left, kind });
             }
-            // Board state too: nothing on disk changes.
-            Act::Board(crate::diff_board::BoardAction::Unpair { row }) => self.unpair(row),
             Act::Board(action) => {
                 self.board_state.popup = None;
                 self.start_board_action(store, action)
@@ -3562,7 +3451,6 @@ impl TransferView {
         self.preview.clear();
         self.preview_gen += 1;
         self.diff_rows.clear();
-        self.name_merge = None;
         // A popup (and an open comparison) belongs to the rows it was opened
         // from.
         self.board_state.popup = None;
@@ -4178,9 +4066,6 @@ impl TransferView {
                 self.diff_rows = rows;
                 self.status = Some(format!("{differing} difference(s)."));
                 self.error = None;
-                // A row action re-plans the board; the guesses the user asked
-                // for are made again over the fresh rows.
-                self.apply_name_merge();
             }
             Err(e) => self.error = Some(e),
         }
@@ -4446,10 +4331,8 @@ impl TransferView {
                         None => Ok(format!("Deleted {deleted} file(s) from '{repo}'.")),
                     }
                 }
-                // Popups, the compare view and UNPAIR are handled in the UI itself.
-                BoardAction::OpenPopup { .. }
-                | BoardAction::Inspect { .. }
-                | BoardAction::Unpair { .. } => Ok(String::new()),
+                // Popups and the compare view are handled in the UI itself.
+                BoardAction::OpenPopup { .. } | BoardAction::Inspect { .. } => Ok(String::new()),
             };
             let result = match outcome {
                 Ok(message) => OpResult::Applied { message },
@@ -7402,118 +7285,6 @@ mod ui_tests {
             "BY PATH never yields Renamed, so no bulk rename is offered"
         );
         let _ = store;
-    }
-
-    /// MERGE REST BY NAME pairs the listed leftovers by name into Probable
-    /// rows that settle like conflicts, offers itself once per comparison,
-    /// never feeds a bulk action, survives a re-plan, and UNPAIR takes a guess
-    /// apart for good.
-    #[test]
-    fn merge_rest_by_name_guesses_pairs_that_settle_by_hand_only() {
-        use board::Cmd;
-        let (_tmp, _store) = sample_store();
-        let mut v = TransferView::new();
-        v.source = Some("source".into());
-        v.target = Some("target".into());
-        let leftovers = || {
-            vec![
-                drow(
-                    DiffRelation::OnlyLeft,
-                    vec![dfile("orphans/Book [B0X] - 05 - Kapitel 5.mp3", 1, 0)],
-                    vec![],
-                ),
-                drow(
-                    DiffRelation::OnlyRight,
-                    vec![],
-                    vec![dfile("lib/Book [B0X] - 005 - Kapitel 5.m4b", 2, 0)],
-                ),
-                drow(
-                    DiffRelation::OnlyLeft,
-                    vec![dfile("orphans/Book [B0X] - 06 - Kapitel 6.mp3", 1, 0)],
-                    vec![],
-                ),
-            ]
-        };
-        v.diff_rows = leftovers();
-        let metas = diff_metas(&v.diff_rows, false, false);
-        let listed = v.listed_diff_rows(&metas);
-        assert!(
-            v.offers_name_merge(&listed),
-            "leftovers on both sides offer the merge"
-        );
-
-        v.name_merge = Some(NameMerge::default());
-        v.apply_name_merge();
-        assert_eq!(v.diff_rows.len(), 2, "{:?}", v.diff_rows);
-        assert_eq!(
-            v.diff_rows[0].relation,
-            DiffRelation::Probable { score: 100 }
-        );
-        assert_eq!(v.diff_rows[1].relation, DiffRelation::OnlyLeft);
-        let metas = diff_metas(&v.diff_rows, false, false);
-        let listed = v.listed_diff_rows(&metas);
-        assert!(
-            !v.offers_name_merge(&listed),
-            "once merged, the button is gone until the next REVIEW"
-        );
-
-        // The guessed row: its score, conflict-style commands and UNPAIR.
-        assert_eq!(metas[0].note.as_deref(), Some("NAME MATCH 100 %"));
-        for cmd in [
-            Cmd::Compare,
-            Cmd::OverwriteRight,
-            Cmd::OverwriteLeft,
-            Cmd::DeleteLeft,
-            Cmd::DeleteRight,
-            Cmd::Unpair,
-        ] {
-            assert!(metas[0].cmds.contains(&cmd), "{cmd:?} offered on a guess");
-        }
-        assert_eq!(
-            diff_action(&v.diff_rows, 0, Cmd::Unpair),
-            Some(crate::diff_board::BoardAction::Unpair { row: 0 })
-        );
-
-        // No bulk action plans anything over a guessed pair.
-        for op in [
-            BulkOp::CopyMissingRight,
-            BulkOp::CopyMissingLeft,
-            BulkOp::RenameAllLeft,
-            BulkOp::RenameAllRight,
-        ] {
-            let touches_pair = v
-                .bulk_plan(op, &listed)
-                .iter()
-                .any(|a| format!("{a:?}").contains("Kapitel 5"));
-            assert!(!touches_pair, "{op:?} must leave the guessed pair alone");
-        }
-
-        // A row action re-plans the diff; the guess is made again.
-        v.apply_diff_preview(Ok(DiffPreviewData {
-            rows: leftovers(),
-            source_header: String::new(),
-            target_header: String::new(),
-        }));
-        assert_eq!(v.diff_rows.len(), 2, "the re-plan is merged again");
-
-        // UNPAIR splits the guess and keeps it split through the next re-plan.
-        v.unpair(0);
-        assert_eq!(v.diff_rows.len(), 3);
-        assert_eq!(v.diff_rows[0].relation, DiffRelation::OnlyLeft);
-        assert_eq!(v.diff_rows[1].relation, DiffRelation::OnlyRight);
-        v.apply_diff_preview(Ok(DiffPreviewData {
-            rows: leftovers(),
-            source_header: String::new(),
-            target_header: String::new(),
-        }));
-        assert_eq!(v.diff_rows.len(), 3, "an unpaired guess is not remade");
-
-        // REVIEW starts over: the merge is forgotten and offered again.
-        v.clear_preview();
-        v.diff_rows = leftovers();
-        let metas = diff_metas(&v.diff_rows, false, false);
-        let listed = v.listed_diff_rows(&metas);
-        assert!(v.name_merge.is_none() && v.offers_name_merge(&listed));
     }
 
     /// Hiding a row is how a bulk action is opted out of — the plan must skip it.

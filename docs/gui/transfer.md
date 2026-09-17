@@ -93,19 +93,6 @@ the rows on screen can actually use are offered. They act on every row *currentl
 hiding a row is how you leave it out — and a confirmation states the exact count first. If some
 operations fail the summary says how many succeeded and how many did not.
 
-**MERGE REST BY NAME**, on the same bar, is for the leftovers neither pairing can match: the
-same chapter as an MP3 on one side and an M4B on the other, a scan renamed by another tool.
-It compares the *file names* of everything only the left side has with everything only the
-right side has — folder and extension ignored, lookalike punctuation and zero-padding
-normalized, and the numbers and codes in a name treated as its identity, so they must agree
-in order and chapter 5 never pairs with chapter 6 — and makes a pair only when each file is
-the other's single best match. Each pair
-becomes one **guessed** row showing its **NAME MATCH** score; it offers what a conflict
-offers — **OVERWRITE** either way, **DELETE** on either side, the viewer on click — plus
-**UNPAIR** to split a wrong guess back into its two rows. Guesses are never part of a bulk
-action, and they are made again after each row action re-plans the board (minus what you
-unpaired) until the next REVIEW starts over.
-
 **Clicking a row** opens the two versions side by side over the whole window, in the same
 shared viewer every surface opens — so what you get depends on the file type, not on which tab
 you happen to be in. The [viewer](duplicates.md#the-viewer-lightbox) is tabbed by

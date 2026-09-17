@@ -4,22 +4,6 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 ## [0.7.0] - Unreleased
 
-### Added
-
-- **MERGE REST BY NAME on the DIFF board.** After a comparison (BY HASH or BY
-  PATH), the leftovers only one side has can be paired by *file name*: the
-  same chapter as MP3 here and M4B there, a photo renamed by another tool.
-  Names are compared with folder and extension ignored, lookalike punctuation
-  and zero-padding normalized, and the numbers and codes in a name treated as
-  its identity — they must agree, in order, so chapter 5 never pairs with
-  chapter 6; a pair forms only when each file is the other's single best
-  match. Every guess becomes one row showing its
-  **NAME MATCH** score and settles by hand like a conflict — OVERWRITE either
-  way, DELETE either side, the viewer on click — or splits again with
-  **UNPAIR**. Guesses never enter a bulk action; they are remade after each
-  row action re-plans the board (minus what you unpaired) until the next
-  REVIEW.
-
 ### Changed
 
 - **Audio similarity now hears the recording, not the file.** The audio

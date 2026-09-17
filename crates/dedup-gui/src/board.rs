@@ -129,7 +129,6 @@ enum Kind {
     Delete,
     Compare,
     Apply,
-    Unpair,
     Hide,
 }
 
@@ -215,9 +214,6 @@ pub enum Cmd {
     KeepOneRight,
     DeleteAllLeft,
     DeleteAllRight,
-    /// DIFF guessed pair (MERGE REST BY NAME): split the row back into its
-    /// only-left and only-right halves.
-    Unpair,
     /// Not a button: synthesised when the row body itself is clicked. Every row
     /// opens the shared viewer, which is why rows no longer carry a COMPARE
     /// command — it would be a second door to the same place.
@@ -243,14 +239,13 @@ impl Cmd {
             Cmd::RenameLeft | Cmd::RenameRight => "RENAME",
             Cmd::KeepOneLeft | Cmd::KeepOneRight => "KEEP 1",
             Cmd::DeleteAllLeft | Cmd::DeleteAllRight => "DEL ALL",
-            Cmd::Unpair => "UNPAIR",
         }
     }
 
     fn color(self) -> egui::Color32 {
         match self {
             Cmd::Apply => theme::green(),
-            Cmd::Hide | Cmd::Unpair => theme::grey(),
+            Cmd::Hide => theme::grey(),
             Cmd::CopyRight | Cmd::CopyLeft => theme::green(),
             Cmd::DeleteLeft | Cmd::DeleteRight | Cmd::DeleteAllLeft | Cmd::DeleteAllRight => {
                 theme::red()
@@ -285,7 +280,7 @@ impl Cmd {
             | Cmd::RenameRight
             | Cmd::KeepOneRight
             | Cmd::DeleteAllRight => Side::Right,
-            Cmd::Apply | Cmd::Hide | Cmd::Compare | Cmd::Unpair | Cmd::OpenRow => Side::Neither,
+            Cmd::Apply | Cmd::Hide | Cmd::Compare | Cmd::OpenRow => Side::Neither,
         }
     }
 
@@ -301,7 +296,6 @@ impl Cmd {
             Cmd::DeleteLeft | Cmd::DeleteRight => Kind::Delete,
             Cmd::Compare => Kind::Compare,
             Cmd::Apply => Kind::Apply,
-            Cmd::Unpair => Kind::Unpair,
             Cmd::Hide => Kind::Hide,
             // Never laid out with the others — it is not a button.
             Cmd::OpenRow => Kind::Apply,
@@ -332,7 +326,6 @@ impl Cmd {
             Cmd::KeepOneRight => "Keep one right-hand copy and delete the others",
             Cmd::DeleteAllLeft => "Delete every left-hand copy of this content",
             Cmd::DeleteAllRight => "Delete every right-hand copy of this content",
-            Cmd::Unpair => "Not the same thing — split this guessed pair back into two rows",
         }
     }
 }
@@ -360,9 +353,6 @@ pub struct RowMeta {
     pub unchanged: bool,
     /// The commands this row offers, in display order.
     pub cmds: Vec<Cmd>,
-    /// A one-line remark about the *pair* (not either file), drawn across the
-    /// top of the centre column — a guessed pair's name-match score.
-    pub note: Option<String>,
 }
 
 impl RowMeta {
@@ -381,15 +371,8 @@ impl RowMeta {
         // n buttons have n-1 gaps between them, not n — counting a trailing gap
         // still left the grid one line short of what it draws.
         let cmd_lines = layout(&self.cmds).len();
-        let centre = BTN_H * cmd_lines as f32
-            + CMD_GAP * cmd_lines.saturating_sub(1) as f32
-            + self.note_height();
+        let centre = BTN_H * cmd_lines as f32 + CMD_GAP * cmd_lines.saturating_sub(1) as f32;
         side.max(centre) + ROW_PAD * 2.0
-    }
-
-    /// The line the centre column reserves above the commands for [`Self::note`].
-    fn note_height(&self) -> f32 {
-        if self.note.is_some() { LINE_H } else { 0.0 }
     }
 }
 
@@ -838,20 +821,11 @@ fn draw_row(
     // The command grid sits on a CMD_W × CMD_H lattice, so the row draws exactly
     // the height `RowMeta::height` reserved for it.
     let grid_left = row.left() + side;
-    // A pair note takes the first line of the centre column; the command
-    // lattice starts below it.
-    let grid_top = row.top() + meta.note_height();
-    if let Some(note) = &meta.note {
-        ui.put(
-            egui::Rect::from_min_size(egui::pos2(grid_left, row.top()), egui::vec2(centre, LINE_H)),
-            egui::Label::new(RichText::new(note).color(theme::amber()).size(10.5)).truncate(),
-        );
-    }
     let slot = |col: usize, line: usize| {
         egui::Rect::from_min_size(
             egui::pos2(
                 grid_left + 4.0 + col as f32 * CMD_W,
-                grid_top + line as f32 * CMD_H,
+                row.top() + line as f32 * CMD_H,
             ),
             egui::vec2(CMD_W - 8.0, BTN_H),
         )
@@ -867,10 +841,10 @@ fn draw_row(
         .take_while(|l| matches!(l, Line::Sides(..)))
         .count();
     if n_sides > 0 && centre >= CMD_W * 2.0 {
-        let bottom = grid_top + n_sides as f32 * CMD_H - CMD_GAP + 2.0;
+        let bottom = row.top() + n_sides as f32 * CMD_H - CMD_GAP + 2.0;
         let half = |x0: f32, accent: egui::Color32| {
             let r = egui::Rect::from_min_max(
-                egui::pos2(x0, grid_top - 2.0),
+                egui::pos2(x0, row.top() - 2.0),
                 egui::pos2(x0 + CMD_W - 2.0, bottom),
             );
             ui.painter()
@@ -880,7 +854,7 @@ fn draw_row(
         half(grid_left + CMD_W + 1.0, theme::blue());
         ui.painter().vline(
             grid_left + CMD_W,
-            (grid_top - 2.0)..=bottom,
+            (row.top() - 2.0)..=bottom,
             egui::Stroke::new(1.0, theme::hairline()),
         );
     }
@@ -918,7 +892,7 @@ fn draw_row(
                     let at = egui::Rect::from_min_size(
                         egui::pos2(
                             grid_left + (centre - btn_w) / 2.0,
-                            grid_top + n as f32 * CMD_H,
+                            row.top() + n as f32 * CMD_H,
                         ),
                         egui::vec2(btn_w, BTN_H),
                     );
@@ -1602,7 +1576,6 @@ mod tests {
             left_modified: 0,
             right_modified: 0,
             unchanged: false,
-            note: None,
             cmds: some_cmds(1),
         };
         let differing = row("a/photo1.jpg", "a/photo.jpg");
@@ -1725,7 +1698,6 @@ mod tests {
             left_modified: 0,
             right_modified: 0,
             unchanged: false,
-            note: None,
             cmds: some_cmds(cmds),
         }
     }
@@ -2082,7 +2054,6 @@ mod tests {
             left_modified: 0,
             right_modified: 0,
             unchanged: false,
-            note: None,
             cmds: vec![
                 Cmd::CopyRight,
                 Cmd::CopyLeft,
@@ -2637,22 +2608,7 @@ mod tests {
         let mut renamed = diff_row("holiday");
         renamed.left_paths = vec!["a/b/holiday_v2.jpg".into()];
         renamed.right_paths = vec!["a/b/holiday.jpg".into()];
-        // A pair MERGE REST BY NAME guessed: the score line above the grid,
-        // conflict commands plus UNPAIR.
-        let mut guessed = diff_row("chapter");
-        guessed.left_paths = vec!["orphans/Book [B0X] - 05 - Kapitel 5.mp3".into()];
-        guessed.right_paths = vec!["lib/Book [B0X] - 005 - Kapitel 5.m4b".into()];
-        guessed.note = Some("NAME MATCH 100 %".into());
-        guessed.cmds = vec![
-            Cmd::Compare,
-            Cmd::OverwriteRight,
-            Cmd::OverwriteLeft,
-            Cmd::DeleteLeft,
-            Cmd::DeleteRight,
-            Cmd::Unpair,
-            Cmd::Hide,
-        ];
-        let mut metas = vec![renamed, multi, simple, guessed];
+        let mut metas = vec![renamed, multi, simple];
         // A believable date, not the epoch (an epoch-0 doc image reads as a bug).
         for m in &mut metas {
             m.left_modified = 1_700_000_000_000;
@@ -2667,7 +2623,7 @@ mod tests {
         // re-requests forever and no texture ever lands) — it rides in the
         // harness state beside the board state.
         let mut harness = egui_kittest::Harness::builder()
-            .with_size(egui::vec2(1200.0, 820.0))
+            .with_size(egui::vec2(1200.0, 680.0))
             .wgpu()
             .build_ui_state(
                 move |ui, (state, thumbs): &mut (BoardState, ThumbCache)| {
@@ -2694,8 +2650,8 @@ mod tests {
                                 path: "/mnt/nas/backup/photos",
                                 multi_repo: false,
                             }),
-                            totals: [0, 1, 3, 0],
-                            full_len: 4,
+                            totals: [0, 1, 2, 0],
+                            full_len: 3,
                             hide_skips_run: false,
                         },
                         thumbs,

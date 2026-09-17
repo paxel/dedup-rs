@@ -1498,7 +1498,6 @@ impl GroomingView {
                             // No COMPARE command: clicking the row opens the
                             // shared viewer, so a row-level command would be a
                             // second door to the same place.
-                            note: None,
                             cmds: vec![board::Cmd::Apply, board::Cmd::Hide],
                         };
                         let body = board::RowBody {
@@ -1568,7 +1567,6 @@ impl GroomingView {
                             left_paths: vec![from],
                             right_paths: vec![to],
                             unchanged: false,
-                            note: None,
                             cmds: vec![board::Cmd::Apply, board::Cmd::Hide],
                         };
                         let body = board::RowBody {
@@ -2354,7 +2352,6 @@ mod ui_tests {
             left_modified: 0,
             right_modified: 0,
             unchanged: false,
-            note: None,
             cmds: vec![board::Cmd::Apply, board::Cmd::Hide],
         };
         assert_eq!(
@@ -2406,7 +2403,6 @@ mod ui_tests {
                 left_modified: 0,
                 right_modified: 0,
                 unchanged: false,
-                note: None,
                 cmds: vec![board::Cmd::Apply, board::Cmd::Hide],
             })
             .collect();

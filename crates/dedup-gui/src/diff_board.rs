@@ -87,9 +87,6 @@ pub enum BoardAction {
         on_left: bool,
         kind: PopupKind,
     },
-    /// Not a file operation: split a guessed (MERGE REST BY NAME) pair back
-    /// into its two rows.
-    Unpair { row: usize },
 }
 
 /// Render the open popup, if any, and turn the user's answer into an action.
