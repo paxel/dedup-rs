@@ -2034,10 +2034,7 @@ impl DiffCompare {
             mime: fp.mime,
             img_size: fp.img_size,
             audio_ms: fp.audio.as_ref().map(|a| a.duration_ms),
-            audio_seed: fp
-                .audio
-                .as_ref()
-                .and_then(|a| a.chunk_hashes.first().copied()),
+            audio_seed: fp.audio.as_ref().and_then(|a| a.glyph_seed()),
             hash_hex: String::new(),
             abs_path: dest,
             origin: None,

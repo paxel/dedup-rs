@@ -26,8 +26,12 @@ const SYNC_GROUP_VERSION: u8 = 2;
 /// so video files below v8 are flagged stale; v9 reclassified MP4-container
 /// audio (`.m4b`/`.m4a` sniffed as plain "video/mp4") as audio — the layout is
 /// unchanged, and only audio-named "video/mp4" entries below v9 are flagged
-/// stale so they re-fingerprint as audio. See [`decode_entry`].
-const ENTRY_VERSION: u8 = 9;
+/// stale so they re-fingerprint as audio; v10 replaced the audio chunk hash
+/// (BLAKE3 of the first 100 KiB of the encoded stream, which no two codecs
+/// ever share) with a Chromaprint acoustic fingerprint of the decoded audio,
+/// so audio files below v10 decode with an empty fingerprint (their duration
+/// survives) and are flagged stale. See [`decode_entry`].
+const ENTRY_VERSION: u8 = 10;
 
 // Registry table definition
 const REPOS: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("repos");
@@ -319,7 +323,7 @@ pub struct FileEntry {
     pub img_fingerprint: Option<ImgHash>, // gradient hash
     pub video_hash: Option<[ImgHash; 3]>, // 512-bit temporal hash (3 frames)
     pub pdf_hash: Option<[u8; 32]>,       // blake3 of normalized text
-    pub audio: Option<AudioFp>,           // duration_ms + chunk hashes
+    pub audio: Option<AudioFp>,           // duration_ms + acoustic fingerprint
     pub img_size: Option<(u32, u32)>,
     /// Provenance: the source repo a file was copied/synced from (set by
     /// `diff_copy`/`sync_copy` when the target is a repo). `None` for scanned
@@ -352,7 +356,7 @@ struct FileEntryV1 {
     img_fingerprint: Option<u64>,
     video_hash: Option<[u64; 3]>,
     pdf_hash: Option<[u8; 32]>,
-    audio: Option<AudioFp>,
+    audio: Option<AudioFpV9>,
     img_size: Option<(u32, u32)>,
 }
 
@@ -368,7 +372,7 @@ struct FileEntryV2 {
     img_fingerprint: Option<ImgHash>,
     video_hash: Option<[u64; 3]>,
     pdf_hash: Option<[u8; 32]>,
-    audio: Option<AudioFp>,
+    audio: Option<AudioFpV9>,
     img_size: Option<(u32, u32)>,
 }
 
@@ -384,7 +388,7 @@ struct FileEntryV3 {
     img_fingerprint: Option<ImgHash>,
     video_hash: Option<[u64; 3]>,
     pdf_hash: Option<[u8; 32]>,
-    audio: Option<AudioFp>,
+    audio: Option<AudioFpV9>,
     img_size: Option<(u32, u32)>,
     origin: Option<String>,
 }
@@ -402,16 +406,78 @@ struct FileEntryV7 {
     img_fingerprint: Option<ImgHash>,
     video_hash: Option<[u64; 3]>,
     pdf_hash: Option<[u8; 32]>,
-    audio: Option<AudioFp>,
+    audio: Option<AudioFpV9>,
     img_size: Option<(u32, u32)>,
     origin: Option<String>,
     exif: Option<ExifInfo>,
 }
 
+/// Version-8..9 [`FileEntry`] layout: the current fields, but audio carried
+/// the chunk hash ([`AudioFpV9`]). Kept so pre-v10 indexes decode; the audio
+/// duration survives, the fingerprint comes back empty and audio files are
+/// flagged stale for re-fingerprinting.
+#[derive(Serialize, Deserialize)]
+struct FileEntryV9 {
+    size: u64,
+    hash: [u8; 32],
+    modified_ms: i64,
+    missing: bool,
+    mime: Option<String>,
+    img_fingerprint: Option<ImgHash>,
+    video_hash: Option<[ImgHash; 3]>,
+    pdf_hash: Option<[u8; 32]>,
+    audio: Option<AudioFpV9>,
+    img_size: Option<(u32, u32)>,
+    origin: Option<String>,
+    exif: Option<ExifInfo>,
+}
+
+/// The pre-v10 audio fingerprint: duration plus BLAKE3 hashes of the first
+/// 100 KiB of the encoded stream. Only ever read back from old indexes.
+#[derive(Serialize, Deserialize)]
+struct AudioFpV9 {
+    duration_ms: u32,
+    chunk_hashes: Vec<[u8; 32]>,
+}
+
+impl AudioFpV9 {
+    /// The v10 shape of a legacy value: the duration is still true, the chunk
+    /// hash is meaningless to the acoustic matcher, so the fingerprint is empty
+    /// until the file is re-scanned.
+    fn upgrade(self) -> AudioFp {
+        AudioFp {
+            duration_ms: self.duration_ms,
+            fingerprint: Vec::new(),
+        }
+    }
+}
+
+/// An audio file's acoustic identity: its duration plus a Chromaprint
+/// fingerprint of the first [`crate::fingerprint::AUDIO_FINGERPRINT_SECS`]
+/// seconds of *decoded* audio (one `u32` per ~1/8 s), so the same recording
+/// matches across codecs, bitrates and containers. `fingerprint` is empty when
+/// the file could not be decoded or the entry predates v10; such entries never
+/// take part in similarity grouping.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct AudioFp {
     pub duration_ms: u32,
-    pub chunk_hashes: Vec<[u8; 32]>,
+    pub fingerprint: Vec<u32>,
+}
+
+impl AudioFp {
+    /// A stable 32-byte digest of the fingerprint, for anything that wants an
+    /// identity-shaped value (the GUI's deterministic audio glyph). `None`
+    /// while the fingerprint is empty.
+    pub fn glyph_seed(&self) -> Option<[u8; 32]> {
+        if self.fingerprint.is_empty() {
+            return None;
+        }
+        let mut hasher = blake3::Hasher::new();
+        for word in &self.fingerprint {
+            hasher.update(&word.to_le_bytes());
+        }
+        Some(*hasher.finalize().as_bytes())
+    }
 }
 
 /// One file inside an archive: its path within the archive plus, when the
@@ -571,10 +637,28 @@ fn deserialize_value<'a, T: Deserialize<'a>>(
 fn decode_entry(bytes: &[u8]) -> Result<(FileEntry, u8), StoreError> {
     match bytes.first() {
         Some(&ENTRY_VERSION) => Ok((deserialize_value(ENTRY_VERSION, bytes)?, ENTRY_VERSION)),
-        // v8 shares the current layout byte-for-byte; only the mime
-        // misclassification of MP4-container audio separates it (the per-mime
-        // stale rules in `read_scan_index` re-scan exactly those files).
-        Some(&8) => Ok((deserialize_value(8, bytes)?, 8)),
+        // v8 and v9 share one layout whose audio field is the old chunk hash;
+        // decode via FileEntryV9 and keep only the duration (audio → stale).
+        // v8 additionally misclassified MP4-container audio (the per-mime stale
+        // rules in `read_scan_index` re-scan exactly those files).
+        Some(&v @ 8..=9) => {
+            let old: FileEntryV9 = deserialize_value(v, bytes)?;
+            let entry = FileEntry {
+                size: old.size,
+                hash: old.hash,
+                modified_ms: old.modified_ms,
+                missing: old.missing,
+                mime: old.mime,
+                img_fingerprint: old.img_fingerprint,
+                video_hash: old.video_hash,
+                pdf_hash: old.pdf_hash,
+                audio: old.audio.map(AudioFpV9::upgrade),
+                img_size: old.img_size,
+                origin: old.origin,
+                exif: old.exif,
+            };
+            Ok((entry, v))
+        }
         // v4..v7 share one layout with the old 64-bit video hash; decode via
         // FileEntryV7 and drop the incompatible video hash (video → stale).
         Some(&v @ 4..=7) => {
@@ -588,7 +672,7 @@ fn decode_entry(bytes: &[u8]) -> Result<(FileEntry, u8), StoreError> {
                 img_fingerprint: old.img_fingerprint,
                 video_hash: None,
                 pdf_hash: old.pdf_hash,
-                audio: old.audio,
+                audio: old.audio.map(AudioFpV9::upgrade),
                 img_size: old.img_size,
                 origin: old.origin,
                 exif: old.exif,
@@ -606,7 +690,7 @@ fn decode_entry(bytes: &[u8]) -> Result<(FileEntry, u8), StoreError> {
                 img_fingerprint: v3.img_fingerprint,
                 video_hash: None, // old 64-bit hash dropped; video re-scans
                 pdf_hash: v3.pdf_hash,
-                audio: v3.audio,
+                audio: v3.audio.map(AudioFpV9::upgrade),
                 img_size: v3.img_size,
                 origin: v3.origin,
                 exif: None,
@@ -624,7 +708,7 @@ fn decode_entry(bytes: &[u8]) -> Result<(FileEntry, u8), StoreError> {
                 img_fingerprint: v2.img_fingerprint,
                 video_hash: None,
                 pdf_hash: v2.pdf_hash,
-                audio: v2.audio,
+                audio: v2.audio.map(AudioFpV9::upgrade),
                 img_size: v2.img_size,
                 origin: None,
                 exif: None,
@@ -642,7 +726,7 @@ fn decode_entry(bytes: &[u8]) -> Result<(FileEntry, u8), StoreError> {
                 img_fingerprint: None,
                 video_hash: None,
                 pdf_hash: v1.pdf_hash,
-                audio: v1.audio,
+                audio: v1.audio.map(AudioFpV9::upgrade),
                 img_size: v1.img_size,
                 origin: None,
                 exif: None,
@@ -1997,6 +2081,9 @@ pub fn read_scan_index(
         // already had a text hash, so they are not re-scanned.
         let stale = match entry.mime.as_deref() {
             Some(m) if m.starts_with("image/") => version < 4,
+            // v10 replaced the audio chunk hash with an acoustic fingerprint,
+            // which needs the audio decoded, so every audio file re-scans.
+            Some(m) if crate::fingerprint::is_audio_mime(m) => version < 10,
             Some(m) if crate::fingerprint::is_office_doc(m) => version < 5,
             Some(m) if m.starts_with("text/") => version < 6,
             Some("message/rfc822") => version < 7,
@@ -2331,7 +2418,7 @@ mod tests {
         std::fs::create_dir_all(&repo_dir)?;
         store.create_repo("legacy", &repo_dir.to_string_lossy())?;
 
-        let mp4 = |hash0: u8| FileEntry {
+        let mp4 = |hash0: u8| FileEntryV9 {
             size: 100,
             hash: [hash0; 32],
             modified_ms: 123456,
@@ -2363,6 +2450,69 @@ mod tests {
             "an audio-named v8 mp4 entry re-scans to become audio"
         );
         assert!(!index["clip.mp4"].stale, "a real v8 video is left alone");
+        Ok(())
+    }
+
+    /// Version-9 audio entries carried a chunk hash of the encoded bytes. They
+    /// must stay readable — the duration is still true — but come back with an
+    /// empty acoustic fingerprint and are flagged stale, so the next update
+    /// decodes the audio; a v9 image is left alone.
+    #[test]
+    fn v9_audio_entries_keep_their_duration_and_flag_stale()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = Store::open_at(temp_dir.path().to_path_buf())?;
+        let repo_dir = temp_dir.path().join("mock_repo");
+        std::fs::create_dir_all(&repo_dir)?;
+        store.create_repo("legacy", &repo_dir.to_string_lossy())?;
+
+        let v9 = |mime: &str, audio: Option<AudioFpV9>| FileEntryV9 {
+            size: 100,
+            hash: [7; 32],
+            modified_ms: 123456,
+            missing: false,
+            mime: Some(mime.to_string()),
+            img_fingerprint: None,
+            video_hash: None,
+            pdf_hash: None,
+            audio,
+            img_size: None,
+            origin: Some("elsewhere".to_string()),
+            exif: None,
+        };
+        let chunked = AudioFpV9 {
+            duration_ms: 1_234_567,
+            chunk_hashes: vec![[9; 32]],
+        };
+        let db = store.open_repo_db("legacy")?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut files = write_txn.open_table(FILES)?;
+            files.insert(
+                "book.mp3",
+                serialize_value(9, &v9("audio/mpeg", Some(chunked)))?.as_slice(),
+            )?;
+            files.insert(
+                "photo.jpg",
+                serialize_value(9, &v9("image/jpeg", None))?.as_slice(),
+            )?;
+        }
+        write_txn.commit()?;
+
+        let entry = get_entry(&db, "book.mp3")?.expect("v9 entry decodes");
+        assert_eq!(
+            entry.audio,
+            Some(AudioFp {
+                duration_ms: 1_234_567,
+                fingerprint: Vec::new(),
+            }),
+            "duration survives, chunk hash is dropped"
+        );
+        assert_eq!(entry.origin.as_deref(), Some("elsewhere"));
+
+        let index = read_scan_index(&db)?;
+        assert!(index["book.mp3"].stale, "v9 audio re-fingerprints");
+        assert!(!index["photo.jpg"].stale, "a v9 image is left alone");
         Ok(())
     }
 

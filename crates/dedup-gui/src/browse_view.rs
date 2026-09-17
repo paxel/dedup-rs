@@ -2621,7 +2621,7 @@ mod tests {
             let mut e = entry();
             e.audio = Some(dedup_core::store::AudioFp {
                 duration_ms: 65_000,
-                chunk_hashes: Vec::new(),
+                fingerprint: Vec::new(),
             });
             e
         };
@@ -3353,7 +3353,7 @@ mod tests {
             aud.size = 5_000_000;
             aud.audio = Some(dedup_core::store::AudioFp {
                 duration_ms: 225_000,
-                chunk_hashes: Vec::new(),
+                fingerprint: Vec::new(),
             });
             std::fs::write(repo_dir.join("2019/song.mp3"), b"").unwrap();
             store

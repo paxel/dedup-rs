@@ -35,7 +35,7 @@ use those with `-p` — while directories, lib targets (`dedup_core`, `dedup_gui
 
 ### Data model (`dedup-core/src/store.rs`)
 
-A registry database maps repo names to paths; each repo has its own redb database with a `files` table plus index tables (`by_size_hash`, `by_fprint2`, mime stats, archive members, tags). **Content identity is always size + BLAKE3 hash — paths never matter.** Serialized `FileEntry` values carry `ENTRY_VERSION`; bumping it (with migration notes in the doc comment) flags older entries stale so they re-hash on the next scan. Fingerprints are per-kind: rotation-invariant image dHash, 3-frame video temporal hash (ffmpeg), normalized-text hash for PDF/office/text/eml, duration+chunk hash for audio.
+A registry database maps repo names to paths; each repo has its own redb database with a `files` table plus index tables (`by_size_hash`, `by_fprint2`, mime stats, archive members, tags). **Content identity is always size + BLAKE3 hash — paths never matter.** Serialized `FileEntry` values carry `ENTRY_VERSION`; bumping it (with migration notes in the doc comment) flags older entries stale so they re-hash on the next scan. Fingerprints are per-kind: rotation-invariant image dHash, 3-frame video temporal hash (ffmpeg), normalized-text hash for PDF/office/text/eml, duration + Chromaprint acoustic fingerprint of the first 120 s of decoded audio (`rusty-chromaprint`, symphonia decode with ffmpeg fallback).
 
 ### GUI conventions
 

@@ -46,7 +46,7 @@ pub struct FileFacts {
     pub mime: Option<String>,
     pub img_size: Option<(u32, u32)>,
     pub audio_ms: Option<u32>,
-    /// First audio chunk hash, the seed for the deterministic glyph.
+    /// Digest of the acoustic fingerprint, the seed for the deterministic glyph.
     pub audio_seed: Option<[u8; 32]>,
     /// Content hash as hex — the thumbnail cache key.
     pub hash_hex: String,
@@ -68,10 +68,7 @@ impl FileFacts {
             mime: entry.mime.clone(),
             img_size: entry.img_size,
             audio_ms: entry.audio.as_ref().map(|a| a.duration_ms),
-            audio_seed: entry
-                .audio
-                .as_ref()
-                .and_then(|a| a.chunk_hashes.first().copied()),
+            audio_seed: entry.audio.as_ref().and_then(|a| a.glyph_seed()),
             hash_hex: hash_hex(&entry.hash),
             abs_path,
             origin: entry.origin.clone(),
@@ -286,7 +283,7 @@ pub fn media_cell(
     // Audio: a deterministic fingerprint glyph (identical content → identical
     // glyph), so a cell reads as audio instead of a broken image. A file whose
     // fingerprint failed still carries a duration, so gate on that, not the seed
-    // (which is absent when the fingerprint has no chunk hashes). Audio with
+    // (which is absent while the acoustic fingerprint is empty). Audio with
     // no duration at all falls through to the byte-view fallback below.
     let audio_glyph = facts.is_audio() && facts.audio_ms.is_some();
     if audio_glyph {

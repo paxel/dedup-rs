@@ -9,8 +9,10 @@
 //!   of the duration, three `u64`s (192 bits). Requires `ffmpeg`/`ffprobe` on
 //!   PATH; absent, video files degrade to content hash only.
 //! - **PDF**: BLAKE3 of the normalized (lowercased, whitespace-stripped) text.
-//! - **Audio**: duration plus a BLAKE3 chunk hash of the raw stream after any
-//!   ID3v2 tag, matching the Java chunk scheme.
+//! - **Audio**: duration plus a Chromaprint acoustic fingerprint of the first
+//!   [`AUDIO_FINGERPRINT_SECS`] of *decoded* audio, so the same recording
+//!   matches across codecs, bitrates and containers. Decoded by symphonia,
+//!   with `ffmpeg` as the fallback for codecs it lacks.
 //!
 //! Every step is best-effort: a decode or tool failure yields `None` for that
 //! field, never an error — the content hash already identifies the file.
@@ -83,8 +85,9 @@ pub fn is_audio_mime(mime: &str) -> bool {
 
 /// Compute all applicable fingerprints for `path`, dispatching on MIME.
 ///
-/// `ffmpeg_available` gates the (external) video path; when false, video files
-/// yield no temporal hash. Pass the result of [`ffmpeg_available`], probed once.
+/// `ffmpeg_available` gates the (external) video path and the audio decode
+/// fallback; when false, video files yield no temporal hash. Pass the result of
+/// [`ffmpeg_available`], probed once.
 pub fn compute(path: &Path, ffmpeg_available: bool) -> Fingerprints {
     let mime = detect_mime(path);
     let mut fp = Fingerprints {
@@ -120,7 +123,7 @@ pub fn compute(path: &Path, ffmpeg_available: bool) -> Fingerprints {
         // line endings or trailing whitespace.
         fp.pdf_hash = text_file_hash(path);
     } else if is_audio_mime(&mime) {
-        fp.audio = audio_fingerprint(path);
+        fp.audio = audio_fingerprint(path, ffmpeg_available);
     }
 
     fp
@@ -703,56 +706,58 @@ fn xls_text(path: &Path) -> Option<String> {
 
 // --- Audio ------------------------------------------------------------------
 
-const AUDIO_CHUNK_SIZE: usize = 100 * 1024;
+/// How much of each audio file is fingerprinted, from its start. Enough to
+/// tell recordings apart (fpcalc's own default), small enough that a chapter
+/// costs ~4 KiB of index and a fraction of a second to decode.
+pub const AUDIO_FINGERPRINT_SECS: u32 = 120;
 
-/// Duration (via symphonia) plus a BLAKE3 chunk hash of the raw stream after
-/// any ID3v2 tag. Returns `None` if no content chunk can be read.
-pub fn audio_fingerprint(path: &Path) -> Option<AudioFp> {
-    let chunk_hash = audio_chunk_hash(path)?;
-    let duration_ms = probe_audio_duration_ms(path).unwrap_or(0);
+/// The Chromaprint algorithm every fingerprint is computed *and* compared
+/// with. Fingerprints from different configurations never match, so this is
+/// one constant, not a parameter.
+pub(crate) fn chromaprint_config() -> rusty_chromaprint::Configuration {
+    rusty_chromaprint::Configuration::preset_test2()
+}
+
+/// Duration (via symphonia) plus a Chromaprint acoustic fingerprint of the
+/// first [`AUDIO_FINGERPRINT_SECS`] of decoded audio. Decoding goes through
+/// symphonia; a codec it lacks (Opus, WMA, …) falls back to `ffmpeg` when
+/// available. Returns `None` only when neither a duration nor a fingerprint
+/// could be read — an undecodable file still keeps its duration, with an empty
+/// fingerprint that similarity search skips.
+pub fn audio_fingerprint(path: &Path, ffmpeg_available: bool) -> Option<AudioFp> {
+    let (mut duration_ms, mut fingerprint) = match decode_audio_prefix(path) {
+        Some(decoded) => (decoded.duration_ms, decoded.fingerprint),
+        None => (None, Vec::new()),
+    };
+    if fingerprint.is_empty() && ffmpeg_available {
+        fingerprint = ffmpeg_audio_fingerprint(path).unwrap_or_default();
+        if duration_ms.is_none() {
+            duration_ms = probe_duration_secs(path).map(|s| (s * 1000.0) as u32);
+        }
+    }
+    if duration_ms.is_none() && fingerprint.is_empty() {
+        return None;
+    }
     Some(AudioFp {
-        duration_ms,
-        chunk_hashes: vec![chunk_hash],
+        duration_ms: duration_ms.unwrap_or(0),
+        fingerprint,
     })
 }
 
-fn audio_chunk_hash(path: &Path) -> Option<[u8; 32]> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path).ok()?;
-
-    // Skip an ID3v2 tag if present so metadata edits don't change the hash.
-    let mut header = [0u8; 10];
-    if file.read_exact(&mut header).is_ok() && &header[0..3] == b"ID3" {
-        let size = (u32::from(header[6] & 0x7f) << 21)
-            | (u32::from(header[7] & 0x7f) << 14)
-            | (u32::from(header[8] & 0x7f) << 7)
-            | u32::from(header[9] & 0x7f);
-        let _ = std::io::copy(
-            &mut file.by_ref().take(u64::from(size)),
-            &mut std::io::sink(),
-        );
-    } else {
-        // Not ID3v2: rewind so the header bytes count as content.
-        use std::io::Seek;
-        file.seek(std::io::SeekFrom::Start(0)).ok()?;
-    }
-
-    let mut chunk = vec![0u8; AUDIO_CHUNK_SIZE];
-    let mut read = 0usize;
-    while read < AUDIO_CHUNK_SIZE {
-        match file.read(&mut chunk[read..]) {
-            Ok(0) => break,
-            Ok(n) => read += n,
-            Err(_) => break,
-        }
-    }
-    if read == 0 {
-        return None;
-    }
-    Some(*blake3::hash(&chunk[..read]).as_bytes())
+/// What one symphonia pass over a file yields: the track's declared length
+/// (when the container states it) and the fingerprint of its opening.
+struct DecodedPrefix {
+    duration_ms: Option<u32>,
+    fingerprint: Vec<u32>,
 }
 
-fn probe_audio_duration_ms(path: &Path) -> Option<u32> {
+/// Decode the first [`AUDIO_FINGERPRINT_SECS`] of `path` with symphonia and
+/// fingerprint them. `None` when the container or codec is not understood at
+/// all; a stream that decodes partially yields whatever it produced.
+fn decode_audio_prefix(path: &Path) -> Option<DecodedPrefix> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::errors::Error as SymphoniaError;
     use symphonia::core::formats::FormatOptions;
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
@@ -772,15 +777,131 @@ fn probe_audio_duration_ms(path: &Path) -> Option<u32> {
             &MetadataOptions::default(),
         )
         .ok()?;
-    let track = probed.format.default_track()?;
-    let params = &track.codec_params;
-    let n_frames = params.n_frames?;
-    let sample_rate = params.sample_rate?;
-    if sample_rate == 0 {
+    let mut format = probed.format;
+    let track = format.default_track()?;
+    let track_id = track.id;
+    let params = track.codec_params.clone();
+    // A container states its length in its own time base (an MP4 track's
+    // timescale, which need not be the codec's rate — HE-AAC halves it);
+    // only a bare stream's frame count is in codec samples.
+    let duration_ms = match (params.n_frames, params.time_base, params.sample_rate) {
+        (Some(frames), Some(time_base), _) => {
+            let t = time_base.calc_time(frames);
+            Some((t.seconds as f64 * 1000.0 + t.frac * 1000.0) as u32)
+        }
+        (Some(frames), None, Some(rate)) if rate > 0 => {
+            Some((frames as f64 / f64::from(rate) * 1000.0) as u32)
+        }
+        _ => None,
+    };
+
+    let mut decoder =
+        match symphonia::default::get_codecs().make(&params, &DecoderOptions::default()) {
+            Ok(d) => d,
+            Err(_) => {
+                return Some(DecodedPrefix {
+                    duration_ms,
+                    fingerprint: Vec::new(),
+                });
+            }
+        };
+
+    let mut printer = rusty_chromaprint::Fingerprinter::new(&chromaprint_config());
+    // The stream's real rate and channel layout are only certain once a packet
+    // has decoded (the container's declaration may be absent), so the
+    // fingerprinter starts lazily and the sample buffer follows the spec.
+    let mut started: Option<(u32, u32)> = None;
+    let mut sample_buf: Option<SampleBuffer<i16>> = None;
+    let mut frames_left: u64 = 0;
+
+    // The packet loop ends at end of stream or an unreadable remainder alike.
+    while let Ok(packet) = format.next_packet() {
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            Err(SymphoniaError::DecodeError(_)) => continue, // a damaged frame
+            Err(_) => break,
+        };
+        let spec = *decoded.spec();
+        let rate = spec.rate;
+        let channels = spec.channels.count() as u32;
+        if channels == 0 || rate == 0 {
+            break;
+        }
+        if started != Some((rate, channels)) {
+            if started.is_some() {
+                break; // a mid-stream format change: keep what we have
+            }
+            if printer.start(rate, channels).is_err() {
+                break;
+            }
+            started = Some((rate, channels));
+            frames_left = u64::from(rate) * u64::from(AUDIO_FINGERPRINT_SECS);
+        }
+        let frames = decoded.frames() as u64;
+        let buf = match sample_buf.as_mut() {
+            Some(buf) if buf.capacity() >= decoded.capacity() * channels as usize => buf,
+            _ => sample_buf.insert(SampleBuffer::<i16>::new(decoded.capacity() as u64, spec)),
+        };
+        buf.copy_interleaved_ref(decoded);
+        let take = frames.min(frames_left) as usize;
+        printer.consume(&buf.samples()[..take * channels as usize]);
+        frames_left -= take as u64;
+        if frames_left == 0 {
+            break;
+        }
+    }
+    let fingerprint = if started.is_some() {
+        printer.finish();
+        printer.fingerprint().to_vec()
+    } else {
+        Vec::new()
+    };
+    Some(DecodedPrefix {
+        duration_ms,
+        fingerprint,
+    })
+}
+
+/// Fingerprint the first [`AUDIO_FINGERPRINT_SECS`] of `path` by having
+/// `ffmpeg` decode them to mono 16-bit PCM at Chromaprint's native rate — the
+/// route for codecs symphonia cannot decode. `None` when ffmpeg fails.
+fn ffmpeg_audio_fingerprint(path: &Path) -> Option<Vec<u32>> {
+    const RATE: u32 = 11025;
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-t"])
+        .arg(AUDIO_FINGERPRINT_SECS.to_string())
+        .arg("-i")
+        .arg(path)
+        .args(["-vn", "-f", "s16le", "-ac", "1", "-ar"])
+        .arg(RATE.to_string())
+        .arg("-")
+        .output()
+        .ok()?;
+    if !output.status.success() || output.stdout.len() < 2 {
         return None;
     }
-    let ms = n_frames as f64 / f64::from(sample_rate) * 1000.0;
-    Some(ms as u32)
+    let samples: Vec<i16> = output
+        .stdout
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    Some(fingerprint_pcm(&samples, RATE, 1))
+}
+
+/// Chromaprint fingerprint of interleaved 16-bit PCM. The building block the
+/// decoders feed; public so tests can fingerprint synthetic signals without a
+/// codec in the way.
+pub fn fingerprint_pcm(samples: &[i16], sample_rate: u32, channels: u32) -> Vec<u32> {
+    let mut printer = rusty_chromaprint::Fingerprinter::new(&chromaprint_config());
+    if printer.start(sample_rate, channels).is_err() {
+        return Vec::new();
+    }
+    printer.consume(samples);
+    printer.finish();
+    printer.fingerprint().to_vec()
 }
 
 #[cfg(test)]

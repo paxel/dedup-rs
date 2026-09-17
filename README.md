@@ -8,7 +8,8 @@ A high-performance, native Rust file-deduplication tool with both a desktop GUI 
 fast command-line interface, packaged as a single self-contained binary.
 
 Content identity is always size + BLAKE3 hash — paths never matter — with per-kind
-perceptual fingerprints (image, video, PDF/office/text, audio) for near-duplicate search.
+perceptual fingerprints (image, video, PDF/office/text, and Chromaprint acoustic fingerprints
+for audio, so the same recording matches across codecs) for near-duplicate search.
 It is a three-crate workspace: `dedup-core` (domain logic), `dedup-cli` (`clap` CLI), and
 `dedup-gui` (an `egui`/`eframe` LCARS-styled desktop app), backed by a `redb` embedded store.
 

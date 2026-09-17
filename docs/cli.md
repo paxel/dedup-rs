@@ -45,7 +45,9 @@ Alongside the content hash, `update` computes a perceptual fingerprint by MIME k
 512-bit image hash (rotation/mirror invariant), a 512-bit-per-frame video temporal hash
 (three frames via `ffmpeg`/`ffprobe` — install ffmpeg to enable it; degrades to content-hash-only
 without it), a normalized-text hash for PDFs and office documents (docx/xlsx/pptx/odt/ods/xls),
-a duration + chunk hash for audio, and EXIF capture date/camera for images.
+a duration + Chromaprint acoustic fingerprint of the first two minutes of decoded audio
+(so the same recording matches across MP3/AAC/FLAC/…; codecs the built-in decoder lacks go
+through `ffmpeg` when present), and EXIF capture date/camera for images.
 
 ---
 

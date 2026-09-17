@@ -2,7 +2,7 @@
 # Published as `dedup-rs-core` (the shorter names are taken on crates.io);
 # the lib target keeps the `dedup_core` name so imports stay unchanged.
 name = "dedup-rs-core"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 description = "Core engine of dedup-rs: content-addressed file index, duplicate/diff/similarity operations, perceptual fingerprints"
 license = "MIT"
@@ -24,6 +24,8 @@ infer = "0.19"
 mime_guess = "2.0"
 lopdf = "0.43"
 symphonia = { version = "0.5", features = ["all"] }
+# Chromaprint acoustic fingerprints (pure Rust port) for codec-blind audio matching.
+rusty-chromaprint = "0.3"
 kamadak-exif = "0.6.1"
 zip = "8.6.0"
 quick-xml = "0.41.0"

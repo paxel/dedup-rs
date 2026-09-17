@@ -4036,7 +4036,7 @@ mod ui_tests {
                 pdf_hash: None,
                 audio: Some(dedup_core::store::AudioFp {
                     duration_ms: 185_000,
-                    chunk_hashes: Vec::new(),
+                    fingerprint: Vec::new(),
                 }),
                 img_size: None,
                 origin: None,
@@ -4365,7 +4365,7 @@ mod ui_tests {
                 pdf_hash: None,
                 audio: Some(dedup_core::store::AudioFp {
                     duration_ms: 1000,
-                    chunk_hashes: Vec::new(),
+                    fingerprint: Vec::new(),
                 }),
                 img_size: None,
                 origin: None,
@@ -4570,7 +4570,7 @@ mod ui_tests {
                     pdf_hash: None,
                     audio: Some(dedup_core::store::AudioFp {
                         duration_ms: 1000,
-                        chunk_hashes: Vec::new(),
+                        fingerprint: Vec::new(),
                     }),
                     img_size: None,
                     origin: None,
@@ -4758,7 +4758,7 @@ mod ui_tests {
                     pdf_hash: None,
                     audio: Some(dedup_core::store::AudioFp {
                         duration_ms: 1000,
-                        chunk_hashes: Vec::new(),
+                        fingerprint: Vec::new(),
                     }),
                     img_size: None,
                     origin: None,
@@ -4975,7 +4975,7 @@ mod ui_tests {
                     pdf_hash: None,
                     audio: Some(dedup_core::store::AudioFp {
                         duration_ms: 1000,
-                        chunk_hashes: Vec::new(),
+                        fingerprint: Vec::new(),
                     }),
                     img_size: None,
                     origin: None,
@@ -5075,7 +5075,7 @@ mod ui_tests {
                     pdf_hash: None,
                     audio: Some(dedup_core::store::AudioFp {
                         duration_ms: 1000,
-                        chunk_hashes: Vec::new(),
+                        fingerprint: Vec::new(),
                     }),
                     img_size: None,
                     origin: None,
@@ -5448,7 +5448,7 @@ mod ui_tests {
                     pdf_hash: None,
                     audio: Some(dedup_core::store::AudioFp {
                         duration_ms: 1000,
-                        chunk_hashes: Vec::new(),
+                        fingerprint: Vec::new(),
                     }),
                     img_size: None,
                     origin: None,
@@ -5571,7 +5571,7 @@ mod ui_tests {
                 }
                 f.entry.audio = Some(dedup_core::store::AudioFp {
                     duration_ms: 60_000 + i as u32 * 45_000,
-                    chunk_hashes: vec![h],
+                    fingerprint: h.iter().map(|&b| u32::from(b)).collect(),
                 });
                 f
             })
@@ -5657,7 +5657,7 @@ mod ui_tests {
                     pdf_hash: None,
                     audio: Some(dedup_core::store::AudioFp {
                         duration_ms: (secs as u32) * 1000,
-                        chunk_hashes: vec![hash],
+                        fingerprint: hash.iter().map(|&b| u32::from(b)).collect(),
                     }),
                     img_size: None,
                     origin: None,
@@ -6428,7 +6428,7 @@ mod ui_tests {
                 pdf_hash: None,
                 audio: Some(dedup_core::store::AudioFp {
                     duration_ms: 1000,
-                    chunk_hashes: Vec::new(),
+                    fingerprint: Vec::new(),
                 }),
                 img_size: None,
                 origin: None,

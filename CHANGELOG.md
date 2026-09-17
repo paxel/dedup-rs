@@ -2,33 +2,35 @@
 
 All notable changes to the `dedup-rs` project will be documented in this file.
 
-## [0.6.0] - Unreleased
+## [0.7.0] - Unreleased
 
-### Added
+### Changed
 
-- **ACCEPT: contents allowed to repeat.** A podcast's per-folder `cover.jpg`
-  (or any content you have decided may exist many times inside one
-  repository) can be accepted, per repository, from the Duplicates tab: a
-  copy's right-click menu offers **ACCEPT IN REPO**, and each group header an
-  **ACCEPT GROUP** button that settles every repository present in one click.
-  Accepted copies are protected like read-only ones — never preselected,
-  never marked by AUTO-RESOLVE or MARK ALL, badged **accepted** on the card,
-  and unlockable one file at a time when you do want one gone. A group whose
-  every copy is accepted stays out of the list until **SHOW ACCEPTED** is
-  turned on (the way back to un-accept it; the count of hidden groups is
-  shown). The mark follows the content, not the path, so next month's episode
-  folder with the same cover is accepted already; acceptance never crosses
-  repositories, so the same cover in another repository is still an ordinary
-  duplicate.
-- **Accepted content is safe from every duplicate delete.** Grooming DEDUPE
-  (and `dedup diff rm`) leave accepted source files alone and the REVIEW
-  preview does not list them; `dedup repo dupes --delete` keeps every
-  accepted copy.
-- **`accepted:yes` / `accepted:no` filter condition** in the shared FILTER
-  wizard and on the CLI, and an **accepted** badge in the Browse file panel.
-- **`dedup accept <repo> [<path>...] [--rm]`** grants or withdraws the mark by
-  path, and with no paths lists a repository's accepted contents with the
-  files currently holding them; `dedup repo dupes` labels accepted copies.
+- **Audio similarity now hears the recording, not the file.** The audio
+  fingerprint used to be a hash of the first 100 KiB of the *encoded* stream,
+  which no two codecs ever share — so an audiobook chapter as MP3 and the same
+  chapter as M4B could never be found similar. Audio files now carry a
+  Chromaprint acoustic fingerprint of their first two minutes of *decoded*
+  sound, and similarity search groups the same recording across codecs,
+  bitrates and containers (MP3, AAC/M4A/M4B, FLAC, Vorbis, WAV, ALAC built in;
+  anything else — Opus, WMA, … — through `ffmpeg` when it is installed). Only
+  files within 2 s of each other in duration are compared, and a match must
+  cover most of both openings — a shared intro jingle is not a duplicate. The
+  threshold slider governs audio like images: 100 % is a bit-exact match, and
+  the score falls with the mean bit error of the aligned fingerprints.
+- **Audio files re-fingerprint on the next scan.** The old chunk hash is
+  dropped from the index (the stored duration survives); every audio file is
+  re-read once, its first two minutes decoded, on the first update after the
+  upgrade. Until a repository has been rescanned its audio does not take part
+  in similarity search at all — nothing is grouped by the stale value.
+
+### Fixed
+
+- **HE-AAC audiobooks report their real length.** An `.m4b`/`.m4a` whose
+  container runs at a different clock than its codec (HE-AAC at 22.05 kHz)
+  was indexed at half its duration; the length now comes from the
+  container's own time base, so such files show the right duration and fall
+  inside the 2 s window their other editions are compared in.
 
 ---
 
