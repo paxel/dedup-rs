@@ -89,7 +89,11 @@ copy the file across, delete it, rename one side to the other's name, or overwri
 with the other — and a side holding several copies of the same content is narrowed down \
 first with DELETE ALL or KEEP 1. A conflicting row also offers COMPARE, which shows both \
 versions side by side with a preview, their size, date and type — the larger and newer \
-values highlighted — and the same actions per side. Nothing happens until you click a row's \
+values highlighted — and the same actions per side. MERGE REST BY NAME, above the board, \
+guesses which files only one side has are the same thing under another name or format — the \
+same chapter as MP3 here and M4B there — pairing a file only with its mutual best name match; \
+each guess shows its score and is settled by hand like a conflict, or split again with UNPAIR. \
+Nothing happens until you click a row's \
 button; rows that are equal on both sides are hidden until you ask for them.
 
 Use the FILTER wizard below to narrow which files are considered — conditions combine with \
