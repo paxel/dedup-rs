@@ -883,11 +883,8 @@ fn ffmpeg_audio_fingerprint(path: &Path) -> Option<Vec<u32>> {
     if !output.status.success() || output.stdout.len() < 2 {
         return None;
     }
-    let samples: Vec<i16> = output
-        .stdout
-        .chunks_exact(2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]))
-        .collect();
+    let (pairs, _odd_byte) = output.stdout.as_chunks::<2>();
+    let samples: Vec<i16> = pairs.iter().map(|b| i16::from_le_bytes(*b)).collect();
     Some(fingerprint_pcm(&samples, RATE, 1))
 }
 
