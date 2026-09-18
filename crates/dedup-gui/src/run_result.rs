@@ -19,6 +19,7 @@ use egui::{Id, RichText};
 pub const MAX_PROBLEMS: usize = 200;
 
 /// What one finished operation did.
+#[derive(Debug)]
 pub struct RunReport {
     /// What ran, e.g. `"Sync group 'offsite'"`.
     title: String,
@@ -97,6 +98,11 @@ impl RunReport {
         !self.cancelled && self.problems.is_empty() && self.problems_dropped == 0
     }
 
+    /// Whether this exact problem line is already listed.
+    pub fn has_problem(&self, problem: &str) -> bool {
+        self.problems.iter().any(|p| p == problem)
+    }
+
     /// How many individual failures are known (including any past the cap).
     pub fn problem_count(&self) -> u64 {
         self.total_problems()
@@ -153,6 +159,11 @@ impl ResultModal {
 
     pub fn close(&mut self) {
         self.report = None;
+    }
+
+    #[cfg(test)]
+    pub fn is_open(&self) -> bool {
+        self.report.is_some()
     }
 
     /// Render the report, if one is waiting. Returns true while it is on screen

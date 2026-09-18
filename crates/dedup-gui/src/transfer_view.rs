@@ -23,23 +23,19 @@ use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::diff::{
     CopyDest, DiffAction, DiffEvent, DiffItem, DiffPairing, DiffProgress, DiffRelation, DiffRun,
-    FolderMode, RepoDiffRow, SyncDelete, copy_file_between, delete_file, diff_copy, diff_print,
-    diff_sync, export_to_folder, overwrite_file, plan_folder_export, plan_repo_diff, plan_sync,
-    rename_file,
+    FolderMode, PlanPhase, PlanProgress, PlanReporter, RepoDiffRow, SyncDelete, copy_file_between,
+    delete_file, diff_copy, diff_print_reporting, diff_sync, export_to_folder, overwrite_file,
+    plan_folder_export_reporting, plan_repo_diff_reporting, plan_sync_reporting, rename_file,
 };
 use dedup_core::store::{Store, SyncGroup, SyncMode};
 use dedup_core::sync_group::{delete_mode, guard_mirror_source};
 use dedup_core::update::CancellationToken;
 use egui::{Id, RichText};
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::board;
 use crate::board::PREVIEW_CAP;
-
-/// How many recent actions the running panel keeps in its scrolling log.
-const RUN_LOG_LIMIT: usize = 10;
 
 /// Longest texture edge uploaded to the GPU for a DIFF preview, matching the
 /// lightbox's limit; larger images are downscaled by the decoder to stay within
@@ -605,20 +601,29 @@ fn diff_action(
 /// Plan a review-board preview for `config`, off the UI thread. Dispatches on
 /// where the transfer lands; each branch reads the relevant index(es), which is
 /// the work that must not block the window on large repos.
-fn build_review_preview(store: &Store, config: &RunConfig) -> Result<ReviewPreviewData, String> {
+fn build_review_preview(
+    store: &Store,
+    config: &RunConfig,
+    progress: PlanReporter<'_>,
+    cancel: &CancellationToken,
+) -> Result<ReviewPreviewData, String> {
     match &config.dest {
-        StartDest::Sync { target, delete, .. } => preview_sync(store, config, target, *delete),
+        StartDest::Sync { target, delete, .. } => {
+            preview_sync(store, config, target, *delete, progress, cancel)
+        }
         StartDest::Repo {
             references,
             target,
             subdir,
-        } => preview_repo(store, config, references, target, subdir),
+        } => preview_repo(store, config, references, target, subdir, progress, cancel),
         StartDest::Folder {
             references,
             dir,
             mode,
             invert,
-        } => preview_folder(store, config, references, dir, *mode, *invert),
+        } => preview_folder(
+            store, config, references, dir, *mode, *invert, progress, cancel,
+        ),
     }
 }
 
@@ -632,6 +637,8 @@ fn build_group_preview(
     store: &Store,
     group: &SyncGroup,
     filter: Option<&str>,
+    progress: PlanReporter<'_>,
+    cancel: &CancellationToken,
 ) -> Result<GroupPreviewData, String> {
     guard_mirror_source(store, group).map_err(|e| e.to_string())?;
     let mut rows = Vec::new();
@@ -641,13 +648,15 @@ fn build_group_preview(
     // Copies carry the main's file, so their facts come from the main index.
     let (main_db, main_base) = open_facts(store, &group.main);
     for sink in &group.sinks {
-        let plan = plan_sync(
+        let plan = plan_sync_reporting(
             store,
             &group.main,
             &sink.repo,
             true,
             delete_mode(sink.mode),
             filter,
+            progress,
+            cancel,
         )
         .map_err(|e| e.to_string())?;
         // A plan that deletes everything the sink holds today is a wholesale
@@ -741,9 +750,18 @@ fn build_group_back_preview(
     group: &SyncGroup,
     sink: &str,
     filter: Option<&str>,
+    progress: PlanReporter<'_>,
+    cancel: &CancellationToken,
 ) -> Result<GroupPreviewData, String> {
-    let pull = dedup_core::diff::plan_sync_back(store, sink, &group.main, filter)
-        .map_err(|e| e.to_string())?;
+    let pull = dedup_core::diff::plan_sync_back_reporting(
+        store,
+        sink,
+        &group.main,
+        filter,
+        progress,
+        cancel,
+    )
+    .map_err(|e| e.to_string())?;
     let (sink_db, sink_base) = open_facts(store, sink);
     let (main_db, main_base) = open_facts(store, &group.main);
     let mut rows = Vec::new();
@@ -868,14 +886,18 @@ fn preview_sync(
     config: &RunConfig,
     target: &str,
     delete: SyncDelete,
+    progress: PlanReporter<'_>,
+    cancel: &CancellationToken,
 ) -> Result<ReviewPreviewData, String> {
-    let plan = plan_sync(
+    let plan = plan_sync_reporting(
         store,
         &config.source,
         target,
         true,
         delete,
         config.filter.as_deref(),
+        progress,
+        cancel,
     )
     .map_err(|e| e.to_string())?;
     // Facts come from whichever side holds the file: a copy's source, a
@@ -967,16 +989,26 @@ fn preview_sync(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn preview_repo(
     store: &Store,
     config: &RunConfig,
     references: &[String],
     target: &str,
     subdir: &str,
+    progress: PlanReporter<'_>,
+    cancel: &CancellationToken,
 ) -> Result<ReviewPreviewData, String> {
     let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
-    let items = diff_print(store, &config.source, &ref_slice, config.filter.as_deref())
-        .map_err(|e| e.to_string())?;
+    let items = diff_print_reporting(
+        store,
+        &config.source,
+        &ref_slice,
+        config.filter.as_deref(),
+        progress,
+        cancel,
+    )
+    .map_err(|e| e.to_string())?;
     // A file the target lacks (New) is added on the target side; on the source
     // side a COPY leaves it unchanged while a MOVE removes it. Files the target
     // already has (Equal) are unchanged on both sides. DeletedInReference isn't
@@ -1098,6 +1130,7 @@ fn preview_repo(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn preview_folder(
     store: &Store,
     config: &RunConfig,
@@ -1105,15 +1138,19 @@ fn preview_folder(
     dir: &Path,
     mode: FolderMode,
     invert: bool,
+    progress: PlanReporter<'_>,
+    cancel: &CancellationToken,
 ) -> Result<ReviewPreviewData, String> {
     let ref_slice: Vec<&str> = references.iter().map(String::as_str).collect();
-    let rels = plan_folder_export(
+    let rels = plan_folder_export_reporting(
         store,
         &config.source,
         &ref_slice,
         mode,
         invert,
         config.filter.as_deref(),
+        progress,
+        cancel,
     )
     .map_err(|e| e.to_string())?;
     // Exporting adds each file into the folder; a MOVE also removes it from the
@@ -1209,6 +1246,25 @@ fn prompt_for(config: &RunConfig, copies: usize, deletes: usize) -> Option<Strin
     })
 }
 
+impl StartDest {
+    /// The repository the files land in, if the destination is one.
+    fn target_repo(&self) -> Option<&str> {
+        match self {
+            StartDest::Repo { target, .. } | StartDest::Sync { target, .. } => Some(target),
+            StartDest::Folder { .. } => None,
+        }
+    }
+
+    /// Where the files land, for a title or a log line: the repo name or the
+    /// export folder.
+    fn display_name(&self) -> String {
+        match self {
+            StartDest::Repo { target, .. } | StartDest::Sync { target, .. } => target.clone(),
+            StartDest::Folder { dir, .. } => dir.display().to_string(),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum OpResult {
     Copied {
@@ -1225,9 +1281,11 @@ enum OpResult {
         /// True for a MIRROR run (labels the status line), false for SYNC.
         mirror: bool,
     },
-    /// A single DIFF board row action finished; the message is the status line.
+    /// A board action finished; the message is the status line and `note`,
+    /// when the action was a single row action, its card.
     Applied {
         message: String,
+        note: Option<crate::activity::Notification>,
     },
     Error(String),
 }
@@ -1235,8 +1293,9 @@ enum OpResult {
 /// Messages flowing from the worker thread to the UI thread: live per-file
 /// progress events plus the single terminal result.
 enum Msg {
-    Progress(DiffEvent),
     Done(OpResult),
+    /// A preview the user cancelled from the activity modal: nothing to apply.
+    PreviewCancelled,
     /// A finished DIFF comparison, built off the UI thread (it scans both
     /// repos' full indexes). Rows come back unsorted; the board sorts them.
     DiffPreview(Result<DiffPreviewData, String>),
@@ -1311,15 +1370,124 @@ struct DiffPreviewData {
     target_header: String,
 }
 
-/// [`DiffProgress`] adapter that forwards every diff event onto the TransferView
-/// channel. Sends never block; a dropped receiver is fine.
-struct ChannelDiffProgress {
-    tx: Sender<Msg>,
+/// [`DiffProgress`] adapter for a run behind the activity modal or a row
+/// action: each file becomes the modal's phase line and an event-log line,
+/// each failure a live problem and a failed log line. `repo` is where the
+/// change lands (the target, the sink, the main, or an export folder).
+struct RunProgress {
+    activity: crate::activity::ActivityProgress,
+    repo: String,
 }
 
-impl DiffProgress for ChannelDiffProgress {
+impl DiffProgress for RunProgress {
     fn on(&self, event: DiffEvent) {
-        let _ = self.tx.send(Msg::Progress(event));
+        match event {
+            DiffEvent::Progress {
+                action,
+                done,
+                total,
+                rel_path,
+            } => {
+                let (doing, did) = match action {
+                    DiffAction::Copy => ("copying", "Copied"),
+                    DiffAction::Move => ("moving", "Moved"),
+                    DiffAction::Delete => ("deleting", "Deleted"),
+                };
+                self.activity
+                    .phase(format!("{doing} {rel_path}"), done, Some(total));
+                self.activity
+                    .record(&crate::activity::Notification::changed(
+                        did, &self.repo, &rel_path,
+                    ));
+            }
+            DiffEvent::Error { path, message } => {
+                log::warn!("transfer error: {path}: {message}");
+                self.activity.problem(format!("{path}: {message}"));
+                self.activity.record(&crate::activity::Notification::failed(
+                    "Transfer", &self.repo, &path, &message,
+                ));
+            }
+        }
+    }
+}
+
+/// Map a plan's phase onto the activity modal.
+fn plan_phase(progress: &crate::activity::ActivityProgress, p: PlanProgress) {
+    match p.phase {
+        PlanPhase::Reading { repo } => progress.phase(format!("reading '{repo}'"), 0, None),
+        PlanPhase::Pairing => progress.phase("pairing files", p.done, p.total),
+        PlanPhase::Grouping => progress.phase("grouping duplicates", p.done, p.total),
+    }
+}
+
+impl GroupSyncResult {
+    fn report(&self) -> crate::run_result::RunReport {
+        let mut report = crate::run_result::RunReport::new(format!("Sync group '{}'", self.main))
+            .count("copied", self.copied)
+            .count("deleted", self.deleted)
+            .cancelled(self.cancelled)
+            .problems(self.failures.clone());
+        // A promote refused because the path is taken must never look like
+        // "nothing happened".
+        if self.skipped_files > 0 {
+            report = report.count("skipped", self.skipped_files).note(format!(
+                "{} file(s) were not copied: the target already has a different file at \
+                 that exact path. The review board marks these rows as conflicts — \
+                 resolve each with < OVERWRITE (or DELETE R).",
+                self.skipped_files
+            ));
+        }
+        if !self.skipped.is_empty() {
+            report = report.note(format!(
+                "{} sink(s) were never pushed and are now stale: {}",
+                self.skipped.len(),
+                self.skipped.join(", ")
+            ));
+        }
+        // `errors` counts failures the modal's live list may not hold all of;
+        // keep the true count visible.
+        if self.errors > report.problem_count() {
+            report = report.count("files that failed to copy", self.errors);
+        }
+        report
+    }
+}
+
+impl OpResult {
+    /// The run report for a batch result; `None` for a row action or an
+    /// error (those become a card).
+    fn report(&self) -> Option<crate::run_result::RunReport> {
+        match self {
+            OpResult::Copied {
+                copied,
+                cancelled,
+                moved,
+            } => Some(
+                crate::run_result::RunReport::new(if *moved { "Move" } else { "Copy" })
+                    .count("copied", *copied)
+                    .cancelled(*cancelled),
+            ),
+            OpResult::Synced {
+                copied,
+                deleted,
+                skipped,
+                errors,
+                cancelled,
+                mirror,
+            } => {
+                let mut report =
+                    crate::run_result::RunReport::new(if *mirror { "Mirror" } else { "Sync" })
+                        .count("copied", *copied)
+                        .count("deleted", *deleted)
+                        .count("skipped", *skipped)
+                        .cancelled(*cancelled);
+                if *errors > 0 {
+                    report = report.count("errors", *errors);
+                }
+                Some(report)
+            }
+            OpResult::Applied { .. } | OpResult::Error(_) => None,
+        }
     }
 }
 
@@ -1412,28 +1580,27 @@ pub struct TransferView {
     error: Option<String>,
     confirm: Option<String>,
     running: bool,
-    /// Set while a preview (DIFF or review-board) is being planned on a worker
-    /// thread, so the UI shows it is busy and does not launch a second one.
+    /// Set while a preview (DIFF or review-board) is being planned behind the
+    /// activity modal.
     previewing: bool,
+    /// Whether the run in flight is a row action (a card when it lands)
+    /// rather than an operation on the activity modal.
+    row_action: bool,
     /// The run a raised confirmation authorises, captured when its plan landed.
     /// PROCEED runs *this*, not whatever the live controls say — the two can
     /// differ across the async plan/confirm gap. Cleared when the dialog closes.
     pending_confirm: Option<Box<RunConfig>>,
     /// Set while a single-row APPLY runs: refresh the preview when it finishes.
     pending_refresh: bool,
-    cancel: CancellationToken,
-    // Live run progress: the last N actions, the running counters and the
-    // file currently being handled.
-    run_log: VecDeque<String>,
-    run_done: u64,
-    run_total: u64,
-    run_current: String,
-    /// Every per-file failure of the current run, capped. The live `run_log`
-    /// keeps only the last handful, so on a large run its errors scroll away;
-    /// this retains the full list for the end-of-run report.
-    run_problems: Vec<String>,
-    /// The report of the last finished batch run.
-    result: crate::run_result::ResultModal,
+    /// The app-wide activity owner: long work runs behind its modal, row
+    /// actions answer with its cards, and every file changed is in its log.
+    activity: crate::activity::Shared,
+    /// WHAT has been answered: the command was picked (or a number key
+    /// pressed), so the repositories section may show.
+    command_chosen: bool,
+    /// After REVIEW or RUN the selection sections fold into one summary line
+    /// until CHANGE.
+    selection_collapsed: bool,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     /// Tooltip wording for this frame, set at the top of [`Self::show`] from
@@ -1463,7 +1630,6 @@ enum Act {
     Ask,
     Confirm,
     CancelConfirm,
-    CancelRun,
     /// Apply a single review row immediately (its namespaced key).
     ApplyRow(String),
     /// GROUP SYNC BACK: replace the main's file at this rel path with the
@@ -1536,15 +1702,12 @@ impl TransferView {
             confirm: None,
             running: false,
             previewing: false,
+            row_action: false,
             pending_confirm: None,
             pending_refresh: false,
-            cancel: CancellationToken::new(),
-            run_log: VecDeque::new(),
-            run_problems: Vec::new(),
-            result: crate::run_result::ResultModal::default(),
-            run_done: 0,
-            run_total: 0,
-            run_current: String::new(),
+            activity: crate::activity::scratch(),
+            command_chosen: false,
+            selection_collapsed: false,
             tx,
             rx,
             verbosity: TooltipVerbosity::default(),
@@ -1555,9 +1718,13 @@ impl TransferView {
 
     /// Construct wired to the app's shared lock registry, so a repo unlocked
     /// here is unlocked on every tab (and vice versa).
-    pub fn new_with_locks(locks: crate::locks::RepoLocks) -> Self {
+    pub fn new_with_locks(
+        locks: crate::locks::RepoLocks,
+        activity: crate::activity::Shared,
+    ) -> Self {
         let mut me = Self::new();
         me.locks = locks;
+        me.activity = activity;
         me
     }
 
@@ -1588,26 +1755,17 @@ impl TransferView {
         // reflects the applied action instead of dropping to the run log.
         if self.pending_refresh && !self.running {
             self.pending_refresh = false;
-            self.reset_run();
-            self.run_preview(store);
+            self.run_preview(store, &ui.ctx().clone());
         }
         if !self.loaded {
             self.sync_repos(store);
         }
-        // The end-of-run report sits above everything, and swallows shortcuts
-        // while it is up.
-        let result_open = self.result.show(ui);
-
         let mut acts: Vec<Act> = Vec::new();
 
-        // Keyboard shortcuts — skipped while a modal is up, a run or preview is
-        // active, or a text field is focused.
-        if self.confirm.is_none()
-            && !result_open
-            && !self.running
-            && !self.previewing
-            && !ui.ctx().egui_wants_keyboard_input()
-        {
+        // Keyboard shortcuts — skipped while the confirmation or the activity
+        // modal is up, or a text field is focused.
+        let activity_busy = crate::activity::lock(&self.activity).is_running();
+        if self.confirm.is_none() && !activity_busy && !ui.ctx().egui_wants_keyboard_input() {
             ui.input(|i| {
                 if i.key_pressed(egui::Key::Num1) {
                     acts.push(Act::SetCommand(Command::Copy));
@@ -1655,46 +1813,29 @@ impl TransferView {
                     "1 copy · 2 move · 3 sync · 4 mirror · 5 diff · P review · R run",
                 );
 
-                self.repo_rows(ui, &mut acts);
-                self.command_bar(ui, &mut acts);
-                // SYNC/MIRROR are always repo→repo at the same relative path, so
-                // they hide the DEST/subdir/folder controls: SYNC shows its
-                // DELETE MISSING toggle; MIRROR shows a warning (it always
-                // deletes).
-                match self.command {
-                    Command::Diff => self.pairing_bar(ui, &mut acts),
-                    Command::Sync => self.sync_bar(ui, &mut acts),
-                    Command::Mirror => self.mirror_bar(ui),
-                    Command::GroupSync => self.group_sinks_bar(ui, &mut acts),
-                    Command::GroupSyncBack => self.group_back_sink_bar(ui, &mut acts),
-                    _ => {
-                        self.dest_bar(ui, &mut acts);
-                        match self.destination {
-                            Destination::Repo => self.subdir_bar(ui, &mut acts),
-                            Destination::Folder => {
-                                self.folder_bar(ui, &mut acts);
-                                self.mode_bar(ui, &mut acts);
-                            }
+                // Reading order is the workflow: WHAT (the command), WITH
+                // WHICH (the repositories), HOW (destination, options, filter),
+                // then RUN. Each section appears once the one before it has an
+                // answer, and after REVIEW or RUN they fold into one line.
+                if self.selection_collapsed {
+                    self.selection_summary(ui);
+                } else {
+                    self.command_bar(ui, &mut acts);
+                    if self.command_chosen {
+                        self.repo_rows(ui, &mut acts);
+                        match self.command {
+                            Command::GroupSync => self.group_sinks_bar(ui, &mut acts),
+                            Command::GroupSyncBack => self.group_back_sink_bar(ui, &mut acts),
+                            _ => {}
                         }
                     }
-                }
-                // The shared FILTER wizard; the source repo backs its MIME
-                // suggestions and live match count. DIFF compares the repos
-                // whole, so it has nothing to filter.
-                if !self.command.is_diff() {
-                    let source = self.source.clone();
-                    let outcome = self.filter.ui(ui, store, source.as_deref(), self.verbosity);
-                    if outcome.changed {
-                        self.clear_preview();
+                    if self.command_chosen && self.source.is_some() {
+                        self.how_sections(ui, store, &mut acts);
                     }
-                    if outcome.status.is_some() {
-                        self.status = outcome.status;
-                    }
-                    if outcome.error.is_some() {
-                        self.error = outcome.error;
+                    if self.command_chosen && self.ready() {
+                        self.action_bar(ui, &mut acts);
                     }
                 }
-                self.action_bar(ui, &mut acts);
 
                 if let Some(err) = &self.error {
                     ui.colored_label(theme::red(), err);
@@ -1703,14 +1844,7 @@ impl TransferView {
                     ui.label(RichText::new(status).color(theme::tan()).size(13.0));
                 }
                 ui.separator();
-                // RUN and REVIEW are mutually exclusive: while a run is active
-                // or has left a log, show the live run panel; otherwise show the
-                // preview.
-                if self.running || !self.run_log.is_empty() {
-                    self.run_panel(ui);
-                } else {
-                    self.preview_panel(ui, store, &mut acts);
-                }
+                self.preview_panel(ui, store, &mut acts);
             });
 
         if let Some(prompt) = self.confirm.clone() {
@@ -1755,8 +1889,9 @@ impl TransferView {
             }
         }
 
+        let ctx = ui.ctx().clone();
         for act in acts {
-            self.apply(store, frame, act);
+            self.apply(store, &ctx, frame, act);
         }
     }
 
@@ -1818,8 +1953,35 @@ impl TransferView {
     }
 
     fn repo_rows(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "REPOS — PICK SOURCE & TARGET", theme::lilac(), |ui| {
-            // SOURCE: every repo, orange when picked.
+        let title = match self.command {
+            Command::GroupSync | Command::GroupSyncBack => "WITH WHICH — THE GROUP'S MAIN",
+            Command::Diff => "WITH WHICH — THE TWO REPOSITORIES TO COMPARE",
+            _ if self.destination == Destination::Folder => "WITH WHICH — SOURCE REPOSITORY",
+            _ => "WITH WHICH — SOURCE & TARGET REPOSITORIES",
+        };
+        // A target column only when the command lands in a repo picked here:
+        // a folder export has none, and both GROUP commands pick their other
+        // repo in the SINK section below.
+        let with_target = self.destination == Destination::Repo
+            && !matches!(self.command, Command::GroupSync | Command::GroupSyncBack);
+        crate::lcars::section_lcars(ui, title, theme::lilac(), |ui| {
+            if with_target {
+                ui.columns(2, |cols| {
+                    self.source_column(&mut cols[0], acts);
+                    self.target_column(&mut cols[1], acts);
+                });
+            } else {
+                self.source_column(ui, acts);
+            }
+            if self.source.is_some() {
+                self.pool_row(ui, acts);
+            }
+        });
+    }
+
+    /// SOURCE: every repo, orange when picked.
+    fn source_column(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        {
             let src = self.repos.clone();
             let mains = self.mains.clone();
             crate::repo_chip::chip_row(ui, "xfer_source", "SOURCE", src.len(), |ui, i| {
@@ -1849,13 +2011,12 @@ impl TransferView {
                 self.locks.handle_badge(chip.lock, self.verbosity, name);
                 chip.outer
             });
+        }
+    }
 
-            // TARGET (only when copying/moving into a repo — a folder export has
-            // no target, and both GROUP SYNC and GROUP SYNC BACK pick their other
-            // repo in the SINK panel below, not here: GROUP SYNC pushes the main
-            // to its sinks, GROUP SYNC BACK pulls a chosen sink into the main).
-            if self.destination == Destination::Repo
-                && !matches!(self.command, Command::GroupSync | Command::GroupSyncBack)
+    /// TARGET: every repo but the source, blue when picked.
+    fn target_column(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        {
             {
                 let tgt: Vec<String> = self
                     .repos
@@ -1891,12 +2052,16 @@ impl TransferView {
                     chip.outer
                 });
             }
+        }
+    }
 
-            // DUPEPOOL: content any of these repos already holds is treated as
-            // "already known" and never re-copied. The target is *always* a
-            // reference (handled in `references`), so — like the source — it's
-            // simply left out of this row rather than shown as a locked chip. SYNC
-            // compares source against the single target only, so it has no pool.
+    /// DUPEPOOL: content any of these repos already holds is treated as
+    /// "already known" and never re-copied. The target is *always* a
+    /// reference (handled in `references`), so — like the source — it's
+    /// simply left out of this row rather than shown as a locked chip. SYNC
+    /// compares source against the single target only, so it has no pool.
+    fn pool_row(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        {
             if !self.command.repo_to_repo() {
                 // The toggleable pool repos: everything except the source and target.
                 let eligible: Vec<String> = self
@@ -1959,7 +2124,7 @@ impl TransferView {
                     chip.outer
                 });
             }
-        });
+        }
     }
 
     /// The reference list for the diff ops: the target (primary) plus any extra
@@ -1998,9 +2163,7 @@ impl TransferView {
     /// resolved (a target repo, a non-blank export folder, or — for GROUP
     /// SYNC — at least one sink selected), and nothing is already running.
     fn ready(&self) -> bool {
-        // A preview in flight disables REVIEW/RUN too, so a second click cannot
-        // launch an overlapping worker.
-        if self.running || self.previewing || self.source.is_none() {
+        if self.source.is_none() {
             return false;
         }
         if matches!(self.command, Command::GroupSync | Command::GroupSyncBack) {
@@ -2012,12 +2175,98 @@ impl TransferView {
         }
     }
 
+    /// HOW: the command's own controls (destination, subfolder, folder and
+    /// mode, sync options, pairing) and the shared filter.
+    fn how_sections(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, acts: &mut Vec<Act>) {
+        // SYNC/MIRROR are always repo→repo at the same relative path, so
+        // they hide the DEST/subdir/folder controls: SYNC shows its
+        // DELETE MISSING toggle; MIRROR shows a warning (it always
+        // deletes). GROUP SYNC picks its sinks in WITH WHICH.
+        match self.command {
+            Command::Diff => self.pairing_bar(ui, acts),
+            Command::Sync => self.sync_bar(ui, acts),
+            Command::Mirror => self.mirror_bar(ui),
+            Command::GroupSync | Command::GroupSyncBack => {}
+            _ => {
+                self.dest_bar(ui, acts);
+                match self.destination {
+                    Destination::Repo => self.subdir_bar(ui, acts),
+                    Destination::Folder => {
+                        self.folder_bar(ui, acts);
+                        self.mode_bar(ui, acts);
+                    }
+                }
+            }
+        }
+        // The shared FILTER wizard; the source repo backs its MIME
+        // suggestions and live match count. DIFF compares the repos
+        // whole, so it has nothing to filter.
+        if !self.command.is_diff() {
+            let source = self.source.clone();
+            let outcome = self.filter.ui(ui, store, source.as_deref(), self.verbosity);
+            if outcome.changed {
+                self.clear_preview();
+            }
+            if outcome.status.is_some() {
+                self.status = outcome.status;
+            }
+            if outcome.error.is_some() {
+                self.error = outcome.error;
+            }
+        }
+    }
+
+    /// The one line the selection folds into after REVIEW or RUN, with
+    /// CHANGE to unfold it.
+    fn selection_summary(&mut self, ui: &mut egui::Ui) {
+        let source = self.source.clone().unwrap_or_default();
+        let other = match self.command {
+            Command::GroupSync => format!("to {} sink(s)", self.selected_sinks.len()),
+            Command::GroupSyncBack => format!(
+                "from '{}'",
+                self.selected_sinks.first().cloned().unwrap_or_default()
+            ),
+            Command::Diff => format!("against '{}'", self.target.clone().unwrap_or_default()),
+            _ => match self.destination {
+                Destination::Repo => {
+                    format!("to '{}'", self.target.clone().unwrap_or_default())
+                }
+                Destination::Folder => format!("to folder {}", self.folder.trim()),
+            },
+        };
+        let filter = self
+            .filter_string()
+            .map(|f| format!(" · filter: {f}"))
+            .unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "{} from '{source}' {other}{filter}",
+                    self.command.label()
+                ))
+                .color(theme::tan())
+                .size(12.5),
+            );
+            if crate::lcars::toggle_button(ui, "CHANGE", false, theme::lilac())
+                .explain(
+                    self.verbosity,
+                    "Change the command or repositories",
+                    "Unfold the command, repository and option sections to set up \
+                     another transfer. The board below stays until the next REVIEW.",
+                )
+                .clicked()
+            {
+                self.selection_collapsed = false;
+            }
+        });
+    }
+
     fn command_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         let has_group = self.current_group.is_some();
         let title = if has_group {
-            "COMMAND — COPY, MOVE, SYNC, MIRROR, GROUP SYNC, GROUP SYNC BACK OR DIFF"
+            "WHAT — COPY, MOVE, SYNC, MIRROR, GROUP SYNC, GROUP SYNC BACK OR DIFF"
         } else {
-            "COMMAND — COPY, MOVE, SYNC, MIRROR OR DIFF"
+            "WHAT — COPY, MOVE, SYNC, MIRROR OR DIFF"
         };
         crate::lcars::section_lcars(ui, title, theme::orange(), |ui| {
             ui.horizontal(|ui| {
@@ -2030,19 +2279,14 @@ impl TransferView {
                 }
                 cmds.push(Command::Diff);
                 for cmd in cmds {
-                    let sel = self.command == cmd;
+                    let sel = self.command_chosen && self.command == cmd;
                     let accent = if cmd.destructive() {
                         theme::red()
                     } else {
                         theme::amber()
                     };
-                    let fill = if sel { accent } else { theme::panel() };
-                    // Unselected pills sit on the dark panel — black text would
-                    // vanish there, so they carry their accent color instead.
-                    let col = if sel { theme::black() } else { accent };
                     let (short, verbose) = cmd.tooltip();
-                    if ui
-                        .add(egui::Button::new(RichText::new(cmd.label()).color(col)).fill(fill))
+                    if crate::lcars::toggle_button(ui, cmd.label(), sel, accent)
                         .explain(self.verbosity, short, verbose)
                         .clicked()
                     {
@@ -2661,76 +2905,55 @@ impl TransferView {
     }
 
     fn action_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "ACTION — REVIEW & RUN", theme::amber(), |ui| {
-            ui.horizontal(|ui| {
-                let ready = self.ready();
-                if ui
-                    .add_enabled(
-                        ready,
-                        egui::Button::new(RichText::new("REVIEW").color(theme::black())),
-                    )
-                    .explain(
-                        self.verbosity,
-                        "Review the first transfers",
-                        "Show the first matching `from → to` transfers (up to a \
-                         limit) and a total count, without changing anything on disk. \
-                         REVIEW and RUN are mutually exclusive — starting a run clears the \
-                         review.",
-                    )
-                    .clicked()
-                {
-                    acts.push(Act::Preview);
-                }
-                if self.command.is_diff() {
-                    if self.running || self.previewing {
-                        ui.add(egui::Spinner::new().color(theme::amber()));
-                    }
-                    return;
-                }
-                let run = egui::Button::new(RichText::new("RUN").color(theme::black()))
-                    .fill(theme::amber());
-                // The session locks can bar the whole run (e.g. MIRROR into a
-                // locked target). The disabled button's hover says exactly why
-                // and which padlock to click.
-                let lock_block = self.lock_block();
-                let resp = ui.add_enabled(ready && lock_block.is_none(), run);
-                let resp = if let Some(why) = &lock_block {
-                    resp.on_disabled_hover_text(why.clone())
-                } else {
-                    resp.explain(
-                        self.verbosity,
-                        "Run the command",
-                        "Run the selected command (COPY/MOVE) on a background thread, \
-                         after a confirmation dialog. Progress, the current file, and a \
-                         running count are shown live.",
-                    )
-                };
-                if resp.clicked() {
-                    acts.push(Act::Ask);
-                }
-                if self.running {
-                    ui.add(egui::Spinner::new().color(theme::amber()));
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("CANCEL").color(theme::ink_on(theme::red())),
-                            )
-                            .fill(theme::red()),
-                        )
+        crate::lcars::section_lcars(
+            ui,
+            "RUN — REVIEW THE PLAN, THEN RUN IT",
+            theme::amber(),
+            |ui| {
+                ui.horizontal(|ui| {
+                    let ready = self.ready();
+                    if crate::lcars::action_button(ui, "REVIEW", ready, theme::blue())
                         .explain(
                             self.verbosity,
-                            "Stop the running operation",
-                            "Cancel the in-progress operation. Files already transferred \
-                             before cancelling stay as they are — this stops further \
-                             work, it doesn't roll back.",
+                            "Review the transfers",
+                            "Plan the transfer in the activity window and show every planned \
+                         `from → to` on the board below, without changing anything on \
+                         disk. Starting a run clears the review.",
                         )
                         .clicked()
                     {
-                        acts.push(Act::CancelRun);
+                        acts.push(Act::Preview);
                     }
-                }
-            });
-        });
+                    if self.command.is_diff() {
+                        return;
+                    }
+                    // The session locks can bar the whole run (e.g. MIRROR into a
+                    // locked target). The blocked button's hover says exactly why
+                    // and which padlock to click.
+                    let lock_block = self.lock_block();
+                    let resp = crate::lcars::action_button(
+                        ui,
+                        "RUN",
+                        ready && lock_block.is_none(),
+                        theme::amber(),
+                    );
+                    let resp = if let Some(why) = &lock_block {
+                        resp.on_hover_text(why.clone())
+                    } else {
+                        resp.explain(
+                            self.verbosity,
+                            "Run the command",
+                            "After a confirmation, run the command in the activity window: \
+                         it shows each file as it is transferred, any problems, and \
+                         ends with the result. CANCEL stops further work.",
+                        )
+                    };
+                    if resp.clicked() {
+                        acts.push(Act::Ask);
+                    }
+                });
+            },
+        );
     }
 
     /// The rows a bulk action would touch: those currently *listed* on the
@@ -3142,44 +3365,6 @@ impl TransferView {
             .unwrap_or_else(|_| name.to_string())
     }
 
-    /// The live run panel: a spinner, the file currently being handled, a
-    /// scrolling list of the last N actions and a running summary line. Styled
-    /// like the repo scan progress in `app.rs`.
-    fn run_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if self.running {
-                ui.add(egui::Spinner::new().color(theme::amber()));
-            }
-            let current = if self.run_current.is_empty() {
-                "preparing…".to_string()
-            } else {
-                self.run_current.clone()
-            };
-            ui.label(RichText::new(current).color(theme::amber()).strong());
-        });
-
-        let summary = if self.run_total > 0 {
-            format!("{} / {}", self.run_done, self.run_total)
-        } else {
-            self.run_done.to_string()
-        };
-        ui.label(
-            RichText::new(format!("Processed {summary}"))
-                .color(theme::tan())
-                .size(12.0),
-        );
-
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .max_height(180.0)
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                for line in &self.run_log {
-                    ui.label(RichText::new(line).color(theme::text()).size(12.0));
-                }
-            });
-    }
-
     fn confirm_modal(&mut self, ui: &mut egui::Ui, prompt: &str, acts: &mut Vec<Act>) {
         egui::Modal::new(Id::new("transfer-confirm")).show(&ui.ctx().clone(), |ui| {
             ui.set_width(380.0);
@@ -3227,7 +3412,13 @@ impl TransferView {
         });
     }
 
-    fn apply(&mut self, store: &Arc<Store>, frame: Option<&eframe::Frame>, act: Act) {
+    fn apply(
+        &mut self,
+        store: &Arc<Store>,
+        ctx: &egui::Context,
+        frame: Option<&eframe::Frame>,
+        act: Act,
+    ) {
         match act {
             Act::PickSource(name) => {
                 if self.target.as_deref() == Some(name.as_str()) {
@@ -3253,6 +3444,7 @@ impl TransferView {
             }
             Act::SetCommand(cmd) => {
                 self.command = cmd;
+                self.command_chosen = true;
                 // SYNC/MIRROR are repo→repo only; snap the destination back to a
                 // repo so the target row is available (the DEST toggle is hidden).
                 if cmd.repo_to_repo() {
@@ -3288,19 +3480,18 @@ impl TransferView {
                     self.browse_subdir(store, frame);
                 }
             }
-            Act::Preview => self.run_preview(store),
+            Act::Preview => self.run_preview(store, ctx),
             Act::Ask => {
-                // Plan on a worker thread; the confirmation is raised (for this
-                // captured config) once the plan lands with real counts. DIFF
-                // has no batch RUN, so it never reaches here.
-                self.reset_run();
+                // Plan behind the activity modal; the confirmation is raised
+                // (for this captured config) once the plan lands with real
+                // counts. DIFF has no batch RUN, so it never reaches here.
                 if self.command == Command::GroupSync {
-                    self.spawn_group_preview(store, true);
+                    self.spawn_group_preview(store, ctx, true);
                 } else if self.command == Command::GroupSyncBack {
-                    self.spawn_group_back_preview(store, true);
+                    self.spawn_group_back_preview(store, ctx, true);
                 } else if let Some(config) = self.capture_run_config() {
                     let confirm = Box::new(config.clone());
-                    self.spawn_review_preview(store, config, Some(confirm));
+                    self.spawn_review_preview(store, ctx, config, Some(confirm));
                 }
             }
             Act::CancelConfirm => {
@@ -3314,11 +3505,11 @@ impl TransferView {
                 // Run the config/group the confirmation was built for, not
                 // live state.
                 if let Some((main, sink)) = self.pending_group_back.take() {
-                    self.start_group_back_pull(store, main, sink, None);
+                    self.start_group_back_pull(store, ctx, main, sink, None);
                 } else if let Some(group) = self.pending_group_confirm.take() {
-                    self.start_group_sync(store, group);
+                    self.start_group_sync(store, ctx, group);
                 } else if let Some(config) = self.pending_confirm.take() {
-                    self.start(store, *config, None);
+                    self.start(store, ctx, *config, None);
                 }
             }
             Act::ApplyRow(key) => {
@@ -3333,14 +3524,14 @@ impl TransferView {
                         self.selected_sinks.first().cloned(),
                     ) {
                         let only = std::iter::once(key).collect();
-                        self.start_group_back_pull(store, group.main, sink, Some(only));
+                        self.start_group_back_pull(store, ctx, group.main, sink, Some(only));
                     }
                 } else if self.lock_block().is_none()
                     && let Some(config) = self.capture_run_config()
                 {
                     // Never act past the lock, even from a preview built before
                     // the repo was re-locked.
-                    self.start(store, config, Some(key));
+                    self.start(store, ctx, config, Some(key));
                 }
             }
             Act::OverwriteMainRow(rel) => {
@@ -3356,11 +3547,35 @@ impl TransferView {
                 if self.locks.read_only(&group.main) {
                     return;
                 }
-                match dedup_core::diff::overwrite_file(store, &sink, &rel, &group.main, &rel) {
-                    // The conflict is resolved on disk: rebuild the preview so
-                    // the row disappears with correct counts.
-                    Ok(()) => self.run_preview(store),
-                    Err(e) => self.error = Some(e.to_string()),
+                let mut activity = crate::activity::lock(&self.activity);
+                if let Err(busy) = activity.begin_row_action() {
+                    activity.card(
+                        ctx,
+                        crate::activity::Notification::refused("OVERWRITE", &busy),
+                    );
+                    return;
+                }
+                let note =
+                    match dedup_core::diff::overwrite_file(store, &sink, &rel, &group.main, &rel) {
+                        Ok(()) => {
+                            crate::activity::Notification::changed("Overwrote", &group.main, &rel)
+                        }
+                        Err(e) => crate::activity::Notification::failed(
+                            "Overwrite",
+                            &group.main,
+                            &rel,
+                            &e.to_string(),
+                        ),
+                    };
+                activity.end_row_action();
+                activity.record(&note);
+                let ok = note.outcome.is_ok();
+                activity.card(ctx, note);
+                drop(activity);
+                // The conflict is resolved on disk: rebuild the preview so
+                // the row disappears with correct counts.
+                if ok {
+                    self.run_preview(store, ctx);
                 }
             }
             Act::DeleteSinkRow(rel) => {
@@ -3372,6 +3587,11 @@ impl TransferView {
                     return;
                 };
                 if self.locks.read_only(&sink) {
+                    return;
+                }
+                let mut activity = crate::activity::lock(&self.activity);
+                if let Err(busy) = activity.begin_row_action() {
+                    activity.card(ctx, crate::activity::Notification::refused("DELETE", &busy));
                     return;
                 }
                 let deleted = store
@@ -3391,11 +3611,18 @@ impl TransferView {
                             .remove_file_entry(&sink, &rel)
                             .map_err(|e| e.to_string())
                     });
-                match deleted {
-                    // The plan changed on disk: rebuild the preview so the row
-                    // disappears with correct counts.
-                    Ok(()) => self.run_preview(store),
-                    Err(e) => self.error = Some(e),
+                let note = match &deleted {
+                    Ok(()) => crate::activity::Notification::changed("Deleted", &sink, &rel),
+                    Err(e) => crate::activity::Notification::failed("Delete", &sink, &rel, e),
+                };
+                activity.end_row_action();
+                activity.record(&note);
+                activity.card(ctx, note);
+                drop(activity);
+                // The plan changed on disk: rebuild the preview so the row
+                // disappears with correct counts.
+                if deleted.is_ok() {
+                    self.run_preview(store, ctx);
                 }
             }
             Act::OpenPreviewPair { left, right } => self.open_pair(store, left, right),
@@ -3414,9 +3641,8 @@ impl TransferView {
             }
             Act::Board(action) => {
                 self.board_state.popup = None;
-                self.start_board_action(store, action)
+                self.start_board_action(store, ctx, action)
             }
-            Act::CancelRun => self.cancel.cancel(),
             Act::ToggleSink(name) => {
                 if let Some(pos) = self.selected_sinks.iter().position(|s| s == &name) {
                     self.selected_sinks.remove(pos);
@@ -3544,28 +3770,133 @@ impl TransferView {
         self.filter.filter_string()
     }
 
-    fn run_preview(&mut self, store: &Arc<Store>) {
+    fn run_preview(&mut self, store: &Arc<Store>, ctx: &egui::Context) {
         let Some(source) = self.source.clone() else {
             return;
         };
-        // REVIEW and RUN are mutually exclusive: reviewing drops any run log.
-        self.reset_run();
         if self.command.is_diff() {
-            self.run_preview_diff(store, &source);
+            self.run_preview_diff(store, ctx, &source);
             return;
         }
         if self.command == Command::GroupSync {
-            self.spawn_group_preview(store, false);
+            self.spawn_group_preview(store, ctx, false);
             return;
         }
         if self.command == Command::GroupSyncBack {
-            self.spawn_group_back_preview(store, false);
+            self.spawn_group_back_preview(store, ctx, false);
             return;
         }
         // Every other command feeds the review board. Plan off the UI thread.
         if let Some(config) = self.capture_run_config() {
-            self.spawn_review_preview(store, config, None);
+            self.spawn_review_preview(store, ctx, config, None);
         }
+    }
+
+    /// Start a preview behind the activity modal. The modal shows the plan's
+    /// phases and closes by itself; the rows land over the view's channel.
+    /// Refused with a card while anything else runs.
+    fn start_preview<F>(
+        &mut self,
+        ctx: &egui::Context,
+        title: String,
+        repos: Vec<String>,
+        work: F,
+    ) -> bool
+    where
+        F: FnOnce(&crate::activity::ActivityProgress, &CancellationToken) -> Result<(), String>
+            + Send
+            + 'static,
+    {
+        let started = crate::activity::lock(&self.activity).start_quiet(
+            ctx,
+            crate::activity::Spec {
+                title: title.clone(),
+                repos,
+            },
+            work,
+        );
+        match started {
+            Ok(()) => {
+                self.previewing = true;
+                self.selection_collapsed = true;
+                self.status = Some(format!("{}…", title.to_lowercase()));
+                true
+            }
+            Err(busy) => {
+                crate::activity::lock(&self.activity)
+                    .card(ctx, crate::activity::Notification::refused("REVIEW", &busy));
+                false
+            }
+        }
+    }
+
+    /// Start a batch operation behind the activity modal; `work` sends the
+    /// view its own result over the channel and returns the report the
+    /// modal ends on. Refused with a card while anything else runs.
+    fn start_operation<F>(
+        &mut self,
+        ctx: &egui::Context,
+        title: String,
+        repos: Vec<String>,
+        work: F,
+    ) -> bool
+    where
+        F: FnOnce(
+                &crate::activity::ActivityProgress,
+                &CancellationToken,
+            ) -> crate::run_result::RunReport
+            + Send
+            + 'static,
+    {
+        let started = crate::activity::lock(&self.activity).start(
+            ctx,
+            crate::activity::Spec {
+                title: title.clone(),
+                repos,
+            },
+            work,
+        );
+        match started {
+            Ok(()) => {
+                self.running = true;
+                self.row_action = false;
+                self.selection_collapsed = true;
+                self.clear_preview();
+                self.status = Some(format!("{}…", title.to_lowercase()));
+                true
+            }
+            Err(busy) => {
+                crate::activity::lock(&self.activity)
+                    .card(ctx, crate::activity::Notification::refused("RUN", &busy));
+                false
+            }
+        }
+    }
+
+    /// Start a row action on a worker: one file, a card when it lands.
+    /// Refused with a card while an operation is on the modal.
+    fn start_row_action<F>(&mut self, ctx: &egui::Context, action: &str, work: F) -> bool
+    where
+        F: FnOnce(&crate::activity::ActivityProgress) -> OpResult + Send + 'static,
+    {
+        let mut activity = crate::activity::lock(&self.activity);
+        if let Err(busy) = activity.begin_row_action() {
+            activity.card(ctx, crate::activity::Notification::refused(action, &busy));
+            return false;
+        }
+        let progress = activity.progress_handle(ctx);
+        drop(activity);
+        self.running = true;
+        self.row_action = true;
+        self.pending_refresh = true;
+        self.status = Some(format!("{}…", action.to_lowercase()));
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = work(&progress);
+            let _ = tx.send(Msg::Done(result));
+            progress.repaint();
+        });
+        true
     }
 
     /// Snapshot the source, command, destination, filter and move flag the
@@ -3628,7 +3959,7 @@ impl TransferView {
     /// selected, filtered from the full group. `confirm` carries through to
     /// the result — when set, the RUN confirmation is raised once the plan
     /// lands with real counts.
-    fn spawn_group_preview(&mut self, store: &Arc<Store>, confirm: bool) {
+    fn spawn_group_preview(&mut self, store: &Arc<Store>, ctx: &egui::Context, confirm: bool) {
         let Some(group) = self.current_group.clone() else {
             return;
         };
@@ -3651,18 +3982,31 @@ impl TransferView {
         let filter = self.filter_string();
         let store = Arc::clone(store);
         let tx = self.tx.clone();
-        self.previewing = true;
-        self.status = Some("planning…".to_string());
-        std::thread::spawn(move || {
-            let result = build_group_preview(&store, &group, filter.as_deref());
-            let _ = tx.send(Msg::GroupPreview { result, confirm });
-        });
+        let mut repos = vec![group.main.clone()];
+        repos.extend(group.sinks.iter().map(|s| s.repo.clone()));
+        self.start_preview(
+            ctx,
+            format!("REVIEW group sync of '{}'", group.main),
+            repos,
+            move |progress, cancel| {
+                let report = |p: PlanProgress| plan_phase(progress, p);
+                let result =
+                    build_group_preview(&store, &group, filter.as_deref(), &report, cancel);
+                if cancel.is_cancelled() {
+                    let _ = tx.send(Msg::PreviewCancelled);
+                    return Ok(());
+                }
+                let outcome = result.as_ref().map(|_| ()).map_err(Clone::clone);
+                let _ = tx.send(Msg::GroupPreview { result, confirm });
+                outcome
+            },
+        );
     }
 
     /// Plan a GROUP SYNC BACK pull of the single selected sink into the main,
     /// off the UI thread. `confirm` defers the RUN confirmation until the plan
     /// lands with real counts.
-    fn spawn_group_back_preview(&mut self, store: &Arc<Store>, confirm: bool) {
+    fn spawn_group_back_preview(&mut self, store: &Arc<Store>, ctx: &egui::Context, confirm: bool) {
         let Some(group) = self.current_group.clone() else {
             return;
         };
@@ -3672,12 +4016,30 @@ impl TransferView {
         let filter = self.filter_string();
         let store = Arc::clone(store);
         let tx = self.tx.clone();
-        self.previewing = true;
-        self.status = Some("planning…".to_string());
-        std::thread::spawn(move || {
-            let result = build_group_back_preview(&store, &group, &sink, filter.as_deref());
-            let _ = tx.send(Msg::GroupBackPreview { result, confirm });
-        });
+        let repos = vec![sink.clone(), group.main.clone()];
+        self.start_preview(
+            ctx,
+            format!("REVIEW pull of '{sink}' into '{}'", group.main),
+            repos,
+            move |progress, cancel| {
+                let report = |p: PlanProgress| plan_phase(progress, p);
+                let result = build_group_back_preview(
+                    &store,
+                    &group,
+                    &sink,
+                    filter.as_deref(),
+                    &report,
+                    cancel,
+                );
+                if cancel.is_cancelled() {
+                    let _ = tx.send(Msg::PreviewCancelled);
+                    return Ok(());
+                }
+                let outcome = result.as_ref().map(|_| ()).map_err(Clone::clone);
+                let _ = tx.send(Msg::GroupBackPreview { result, confirm });
+                outcome
+            },
+        );
     }
 
     /// Fold a finished GROUP SYNC BACK plan into the board: new files to promote
@@ -3845,6 +4207,7 @@ impl TransferView {
     fn start_group_back_pull(
         &mut self,
         store: &Arc<Store>,
+        ctx: &egui::Context,
         main: String,
         sink: String,
         only: Option<std::collections::HashSet<String>>,
@@ -3852,36 +4215,50 @@ impl TransferView {
         let filter = self.filter_string();
         let store = Arc::clone(store);
         let tx = self.tx.clone();
-        self.cancel = CancellationToken::new();
-        let cancel = self.cancel.clone();
-        self.running = true;
-        self.status = Some(format!("pulling '{sink}' into '{main}'…"));
-        self.clear_preview();
-        self.reset_run();
+        let title = format!("PULL '{sink}' into '{main}'");
+        let repos = vec![sink.clone(), main.clone()];
+        let single = only.is_some();
+        let what = only
+            .as_ref()
+            .and_then(|keys| keys.iter().next())
+            .map(|k| {
+                k.split_once(':')
+                    .map(|(_, rel)| rel)
+                    .unwrap_or(k)
+                    .to_string()
+            })
+            .unwrap_or_default();
+        let main_name = main.clone();
 
-        std::thread::spawn(move || {
+        // The pull itself, shared by the batch and the single-row apply.
+        let pull = move |progress: &crate::activity::ActivityProgress,
+                         cancel: &CancellationToken|
+              -> Result<GroupSyncResult, String> {
             let keys: std::collections::HashSet<String> = match only {
                 Some(keys) => keys,
                 None => {
-                    match dedup_core::diff::plan_sync_back(&store, &sink, &main, filter.as_deref())
-                    {
-                        Ok(items) => items
-                            .into_iter()
-                            .filter(|i| i.kind == dedup_core::diff::PullKind::New)
-                            .map(|i| dedup_core::diff::source_key(&i.rel_path))
-                            .collect(),
-                        Err(e) => {
-                            let _ = tx.send(Msg::GroupDone(Err(e.to_string())));
-                            return;
-                        }
-                    }
+                    let report = |p: PlanProgress| plan_phase(progress, p);
+                    dedup_core::diff::plan_sync_back_reporting(
+                        &store,
+                        &sink,
+                        &main,
+                        filter.as_deref(),
+                        &report,
+                        cancel,
+                    )
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .filter(|i| i.kind == dedup_core::diff::PullKind::New)
+                    .map(|i| dedup_core::diff::source_key(&i.rel_path))
+                    .collect()
                 }
             };
-            let progress = ChannelDiffProgress { tx: tx.clone() };
-            let run = DiffRun::new(&progress, &cancel).with_selection(None, Some(&keys));
-            // Copy sink content the main lacks, scoped to the new files, into the
-            // main at the same relative path; the main is re-indexed by the sync.
-            let result = dedup_core::diff::diff_sync(
+            let run_progress = RunProgress {
+                activity: progress.clone(),
+                repo: main.clone(),
+            };
+            let run = DiffRun::new(&run_progress, cancel).with_selection(None, Some(&keys));
+            let stats = dedup_core::diff::diff_sync(
                 &store,
                 &sink,
                 &main,
@@ -3889,54 +4266,90 @@ impl TransferView {
                 SyncDelete::None,
                 filter.as_deref(),
                 &run,
-            );
-            let done = match result {
-                Ok(stats) => Ok(GroupSyncResult {
-                    main: main.clone(),
-                    copied: stats.copied,
-                    deleted: 0,
-                    skipped_files: stats.skipped,
-                    errors: stats.errors,
-                    cancelled: stats.cancelled,
-                    failures: Vec::new(),
-                    skipped: Vec::new(),
-                }),
-                Err(e) => Err(format!("{sink}: {e}")),
+            )
+            .map_err(|e| format!("{sink}: {e}"))?;
+            Ok(GroupSyncResult {
+                main: main.clone(),
+                copied: stats.copied,
+                deleted: 0,
+                skipped_files: stats.skipped,
+                errors: stats.errors,
+                cancelled: stats.cancelled,
+                failures: Vec::new(),
+                skipped: Vec::new(),
+            })
+        };
+
+        if single {
+            // One row: a row action with a card, not the modal.
+            self.start_row_action(ctx, "APPLY", move |progress| {
+                let cancel = CancellationToken::new();
+                match pull(progress, &cancel) {
+                    Ok(r) if r.errors == 0 && r.skipped_files == 0 => OpResult::Applied {
+                        message: format!("Pulled '{what}' into '{main_name}'."),
+                        note: Some(crate::activity::Notification::changed(
+                            "Pulled", &main_name, &what,
+                        )),
+                    },
+                    Ok(_) => OpResult::Applied {
+                        message: format!("'{what}' was not pulled into '{main_name}'."),
+                        note: Some(crate::activity::Notification::failed(
+                            "Pull",
+                            &main_name,
+                            &what,
+                            "the main already has a different file at that path",
+                        )),
+                    },
+                    Err(e) => OpResult::Error(e),
+                }
+            });
+            return;
+        }
+        self.start_operation(ctx, title.clone(), repos, move |progress, cancel| {
+            let done = pull(progress, cancel);
+            let report = match &done {
+                Ok(r) => r.report(),
+                Err(e) => {
+                    let mut report = crate::run_result::RunReport::new(title);
+                    report.problem(e.clone());
+                    report
+                }
             };
             let _ = tx.send(Msg::GroupDone(done));
+            report
         });
     }
 
-    fn start_group_sync(&mut self, store: &Arc<Store>, group: SyncGroup) {
+    fn start_group_sync(&mut self, store: &Arc<Store>, ctx: &egui::Context, group: SyncGroup) {
         let filter = self.filter_string();
         let store = Arc::clone(store);
         let tx = self.tx.clone();
-        self.cancel = CancellationToken::new();
-        let cancel = self.cancel.clone();
-        self.running = true;
-        self.status = Some(format!("syncing '{}'…", group.main));
-        self.clear_preview();
-        self.reset_run();
-
-        std::thread::spawn(move || {
-            // Re-checked here, not just at plan time: the main could have
-            // been rescanned to empty in the gap between REVIEW and RUN.
+        let title = format!("SYNC group '{}'", group.main);
+        let mut repos = vec![group.main.clone()];
+        repos.extend(group.sinks.iter().map(|s| s.repo.clone()));
+        self.start_operation(ctx, title.clone(), repos, move |progress, cancel| {
             if let Err(e) = guard_mirror_source(&store, &group) {
+                let mut report = crate::run_result::RunReport::new(title);
+                report.problem(e.to_string());
                 let _ = tx.send(Msg::GroupDone(Err(e.to_string())));
-                return;
+                return report;
             }
-            let progress = ChannelDiffProgress { tx: tx.clone() };
-            let run = DiffRun::new(&progress, &cancel);
             let (mut copied, mut deleted, mut skipped_files, mut errors) = (0u64, 0u64, 0u64, 0u64);
             let mut failures = Vec::new();
             let mut skipped = Vec::new();
             let mut cancelled = false;
             for sink in &group.sinks {
-                if run.cancel.is_cancelled() {
+                if cancel.is_cancelled() {
                     cancelled = true;
                     skipped.push(sink.repo.clone());
                     continue;
                 }
+                let run_progress = RunProgress {
+                    activity: progress.clone(),
+                    repo: sink.repo.clone(),
+                };
+                let run = DiffRun::new(&run_progress, cancel);
+                progress.phase(format!("syncing '{}'", sink.repo), 0, None);
                 match diff_sync(
                     &store,
                     &group.main,
@@ -3956,8 +4369,8 @@ impl TransferView {
                     Err(e) => failures.push(format!("{}: {e}", sink.repo)),
                 }
             }
-            let _ = tx.send(Msg::GroupDone(Ok(GroupSyncResult {
-                main: group.main,
+            let result = GroupSyncResult {
+                main: group.main.clone(),
                 copied,
                 deleted,
                 skipped_files,
@@ -3965,24 +4378,42 @@ impl TransferView {
                 cancelled,
                 failures,
                 skipped,
-            })));
+            };
+            let report = result.report();
+            let _ = tx.send(Msg::GroupDone(Ok(result)));
+            report
         });
     }
 
     fn spawn_review_preview(
         &mut self,
         store: &Arc<Store>,
+        ctx: &egui::Context,
         config: RunConfig,
         confirm: Option<Box<RunConfig>>,
     ) {
         let store = Arc::clone(store);
         let tx = self.tx.clone();
-        self.previewing = true;
-        self.status = Some(format!("{}…", config.command.label().to_lowercase()));
-        std::thread::spawn(move || {
-            let result = build_review_preview(&store, &config);
-            let _ = tx.send(Msg::ReviewPreview { result, confirm });
-        });
+        let mut repos = vec![config.source.clone()];
+        if let Some(target) = config.dest.target_repo() {
+            repos.push(target.to_string());
+        }
+        self.start_preview(
+            ctx,
+            format!("REVIEW {} from '{}'", config.command.label(), config.source),
+            repos,
+            move |progress, cancel| {
+                let report = |p: PlanProgress| plan_phase(progress, p);
+                let result = build_review_preview(&store, &config, &report, cancel);
+                if cancel.is_cancelled() {
+                    let _ = tx.send(Msg::PreviewCancelled);
+                    return Ok(());
+                }
+                let outcome = result.as_ref().map(|_| ()).map_err(Clone::clone);
+                let _ = tx.send(Msg::ReviewPreview { result, confirm });
+                outcome
+            },
+        );
     }
 
     /// Fold a finished review preview into the board, and — if the plan was for
@@ -4029,7 +4460,7 @@ impl TransferView {
     /// repos' full indexes, so on the whole-disk repos this tool targets it
     /// would freeze the window for seconds if run inline; the result comes back
     /// over the channel and is applied in [`Self::apply_diff_preview`].
-    fn run_preview_diff(&mut self, store: &Arc<Store>, source: &str) {
+    fn run_preview_diff(&mut self, store: &Arc<Store>, ctx: &egui::Context, source: &str) {
         let Some(target) = self.target.clone() else {
             return;
         };
@@ -4037,18 +4468,30 @@ impl TransferView {
         let source = source.to_string();
         let pairing = self.pairing;
         let tx = self.tx.clone();
-        self.previewing = true;
-        self.status = Some(format!("comparing '{source}' and '{target}'…"));
-        std::thread::spawn(move || {
-            let result = plan_repo_diff(&store, &source, &target, pairing)
-                .map(|rows| DiffPreviewData {
-                    rows,
-                    source_header: Self::repo_header(&store, &source),
-                    target_header: Self::repo_header(&store, &target),
-                })
-                .map_err(|e| e.to_string());
-            let _ = tx.send(Msg::DiffPreview(result));
-        });
+        let repos = vec![source.clone(), target.clone()];
+        self.start_preview(
+            ctx,
+            format!("DIFF '{source}' against '{target}'"),
+            repos,
+            move |progress, cancel| {
+                let report = |p: PlanProgress| plan_phase(progress, p);
+                let result =
+                    plan_repo_diff_reporting(&store, &source, &target, pairing, &report, cancel)
+                        .map(|rows| DiffPreviewData {
+                            rows,
+                            source_header: Self::repo_header(&store, &source),
+                            target_header: Self::repo_header(&store, &target),
+                        })
+                        .map_err(|e| e.to_string());
+                if cancel.is_cancelled() {
+                    let _ = tx.send(Msg::PreviewCancelled);
+                    return Ok(());
+                }
+                let outcome = result.as_ref().map(|_| ()).map_err(Clone::clone);
+                let _ = tx.send(Msg::DiffPreview(result));
+                outcome
+            },
+        );
     }
 
     /// Fold a finished DIFF comparison into the board.
@@ -4183,7 +4626,7 @@ impl TransferView {
         if let Some(go) = decision {
             self.bulk_confirm = None;
             if go {
-                self.start_bulk(store, plan);
+                self.start_bulk(store, ctx, plan);
             }
         } else if response.should_close() {
             self.bulk_confirm = None;
@@ -4195,20 +4638,22 @@ impl TransferView {
     /// Every operation is attempted — one failure does not abandon the rest —
     /// and the summary reports both counts, so a partial failure is visible
     /// rather than silently swallowed.
-    fn start_bulk(&mut self, store: &Arc<Store>, plan: Vec<crate::diff_board::BoardAction>) {
+    fn start_bulk(
+        &mut self,
+        store: &Arc<Store>,
+        ctx: &egui::Context,
+        plan: Vec<crate::diff_board::BoardAction>,
+    ) {
         use crate::diff_board::BoardAction;
         let (Some(source), Some(target)) = (self.source.clone(), self.target.clone()) else {
             return;
         };
         let store = Arc::clone(store);
         let tx = self.tx.clone();
-        let cancel = self.cancel.clone();
-        self.running = true;
+        let title = format!("APPLY {} operation(s)", plan.len());
+        let repos = vec![source.clone(), target.clone()];
         self.pending_refresh = true;
-        self.reset_run();
-        self.status = Some(format!("applying {} operation(s)…", plan.len()));
-
-        std::thread::spawn(move || {
+        self.start_operation(ctx, title.clone(), repos, move |progress, cancel| {
             let side = |on_left: bool| {
                 if on_left {
                     (source.clone(), target.clone())
@@ -4216,37 +4661,49 @@ impl TransferView {
                     (target.clone(), source.clone())
                 }
             };
-            let (mut done, mut failed) = (0usize, 0usize);
+            let total = plan.len() as u64;
+            let (mut done, mut failed) = (0u64, 0u64);
             let mut cancelled = false;
-            for action in plan {
+            for (i, action) in plan.into_iter().enumerate() {
                 if cancel.is_cancelled() {
                     cancelled = true;
                     break;
                 }
-                let outcome = match action {
+                let (verb, did, repo, rel, outcome) = match action {
                     BoardAction::Copy {
                         from_left,
                         rel_path,
                     } => {
                         let (from, to) = side(from_left);
-                        copy_file_between(&store, &from, &rel_path, &to, &rel_path)
+                        let r = copy_file_between(&store, &from, &rel_path, &to, &rel_path);
+                        ("copying", "Copied", to, rel_path, r)
                     }
                     BoardAction::Rename { on_left, from, to } => {
                         let (repo, _) = side(on_left);
-                        rename_file(&store, &repo, &from, &to)
+                        let r = rename_file(&store, &repo, &from, &to);
+                        ("renaming", "Renamed", repo, from, r)
                     }
                     BoardAction::Delete { on_left, rel_path } => {
                         let (repo, _) = side(on_left);
-                        delete_file(&store, &repo, &rel_path)
+                        let r = delete_file(&store, &repo, &rel_path);
+                        ("deleting", "Deleted", repo, rel_path, r)
                     }
                     // Not produced by `bulk_plan`.
-                    _ => Ok(()),
+                    _ => continue,
                 };
+                progress.phase(format!("{verb} {rel}"), i as u64 + 1, Some(total));
                 match outcome {
-                    Ok(()) => done += 1,
+                    Ok(()) => {
+                        done += 1;
+                        progress.record(&crate::activity::Notification::changed(did, &repo, &rel));
+                    }
                     Err(e) => {
                         log::warn!("bulk action failed: {e}");
                         failed += 1;
+                        let e = e.to_string();
+                        progress.problem(format!("{rel}: {e}"));
+                        progress
+                            .record(&crate::activity::Notification::failed(did, &repo, &rel, &e));
                     }
                 }
             }
@@ -4258,23 +4715,37 @@ impl TransferView {
                 message.push_str(" (cancelled)");
             }
             message.push('.');
-            let _ = tx.send(Msg::Done(OpResult::Applied { message }));
+            let _ = tx.send(Msg::Done(OpResult::Applied {
+                message,
+                note: None,
+            }));
+            crate::run_result::RunReport::new(title)
+                .count("applied", done)
+                .count("failed", failed)
+                .cancelled(cancelled)
         });
     }
 
-    fn start_board_action(&mut self, store: &Arc<Store>, action: crate::diff_board::BoardAction) {
+    fn start_board_action(
+        &mut self,
+        store: &Arc<Store>,
+        ctx: &egui::Context,
+        action: crate::diff_board::BoardAction,
+    ) {
         use crate::diff_board::BoardAction;
         let (Some(source), Some(target)) = (self.source.clone(), self.target.clone()) else {
             return;
         };
         let store = Arc::clone(store);
-        let tx = self.tx.clone();
-        self.running = true;
-        self.pending_refresh = true;
-        self.reset_run();
-        self.status = Some("applying…".to_string());
-
-        std::thread::spawn(move || {
+        let label = match &action {
+            BoardAction::Copy { .. } => "COPY",
+            BoardAction::Delete { .. } | BoardAction::DeleteMany { .. } => "DELETE",
+            BoardAction::Rename { .. } => "RENAME",
+            BoardAction::Overwrite { .. } => "OVERWRITE",
+            BoardAction::OpenPopup { .. } | BoardAction::Inspect { .. } => return,
+        };
+        self.start_row_action(ctx, label, move |progress| {
+            use crate::activity::Notification;
             // "left" is always the source repo, "right" the target.
             let side = |on_left: bool| {
                 if on_left {
@@ -4283,24 +4754,29 @@ impl TransferView {
                     (target.clone(), source.clone())
                 }
             };
-            let outcome = match action {
+            // Each arm yields the card for success, and the (repo, path, verb)
+            // a failure card names.
+            let (did, repo, what, message, outcome) = match action {
                 BoardAction::Copy {
                     from_left,
                     rel_path,
                 } => {
                     let (from, to) = side(from_left);
-                    copy_file_between(&store, &from, &rel_path, &to, &rel_path)
-                        .map(|()| format!("Copied '{rel_path}' to '{to}'."))
+                    let r = copy_file_between(&store, &from, &rel_path, &to, &rel_path);
+                    let message = format!("Copied '{rel_path}' to '{to}'.");
+                    ("Copied", to, rel_path, message, r)
                 }
                 BoardAction::Delete { on_left, rel_path } => {
                     let (repo, _) = side(on_left);
-                    delete_file(&store, &repo, &rel_path)
-                        .map(|()| format!("Deleted '{rel_path}' from '{repo}'."))
+                    let r = delete_file(&store, &repo, &rel_path);
+                    let message = format!("Deleted '{rel_path}' from '{repo}'.");
+                    ("Deleted", repo, rel_path, message, r)
                 }
                 BoardAction::Rename { on_left, from, to } => {
                     let (repo, _) = side(on_left);
-                    rename_file(&store, &repo, &from, &to)
-                        .map(|()| format!("Renamed '{from}' to '{to}' in '{repo}'."))
+                    let r = rename_file(&store, &repo, &from, &to);
+                    let message = format!("Renamed '{from}' to '{to}' in '{repo}'.");
+                    ("Renamed", repo, format!("{from} → {to}"), message, r)
                 }
                 BoardAction::Overwrite {
                     from_left,
@@ -4308,37 +4784,67 @@ impl TransferView {
                     to_rel,
                 } => {
                     let (from, to) = side(from_left);
-                    overwrite_file(&store, &from, &from_rel, &to, &to_rel)
-                        .map(|()| format!("Overwrote '{to_rel}' in '{to}' with '{from}'s copy."))
+                    let r = overwrite_file(&store, &from, &from_rel, &to, &to_rel);
+                    let message = format!("Overwrote '{to_rel}' in '{to}' with '{from}'s copy.");
+                    ("Overwrote", to, to_rel, message, r)
                 }
                 BoardAction::DeleteMany { on_left, rel_paths } => {
                     let (repo, _) = side(on_left);
                     // Best effort as a batch: stop at the first failure so the
-                    // message names the file that could not be removed.
+                    // card names the file that could not be removed.
                     let mut deleted = 0usize;
                     let mut failed = None;
                     for rel_path in &rel_paths {
                         match delete_file(&store, &repo, rel_path) {
-                            Ok(()) => deleted += 1,
+                            Ok(()) => {
+                                deleted += 1;
+                                progress.record(&Notification::changed("Deleted", &repo, rel_path));
+                            }
                             Err(e) => {
-                                failed = Some(e);
+                                failed = Some((rel_path.clone(), e));
                                 break;
                             }
                         }
                     }
-                    match failed {
-                        Some(e) => Err(e),
-                        None => Ok(format!("Deleted {deleted} file(s) from '{repo}'.")),
-                    }
+                    let message = format!("Deleted {deleted} file(s) from '{repo}'.");
+                    let what = format!("{deleted} file(s)");
+                    return match failed {
+                        None => OpResult::Applied {
+                            message,
+                            note: Some(Notification::noted("Deleted", &repo, &what)),
+                        },
+                        Some((rel, e)) => {
+                            let e = e.to_string();
+                            let note = Notification::failed("Delete", &repo, &rel, &e);
+                            progress.record(&note);
+                            OpResult::Applied {
+                                message: format!("Could not delete '{rel}': {e}"),
+                                note: Some(note),
+                            }
+                        }
+                    };
                 }
                 // Popups and the compare view are handled in the UI itself.
-                BoardAction::OpenPopup { .. } | BoardAction::Inspect { .. } => Ok(String::new()),
+                BoardAction::OpenPopup { .. } | BoardAction::Inspect { .. } => {
+                    return OpResult::Applied {
+                        message: String::new(),
+                        note: None,
+                    };
+                }
             };
-            let result = match outcome {
-                Ok(message) => OpResult::Applied { message },
-                Err(e) => OpResult::Error(e.to_string()),
+            let note = match outcome {
+                Ok(()) => Notification::changed(did, &repo, &what),
+                Err(e) => Notification::failed(did, &repo, &what, &e.to_string()),
             };
-            let _ = tx.send(Msg::Done(result));
+            progress.record(&note);
+            let message = match &note.outcome {
+                Ok(()) => message,
+                Err(e) => format!("Could not {}: {e}", did.to_lowercase()),
+            };
+            OpResult::Applied {
+                message,
+                note: Some(note),
+            }
         });
     }
 
@@ -4346,7 +4852,13 @@ impl TransferView {
     /// a single review row (the APPLY button); `None` runs the whole batch minus
     /// any rejected rows. `config` is a snapshot taken when the run was asked
     /// for, so nothing the live controls do since can change what runs.
-    fn start(&mut self, store: &Arc<Store>, config: RunConfig, only: Option<String>) {
+    fn start(
+        &mut self,
+        store: &Arc<Store>,
+        ctx: &egui::Context,
+        config: RunConfig,
+        only: Option<String>,
+    ) {
         let RunConfig {
             source,
             command,
@@ -4356,28 +4868,23 @@ impl TransferView {
         } = config;
         let hidden: std::collections::HashSet<String> = self.preview_board.hidden.clone();
         let store = Arc::clone(store);
-        let tx = self.tx.clone();
-        self.cancel = CancellationToken::new();
-        let cancel = self.cancel.clone();
-        self.running = true;
-        self.status = Some(format!("{}…", command.label().to_lowercase()));
-        if only.is_some() {
-            // A single-row APPLY keeps the preview on screen (it refreshes
-            // when the run finishes) instead of dropping to the run log.
-            self.pending_refresh = true;
-            self.reset_run();
-        } else {
-            // RUN and REVIEW are mutually exclusive: starting a run drops the
-            // stale preview and resets the live run log/counters.
-            self.clear_preview();
-            self.reset_run();
+        let dest_name = dest.display_name();
+        let title = format!("{} '{source}' to '{dest_name}'", command.label());
+        let mut repos = vec![source.clone()];
+        if let Some(target) = dest.target_repo() {
+            repos.push(target.to_string());
         }
-
-        std::thread::spawn(move || {
-            let progress = ChannelDiffProgress { tx: tx.clone() };
-            let only_set: Option<std::collections::HashSet<String>> =
-                only.map(|k| std::collections::HashSet::from([k]));
-            let run = DiffRun::new(&progress, &cancel)
+        let only_set: Option<std::collections::HashSet<String>> =
+            only.clone().map(|k| std::collections::HashSet::from([k]));
+        let card_dest = dest_name.clone();
+        let work = move |progress: &crate::activity::ActivityProgress,
+                         cancel: &CancellationToken|
+              -> OpResult {
+            let run_progress = RunProgress {
+                activity: progress.clone(),
+                repo: dest_name.clone(),
+            };
+            let run = DiffRun::new(&run_progress, cancel)
                 .with_selection((!hidden.is_empty()).then_some(&hidden), only_set.as_ref());
             // Copy/Move (repo or folder) both yield CopyStats → Copied; Sync
             // yields SyncStats → Synced. Map each to its OpResult in place.
@@ -4389,7 +4896,7 @@ impl TransferView {
                 },
                 Err(e) => OpResult::Error(e),
             };
-            let result = match &dest {
+            match &dest {
                 StartDest::Repo {
                     references,
                     target,
@@ -4466,57 +4973,61 @@ impl TransferView {
                     },
                     Err(e) => OpResult::Error(e.to_string()),
                 },
-            };
-            let _ = tx.send(Msg::Done(result));
-        });
-    }
-
-    /// Clear the live run log and counters (used when a run starts or a
-    /// preview replaces it).
-    fn reset_run(&mut self) {
-        self.run_log.clear();
-        self.run_problems.clear();
-        self.result.close();
-        self.run_done = 0;
-        self.run_total = 0;
-        self.run_current.clear();
-    }
-
-    /// Fold one live progress event into the running counters, current line
-    /// and last-N action log.
-    fn apply_progress(&mut self, event: DiffEvent) {
-        match event {
-            DiffEvent::Progress {
-                action,
-                done,
-                total,
-                rel_path,
-            } => {
-                let verb = match action {
-                    DiffAction::Copy => "Copied",
-                    DiffAction::Move => "Moved",
-                    DiffAction::Delete => "Deleted",
-                };
-                self.run_done = done;
-                self.run_total = total;
-                self.run_current = rel_path.clone();
-                self.run_log.push_back(format!("{verb} {rel_path}"));
-                while self.run_log.len() > RUN_LOG_LIMIT {
-                    self.run_log.pop_front();
-                }
             }
-            DiffEvent::Error { path, message } => {
-                // Session log gets every failure, so a large run's error list
-                // survives even as the live log rolls; the report keeps a
-                // capped copy for the UI.
-                log::warn!("transfer error: {path}: {message}");
-                if self.run_problems.len() < crate::run_result::MAX_PROBLEMS {
-                    self.run_problems.push(format!("{path}: {message}"));
-                }
-                self.run_log.push_back(format!("✗ {path}: {message}"));
-                while self.run_log.len() > RUN_LOG_LIMIT {
-                    self.run_log.pop_front();
-                }
+        };
+
+        match only {
+            // A single-row APPLY keeps the preview on screen (it refreshes when
+            // the action lands): a row action with a card.
+            Some(key) => {
+                let what = key
+                    .split_once(':')
+                    .map(|(_, rel)| rel.to_string())
+                    .unwrap_or(key);
+                let dest_name = card_dest;
+                self.start_row_action(ctx, "APPLY", move |progress| {
+                    let result = work(progress, &CancellationToken::new());
+                    match result {
+                        OpResult::Copied { copied, moved, .. } => {
+                            let did = if moved { "Moved" } else { "Copied" };
+                            if copied > 0 {
+                                OpResult::Applied {
+                                    message: format!("{did} '{what}' to '{dest_name}'."),
+                                    note: Some(crate::activity::Notification::changed(
+                                        did, &dest_name, &what,
+                                    )),
+                                }
+                            } else {
+                                OpResult::Applied {
+                                    message: format!("'{what}' was not transferred."),
+                                    note: Some(crate::activity::Notification::failed(
+                                        did,
+                                        &dest_name,
+                                        &what,
+                                        "nothing was transferred — the target may already \
+                                         hold that path",
+                                    )),
+                                }
+                            }
+                        }
+                        other => other,
+                    }
+                });
+            }
+            None => {
+                let tx = self.tx.clone();
+                self.start_operation(ctx, title.clone(), repos, move |progress, cancel| {
+                    let result = work(progress, cancel);
+                    let report = result.report().unwrap_or_else(|| {
+                        let mut report = crate::run_result::RunReport::new(title);
+                        if let OpResult::Error(e) = &result {
+                            report.problem(e.clone());
+                        }
+                        report
+                    });
+                    let _ = tx.send(Msg::Done(result));
+                    report
+                });
             }
         }
     }
@@ -4526,7 +5037,10 @@ impl TransferView {
         while let Ok(msg) = self.rx.try_recv() {
             got = true;
             match msg {
-                Msg::Progress(event) => self.apply_progress(event),
+                Msg::PreviewCancelled => {
+                    self.previewing = false;
+                    self.status = Some("review cancelled".to_string());
+                }
                 Msg::DiffPreview(result) => {
                     self.previewing = false;
                     self.apply_diff_preview(result);
@@ -4548,41 +5062,8 @@ impl TransferView {
                     log::info!("group sync finished: {}", result.is_ok());
                     match result {
                         Ok(r) => {
-                            let mut report = crate::run_result::RunReport::new(format!(
-                                "Sync group '{}'",
-                                r.main
-                            ))
-                            .count("copied", r.copied)
-                            .count("deleted", r.deleted)
-                            .cancelled(r.cancelled)
-                            .problems(std::mem::take(&mut self.run_problems))
-                            .problems(r.failures);
-                            // A promote refused because the path is taken must
-                            // never look like "nothing happened".
-                            if r.skipped_files > 0 {
-                                report = report.count("skipped", r.skipped_files).note(format!(
-                                    "{} file(s) were not copied: the target already has a \
-                                     different file at that exact path. The review board \
-                                     marks these rows as conflicts — resolve each with \
-                                     < OVERWRITE (or DELETE R).",
-                                    r.skipped_files
-                                ));
-                            }
-                            if !r.skipped.is_empty() {
-                                report = report.note(format!(
-                                    "{} sink(s) were never pushed and are now stale: {}",
-                                    r.skipped.len(),
-                                    r.skipped.join(", ")
-                                ));
-                            }
-                            // `errors` counts failures the capped list may not
-                            // hold all of; keep the true count visible.
-                            if r.errors > report.problem_count() {
-                                report = report.count("files that failed to copy", r.errors);
-                            }
-                            self.status = Some(report.headline());
+                            self.status = Some(r.report().headline());
                             self.error = None;
-                            self.result.open(report);
                         }
                         Err(e) => self.error = Some(e),
                     }
@@ -4592,50 +5073,37 @@ impl TransferView {
                     // The session log gets every finished run, so a bug report
                     // covering the Transfer tab has a trail.
                     log::info!("transfer finished: {result:?}");
+                    if self.row_action {
+                        self.row_action = false;
+                        crate::activity::lock(&self.activity).end_row_action();
+                    }
                     match result {
-                        OpResult::Copied {
-                            copied,
-                            cancelled,
-                            moved,
-                        } => {
-                            let verb = if moved { "Move" } else { "Copy" };
-                            let report = crate::run_result::RunReport::new(verb)
-                                .count("copied", copied)
-                                .cancelled(cancelled)
-                                .problems(std::mem::take(&mut self.run_problems));
-                            self.status = Some(report.headline());
-                            self.error = None;
-                            self.result.open(report);
-                        }
-                        OpResult::Synced {
-                            copied,
-                            deleted,
-                            skipped,
-                            errors,
-                            cancelled,
-                            mirror,
-                        } => {
-                            let title = if mirror { "Mirror" } else { "Sync" };
-                            let mut report = crate::run_result::RunReport::new(title)
-                                .count("copied", copied)
-                                .count("deleted", deleted)
-                                .count("skipped", skipped)
-                                .cancelled(cancelled)
-                                .problems(std::mem::take(&mut self.run_problems));
-                            // `errors` counts failures the capped list may not
-                            // hold all of; keep the true count visible.
-                            if errors > report.problem_count() {
-                                report = report.count("errors", errors);
+                        OpResult::Copied { .. } | OpResult::Synced { .. } => {
+                            if let Some(report) = result.report() {
+                                self.status = Some(report.headline());
                             }
-                            self.status = Some(report.headline());
                             self.error = None;
-                            self.result.open(report);
                         }
-                        OpResult::Applied { message } => {
+                        OpResult::Applied { message, note } => {
+                            if let Some(note) = note {
+                                crate::activity::lock(&self.activity).card(&ui.ctx().clone(), note);
+                            }
                             self.status = Some(message);
                             self.error = None;
                         }
-                        OpResult::Error(e) => self.error = Some(e),
+                        OpResult::Error(e) => {
+                            crate::activity::lock(&self.activity).card(
+                                &ui.ctx().clone(),
+                                crate::activity::Notification {
+                                    action: "Transfer".into(),
+                                    repo: String::new(),
+                                    path: "failed".into(),
+                                    outcome: Err(e.clone()),
+                                    changed_disk: false,
+                                },
+                            );
+                            self.error = Some(e);
+                        }
                     }
                 }
             }
@@ -4982,6 +5450,7 @@ mod ui_tests {
             .add_sync_sink("source", "target", dedup_core::store::SyncMode::AddOnly)
             .expect("sink");
         let mut view = TransferView::new();
+        view.command_chosen = true;
         view.sync_repos(&store);
         assert!(
             view.repos.contains(&"source".to_string()),
@@ -5022,6 +5491,7 @@ mod ui_tests {
         let store2 = Arc::clone(&store);
         let width = 900.0;
         let mut view = TransferView::new();
+        view.command_chosen = true;
         view.loaded = true;
         view.source = Some("source".to_string());
         view.sync_repos(&store2);
@@ -5092,6 +5562,7 @@ mod ui_tests {
     fn doc_screenshot_group_sync_back() {
         let (_tmp, store) = back_preview_store();
         let mut view = TransferView::new();
+        view.command_chosen = true;
         view.loaded = true;
         view.repos = vec!["source".to_string(), "target".to_string()];
         view.sync_repos(&store);
@@ -5263,16 +5734,26 @@ mod ui_tests {
             status.contains("skipped 2"),
             "the headline counts the refused copies: {status}"
         );
-        // The modal spells out why.
-        use egui_kittest::kittest::Queryable;
+        // The report the activity modal ends on spells out why.
+        let report = GroupSyncResult {
+            main: "photos".to_string(),
+            copied: 0,
+            deleted: 0,
+            skipped_files: 2,
+            errors: 0,
+            cancelled: false,
+            failures: Vec::new(),
+            skipped: Vec::new(),
+        }
+        .report();
+        let text = format!("{report:?}");
         assert!(
-            h.query_by_label_contains("different file at that exact path")
-                .is_some(),
-            "the modal explains the collision"
+            text.contains("different file at that exact path"),
+            "the report explains the collision: {text}"
         );
         assert!(
-            h.query_by_label_contains("OVERWRITE").is_some(),
-            "and points at the board's per-row resolution"
+            text.contains("OVERWRITE"),
+            "and points at the board's per-row resolution: {text}"
         );
     }
 
@@ -5342,8 +5823,12 @@ mod ui_tests {
 
         // Locked main (the session default): the handler re-checks and no-ops.
         let rel = conflict.right_paths.first().unwrap().clone();
-        h.state_mut()
-            .apply(&store, None, Act::OverwriteMainRow(rel.clone()));
+        h.state_mut().apply(
+            &store,
+            &egui::Context::default(),
+            None,
+            Act::OverwriteMainRow(rel.clone()),
+        );
         assert_eq!(
             std::fs::read(tmp.path().join("source").join("photo.jpg")).unwrap(),
             b"main-version!",
@@ -5351,8 +5836,12 @@ mod ui_tests {
         );
 
         h.state().locks.toggle("source");
-        h.state_mut()
-            .apply(&store, None, Act::OverwriteMainRow(rel));
+        h.state_mut().apply(
+            &store,
+            &egui::Context::default(),
+            None,
+            Act::OverwriteMainRow(rel),
+        );
         assert_eq!(
             std::fs::read(tmp.path().join("source").join("photo.jpg")).unwrap(),
             b"sink-version",
@@ -5411,8 +5900,12 @@ mod ui_tests {
             Some(("target".to_string(), "photo.jpg".to_string())),
             "the sink's file is the right side"
         );
-        h.state_mut()
-            .apply(&store, None, Act::OpenPreviewPair { left, right });
+        h.state_mut().apply(
+            &store,
+            &egui::Context::default(),
+            None,
+            Act::OpenPreviewPair { left, right },
+        );
         // … and both really open: the viewer shows a two-sided compare.
         assert!(
             h.state()
@@ -5436,8 +5929,12 @@ mod ui_tests {
             .map(|(j, r)| (j, r.clone()))
             .expect("the sink's new file surfaces as a promote row");
         let (left, right) = h.state().preview_row_pair(j, &promote);
-        h.state_mut()
-            .apply(&store, None, Act::OpenPreviewPair { left, right });
+        h.state_mut().apply(
+            &store,
+            &egui::Context::default(),
+            None,
+            Act::OpenPreviewPair { left, right },
+        );
         let viewer = h
             .state()
             .inspect
@@ -5578,6 +6075,7 @@ mod ui_tests {
             .unwrap();
         let store = Arc::new(store);
         let mut view = TransferView::new();
+        view.command_chosen = true;
         view.loaded = true;
         view.repos = vec!["source".to_string(), "target".to_string()];
         view.source = Some("source".to_string());
@@ -5632,6 +6130,23 @@ mod ui_tests {
             h.state().preview.is_empty(),
             "the rebuilt preview has nothing left to promote"
         );
+        // A row action answers with a card and a log line.
+        let activity = crate::activity::lock(&h.state().activity);
+        assert!(
+            activity
+                .card_lines()
+                .iter()
+                .any(|l| l == "Deleted junk.txt"),
+            "a card names the deleted file: {:?}",
+            activity.card_lines()
+        );
+        assert!(
+            activity
+                .logged()
+                .iter()
+                .any(|e| e.action == "Deleted" && e.repo == "target" && e.path == "junk.txt"),
+            "and the event log records it"
+        );
     }
 
     /// A single resurrection row's per-row `< COPY` pulls just that file into
@@ -5671,6 +6186,7 @@ mod ui_tests {
         // A taller harness than the shared helper, so the single row's APPLY
         // button is on-screen (the board virtualizes off-screen rows away).
         let mut view = TransferView::new();
+        view.command_chosen = true;
         view.loaded = true;
         view.repos = vec!["source".to_string(), "target".to_string()];
         view.source = Some("source".to_string());
@@ -6036,7 +6552,9 @@ mod ui_tests {
         setup: impl FnOnce(&mut TransferView),
     ) -> Harness<'static, TransferView> {
         let mut view = TransferView::new();
+        view.command_chosen = true;
         view.loaded = true;
+        view.command_chosen = true;
         view.repos = vec!["source".to_string(), "target".to_string()];
         view.source = Some("source".to_string());
         setup(&mut view);
@@ -6058,6 +6576,116 @@ mod ui_tests {
             );
         harness.run();
         harness
+    }
+
+    /// The rect of the highest node carrying `label`; among those on the
+    /// highest row, the leftmost or (`right`) the rightmost.
+    fn top_chip(h: &Harness<'_, TransferView>, label: &str, right: bool) -> egui::Rect {
+        h.get_all_by_label(label)
+            .map(|n| n.rect())
+            .min_by(|a, b| {
+                let row = a.top().total_cmp(&b.top());
+                let col = a.left().total_cmp(&b.left());
+                row.then(if right { col.reverse() } else { col })
+            })
+            .expect("label present")
+    }
+
+    /// Click the node carrying `label` at exactly `rect`.
+    fn click_at(h: &mut Harness<'_, TransferView>, label: &str, rect: egui::Rect) {
+        h.get_all_by_label(label)
+            .find(|n| n.rect() == rect)
+            .expect("node at rect")
+            .click();
+    }
+
+    /// The tab asks its questions in order — WHAT, WITH WHICH, HOW, RUN —
+    /// each section appearing once the one before it has an answer, and
+    /// folds into one summary line after REVIEW.
+    #[test]
+    fn sections_reveal_in_reading_order_and_fold_after_review() {
+        let (_tmp, store) = sample_store();
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1120.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut TransferView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default(), None);
+                },
+                TransferView::new(),
+            );
+        h.run();
+        assert!(h.query_by_label("COPY").is_some(), "WHAT shows first");
+        assert!(
+            h.query_by_label("source").is_none(),
+            "no repository chip before a command is chosen"
+        );
+        assert!(h.query_by_label_contains("DEST — ").is_none());
+        assert!(h.query_by_label("REVIEW").is_none());
+
+        h.get_by_label("COPY").click();
+        h.run();
+        let copy = h.get_by_label("COPY").rect();
+        // Until a side is picked the same repo is offered on both panels (and
+        // in the pool): the SOURCE panel's chip is the top-left one, the
+        // TARGET panel's the top-right one.
+        let source_chip = top_chip(&h, "source", false);
+        let target_chip = top_chip(&h, "target", true);
+        assert!(
+            source_chip.top() > copy.bottom(),
+            "repositories sit below the command: {source_chip:?} vs {copy:?}"
+        );
+        assert!(
+            (source_chip.top() - target_chip.top()).abs() < 4.0
+                && target_chip.left() > source_chip.right(),
+            "SOURCE and TARGET are two panels side by side: {source_chip:?} vs {target_chip:?}"
+        );
+        assert!(
+            h.query_by_label_contains("DEST — ").is_none(),
+            "HOW waits for a source"
+        );
+
+        click_at(&mut h, "source", source_chip);
+        h.run();
+        let dest = h.get_by_label_contains("DEST — ").rect();
+        assert!(
+            dest.top() > source_chip.bottom(),
+            "HOW sits below the repositories"
+        );
+        assert!(
+            h.query_by_label("REVIEW").is_none(),
+            "RUN waits for a target"
+        );
+
+        let target_chip = top_chip(&h, "target", true);
+        click_at(&mut h, "target", target_chip);
+        h.run();
+        let review = h.get_by_label("REVIEW").rect();
+        assert!(review.top() > dest.top(), "RUN comes last");
+
+        h.get_by_label("REVIEW").click();
+        settle_preview(&mut h);
+        assert!(
+            h.query_by_label("CHANGE").is_some(),
+            "after REVIEW the selection folds into a summary with CHANGE"
+        );
+        assert!(
+            h.query_by_label_contains("WHAT — ").is_none(),
+            "the sections are folded away"
+        );
+        h.get_by_label("CHANGE").click();
+        h.run();
+        assert!(
+            h.query_by_label_contains("WHAT — ").is_some()
+                && h.state().target.as_deref() == Some("target"),
+            "CHANGE unfolds the sections and keeps the answers"
+        );
     }
 
     /// The number keys switch the COPY/MOVE command from the keyboard.
@@ -6245,6 +6873,7 @@ mod ui_tests {
     fn doc_screenshot_files_tab() {
         let (_tmp, store) = sample_store();
         let mut view = TransferView::new();
+        view.command_chosen = true;
         view.loaded = true;
         view.repos = vec!["source".to_string(), "target".to_string()];
         view.source = Some("source".to_string());
@@ -6300,6 +6929,7 @@ mod ui_tests {
             .expect("sink");
 
         let mut view = TransferView::new();
+        view.command_chosen = true;
         view.sync_repos(&store);
         view.source = Some("source".to_string());
         view.refresh_group(&store);
@@ -6338,6 +6968,7 @@ mod ui_tests {
     fn render_transfer_sync() {
         let (_tmp, store) = sample_store();
         let mut view = TransferView::new();
+        view.command_chosen = true;
         view.loaded = true;
         view.repos = vec!["source".to_string(), "target".to_string()];
         view.source = Some("source".to_string());
@@ -6378,6 +7009,7 @@ mod ui_tests {
     fn render_transfer_mirror() {
         let (_tmp, store) = sample_store();
         let mut view = TransferView::new();
+        view.command_chosen = true;
         view.loaded = true;
         view.repos = vec!["source".to_string(), "target".to_string()];
         view.source = Some("source".to_string());
@@ -6418,6 +7050,7 @@ mod ui_tests {
         // Keep the temp dir alive for the harness's lifetime.
         std::mem::forget(_tmp);
         let mut view = TransferView::new();
+        view.command_chosen = true;
         view.loaded = true;
         view.repos = vec!["source".to_string(), "target".to_string()];
         view.source = Some("source".to_string());
@@ -6477,6 +7110,7 @@ mod ui_tests {
     /// first and let the row actions really run).
     fn diff_harness_over(store: Arc<Store>) -> Harness<'static, TransferView> {
         let mut view = TransferView::new();
+        view.command_chosen = true;
         view.loaded = true;
         view.repos = vec!["source".to_string(), "target".to_string()];
         view.source = Some("source".to_string());
@@ -6835,6 +7469,7 @@ mod ui_tests {
         }
 
         let mut view = TransferView::new();
+        view.command_chosen = true;
         view.loaded = true;
         view.repos = vec!["source".to_string(), "target".to_string()];
         view.source = Some("source".to_string());
@@ -6947,6 +7582,7 @@ mod ui_tests {
         scan("target");
         let store = Arc::new(store);
         let mut view = TransferView::new();
+        view.command_chosen = true;
         view.loaded = true;
         view.repos = vec!["source".to_string(), "target".to_string()];
         view.source = Some("source".to_string());
@@ -7364,7 +8000,8 @@ mod ui_tests {
         let plan = h.state().bulk_plan(BulkOp::CopyMissingRight, &listed);
         assert_eq!(plan.len(), 2, "both left-only files are planned");
 
-        h.state_mut().start_bulk(&store, plan);
+        let ctx = h.ctx.clone();
+        h.state_mut().start_bulk(&store, &ctx, plan);
         // Wait for the worker rather than polling a fixed budget — the fixed
         // budget was a known flake in this file. `step`, not `run`: the board
         // shows a spinner while the worker runs, so `run()` panics with
@@ -7442,6 +8079,29 @@ mod ui_tests {
             h.state().running,
             h.state().status
         );
+        // The run went through the activity owner: it ends on a report, and
+        // every file copied is in the event log under the target.
+        let mut reported = false;
+        for _ in 0..200 {
+            if crate::activity::lock(&h.state().activity).has_report() {
+                reported = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(reported, "the activity modal ends on the report");
+        let activity = crate::activity::lock(&h.state().activity);
+        let copied: Vec<String> = activity
+            .logged()
+            .into_iter()
+            .filter(|e| e.action == "Copied" && e.repo == "target" && e.ok)
+            .map(|e| e.path)
+            .collect();
+        assert_eq!(copied.len(), 2, "both copies are logged: {copied:?}");
+        assert!(
+            h.state().selection_collapsed,
+            "the selection folds into its summary once the run starts"
+        );
     }
 
     /// A batch RUN plans off-thread, so the command/target can change before the
@@ -7450,6 +8110,7 @@ mod ui_tests {
     #[test]
     fn confirm_runs_the_planned_config_not_the_current_controls() {
         let mut view = TransferView::new();
+        view.command_chosen = true;
         let planned = RunConfig {
             source: "SRC".to_string(),
             command: Command::Copy,

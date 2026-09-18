@@ -440,9 +440,7 @@ impl DupesView {
             filter: FilterBuilder::new(),
             archive_evidence: HashMap::new(),
             locks: crate::locks::RepoLocks::new(),
-            activity: crate::activity::shared(
-                &std::env::temp_dir().join(format!("dedup-rs-{}", std::process::id())),
-            ),
+            activity: crate::activity::scratch(),
             browse_request: None,
             find_note: None,
         }

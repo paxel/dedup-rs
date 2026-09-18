@@ -24,6 +24,19 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   deletes is appended to an event log (`events.jsonl` under the
   configuration directory, one JSON object per change, kept across
   restarts), and LOG opens it: newest first, with a filter box.
+- **Transfer runs in the activity window and asks its questions in
+  order.** REVIEW (every command, DIFF included) plans behind the activity
+  window — "reading 'source'", "reading 'target'", "pairing files" with a
+  percentage — and the window closes by itself once the board is ready. RUN,
+  GROUP SYNC, GROUP SYNC BACK and the board's bulk actions run there too,
+  naming each file as it is copied, moved or deleted, and end on the result
+  report; the in-page run log and its CANCEL button are gone. A row's COPY,
+  DELETE, RENAME, OVERWRITE, DEL ALL, KEEP 1 and APPLY answer with a
+  notification card, and every file they change is in the event log. The
+  tab now shows the command chips first, then SOURCE and TARGET as two
+  panels side by side (DUPEPOOL below once a source is picked), then the
+  command's options and the filter, and RUN last; after REVIEW or RUN the
+  sections fold into one summary line with CHANGE.
 - **Duplicates asks its questions in order.** The tab shows the mode choice
   first — DUPLICATES or SIMILAR FILES, with the similarity threshold beside
   the SIMILAR chip and QUICK DELETE on the same row — then the repository
@@ -39,6 +52,11 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   pair at a time; a large audiobook library looked frozen at 0 % for minutes.
   It now reports each phase with a percentage and scores the audio pairs in
   parallel, with the same groups as before.
+- **Transfer plans report their phases and can be cancelled.** The core
+  plan functions behind REVIEW (`plan_repo_diff`, `plan_sync`,
+  `plan_sync_back`, `diff_print`, `plan_folder_export`) gained reporting
+  variants that name the index being read, count the pairing, and stop on a
+  cancelled token.
 - **A group's delete now says which files could not be removed.** The
   delete counts carry every removed and every failed file by name, so the
   event log and the result report can list them.

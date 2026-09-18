@@ -6,17 +6,16 @@ Copy, move, or delete files between repositories by content (size + BLAKE3 — p
 matter), with an assisted filter builder and a review before anything runs. This is the GUI
 equivalent of [`diff cp`/`mv`/`rm`](../cli.md#diff).
 
-## Repo pickers
+## Reading order
 
-- **SOURCE** — the repository whose files are considered for transfer/deletion.
-- **TARGET** — where COPY/MOVE places files (and always a reference for "already known"); for
-  DELETE, the reference whose known content makes source files deletable.
-- **ALSO REF** — optional extra reference repositories. A source file counts as new only when
-  **none** of the target or these extra references already has its content — this is what
-  makes multi-disk triage correct (unique against the destination repo *and* every
-  already-processed disk, not just one).
+The tab asks its questions top to bottom: **WHAT** (the command), **WITH WHICH** (the
+repositories), **HOW** (destination, options, filter) and only then **RUN**. Each section
+appears once the one above it has an answer — a fresh tab shows only the command chips — and
+keeps its answer when an earlier one changes unless that change makes it invalid (picking a
+new source drops a target that is now the same repo). Once REVIEW or RUN starts, the sections
+fold into one summary line above the board; **CHANGE** unfolds them.
 
-## Command
+## What: the command
 
 - **COPY** — copy source files the target (and ALSO REF repos) doesn't have into the target
   repo. Source files are left in place.
@@ -34,6 +33,20 @@ equivalent of [`diff cp`/`mv`/`rm`](../cli.md#diff).
   offered when SOURCE is a group's main; see [Group sync back](#group-sync-back) below.
 - **DIFF** — compare the two repos side by side and resolve the differences yourself, one
   row at a time (see [Diff board](#diff-board) below). Nothing runs as a batch.
+
+## With which: the repositories
+
+**SOURCE** and **TARGET** are two panels side by side:
+
+- **SOURCE** — the repository whose files are considered for transfer/deletion.
+- **TARGET** — where COPY/MOVE places files (and always a reference for "already known"); for
+  DELETE, the reference whose known content makes source files deletable. A folder export has
+  no target panel, and GROUP SYNC / GROUP SYNC BACK pick their other repository in the
+  **SINKS** section below instead.
+- **DUPEPOOL** — optional extra reference repositories, shown once a source is picked. A
+  source file counts as new only when **none** of the target or these extra references already
+  has its content — this is what makes multi-disk triage correct (unique against the
+  destination repo *and* every already-processed disk, not just one).
 
 ## Into (subfolder)
 
@@ -90,8 +103,14 @@ Above the board, **ALL LISTED** offers bulk actions for reconciling large reposi
 **COPY MISSING >** / **< COPY MISSING** send everything only one side has to the other, and
 **RENAME ALL L** / **RENAME ALL R** rename each side's files to the other's names. Only actions
 the rows on screen can actually use are offered. They act on every row *currently listed* — so
-hiding a row is how you leave it out — and a confirmation states the exact count first. If some
-operations fail the summary says how many succeeded and how many did not.
+hiding a row is how you leave it out — and a confirmation states the exact count first. The
+batch then runs in the [activity window](index.md#the-activity-window), one file at a time
+with CANCEL, and ends on a report that names every file that could not be handled.
+
+Each single-row command — COPY, DELETE, RENAME, OVERWRITE, DEL ALL, KEEP 1 — is a quick
+action: it answers with a notification card in the top-right corner naming the file and the
+repository it changed, and writes a line to the event log (**LOG**). If something else is still
+running the card says so instead, and nothing happens.
 
 **Clicking a row** opens the two versions side by side over the whole window, in the same
 shared viewer every surface opens — so what you get depends on the file type, not on which tab
@@ -115,7 +134,9 @@ re-compares the two repos, so the row's commands always reflect the current stat
 
 Equal rows are hidden until **SHOW UNCHANGED** is pressed, and each action is applied to disk
 and to both repo indexes immediately — there is no RUN button and no batch confirmation.
-**HIDE** parks a row you have decided to leave alone; it comes back on the next REVIEW.
+**HIDE** parks a row you have decided to leave alone; it comes back on the next REVIEW. The
+comparison itself (REVIEW) reads both indexes in the activity window, which closes by itself
+when the board is ready.
 
 ## Group sync
 
@@ -139,9 +160,10 @@ content — those deletions cannot be undone.
 sink and shows what would be copied and deleted, without touching disk — each row naming the
 sink it belongs to. A group push is all-or-nothing, so these rows carry no per-row commands; RUN asks for
 confirmation — naming the sink count and, for a MIRROR push, any sink it would empty
-entirely — then pushes on a background thread. Sinks are handled independently, so one
-unreachable backup drive does not stop the others, and the main is never changed. The FILTER
-wizard applies here too, narrowing which files count for every selected sink.
+entirely — then pushes in the activity window, sink by sink and file by file, with CANCEL.
+Sinks are handled independently, so one unreachable backup drive does not stop the others,
+and the main is never changed. The FILTER wizard applies here too, narrowing which files
+count for every selected sink.
 
 ## Group sync back
 
@@ -169,7 +191,9 @@ Each row is a full triage decision: **`< COPY`** pulls *just that file* into the
 way a resurrection comes back), and **`DELETE`** on the sink's side removes it there instead —
 for the files that turn out to be worth neither keeping nor promoting. It appears only while the
 sink is **unlocked** (its padlock in the SINK panel); promoting is never barred, because adding
-to the main loses nothing. Clicking a row opens the file itself in the viewer.
+to the main loses nothing. Both are quick actions: a notification card names the file and the
+repository, and the event log keeps the line. Clicking a row opens the file itself in the
+viewer.
 
 Content already in the main is skipped, and a **RESURRECTIONS ONLY** toggle above the rows hides
 everything but the blue ones when you want to focus on what would come back. Nothing on the sink
@@ -178,20 +202,31 @@ GROUP SYNC BACK *before* you push again.
 
 ## Review and run
 
-- **REVIEW** shows the first matching transfers (up to a limit) and a total count, without
-  touching disk, on the shared [review board](index.md#the-review-board).
+The RUN section appears once the command has everything it needs — a source and a target,
+folder or sink. **REVIEW** and **RUN** are the two run buttons; everything above them is a
+selection.
+
+- **REVIEW** plans the transfer in the [activity window](index.md#the-activity-window) —
+  "reading 'source'", "reading 'target'", "pairing files" with a percentage — and, when the
+  plan is ready, closes by itself and shows every planned transfer and a total count on the
+  shared [review board](index.md#the-review-board), without touching disk.
 
   ![A COPY preview on the review board](../screenshots/transfer_review_board.png)
  Each side carries a
   thumbnail (image, video still, audio fingerprint, or a text file's first
   lines — hover the small cell to read the whole preview) and the file's size, dimensions or
   duration, and date — the same info as a Duplicate card. Per row, **APPLY** runs just that
-  transfer now and **HIDE** drops it from the board and from what RUN will do. REVIEW and RUN
-  are mutually exclusive — starting a run clears the review and vice versa.
-- **RUN** starts the command on a background thread after a confirmation dialog. Live
-  progress shows a spinner, the file currently being handled, the last few actions, and a
-  running count. **CANCEL** stops the operation — files already transferred or deleted before
-  cancelling stay as they are; this doesn't roll back, it just stops further work.
+  transfer now as a quick action — a notification card names the file once it has landed,
+  and the board refreshes — and **HIDE** drops it from the board and from what RUN will do.
+  Starting a run clears the review.
+- **RUN** plans first (so the confirmation can state the real count), asks for confirmation,
+  then runs the command in the activity window: it names the file being copied, moved or
+  deleted, counts up to the total, lists each problem as it occurs, and offers **CANCEL** —
+  files already transferred or deleted before cancelling stay as they are; this doesn't roll
+  back, it just stops further work. When the run ends the same window shows the result
+  report, and every file it changed is in the event log (**LOG**, top right). Only one
+  operation runs at a time: a second REVIEW or RUN while one is up is refused with a card
+  that names what is still running.
 - Both repos' indexes are kept in sync as a run proceeds: COPY/MOVE record each transferred
   file in the target's index (with its real on-disk mtime, plus provenance — which repo it
   came from); MOVE/DELETE mark the source entries missing.

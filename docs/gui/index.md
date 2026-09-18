@@ -106,6 +106,28 @@ Session logs live separately under `$XDG_STATE_HOME/dedup/logs` (default
 deliberately **not** persisted — every repo re-locks on launch as a safety default, since
 unlocking for deletion should be a fresh, conscious choice each session.
 
+## The activity window
+
+Long work runs one at a time in a central window that blocks the rest of the app while it
+runs: a Duplicates FIND or DELETE MARKED, a Transfer REVIEW, RUN, GROUP SYNC or bulk board
+action, and — tab by tab — the rest. The window names the operation and its repositories,
+the current phase ("reading 'photos'", "comparing audio", "copying 2020/a.jpg"), how far it
+is with a percentage where the total is known, elapsed time and an estimate of what is left,
+and each problem as it occurs. **CANCEL** is its only control and stops the whole batch;
+files already changed stay as they are. When the operation ends the same window becomes the
+result report (`Esc` closes it), except for a plan whose result is the board it fills — that
+window closes by itself. Anything else that wants to start meanwhile — another operation, a
+row action, a repository scan — is refused with a card naming what is still running.
+
+Quick actions — a row's COPY, DELETE, RENAME, OVERWRITE or APPLY, a group's DELETE NOW, an
+accept — answer with an animated **notification card** in the top-right corner naming the
+action, the file, the repository and the outcome. Every file the app changes on disk is also
+appended to the **event log** (`events.jsonl` under the configuration directory, kept across
+restarts); the **LOG** button beside the cards carries the unread count and opens it, newest
+first, with a filter box. Marks and accepts get a card but no log line: they change nothing
+on disk. The rules are in
+[ADR 0003](../adr/0003-every-action-reports-and-long-work-runs-alone.md).
+
 ## The review board
 
 Every preview and reconcile view renders on one shared board, so it reads the same wherever it

@@ -30,6 +30,19 @@ use std::time::{Duration, Instant};
 pub type Shared = Arc<Mutex<Activity>>;
 
 /// A new shared owner whose event log lives under `config_dir`.
+/// An owner for a view built without the app root (tests, previews): its
+/// event log goes to a fresh scratch directory under the system temp dir, so
+/// no two such views — or test processes — share a log.
+pub fn scratch() -> Shared {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    shared(
+        &std::env::temp_dir()
+            .join(format!("dedup-rs-{}", std::process::id()))
+            .join(n.to_string()),
+    )
+}
+
 pub fn shared(config_dir: &Path) -> Shared {
     Arc::new(Mutex::new(Activity::new(config_dir)))
 }
@@ -145,7 +158,9 @@ enum Msg {
         total: Option<u64>,
     },
     Problem(String),
-    Finished(RunReport),
+    /// The operation ended; `None` closes the modal without a report (a
+    /// preview whose result is the board it fills).
+    Finished(Option<RunReport>),
 }
 
 /// The progress side of a running operation: what the worker closure reports
@@ -155,9 +170,23 @@ enum Msg {
 pub struct ActivityProgress {
     tx: Sender<Msg>,
     ctx: egui::Context,
+    log: EventLog,
 }
 
 impl ActivityProgress {
+    /// Append one filesystem change to the event log from the worker — for
+    /// an operation that touches many files and summarises them in its
+    /// report. Nothing is drawn; the card, if any, is the caller's.
+    pub fn record(&self, note: &Notification) {
+        self.log.append(&LogEntry::from_note(note));
+    }
+
+    /// Ask the window to redraw — for a worker that has just sent its view a
+    /// message over the view's own channel.
+    pub fn repaint(&self) {
+        self.ctx.request_repaint();
+    }
+
     /// The current phase: a short present-tense line, and how far along it is.
     /// `total: None` is an indeterminate phase (a spinner, no percentage).
     pub fn phase(&self, name: impl Into<String>, done: u64, total: Option<u64>) {
@@ -248,6 +277,17 @@ pub struct LogEntry {
 }
 
 impl LogEntry {
+    fn from_note(note: &Notification) -> Self {
+        Self {
+            at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            action: note.action.clone(),
+            repo: note.repo.clone(),
+            path: note.path.clone(),
+            ok: note.outcome.is_ok(),
+            error: note.outcome.clone().err(),
+        }
+    }
+
     fn matches(&self, filter: &str) -> bool {
         let f = filter.to_lowercase();
         f.is_empty()
@@ -264,6 +304,7 @@ impl LogEntry {
 
 /// The append-only event log on disk. One JSON object per line; the app
 /// never rewrites or truncates it.
+#[derive(Clone)]
 pub struct EventLog {
     path: PathBuf,
 }
@@ -386,6 +427,37 @@ impl Activity {
     where
         F: FnOnce(&ActivityProgress, &CancellationToken) -> RunReport + Send + 'static,
     {
+        self.launch(ctx, spec, move |progress, cancel| {
+            Some(work(progress, cancel))
+        })
+    }
+
+    /// Start a long-running operation whose result is what it fills in
+    /// (a preview's board), not a report: the modal shows its phases and
+    /// closes by itself when `work` returns `Ok`. An `Err` becomes a
+    /// one-problem report, unless the operation was cancelled.
+    pub fn start_quiet<F>(&mut self, ctx: &egui::Context, spec: Spec, work: F) -> Result<(), Busy>
+    where
+        F: FnOnce(&ActivityProgress, &CancellationToken) -> Result<(), String> + Send + 'static,
+    {
+        let title = spec.title.clone();
+        self.launch(ctx, spec, move |progress, cancel| {
+            match work(progress, cancel) {
+                Ok(()) => None,
+                Err(_) if cancel.is_cancelled() => None,
+                Err(e) => {
+                    let mut report = RunReport::new(title);
+                    report.problem(e);
+                    Some(report)
+                }
+            }
+        })
+    }
+
+    fn launch<F>(&mut self, ctx: &egui::Context, spec: Spec, work: F) -> Result<(), Busy>
+    where
+        F: FnOnce(&ActivityProgress, &CancellationToken) -> Option<RunReport> + Send + 'static,
+    {
         // A finished operation may not have been drawn yet (a view starting
         // work before the root's next frame); fold it in before judging.
         self.drain();
@@ -404,10 +476,7 @@ impl Activity {
             problems: Vec::new(),
             cancel: cancel.clone(),
         });
-        let progress = ActivityProgress {
-            tx: self.tx.clone(),
-            ctx: ctx.clone(),
-        };
+        let progress = self.progress_handle(ctx);
         std::thread::spawn(move || {
             let report = work(&progress, &cancel);
             let _ = progress.tx.send(Msg::Finished(report));
@@ -438,14 +507,18 @@ impl Activity {
     /// Log a change without a card — for each file of a batch whose card is
     /// one summary line.
     pub fn record(&mut self, note: &Notification) {
-        self.log.append(&LogEntry {
-            at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            action: note.action.clone(),
-            repo: note.repo.clone(),
-            path: note.path.clone(),
-            ok: note.outcome.is_ok(),
-            error: note.outcome.clone().err(),
-        });
+        self.log.append(&LogEntry::from_note(note));
+    }
+
+    /// A progress handle for a row action's worker thread, so it can
+    /// [`ActivityProgress::record`] the files it changes. Phase reports
+    /// through it are dropped: no operation is on the modal.
+    pub fn progress_handle(&self, ctx: &egui::Context) -> ActivityProgress {
+        ActivityProgress {
+            tx: self.tx.clone(),
+            ctx: ctx.clone(),
+            log: self.log.clone(),
+        }
     }
 
     /// Show a card without logging — the summary of a batch whose files were
@@ -468,6 +541,20 @@ impl Activity {
         self.cards.iter().map(|c| c.note.headline()).collect()
     }
 
+    /// Whether a finished operation's report is up (folding in a finish
+    /// the root has not drawn yet).
+    #[cfg(test)]
+    pub fn has_report(&mut self) -> bool {
+        self.drain();
+        self.report.is_open()
+    }
+
+    /// Every event-log line, newest first.
+    #[cfg(test)]
+    pub fn logged(&self) -> Vec<LogEntry> {
+        self.log.read()
+    }
+
     fn drain(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
@@ -483,12 +570,17 @@ impl Activity {
                         r.problems.push(text);
                     }
                 }
-                Msg::Finished(mut report) => {
-                    if let Some(r) = self.running.take() {
-                        // The problems the modal listed live belong in the
-                        // report too, in case the operation did not add them.
-                        if report.problem_count() == 0 {
-                            for p in r.problems {
+                Msg::Finished(report) => {
+                    let running = self.running.take();
+                    let Some(mut report) = report else {
+                        continue;
+                    };
+                    if let Some(r) = running {
+                        // Every problem the modal listed live belongs in the
+                        // report too, whether or not the operation added
+                        // some of its own.
+                        for p in r.problems {
+                            if !report.has_problem(&p) {
                                 report.problem(p);
                             }
                         }
@@ -907,6 +999,58 @@ mod tests {
         }
         assert!(!activity.is_running());
         assert!(activity.busy().is_none());
+    }
+
+    #[test]
+    fn a_quiet_operation_closes_without_a_report_and_its_worker_can_log() {
+        let dir = tempfile::tempdir().expect("dir");
+        let ctx = egui::Context::default();
+        let mut activity = Activity::new(dir.path());
+        activity
+            .start_quiet(
+                &ctx,
+                Spec {
+                    title: "REVIEW".into(),
+                    repos: vec!["photos".into()],
+                },
+                |progress, _| {
+                    progress.phase("reading 'photos'", 0, None);
+                    progress.record(&Notification::changed("Copied", "photos", "a.jpg"));
+                    Ok(())
+                },
+            )
+            .expect("start");
+        for _ in 0..50 {
+            activity.drain();
+            if !activity.is_running() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!activity.is_running());
+        assert!(!activity.report.is_open(), "a quiet finish shows no report");
+        let logged = activity.log.read();
+        assert_eq!(logged.len(), 1);
+        assert_eq!((logged[0].action.as_str(), logged[0].ok), ("Copied", true));
+
+        activity
+            .start_quiet(
+                &ctx,
+                Spec {
+                    title: "REVIEW".into(),
+                    repos: vec![],
+                },
+                |_, _| Err("index unreadable".to_string()),
+            )
+            .expect("start");
+        for _ in 0..50 {
+            activity.drain();
+            if !activity.is_running() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(activity.report.is_open(), "a failed quiet finish reports");
     }
 
     #[test]

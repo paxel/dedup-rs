@@ -67,7 +67,11 @@ const TRANSFER: &str = "\
 Copy, move, or sync files between two repositories by content (size + hash — paths never \
 matter), with an assisted filter and a preview before anything runs.
 
-Pick a SOURCE and a TARGET repo, optionally add ALSO REF repositories — a source file only \
+The tab asks its questions in order: WHAT (the command), WITH WHICH (SOURCE and TARGET, side \
+by side), HOW (destination, options, filter), then RUN. Each section appears once the one \
+above it is answered, and after REVIEW or RUN they fold into one line — CHANGE unfolds them.
+
+Pick a SOURCE and a TARGET repo, optionally add DUPEPOOL repositories — a source file only \
 counts as new when none of the target or the extra references already has its content.
 
 COPY copies source files the target doesn't have (the source is left in place). MOVE does \
@@ -83,10 +87,9 @@ deleted, so the sink follows the main's edits while keeping what the main never 
 deletes all sink content the main does not have, so it ends up holding exactly the main's \
 content — deletions cannot be undone. REVIEW plans every selected sink and shows what would \
 be copied and deleted, without touching disk; RUN asks for confirmation — naming the sink \
-count and any sink a push would empty entirely — then pushes on a background thread. Sinks are handled independently, so one \
-unreachable backup drive does not stop the others, and the main is never changed. To bring \
-changes made inside a sink back to the main, use DIFF with the sink as source and the main \
-as target.
+count and any sink a push would empty entirely — then pushes in the activity window. Sinks \
+are handled independently, so one unreachable backup drive does not stop the others, and \
+the main is never changed. GROUP SYNC BACK pulls one sink's changes back into the main.
 
 DIFF is the manual view: it compares the two repos side by side and leaves every decision \
 to you. PAIR BY HASH matches files by content, so the same file under two names is one row \
@@ -99,10 +102,12 @@ versions side by side with a preview, their size, date and type — the larger a
 values highlighted — and the same actions per side. Nothing happens until you click a row's \
 button; rows that are equal on both sides are hidden until you ask for them.
 
-Use the FILTER wizard below to narrow which files are considered — conditions combine with \
-AND. REVIEW shows the matching transfers, paged, plus a total count, without touching \
-disk. RUN asks for confirmation, then performs the transfer while you watch its progress — \
-CANCEL stops it at any point.";
+Use the FILTER wizard to narrow which files are considered — conditions combine with \
+AND. REVIEW plans in the activity window and shows the matching transfers, paged, plus a \
+total count, without touching disk. RUN asks for confirmation, then performs the transfer \
+in the activity window — each file as it goes, every problem, and CANCEL — and ends on the \
+result report. A row's COPY, DELETE, RENAME, OVERWRITE or APPLY answers with a notification \
+card, and every file changed is in the event log behind the LOG button.";
 
 const GROOMING: &str = "\
 Prune and reorganize a single repository. Pick a command from the bar at the top; each has \
