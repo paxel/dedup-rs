@@ -224,6 +224,9 @@ pub struct DupesView {
     /// Keys handed to the in-flight delete, applied to `marked` on completion.
     delete_batch: Vec<FileKey>,
     page: usize,
+    /// The page just changed: the next frame shows the list from its first
+    /// group instead of wherever the previous page was scrolled to.
+    scroll_to_top: bool,
     /// A background operation in flight, if any.
     busy: Option<Op>,
     tx: Sender<Msg>,
@@ -290,6 +293,7 @@ impl DupesView {
             quick_delete: false,
             delete_batch: Vec::new(),
             page: 0,
+            scroll_to_top: false,
             busy: None,
             tx,
             rx,
@@ -532,6 +536,7 @@ impl DupesView {
                             self.resolved.clear();
                             self.hidden.clear();
                             self.page = 0;
+                            self.scroll_to_top = true;
                             self.cached_page = None;
                             self.error = None;
                             // The archives across the searched repos that contain
@@ -927,43 +932,45 @@ impl DupesView {
         }
         // Materialize just this page's groups (exact loads from the DB).
         self.ensure_page(store, page);
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let avail_w = ui.available_width();
-                let spacing = ui.spacing().item_spacing.y;
-                for gi in start..end {
-                    // HIDE GROUP dismisses a group from the list until the next
-                    // FIND — skip it entirely (no card, no reserved space). A
-                    // fully accepted group is skipped the same way unless SHOW
-                    // ACCEPTED is on.
-                    if self.hidden.contains(&gi)
-                        || (!self.show_accepted && self.accepted_groups.contains(&gi))
-                    {
-                        continue;
-                    }
-                    // Virtualize: a group we've measured before and that lies
-                    // outside the viewport just reserves its known height — we
-                    // skip building (and cloning) its widgets entirely. Unmeasured
-                    // groups always render once so their height is recorded.
-                    let known = self.group_heights[gi];
-                    let top = ui.next_widget_position();
-                    let visible = known <= 0.0
-                        || ui.is_rect_visible(egui::Rect::from_min_size(
-                            top,
-                            egui::vec2(avail_w, known),
-                        ));
-                    if visible {
-                        let before = top.y;
-                        self.group_card(ui, gi, start, acts);
-                        self.group_heights[gi] = ui.next_widget_position().y - before;
-                    } else {
-                        // `allocate_space` adds a trailing item-spacing itself, so
-                        // reserve the slot minus that to match the rendered advance.
-                        ui.allocate_space(egui::vec2(avail_w, (known - spacing).max(0.0)));
-                    }
+        let mut list = egui::ScrollArea::vertical().auto_shrink([false, false]);
+        if std::mem::take(&mut self.scroll_to_top) {
+            list = list.vertical_scroll_offset(0.0);
+        }
+        list.show(ui, |ui| {
+            let avail_w = ui.available_width();
+            let spacing = ui.spacing().item_spacing.y;
+            for gi in start..end {
+                // HIDE GROUP dismisses a group from the list until the next
+                // FIND — skip it entirely (no card, no reserved space). A
+                // fully accepted group is skipped the same way unless SHOW
+                // ACCEPTED is on.
+                if self.hidden.contains(&gi)
+                    || (!self.show_accepted && self.accepted_groups.contains(&gi))
+                {
+                    continue;
                 }
-            });
+                // Virtualize: a group we've measured before and that lies
+                // outside the viewport just reserves its known height — we
+                // skip building (and cloning) its widgets entirely. Unmeasured
+                // groups always render once so their height is recorded.
+                let known = self.group_heights[gi];
+                let top = ui.next_widget_position();
+                let visible = known <= 0.0
+                    || ui.is_rect_visible(egui::Rect::from_min_size(
+                        top,
+                        egui::vec2(avail_w, known),
+                    ));
+                if visible {
+                    let before = top.y;
+                    self.group_card(ui, gi, start, acts);
+                    self.group_heights[gi] = ui.next_widget_position().y - before;
+                } else {
+                    // `allocate_space` adds a trailing item-spacing itself, so
+                    // reserve the slot minus that to match the rendered advance.
+                    ui.allocate_space(egui::vec2(avail_w, (known - spacing).max(0.0)));
+                }
+            }
+        });
     }
 
     /// Load the current page's groups into `page_groups` if not already cached.
@@ -1957,7 +1964,10 @@ impl DupesView {
                 self.set_accepted(store, &contents, false);
             }
             Act::ToggleShowAccepted => self.show_accepted = !self.show_accepted,
-            Act::SetPage(p) => self.page = p,
+            Act::SetPage(p) => {
+                self.page = p;
+                self.scroll_to_top = true;
+            }
             Act::AskDelete => {
                 let n = self.marked.len();
                 if n > 0 {
@@ -3357,6 +3367,25 @@ mod ui_tests {
     /// Accepting one content drops the marks and per-file unlocks of *its*
     /// copies only; an unlock the user made on another group survives, and
     /// un-accepting touches neither.
+    /// Turning a page shows that page from its first group: the previous
+    /// page's scroll position must not carry over, or page two opens at the
+    /// bottom and has to be scrolled back up.
+    #[test]
+    fn turning_a_page_scrolls_the_list_back_to_its_first_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let ctx = egui::Context::default();
+        let mut view = DupesView::new();
+        assert!(!view.scroll_to_top, "a fresh view has nothing to reset");
+
+        view.apply(&ctx, &store, Act::SetPage(1));
+        assert_eq!(view.page, 1);
+        assert!(
+            view.scroll_to_top,
+            "a page turn asks for the top of the list"
+        );
+    }
+
     #[test]
     fn accept_scopes_its_cleanup_to_the_accepted_content() {
         let tmp = tempfile::tempdir().unwrap();
