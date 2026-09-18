@@ -36,7 +36,7 @@ jobs:
     name: Gate (Linux, full)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -78,7 +78,7 @@ jobs:
             arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: System dependencies
@@ -94,7 +94,7 @@ jobs:
           tar -C target/release -czf "dist/dedup-${ver}-linux-${{ matrix.arch }}.tar.gz" dedup
       - name: AppImage (reuses the release binary)
         run: packaging/mkappimage.sh --release --out dist --no-build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-${{ matrix.arch }}
           path: dist/*
@@ -104,7 +104,7 @@ jobs:
     needs: gate
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release binaries
@@ -118,7 +118,7 @@ jobs:
                                  target/release/dedup-gui.exe, `
                                  LICENSE `
                            -DestinationPath "dist/dedup-$ver-windows-x86_64.zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: dist/*
@@ -138,7 +138,7 @@ jobs:
             arch: x86_64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
@@ -150,7 +150,7 @@ jobs:
           tar -C target/release -czf "dist/dedup-${ver}-macos-${{ matrix.arch }}.tar.gz" dedup
           packaging/mkapp.sh target/release/dedup "$ver" dist
           rm -rf dist/dedup.app
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-${{ matrix.arch }}
           path: dist/*
@@ -162,8 +162,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -196,7 +196,7 @@ jobs:
     needs: release
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: System dependencies
         run: |
@@ -227,8 +227,8 @@ jobs:
     needs: release
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
