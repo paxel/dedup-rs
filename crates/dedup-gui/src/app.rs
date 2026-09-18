@@ -627,6 +627,12 @@ impl DedupApp {
     /// while anything else runs.
     fn start_scans(&mut self, ctx: &egui::Context, names: Vec<String>, kind: JobKind) {
         if names.is_empty() {
+            // Never a silent click: UPDATE ALL with every repository offline
+            // says so.
+            self.card(
+                ctx,
+                Notification::noted("Nothing to scan —", "", "no repository is reachable"),
+            );
             return;
         }
         let verb = if kind == JobKind::Check {

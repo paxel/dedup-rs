@@ -216,12 +216,13 @@ impl ActivityProgress {
     /// The current phase: a short present-tense line, and how far along it is.
     /// `total: None` is an indeterminate phase (a spinner, no percentage).
     pub fn phase(&self, name: impl Into<String>, done: u64, total: Option<u64>) {
+        // No repaint per event: the modal polls at 10 Hz while it is up, and a
+        // scan reports once per hashed file.
         let _ = self.tx.send(Msg::Phase {
             name: name.into(),
             done,
             total,
         });
-        self.ctx.request_repaint();
     }
 
     /// One repository's own line in a multi-repository operation (UPDATE
@@ -233,7 +234,6 @@ impl ActivityProgress {
             done,
             total,
         });
-        self.ctx.request_repaint();
     }
 
     /// One repository's line is finished: what it ends on.
@@ -242,13 +242,11 @@ impl ActivityProgress {
             repo: repo.to_string(),
             summary: summary.into(),
         });
-        self.ctx.request_repaint();
     }
 
     /// A failure on one item, listed live in the modal and again in the report.
     pub fn problem(&self, text: impl Into<String>) {
         let _ = self.tx.send(Msg::Problem(text.into()));
-        self.ctx.request_repaint();
     }
 }
 
@@ -976,6 +974,7 @@ impl Activity {
                                     .strong(),
                             );
                             let detail = match (&card.note.outcome, card.note.repo.as_str()) {
+                                (Ok(()), "") => String::new(),
                                 (Ok(()), repo) => format!("in {repo}"),
                                 (Err(e), "") => e.clone(),
                                 (Err(e), repo) => format!("in {repo} — {e}"),
