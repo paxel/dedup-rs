@@ -44,12 +44,73 @@ pub enum DiffError {
     #[error("at least one reference repo is required")]
     NoReference,
 
+    #[error("cancelled")]
+    Cancelled,
+
     #[error(
         "Sync group main '{main}' has no indexed files, so a MIRROR push would delete \
          everything in its sink(s). Scan '{main}' first — a drive that failed to mount \
          scans as an empty directory."
     )]
     EmptyMirrorSource { main: String },
+}
+
+/// Where a plan is, for a caller that shows progress: the phase and how far
+/// along it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanProgress {
+    pub phase: PlanPhase,
+    pub done: u64,
+    /// `None` while the size of the phase is not known (an index being
+    /// streamed).
+    pub total: Option<u64>,
+}
+
+/// The phases of a plan, in the order they run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanPhase {
+    /// Streaming one repository's index (or several, named together).
+    Reading { repo: String },
+    /// Classifying each file against the other side.
+    Pairing,
+    /// Grouping the source's own duplicates (a folder export).
+    Grouping,
+}
+
+/// A progress sink for the `*_reporting` plan functions. Called from the
+/// planning thread; must be `Sync` because a similarity search reports from
+/// its worker threads.
+pub type PlanReporter<'a> = &'a (dyn Fn(PlanProgress) + Sync);
+
+fn report(progress: PlanReporter<'_>, phase: PlanPhase, done: u64, total: Option<u64>) {
+    progress(PlanProgress { phase, done, total });
+}
+
+fn reading(progress: PlanReporter<'_>, repo: &str) {
+    report(
+        progress,
+        PlanPhase::Reading {
+            repo: repo.to_string(),
+        },
+        0,
+        None,
+    );
+}
+
+/// Report a pairing step about once per percent, and always at the end.
+fn pairing_step(progress: PlanReporter<'_>, done: u64, total: u64) {
+    let step = (total / 100).max(1);
+    if done == total || done.is_multiple_of(step) {
+        report(progress, PlanPhase::Pairing, done, Some(total));
+    }
+}
+
+fn check(cancel: &CancellationToken) -> Result<(), DiffError> {
+    if cancel.is_cancelled() {
+        Err(DiffError::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 /// Where a copy/move should place files: a target directory and an optional
@@ -252,20 +313,42 @@ pub fn plan_sync_back(
     main: &str,
     filter: Option<&str>,
 ) -> Result<Vec<PullItem>, DiffError> {
-    Ok(diff_print(store, sink, &[main], filter)?
-        .into_iter()
-        .filter_map(|item| match item {
-            DiffItem::New { rel_path } => Some(PullItem {
-                rel_path,
-                kind: PullKind::New,
-            }),
-            DiffItem::DeletedInReference { rel_path } => Some(PullItem {
-                rel_path,
-                kind: PullKind::Resurrection,
-            }),
-            DiffItem::Equal { .. } => None,
-        })
-        .collect())
+    plan_sync_back_reporting(
+        store,
+        sink,
+        main,
+        filter,
+        &|_| {},
+        &CancellationToken::new(),
+    )
+}
+
+/// [`plan_sync_back`] reporting its phases and stopping on `cancel` with
+/// [`DiffError::Cancelled`].
+pub fn plan_sync_back_reporting(
+    store: &Store,
+    sink: &str,
+    main: &str,
+    filter: Option<&str>,
+    progress: PlanReporter<'_>,
+    cancel: &CancellationToken,
+) -> Result<Vec<PullItem>, DiffError> {
+    Ok(
+        diff_print_reporting(store, sink, &[main], filter, progress, cancel)?
+            .into_iter()
+            .filter_map(|item| match item {
+                DiffItem::New { rel_path } => Some(PullItem {
+                    rel_path,
+                    kind: PullKind::New,
+                }),
+                DiffItem::DeletedInReference { rel_path } => Some(PullItem {
+                    rel_path,
+                    kind: PullKind::Resurrection,
+                }),
+                DiffItem::Equal { .. } => None,
+            })
+            .collect(),
+    )
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -403,12 +486,40 @@ pub fn diff_print(
     references: &[&str],
     filter: Option<&str>,
 ) -> Result<Vec<DiffItem>, DiffError> {
-    let filter = FileFilter::parse(filter)?;
-    let source = open_repo(store, source)?;
-    let (refs, ref_index) = open_references(store, references)?;
+    diff_print_reporting(
+        store,
+        source,
+        references,
+        filter,
+        &|_| {},
+        &CancellationToken::new(),
+    )
+}
 
+/// [`diff_print`] reporting its phases and stopping on `cancel` with
+/// [`DiffError::Cancelled`].
+pub fn diff_print_reporting(
+    store: &Store,
+    source: &str,
+    references: &[&str],
+    filter: Option<&str>,
+    progress: PlanReporter<'_>,
+    cancel: &CancellationToken,
+) -> Result<Vec<DiffItem>, DiffError> {
+    let filter = FileFilter::parse(filter)?;
+    reading(progress, source);
+    let source = open_repo(store, source)?;
+    let entries = collect_source_entries(&source.db, &filter, false)?;
+    check(cancel)?;
+    reading(progress, &references.join(", "));
+    let (refs, ref_index) = open_references(store, references)?;
+    check(cancel)?;
+
+    let total = entries.len() as u64;
     let mut items = Vec::new();
-    for (rel_path, entry) in collect_source_entries(&source.db, &filter, false)? {
+    for (done, (rel_path, entry)) in entries.into_iter().enumerate() {
+        pairing_step(progress, done as u64 + 1, total);
+        check(cancel)?;
         match ref_index.get(&(entry.size, entry.hash)) {
             None => items.push(DiffItem::New { rel_path }),
             Some(state) if state.present => {
@@ -914,9 +1025,38 @@ pub fn plan_sync(
     delete: SyncDelete,
     filter: Option<&str>,
 ) -> Result<SyncPlan, DiffError> {
+    plan_sync_reporting(
+        store,
+        source,
+        target,
+        copy_new,
+        delete,
+        filter,
+        &|_| {},
+        &CancellationToken::new(),
+    )
+}
+
+/// [`plan_sync`] reporting its phases and stopping on `cancel` with
+/// [`DiffError::Cancelled`].
+#[allow(clippy::too_many_arguments)]
+pub fn plan_sync_reporting(
+    store: &Store,
+    source: &str,
+    target: &str,
+    copy_new: bool,
+    delete: SyncDelete,
+    filter: Option<&str>,
+    progress: PlanReporter<'_>,
+    cancel: &CancellationToken,
+) -> Result<SyncPlan, DiffError> {
     let filter = FileFilter::parse(filter)?;
+    reading(progress, source);
     let source = SourceView::collect(store, source, &filter)?;
-    plan_sync_from(store, &source, target, copy_new, delete, &filter)
+    check(cancel)?;
+    plan_sync_from_reporting(
+        store, &source, target, copy_new, delete, &filter, progress, cancel,
+    )
 }
 
 /// [`plan_sync`] against an already-collected source, so a multi-sink push
@@ -929,14 +1069,44 @@ pub fn plan_sync_from(
     delete: SyncDelete,
     filter: &FileFilter,
 ) -> Result<SyncPlan, DiffError> {
-    let target = open_repo(store, target)?;
+    plan_sync_from_reporting(
+        store,
+        source,
+        target,
+        copy_new,
+        delete,
+        filter,
+        &|_| {},
+        &CancellationToken::new(),
+    )
+}
+
+/// [`plan_sync_from`] reporting its phases and stopping on `cancel` with
+/// [`DiffError::Cancelled`].
+#[allow(clippy::too_many_arguments)]
+pub fn plan_sync_from_reporting(
+    store: &Store,
+    source: &SourceView,
+    target_name: &str,
+    copy_new: bool,
+    delete: SyncDelete,
+    filter: &FileFilter,
+    progress: PlanReporter<'_>,
+    cancel: &CancellationToken,
+) -> Result<SyncPlan, DiffError> {
+    reading(progress, target_name);
+    let target = open_repo(store, target_name)?;
     let target_index = store::read_content_index(&target.db)?;
+    check(cancel)?;
 
     let source_entries = &source.entries;
+    let total = source_entries.len() as u64;
     let mut plan = SyncPlan::default();
 
     if copy_new {
-        for (rel_path, entry) in source_entries {
+        for (done, (rel_path, entry)) in source_entries.iter().enumerate() {
+            pairing_step(progress, done as u64 + 1, total);
+            check(cancel)?;
             if entry.missing {
                 continue;
             }
@@ -953,6 +1123,7 @@ pub fn plan_sync_from(
         SyncDelete::None => {}
         SyncDelete::Missing => {
             for (_, entry) in source_entries.iter().filter(|(_, e)| e.missing) {
+                check(cancel)?;
                 let present = target_index
                     .get(&(entry.size, entry.hash))
                     .is_some_and(|s| s.present);
@@ -965,7 +1136,10 @@ pub fn plan_sync_from(
         }
         SyncDelete::Absent => {
             let source_present = source.present_content();
-            for (rel_path, entry) in collect_source_entries(&target.db, filter, false)? {
+            reading(progress, target_name);
+            let target_entries = collect_source_entries(&target.db, filter, false)?;
+            check(cancel)?;
+            for (rel_path, entry) in target_entries {
                 if !source_present.contains(&(entry.size, entry.hash)) {
                     plan.deletes.push(rel_path);
                 }
@@ -1169,30 +1343,68 @@ pub fn plan_folder_export(
     invert: bool,
     filter: Option<&str>,
 ) -> Result<Vec<String>, DiffError> {
+    plan_folder_export_reporting(
+        store,
+        source,
+        references,
+        mode,
+        invert,
+        filter,
+        &|_| {},
+        &CancellationToken::new(),
+    )
+}
+
+/// [`plan_folder_export`] reporting its phases and stopping on `cancel` with
+/// [`DiffError::Cancelled`].
+#[allow(clippy::too_many_arguments)]
+pub fn plan_folder_export_reporting(
+    store: &Store,
+    source: &str,
+    references: &[&str],
+    mode: FolderMode,
+    invert: bool,
+    filter: Option<&str>,
+    progress: PlanReporter<'_>,
+    cancel: &CancellationToken,
+) -> Result<Vec<String>, DiffError> {
     let filter = FileFilter::parse(filter)?;
+    reading(progress, source);
     let source_open = open_repo(store, source)?;
 
     // Content the reference repos already hold is excluded up front.
     let ref_index = if references.is_empty() {
         HashMap::new()
     } else {
+        reading(progress, &references.join(", "));
         open_references(store, references)?.1
     };
+    check(cancel)?;
     let mut candidates: Vec<String> = collect_source_entries(&source_open.db, &filter, false)?
         .into_iter()
         .filter(|(_, entry)| !ref_index.contains_key(&(entry.size, entry.hash)))
         .map(|(rel_path, _)| rel_path)
         .collect();
+    check(cancel)?;
 
     // The non-best members of each exact/similar group within the source repo
     // are the "redundant" copies; every group is sorted best-copy-first.
     let source_names = [source.to_string()];
+    report(progress, PlanPhase::Grouping, 0, None);
     let groups = match mode {
         FolderMode::Exact => crate::dupes::find_exact_duplicates(store, &source_names)?,
-        FolderMode::Similar { threshold } => {
-            crate::similar::find_similar(store, &source_names, threshold, None)?
-        }
+        FolderMode::Similar { threshold } => crate::similar::find_similar_reporting(
+            store,
+            &source_names,
+            threshold,
+            None,
+            &|p: crate::similar::SimilarProgress| {
+                report(progress, PlanPhase::Grouping, p.done, Some(p.total));
+            },
+            cancel,
+        )?,
     };
+    check(cancel)?;
     let redundant: HashSet<String> = groups
         .iter()
         .flat_map(|group| group.iter().skip(1))
@@ -1370,12 +1582,37 @@ pub fn plan_repo_diff(
     right: &str,
     pairing: DiffPairing,
 ) -> Result<Vec<RepoDiffRow>, DiffError> {
+    plan_repo_diff_reporting(
+        store,
+        left,
+        right,
+        pairing,
+        &|_| {},
+        &CancellationToken::new(),
+    )
+}
+
+/// [`plan_repo_diff`] reporting its phases and stopping on `cancel` with
+/// [`DiffError::Cancelled`].
+pub fn plan_repo_diff_reporting(
+    store: &Store,
+    left: &str,
+    right: &str,
+    pairing: DiffPairing,
+    progress: PlanReporter<'_>,
+    cancel: &CancellationToken,
+) -> Result<Vec<RepoDiffRow>, DiffError> {
     let left_repo = open_repo(store, left)?;
     let right_repo = open_repo(store, right)?;
-    let mut rows = match pairing {
-        DiffPairing::ByHash => rows_by_hash(&left_repo.db, &right_repo.db)?,
-        DiffPairing::ByPath => rows_by_path(&left_repo.db, &right_repo.db)?,
+    let sides = Sides {
+        left: (left, &left_repo.db),
+        right: (right, &right_repo.db),
     };
+    let mut rows = match pairing {
+        DiffPairing::ByHash => rows_by_hash(&sides, progress, cancel)?,
+        DiffPairing::ByPath => rows_by_path(&sides, progress, cancel)?,
+    };
+    check(cancel)?;
     rows.sort_by(|a, b| {
         a.sort_key()
             .to_lowercase()
@@ -1383,6 +1620,12 @@ pub fn plan_repo_diff(
             .then_with(|| a.sort_key().cmp(b.sort_key()))
     });
     Ok(rows)
+}
+
+/// The two open sides of a repo diff, each with its name for progress.
+struct Sides<'a> {
+    left: (&'a str, &'a redb::Database),
+    right: (&'a str, &'a redb::Database),
 }
 
 /// Collect one repo's live files, keyed by content, as diff-ready files.
@@ -1411,14 +1654,22 @@ fn live_files_by_content(
 
 /// Pair by content: one row per content key either side holds.
 fn rows_by_hash(
-    left_db: &redb::Database,
-    right_db: &redb::Database,
-) -> Result<Vec<RepoDiffRow>, StoreError> {
+    sides: &Sides<'_>,
+    progress: PlanReporter<'_>,
+    cancel: &CancellationToken,
+) -> Result<Vec<RepoDiffRow>, DiffError> {
+    let (left_name, left_db) = sides.left;
+    let (right_name, right_db) = sides.right;
+    reading(progress, left_name);
     let mut left = live_files_by_content(left_db)?;
-    let right = live_files_by_content(right_db)?;
     // Tombstone knowledge for the one-sided rows (one pass per side).
     let left_idx = store::read_content_index(left_db)?;
+    check(cancel)?;
+    reading(progress, right_name);
+    let right = live_files_by_content(right_db)?;
     let right_idx = store::read_content_index(right_db)?;
+    check(cancel)?;
+    report(progress, PlanPhase::Pairing, 0, None);
     let mut rows = Vec::new();
     for (key, right_files) in right {
         let left_files = left.remove(&key).unwrap_or_default();
@@ -1465,9 +1716,12 @@ fn hash_row(left: Vec<DiffFile>, right: Vec<DiffFile>) -> RepoDiffRow {
 
 /// Pair by path: one row per relative path either side holds.
 fn rows_by_path(
-    left_db: &redb::Database,
-    right_db: &redb::Database,
-) -> Result<Vec<RepoDiffRow>, StoreError> {
+    sides: &Sides<'_>,
+    progress: PlanReporter<'_>,
+    cancel: &CancellationToken,
+) -> Result<Vec<RepoDiffRow>, DiffError> {
+    let (left_name, left_db) = sides.left;
+    let (right_name, right_db) = sides.right;
     // Path → (file, content key) per side; the key decides equal vs conflict.
     let live =
         |db: &redb::Database| -> Result<HashMap<String, (DiffFile, ContentKey)>, StoreError> {
@@ -1490,10 +1744,15 @@ fn rows_by_path(
             })?;
             Ok(files)
         };
+    reading(progress, left_name);
     let mut left = live(left_db)?;
-    let right = live(right_db)?;
     let left_idx = store::read_content_index(left_db)?;
+    check(cancel)?;
+    reading(progress, right_name);
+    let right = live(right_db)?;
     let right_idx = store::read_content_index(right_db)?;
+    check(cancel)?;
+    report(progress, PlanPhase::Pairing, 0, None);
     let mut rows = Vec::new();
     for (path, (right_file, right_key)) in right {
         match left.remove(&path) {
