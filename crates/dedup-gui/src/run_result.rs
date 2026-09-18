@@ -70,6 +70,21 @@ impl RunReport {
         }
     }
 
+    /// Fold a follow-up operation's report into this one: its counts and
+    /// problems are appended, and a cancellation anywhere marks the whole
+    /// run cancelled. For an operation that runs two steps as one activity
+    /// (delete, then search again).
+    pub fn absorb(mut self, other: RunReport) -> Self {
+        self.counts.extend(other.counts);
+        for p in other.problems {
+            self.problem(p);
+        }
+        self.problems_dropped += other.problems_dropped;
+        self.cancelled |= other.cancelled;
+        self.notes.extend(other.notes);
+        self
+    }
+
     pub fn problems(mut self, problems: impl IntoIterator<Item = String>) -> Self {
         for problem in problems {
             self.problem(problem);

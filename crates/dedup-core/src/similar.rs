@@ -19,8 +19,38 @@ use crate::dupes::{DupeFile, DupeGroup, sort_groups};
 use crate::filter::{AnnotatedFilter, FileFilter};
 use crate::fingerprint::chromaprint_config;
 use crate::store::{self, FileEntry, ImgHash, Store, StoreError};
+use crate::update::CancellationToken;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Where a similarity search is, for the caller's progress display. Each
+/// phase reports `done` of `total` in its own unit (repositories loaded,
+/// fingerprints grouped, audio pairs compared).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimilarProgress {
+    pub phase: SimilarPhase,
+    pub done: u64,
+    pub total: u64,
+}
+
+/// The phases of [`find_similar_reporting`], in the order they run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SimilarPhase {
+    /// Reading one repository's index into the candidate set.
+    Loading {
+        repo: String,
+    },
+    Images,
+    Videos,
+    Documents,
+    Audio,
+}
+
+/// A progress sink for [`find_similar_reporting`]: called from the searching
+/// thread and, during the audio phase, from the worker threads that score
+/// pairs, so it must be `Sync` and cheap.
+pub type SimilarReporter<'a> = &'a (dyn Fn(SimilarProgress) + Sync);
 
 const IMG_BITS: f64 = 512.0;
 /// 16-bit LSH bands per image hash: 512 / 16.
@@ -182,9 +212,67 @@ where
 /// and each is matched against the run that follows it inside the window.
 /// Same greedy semantics as [`group_by`]; returns groups of indices into
 /// `items` (singletons excluded).
-fn group_audio(items: &[Candidate<(u32, Vec<u32>)>], threshold: f64) -> Vec<Vec<usize>> {
+///
+/// The comparisons — a Chromaprint alignment each, and around a million of
+/// them for a large audiobook library — are scored on every core first; the
+/// greedy walk over the scores is then sequential, so the groups are exactly
+/// what the single-threaded walk would have produced. Progress is reported
+/// in compared pairs; a cancelled token ends the scoring early and yields no
+/// groups.
+fn group_audio(
+    items: &[Candidate<(u32, Vec<u32>)>],
+    threshold: f64,
+    progress: SimilarReporter<'_>,
+    cancel: &CancellationToken,
+) -> Vec<Vec<usize>> {
+    use rayon::prelude::*;
+
     let mut order: Vec<usize> = (0..items.len()).collect();
     order.sort_by_key(|&i| items[i].key.0);
+    // Every pair inside the window, in the order the greedy walk visits them,
+    // plus each position's slice of that list.
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(order.len());
+    for (pos, &i) in order.iter().enumerate() {
+        let start = pairs.len();
+        for &j in &order[pos + 1..] {
+            if items[j].key.0.abs_diff(items[i].key.0) > AUDIO_DURATION_TOLERANCE_MS {
+                break;
+            }
+            pairs.push((i, j));
+        }
+        ranges.push((start, pairs.len()));
+    }
+    let total = pairs.len() as u64;
+    progress(SimilarProgress {
+        phase: SimilarPhase::Audio,
+        done: 0,
+        total,
+    });
+    let step = (total / 100).max(1);
+    let counted = AtomicU64::new(0);
+    let hits: Vec<bool> = pairs
+        .par_iter()
+        .map(|&(i, j)| {
+            if cancel.is_cancelled() {
+                return false;
+            }
+            let hit = similarity_audio(&items[i].key.1, &items[j].key.1) >= threshold;
+            let n = counted.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_multiple_of(step) || n == total {
+                progress(SimilarProgress {
+                    phase: SimilarPhase::Audio,
+                    done: n,
+                    total,
+                });
+            }
+            hit
+        })
+        .collect();
+    if cancel.is_cancelled() {
+        return Vec::new();
+    }
+
     let mut handled = vec![false; items.len()];
     let mut groups = Vec::new();
     for (pos, &i) in order.iter().enumerate() {
@@ -193,14 +281,9 @@ fn group_audio(items: &[Candidate<(u32, Vec<u32>)>], threshold: f64) -> Vec<Vec<
         }
         handled[i] = true;
         let mut group = vec![i];
-        for &j in &order[pos + 1..] {
-            if items[j].key.0.abs_diff(items[i].key.0) > AUDIO_DURATION_TOLERANCE_MS {
-                break;
-            }
-            if handled[j] {
-                continue;
-            }
-            if similarity_audio(&items[i].key.1, &items[j].key.1) >= threshold {
+        let (start, end) = ranges[pos];
+        for (k, &(_, j)) in pairs[start..end].iter().enumerate() {
+            if !handled[j] && hits[start + k] {
                 group.push(j);
                 handled[j] = true;
             }
@@ -234,7 +317,12 @@ struct Staged {
     audios: Vec<Candidate<(u32, Vec<u32>)>>,
 }
 
-fn stage(store: &Store, repo_names: &[String]) -> Result<Staged, StoreError> {
+fn stage(
+    store: &Store,
+    repo_names: &[String],
+    progress: SimilarReporter<'_>,
+    cancel: &CancellationToken,
+) -> Result<Staged, StoreError> {
     let mut staged = Staged {
         names: repo_names.to_vec(),
         roots: Vec::with_capacity(repo_names.len()),
@@ -246,6 +334,14 @@ fn stage(store: &Store, repo_names: &[String]) -> Result<Staged, StoreError> {
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
     for (repo_idx, name) in repo_names.iter().enumerate() {
+        if cancel.is_cancelled() {
+            break;
+        }
+        progress(SimilarProgress {
+            phase: SimilarPhase::Loading { repo: name.clone() },
+            done: repo_idx as u64,
+            total: repo_names.len() as u64,
+        });
         let meta = store.get_repo(name)?;
         staged.roots.push(meta.abs_path.clone());
         let db = store.open_repo_db(name)?;
@@ -334,7 +430,48 @@ pub fn find_similar(
     threshold: f64,
     filter: Option<&FileFilter>,
 ) -> Result<Vec<DupeGroup>, StoreError> {
-    let staged = stage(store, repo_names)?;
+    find_similar_reporting(
+        store,
+        repo_names,
+        threshold,
+        filter,
+        &|_| {},
+        &CancellationToken::new(),
+    )
+}
+
+/// [`find_similar`] that reports its phases (see [`SimilarPhase`]) and stops
+/// early when `cancel` is cancelled — in which case it returns an empty result
+/// rather than an error; the caller holds the token and knows why.
+pub fn find_similar_reporting(
+    store: &Store,
+    repo_names: &[String],
+    threshold: f64,
+    filter: Option<&FileFilter>,
+    progress: SimilarReporter<'_>,
+    cancel: &CancellationToken,
+) -> Result<Vec<DupeGroup>, StoreError> {
+    let staged = stage(store, repo_names, progress, cancel)?;
+    if cancel.is_cancelled() {
+        return Ok(Vec::new());
+    }
+    // One phase per kind: the grouping of a kind is a single step from the
+    // caller's point of view (banded images and the small direct scans are
+    // quick), except audio, which reports every pair it compares.
+    let bulk = |phase: SimilarPhase, total: usize| {
+        progress(SimilarProgress {
+            phase: phase.clone(),
+            done: 0,
+            total: total as u64,
+        });
+        move |progress: SimilarReporter<'_>| {
+            progress(SimilarProgress {
+                phase,
+                done: total as u64,
+                total: total as u64,
+            })
+        }
+    };
 
     // Open each repo DB once; grouped members' entries are fetched from these.
     let mut dbs: Vec<std::sync::Arc<redb::Database>> = Vec::with_capacity(staged.names.len());
@@ -344,19 +481,34 @@ pub fn find_similar(
 
     let mut groups: Vec<DupeGroup> = Vec::new();
 
+    let done = bulk(SimilarPhase::Images, staged.images.len());
     let img_fps: Vec<ImgHash> = staged.images.iter().map(|c| c.key).collect();
     let img_groups = group_img(&img_fps, threshold);
     groups.extend(materialize(&dbs, &staged, &staged.images, img_groups)?);
+    done(progress);
+    if cancel.is_cancelled() {
+        return Ok(Vec::new());
+    }
 
+    let done = bulk(SimilarPhase::Videos, staged.videos.len());
     let video_groups = group_by(&staged.videos, |a, b| {
         similarity_video(&a.key, &b.key) >= threshold
     });
     groups.extend(materialize(&dbs, &staged, &staged.videos, video_groups)?);
+    done(progress);
 
+    let done = bulk(SimilarPhase::Documents, staged.pdfs.len());
     let pdf_groups = group_by(&staged.pdfs, |a, b| a.key == b.key);
     groups.extend(materialize(&dbs, &staged, &staged.pdfs, pdf_groups)?);
+    done(progress);
+    if cancel.is_cancelled() {
+        return Ok(Vec::new());
+    }
 
-    let audio_groups = group_audio(&staged.audios, threshold);
+    let audio_groups = group_audio(&staged.audios, threshold, progress, cancel);
+    if cancel.is_cancelled() {
+        return Ok(Vec::new());
+    }
     groups.extend(materialize(&dbs, &staged, &staged.audios, audio_groups)?);
 
     // Keep only groups with at least one member matching the filter (a whole
@@ -485,7 +637,7 @@ mod tests {
             cand(8_200, &other), // 2: unrelated, in the window → not grouped
             cand(20_000, &same), // 3: same take, far outside the window
         ];
-        let groups = group_audio(&items, 90.0);
+        let groups = group_audio(&items, 90.0, &|_| {}, &CancellationToken::new());
         assert_eq!(groups, vec![vec![0, 1]]);
     }
 

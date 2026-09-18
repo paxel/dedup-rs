@@ -7,7 +7,22 @@ with real previews, and delete the worse copies — batched per repo, always con
 you turn on Quick Delete. This is the GUI equivalent of `repo dupes`, with a full review
 workflow on top.
 
-## Repo bar
+## Reading order
+
+The tab asks its questions top to bottom, and each section appears once the one above it
+has an answer:
+
+1. **WHAT** — DUPLICATES or SIMILAR FILES. Choosing SIMILAR reveals the **similarity
+   threshold** slider right beside the chip. **QUICK DELETE** sits on the same row.
+2. **WITH WHICH** — the repository chips, shown once a mode is chosen. Flipping the mode
+   keeps the chips you picked.
+3. **HOW** — the shared FILTER wizard and the **FIND** button on one row, shown once at
+   least one repository is included.
+
+After a FIND the three sections fold into one summary line (mode, repositories, filter)
+so the groups get the screen; **CHANGE** unfolds them for the next search.
+
+## Repositories
 
 One chip per registered repository:
 
@@ -22,21 +37,35 @@ One chip per registered repository:
 
 - **DUPLICATES** — exact, byte-for-byte matches (same size and BLAKE3 hash). Fast, no false
   positives.
-- **SIMILAR** — perceptually similar images and videos: re-saves, re-encodes, or crops that
-  don't hash identically but look alike. Reveals a **similarity threshold** slider (50–100%,
-  `similarity % = (1 − hamming distance / bits) × 100`); lower catches more — and riskier —
-  matches, 100% is bit-identical, and ≥99.5% is labeled "identical" since it's visually
-  indistinguishable in practice. The threshold persists across launches.
-- **FIND** searches every included repo per the selected mode.
+- **SIMILAR** — perceptually similar images, videos and audio: re-saves, re-encodes, or
+  crops that don't hash identically but look (or sound) alike. Reveals a **similarity
+  threshold** slider (50–100%, `similarity % = (1 − hamming distance / bits) × 100`);
+  lower catches more — and riskier — matches, 100% is bit-identical, and ≥99.5% is labeled
+  "identical" since it's visually indistinguishable in practice. The threshold persists
+  across launches.
+- **FIND** searches every included repo per the selected mode. It runs in the **activity
+  window**, which blocks the rest of the app while it works and shows what it is doing:
+  which index it is reading, then "grouping images", "grouping videos", "grouping
+  documents" and "comparing audio" with a percentage, the time elapsed and an estimate of
+  what is left, and any problem as it occurs. **CANCEL** stops it. When it finishes the
+  same window shows the result — how many repositories were searched and how many groups
+  were found — and closes on CLOSE or Escape. Nothing else that changes an index can start
+  while it runs.
 
 **QUICK DELETE** gives every group its own DELETE NOW button that deletes marked files
-immediately, no confirmation — turn it off to go back to confirming every batch.
+immediately, no confirmation — turn it off to go back to confirming every batch. Each
+DELETE NOW is answered by a **notification card** in the top-right corner naming the file
+and the repository, and every file it removed is written to the **event log**, which the
+**LOG** button in that corner opens.
 
 Below the results: **SHOW ACCEPTED** lists the groups whose every copy is
 [accepted](#accepted-content) (hidden by default, with a count of how many are skipped),
 **AUTO-RESOLVE REST** marks every non-best copy for deletion (skipping read-only repos and
 accepted copies) so you only have to review the marks, and **DELETE MARKED (n)** deletes
 everything currently marked, batched per repo in one transaction, behind a confirmation.
+The delete and the search that follows run in the activity window as one operation whose
+report lists what was deleted, what could not be, and the fresh group count; every deleted
+file is in the event log by name.
 
 ## Accepted content
 

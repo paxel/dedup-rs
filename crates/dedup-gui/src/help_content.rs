@@ -38,17 +38,24 @@ const DUPLICATES: &str = "\
 Find exact or perceptually similar duplicates across one or more repositories, review them \
 with real previews, and delete the worse copies.
 
+The tab asks top to bottom: WHAT (DUPLICATES or SIMILAR FILES — SIMILAR shows its \
+threshold slider beside the chip; QUICK DELETE sits on the same row), then WITH WHICH \
+(the repository chips, once a mode is chosen), then HOW (the FILTER and FIND, once a \
+repository is included). After a FIND the three fold into one line; CHANGE unfolds them.
+
 Click a repo chip's name to include or exclude it from the next FIND; click its padlock to \
 protect it from deletion — locked files are never preselected or auto-resolved.
 
 DUPLICATES mode finds exact, byte-for-byte matches (same size + hash). SIMILAR mode finds \
-perceptually similar images and videos and reveals a similarity threshold slider — lower \
-catches more, and riskier, matches.
+perceptually similar images, videos and audio — lower threshold catches more, and riskier, \
+matches. FIND runs in the activity window, which shows each phase and its progress, offers \
+CANCEL, blocks the rest of the app meanwhile, and ends as the result report.
 
 Results are shown a page of groups at a time. Each file can be toggled KEEP / DELETE; the \
 best copy is starred. AUTO-RESOLVE REST marks every non-best copy at once. DELETE MARKED \
-runs the batch behind a confirmation — or turn on QUICK DELETE to skip confirmation per \
-group.
+runs the delete and the search that follows in the activity window, behind a confirmation \
+— or turn on QUICK DELETE to skip confirmation per group; each DELETE NOW is answered by a \
+notification card, and every deleted file is written to the event log (LOG, top right).
 
 Click a thumbnail to open the lightbox. It opens on Overview — both files' facts, repos and \
 mark pills side by side — and its tabs offer whatever the two files can show: Image, Video \

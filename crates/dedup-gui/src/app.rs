@@ -219,6 +219,9 @@ pub struct DedupApp {
     /// Location/reachability results delivered from the status-refresh thread.
     status_tx: Sender<(String, Location)>,
     status_rx: Receiver<(String, Location)>,
+    /// ADR 0003: the one owner of the activity modal, the notification cards
+    /// and the event log, shared with every view.
+    activity: crate::activity::Shared,
     dupes: DupesView,
     transfer: TransferView,
     grooming: GroomingView,
@@ -240,6 +243,7 @@ impl DedupApp {
         // One lock registry for the whole app: a repo unlocked on any tab is
         // unlocked on every tab, for this session only.
         let locks = crate::locks::RepoLocks::new();
+        let activity = crate::activity::shared(store.config_dir());
         let mut app = Self {
             store,
             tab: Tab::Repositories,
@@ -269,7 +273,8 @@ impl DedupApp {
             cancels: HashMap::new(),
             status_tx,
             status_rx,
-            dupes: DupesView::new_with_locks(locks.clone()),
+            activity: activity.clone(),
+            dupes: DupesView::new_with_locks(locks.clone(), activity),
             transfer: TransferView::new_with_locks(locks.clone()),
             grooming: GroomingView::new_with_locks(locks.clone()),
             groups: Vec::new(),
@@ -517,6 +522,11 @@ impl DedupApp {
     /// Start queued jobs until [`MAX_CONCURRENT`] are running. Called once per
     /// frame after completions are drained and new work is enqueued.
     fn pump_queue(&mut self, ctx: &egui::Context) {
+        // A long-running operation on the modal, or a row action in flight,
+        // holds the scan queue: one index-changing thing at a time.
+        if crate::activity::lock(&self.activity).blocks_external() {
+            return;
+        }
         while self.worker.running_count() < MAX_CONCURRENT {
             let Some((name, kind)) = self.queue.pop_front() else {
                 break;
@@ -1068,6 +1078,16 @@ impl eframe::App for DedupApp {
         // store, so repos added/removed elsewhere appear without a refresh
         // button. (The Repositories tab refreshes its own cards separately.)
         self.sync_shown_tab();
+        // The scan worker still runs outside the activity owner (until the
+        // Repositories tab moves behind the modal); tell the owner about it so
+        // "one at a time" holds across both.
+        let scanning = self
+            .worker
+            .jobs()
+            .into_iter()
+            .find(|(_, status, _)| *status == crate::worker::RepoStatus::Running)
+            .map(|(name, _, _)| format!("the scan of '{name}'"));
+        crate::activity::lock(&self.activity).set_external(scanning);
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Repositories => self.repositories_view(ui, &mut actions),
             Tab::Duplicates => self.dupes.show(ui, &self.store, self.tooltip_verbosity),
@@ -1104,6 +1124,9 @@ impl eframe::App for DedupApp {
         if self.show_add {
             self.add_modal(&ctx, &mut actions);
         }
+        // The activity modal, the notification cards and the event-log viewer
+        // sit above every tab and every other modal.
+        crate::activity::lock(&self.activity).show(ui);
         for action in actions {
             self.apply(&ctx, Some(frame), action);
         }
@@ -3699,6 +3722,212 @@ mod ui_tests {
             );
         harness.run();
         harness
+    }
+
+    /// The app with the activity owner drawn each frame — the seam ADR 0003
+    /// is proved at: the modal, its refusal, CANCEL, the report, the cards
+    /// and the event log, as the user sees them.
+    fn render_with_activity(app: DedupApp) -> Harness<'static, DedupApp> {
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 900.0))
+            .build_ui_state(
+                move |ui, app: &mut DedupApp| {
+                    if !init {
+                        icon::install(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
+                        init = true;
+                    }
+                    let mut actions = Vec::new();
+                    app.repositories_view(ui, &mut actions);
+                    crate::activity::lock(&app.activity).show(ui);
+                    let ctx = ui.ctx().clone();
+                    for action in actions {
+                        app.apply(&ctx, None, action);
+                    }
+                },
+                app,
+            );
+        harness.run();
+        harness
+    }
+
+    /// A long-running operation takes the modal with its phase line, a
+    /// second one is refused by name, CANCEL fires the token and the finished
+    /// modal shows the (cancelled) report in place.
+    #[test]
+    fn a_long_running_operation_shows_its_phase_refuses_a_second_and_reports() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, app) = sample_app();
+        let activity = app.activity.clone();
+        let mut h = render_with_activity(app);
+        assert!(h.query_by_label("CANCEL").is_none(), "no modal while idle");
+
+        let (hold_tx, hold_rx) = crossbeam_channel::bounded::<()>(0);
+        crate::activity::lock(&activity)
+            .start(
+                &h.ctx.clone(),
+                crate::activity::Spec {
+                    title: "FIND similar files".into(),
+                    repos: vec!["Automatic Upload".into(), "Videos".into()],
+                },
+                move |progress, cancel| {
+                    progress.phase("comparing audio", 41, Some(100));
+                    let _ = hold_rx.recv();
+                    crate::run_result::RunReport::new("FIND similar files")
+                        .count("groups found", 0)
+                        .cancelled(cancel.is_cancelled())
+                },
+            )
+            .expect("start");
+        // Step, not run: the modal asks for repaints while it is up.
+        for _ in 0..20 {
+            h.step();
+        }
+        assert!(
+            h.query_by_label_contains("FIND SIMILAR FILES").is_some(),
+            "the modal names what runs"
+        );
+        assert!(
+            h.query_by_label_contains("comparing audio").is_some(),
+            "the modal shows the phase line"
+        );
+        assert!(
+            h.query_by_label_contains("41 of 100").is_some(),
+            "the modal shows how far along"
+        );
+        let refused = crate::activity::lock(&activity).start(
+            &h.ctx.clone(),
+            crate::activity::Spec {
+                title: "UPDATE".into(),
+                repos: vec![],
+            },
+            |_, _| crate::run_result::RunReport::new("never"),
+        );
+        assert_eq!(
+            refused,
+            Err(crate::activity::Busy("FIND similar files".into())),
+            "a second operation is refused by name"
+        );
+        assert!(crate::activity::lock(&activity).blocks_external());
+
+        h.get_by_label("CANCEL").click();
+        for _ in 0..5 {
+            h.step();
+        }
+        assert!(
+            h.query_by_label_contains("cancelling").is_some(),
+            "CANCEL is acknowledged while the step finishes"
+        );
+        hold_tx.send(()).expect("release the worker");
+        for _ in 0..100 {
+            h.step();
+            if !crate::activity::lock(&activity).is_running() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        h.step();
+        assert!(
+            h.query_by_label("RUN INCOMPLETE").is_some(),
+            "the finished modal is the run report, marked cancelled"
+        );
+        assert!(
+            h.query_by_label("CANCEL").is_none(),
+            "nothing runs any more"
+        );
+        assert!(crate::activity::lock(&activity).busy().is_none());
+    }
+
+    /// A row action shows a card at once, and a change to the filesystem is
+    /// in the event log under the configuration directory, with a line the
+    /// LOG viewer lists.
+    #[test]
+    fn a_row_action_puts_a_card_on_screen_and_a_line_in_the_event_log() {
+        use egui_kittest::kittest::Queryable;
+        let (tmp, app) = sample_app();
+        let activity = app.activity.clone();
+        let mut h = render_with_activity(app);
+        let ctx = h.ctx.clone();
+        {
+            let mut a = crate::activity::lock(&activity);
+            let note = crate::activity::Notification::changed(
+                "Deleted",
+                "Automatic Upload",
+                "IMG_2019_field.jpg",
+            );
+            a.record(&note);
+            a.card(&ctx, note);
+        }
+        h.step();
+        assert!(
+            h.query_by_label_contains("Deleted IMG_2019_field.jpg")
+                .is_some(),
+            "the card is on screen in the next frame"
+        );
+        assert!(
+            h.query_by_label("LOG (1)").is_some(),
+            "the corner shows one unread"
+        );
+        let log =
+            std::fs::read_to_string(tmp.path().join("cfg").join(crate::activity::EVENT_LOG_FILE))
+                .expect("event log exists");
+        assert_eq!(log.lines().count(), 1);
+        assert!(log.contains("\"action\":\"Deleted\""), "{log}");
+        assert!(log.contains("IMG_2019_field.jpg"), "{log}");
+
+        h.get_by_label("LOG (1)").click();
+        h.step();
+        assert!(h.query_by_label("EVENT LOG").is_some(), "the viewer opens");
+        assert!(
+            h.query_by_label("IMG_2019_field.jpg").is_some(),
+            "the viewer lists the change"
+        );
+    }
+
+    /// Doc image of the activity modal mid-operation, to
+    /// `docs/screenshots/activity-modal.png`.
+    #[test]
+    #[ignore = "generates a doc screenshot (needs wgpu)"]
+    fn doc_screenshot_activity_modal() {
+        let (_tmp, app) = sample_app();
+        let activity = app.activity.clone();
+        let mut h = render_with_activity(app);
+        let (hold_tx, hold_rx) = crossbeam_channel::bounded::<()>(0);
+        crate::activity::lock(&activity)
+            .start(
+                &h.ctx.clone(),
+                crate::activity::Spec {
+                    title: "FIND similar files at 97.5 %".into(),
+                    repos: vec!["Automatic Upload".into(), "Videos".into()],
+                },
+                move |progress, _| {
+                    progress.phase("comparing audio", 412_880, Some(1_003_112));
+                    progress.problem("Videos: clips/broken.mp3: could not decode");
+                    let _ = hold_rx.recv();
+                    crate::run_result::RunReport::new("FIND similar files")
+                },
+            )
+            .expect("start");
+        {
+            let mut a = crate::activity::lock(&activity);
+            let ctx = h.ctx.clone();
+            a.card(
+                &ctx,
+                crate::activity::Notification::changed("Deleted", "Videos", "bebop_sepia.jpg"),
+            );
+        }
+        for _ in 0..40 {
+            h.step();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let img = h.render().expect("wgpu render failed");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
+        std::fs::create_dir_all(&dir).expect("screenshot dir");
+        let out = dir.join("activity-modal.png");
+        img.save(&out).expect("save png");
+        eprintln!("WROTE_SNAPSHOT {}", out.display());
+        hold_tx.send(()).ok();
     }
 
     /// Every repo card carries the LOCAL/REMOTE flag button, the toolbar offers

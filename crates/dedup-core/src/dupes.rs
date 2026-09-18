@@ -32,10 +32,16 @@ impl DupeFile {
 
 pub type DupeGroup = Vec<DupeFile>;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DupeDeleteStats {
     pub deleted: u64,
     pub errors: u64,
+    /// Every file actually removed, as `(repo, relative path)`, so a caller
+    /// can record each change by name.
+    pub removed: Vec<(String, String)>,
+    /// Every file that could not be removed, as `(repo, relative path,
+    /// error)`.
+    pub failed: Vec<(String, String, String)>,
 }
 
 /// A lightweight descriptor of one exact-duplicate group — its content key and
@@ -444,12 +450,18 @@ pub fn delete_paths(
         match std::fs::remove_file(&path) {
             Ok(()) => {
                 stats.deleted += 1;
+                stats.removed.push((repo.clone(), rel.clone()));
                 deleted_per_repo
                     .entry(repo.as_str())
                     .or_default()
                     .push(rel.as_str());
             }
-            Err(_) => stats.errors += 1,
+            Err(e) => {
+                stats.errors += 1;
+                stats
+                    .failed
+                    .push((repo.clone(), rel.clone(), e.to_string()));
+            }
         }
     }
 

@@ -62,3 +62,35 @@ The session-only set of candidate passwords the tool auto-tries against locked
 archives and seeds into a recovery attempt. It is never written to disk.
 _Avoid_: password list, wordlist (a wordlist is an external input to recovery;
 the spray-book is the in-session set of already-seen passwords).
+
+
+**Long-running operation**:
+Work the user starts that may take longer than a moment — a repository scan
+or check, a Duplicates FIND or DELETE MARKED, a Transfer RUN or GROUP SYNC, a
+Grooming RUN, a DIFF REVIEW. It runs alone behind the activity modal.
+_Avoid_: job, task, background operation (nothing long-running runs in the
+background any more).
+
+**Row action**:
+A single, quick change the user makes from a result — a board's DELETE, COPY,
+RENAME, OVERWRITE, a group's DELETE NOW, an accept — answered by a
+notification card, never by a modal.
+_Avoid_: quick action, inline action.
+
+**Activity modal**:
+The one blocking window in which a long-running operation shows its title,
+repositories, phase, progress, problems and CANCEL, and which becomes the run
+report when the operation ends.
+_Avoid_: progress dialog, busy overlay.
+
+**Notification card**:
+The animated card in the top-right stack that reports a row action: what
+happened, to which file, in which repository, with what result.
+_Avoid_: toast, status line.
+
+**Event log**:
+The persistent, append-only record of every change the app made to the
+filesystem, kept under the configuration directory and opened from the
+notification area. Marks, scans and searches are not in it.
+_Avoid_: history, audit trail, session log (the session log is the diagnostic
+log file, not this).

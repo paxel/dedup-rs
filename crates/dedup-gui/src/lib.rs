@@ -1,6 +1,7 @@
 //! dedup-gui
 //! LCARS-themed eframe/egui desktop shell for dedup.
 
+mod activity;
 mod app;
 mod board;
 mod browse_view;

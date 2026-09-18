@@ -17,9 +17,10 @@ use dedup_core::dupes::{
     key_all_accepted, load_groups, plan_exact_duplicates, retain_matching_keys, wasted_bytes,
 };
 use dedup_core::filter::FileFilter;
-use dedup_core::similar::find_similar;
+use dedup_core::similar::{SimilarPhase, SimilarProgress, find_similar_reporting};
 use dedup_core::store::Store;
 use dedup_core::thumbnail::hash_hex;
+use dedup_core::update::CancellationToken;
 use egui::{Id, RichText};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -57,18 +58,133 @@ struct Found {
 
 /// A background operation in flight (drives the spinner and disables actions).
 enum Op {
-    Find(usize),
+    Find,
     AutoResolve { done: usize, total: usize },
     Delete,
 }
 
 /// Messages from background operation threads back to the UI.
 enum Msg {
-    FindProgress(usize),
+    FindProgress,
     FindDone(Result<Found, String>),
     AutoProgress { done: usize, total: usize },
     AutoDone(Result<Vec<FileKey>, String>),
     DeleteDone(Result<DupeDeleteStats, String>, DeleteFollow),
+}
+
+/// One FIND, ready to run on a worker: what to search, how, and where to
+/// deliver the result. Shared by FIND itself and by DELETE MARKED, whose
+/// worker re-runs the search after deleting.
+struct Search {
+    store: Arc<Store>,
+    names: Vec<String>,
+    mode: Mode,
+    threshold: f64,
+    filter: Option<FileFilter>,
+    tx: Sender<Msg>,
+}
+
+impl Search {
+    fn title(&self) -> String {
+        match self.mode {
+            Mode::Exact => "FIND duplicates".to_string(),
+            Mode::Similar => format!("FIND similar files at {:.1} %", self.threshold),
+        }
+    }
+
+    /// Run the search, deliver `Msg::FindDone`, and describe the outcome for
+    /// the activity modal's report. Exact search has no cancellation point
+    /// inside the index scan; similar search stops at its next phase.
+    fn run(
+        self,
+        progress: &crate::activity::ActivityProgress,
+        cancel: &CancellationToken,
+    ) -> crate::run_result::RunReport {
+        let Search {
+            store,
+            names,
+            mode,
+            threshold,
+            filter,
+            tx,
+        } = self;
+        let title = match mode {
+            Mode::Exact => "FIND duplicates".to_string(),
+            Mode::Similar => format!("FIND similar files at {threshold:.1} %"),
+        };
+        let fref = filter.as_ref();
+        let results = match mode {
+            Mode::Exact => {
+                let tx2 = tx.clone();
+                plan_exact_duplicates(&store, &names, |n| {
+                    progress.phase("collecting duplicate groups", n as u64, None);
+                    let _ = tx2.send(Msg::FindProgress);
+                })
+                .and_then(|plan| {
+                    // Keep only groups with ≥1 matching member (streams each
+                    // key's members; reports keys examined as progress).
+                    let total = plan.len() as u64;
+                    retain_matching_keys(&store, &names, plan, fref, |n| {
+                        progress.phase("matching the filter", n as u64, Some(total));
+                    })
+                })
+                .map(Results::Exact)
+                .map_err(|e| e.to_string())
+            }
+            Mode::Similar => {
+                let report = |p: SimilarProgress| {
+                    let name = match &p.phase {
+                        SimilarPhase::Loading { repo } => format!("reading the index of '{repo}'"),
+                        SimilarPhase::Images => "grouping images".to_string(),
+                        SimilarPhase::Videos => "grouping videos".to_string(),
+                        SimilarPhase::Documents => "grouping documents".to_string(),
+                        SimilarPhase::Audio => "comparing audio".to_string(),
+                    };
+                    progress.phase(name, p.done, Some(p.total));
+                };
+                find_similar_reporting(&store, &names, threshold, fref, &report, cancel)
+                    .map(Results::Similar)
+                    .map_err(|e| e.to_string())
+            }
+        };
+        let mut report = crate::run_result::RunReport::new(title)
+            .count("repositories searched", names.len() as u64);
+        let result = results.and_then(|results| {
+            let accepted = AcceptedIndex::load(&store, &names).map_err(|e| e.to_string())?;
+            let mut accepted_groups = HashSet::new();
+            match &results {
+                Results::Exact(plan) => {
+                    for (i, k) in plan.iter().enumerate() {
+                        if key_all_accepted(&store, &names, &accepted, k.size, &k.hash)
+                            .map_err(|e| e.to_string())?
+                        {
+                            accepted_groups.insert(i);
+                        }
+                    }
+                }
+                Results::Similar(groups) => {
+                    for (i, g) in groups.iter().enumerate() {
+                        if accepted.all_accepted(g) {
+                            accepted_groups.insert(i);
+                        }
+                    }
+                }
+            }
+            Ok(Found {
+                results,
+                accepted,
+                accepted_groups,
+            })
+        });
+        match &result {
+            Ok(found) => {
+                report = report.count("groups found", found.results.len() as u64);
+            }
+            Err(e) => report.problem(e.clone()),
+        }
+        let _ = tx.send(Msg::FindDone(result));
+        report.cancelled(cancel.is_cancelled())
+    }
 }
 
 /// What to do after a background delete finishes.
@@ -76,6 +192,10 @@ enum Msg {
 enum DeleteFollow {
     /// Global delete: clear marks and re-run the search.
     Refind,
+    /// Global delete that ran behind the activity modal, whose worker goes on
+    /// to re-run the search itself: clear marks, note the counts for the
+    /// coming `FindDone`, start nothing.
+    Reported,
     /// Per-group delete: drop this group's marks and collapse it (no re-plan).
     Resolve(usize),
 }
@@ -227,6 +347,12 @@ pub struct DupesView {
     /// The page just changed: the next frame shows the list from its first
     /// group instead of wherever the previous page was scrolled to.
     scroll_to_top: bool,
+    /// ADR 0003 reading order: the repositories appear once a mode has been
+    /// picked, the filter and FIND once a repository is included.
+    mode_chosen: bool,
+    /// After FIND the three selection sections fold into one summary line
+    /// that reopens on click, so the groups get the screen.
+    selection_collapsed: bool,
     /// A background operation in flight, if any.
     busy: Option<Op>,
     tx: Sender<Msg>,
@@ -260,6 +386,9 @@ pub struct DupesView {
     /// The app-wide repo lock registry (see [`crate::locks`]): which repos'
     /// existing files may be deleted this session.
     locks: crate::locks::RepoLocks,
+    /// ADR 0003: FIND and DELETE MARKED run behind the app's activity modal;
+    /// quick deletes and acceptances report through its cards and log.
+    activity: crate::activity::Shared,
     /// A "SHOW IN BROWSE" pick, for `app.rs` to collect: jump the app to the
     /// Browse tab with this `(repo, rel_path)` selected in its folder.
     browse_request: Option<FileKey>,
@@ -294,6 +423,8 @@ impl DupesView {
             delete_batch: Vec::new(),
             page: 0,
             scroll_to_top: false,
+            mode_chosen: false,
+            selection_collapsed: false,
             busy: None,
             tx,
             rx,
@@ -309,6 +440,9 @@ impl DupesView {
             filter: FilterBuilder::new(),
             archive_evidence: HashMap::new(),
             locks: crate::locks::RepoLocks::new(),
+            activity: crate::activity::shared(
+                &std::env::temp_dir().join(format!("dedup-rs-{}", std::process::id())),
+            ),
             browse_request: None,
             find_note: None,
         }
@@ -322,9 +456,13 @@ impl DupesView {
 
     /// Construct wired to the app's shared lock registry, so a repo unlocked
     /// here is unlocked on every tab (and vice versa).
-    pub fn new_with_locks(locks: crate::locks::RepoLocks) -> Self {
+    pub fn new_with_locks(
+        locks: crate::locks::RepoLocks,
+        activity: crate::activity::Shared,
+    ) -> Self {
         let mut me = Self::new();
         me.locks = locks;
+        me.activity = activity;
         me
     }
 
@@ -425,7 +563,12 @@ impl DupesView {
 
         // Grid keyboard shortcuts — skipped while a lightbox or confirm modal
         // owns the keyboard, or a text field is focused.
-        if self.lightbox.is_none() && self.confirm.is_none() && !ctx.egui_wants_keyboard_input() {
+        let modal_up = crate::activity::lock(&self.activity).is_running();
+        if self.lightbox.is_none()
+            && self.confirm.is_none()
+            && !modal_up
+            && !ctx.egui_wants_keyboard_input()
+        {
             let pages = self.total_groups().div_ceil(PAGE_SIZE);
             let cur = self.page.min(pages.saturating_sub(1));
             ctx.input(|i| {
@@ -438,6 +581,7 @@ impl DupesView {
                     } else {
                         Mode::Exact
                     };
+                    self.mode_chosen = true;
                 }
                 if i.key_pressed(egui::Key::ArrowLeft) && cur > 0 {
                     acts.push(Act::SetPage(cur - 1));
@@ -455,18 +599,21 @@ impl DupesView {
                 .size(18.0)
                 .strong(),
         );
-        self.repo_bar(ui, &mut acts);
-        // Shared FILTER wizard: FIND keeps only groups with ≥1 member matching
-        // it. The first included repo backs the MIME/TAG pick-lists.
-        let sugg = self.suggestion_repo();
-        let outcome = self.filter.ui(ui, store, sugg.as_deref(), self.verbosity);
-        if outcome.status.is_some() {
-            self.status = outcome.status;
+        // Reading order is the workflow (ADR 0003): WHAT, then WITH WHICH,
+        // then HOW and FIND — each shown once the one before has an answer.
+        // After a FIND they fold into one line so the groups get the screen.
+        if self.selection_collapsed {
+            self.selection_summary(ui);
+        } else {
+            self.mode_section(ui, &mut acts);
+            if self.mode_chosen {
+                self.repo_bar(ui, &mut acts);
+            }
+            if self.mode_chosen && self.repos.iter().any(|r| r.included) {
+                self.how_section(ui, store, &mut acts);
+            }
         }
-        if outcome.error.is_some() {
-            self.error = outcome.error;
-        }
-        self.controls(ui, &mut acts);
+        self.result_actions(ui, &mut acts);
         crate::util::shortcut_bar(
             ui,
             &format!(
@@ -511,7 +658,7 @@ impl DupesView {
     fn drain_messages(&mut self, store: &Arc<Store>, ctx: &egui::Context) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                Msg::FindProgress(n) => self.busy = Some(Op::Find(n)),
+                Msg::FindProgress => self.busy = Some(Op::Find),
                 Msg::FindDone(result) => {
                     self.busy = None;
                     match result {
@@ -571,11 +718,28 @@ impl DupesView {
                     }
                 }
                 Msg::DeleteDone(result, follow) => {
-                    self.busy = None;
                     let batch = std::mem::take(&mut self.delete_batch);
+                    let mut activity = crate::activity::lock(&self.activity);
+                    if matches!(follow, DeleteFollow::Resolve(_)) {
+                        activity.end_row_action();
+                    }
+                    // Every file that changed on disk is in the event log by
+                    // name, whichever path deleted it; the cards summarise.
+                    if let Ok(stats) = &result {
+                        for (repo, rel) in &stats.removed {
+                            activity.record(&crate::activity::Notification::changed(
+                                "Deleted", repo, rel,
+                            ));
+                        }
+                        for (repo, rel, err) in &stats.failed {
+                            activity.record(&crate::activity::Notification::failed(
+                                "Deleted", repo, rel, err,
+                            ));
+                        }
+                    }
                     match result {
                         Ok(stats) => match follow {
-                            DeleteFollow::Refind => {
+                            DeleteFollow::Refind | DeleteFollow::Reported => {
                                 let note = format!(
                                     "Deleted {} file(s), {} error(s).",
                                     stats.deleted, stats.errors
@@ -588,17 +752,51 @@ impl DupesView {
                                 // was deleted".
                                 self.find_note = Some(note);
                                 self.marked.clear();
-                                self.start_find(store, ctx);
+                                // The modal's worker goes on to re-run the
+                                // search; `busy` clears on its `FindDone`.
+                                self.busy = Some(Op::Find);
                             }
                             DeleteFollow::Resolve(gi) => {
+                                self.busy = None;
                                 self.status = Some(format!("Deleted {} file(s)", stats.deleted));
                                 for k in &batch {
                                     self.marked.remove(k);
                                 }
                                 self.resolved.insert(gi);
+                                let repo = batch.first().map(|k| k.0.as_str()).unwrap_or("");
+                                let what = match batch.as_slice() {
+                                    [one] => one.1.clone(),
+                                    _ => format!("{} file(s)", stats.deleted),
+                                };
+                                if stats.errors == 0 {
+                                    activity.card(
+                                        ctx,
+                                        crate::activity::Notification::changed(
+                                            "Deleted", repo, &what,
+                                        ),
+                                    );
+                                } else {
+                                    activity.card(
+                                        ctx,
+                                        crate::activity::Notification {
+                                            action: "Deleted".into(),
+                                            repo: repo.to_string(),
+                                            path: what,
+                                            outcome: Err(format!(
+                                                "{} of {} could not be deleted",
+                                                stats.errors,
+                                                stats.deleted + stats.errors
+                                            )),
+                                            changed_disk: false,
+                                        },
+                                    );
+                                }
                             }
                         },
-                        Err(e) => self.error = Some(e),
+                        Err(e) => {
+                            self.busy = None;
+                            self.error = Some(e);
+                        }
                     }
                 }
             }
@@ -640,7 +838,7 @@ impl DupesView {
     fn repo_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         crate::lcars::section_lcars(
             ui,
-            "REPOS — WHERE TO LOOK FOR DUPLICATES",
+            "WITH WHICH — REPOSITORIES TO SEARCH",
             theme::lilac(),
             |ui| {
                 // Bulk MARK ALL / NONE (repos start excluded, so this is the quick way
@@ -715,14 +913,19 @@ impl DupesView {
         chip.outer
     }
 
-    fn controls(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+    /// WHAT: duplicates or similar, the threshold beside SIMILAR, and QUICK
+    /// DELETE — the settings that shape what a group is, on one row.
+    fn mode_section(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         crate::lcars::section_lcars(
             ui,
-            "MODE — WHAT COUNTS AS A DUPLICATE",
+            "WHAT — DUPLICATES OR SIMILAR FILES",
             theme::amber(),
             |ui| {
-                ui.horizontal(|ui| {
-                    let exact = self.mode == Mode::Exact;
+                // Top-aligned: the slider is taller than a chip, and a centred
+                // row would drop the chips after it by a couple of pixels.
+                ui.horizontal_top(|ui| {
+                    let exact = self.mode_chosen && self.mode == Mode::Exact;
+                    let similar = self.mode_chosen && self.mode == Mode::Similar;
                     // The two match modes: DUPLICATES (orange) / SIMILAR (lilac).
                     if crate::lcars::toggle_button(ui, "DUPLICATES", exact, theme::orange())
                         .explain(
@@ -734,89 +937,143 @@ impl DupesView {
                         .clicked()
                     {
                         self.mode = Mode::Exact;
+                        self.mode_chosen = true;
                     }
-                    if crate::lcars::toggle_button(ui, "SIMILAR", !exact, theme::lilac())
+                    if crate::lcars::toggle_button(ui, "SIMILAR", similar, theme::lilac())
                         .explain(
                             self.verbosity,
-                            "Perceptually similar images/videos",
-                            "Find images and videos that look alike even when their \
-                         bytes differ — re-saves, re-encodes, or crops — using a \
-                         perceptual hash and the similarity threshold below.",
+                            "Perceptually similar images, videos and audio",
+                            "Find images and videos that look alike and audio that sounds \
+                         alike even when their bytes differ — re-saves, re-encodes, or \
+                         crops — using a perceptual fingerprint and the similarity \
+                         threshold beside this button.",
                         )
                         .clicked()
                     {
                         self.mode = Mode::Similar;
+                        self.mode_chosen = true;
                     }
-                    if crate::lcars::action_button(
-                        ui,
-                        &format!("{} FIND", icon::SEARCH),
-                        self.busy.is_none(),
-                        theme::amber(),
-                    )
-                    .explain(
-                        self.verbosity,
-                        "Search the included repos",
-                        "Search every included (checked) repository for duplicates or \
-                     similars per the selected mode. Excluded repos are skipped.",
-                    )
-                    .clicked()
+                    // The threshold sits beside the mode it belongs to, with a
+                    // track wide enough to read as a slider.
+                    if similar {
+                        ui.add_space(8.0);
+                        ui.spacing_mut().slider_width = 220.0;
+                        crate::util::similarity_slider(ui, &mut self.threshold, self.verbosity);
+                    }
+                    ui.add_space(16.0);
+                    // Quick Delete: gives each group a DELETE NOW button that
+                    // removes its marked files instantly (no per-group confirmation).
+                    let label = format!("{} QUICK DELETE", icon::LIGHTNING);
+                    if crate::lcars::toggle_button(ui, &label, self.quick_delete, theme::red())
+                        .explain(
+                            self.verbosity,
+                            "Show a DELETE NOW button on each group that deletes its marked files immediately, no confirmation",
+                            "When on, every group gets a DELETE NOW button that deletes its \
+                             currently marked files immediately, skipping the usual \
+                             confirmation dialog. Turn off to go back to confirming every batch.",
+                        )
+                        .clicked()
                     {
-                        acts.push(Act::Find);
+                        acts.push(Act::ToggleQuickDelete);
                     }
-                    // Progress while a background op runs.
-                    if let Some(op) = &self.busy {
-                        ui.add(egui::Spinner::new().color(theme::amber()));
-                        let text = match op {
-                            Op::Find(n) => format!("searching… {n} groups"),
-                            Op::AutoResolve { done, total } => {
-                                format!("auto-resolving… {done}/{total}")
-                            }
-                            Op::Delete => "deleting…".to_string(),
-                        };
-                        ui.label(RichText::new(text).color(theme::amber()).size(12.0));
+                    if self.quick_delete {
+                        ui.label(
+                            RichText::new("on — DELETE NOW removes files instantly")
+                                .color(theme::red())
+                                .size(12.0),
+                        );
                     }
                 });
-
-                // The similarity threshold gets its own row so the slider has room
-                // to read as a slider (cramming it into the button row hid the track
-                // behind the value box). The value box still accepts typed floats.
-                if self.mode == Mode::Similar {
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        crate::util::similarity_slider(ui, &mut self.threshold, self.verbosity);
-                    });
-                }
-
-                // Quick Delete: gives each group a DELETE NOW button that removes
-                // its marked files instantly (no per-group confirmation).
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                // A proper bordered toggle now (filled red when on), so it's
-                // clearly a clickable control even when off.
-                let label = format!("{} QUICK DELETE", icon::LIGHTNING);
-                if crate::lcars::toggle_button(ui, &label, self.quick_delete, theme::red())
-                    .explain(
-                        self.verbosity,
-                        "Show a DELETE NOW button on each group that deletes its marked files immediately, no confirmation",
-                        "When on, every group gets a DELETE NOW button that deletes its \
-                         currently marked files immediately, skipping the usual \
-                         confirmation dialog. Turn off to go back to confirming every batch.",
-                    )
-                    .clicked()
-                {
-                    acts.push(Act::ToggleQuickDelete);
-                }
-                if self.quick_delete {
-                    ui.label(
-                        RichText::new("on — DELETE NOW removes files instantly")
-                            .color(theme::red())
-                            .size(12.0),
-                    );
-                }
-            });
             },
         );
+    }
 
+    /// HOW: the shared FILTER wizard, and FIND beside it — the last decision
+    /// and the run on one line.
+    fn how_section(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, acts: &mut Vec<Act>) {
+        crate::lcars::section_lcars(ui, "HOW — FILTER, THEN FIND", theme::orange(), |ui| {
+            ui.horizontal_top(|ui| {
+                let run_w = 140.0;
+                ui.vertical(|ui| {
+                    ui.set_max_width((ui.available_width() - run_w).max(240.0));
+                    // FIND keeps only groups with ≥1 member matching the
+                    // filter. The first included repo backs the pick-lists.
+                    let sugg = self.suggestion_repo();
+                    let outcome = self.filter.ui(ui, store, sugg.as_deref(), self.verbosity);
+                    if outcome.status.is_some() {
+                        self.status = outcome.status;
+                    }
+                    if outcome.error.is_some() {
+                        self.error = outcome.error;
+                    }
+                });
+                if crate::lcars::action_button(
+                    ui,
+                    &format!("{} FIND", icon::SEARCH),
+                    self.busy.is_none(),
+                    theme::amber(),
+                )
+                .explain(
+                    self.verbosity,
+                    "Search the included repos",
+                    "Search every included (checked) repository for duplicates or \
+                     similars per the selected mode. Excluded repos are skipped. The \
+                     search runs in a window that shows its progress.",
+                )
+                .clicked()
+                {
+                    acts.push(Act::Find);
+                }
+            });
+        });
+    }
+
+    /// The folded selection after a FIND: what was searched, in one line,
+    /// and CHANGE to unfold it.
+    fn selection_summary(&mut self, ui: &mut egui::Ui) {
+        let mode = match self.mode {
+            Mode::Exact => "DUPLICATES".to_string(),
+            Mode::Similar => format!("SIMILAR ≥ {:.1} %", self.threshold),
+        };
+        let repos = self.result_names.join(", ");
+        let filter = self
+            .filter
+            .filter_string()
+            .map(|f| format!(" · filter: {f}"))
+            .unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("{mode} in {repos}{filter}"))
+                    .color(theme::tan())
+                    .size(12.5),
+            );
+            if crate::lcars::toggle_button(ui, "CHANGE", false, theme::lilac())
+                .explain(
+                    self.verbosity,
+                    "Change what to search",
+                    "Unfold the mode, repository and filter sections to set up another \
+                     search. The groups below stay until the next FIND.",
+                )
+                .clicked()
+            {
+                self.selection_collapsed = false;
+            }
+        });
+    }
+
+    /// The actions over a result: SHOW ACCEPTED, AUTO-RESOLVE, DELETE
+    /// MARKED, and the view's own spinner for the marks it computes.
+    fn result_actions(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        if let Some(Op::AutoResolve { done, total }) = &self.busy {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().color(theme::amber()));
+                ui.label(
+                    RichText::new(format!("auto-resolving… {done}/{total}"))
+                        .color(theme::amber())
+                        .size(12.0),
+                );
+            });
+        }
         if self.total_groups() > 0 {
             ui.horizontal(|ui| {
                 let n = self.marked.len();
@@ -871,7 +1128,9 @@ impl DupesView {
                     "Delete every marked file, with confirmation",
                     "Delete every currently marked file across all groups, batched per \
                      repo in one transaction. Always asks for confirmation first — use \
-                     QUICK DELETE if you want per-group deletes without asking.",
+                     QUICK DELETE if you want per-group deletes without asking. The \
+                     delete and the search that follows run in a window that shows \
+                     their progress and reports what was deleted.",
                 )
                 .clicked()
                 {
@@ -1951,17 +2210,19 @@ impl DupesView {
             Act::HideGroup(gi) => {
                 self.hidden.insert(gi);
             }
-            Act::Accept(repo, size, hash) => self.set_accepted(store, &[(repo, size, hash)], true),
+            Act::Accept(repo, size, hash) => {
+                self.set_accepted(ctx, store, &[(repo, size, hash)], true)
+            }
             Act::Unaccept(repo, size, hash) => {
-                self.set_accepted(store, &[(repo, size, hash)], false)
+                self.set_accepted(ctx, store, &[(repo, size, hash)], false)
             }
             Act::AcceptGroup(gi) => {
                 let contents = self.group_contents(gi, false);
-                self.set_accepted(store, &contents, true);
+                self.set_accepted(ctx, store, &contents, true);
             }
             Act::UnacceptGroup(gi) => {
                 let contents = self.group_contents(gi, true);
-                self.set_accepted(store, &contents, false);
+                self.set_accepted(ctx, store, &contents, false);
             }
             Act::ToggleShowAccepted => self.show_accepted = !self.show_accepted,
             Act::SetPage(p) => {
@@ -2050,8 +2311,19 @@ impl DupesView {
     /// per-file unlock on the copies it now protects. Refused while a
     /// background operation runs, so a running auto-resolve can't mark a copy
     /// accepted under its feet.
+    /// The path of a file on the current page holding this content in this
+    /// repo, for a card that names what was accepted.
+    fn path_for(&self, repo: &str, size: u64, hash: &[u8; 32]) -> Option<String> {
+        self.page_groups
+            .iter()
+            .flatten()
+            .find(|f| f.repo == repo && f.entry.size == size && &f.entry.hash == hash)
+            .map(|f| f.rel_path.clone())
+    }
+
     fn set_accepted(
         &mut self,
+        ctx: &egui::Context,
         store: &Arc<Store>,
         contents: &[(String, u64, [u8; 32])],
         accept: bool,
@@ -2074,6 +2346,17 @@ impl DupesView {
                     } else {
                         self.accepted.remove(repo, *size, hash);
                     }
+                    let what = self
+                        .path_for(repo, *size, hash)
+                        .unwrap_or_else(|| format!("content {}", &hash_hex(hash)[..12]));
+                    crate::activity::lock(&self.activity).card(
+                        ctx,
+                        crate::activity::Notification::noted(
+                            if accept { "Accepted" } else { "Un-accepted" },
+                            repo,
+                            &what,
+                        ),
+                    );
                 }
                 Err(e) => {
                     self.error = Some(format!("Could not update the accepted mark: {e}"));
@@ -2159,7 +2442,6 @@ impl DupesView {
             .collect()
     }
 
-    /// Run the search on a background thread; results/progress arrive via `rx`.
     fn start_find(&mut self, store: &Arc<Store>, ctx: &egui::Context) {
         if self.busy.is_some() {
             return;
@@ -2173,84 +2455,41 @@ impl DupesView {
         // rather than on the worker thread. `None` (no conditions) skips the
         // per-member matching entirely.
         let filter_str = self.filter.filter_string();
-        let has_filter = filter_str.is_some();
         let filter = match FileFilter::parse(filter_str.as_deref()) {
-            Ok(f) => f,
+            Ok(f) => filter_str.is_some().then_some(f),
             Err(e) => {
                 self.error = Some(e.to_string());
                 return;
             }
         };
-        self.result_names = names.clone();
-        self.busy = Some(Op::Find(0));
+        let search = Search {
+            store: Arc::clone(store),
+            names: names.clone(),
+            mode: self.mode,
+            threshold: self.threshold,
+            filter,
+            tx: self.tx.clone(),
+        };
+        let started = crate::activity::lock(&self.activity).start(
+            ctx,
+            crate::activity::Spec {
+                title: search.title(),
+                repos: names.clone(),
+            },
+            move |progress, cancel| search.run(progress, cancel),
+        );
+        if let Err(busy) = started {
+            crate::activity::lock(&self.activity)
+                .card(ctx, crate::activity::Notification::refused("FIND", &busy));
+            return;
+        }
+        self.result_names = names;
+        self.busy = Some(Op::Find);
         self.status = None;
         self.error = None;
-        let store = Arc::clone(store);
-        let tx = self.tx.clone();
-        let mode = self.mode;
-        let threshold = self.threshold;
-        let repaint = ctx.clone();
-        std::thread::spawn(move || {
-            let fref = has_filter.then_some(&filter);
-            let results = match mode {
-                Mode::Exact => {
-                    let tx2 = tx.clone();
-                    let r = repaint.clone();
-                    plan_exact_duplicates(&store, &names, move |n| {
-                        let _ = tx2.send(Msg::FindProgress(n));
-                        r.request_repaint();
-                    })
-                    .and_then(|plan| {
-                        // Keep only groups with ≥1 matching member (streams each
-                        // key's members; reports keys examined as progress).
-                        let tx2 = tx.clone();
-                        let r = repaint.clone();
-                        retain_matching_keys(&store, &names, plan, fref, move |n| {
-                            let _ = tx2.send(Msg::FindProgress(n));
-                            r.request_repaint();
-                        })
-                    })
-                    .map(Results::Exact)
-                    .map_err(|e| e.to_string())
-                }
-                Mode::Similar => find_similar(&store, &names, threshold, fref)
-                    .map(Results::Similar)
-                    .map_err(|e| e.to_string()),
-            };
-            let result = results.and_then(|results| {
-                let accepted = AcceptedIndex::load(&store, &names).map_err(|e| e.to_string())?;
-                let mut accepted_groups = HashSet::new();
-                match &results {
-                    Results::Exact(plan) => {
-                        for (i, k) in plan.iter().enumerate() {
-                            if key_all_accepted(&store, &names, &accepted, k.size, &k.hash)
-                                .map_err(|e| e.to_string())?
-                            {
-                                accepted_groups.insert(i);
-                            }
-                        }
-                    }
-                    Results::Similar(groups) => {
-                        for (i, g) in groups.iter().enumerate() {
-                            if accepted.all_accepted(g) {
-                                accepted_groups.insert(i);
-                            }
-                        }
-                    }
-                }
-                Ok(Found {
-                    results,
-                    accepted,
-                    accepted_groups,
-                })
-            });
-            let _ = tx.send(Msg::FindDone(result));
-            repaint.request_repaint();
-        });
+        self.selection_collapsed = true;
     }
 
-    /// Mark every non-best copy in a non-read-only repo. Similar results are in
-    /// memory (marked inline); exact streams the plan on a background thread.
     fn start_auto_resolve(&mut self, store: &Arc<Store>, ctx: &egui::Context) {
         if self.busy.is_some() {
             return;
@@ -2322,7 +2561,6 @@ impl DupesView {
         }
     }
 
-    /// Delete `keys` on a background thread; `follow` decides the aftermath.
     fn start_delete(
         &mut self,
         store: &Arc<Store>,
@@ -2340,16 +2578,90 @@ impl DupesView {
         if self.busy.is_some() || keys.is_empty() {
             return;
         }
-        self.delete_batch = keys.clone();
-        self.busy = Some(Op::Delete);
         let store = Arc::clone(store);
         let tx = self.tx.clone();
-        let repaint = ctx.clone();
-        std::thread::spawn(move || {
-            let result = delete_paths(&store, &keys).map_err(|e| e.to_string());
-            let _ = tx.send(Msg::DeleteDone(result, follow));
-            repaint.request_repaint();
-        });
+        match follow {
+            // The whole marked set: a long-running operation. Its worker
+            // deletes, reports each file, then re-runs the search, so the
+            // modal shows both phases and one report carries both counts.
+            DeleteFollow::Refind | DeleteFollow::Reported => {
+                let names = self.result_names.clone();
+                let filter = FileFilter::parse(self.filter.filter_string().as_deref())
+                    .ok()
+                    .filter(|_| self.filter.filter_string().is_some());
+                let search = Search {
+                    store: Arc::clone(&store),
+                    names: names.clone(),
+                    mode: self.mode,
+                    threshold: self.threshold,
+                    filter,
+                    tx: tx.clone(),
+                };
+                let n = keys.len() as u64;
+                let started = crate::activity::lock(&self.activity).start(
+                    ctx,
+                    crate::activity::Spec {
+                        title: format!("DELETE {n} marked file(s)"),
+                        repos: names,
+                    },
+                    move |progress, cancel| {
+                        progress.phase(format!("deleting {n} file(s)"), 0, None);
+                        let result = delete_paths(&store, &keys).map_err(|e| e.to_string());
+                        let mut report = crate::run_result::RunReport::new(format!(
+                            "DELETE {n} marked file(s), then {}",
+                            search.title()
+                        ));
+                        match &result {
+                            Ok(stats) => {
+                                report = report
+                                    .count("deleted", stats.deleted)
+                                    .count("could not delete", stats.errors);
+                                for (repo, rel, err) in &stats.failed {
+                                    report.problem(format!("{repo}: {rel}: {err}"));
+                                    progress.problem(format!("{repo}: {rel}: {err}"));
+                                }
+                            }
+                            Err(e) => report.problem(e.clone()),
+                        }
+                        let _ = tx.send(Msg::DeleteDone(result, DeleteFollow::Reported));
+                        if cancel.is_cancelled() {
+                            return report.cancelled(true);
+                        }
+                        let found = search.run(progress, cancel);
+                        report.absorb(found)
+                    },
+                );
+                if let Err(busy) = started {
+                    crate::activity::lock(&self.activity).card(
+                        ctx,
+                        crate::activity::Notification::refused("DELETE MARKED", &busy),
+                    );
+                    return;
+                }
+                self.delete_batch = Vec::new();
+                self.busy = Some(Op::Delete);
+            }
+            // One group's marked files: a row action — no modal, a card and a
+            // log line per file when it lands.
+            DeleteFollow::Resolve(_) => {
+                let refused = crate::activity::lock(&self.activity).begin_row_action();
+                if let Err(busy) = refused {
+                    crate::activity::lock(&self.activity).card(
+                        ctx,
+                        crate::activity::Notification::refused("DELETE NOW", &busy),
+                    );
+                    return;
+                }
+                self.delete_batch = keys.clone();
+                self.busy = Some(Op::Delete);
+                let repaint = ctx.clone();
+                std::thread::spawn(move || {
+                    let result = delete_paths(&store, &keys).map_err(|e| e.to_string());
+                    let _ = tx.send(Msg::DeleteDone(result, follow));
+                    repaint.request_repaint();
+                });
+            }
+        }
     }
 
     fn repo_is_ro(&self, name: &str) -> bool {
@@ -2418,21 +2730,159 @@ mod ui_tests {
     /// Build a driven harness showing the Duplicates view for `store`. The
     /// closure owns `view`/`store`; the theme + icon font are installed once so
     /// glyph metrics match the real app.
-    fn dupes_harness<'a>(store: Arc<Store>) -> Harness<'a> {
+    /// A view as a user has it after the first click: the mode chosen, so the
+    /// repositories, the filter and FIND are on screen (ADR 0003 reveals them
+    /// step by step). Every repo is included, as the layout tests assume.
+    fn ready_view() -> DupesView {
         let mut view = DupesView::new();
+        view.mode_chosen = true;
+        view
+    }
+
+    fn dupes_harness<'a>(store: Arc<Store>) -> Harness<'a, DupesView> {
         let mut init = false;
         let mut harness = Harness::builder()
-            .with_size(egui::vec2(1120.0, 360.0))
-            .build_ui(move |ui| {
-                if !init {
-                    crate::icon::install(ui.ctx());
-                    crate::theme::apply(ui.ctx(), crate::theme::DARK);
-                    init = true;
-                }
-                view.show(ui, &store, TooltipVerbosity::default());
-            });
+            .with_size(egui::vec2(1120.0, 420.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    view.show(ui, &store, TooltipVerbosity::default());
+                },
+                ready_view(),
+            );
+        harness.run();
+        // Repos start excluded; the layout tests look at the whole tab, so
+        // include them all and render again to reveal the HOW section.
+        harness
+            .state_mut()
+            .repos
+            .iter_mut()
+            .for_each(|r| r.included = true);
         harness.run();
         harness
+    }
+
+    /// ADR 0003 reading order: a fresh tab shows the mode choice alone; the
+    /// repositories appear once a mode is picked; the filter and FIND once a
+    /// repository is included; and flipping the mode keeps the repository pick.
+    #[test]
+    fn sections_reveal_in_reading_order_and_keep_earlier_answers() {
+        let (_tmp, store) = sample_store(&SAMPLE_REPOS);
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1120.0, 600.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default());
+                },
+                DupesView::new(),
+            );
+        h.run();
+        let find = format!("{} FIND", icon::SEARCH);
+        assert!(h.query_by_label("DUPLICATES").is_some());
+        assert!(
+            h.query_by_label(SAMPLE_REPOS[0]).is_none(),
+            "no repository chip before a mode is chosen"
+        );
+        assert!(h.query_by_label_contains("FILTER — ").is_none());
+        assert!(h.query_by_label(&find).is_none());
+
+        h.get_by_label("DUPLICATES").click();
+        h.run();
+        let repo_chip = h.get_by_label(SAMPLE_REPOS[0]).rect();
+        let mode_chip = h.get_by_label("DUPLICATES").rect();
+        assert!(
+            repo_chip.top() > mode_chip.bottom(),
+            "repositories sit below the mode: {repo_chip:?} vs {mode_chip:?}"
+        );
+        assert!(
+            h.query_by_label(&find).is_none(),
+            "FIND waits for a repository to be included"
+        );
+
+        h.get_by_label(SAMPLE_REPOS[0]).click();
+        h.run();
+        let filter = h.get_by_label_contains("FILTER — ").rect();
+        let find_btn = h.get_by_label(&find).rect();
+        assert!(
+            filter.top() > repo_chip.bottom(),
+            "filter below the repositories"
+        );
+        assert!(
+            (find_btn.top() - filter.top()).abs() < 40.0,
+            "FIND shares the HOW row with the filter: {find_btn:?} vs {filter:?}"
+        );
+
+        // Flipping the mode does not reset the repository pick.
+        h.get_by_label("SIMILAR").click();
+        h.run();
+        assert!(
+            h.state().repos[0].included,
+            "the repository pick survives a mode flip"
+        );
+        assert!(h.query_by_label(&find).is_some());
+    }
+
+    /// After a FIND the three selection sections fold into one summary line,
+    /// and CHANGE unfolds them again.
+    #[test]
+    fn selection_folds_after_find_and_unfolds_on_change() {
+        let (_tmp, store) = sample_store(&SAMPLE_REPOS);
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1120.0, 600.0))
+            .build_ui_state(
+                move |ui, view: &mut DupesView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default());
+                },
+                ready_view(),
+            );
+        h.run();
+        h.state_mut()
+            .repos
+            .iter_mut()
+            .for_each(|r| r.included = true);
+        h.run();
+        h.get_by_label(&format!("{} FIND", icon::SEARCH)).click();
+        for _ in 0..200 {
+            h.step();
+            if h.state().results.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(h.state().results.is_some(), "the search landed");
+        h.run();
+        assert!(
+            h.query_by_label("DUPLICATES").is_none(),
+            "the mode section is folded away after FIND"
+        );
+        assert!(
+            h.query_by_label("CHANGE").is_some(),
+            "the summary offers CHANGE"
+        );
+        h.get_by_label("CHANGE").click();
+        h.run();
+        assert!(
+            h.query_by_label("DUPLICATES").is_some(),
+            "CHANGE unfolds the sections"
+        );
     }
 
     /// Regression test for the recurring "first repo sits higher" bug: every
@@ -2461,7 +2911,7 @@ mod ui_tests {
     #[test]
     fn sync_repos_preserves_state_and_adds_new() {
         let (tmp, store) = sample_store(&["A", "B"]);
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.sync_repos(&store);
         assert_eq!(
             view.repos
@@ -2520,7 +2970,7 @@ mod ui_tests {
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default());
                 },
-                DupesView::new(),
+                ready_view(),
             );
         harness.run();
         assert!(
@@ -2549,7 +2999,7 @@ mod ui_tests {
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let (_tmp, store) = sample_store(&refs);
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         let mut init = false;
         let mut harness = Harness::builder()
             .with_size(egui::vec2(420.0, 500.0))
@@ -2605,8 +3055,8 @@ mod ui_tests {
         // it hundreds of px down, so a ~200px ceiling still catches that.
         let filter_top = harness.get_by_label_contains("FILTER — ").rect().top();
         assert!(
-            filter_top < 200.0,
-            "FILTER section at y={filter_top}; the REPOS section is too tall (expanded?)"
+            filter_top < 320.0,
+            "FILTER section at y={filter_top}; the WHAT or WITH WHICH section is too tall (expanded?)"
         );
     }
 
@@ -2631,7 +3081,7 @@ mod ui_tests {
     #[test]
     fn similar_mode_row_is_aligned() {
         let (_tmp, store) = sample_store(&SAMPLE_REPOS);
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         let mut init = false;
         let mut harness = Harness::builder()
             .with_size(egui::vec2(1120.0, 360.0))
@@ -2648,13 +3098,18 @@ mod ui_tests {
         harness.run();
 
         let dup_top = harness.get_by_label("DUPLICATES").rect().top();
-        let find_top = harness
-            .get_by_label(&format!("{} FIND", icon::SEARCH))
+        let quick_top = harness
+            .get_by_label(&format!("{} QUICK DELETE", icon::LIGHTNING))
             .rect()
             .top();
+        let slider_top = harness.get_by_label("similarity").rect().top();
         assert!(
-            (dup_top - find_top).abs() < 0.75,
-            "SIMILAR row misaligned: DUPLICATES top {dup_top} vs FIND top {find_top}"
+            (dup_top - quick_top).abs() < 0.75,
+            "mode row misaligned: DUPLICATES top {dup_top} vs QUICK DELETE top {quick_top}"
+        );
+        assert!(
+            (slider_top - dup_top).abs() < 12.0,
+            "the threshold sits on the mode row beside SIMILAR: {slider_top} vs {dup_top}"
         );
     }
 
@@ -2664,7 +3119,7 @@ mod ui_tests {
     #[test]
     fn delete_summary_survives_the_refind() {
         let (_tmp, store) = sample_store(&["a"]);
-        let view = DupesView::new();
+        let view = ready_view();
         let store_ui = Arc::clone(&store);
         let mut init = false;
         let mut h = Harness::builder()
@@ -2686,10 +3141,18 @@ mod ui_tests {
         tx.send(Msg::DeleteDone(
             Ok(DupeDeleteStats {
                 deleted: 45,
-                errors: 0,
+                ..DupeDeleteStats::default()
             }),
-            DeleteFollow::Refind,
+            DeleteFollow::Reported,
         ))
+        .unwrap();
+        // DELETE MARKED's worker deletes, then searches again and delivers
+        // the fresh result itself; play that second message.
+        tx.send(Msg::FindDone(Ok(Found {
+            results: Results::Exact(Vec::new()),
+            accepted: AcceptedIndex::default(),
+            accepted_groups: HashSet::new(),
+        })))
         .unwrap();
         for _ in 0..200 {
             h.step();
@@ -2729,7 +3192,7 @@ mod ui_tests {
         writable.entry.modified_ms = 1_000;
         protected.entry.modified_ms = 2_000;
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.repos = vec![
             RepoSel {
@@ -2802,7 +3265,7 @@ mod ui_tests {
     fn archive_evidence_rows_name_the_containing_zip() {
         let group: DupeGroup = vec![content_file("a.png", 7), content_file("b.png", 7)];
         let ck = (group[0].entry.size, group[0].entry.hash);
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
         view.archive_evidence
@@ -2841,7 +3304,7 @@ mod ui_tests {
         let group: DupeGroup = vec![content_file("a.png", 9), content_file("b.png", 9)];
         let ck = (group[0].entry.size, group[0].entry.hash);
         let (ka, kb) = (key(&group[0]), key(&group[1]));
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
         view.archive_evidence
@@ -2920,7 +3383,7 @@ mod ui_tests {
         let total = 40usize;
         let groups: Vec<DupeGroup> = (0..total).map(|i| vec![image_file(i)]).collect();
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true; // no repos needed; render fabricated groups
         view.results = Some(Results::Similar(groups));
 
@@ -2958,7 +3421,7 @@ mod ui_tests {
         let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
         let groups: Vec<DupeGroup> = (0..40).map(|i| vec![image_file(i)]).collect();
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(groups));
 
@@ -3100,7 +3563,7 @@ mod ui_tests {
         let plan = plan_exact_duplicates(&store, &["repo".to_string()], |_| {}).unwrap();
         assert_eq!(plan.len(), 120);
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Exact(plan));
         view.result_names = vec!["repo".to_string()];
@@ -3148,15 +3611,17 @@ mod ui_tests {
                     }
                     view.show(ui, &store_ui, TooltipVerbosity::default());
                 },
-                DupesView::new(),
+                ready_view(),
             );
         harness.run(); // sync_repos (all excluded by default), initial render
-        // Repos start excluded; opt them all in before searching.
+        // Repos start excluded; opt them all in before searching, and render
+        // once more so the HOW section (filter and FIND) is on screen.
         harness
             .state_mut()
             .repos
             .iter_mut()
             .for_each(|r| r.included = true);
+        harness.run();
 
         harness
             .get_by_label(&format!("{} FIND", icon::SEARCH))
@@ -3187,7 +3652,7 @@ mod ui_tests {
     fn find_applies_the_filter() {
         let (_tmp, store) = seeded_store(5);
         let store_ui = Arc::clone(&store);
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         // seed_groups names copies g{g}_c{c}.bin, so this matches only group 0.
         view.filter.set_expression("name:g0_");
         let mut init = false;
@@ -3209,12 +3674,14 @@ mod ui_tests {
         for _ in 0..5 {
             harness.step();
         }
-        // Repos start excluded; opt them all in before searching.
+        // Repos start excluded; opt them all in before searching, then render
+        // once so the HOW section (filter and FIND) is on screen.
         harness
             .state_mut()
             .repos
             .iter_mut()
             .for_each(|r| r.included = true);
+        harness.run();
 
         harness
             .get_by_label(&format!("{} FIND", icon::SEARCH))
@@ -3275,7 +3742,7 @@ mod ui_tests {
     /// `acc_one.jpg`/`acc_two.jpg` (content 1, accepted in `w`) and
     /// `acc_c.jpg`/`plain_d.jpg` (contents 2 accepted / 3 not).
     fn accepted_view() -> DupesView {
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.locks.toggle("w");
         view.repos = vec![RepoSel {
@@ -3375,7 +3842,7 @@ mod ui_tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
         let ctx = egui::Context::default();
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         assert!(!view.scroll_to_top, "a fresh view has nothing to reset");
 
         view.apply(&ctx, &store, Act::SetPage(1));
@@ -3395,7 +3862,7 @@ mod ui_tests {
         store.create_repo("w", &repo_dir.to_string_lossy()).unwrap();
         let ctx = egui::Context::default();
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.cached_page = Some(0);
         view.page_groups = vec![
             vec![dfile_h("w", "a1", 1), dfile_h("w", "a2", 1)],
@@ -3440,7 +3907,7 @@ mod ui_tests {
         store.create_repo("w", &repo_dir.to_string_lossy()).unwrap();
         store.accept_content("w", 10, &[4u8; 32]).unwrap();
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.locks.toggle("w");
         view.repos = vec![RepoSel {
@@ -3516,7 +3983,7 @@ mod ui_tests {
         std::fs::create_dir_all(&repo_dir).unwrap();
         store.create_repo("w", &repo_dir.to_string_lossy()).unwrap();
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.locks.toggle("w");
         view.repos = vec![RepoSel {
@@ -3608,7 +4075,7 @@ mod ui_tests {
     /// read-only repo (fixes the "everything is KEEP" regression).
     #[test]
     fn default_marks_worse_copies_excluding_read_only() {
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.repos = vec![
             RepoSel {
@@ -3646,7 +4113,7 @@ mod ui_tests {
     /// whole group from the list.
     #[test]
     fn group_bulk_buttons_mark_and_hide() {
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.locks.toggle("w");
         view.repos = vec![
@@ -3723,7 +4190,7 @@ mod ui_tests {
     /// "unlocked" badge plus a working KEEP/DELETE toggle.
     #[test]
     fn unlocking_a_read_only_file_makes_it_markable() {
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.repos = vec![RepoSel {
             name: "ro".into(),
@@ -3788,7 +4255,7 @@ mod ui_tests {
     /// context menu whose UNLOCK entry lifts the per-file lock.
     #[test]
     fn right_click_menu_unlocks_a_read_only_file() {
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.locks.toggle("w");
         view.repos = vec![
@@ -3846,7 +4313,7 @@ mod ui_tests {
     /// OPEN (system default app) and SHOW IN FOLDER entries.
     #[test]
     fn right_click_card_offers_open_and_show_in_folder() {
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![vec![
             dfile("w", "best"),
@@ -3898,7 +4365,7 @@ mod ui_tests {
     fn a_card_opens_the_shared_viewer_with_the_group_as_pool_and_marks() {
         let group: DupeGroup = (0..3).map(image_file).collect();
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         // The registry defaults every repo to locked; these fixtures
         // exercise marking/editing, which needs "r" unlocked.
         view.locks.toggle("r");
@@ -3981,7 +4448,7 @@ mod ui_tests {
     fn lightbox_opens_navigates_marks_and_closes() {
         let group: DupeGroup = (0..3).map(image_file).collect();
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true; // fabricated groups, no repos needed
         view.results = Some(Results::Similar(vec![group]));
 
@@ -4081,7 +4548,7 @@ mod ui_tests {
         let group: DupeGroup = (0..2).map(audio_file).collect();
         let target_hex = dedup_core::thumbnail::hash_hex(&group[0].entry.hash);
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
 
@@ -4129,7 +4596,7 @@ mod ui_tests {
     fn audio_card_shows_fingerprint_tile_not_placeholder() {
         let group: DupeGroup = (0..2).map(audio_file).collect();
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
 
@@ -4170,7 +4637,7 @@ mod ui_tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
         let ctx = egui::Context::default();
-        let mut view = DupesView::new();
+        let mut view = ready_view();
 
         let f0 = audio_file(0);
         let f1 = audio_file(1);
@@ -4215,7 +4682,7 @@ mod ui_tests {
         let a_hex = hash_hex(&group[0].entry.hash);
         let b_hex = hash_hex(&group[1].entry.hash);
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
 
@@ -4286,7 +4753,7 @@ mod ui_tests {
         let group: DupeGroup = (0..2).map(audio_file).collect();
         let a_hex = hash_hex(&group[0].entry.hash);
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
 
@@ -4402,7 +4869,7 @@ mod ui_tests {
             },
         };
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         // The registry defaults every repo to locked; these fixtures
         // exercise marking/editing, which needs "r" unlocked.
         view.locks.toggle("r");
@@ -4491,7 +4958,7 @@ mod ui_tests {
         let a_hex = hash_hex(&group[0].entry.hash);
         let b_hex = hash_hex(&group[1].entry.hash);
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
 
@@ -4636,7 +5103,7 @@ mod ui_tests {
             );
         }
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
         let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
@@ -4718,7 +5185,7 @@ mod ui_tests {
     fn the_audio_header_offers_playback_speed() {
         let tmp = tempfile::tempdir().unwrap();
         let group: DupeGroup = (0..2).map(audio_file).collect();
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
         let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
@@ -4827,7 +5294,7 @@ mod ui_tests {
         let a_key = key(&group[0]);
         let b_key = key(&group[1]);
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         // The registry defaults every repo to locked; these fixtures
         // exercise marking/editing, which needs "r" unlocked.
         view.locks.toggle("r");
@@ -4916,7 +5383,7 @@ mod ui_tests {
     fn audio_compare_header_controls_stay_inside_a_narrow_window() {
         let tmp = tempfile::tempdir().unwrap();
         let group: DupeGroup = (0..2).map(audio_file).collect();
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
         let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
@@ -5014,7 +5481,7 @@ mod ui_tests {
         };
         let group: DupeGroup = vec![mk("a.mp3", "Alpha", 0), mk("b.mp3", "Beta", 1)];
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         // The registry defaults every repo to locked; these fixtures
         // exercise marking/editing, which needs "r" unlocked.
         view.locks.toggle("r");
@@ -5114,7 +5581,7 @@ mod ui_tests {
         };
         let group: DupeGroup = vec![mk("one.mp3", "Take One", 0), mk("two.mp3", "Take Two", 1)];
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         // The registry defaults every repo to locked; these fixtures
         // exercise marking/editing, which needs "r" unlocked.
         view.locks.toggle("r");
@@ -5179,7 +5646,7 @@ mod ui_tests {
         let group: DupeGroup = (0..3).map(image_file).collect();
         let b_key = key(&group[1]); // A is index 0 → B defaults to index 1
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         // The registry defaults every repo to locked; these fixtures
         // exercise marking/editing, which needs "r" unlocked.
         view.locks.toggle("r");
@@ -5246,7 +5713,7 @@ mod ui_tests {
     /// `M` toggles the match mode from the grid (no lightbox/modal open).
     #[test]
     fn grid_shortcut_toggles_match_mode() {
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -5294,7 +5761,7 @@ mod ui_tests {
         let ctx = egui::Context::default();
         let k: FileKey = ("r".into(), "f".into());
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.unlocked.insert(k.clone());
         view.marked.insert(k.clone());
         view.apply(&ctx, &store, Act::Relock(k.clone()));
@@ -5326,7 +5793,7 @@ mod ui_tests {
                 ]
             })
             .collect();
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true; // repos empty → nothing read-only → all worse markable
         view.results = Some(Results::Similar(groups));
 
@@ -5348,7 +5815,7 @@ mod ui_tests {
         best.entry.size = 3000;
         let mut worse = dfile("w", "b");
         worse.entry.size = 1000;
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![vec![best, worse]]));
 
@@ -5399,7 +5866,7 @@ mod ui_tests {
         let plan = plan_exact_duplicates(&store, &["repo".to_string()], |_| {}).unwrap();
         assert_eq!(plan.len(), 1);
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.repos = vec![RepoSel {
             name: "repo".into(),
@@ -5510,7 +5977,7 @@ mod ui_tests {
             },
             1,
         );
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![vec![a, b]]));
         let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
@@ -5561,7 +6028,7 @@ mod ui_tests {
     #[ignore = "renders a PNG for manual inspection"]
     fn render_dupes_view() {
         let (_tmp, store) = sample_store(&SAMPLE_REPOS);
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         let mut init = false;
         let mut harness = Harness::builder()
             .with_size(egui::vec2(1120.0, 360.0))
@@ -5606,7 +6073,7 @@ mod ui_tests {
             })
             .collect();
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
 
@@ -5696,7 +6163,7 @@ mod ui_tests {
         };
         let group: DupeGroup = vec![wav(0, true), wav(1, false)];
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
 
@@ -5743,7 +6210,7 @@ mod ui_tests {
     #[ignore = "renders a PNG for manual inspection"]
     fn render_dupes_similar() {
         let (_tmp, store) = sample_store(&SAMPLE_REPOS);
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         let mut init = false;
         let mut harness = Harness::builder()
             .with_size(egui::vec2(1120.0, 360.0))
@@ -5773,7 +6240,7 @@ mod ui_tests {
     fn render_dupes_populated() {
         let (_tmp, store) = seeded_store(3);
         let plan = plan_exact_duplicates(&store, &["repo".to_string()], |_| {}).unwrap();
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.repos = vec![RepoSel {
             name: "repo".into(),
@@ -5814,7 +6281,7 @@ mod ui_tests {
     #[test]
     fn overview_mark_pill_is_protected_for_a_read_only_repo() {
         use egui_kittest::Harness;
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.repos = vec![RepoSel {
             name: "ro".into(),
@@ -5868,7 +6335,7 @@ mod ui_tests {
         dedup_core::thumbnail::set_cache_dir(dir.path().join("thumbs"));
         let group = hero_or_gradient_group(dir.path());
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
 
@@ -5969,7 +6436,7 @@ mod ui_tests {
             },
         };
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![vec![file]]));
 
@@ -6030,7 +6497,7 @@ mod ui_tests {
             None => ("repo".to_string(), seeded_store(3)),
         };
         let plan = plan_exact_duplicates(&store, std::slice::from_ref(&repo), |_| {}).unwrap();
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.repos = vec![RepoSel {
             name: repo.clone(),
@@ -6162,7 +6629,7 @@ mod ui_tests {
         dedup_core::thumbnail::set_cache_dir(dir.path().join("thumbs"));
         let group = hero_or_gradient_group(dir.path());
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
 
@@ -6216,7 +6683,7 @@ mod ui_tests {
         let dir = tempfile::tempdir().unwrap();
         dedup_core::thumbnail::set_cache_dir(dir.path().join("thumbs"));
         let group = hero_or_gradient_group(dir.path());
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
 
@@ -6332,7 +6799,7 @@ mod ui_tests {
             });
         }
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
 
@@ -6504,7 +6971,7 @@ mod ui_tests {
         ];
         let mp3 = dir.path().join("a.mp3");
 
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         // The registry defaults every repo to locked; these fixtures
         // exercise marking/editing, which needs "r" unlocked.
         view.locks.toggle("r");
@@ -6578,7 +7045,7 @@ mod ui_tests {
             tagged_mp3(dir.path(), "a.mp3", 1, "Alpha"),
             tagged_mp3(dir.path(), "b.mp3", 2, "Beta"),
         ];
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         // The registry defaults every repo to locked; these fixtures
         // exercise marking/editing, which needs "r" unlocked.
         view.locks.toggle("r");
@@ -6612,7 +7079,7 @@ mod ui_tests {
         // B is a FLAC: no ID3 container, so no B column at all.
         let flac = plain_file(dir.path(), "b.flac", 3, "audio/flac", b"fLaC\0\0\0\0");
         let group: DupeGroup = vec![tagged_mp3(dir.path(), "a.mp3", 1, "Alpha"), flac];
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.locks.toggle("r");
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
@@ -6634,7 +7101,7 @@ mod ui_tests {
     fn metadata_tab_offers_no_editing_in_a_read_only_repo() {
         let dir = tempfile::tempdir().unwrap();
         let group: DupeGroup = vec![tagged_mp3(dir.path(), "a.mp3", 1, "Alpha")];
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.repos = vec![RepoSel {
             name: "r".into(),
@@ -6678,7 +7145,7 @@ mod ui_tests {
                 &[0x25, 0x50, 0x44, 0x46, 0xff, 0xfe, 0x00, 0x01],
             ),
         ];
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
         let mut harness = lightbox_harness(view, egui::vec2(1000.0, 720.0));
@@ -6734,7 +7201,7 @@ mod ui_tests {
                 b"%PDF-1.4\x00 two",
             ),
         ];
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
         let mut harness = lightbox_harness(view, egui::vec2(1000.0, 720.0));
@@ -6787,7 +7254,7 @@ mod ui_tests {
                 f
             })
             .collect();
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
         let mut harness = lightbox_harness(view, egui::vec2(1000.0, 720.0));
@@ -6816,7 +7283,7 @@ mod ui_tests {
             tagged_mp3(dir.path(), "chelsea-1974.mp3", 1, "Chelsea Hotel"),
             tagged_mp3(dir.path(), "chelsea-remaster.mp3", 2, "Chelsea Hotel #2"),
         ];
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
 
@@ -6880,7 +7347,7 @@ mod ui_tests {
                 b"%PDF-1.4\x00\x01\x02 stream ... binary payload ...",
             ),
         ];
-        let mut view = DupesView::new();
+        let mut view = ready_view();
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
 
