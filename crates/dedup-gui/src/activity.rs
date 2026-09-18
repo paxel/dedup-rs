@@ -16,6 +16,7 @@ use crate::run_result::{ResultModal, RunReport};
 use crate::theme;
 use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
+use dedup_core::diff::{DiffAction, DiffEvent, DiffProgress, PlanPhase, PlanProgress};
 use dedup_core::update::{CancellationToken, Progress, ProgressEvent};
 use egui::{Id, RichText};
 use std::collections::VecDeque;
@@ -142,7 +143,8 @@ impl Notification {
         }
     }
 
-    fn headline(&self) -> String {
+    /// The card's first line: the verb and the file.
+    pub fn headline(&self) -> String {
         match &self.outcome {
             Ok(()) => format!("{} {}", self.action, self.path),
             Err(_) => format!("FAILED: {} {}", self.action.to_lowercase(), self.path),
@@ -224,6 +226,54 @@ impl Progress for ActivityProgress {
             ProgressEvent::Error { path, message } => self.problem(format!("{path}: {message}")),
             ProgressEvent::Finished { .. } => {}
         }
+    }
+}
+
+/// [`DiffProgress`] adapter for a run behind the activity modal or a row
+/// action: each file becomes the modal's phase line and an event-log line,
+/// each failure a live problem and a failed log line. `repo` is where the
+/// change lands (the target, the sink, the main, or an export folder).
+pub struct RunProgress {
+    pub activity: ActivityProgress,
+    pub repo: String,
+}
+
+impl DiffProgress for RunProgress {
+    fn on(&self, event: DiffEvent) {
+        match event {
+            DiffEvent::Progress {
+                action,
+                done,
+                total,
+                rel_path,
+            } => {
+                let (doing, did) = match action {
+                    DiffAction::Copy => ("copying", "Copied"),
+                    DiffAction::Move => ("moving", "Moved"),
+                    DiffAction::Delete => ("deleting", "Deleted"),
+                };
+                self.activity
+                    .phase(format!("{doing} {rel_path}"), done, Some(total));
+                self.activity
+                    .record(&Notification::changed(did, &self.repo, &rel_path));
+            }
+            DiffEvent::Error { path, message } => {
+                log::warn!("transfer error: {path}: {message}");
+                self.activity.problem(format!("{path}: {message}"));
+                self.activity.record(&Notification::failed(
+                    "Transfer", &self.repo, &path, &message,
+                ));
+            }
+        }
+    }
+}
+
+/// Map a plan's phase onto the activity modal.
+pub fn plan_phase(progress: &ActivityProgress, p: PlanProgress) {
+    match p.phase {
+        PlanPhase::Reading { repo } => progress.phase(format!("reading '{repo}'"), 0, None),
+        PlanPhase::Pairing => progress.phase("pairing files", p.done, p.total),
+        PlanPhase::Grouping => progress.phase("grouping duplicates", p.done, p.total),
     }
 }
 

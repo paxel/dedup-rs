@@ -7,9 +7,18 @@ empty directories, reorganize files into a dated/templated tree, or drop stale i
 Every tool previews on the shared [review board](index.md#the-review-board) first — nothing
 touches disk until you RUN.
 
-## Command
+## Reading order
 
-Pick a grooming tool with the segmented selector (or the number keys `1`–`5`):
+The tab asks its questions top to bottom: **WHAT** (the tool), **WITH WHICH** (the
+repository, plus the dupe pool for DEDUPE), **HOW** (the filter or the rules) and only then
+**RUN**. Each section appears once the one above it has an answer — a fresh tab shows only
+the tool chips — and keeps its answer when an earlier one changes. Once REVIEW or RUN
+starts, the sections above fold into one summary line; **CHANGE** unfolds them, and the RUN
+section stays so a reviewed plan can be run.
+
+## What: the tool
+
+Pick a grooming tool with the chips (or the number keys `1`–`5`):
 
 - **DEDUPE** — find files in this repo whose content also exists **elsewhere** (in other
   repositories you pick as references) and delete the redundant local copies. Each row names
@@ -31,19 +40,33 @@ Pick a grooming tool with the segmented selector (or the number keys `1`–`5`):
 - **PRUNE** — drop index records for files that are no longer on disk (the **missing**
   entries). This is index hygiene only — it removes tracking records, never files.
 
-## Repo and filter
+## With which: the repository
 
-- **REPO** — the single repository to groom (DEDUPE also takes the reference repos it checks
-  against).
+- **REPO** — the single repository to groom. DEDUPE instead picks a **SOURCE** and the
+  **DUPEPOOL** repositories it checks against.
+
+## How: filter or rules
+
 - **FILTER** — the same condition builder the [Transfer tab](transfer.md#filter-builder) uses.
-  Required for PURGE; optional for the others, where it narrows which files a preview considers.
+  Required for PURGE; optional for DEDUPE, where it narrows which files a preview considers.
+- **RULES** — ORGANIZE's ordered list of filter + path template pairs (see the tool above).
+  EMPTY DIRS and PRUNE have nothing to set.
 
-## Review and run
+## Run
 
-- **REVIEW** builds the preview on the shared board without touching disk. PURGE, DEDUPE and
-  ORGANIZE rows show what would be deleted or moved (DEDUPE naming the surviving copy, ORGANIZE
-  the destination path); **HIDE** parks a row so RUN skips it. PURGE and PRUNE rows are
-  one-sided and carry no COMPARE (there is no counterpart to look at).
-- **RUN** applies the plan on a background thread behind a confirmation that states the exact
-  count. Live progress shows the current file and a running tally; **CANCEL** stops further
-  work without rolling back what already ran.
+**REVIEW** and **RUN** are the two run buttons; everything above them is a selection.
+
+- **REVIEW** plans in the [activity window](index.md#the-activity-window) — "reading
+  'repo'", "pairing files" for DEDUPE — which closes by itself once the board is ready, without
+  touching disk. PURGE, DEDUPE and ORGANIZE rows show what would be deleted or moved (DEDUPE
+  naming the surviving copy, ORGANIZE the destination path); **HIDE** parks a row so RUN skips
+  it. PURGE and PRUNE rows are one-sided and carry no COMPARE (there is no counterpart to look
+  at). A row's **APPLY** runs just that row as a quick action: a notification card names the
+  file once it is done, the event log keeps the line, and the board refreshes.
+- **RUN** plans first (so the confirmation can state the exact count), asks, then applies the
+  plan in the activity window: it names each file as it is deleted or moved, counts up to the
+  total, lists each problem, and offers **CANCEL** — which stops further work without rolling
+  back what already ran. When the run ends the same window shows the result report, and every
+  file it changed is in the event log (**LOG**, top right). EMPTY DIRS reports how many
+  directories it removed per repository. Only one operation runs at a time: a second REVIEW or
+  RUN while one is up is refused with a card naming what is still running.

@@ -22,10 +22,10 @@ use crate::thumbs::ThumbCache;
 use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::diff::{
-    CopyDest, DiffAction, DiffEvent, DiffItem, DiffPairing, DiffProgress, DiffRelation, DiffRun,
-    FolderMode, PlanPhase, PlanProgress, PlanReporter, RepoDiffRow, SyncDelete, copy_file_between,
-    delete_file, diff_copy, diff_print_reporting, diff_sync, export_to_folder, overwrite_file,
-    plan_folder_export_reporting, plan_repo_diff_reporting, plan_sync_reporting, rename_file,
+    CopyDest, DiffItem, DiffPairing, DiffRelation, DiffRun, FolderMode, PlanProgress, PlanReporter,
+    RepoDiffRow, SyncDelete, copy_file_between, delete_file, diff_copy, diff_print_reporting,
+    diff_sync, export_to_folder, overwrite_file, plan_folder_export_reporting,
+    plan_repo_diff_reporting, plan_sync_reporting, rename_file,
 };
 use dedup_core::store::{Store, SyncGroup, SyncMode};
 use dedup_core::sync_group::{delete_mode, guard_mirror_source};
@@ -1370,56 +1370,6 @@ struct DiffPreviewData {
     target_header: String,
 }
 
-/// [`DiffProgress`] adapter for a run behind the activity modal or a row
-/// action: each file becomes the modal's phase line and an event-log line,
-/// each failure a live problem and a failed log line. `repo` is where the
-/// change lands (the target, the sink, the main, or an export folder).
-struct RunProgress {
-    activity: crate::activity::ActivityProgress,
-    repo: String,
-}
-
-impl DiffProgress for RunProgress {
-    fn on(&self, event: DiffEvent) {
-        match event {
-            DiffEvent::Progress {
-                action,
-                done,
-                total,
-                rel_path,
-            } => {
-                let (doing, did) = match action {
-                    DiffAction::Copy => ("copying", "Copied"),
-                    DiffAction::Move => ("moving", "Moved"),
-                    DiffAction::Delete => ("deleting", "Deleted"),
-                };
-                self.activity
-                    .phase(format!("{doing} {rel_path}"), done, Some(total));
-                self.activity
-                    .record(&crate::activity::Notification::changed(
-                        did, &self.repo, &rel_path,
-                    ));
-            }
-            DiffEvent::Error { path, message } => {
-                log::warn!("transfer error: {path}: {message}");
-                self.activity.problem(format!("{path}: {message}"));
-                self.activity.record(&crate::activity::Notification::failed(
-                    "Transfer", &self.repo, &path, &message,
-                ));
-            }
-        }
-    }
-}
-
-/// Map a plan's phase onto the activity modal.
-fn plan_phase(progress: &crate::activity::ActivityProgress, p: PlanProgress) {
-    match p.phase {
-        PlanPhase::Reading { repo } => progress.phase(format!("reading '{repo}'"), 0, None),
-        PlanPhase::Pairing => progress.phase("pairing files", p.done, p.total),
-        PlanPhase::Grouping => progress.phase("grouping duplicates", p.done, p.total),
-    }
-}
-
 impl GroupSyncResult {
     fn report(&self) -> crate::run_result::RunReport {
         let mut report = crate::run_result::RunReport::new(format!("Sync group '{}'", self.main))
@@ -1819,6 +1769,9 @@ impl TransferView {
                 // answer, and after REVIEW or RUN they fold into one line.
                 if self.selection_collapsed {
                     self.selection_summary(ui);
+                    if self.ready() {
+                        self.action_bar(ui, &mut acts);
+                    }
                 } else {
                     self.command_bar(ui, &mut acts);
                     if self.command_chosen {
@@ -3989,7 +3942,7 @@ impl TransferView {
             format!("REVIEW group sync of '{}'", group.main),
             repos,
             move |progress, cancel| {
-                let report = |p: PlanProgress| plan_phase(progress, p);
+                let report = |p: PlanProgress| crate::activity::plan_phase(progress, p);
                 let result =
                     build_group_preview(&store, &group, filter.as_deref(), &report, cancel);
                 if cancel.is_cancelled() {
@@ -4022,7 +3975,7 @@ impl TransferView {
             format!("REVIEW pull of '{sink}' into '{}'", group.main),
             repos,
             move |progress, cancel| {
-                let report = |p: PlanProgress| plan_phase(progress, p);
+                let report = |p: PlanProgress| crate::activity::plan_phase(progress, p);
                 let result = build_group_back_preview(
                     &store,
                     &group,
@@ -4237,7 +4190,7 @@ impl TransferView {
             let keys: std::collections::HashSet<String> = match only {
                 Some(keys) => keys,
                 None => {
-                    let report = |p: PlanProgress| plan_phase(progress, p);
+                    let report = |p: PlanProgress| crate::activity::plan_phase(progress, p);
                     dedup_core::diff::plan_sync_back_reporting(
                         &store,
                         &sink,
@@ -4253,7 +4206,7 @@ impl TransferView {
                     .collect()
                 }
             };
-            let run_progress = RunProgress {
+            let run_progress = crate::activity::RunProgress {
                 activity: progress.clone(),
                 repo: main.clone(),
             };
@@ -4344,7 +4297,7 @@ impl TransferView {
                     skipped.push(sink.repo.clone());
                     continue;
                 }
-                let run_progress = RunProgress {
+                let run_progress = crate::activity::RunProgress {
                     activity: progress.clone(),
                     repo: sink.repo.clone(),
                 };
@@ -4403,7 +4356,7 @@ impl TransferView {
             format!("REVIEW {} from '{}'", config.command.label(), config.source),
             repos,
             move |progress, cancel| {
-                let report = |p: PlanProgress| plan_phase(progress, p);
+                let report = |p: PlanProgress| crate::activity::plan_phase(progress, p);
                 let result = build_review_preview(&store, &config, &report, cancel);
                 if cancel.is_cancelled() {
                     let _ = tx.send(Msg::PreviewCancelled);
@@ -4474,7 +4427,7 @@ impl TransferView {
             format!("DIFF '{source}' against '{target}'"),
             repos,
             move |progress, cancel| {
-                let report = |p: PlanProgress| plan_phase(progress, p);
+                let report = |p: PlanProgress| crate::activity::plan_phase(progress, p);
                 let result =
                     plan_repo_diff_reporting(&store, &source, &target, pairing, &report, cancel)
                         .map(|rows| DiffPreviewData {
@@ -4880,7 +4833,7 @@ impl TransferView {
         let work = move |progress: &crate::activity::ActivityProgress,
                          cancel: &CancellationToken|
               -> OpResult {
-            let run_progress = RunProgress {
+            let run_progress = crate::activity::RunProgress {
                 activity: progress.clone(),
                 repo: dest_name.clone(),
             };

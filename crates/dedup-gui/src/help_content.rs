@@ -110,8 +110,10 @@ result report. A row's COPY, DELETE, RENAME, OVERWRITE or APPLY answers with a n
 card, and every file changed is in the event log behind the LOG button.";
 
 const GROOMING: &str = "\
-Prune and reorganize a single repository. Pick a command from the bar at the top; each has \
-its own controls below it.
+Prune and reorganize a single repository. The tab asks its questions in order: WHAT (the \
+tool), WITH WHICH (the repository, plus the dupe pool for DEDUPE), HOW (the filter or the \
+rules), then RUN. Each section appears once the one above it is answered, and after REVIEW \
+or RUN they fold into one line — CHANGE unfolds them.
 
 DEDUPE deletes files in a source repo whose content also exists in any selected dupe-pool \
 repo. PURGE deletes everything matching a filter — it requires at least one filter \
@@ -142,8 +144,11 @@ never outside it.
 Save the current rule list as a preset with STORE PRESET, to reuse on any repo; right-click a \
 preset to rename it.
 
-Every destructive command runs behind a REVIEW and a confirmation dialog, on a background \
-thread with a CANCEL button.";
+Every destructive command runs behind a REVIEW and a confirmation dialog. REVIEW plans in \
+the activity window and fills the board; RUN performs the plan in the activity window — \
+each file as it goes, every problem, and CANCEL — and ends on the result report. A row's \
+APPLY answers with a notification card, and every file changed is in the event log behind \
+the LOG button.";
 
 const BROWSE: &str = "\
 Browse one repository folder by folder — subfolders on the left, files in the middle.

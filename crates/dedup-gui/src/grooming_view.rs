@@ -25,7 +25,7 @@ use crate::theme;
 use crate::thumbs::ThumbCache;
 use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
-use dedup_core::diff::{DiffAction, DiffEvent, DiffProgress, DiffRun, diff_delete};
+use dedup_core::diff::{DiffRun, PlanProgress, diff_delete, diff_print_reporting};
 use dedup_core::groom::{
     delete_by_filter, delete_empty_dirs, preview_by_filter, preview_prune, prune,
 };
@@ -33,12 +33,9 @@ use dedup_core::organize::{DEFAULT_TEMPLATE, OrganizeRule, organize_apply, plan_
 use dedup_core::store::Store;
 use dedup_core::update::CancellationToken;
 use egui::{Id, RichText};
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::board::PREVIEW_CAP;
-
-const RUN_LOG_LIMIT: usize = 10;
 
 /// File name of the persisted ORGANIZE presets inside the store's config dir.
 const ORGANIZE_PRESETS_FILE: &str = "organize_presets.json";
@@ -147,7 +144,112 @@ enum OpResult {
         compacted: bool,
         cancelled: bool,
     },
+    /// A single review row was applied: the card to show.
+    Applied {
+        note: crate::activity::Notification,
+    },
     Error(String),
+}
+
+impl OpResult {
+    /// The report the activity modal ends on for a batch run.
+    fn report(&self) -> crate::run_result::RunReport {
+        use crate::run_result::RunReport;
+        match self {
+            OpResult::Deleted { deleted, cancelled } => RunReport::new("Delete")
+                .count("deleted", *deleted)
+                .cancelled(*cancelled),
+            OpResult::EmptyDirs {
+                removed,
+                repos,
+                errors,
+            } => {
+                let mut report = RunReport::new("Remove empty dirs")
+                    .count("removed", *removed)
+                    .problems(errors.iter().cloned());
+                if *repos > 1 {
+                    report = report.count("repositories swept", *repos);
+                }
+                report
+            }
+            OpResult::Organized {
+                moved,
+                skipped,
+                errors,
+                cancelled,
+            } => {
+                let mut report = RunReport::new("Organize")
+                    .count("moved", *moved)
+                    .count("skipped", *skipped)
+                    .cancelled(*cancelled);
+                if *errors > 0 {
+                    report = report.count("errors", *errors);
+                }
+                report
+            }
+            OpResult::Pruned {
+                pruned,
+                compacted,
+                cancelled,
+            } => {
+                let mut report = RunReport::new("Prune")
+                    .count("records dropped", *pruned)
+                    .cancelled(*cancelled);
+                report = report.note(if *cancelled {
+                    "Cancelled: the index was not compacted."
+                } else if *compacted {
+                    "The index was compacted."
+                } else {
+                    "The index was already compact."
+                });
+                report
+            }
+            OpResult::Applied { note } => {
+                let mut report = RunReport::new(note.action.clone());
+                if let Err(e) = &note.outcome {
+                    report.problem(e.clone());
+                }
+                report
+            }
+            OpResult::Error(e) => {
+                let mut report = RunReport::new("Grooming");
+                report.problem(e.clone());
+                report
+            }
+        }
+    }
+}
+
+/// A finished preview, built off the UI thread.
+struct PreviewData {
+    metas: Vec<board::RowMeta>,
+    bodies: Vec<board::RowBody>,
+    total: usize,
+    totals: [usize; 4],
+    source_header: String,
+    target_header: Option<String>,
+    status: String,
+}
+
+/// What a preview needs, captured from the controls when it starts so the
+/// worker never reads live state.
+enum PreviewSpec {
+    Dedupe {
+        source: String,
+        pool: Vec<String>,
+        filter: Option<String>,
+    },
+    Purge {
+        repo: String,
+        filter: Option<String>,
+    },
+    Prune {
+        repo: String,
+    },
+    Organize {
+        repo: String,
+        rules: Vec<OrganizeRule>,
+    },
 }
 
 /// One ORGANIZE rule in the UI: a shared filter wizard plus a path template.
@@ -181,19 +283,15 @@ struct SavedRule {
 }
 
 enum Msg {
-    Progress(DiffEvent),
     Done(OpResult),
-}
-
-/// [`DiffProgress`] adapter forwarding diff events onto the view's channel.
-struct ChannelDiffProgress {
-    tx: Sender<Msg>,
-}
-
-impl DiffProgress for ChannelDiffProgress {
-    fn on(&self, event: DiffEvent) {
-        let _ = self.tx.send(Msg::Progress(event));
-    }
+    /// A finished preview; `confirm` raises the RUN confirmation once the
+    /// rows land with real counts (the deferred half of a RUN click).
+    Preview {
+        result: Result<PreviewData, String>,
+        confirm: bool,
+    },
+    /// A preview the user cancelled from the activity modal.
+    PreviewCancelled,
 }
 
 pub struct GroomingView {
@@ -244,18 +342,22 @@ pub struct GroomingView {
     error: Option<String>,
     confirm: Option<String>,
     running: bool,
+    /// Set while a preview is being planned behind the activity modal.
+    previewing: bool,
+    /// Whether the run in flight is a row action (a card when it lands)
+    /// rather than an operation on the activity modal.
+    row_action: bool,
     /// Set while a single-row APPLY runs: refresh the preview when it finishes.
     pending_refresh: bool,
-    cancel: CancellationToken,
-    run_log: VecDeque<String>,
-    /// Every per-file failure of the current run, capped — the live `run_log`
-    /// keeps only the last few, so this retains the full list for the report.
-    run_problems: Vec<String>,
-    /// The report of the last finished run.
-    result: crate::run_result::ResultModal,
-    run_done: u64,
-    run_total: u64,
-    run_current: String,
+    /// The app-wide activity owner: long work runs behind its modal, row
+    /// actions answer with its cards, and every file changed is in its log.
+    activity: crate::activity::Shared,
+    /// WHAT has been answered: a command was picked (or a number key
+    /// pressed), so the repository section may show.
+    command_chosen: bool,
+    /// After REVIEW or RUN the selection sections fold into one summary line
+    /// until CHANGE.
+    selection_collapsed: bool,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     verbosity: TooltipVerbosity,
@@ -289,7 +391,6 @@ enum Act {
     Ask,
     Confirm,
     CancelConfirm,
-    CancelRun,
     /// Apply a single review row immediately (its namespaced key).
     ApplyRow(String),
 }
@@ -323,14 +424,12 @@ impl GroomingView {
             error: None,
             confirm: None,
             running: false,
+            previewing: false,
+            row_action: false,
             pending_refresh: false,
-            cancel: CancellationToken::new(),
-            run_log: VecDeque::new(),
-            run_problems: Vec::new(),
-            result: crate::run_result::ResultModal::default(),
-            run_done: 0,
-            run_total: 0,
-            run_current: String::new(),
+            activity: crate::activity::scratch(),
+            command_chosen: false,
+            selection_collapsed: false,
             tx,
             rx,
             verbosity: TooltipVerbosity::default(),
@@ -342,9 +441,13 @@ impl GroomingView {
 
     /// Construct wired to the app's shared lock registry, so a repo unlocked
     /// here is unlocked on every tab (and vice versa).
-    pub fn new_with_locks(locks: crate::locks::RepoLocks) -> Self {
+    pub fn new_with_locks(
+        locks: crate::locks::RepoLocks,
+        activity: crate::activity::Shared,
+    ) -> Self {
         let mut me = Self::new();
         me.locks = locks;
+        me.activity = activity;
         me
     }
 
@@ -353,7 +456,7 @@ impl GroomingView {
         if self.thumbs.poll(ui.ctx()) {
             ui.ctx().request_repaint();
         }
-        self.drain();
+        self.drain(&ui.ctx().clone());
         // The shared comparison, when a DEDUPE row asked for it. Any pick just
         // closes it: Grooming's own APPLY / HIDE are how a row is acted on, so
         // the viewer is shared but the decisions stay this view's.
@@ -366,24 +469,18 @@ impl GroomingView {
         // reflects the applied action instead of dropping to the run log.
         if self.pending_refresh && !self.running {
             self.pending_refresh = false;
-            self.reset_run();
-            self.run_preview(store);
+            self.run_preview(store, &ui.ctx().clone(), false);
         }
         if !self.loaded {
             self.sync_repos(store);
         }
-        // The end-of-run report sits above everything and swallows shortcuts.
-        let result_open = self.result.show(ui);
 
         let mut acts: Vec<Act> = Vec::new();
 
-        // Keyboard shortcuts — skipped while a modal is up, a run is active, or
-        // a text field is focused.
-        if self.confirm.is_none()
-            && !result_open
-            && !self.running
-            && !ui.ctx().egui_wants_keyboard_input()
-        {
+        // Keyboard shortcuts — skipped while the confirmation or the activity
+        // modal is up, or a text field is focused.
+        let activity_busy = crate::activity::lock(&self.activity).is_running();
+        if self.confirm.is_none() && !activity_busy && !ui.ctx().egui_wants_keyboard_input() {
             ui.input(|i| {
                 for (key, cmd) in [
                     (egui::Key::Num1, Command::Dedupe),
@@ -426,26 +523,34 @@ impl GroomingView {
                     "1 dedupe · 2 purge · 3 empty-dirs · 4 organize · 5 prune · P review · R run",
                 );
 
-                self.command_bar(ui, &mut acts);
-                // Each command draws its own controls; DEDUPE/PURGE then get the
-                // shared single FILTER wizard, backed by the repo they act on.
-                // ORGANIZE draws its own per-rule wizards inside its layout.
-                match self.command {
-                    Command::Dedupe => {
-                        self.dedupe_layout(ui, &mut acts);
-                        let repo = self.source.clone();
-                        self.shared_filter(ui, store, repo.as_deref());
+                // Reading order is the workflow: WHAT (the tool), WITH WHICH
+                // (the repository, plus the dupe pool for DEDUPE), HOW (the
+                // filter or the rules), then RUN. Each section appears once the
+                // one before it has an answer; after REVIEW or RUN they fold
+                // into one line.
+                if self.selection_collapsed {
+                    self.selection_summary(ui);
+                    if self.ready() {
+                        self.action_bar(ui, &mut acts);
                     }
-                    Command::Purge => {
-                        self.purge_layout(ui, &mut acts);
-                        let repo = self.repo.clone();
-                        self.shared_filter(ui, store, repo.as_deref());
+                } else {
+                    self.command_bar(ui, &mut acts);
+                    if self.command_chosen {
+                        match self.command {
+                            Command::Dedupe => self.dedupe_layout(ui, &mut acts),
+                            Command::Purge => self.purge_layout(ui, &mut acts),
+                            Command::EmptyDirs => self.empty_dirs_layout(ui, &mut acts),
+                            Command::Organize => self.organize_layout(ui, &mut acts),
+                            Command::Prune => self.prune_layout(ui, &mut acts),
+                        }
                     }
-                    Command::EmptyDirs => self.empty_dirs_layout(ui, &mut acts),
-                    Command::Organize => self.organize_layout(ui, store, &mut acts),
-                    Command::Prune => self.prune_layout(ui, &mut acts),
+                    if self.command_chosen && self.repo_picked() {
+                        self.how_sections(ui, store, &mut acts);
+                    }
+                    if self.command_chosen && self.ready() {
+                        self.action_bar(ui, &mut acts);
+                    }
                 }
-                self.action_bar(ui, &mut acts);
 
                 if let Some(err) = &self.error {
                     ui.colored_label(theme::red(), err);
@@ -454,26 +559,23 @@ impl GroomingView {
                     ui.label(RichText::new(status).color(theme::tan()).size(13.0));
                 }
                 ui.separator();
-                if self.running || !self.run_log.is_empty() {
-                    self.run_panel(ui);
-                } else {
-                    self.preview_panel(ui, &mut acts);
-                }
+                self.preview_panel(ui, &mut acts);
             });
 
         if let Some(prompt) = self.confirm.clone() {
             self.confirm_modal(ui, &prompt, &mut acts);
         }
 
+        let ctx = ui.ctx().clone();
         for act in acts {
-            self.apply(store, act);
+            self.apply(store, &ctx, act);
         }
     }
 
     fn command_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         crate::lcars::section_lcars(
             ui,
-            "COMMAND — PICK A GROOMING TOOL",
+            "WHAT — DEDUPE, PURGE, EMPTY DIRS, ORGANIZE OR PRUNE",
             theme::orange(),
             |ui| {
                 ui.horizontal(|ui| {
@@ -484,14 +586,9 @@ impl GroomingView {
                         Command::Organize,
                         Command::Prune,
                     ] {
-                        let sel = self.command == cmd;
-                        let fill = if sel { theme::red() } else { theme::panel() };
-                        let col = if sel { theme::black() } else { theme::red() };
+                        let sel = self.command_chosen && self.command == cmd;
                         let (short, verbose) = cmd.tooltip();
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new(cmd.label()).color(col)).fill(fill),
-                            )
+                        if crate::lcars::toggle_button(ui, cmd.label(), sel, theme::red())
                             .explain(self.verbosity, short, verbose)
                             .clicked()
                         {
@@ -503,80 +600,158 @@ impl GroomingView {
         );
     }
 
+    /// Whether WITH WHICH has an answer: the repository the command acts on.
+    fn repo_picked(&self) -> bool {
+        match self.command {
+            Command::Dedupe => self.source.is_some(),
+            _ => self.repo.is_some(),
+        }
+    }
+
+    /// HOW: the filter (DEDUPE, PURGE) or the rules (ORGANIZE). EMPTY DIRS and
+    /// PRUNE have nothing to set.
+    fn how_sections(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, acts: &mut Vec<Act>) {
+        match self.command {
+            Command::Dedupe => {
+                let repo = self.source.clone();
+                self.shared_filter(ui, store, repo.as_deref());
+            }
+            Command::Purge => {
+                let repo = self.repo.clone();
+                self.shared_filter(ui, store, repo.as_deref());
+                if self.filter_string().is_none() {
+                    ui.label(
+                        RichText::new(
+                            "PURGE needs at least one filter condition — with no filter, \
+                             nothing matches and nothing can be deleted.",
+                        )
+                        .color(theme::tan())
+                        .size(12.0),
+                    );
+                }
+            }
+            Command::Organize => self.rules_section(ui, store, acts),
+            Command::EmptyDirs | Command::Prune => {}
+        }
+    }
+
+    /// The one line the selection folds into after REVIEW or RUN, with
+    /// CHANGE to unfold it.
+    fn selection_summary(&mut self, ui: &mut egui::Ui) {
+        let repo = match self.command {
+            Command::Dedupe => format!(
+                "from '{}' against {}",
+                self.source.clone().unwrap_or_default(),
+                self.pool.join(", ")
+            ),
+            _ => format!("in '{}'", self.repo.clone().unwrap_or_default()),
+        };
+        let how = match self.command {
+            Command::Dedupe | Command::Purge => self
+                .filter_string()
+                .map(|f| format!(" · filter: {f}"))
+                .unwrap_or_default(),
+            Command::Organize => format!(" · {} rule(s)", self.organize_rules().len()),
+            Command::EmptyDirs | Command::Prune => String::new(),
+        };
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("{} {repo}{how}", self.command.label()))
+                    .color(theme::tan())
+                    .size(12.5),
+            );
+            if crate::lcars::toggle_button(ui, "CHANGE", false, theme::lilac())
+                .explain(
+                    self.verbosity,
+                    "Change the tool or repository",
+                    "Unfold the tool, repository and option sections to set up another \
+                     grooming run. The board below stays until the next REVIEW.",
+                )
+                .clicked()
+            {
+                self.selection_collapsed = false;
+            }
+        });
+    }
+
     fn dedupe_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "REPOS — SOURCE & DUPE POOL", theme::lilac(), |ui| {
-            // SOURCE: the repo duplicates are deleted from, orange when picked.
-            let src = self.repos.clone();
-            let mains = self.mains.clone();
-            crate::repo_chip::chip_row(ui, "groom_source", "SOURCE", src.len(), |ui, i| {
-                let name = &src[i];
-                let sel = self.source.as_deref() == Some(name.as_str());
-                let chip = crate::repo_chip::repo_chip(
-                    ui,
-                    name,
-                    sel,
-                    theme::orange(),
-                    mains.contains(name),
-                    Some(self.locks.read_only(name)),
-                );
-                if chip
-                    .name
-                    .explain(
-                        self.verbosity,
-                        "Pick the repo to delete duplicates from",
-                        "Files in this repo whose content is also in any dupe-pool repo are \
+        crate::lcars::section_lcars(
+            ui,
+            "WITH WHICH — SOURCE & DUPE POOL",
+            theme::lilac(),
+            |ui| {
+                // SOURCE: the repo duplicates are deleted from, orange when picked.
+                let src = self.repos.clone();
+                let mains = self.mains.clone();
+                crate::repo_chip::chip_row(ui, "groom_source", "SOURCE", src.len(), |ui, i| {
+                    let name = &src[i];
+                    let sel = self.source.as_deref() == Some(name.as_str());
+                    let chip = crate::repo_chip::repo_chip(
+                        ui,
+                        name,
+                        sel,
+                        theme::orange(),
+                        mains.contains(name),
+                        Some(self.locks.read_only(name)),
+                    );
+                    if chip
+                        .name
+                        .explain(
+                            self.verbosity,
+                            "Pick the repo to delete duplicates from",
+                            "Files in this repo whose content is also in any dupe-pool repo are \
                          deleted from here.",
-                    )
-                    .clicked()
-                {
-                    acts.push(Act::PickSource(name.clone()));
-                }
-                self.locks.handle_badge(chip.lock, self.verbosity, name);
-                chip.outer
-            });
-            // DUPEPOOL: the repos to check the source against, lilac when on.
-            let pool: Vec<String> = self
-                .repos
-                .iter()
-                .filter(|n| self.source.as_deref() != Some(n.as_str()))
-                .cloned()
-                .collect();
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("DUPEPOOL").color(theme::text()).size(12.0));
-                if crate::repo_chip::small_button(ui, "ALL", theme::lilac())
-                    .explain(
-                        self.verbosity,
-                        "Add every eligible repo to the pool",
-                        "A source file is deleted when its content exists in any pool repo.",
-                    )
-                    .clicked()
-                {
-                    self.pool = pool.clone();
-                }
-                if crate::repo_chip::small_button(ui, "NONE", theme::lilac())
-                    .explain(
-                        self.verbosity,
-                        "Clear the dupe pool",
-                        "No pool repos selected.",
-                    )
-                    .clicked()
-                {
-                    self.pool.clear();
-                }
-            });
-            let mains = self.mains.clone();
-            crate::repo_chip::chip_row(ui, "groom_pool", "", pool.len(), |ui, i| {
-                let name = &pool[i];
-                let sel = self.pool.iter().any(|r| r == name);
-                let chip = crate::repo_chip::repo_chip(
-                    ui,
-                    name,
-                    sel,
-                    theme::lilac(),
-                    mains.contains(name),
-                    Some(self.locks.read_only(name)),
-                );
-                if chip
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::PickSource(name.clone()));
+                    }
+                    self.locks.handle_badge(chip.lock, self.verbosity, name);
+                    chip.outer
+                });
+                // DUPEPOOL: the repos to check the source against, lilac when on.
+                let pool: Vec<String> = self
+                    .repos
+                    .iter()
+                    .filter(|n| self.source.as_deref() != Some(n.as_str()))
+                    .cloned()
+                    .collect();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("DUPEPOOL").color(theme::text()).size(12.0));
+                    if crate::repo_chip::small_button(ui, "ALL", theme::lilac())
+                        .explain(
+                            self.verbosity,
+                            "Add every eligible repo to the pool",
+                            "A source file is deleted when its content exists in any pool repo.",
+                        )
+                        .clicked()
+                    {
+                        self.pool = pool.clone();
+                    }
+                    if crate::repo_chip::small_button(ui, "NONE", theme::lilac())
+                        .explain(
+                            self.verbosity,
+                            "Clear the dupe pool",
+                            "No pool repos selected.",
+                        )
+                        .clicked()
+                    {
+                        self.pool.clear();
+                    }
+                });
+                let mains = self.mains.clone();
+                crate::repo_chip::chip_row(ui, "groom_pool", "", pool.len(), |ui, i| {
+                    let name = &pool[i];
+                    let sel = self.pool.iter().any(|r| r == name);
+                    let chip = crate::repo_chip::repo_chip(
+                        ui,
+                        name,
+                        sel,
+                        theme::lilac(),
+                        mains.contains(name),
+                        Some(self.locks.read_only(name)),
+                    );
+                    if chip
                     .name
                     .explain(
                         self.verbosity,
@@ -588,24 +763,15 @@ impl GroomingView {
                 {
                     acts.push(Act::TogglePool(name.clone()));
                 }
-                self.locks.handle_badge(chip.lock, self.verbosity, name);
-                chip.outer
-            });
-        });
+                    self.locks.handle_badge(chip.lock, self.verbosity, name);
+                    chip.outer
+                });
+            },
+        );
     }
 
     fn purge_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         self.single_repo_bar(ui, acts, "Delete matching files from this repo.");
-        if self.filter_string().is_none() {
-            ui.label(
-                RichText::new(
-                    "PURGE needs at least one filter condition — with no filter, nothing \
-                     matches and nothing can be deleted.",
-                )
-                .color(theme::tan())
-                .size(12.0),
-            );
-        }
     }
 
     fn empty_dirs_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
@@ -643,13 +809,18 @@ impl GroomingView {
     /// ORGANIZE: a repo picker and one RULES section holding the add/preset row
     /// plus every rule as a nested, collapsible section (each rule = the shared
     /// FILTER wizard + a path template with token chips and an inline delete).
-    fn organize_layout(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, acts: &mut Vec<Act>) {
+    fn organize_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         self.single_repo_bar(ui, acts, "Reorganize the files in this repo in place.");
+    }
+
+    /// ORGANIZE's HOW: one RULES section holding the add/preset row plus every
+    /// rule as a nested, collapsible section.
+    fn rules_section(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, acts: &mut Vec<Act>) {
         let repo = self.repo.clone();
 
         crate::lcars::section_lcars(
             ui,
-            "RULES — MATCH FILES & BUILD THEIR NEW PATHS",
+            "HOW — RULES THAT MATCH FILES & BUILD THEIR NEW PATHS",
             theme::lilac(),
             |ui| {
                 ui.horizontal_wrapped(|ui| {
@@ -844,7 +1015,7 @@ impl GroomingView {
     fn single_repo_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>, hint: &str) {
         crate::lcars::section_lcars(
             ui,
-            "REPO — WHICH REPOSITORY TO GROOM",
+            "WITH WHICH — THE REPOSITORY TO GROOM",
             theme::lilac(),
             |ui| {
                 let repos = self.repos.clone();
@@ -877,70 +1048,56 @@ impl GroomingView {
 
     /// A single-line filter expression (mime / size / name with `*` wildcards).
     fn action_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "ACTION — REVIEW & RUN", theme::amber(), |ui| {
-            ui.horizontal(|ui| {
-                let ready = self.ready();
-                // EMPTY DIRS has no meaningful file preview (its count is only
-                // known after walking), so REVIEW is offered for the other two.
-                if self.command != Command::EmptyDirs
-                    && ui
-                        .add_enabled(
-                            ready,
-                            egui::Button::new(RichText::new("REVIEW").color(theme::black())),
-                        )
-                        .explain(
-                            self.verbosity,
-                            "Review what would be deleted",
-                            "List the first matching files (up to a limit) and a total count, \
-                             without changing anything on disk.",
-                        )
-                        .clicked()
-                {
-                    acts.push(Act::Preview);
-                }
-                let run =
-                    egui::Button::new(RichText::new("RUN").color(theme::ink_on(theme::red())))
-                        .fill(theme::red());
-                // The session lock bars a run that would change the groomed
-                // repo's existing files; the disabled button says which
-                // padlock to click.
-                let lock_block = self.lock_block();
-                let resp = ui.add_enabled(ready && lock_block.is_none(), run);
-                let resp = if let Some(why) = &lock_block {
-                    resp.on_disabled_hover_text(why.clone())
-                } else {
-                    resp.explain(
-                        self.verbosity,
-                        "Run the command",
-                        "Run the selected command on a background thread, after a \
-                         confirmation dialog.",
-                    )
-                };
-                if resp.clicked() {
-                    acts.push(Act::Ask);
-                }
-                if self.running {
-                    ui.add(egui::Spinner::new().color(theme::amber()));
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("CANCEL").color(theme::ink_on(theme::red())),
+        crate::lcars::section_lcars(
+            ui,
+            "RUN — REVIEW THE PLAN, THEN RUN IT",
+            theme::amber(),
+            |ui| {
+                ui.horizontal(|ui| {
+                    let ready = self.ready();
+                    // EMPTY DIRS has no meaningful file preview (its count is
+                    // only known after walking), so REVIEW is offered for the
+                    // other tools.
+                    if self.command != Command::EmptyDirs
+                        && crate::lcars::action_button(ui, "REVIEW", ready, theme::blue())
+                            .explain(
+                                self.verbosity,
+                                "Review what would change",
+                                "Plan the run in the activity window and list the matching \
+                                 files (up to a limit) and a total count on the board below, \
+                                 without changing anything on disk.",
                             )
-                            .fill(theme::red()),
-                        )
-                        .explain(
-                            self.verbosity,
-                            "Stop the running operation",
-                            "Cancel the in-progress operation. Files already deleted stay \
-                             deleted — this stops further work, it doesn't roll back.",
-                        )
-                        .clicked()
+                            .clicked()
                     {
-                        acts.push(Act::CancelRun);
+                        acts.push(Act::Preview);
                     }
-                }
-            });
-        });
+                    // The session lock bars a run that would change the
+                    // groomed repo's existing files; the blocked button says
+                    // which padlock to click.
+                    let lock_block = self.lock_block();
+                    let resp = crate::lcars::action_button(
+                        ui,
+                        "RUN",
+                        ready && lock_block.is_none(),
+                        theme::red(),
+                    );
+                    let resp = if let Some(why) = &lock_block {
+                        resp.on_hover_text(why.clone())
+                    } else {
+                        resp.explain(
+                            self.verbosity,
+                            "Run the command",
+                            "After a confirmation, run the command in the activity window: \
+                             it names each file as it goes, lists any problems, and ends \
+                             with the result. CANCEL stops further work.",
+                        )
+                    };
+                    if resp.clicked() {
+                        acts.push(Act::Ask);
+                    }
+                });
+            },
+        );
     }
 
     fn preview_panel(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
@@ -1030,39 +1187,6 @@ impl GroomingView {
             .unwrap_or_else(|_| name.to_string())
     }
 
-    fn run_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if self.running {
-                ui.add(egui::Spinner::new().color(theme::amber()));
-            }
-            let current = if self.run_current.is_empty() {
-                "preparing…".to_string()
-            } else {
-                self.run_current.clone()
-            };
-            ui.label(RichText::new(current).color(theme::amber()).strong());
-        });
-        let summary = if self.run_total > 0 {
-            format!("{} / {}", self.run_done, self.run_total)
-        } else {
-            self.run_done.to_string()
-        };
-        ui.label(
-            RichText::new(format!("Processed {summary}"))
-                .color(theme::tan())
-                .size(12.0),
-        );
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .max_height(180.0)
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                for line in &self.run_log {
-                    ui.label(RichText::new(line).color(theme::text()).size(12.0));
-                }
-            });
-    }
-
     fn confirm_modal(&mut self, ui: &mut egui::Ui, prompt: &str, acts: &mut Vec<Act>) {
         egui::Modal::new(Id::new("grooming-confirm")).show(&ui.ctx().clone(), |ui| {
             ui.set_width(380.0);
@@ -1101,9 +1225,6 @@ impl GroomingView {
 
     /// Whether the current command has everything it needs to preview/run.
     fn ready(&self) -> bool {
-        if self.running {
-            return false;
-        }
         match self.command {
             Command::Dedupe => self.source.is_some() && !self.pool.is_empty(),
             // PURGE without a filter would match every file; require one.
@@ -1193,7 +1314,7 @@ impl GroomingView {
         self.presets_loaded = true;
     }
 
-    fn apply(&mut self, store: &Arc<Store>, act: Act) {
+    fn apply(&mut self, store: &Arc<Store>, ctx: &egui::Context, act: Act) {
         match act {
             Act::Inspect(left_rel, right_rel) => {
                 // Left is the file the command acts on, in the repo the
@@ -1251,6 +1372,7 @@ impl GroomingView {
             }
             Act::SetCommand(cmd) => {
                 self.command = cmd;
+                self.command_chosen = true;
                 self.clear_preview();
             }
             Act::PickSource(name) => {
@@ -1317,29 +1439,31 @@ impl GroomingView {
                     self.save_presets(store);
                 }
             }
-            Act::Preview => self.run_preview(store),
+            Act::Preview => self.run_preview(store, ctx, false),
             Act::Ask => {
-                if let Some(mut prompt) = self.build_prompt(store) {
-                    let hidden = self.board_state.hidden.len();
-                    if hidden > 0 {
-                        prompt.push_str(&format!(" {hidden} hidden row(s) will be skipped."));
+                // EMPTY DIRS has no plan to count; every other tool plans
+                // behind the activity modal first, and the confirmation is
+                // raised once the plan lands with its real count.
+                if self.command == Command::EmptyDirs {
+                    if let Some(prompt) = self.build_prompt() {
+                        self.confirm = Some(prompt);
                     }
-                    self.confirm = Some(prompt);
+                } else {
+                    self.run_preview(store, ctx, true);
                 }
             }
             Act::CancelConfirm => self.confirm = None,
             Act::Confirm => {
                 self.confirm = None;
-                self.start(store, None);
+                self.start(store, ctx, None);
             }
             Act::ApplyRow(key) => {
                 // A preview built before the repo was re-locked could still
                 // carry APPLY buttons for a frame — never act past the lock.
                 if self.lock_block().is_none() {
-                    self.start(store, Some(key));
+                    self.start(store, ctx, Some(key));
                 }
             }
-            Act::CancelRun => self.cancel.cancel(),
         }
     }
 
@@ -1354,168 +1478,106 @@ impl GroomingView {
         self.board_state.hidden.clear();
     }
 
-    fn reset_run(&mut self) {
-        self.run_log.clear();
-        self.run_problems.clear();
-        self.result.close();
-        self.run_done = 0;
-        self.run_total = 0;
-        self.run_current.clear();
-    }
-
-    /// Rows with nothing on the other side: PURGE and PRUNE just remove files.
-    fn one_sided(paths: Vec<String>) -> Vec<(String, Option<String>)> {
-        paths.into_iter().map(|p| (p, None)).collect()
-    }
-
-    fn run_preview(&mut self, store: &Store) {
-        self.reset_run();
+    /// Plan the current command behind the activity modal. `confirm` raises
+    /// the RUN confirmation (with the real count) once the plan lands.
+    fn run_preview(&mut self, store: &Arc<Store>, ctx: &egui::Context, confirm: bool) {
         let filter = self.filter_string();
-        // The single repo these files live in, for their thumbnails + facts.
-        // Set by every command that reaches the row-building block below;
-        // ORGANIZE and EMPTY DIRS return earlier.
-        let facts_repo: String;
-        let result = match self.command {
+        let (spec, repos) = match self.command {
             Command::Dedupe => {
                 let Some(source) = self.source.clone() else {
                     return;
                 };
-                facts_repo = source.clone();
-                self.preview_source_header = Self::repo_header(store, &source);
-                let pool = self.pool.clone();
-                let ref_slice: Vec<&str> = pool.iter().map(String::as_str).collect();
-                // Contents accepted in the source are allowed to exist there:
-                // the run skips them, so the preview must not promise them.
-                let accepted = crate::util::or_log_default(
-                    store.accepted_paths(&source),
-                    "accepted contents of the source",
-                );
-                dedup_core::diff::diff_print(store, &source, &ref_slice, filter.as_deref())
-                    .map(|items| {
-                        // Keep the reference path alongside each doomed file: it
-                        // is *why* the file is redundant, and showing it is the
-                        // difference between "trust the plan" and seeing the copy
-                        // that will survive. `DeletedInReference` has no live
-                        // counterpart — the reference knows the content but no
-                        // longer holds it — so it stays one-sided.
-                        let matched: Vec<(String, Option<String>)> = items
-                            .into_iter()
-                            .filter(|item| match item {
-                                dedup_core::diff::DiffItem::Equal { rel_path, .. }
-                                | dedup_core::diff::DiffItem::DeletedInReference { rel_path } => {
-                                    !accepted.contains(rel_path)
-                                }
-                                dedup_core::diff::DiffItem::New { .. } => true,
-                            })
-                            .filter_map(|item| match item {
-                                dedup_core::diff::DiffItem::Equal {
-                                    rel_path,
-                                    reference_path,
-                                } => Some((
-                                    rel_path,
-                                    (!reference_path.is_empty()).then_some(reference_path),
-                                )),
-                                dedup_core::diff::DiffItem::DeletedInReference { rel_path } => {
-                                    Some((rel_path, None))
-                                }
-                                dedup_core::diff::DiffItem::New { .. } => None,
-                            })
-                            .collect();
-                        let total = matched.len();
-                        (matched.into_iter().take(PREVIEW_CAP).collect(), total)
-                    })
-                    .map_err(|e| e.to_string())
+                let mut repos = vec![source.clone()];
+                repos.extend(self.pool.iter().cloned());
+                (
+                    PreviewSpec::Dedupe {
+                        source,
+                        pool: self.pool.clone(),
+                        filter,
+                    },
+                    repos,
+                )
             }
             Command::Purge => {
                 let Some(repo) = self.repo.clone() else {
                     return;
                 };
-                facts_repo = repo.clone();
-                self.preview_source_header = Self::repo_header(store, &repo);
-                preview_by_filter(store, &repo, filter.as_deref(), PREVIEW_CAP)
-                    .map(|(paths, total)| (Self::one_sided(paths), total))
-                    .map_err(|e| e.to_string())
+                (
+                    PreviewSpec::Purge {
+                        repo: repo.clone(),
+                        filter,
+                    },
+                    vec![repo],
+                )
             }
             Command::Prune => {
                 let Some(repo) = self.repo.clone() else {
                     return;
                 };
-                facts_repo = repo.clone();
-                self.preview_source_header = Self::repo_header(store, &repo);
-                preview_prune(store, &repo, PREVIEW_CAP)
-                    .map(|(paths, total)| (Self::one_sided(paths), total))
-                    .map_err(|e| e.to_string())
+                (PreviewSpec::Prune { repo: repo.clone() }, vec![repo])
             }
             Command::Organize => {
-                self.run_preview_organize(store);
-                return;
+                let Some(repo) = self.repo.clone() else {
+                    return;
+                };
+                (
+                    PreviewSpec::Organize {
+                        repo: repo.clone(),
+                        rules: self.organize_rules(),
+                    },
+                    vec![repo],
+                )
             }
             // EMPTY DIRS has no file preview.
             Command::EmptyDirs => return,
         };
+        let title = format!("REVIEW {}", self.command.label());
+        let store = Arc::clone(store);
+        let tx = self.tx.clone();
+        let started = crate::activity::lock(&self.activity).start_quiet(
+            ctx,
+            crate::activity::Spec {
+                title: title.clone(),
+                repos,
+            },
+            move |progress, cancel| {
+                let result = build_preview(&store, spec, progress, cancel);
+                if cancel.is_cancelled() {
+                    let _ = tx.send(Msg::PreviewCancelled);
+                    return Ok(());
+                }
+                let outcome = result.as_ref().map(|_| ()).map_err(Clone::clone);
+                let _ = tx.send(Msg::Preview { result, confirm });
+                outcome
+            },
+        );
+        match started {
+            Ok(()) => {
+                self.previewing = true;
+                self.selection_collapsed = true;
+                self.status = Some(format!("{}…", title.to_lowercase()));
+            }
+            Err(busy) => crate::activity::lock(&self.activity)
+                .card(ctx, crate::activity::Notification::refused("REVIEW", &busy)),
+        }
+    }
+
+    /// Fold a finished preview into the board; with `confirm`, raise the RUN
+    /// confirmation now that the count is real.
+    fn apply_preview(&mut self, result: Result<PreviewData, String>, confirm: bool) {
         match result {
-            Ok((paths, total)) => {
-                // PURGE / PRUNE remove files from one repo, so the right side is
-                // absent. DEDUPE also removes from one repo, but it removes them
-                // *because* the pool already holds the content — so the pool is
-                // named on the right and each row shows the copy that survives.
-                self.preview_total = total;
-                self.preview_totals = [total, 0, 0, 0];
-                self.preview_target_header = match self.command {
-                    Command::Dedupe if !self.pool.is_empty() => Some(self.pool.join(", ")),
-                    _ => None,
-                };
-                let (db, base) = open_facts(store, &facts_repo);
-                let (metas, bodies) = paths
-                    .into_iter()
-                    .map(|(from, reference)| {
-                        let facts = facts_for(db.as_deref(), base.as_deref(), &from);
-                        // DEDUPE knows which copy makes this file redundant, so
-                        // that copy is shown on the right: the row reads "this
-                        // goes, because that stays" instead of a bare deletion.
-                        // PURGE and PRUNE have no counterpart and stay one-sided.
-                        let right_status = if reference.is_some() {
-                            board::Status::Same
-                        } else {
-                            board::Status::Absent
-                        };
-                        let meta = board::RowMeta {
-                            key: dedup_core::diff::source_key(&from),
-                            left_status: board::Status::WillDelete,
-                            right_status,
-                            left_size: facts.as_ref().map(|f| f.size).unwrap_or(0),
-                            left_modified: facts.as_ref().map(|f| f.modified_ms).unwrap_or(0),
-                            // The counterpart is the same content by definition,
-                            // so it carries the same size.
-                            right_size: reference
-                                .as_ref()
-                                .map(|_| facts.as_ref().map(|f| f.size).unwrap_or(0))
-                                .unwrap_or(0),
-                            right_modified: 0,
-                            left_paths: vec![from],
-                            right_paths: reference.iter().cloned().collect(),
-                            unchanged: false,
-                            // No COMPARE command: clicking the row opens the
-                            // shared viewer, so a row-level command would be a
-                            // second door to the same place.
-                            cmds: vec![board::Cmd::Apply, board::Cmd::Hide],
-                        };
-                        let body = board::RowBody {
-                            left: board::SideBody {
-                                facts,
-                                // Its own fate, painted on its own preview.
-                                overlay: Some(crate::media_cell::CellOverlay::WillDelete),
-                                ..Default::default()
-                            },
-                            right: board::SideBody::default(),
-                        };
-                        (meta, body)
-                    })
-                    .unzip();
-                self.preview = metas;
-                self.preview_bodies = bodies;
-                self.status = Some(format!("{total} file(s) match."));
+            Ok(data) => {
+                self.preview = data.metas;
+                self.preview_bodies = data.bodies;
+                self.preview_total = data.total;
+                self.preview_totals = data.totals;
+                self.preview_source_header = data.source_header;
+                self.preview_target_header = data.target_header;
+                self.status = Some(data.status);
                 self.error = None;
+                if confirm && let Some(prompt) = self.build_prompt() {
+                    self.confirm = Some(prompt);
+                }
             }
             Err(e) => self.error = Some(e),
         }
@@ -1534,116 +1596,58 @@ impl GroomingView {
             .collect()
     }
 
-    fn run_preview_organize(&mut self, store: &Store) {
-        let Some(repo) = self.repo.clone() else {
-            return;
-        };
-        match plan_organize(store, &repo, &self.organize_rules()) {
-            Ok(moves) => {
-                self.preview_total = moves.len();
-                // A relocation both removes the old path and adds the new one.
-                self.preview_totals = [moves.len(), moves.len(), 0, 0];
-                // ORGANIZE relocates within one repo: the old path is removed and
-                // the new path added — same repo on both sides.
-                let header = Self::repo_header(store, &repo);
-                self.preview_source_header = header.clone();
-                self.preview_target_header = Some(header);
-                // The file is still at its old path until the move runs, so its
-                // facts come from the removed (source) side.
-                let (db, base) = open_facts(store, &repo);
-                let (metas, bodies) = moves
-                    .into_iter()
-                    .take(PREVIEW_CAP)
-                    .map(|(from, to)| {
-                        let facts = facts_for(db.as_deref(), base.as_deref(), &from);
-                        let meta = board::RowMeta {
-                            key: dedup_core::diff::source_key(&from),
-                            left_status: board::Status::WillDelete,
-                            right_status: board::Status::OnlyHere,
-                            left_size: facts.as_ref().map(|f| f.size).unwrap_or(0),
-                            left_modified: facts.as_ref().map(|f| f.modified_ms).unwrap_or(0),
-                            right_size: 0,
-                            right_modified: 0,
-                            left_paths: vec![from],
-                            right_paths: vec![to],
-                            unchanged: false,
-                            cmds: vec![board::Cmd::Apply, board::Cmd::Hide],
-                        };
-                        let body = board::RowBody {
-                            left: board::SideBody {
-                                facts: facts.clone(),
-                                overlay: Some(crate::media_cell::CellOverlay::WillDelete),
-                                ..Default::default()
-                            },
-                            // Golden rule: the arriving side shows the file
-                            // that will be there — the same file, new path.
-                            right: board::SideBody {
-                                facts,
-                                overlay: Some(crate::media_cell::CellOverlay::New),
-                                ..Default::default()
-                            },
-                        };
-                        (meta, body)
-                    })
-                    .unzip();
-                self.preview = metas;
-                self.preview_bodies = bodies;
-                self.status = Some(format!("{} file(s) would move.", self.preview_total));
-                self.error = None;
-            }
-            Err(e) => self.error = Some(e.to_string()),
-        }
-    }
-
-    fn build_prompt(&mut self, store: &Store) -> Option<String> {
-        match self.command {
+    /// The RUN confirmation for the current command, from the preview's
+    /// count (EMPTY DIRS has none). Hidden rows are named as skipped.
+    fn build_prompt(&self) -> Option<String> {
+        let mut prompt = match self.command {
             Command::Dedupe => {
-                self.run_preview(store);
                 let source = self.source.as_ref()?;
-                Some(format!(
+                format!(
                     "Delete {} file(s) from '{source}' whose content is in the dupe pool? \
                      This cannot be undone.",
                     self.preview_total
-                ))
+                )
             }
             Command::Purge => {
-                self.run_preview(store);
                 let repo = self.repo.as_ref()?;
-                Some(format!(
+                format!(
                     "Delete all {} file(s) matching the filter from '{repo}'? \
                      This cannot be undone.",
                     self.preview_total
-                ))
+                )
             }
             Command::EmptyDirs => {
                 let repo = self.repo.as_ref()?;
-                Some(format!("Remove all empty directories under '{repo}'?"))
+                format!("Remove all empty directories under '{repo}'?")
             }
             Command::Prune => {
-                self.run_preview(store);
                 let repo = self.repo.as_ref()?;
-                Some(format!(
+                format!(
                     "Permanently drop {} record(s) of deleted files from '{repo}' and \
                      compact its index? This cannot be undone.",
                     self.preview_total
-                ))
+                )
             }
             Command::Organize => {
-                self.run_preview(store);
                 let repo = self.repo.as_ref()?;
-                Some(format!(
+                format!(
                     "Move {} file(s) into their new layout in '{repo}'? Files move within \
                      the repo; nothing is overwritten (collisions are renamed).",
                     self.preview_total
-                ))
+                )
             }
+        };
+        let hidden = self.board_state.hidden.len();
+        if hidden > 0 {
+            prompt.push_str(&format!(" {hidden} hidden row(s) will be skipped."));
         }
+        Some(prompt)
     }
 
     /// Start the selected command on a worker thread. `only` restricts the run
     /// to a single review row (the APPLY button); `None` runs the whole batch
     /// minus any rejected rows.
-    fn start(&mut self, store: &Arc<Store>, only: Option<String>) {
+    fn start(&mut self, store: &Arc<Store>, ctx: &egui::Context, only: Option<String>) {
         let command = self.command;
         let filter = self.filter_string();
         let source = self.source.clone();
@@ -1652,30 +1656,36 @@ impl GroomingView {
         let rules = self.organize_rules();
         let hidden: std::collections::HashSet<String> = self.board_state.hidden.clone();
         let store = Arc::clone(store);
-        let tx = self.tx.clone();
-        self.cancel = CancellationToken::new();
-        let cancel = self.cancel.clone();
-        self.running = true;
-        self.status = Some(format!("{}…", command.label().to_lowercase()));
-        if only.is_some() {
-            // A single-row APPLY keeps the preview on screen (it refreshes
-            // when the run finishes) instead of dropping to the run log.
-            self.pending_refresh = true;
-            self.reset_run();
-        } else {
-            self.clear_preview();
-            self.reset_run();
+        // The repository the run changes: what the log lines name.
+        let Some(acted_on) = (match command {
+            Command::Dedupe => source.clone(),
+            _ => repo.clone(),
+        }) else {
+            return;
+        };
+        let title = format!("{} '{acted_on}'", command.label());
+        let mut repos = vec![acted_on.clone()];
+        if command == Command::Dedupe {
+            repos.extend(pool.iter().cloned());
         }
+        let only_set: Option<std::collections::HashSet<String>> =
+            only.clone().map(|k| std::collections::HashSet::from([k]));
+        let card_repo = acted_on.clone();
 
-        std::thread::spawn(move || {
-            let progress = ChannelDiffProgress { tx: tx.clone() };
-            let only_set: Option<std::collections::HashSet<String>> =
-                only.map(|k| std::collections::HashSet::from([k]));
-            let run = DiffRun::new(&progress, &cancel)
+        let work = move |progress: &crate::activity::ActivityProgress,
+                         cancel: &CancellationToken|
+              -> OpResult {
+            let run_progress = crate::activity::RunProgress {
+                activity: progress.clone(),
+                repo: acted_on.clone(),
+            };
+            let run = DiffRun::new(&run_progress, cancel)
                 .with_selection((!hidden.is_empty()).then_some(&hidden), only_set.as_ref());
-            let result = match command {
+            match command {
                 Command::Dedupe => {
-                    let Some(source) = source else { return };
+                    let Some(source) = source else {
+                        return OpResult::Error("no source repository".into());
+                    };
                     let ref_slice: Vec<&str> = pool.iter().map(String::as_str).collect();
                     match diff_delete(&store, &source, &ref_slice, filter.as_deref(), &run) {
                         Ok(s) => OpResult::Deleted {
@@ -1686,7 +1696,9 @@ impl GroomingView {
                     }
                 }
                 Command::Purge => {
-                    let Some(repo) = repo else { return };
+                    let Some(repo) = repo else {
+                        return OpResult::Error("no repository".into());
+                    };
                     match delete_by_filter(&store, &repo, filter.as_deref(), &run) {
                         Ok(s) => OpResult::Deleted {
                             deleted: s.deleted,
@@ -1696,7 +1708,9 @@ impl GroomingView {
                     }
                 }
                 Command::EmptyDirs => {
-                    let Some(repo) = repo else { return };
+                    let Some(repo) = repo else {
+                        return OpResult::Error("no repository".into());
+                    };
                     // A group main's sinks mirror its tree, so the same stale
                     // directory skeletons accumulate there — sweep them in the
                     // same run. Empty directories hold no data, so sink locks
@@ -1710,10 +1724,31 @@ impl GroomingView {
                     }
                     let mut removed = 0u64;
                     let mut errors: Vec<String> = Vec::new();
-                    for r in &repos {
+                    for (i, r) in repos.iter().enumerate() {
+                        progress.phase(
+                            format!("sweeping '{r}'"),
+                            i as u64,
+                            Some(repos.len() as u64),
+                        );
                         match delete_empty_dirs(&store, r) {
-                            Ok(n) => removed += n,
-                            Err(e) => errors.push(format!("{r}: {e}")),
+                            Ok(n) => {
+                                removed += n;
+                                if n > 0 {
+                                    progress.record(&crate::activity::Notification::changed(
+                                        "Removed empty directories",
+                                        r,
+                                        &format!(
+                                            "{n} director{}",
+                                            if n == 1 { "y" } else { "ies" }
+                                        ),
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                let e = e.to_string();
+                                progress.problem(format!("{r}: {e}"));
+                                errors.push(format!("{r}: {e}"));
+                            }
                         }
                     }
                     OpResult::EmptyDirs {
@@ -1723,7 +1758,9 @@ impl GroomingView {
                     }
                 }
                 Command::Organize => {
-                    let Some(repo) = repo else { return };
+                    let Some(repo) = repo else {
+                        return OpResult::Error("no repository".into());
+                    };
                     match organize_apply(&store, &repo, &rules, &run) {
                         Ok(s) => OpResult::Organized {
                             moved: s.moved,
@@ -1735,7 +1772,10 @@ impl GroomingView {
                     }
                 }
                 Command::Prune => {
-                    let Some(repo) = repo else { return };
+                    let Some(repo) = repo else {
+                        return OpResult::Error("no repository".into());
+                    };
+                    progress.phase("dropping records of deleted files", 0, None);
                     match prune(&store, &repo, &run) {
                         Ok(s) => OpResult::Pruned {
                             pruned: s.pruned,
@@ -1745,129 +1785,126 @@ impl GroomingView {
                         Err(e) => OpResult::Error(e.to_string()),
                     }
                 }
-            };
-            let _ = tx.send(Msg::Done(result));
-        });
-    }
-
-    fn apply_progress(&mut self, event: DiffEvent) {
-        match event {
-            DiffEvent::Progress {
-                action,
-                done,
-                total,
-                rel_path,
-            } => {
-                let verb = match action {
-                    DiffAction::Copy => "Copied",
-                    DiffAction::Move => "Moved",
-                    DiffAction::Delete => "Deleted",
-                };
-                self.run_done = done;
-                self.run_total = total;
-                self.run_current = rel_path.clone();
-                self.run_log.push_back(format!("{verb} {rel_path}"));
-                while self.run_log.len() > RUN_LOG_LIMIT {
-                    self.run_log.pop_front();
-                }
             }
-            DiffEvent::Error { path, message } => {
-                // Every failure to the session log, so a large run's error list
-                // outlives the rolling live log; a capped copy for the report.
-                log::warn!("grooming error: {path}: {message}");
-                if self.run_problems.len() < crate::run_result::MAX_PROBLEMS {
-                    self.run_problems.push(format!("{path}: {message}"));
+        };
+
+        match only {
+            // One review row: a row action with a card, and the board
+            // refreshes when it lands.
+            Some(key) => {
+                let what = key
+                    .split_once(':')
+                    .map(|(_, rel)| rel.to_string())
+                    .unwrap_or(key);
+                let repo_name = card_repo;
+                let mut activity = crate::activity::lock(&self.activity);
+                if let Err(busy) = activity.begin_row_action() {
+                    activity.card(ctx, crate::activity::Notification::refused("APPLY", &busy));
+                    return;
                 }
-                self.run_log.push_back(format!("✗ {path}: {message}"));
-                while self.run_log.len() > RUN_LOG_LIMIT {
-                    self.run_log.pop_front();
+                let progress = activity.progress_handle(ctx);
+                drop(activity);
+                self.running = true;
+                self.row_action = true;
+                self.pending_refresh = true;
+                self.status = Some("applying…".to_string());
+                let tx = self.tx.clone();
+                std::thread::spawn(move || {
+                    let result = work(&progress, &CancellationToken::new());
+                    let did = match command {
+                        Command::Organize => "Moved",
+                        Command::Prune => "Pruned",
+                        _ => "Deleted",
+                    };
+                    let note = match &result {
+                        OpResult::Deleted { deleted: n, .. } if *n > 0 => {
+                            crate::activity::Notification::changed(did, &repo_name, &what)
+                        }
+                        OpResult::Organized { moved: n, .. } if *n > 0 => {
+                            crate::activity::Notification::changed(did, &repo_name, &what)
+                        }
+                        OpResult::Pruned { .. } => {
+                            crate::activity::Notification::noted(did, &repo_name, &what)
+                        }
+                        OpResult::Error(e) => {
+                            crate::activity::Notification::failed(did, &repo_name, &what, e)
+                        }
+                        _ => crate::activity::Notification::failed(
+                            did,
+                            &repo_name,
+                            &what,
+                            "nothing was changed",
+                        ),
+                    };
+                    let _ = tx.send(Msg::Done(OpResult::Applied { note }));
+                    progress.repaint();
+                });
+            }
+            None => {
+                let tx = self.tx.clone();
+                let started = crate::activity::lock(&self.activity).start(
+                    ctx,
+                    crate::activity::Spec {
+                        title: title.clone(),
+                        repos,
+                    },
+                    move |progress, cancel| {
+                        let result = work(progress, cancel);
+                        let report = result.report();
+                        let _ = tx.send(Msg::Done(result));
+                        report
+                    },
+                );
+                match started {
+                    Ok(()) => {
+                        self.running = true;
+                        self.row_action = false;
+                        self.selection_collapsed = true;
+                        self.clear_preview();
+                        self.status = Some(format!("{}…", title.to_lowercase()));
+                    }
+                    Err(busy) => crate::activity::lock(&self.activity)
+                        .card(ctx, crate::activity::Notification::refused("RUN", &busy)),
                 }
             }
         }
     }
 
-    fn drain(&mut self) {
+    fn drain(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                Msg::Progress(event) => self.apply_progress(event),
+                Msg::PreviewCancelled => {
+                    self.previewing = false;
+                    self.status = Some("review cancelled".to_string());
+                }
+                Msg::Preview { result, confirm } => {
+                    self.previewing = false;
+                    self.apply_preview(result, confirm);
+                }
                 Msg::Done(result) => {
                     self.running = false;
                     log::info!("grooming finished: {result:?}");
-                    let problems = std::mem::take(&mut self.run_problems);
+                    if self.row_action {
+                        self.row_action = false;
+                        crate::activity::lock(&self.activity).end_row_action();
+                    }
                     match result {
-                        OpResult::Deleted { deleted, cancelled } => {
-                            let report = crate::run_result::RunReport::new("Delete")
-                                .count("deleted", deleted)
-                                .cancelled(cancelled)
-                                .problems(problems);
-                            self.status = Some(report.headline());
+                        OpResult::Applied { note } => {
+                            self.status = Some(note.headline());
                             self.error = None;
-                            self.result.open(report);
-                        }
-                        OpResult::EmptyDirs {
-                            removed,
-                            repos,
-                            errors,
-                        } => {
-                            let mut report = crate::run_result::RunReport::new("Remove empty dirs")
-                                .count("removed", removed)
-                                .problems(problems.into_iter().chain(errors));
-                            // Only a group sweep names its breadth — a plain
-                            // single-repo run needs no "1 repository" noise.
-                            if repos > 1 {
-                                report = report.count("repositories swept", repos);
-                            }
-                            self.status = Some(report.headline());
-                            self.error = None;
-                            self.result.open(report);
-                        }
-                        OpResult::Organized {
-                            moved,
-                            skipped,
-                            errors,
-                            cancelled,
-                        } => {
-                            let mut report = crate::run_result::RunReport::new("Organize")
-                                .count("moved", moved)
-                                .count("skipped", skipped)
-                                .cancelled(cancelled)
-                                .problems(problems);
-                            if errors > report.problem_count() {
-                                report = report.count("errors", errors);
-                            }
-                            self.status = Some(report.headline());
-                            self.error = None;
-                            self.result.open(report);
-                        }
-                        OpResult::Pruned {
-                            pruned,
-                            compacted,
-                            cancelled,
-                        } => {
-                            // An index maintenance run, not a per-file one: keep
-                            // its own status line rather than the shared report.
-                            self.status = Some(format!(
-                                "Pruned {pruned} record(s){}.",
-                                if cancelled {
-                                    " (cancelled, index not compacted)"
-                                } else if compacted {
-                                    "; index compacted"
-                                } else {
-                                    "; index already compact"
-                                }
-                            ));
-                            self.error = None;
+                            crate::activity::lock(&self.activity).card(ctx, note);
                         }
                         OpResult::Error(e) => self.error = Some(e),
+                        other => {
+                            self.status = Some(other.report().headline());
+                            self.error = None;
+                        }
                     }
                 }
             }
         }
     }
 
-    /// Sync the repo list with the store, keeping the current source/repo/pool
-    /// picks and dropping any that no longer exist. Called on first show and
-    /// whenever the tab is re-shown, so no manual reload button is needed.
     pub fn sync_repos(&mut self, store: &Store) {
         if !self.presets_loaded {
             self.load_presets(store);
@@ -1906,6 +1943,252 @@ impl GroomingView {
 /// `id`, leaving the caret just after the insertion so consecutive chip clicks
 /// build the template left to right. Appends when the field has no cursor
 /// state yet (never focused).
+/// The planned rows before their board bodies are built: each file with
+/// its counterpart (the surviving copy, or the new path), the true total
+/// past the preview cap, and the header of the right side.
+struct Planned {
+    /// The single repo these files live in, for their thumbnails + facts.
+    facts_repo: String,
+    paths: Vec<(String, Option<String>)>,
+    total: usize,
+    target_header: Option<String>,
+    /// An ORGANIZE relocation: the counterpart is the same file's new path.
+    organize: bool,
+}
+
+/// Plan a preview off the UI thread: the rows, their bodies and the counts.
+fn build_preview(
+    store: &Store,
+    spec: PreviewSpec,
+    progress: &crate::activity::ActivityProgress,
+    cancel: &CancellationToken,
+) -> Result<PreviewData, String> {
+    let report = |p: PlanProgress| crate::activity::plan_phase(progress, p);
+    let Planned {
+        facts_repo,
+        paths,
+        total,
+        target_header,
+        organize,
+    } = match spec {
+        PreviewSpec::Dedupe {
+            source,
+            pool,
+            filter,
+        } => {
+            let ref_slice: Vec<&str> = pool.iter().map(String::as_str).collect();
+            // Contents accepted in the source are allowed to exist there:
+            // the run skips them, so the preview must not promise them.
+            let accepted = crate::util::or_log_default(
+                store.accepted_paths(&source),
+                "accepted contents of the source",
+            );
+            let items = diff_print_reporting(
+                store,
+                &source,
+                &ref_slice,
+                filter.as_deref(),
+                &report,
+                cancel,
+            )
+            .map_err(|e| e.to_string())?;
+            // Keep the reference path alongside each doomed file: it is *why*
+            // the file is redundant, and showing it is the difference between
+            // "trust the plan" and seeing the copy that will survive.
+            // `DeletedInReference` has no live counterpart — the reference
+            // knows the content but no longer holds it — so it stays one-sided.
+            let matched: Vec<(String, Option<String>)> = items
+                .into_iter()
+                .filter(|item| match item {
+                    dedup_core::diff::DiffItem::Equal { rel_path, .. }
+                    | dedup_core::diff::DiffItem::DeletedInReference { rel_path } => {
+                        !accepted.contains(rel_path)
+                    }
+                    dedup_core::diff::DiffItem::New { .. } => true,
+                })
+                .filter_map(|item| match item {
+                    dedup_core::diff::DiffItem::Equal {
+                        rel_path,
+                        reference_path,
+                    } => Some((
+                        rel_path,
+                        (!reference_path.is_empty()).then_some(reference_path),
+                    )),
+                    dedup_core::diff::DiffItem::DeletedInReference { rel_path } => {
+                        Some((rel_path, None))
+                    }
+                    dedup_core::diff::DiffItem::New { .. } => None,
+                })
+                .collect();
+            let total = matched.len();
+            let target = (!pool.is_empty()).then(|| pool.join(", "));
+            Planned {
+                facts_repo: source,
+                paths: matched.into_iter().take(PREVIEW_CAP).collect(),
+                total,
+                target_header: target,
+                organize: false,
+            }
+        }
+        PreviewSpec::Purge { repo, filter } => {
+            progress.phase(format!("reading '{repo}'"), 0, None);
+            let (paths, total) = preview_by_filter(store, &repo, filter.as_deref(), PREVIEW_CAP)
+                .map_err(|e| e.to_string())?;
+            Planned {
+                facts_repo: repo,
+                paths: one_sided(paths),
+                total,
+                target_header: None,
+                organize: false,
+            }
+        }
+        PreviewSpec::Prune { repo } => {
+            progress.phase(format!("reading '{repo}'"), 0, None);
+            let (paths, total) =
+                preview_prune(store, &repo, PREVIEW_CAP).map_err(|e| e.to_string())?;
+            Planned {
+                facts_repo: repo,
+                paths: one_sided(paths),
+                total,
+                target_header: None,
+                organize: false,
+            }
+        }
+        PreviewSpec::Organize { repo, rules } => {
+            progress.phase(format!("reading '{repo}'"), 0, None);
+            let moves = plan_organize(store, &repo, &rules).map_err(|e| e.to_string())?;
+            let total = moves.len();
+            let paths = moves
+                .into_iter()
+                .take(PREVIEW_CAP)
+                .map(|(from, to)| (from, Some(to)))
+                .collect();
+            Planned {
+                facts_repo: repo,
+                paths,
+                total,
+                target_header: None,
+                organize: true,
+            }
+        }
+    };
+    if cancel.is_cancelled() {
+        return Err("cancelled".to_string());
+    }
+    progress.phase("building the board", 0, None);
+    let source_header = GroomingView::repo_header(store, &facts_repo);
+    let (db, base) = open_facts(store, &facts_repo);
+    if organize {
+        // ORGANIZE relocates within one repo: the old path is removed and the
+        // new path added — same repo on both sides. The file is still at its
+        // old path until the move runs, so its facts come from the removed
+        // (source) side.
+        let (metas, bodies) = paths
+            .into_iter()
+            .map(|(from, to)| {
+                let facts = facts_for(db.as_deref(), base.as_deref(), &from);
+                let meta = board::RowMeta {
+                    key: dedup_core::diff::source_key(&from),
+                    left_status: board::Status::WillDelete,
+                    right_status: board::Status::OnlyHere,
+                    left_size: facts.as_ref().map(|f| f.size).unwrap_or(0),
+                    left_modified: facts.as_ref().map(|f| f.modified_ms).unwrap_or(0),
+                    right_size: 0,
+                    right_modified: 0,
+                    left_paths: vec![from],
+                    right_paths: to.into_iter().collect(),
+                    unchanged: false,
+                    cmds: vec![board::Cmd::Apply, board::Cmd::Hide],
+                };
+                let body = board::RowBody {
+                    left: board::SideBody {
+                        facts: facts.clone(),
+                        overlay: Some(crate::media_cell::CellOverlay::WillDelete),
+                        ..Default::default()
+                    },
+                    // Golden rule: the arriving side shows the file that will
+                    // be there — the same file, new path.
+                    right: board::SideBody {
+                        facts,
+                        overlay: Some(crate::media_cell::CellOverlay::New),
+                        ..Default::default()
+                    },
+                };
+                (meta, body)
+            })
+            .unzip();
+        return Ok(PreviewData {
+            metas,
+            bodies,
+            total,
+            // A relocation both removes the old path and adds the new one.
+            totals: [total, total, 0, 0],
+            source_header: source_header.clone(),
+            target_header: Some(source_header),
+            status: format!("{total} file(s) would move."),
+        });
+    }
+    // PURGE / PRUNE remove files from one repo, so the right side is absent.
+    // DEDUPE also removes from one repo, but it removes them *because* the
+    // pool already holds the content — so the pool is named on the right and
+    // each row shows the copy that survives.
+    let (metas, bodies) = paths
+        .into_iter()
+        .map(|(from, reference)| {
+            let facts = facts_for(db.as_deref(), base.as_deref(), &from);
+            let right_status = if reference.is_some() {
+                board::Status::Same
+            } else {
+                board::Status::Absent
+            };
+            let meta = board::RowMeta {
+                key: dedup_core::diff::source_key(&from),
+                left_status: board::Status::WillDelete,
+                right_status,
+                left_size: facts.as_ref().map(|f| f.size).unwrap_or(0),
+                left_modified: facts.as_ref().map(|f| f.modified_ms).unwrap_or(0),
+                // The counterpart is the same content by definition, so it
+                // carries the same size.
+                right_size: reference
+                    .as_ref()
+                    .map(|_| facts.as_ref().map(|f| f.size).unwrap_or(0))
+                    .unwrap_or(0),
+                right_modified: 0,
+                left_paths: vec![from],
+                right_paths: reference.iter().cloned().collect(),
+                unchanged: false,
+                // No COMPARE command: clicking the row opens the shared
+                // viewer, so a row-level command would be a second door to the
+                // same place.
+                cmds: vec![board::Cmd::Apply, board::Cmd::Hide],
+            };
+            let body = board::RowBody {
+                left: board::SideBody {
+                    facts,
+                    // Its own fate, painted on its own preview.
+                    overlay: Some(crate::media_cell::CellOverlay::WillDelete),
+                    ..Default::default()
+                },
+                right: board::SideBody::default(),
+            };
+            (meta, body)
+        })
+        .unzip();
+    Ok(PreviewData {
+        metas,
+        bodies,
+        total,
+        totals: [total, 0, 0, 0],
+        source_header,
+        target_header,
+        status: format!("{total} file(s) match."),
+    })
+}
+
+fn one_sided(paths: Vec<String>) -> Vec<(String, Option<String>)> {
+    paths.into_iter().map(|p| (p, None)).collect()
+}
+
 fn insert_at_cursor(ctx: &egui::Context, id: egui::Id, template: &mut String, text: &str) {
     let Some(mut state) = egui::TextEdit::load_state(ctx, id) else {
         template.push_str(text);
@@ -1949,9 +2232,13 @@ mod ui_tests {
 
     fn grooming_harness(store: Arc<Store>, command: Command) -> Harness<'static, GroomingView> {
         let mut view = GroomingView::new();
+        view.command_chosen = true;
         view.loaded = true;
         view.repos = vec!["a".to_string(), "b".to_string()];
         view.command = command;
+        // WITH WHICH answered, so the command's HOW section is on screen.
+        view.source = Some("a".to_string());
+        view.repo = Some("a".to_string());
 
         let store_ui = Arc::clone(&store);
         let mut init = false;
@@ -1992,8 +2279,11 @@ mod ui_tests {
         .unwrap();
         let mut h = grooming_harness(Arc::clone(&store), Command::Purge);
         h.state_mut().repo = Some("a".to_string());
-        h.state_mut()
-            .apply(&store, Act::Inspect("junk.txt".to_string(), None));
+        h.state_mut().apply(
+            &store,
+            &egui::Context::default(),
+            Act::Inspect("junk.txt".to_string(), None),
+        );
         assert!(
             h.state().inspect.is_some(),
             "a PURGE row opens the file alone: {:?}",
@@ -2005,6 +2295,7 @@ mod ui_tests {
         h.state_mut().command = Command::Organize;
         h.state_mut().apply(
             &store,
+            &egui::Context::default(),
             Act::Inspect("junk.txt".to_string(), Some("2026/junk.txt".to_string())),
         );
         assert!(
@@ -2029,7 +2320,8 @@ mod ui_tests {
             .unwrap();
         let mut h = grooming_harness(Arc::clone(&store), Command::EmptyDirs);
         h.state_mut().repo = Some("a".to_string());
-        h.state_mut().apply(&store, Act::Confirm);
+        h.state_mut()
+            .apply(&store, &egui::Context::default(), Act::Confirm);
         for _ in 0..200 {
             h.step();
             if !h.state().running && h.state().status.is_some() {
@@ -2080,7 +2372,9 @@ mod ui_tests {
         let mut h = grooming_harness(Arc::clone(&store), Command::Dedupe);
         h.state_mut().source = Some("a".to_string());
         h.state_mut().pool = vec!["b".to_string()];
-        h.state_mut().run_preview(&store);
+        let ctx = h.ctx.clone();
+        h.state_mut().run_preview(&store, &ctx, false);
+        wait_done(&mut h);
         assert_eq!(
             h.state().preview_total,
             1,
@@ -2119,7 +2413,7 @@ mod ui_tests {
         let (_tmp, store) = sample_store();
         let prune = grooming_harness(store, Command::Prune);
         assert!(
-            prune.query_by_label_contains("REPO — ").is_some(),
+            prune.query_by_label_contains("WITH WHICH — ").is_some(),
             "PRUNE has REPO"
         );
         assert!(
@@ -2153,13 +2447,15 @@ mod ui_tests {
             "DEDUPE has FILTER"
         );
         assert!(
-            dedupe.query_by_label_contains("REPO — ").is_none(),
+            dedupe
+                .query_by_label_contains("THE REPOSITORY TO GROOM")
+                .is_none(),
             "DEDUPE uses SOURCE, not the single REPO picker"
         );
 
         let purge = grooming_harness(Arc::clone(&store), Command::Purge);
         assert!(
-            purge.query_by_label_contains("REPO — ").is_some(),
+            purge.query_by_label_contains("WITH WHICH — ").is_some(),
             "PURGE has REPO"
         );
         assert!(
@@ -2173,7 +2469,7 @@ mod ui_tests {
 
         let empty = grooming_harness(Arc::clone(&store), Command::EmptyDirs);
         assert!(
-            empty.query_by_label_contains("REPO — ").is_some(),
+            empty.query_by_label_contains("WITH WHICH — ").is_some(),
             "EMPTY DIRS has REPO"
         );
         assert!(
@@ -2183,7 +2479,7 @@ mod ui_tests {
 
         let organize = grooming_harness(store, Command::Organize);
         assert!(
-            organize.query_by_label_contains("REPO — ").is_some(),
+            organize.query_by_label_contains("WITH WHICH — ").is_some(),
             "ORGANIZE has a repo picker"
         );
         assert!(
@@ -2235,7 +2531,7 @@ mod ui_tests {
     fn rule_sections_nest_inside_rules_elbow() {
         let (_tmp, store) = sample_store();
         let organize = grooming_harness(store, Command::Organize);
-        let rules = organize.get_by_label_contains("RULES — ").rect();
+        let rules = organize.get_by_label_contains("RULES THAT MATCH").rect();
         let rule1 = organize.get_by_label_contains("RULE 1").rect();
         assert!(
             rule1.left() > rules.left(),
@@ -2260,13 +2556,13 @@ mod ui_tests {
             h.query_by_label("DEDUPE").is_some(),
             "the command selector starts visible"
         );
-        h.get_by_label_contains("COMMAND — ").click();
+        h.get_by_label_contains("WHAT — ").click();
         h.run();
         assert!(
             h.query_by_label("DEDUPE").is_none(),
             "collapsing COMMAND hides the selector"
         );
-        h.get_by_label_contains("COMMAND — ").click();
+        h.get_by_label_contains("WHAT — ").click();
         h.run();
         assert!(
             h.query_by_label("DEDUPE").is_some(),
@@ -2366,7 +2662,7 @@ mod ui_tests {
         );
 
         // PURGE / PRUNE keep the one-sided shape.
-        let one_sided = GroomingView::one_sided(vec!["junk.tmp".to_string()]);
+        let one_sided = one_sided(vec!["junk.tmp".to_string()]);
         assert_eq!(one_sided, [("junk.tmp".to_string(), None)]);
     }
 
@@ -2496,6 +2792,8 @@ mod ui_tests {
     fn a_row_can_be_applied_on_its_own() {
         let (_tmp, store) = sample_store();
         let mut h = grooming_harness(store, Command::Purge);
+        // APPLY deletes, so the groomed repo must be unlocked to offer it.
+        h.state().locks.toggle("a");
         seed_purge(h.state_mut(), &["a.tmp".to_string(), "b.tmp".to_string()]);
         h.run();
         assert_eq!(
@@ -2663,7 +2961,8 @@ mod ui_tests {
     fn wait_done(h: &mut Harness<'static, GroomingView>) {
         for _ in 0..600 {
             h.step();
-            if !h.state().running {
+            if !h.state().running && !h.state().previewing {
+                h.step();
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2751,6 +3050,131 @@ mod ui_tests {
         assert!(!a.join("junk.tmp").exists(), "the match was purged");
         assert!(a.join("dup.txt").exists(), "non-matches stay");
         assert!(a.join("unique.txt").exists(), "non-matches stay");
+        // The run went through the activity owner: it ends on a report, and
+        // the purged file is in the event log under the repo.
+        let mut reported = false;
+        for _ in 0..200 {
+            if crate::activity::lock(&h.state().activity).has_report() {
+                reported = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(reported, "the activity modal ends on the report");
+        let activity = crate::activity::lock(&h.state().activity);
+        assert!(
+            activity
+                .logged()
+                .iter()
+                .any(|e| e.action == "Deleted" && e.repo == "a" && e.path == "junk.tmp"),
+            "the event log records the deletion: {:?}",
+            activity.logged()
+        );
+        assert!(
+            h.state().selection_collapsed,
+            "the selection folds into its summary once REVIEW starts"
+        );
+    }
+
+    /// The tab asks its questions in order — WHAT, WITH WHICH, HOW, RUN —
+    /// each section appearing once the one before it has an answer.
+    #[test]
+    fn sections_reveal_in_reading_order() {
+        let (_tmp, store) = sample_store();
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1120.0, 800.0))
+            .build_ui_state(
+                move |ui, view: &mut GroomingView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    view.show(ui, &store_ui, TooltipVerbosity::default());
+                },
+                {
+                    let mut view = GroomingView::new();
+                    view.loaded = true;
+                    view.repos = vec!["a".to_string(), "b".to_string()];
+                    view
+                },
+            );
+        h.run();
+        assert!(h.query_by_label("PURGE").is_some(), "WHAT shows first");
+        assert!(
+            h.query_by_label("a").is_none(),
+            "no repository chip before a tool is chosen"
+        );
+        assert!(h.query_by_label_contains("FILTER — ").is_none());
+        assert!(h.query_by_label("REVIEW").is_none());
+
+        h.get_by_label("PURGE").click();
+        h.run();
+        let purge = h.get_by_label("PURGE").rect();
+        let repo_chip = h.get_by_label("a").rect();
+        assert!(
+            repo_chip.top() > purge.bottom(),
+            "the repository sits below the tool: {repo_chip:?} vs {purge:?}"
+        );
+        assert!(
+            h.query_by_label_contains("FILTER — ").is_none(),
+            "HOW waits for a repository"
+        );
+
+        h.get_by_label("a").click();
+        h.run();
+        let filter = h.get_by_label_contains("FILTER — ").rect();
+        assert!(
+            filter.top() > repo_chip.bottom(),
+            "HOW sits below the repository"
+        );
+        assert!(
+            h.query_by_label("REVIEW").is_none(),
+            "RUN waits for PURGE's filter condition"
+        );
+
+        h.state_mut().filter.set_expression("name:*.tmp");
+        h.run();
+        let review = h.get_by_label("REVIEW").rect();
+        assert!(review.top() > filter.top(), "RUN comes last");
+    }
+
+    /// A single row's APPLY is a row action: a card names the file, the
+    /// event log keeps the line.
+    #[test]
+    fn a_single_row_apply_answers_with_a_card_and_a_log_line() {
+        let (tmp, store) = seeded_store();
+        let mut h = grooming_harness(Arc::clone(&store), Command::Purge);
+        h.state_mut().repo = Some("a".to_string());
+        h.state_mut().filter.set_expression("name:*.tmp");
+        h.state().locks.toggle("a");
+        h.run();
+        h.get_by_label("REVIEW").click_accesskit();
+        wait_done(&mut h);
+        h.get_by_label("APPLY").click_accesskit();
+        wait_done(&mut h);
+        assert!(
+            !tmp.path().join("a").join("junk.tmp").exists(),
+            "the row's file was deleted"
+        );
+        let activity = crate::activity::lock(&h.state().activity);
+        assert!(
+            activity
+                .card_lines()
+                .iter()
+                .any(|l| l == "Deleted junk.tmp"),
+            "a card names the deleted file: {:?}",
+            activity.card_lines()
+        );
+        assert!(
+            activity
+                .logged()
+                .iter()
+                .any(|e| e.action == "Deleted" && e.repo == "a" && e.path == "junk.tmp"),
+            "and the event log records it"
+        );
     }
 
     /// EMPTY DIRS removes the whole empty tree bottom-up and keeps the root
@@ -2810,7 +3234,7 @@ mod ui_tests {
         wait_done(&mut h);
         let status = h.state().status.clone().unwrap_or_default();
         assert!(
-            status.contains("Pruned 1"),
+            status.contains("records dropped 1"),
             "one missing record is pruned: {status}"
         );
     }
@@ -2822,6 +3246,7 @@ mod ui_tests {
     fn organize_presets_roundtrip_and_apply() {
         let (_tmp, store) = seeded_store();
         let mut view = GroomingView::new();
+        view.command_chosen = true;
         // Edit the default rule in place (a fresh view already has one).
         view.rules[0].template = "{year}/{month}/{o-name}".to_string();
         view.rules[0].filter.set_expression("mime:image");
@@ -2829,6 +3254,7 @@ mod ui_tests {
         assert_eq!(view.presets.len(), 1, "the preset was stored");
 
         let mut fresh = GroomingView::new();
+        fresh.command_chosen = true;
         fresh.load_presets(&store);
         assert_eq!(fresh.presets.len(), 1, "the preset survives a restart");
         assert_eq!(fresh.presets[0].rules.len(), 1);
@@ -2840,7 +3266,7 @@ mod ui_tests {
 
         // Applying the preset replaces the live rules with the saved ones.
         fresh.rules.clear();
-        fresh.apply(&store, Act::ApplyPreset(0));
+        fresh.apply(&store, &egui::Context::default(), Act::ApplyPreset(0));
         assert_eq!(fresh.rules.len(), 1, "the preset's rules are applied");
         assert_eq!(fresh.rules[0].template, "{year}/{month}/{o-name}");
     }
@@ -2856,7 +3282,7 @@ mod ui_tests {
         h.run();
         // Fold two sections so the snapshot also shows the collapsed form
         // (stadium bar + right-caret hint) next to open ones.
-        h.get_by_label_contains("REPO — ").click();
+        h.get_by_label_contains("WITH WHICH — ").click();
         h.run();
         h.get_by_label_contains("RULE 2").click();
         h.run();

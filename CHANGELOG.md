@@ -37,6 +37,17 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   panels side by side (DUPEPOOL below once a source is picked), then the
   command's options and the filter, and RUN last; after REVIEW or RUN the
   sections fold into one summary line with CHANGE.
+- **Grooming runs in the activity window and asks its questions in
+  order.** REVIEW plans behind the activity window and fills the board when
+  the window closes; RUN (DEDUPE, PURGE, EMPTY DIRS, ORGANIZE, PRUNE) runs
+  there too, naming each file as it is deleted or moved — EMPTY DIRS each
+  repository as it is swept — and ends on the result report; the in-page
+  run log and its CANCEL button are gone. A row's APPLY answers with a
+  notification card, and every file changed is in the event log. The tab
+  shows the tool chips first, then the repository (SOURCE and DUPEPOOL for
+  DEDUPE), then the filter or the rules, and RUN last; after REVIEW or RUN
+  the sections above fold into one summary line with CHANGE, and RUN stays
+  reachable.
 - **Duplicates asks its questions in order.** The tab shows the mode choice
   first — DUPLICATES or SIMILAR FILES, with the similarity threshold beside
   the SIMILAR chip and QUICK DELETE on the same row — then the repository
