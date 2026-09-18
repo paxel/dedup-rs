@@ -37,6 +37,11 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   panels side by side (DUPEPOOL below once a source is picked), then the
   command's options and the filter, and RUN last; after REVIEW or RUN the
   sections fold into one summary line with CHANGE.
+- **Browse answers with cards.** Adding or removing a tag, a batch tag,
+  writing ID3 tags into an audio file, and saving a turned image over its
+  original in the viewer each answer with a notification card; the two that
+  change the file also write an event-log line. This completes the standard
+  across every tab.
 - **Repository scans run in the activity window, one after another.**
   UPDATE / SCAN, CHECK, UPDATE ALL, UPDATE LOCAL and a group's UPDATE ALL
   are operations on the activity window: it names the repository and the

@@ -288,9 +288,9 @@ impl DedupApp {
             activity: activity.clone(),
             dupes: DupesView::new_with_locks(locks.clone(), activity.clone()),
             transfer: TransferView::new_with_locks(locks.clone(), activity.clone()),
-            grooming: GroomingView::new_with_locks(locks.clone(), activity),
+            grooming: GroomingView::new_with_locks(locks.clone(), activity.clone()),
             groups: Vec::new(),
-            browse: crate::browse_view::BrowseView::new_with_locks(locks),
+            browse: crate::browse_view::BrowseView::new_with_locks(locks, activity),
             saved_settings: crate::settings::Settings::default(),
             window_size: None,
         };

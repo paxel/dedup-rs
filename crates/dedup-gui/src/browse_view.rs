@@ -240,6 +240,9 @@ pub struct BrowseView {
     /// The app-wide repo lock registry (see [`crate::locks`]): which repos'
     /// existing files may be deleted or overwritten this session.
     locks: crate::locks::RepoLocks,
+    /// The app-wide activity owner: a tag write or an in-place save answers
+    /// with its cards and lands in its event log.
+    activity: crate::activity::Shared,
     /// Generation counter for the folder read-ahead worker: bumping it makes
     /// the running worker stop at its next check (folder change, tab exit).
     prefetch_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -304,6 +307,7 @@ impl BrowseView {
             audio_tags: None,
             tag_edit: None,
             locks: crate::locks::RepoLocks::new(),
+            activity: crate::activity::scratch(),
             prefetch_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             prefetch_alive: false,
             prefetch_key: None,
@@ -335,10 +339,23 @@ impl BrowseView {
 
     /// Construct wired to the app's shared lock registry, so a repo unlocked
     /// here is unlocked on every tab (and vice versa).
-    pub fn new_with_locks(locks: crate::locks::RepoLocks) -> Self {
+    pub fn new_with_locks(
+        locks: crate::locks::RepoLocks,
+        activity: crate::activity::Shared,
+    ) -> Self {
         let mut me = Self::new();
         me.locks = locks;
+        me.activity = activity;
         me
+    }
+
+    /// A card, plus an event-log line when the note changed the disk.
+    fn notify(&self, ctx: &egui::Context, note: crate::activity::Notification) {
+        let mut activity = crate::activity::lock(&self.activity);
+        if note.changed_disk {
+            activity.record(&note);
+        }
+        activity.card(ctx, note);
     }
 
     /// Sync the repo list with the store, keeping the currently browsed repo if
@@ -964,9 +981,19 @@ impl BrowseView {
             Some(crate::compare_view::DiffPick::Edited { on_left }) => {
                 let side = if on_left { &lb.left } else { &lb.right };
                 let (repo, rel) = (side.repo.clone(), side.rel_path.clone());
-                if let Err(e) = dedup_core::update::refresh_file_entry(store, &repo, &rel) {
-                    self.error = Some(format!("Saved, but re-indexing failed: {e}"));
-                }
+                let note = match dedup_core::update::refresh_file_entry(store, &repo, &rel) {
+                    Ok(_) => crate::activity::Notification::changed("Saved", &repo, &rel),
+                    Err(e) => {
+                        self.error = Some(format!("Saved, but re-indexing failed: {e}"));
+                        crate::activity::Notification::failed(
+                            "Saved",
+                            &repo,
+                            &rel,
+                            &format!("saved, but re-indexing failed: {e}"),
+                        )
+                    }
+                };
+                self.notify(ctx, note);
                 // The listing shows sizes/dates from the index — reload it.
                 self.entries_repo = None;
             }
@@ -1659,12 +1686,28 @@ impl BrowseView {
             if cancel {
                 self.tag_edit = None;
             } else if save && let Some(te) = self.tag_edit.take() {
+                let repo = self.repo.clone().unwrap_or_default();
                 match crate::id3tags::write(&te.abs, &te.tags) {
                     Ok(()) => {
                         self.audio_tags = Some((te.hex, Some(te.tags)));
                         self.error = None;
+                        self.notify(
+                            &ui.ctx().clone(),
+                            crate::activity::Notification::changed("Wrote tags", &repo, &sel.rel),
+                        );
                     }
-                    Err(e) => self.error = Some(format!("Tag save failed: {e}")),
+                    Err(e) => {
+                        self.error = Some(format!("Tag save failed: {e}"));
+                        self.notify(
+                            &ui.ctx().clone(),
+                            crate::activity::Notification::failed(
+                                "Write tags",
+                                &repo,
+                                &sel.rel,
+                                &e.to_string(),
+                            ),
+                        );
+                    }
                 }
             }
             return;
@@ -1818,7 +1861,7 @@ impl BrowseView {
             if batch_submit {
                 let tag = self.batch_input.trim().to_string();
                 self.batch_input.clear();
-                self.batch_tag(store, &tag);
+                self.batch_tag(&ui.ctx().clone(), store, &tag);
             }
             ui.separator();
             ui.add_space(4.0);
@@ -1925,16 +1968,16 @@ impl BrowseView {
             && i < self.annos.len()
         {
             self.annos.remove(i);
-            self.save_annotations(store, &sel.rel);
+            self.save_annotations(&ui.ctx().clone(), store, &sel.rel);
         }
         if submit {
             let tag = self.anno_input.trim().to_string();
             self.anno_input.clear();
-            self.add_tag(store, &sel.rel, &tag);
+            self.add_tag(&ui.ctx().clone(), store, &sel.rel, &tag);
         }
         if let Some(tag) = add_existing {
             self.anno_input.clear();
-            self.add_tag(store, &sel.rel, &tag);
+            self.add_tag(&ui.ctx().clone(), store, &sel.rel, &tag);
         }
 
         ui.add_space(10.0);
@@ -2049,30 +2092,38 @@ impl BrowseView {
 
     /// Add `tag` to the selected file (no-op if blank or already present), then
     /// persist and refresh the repo-wide suggestion list.
-    fn add_tag(&mut self, store: &Store, rel: &str, tag: &str) {
+    fn add_tag(&mut self, ctx: &egui::Context, store: &Store, rel: &str, tag: &str) {
         let tag = tag.trim();
         if tag.is_empty() || self.annos.iter().any(|a| a == tag) {
             return;
         }
         self.annos.push(tag.to_string());
-        self.save_annotations(store, rel);
+        self.save_annotations(ctx, store, rel);
     }
 
-    fn save_annotations(&mut self, store: &Store, rel: &str) {
+    fn save_annotations(&mut self, ctx: &egui::Context, store: &Store, rel: &str) {
         let Some(repo) = self.repo.clone() else {
             return;
         };
         if let Err(e) = store.set_annotations(&repo, rel, &self.annos) {
             self.error = Some(e.to_string());
+            self.notify(
+                ctx,
+                crate::activity::Notification::error("Tag", &repo, rel, &e.to_string()),
+            );
             return;
         }
+        self.notify(
+            ctx,
+            crate::activity::Notification::noted("Tags updated", &repo, rel),
+        );
         // A new tag may have appeared (or the last of one vanished): refresh.
         self.reload_all_tags(store);
     }
 
     /// Add `tag` to every multi-selected file (skipping ones that already carry
     /// it), then refresh the tag map / suggestions and the open editor.
-    fn batch_tag(&mut self, store: &Store, tag: &str) {
+    fn batch_tag(&mut self, ctx: &egui::Context, store: &Store, tag: &str) {
         let tag = tag.trim();
         let Some(repo) = self.repo.clone() else {
             return;
@@ -2080,16 +2131,26 @@ impl BrowseView {
         if tag.is_empty() {
             return;
         }
+        let mut tagged = 0usize;
         for rel in self.selected.clone() {
             let mut tags =
                 crate::util::or_log_default(store.get_annotations(&repo, &rel), "tags for a file");
             if !tags.iter().any(|t| t == tag) {
                 tags.push(tag.to_string());
-                if let Err(e) = store.set_annotations(&repo, &rel, &tags) {
-                    self.error = Some(e.to_string());
+                match store.set_annotations(&repo, &rel, &tags) {
+                    Ok(()) => tagged += 1,
+                    Err(e) => self.error = Some(e.to_string()),
                 }
             }
         }
+        self.notify(
+            ctx,
+            crate::activity::Notification::noted(
+                &format!("Tagged '{tag}' on"),
+                &repo,
+                &format!("{tagged} file(s)"),
+            ),
+        );
         self.reload_all_tags(store);
         // Force the cursor file's editor to reload in case it was in the batch.
         self.annos_key = None;
@@ -2792,11 +2853,79 @@ mod tests {
         let mut v = BrowseView::new();
         v.repo = Some("R".into());
         v.selected = std::collections::HashSet::from(["a.txt".to_string(), "c.txt".to_string()]);
-        v.batch_tag(&store, "reviewed");
+        v.batch_tag(&egui::Context::default(), &store, "reviewed");
 
         assert_eq!(store.get_annotations("R", "a.txt").unwrap(), ["reviewed"]);
         assert_eq!(store.get_annotations("R", "c.txt").unwrap(), ["reviewed"]);
         assert!(store.get_annotations("R", "b.txt").unwrap().is_empty());
+        // A tag changes the index, not a file: a card, no event-log line.
+        let activity = crate::activity::lock(&v.activity);
+        assert!(
+            activity
+                .card_lines()
+                .iter()
+                .any(|l| l == "Tagged 'reviewed' on 2 file(s)"),
+            "a card counts the tagged files: {:?}",
+            activity.card_lines()
+        );
+        assert!(activity.logged().is_empty(), "no event-log line for a tag");
+    }
+
+    /// Writing ID3 tags is a change to the file: it answers with a card and
+    /// an event-log line.
+    #[test]
+    fn a_tag_write_answers_with_a_card_and_a_log_line() {
+        use egui_kittest::kittest::Queryable;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let repo_dir = tmp.path().join("R");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        store.create_repo("R", &repo_dir.to_string_lossy()).unwrap();
+        std::fs::write(repo_dir.join("song.mp3"), b"not really audio").unwrap();
+        let mut e = entry();
+        e.mime = Some("audio/mpeg".into());
+        store.update_file_entry("R", "song.mp3", &e).unwrap();
+
+        let mut view = BrowseView::new();
+        view.repo = Some("R".into());
+        let store_ui = Arc::clone(&store);
+        let mut init = false;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui, view: &mut BrowseView| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    ui.allocate_ui(egui::vec2(ui.available_width(), 600.0), |ui| {
+                        view.show(ui, &store_ui, TooltipVerbosity::default());
+                    });
+                },
+                view,
+            );
+        h.run();
+        h.get_by_label("EDIT TAGS").click_accesskit();
+        h.run();
+        h.get_by_label("SAVE TAGS").click_accesskit();
+        h.run();
+        let activity = crate::activity::lock(&h.state().activity);
+        assert!(
+            activity
+                .card_lines()
+                .iter()
+                .any(|l| l == "Wrote tags song.mp3"),
+            "the write is a card naming the file: {:?}",
+            activity.card_lines()
+        );
+        assert!(
+            activity
+                .logged()
+                .iter()
+                .any(|e| e.action == "Wrote tags" && e.repo == "R" && e.path == "song.mp3" && e.ok),
+            "and an event-log line"
+        );
     }
 
     /// `hex_view` forces a hex-header + strings body for any file type; without

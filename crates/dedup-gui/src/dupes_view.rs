@@ -2027,16 +2027,26 @@ impl DupesView {
                 // for a rescan that would skip an unchanged (size, mtime).
                 let side = if on_left { &lb.left } else { &lb.right };
                 let (repo, rel) = (side.repo.clone(), side.rel_path.clone());
-                match dedup_core::update::refresh_file_entry(store, &repo, &rel) {
+                let note = match dedup_core::update::refresh_file_entry(store, &repo, &rel) {
                     Ok(_) => {
                         self.status = Some(format!("Saved {rel}"));
                         // The cards show sizes from the loaded page — reload it.
                         self.cached_page = None;
+                        crate::activity::Notification::changed("Saved", &repo, &rel)
                     }
                     Err(e) => {
                         self.error = Some(format!("Saved, but re-indexing failed: {e}"));
+                        crate::activity::Notification::failed(
+                            "Saved",
+                            &repo,
+                            &rel,
+                            &format!("saved, but re-indexing failed: {e}"),
+                        )
                     }
-                }
+                };
+                let mut activity = crate::activity::lock(&self.activity);
+                activity.record(&note);
+                activity.card(ctx, note);
             }
             Some(_) => {
                 // Closing the viewer also silences what it was playing; the

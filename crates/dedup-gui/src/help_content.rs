@@ -160,7 +160,9 @@ waveform or spectrogram (switchable) beside its ID3 tags, text a scrollable view
 anything else a hex-header + strings dump. The hex/strings toggle forces that forensic \
 view for any file. Click an image or video preview to open it full-window in the lightbox \
 (zoom, pan, Esc to close). For MP3/WAV/AIFF audio, EDIT TAGS rewrites the embedded ID3 \
-tags in place — run UPDATE on the repo afterwards so the index sees the changed file.
+tags in place — a notification card confirms it and the event log keeps the line; run \
+UPDATE on the repo afterwards so the index sees the changed file. Tag annotations answer \
+with a card too, but change only the index.
 
 The file table's columns (NAME, SIZE, TYPE, INFO, MODIFIED, TAGS) are drag-resizable and \
 click-to-sort. Use the annotations editor to tag files — tags are also searchable from the \
