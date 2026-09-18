@@ -20,19 +20,21 @@ tracked by its own index of file contents.
 
 Add a repository with ADD REPOSITORY, or simply drag folders from your file manager and \
 drop them anywhere onto the window. After adding files or changing a folder's contents, \
-run UPDATE ALL so the indexes match the disk again — repositories that are already up to \
-date finish almost instantly. REFRESH STATUS re-checks each repository's reachability and \
-whether it needs an update, without changing anything.
+run UPDATE ALL so the indexes match the disk again — it scans every repository one after \
+another in the activity window, each on its own row with its progress, and ends on one \
+report; repositories that are already up to date finish almost instantly. REFRESH STATUS \
+re-checks each repository's reachability, without changing anything.
 
 Each card shows FILES, SIZE, MISSING and SCANNED stats, plus \
 status pills: LOCAL / REMOTE / OFFLINE / MISSING for reachability, and UP TO DATE / UPDATE \
 REQUIRED from the last CHECK.
 
-Per-repository actions: UPDATE / SCAN (hash new/changed files), CHECK (dry-run, no writes), \
-RENAME (registry name only, the on-disk folder isn't moved), RELOCATE (point at a different \
-folder, keep the index), DUPLICATE (clone the whole index into a new repository at a new \
-path), and DELETE (remove the registry entry and its index — the on-disk files are never \
-touched).";
+Per-repository actions: UPDATE / SCAN (hash new/changed files) and CHECK (dry-run, no \
+writes) run in the activity window with CANCEL; RENAME (registry name only, the on-disk \
+folder isn't moved), RELOCATE (point at a different folder, keep the index), DUPLICATE \
+(clone the whole index into a new repository at a new path), and DELETE (remove the \
+registry entry and its index — the on-disk files are never touched) each answer with a \
+notification card.";
 
 const DUPLICATES: &str = "\
 Find exact or perceptually similar duplicates across one or more repositories, review them \

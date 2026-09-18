@@ -35,7 +35,6 @@ mod thumbs;
 mod transfer_view;
 mod util;
 mod waveform;
-mod worker;
 
 #[cfg(test)]
 pub(crate) mod doc_media;

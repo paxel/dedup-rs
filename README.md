@@ -61,9 +61,9 @@ at the cost of drag-and-drop.
 - **Duplicates** — find exact or perceptually-similar files across repos and delete the worse copies. A copy's right-click menu can jump straight to it in Browse (**SHOW IN BROWSE**), to judge it by the folder it lives in, or **ACCEPT** its content as allowed to repeat inside that repo (a podcast's per-folder cover): accepted copies are protected from every duplicate delete and their groups stay out of the way.
 - **Transfer / DIFF** — copy, move, sync or mirror content between repos, reconcile two repos side by side, or push a backup group's main to its sinks (each ADD ONLY, APPLY CHANGES — which also carries the main's own deletions over — or MIRROR).
 - **Grooming** — dedupe, purge by filter, prune missing records, reorganize by path templates.
-- **One thing at a time, always visible** — long work (a Duplicates FIND or DELETE MARKED, a
-  Transfer or Grooming REVIEW and RUN, a GROUP SYNC or a bulk board action, so far; the other tabs
-  follow) runs in one central activity window that shows each phase, its progress and
+- **One thing at a time, always visible** — long work (a repository UPDATE or CHECK, a Duplicates
+  FIND or DELETE MARKED, a Transfer or Grooming REVIEW and RUN, a GROUP SYNC or a bulk board action)
+  runs in one central activity window that shows each phase, its progress and
   problems, offers CANCEL, and ends as the result report. Quick actions answer with a notification
   card, and every file the app changes is written to an event log (**LOG**, top right) that survives
   restarts. See [ADR 0003](docs/adr/0003-every-action-reports-and-long-work-runs-alone.md).

@@ -132,6 +132,18 @@ impl Notification {
         }
     }
 
+    /// An action that failed without touching the filesystem (a registry
+    /// change the store refused).
+    pub fn error(action: &str, repo: &str, path: &str, error: &str) -> Self {
+        Self {
+            action: action.to_string(),
+            repo: repo.to_string(),
+            path: path.to_string(),
+            outcome: Err(error.to_string()),
+            changed_disk: false,
+        }
+    }
+
     /// An action that did not start because something else is still running.
     pub fn refused(action: &str, busy: &Busy) -> Self {
         Self {
@@ -160,6 +172,18 @@ enum Msg {
         total: Option<u64>,
     },
     Problem(String),
+    /// One repository's line in a multi-repository operation.
+    Row {
+        repo: String,
+        phase: String,
+        done: u64,
+        total: Option<u64>,
+    },
+    /// One repository's line is finished: the summary it ends on.
+    RowDone {
+        repo: String,
+        summary: String,
+    },
     /// The operation ended; `None` closes the modal without a report (a
     /// preview whose result is the board it fills).
     Finished(Option<RunReport>),
@@ -200,6 +224,27 @@ impl ActivityProgress {
         self.ctx.request_repaint();
     }
 
+    /// One repository's own line in a multi-repository operation (UPDATE
+    /// ALL): its phase and how far along it is, with an ETA of its own.
+    pub fn row(&self, repo: &str, phase: impl Into<String>, done: u64, total: Option<u64>) {
+        let _ = self.tx.send(Msg::Row {
+            repo: repo.to_string(),
+            phase: phase.into(),
+            done,
+            total,
+        });
+        self.ctx.request_repaint();
+    }
+
+    /// One repository's line is finished: what it ends on.
+    pub fn row_done(&self, repo: &str, summary: impl Into<String>) {
+        let _ = self.tx.send(Msg::RowDone {
+            repo: repo.to_string(),
+            summary: summary.into(),
+        });
+        self.ctx.request_repaint();
+    }
+
     /// A failure on one item, listed live in the modal and again in the report.
     pub fn problem(&self, text: impl Into<String>) {
         let _ = self.tx.send(Msg::Problem(text.into()));
@@ -207,23 +252,43 @@ impl ActivityProgress {
     }
 }
 
-impl Progress for ActivityProgress {
+/// [`Progress`] adapter for one repository's scan inside an activity: the
+/// modal's phase line follows the scan, and the repository's own row (for a
+/// multi-repository UPDATE) carries bytes hashed, which is what its ETA is
+/// measured on.
+pub struct ScanProgress {
+    pub activity: ActivityProgress,
+    pub repo: String,
+}
+
+impl Progress for ScanProgress {
     fn on(&self, event: ProgressEvent) {
         match event {
             ProgressEvent::Scanning { files, dirs } => {
-                self.phase(
-                    format!("walking — {files} files in {dirs} folders"),
-                    0,
-                    None,
-                );
+                let line = format!("walking '{}' — {files} files in {dirs} folders", self.repo);
+                self.activity.phase(line.clone(), 0, None);
+                self.activity.row(&self.repo, line, 0, None);
             }
             ProgressEvent::Hashing {
                 done,
                 total,
+                done_bytes,
+                total_bytes,
                 current,
-                ..
-            } => self.phase(format!("hashing {current}"), done, Some(total)),
-            ProgressEvent::Error { path, message } => self.problem(format!("{path}: {message}")),
+            } => {
+                self.activity
+                    .phase(format!("hashing {current}"), done, Some(total));
+                self.activity.row(
+                    &self.repo,
+                    format!("hashing {done} of {total}"),
+                    done_bytes,
+                    Some(total_bytes),
+                );
+            }
+            ProgressEvent::Error { path, message } => {
+                self.activity
+                    .problem(format!("{}: {path}: {message}", self.repo));
+            }
             ProgressEvent::Finished { .. } => {}
         }
     }
@@ -284,8 +349,34 @@ struct Running {
     phase: String,
     done: u64,
     total: Option<u64>,
+    /// One line per repository, for an operation over several.
+    rows: Vec<RepoRow>,
     problems: Vec<String>,
     cancel: CancellationToken,
+}
+
+/// One repository's line in a multi-repository operation.
+struct RepoRow {
+    repo: String,
+    phase: String,
+    done: u64,
+    total: Option<u64>,
+    started: Instant,
+    /// Set once the repository is finished: the summary it ends on.
+    summary: Option<String>,
+}
+
+impl RepoRow {
+    fn eta(&self) -> Option<Duration> {
+        let total = self.total?;
+        if self.done == 0 || total <= self.done {
+            return None;
+        }
+        let per_unit = self.started.elapsed().as_secs_f64() / self.done as f64;
+        Some(Duration::from_secs_f64(
+            per_unit * (total - self.done) as f64,
+        ))
+    }
 }
 
 impl Running {
@@ -414,9 +505,6 @@ pub struct Activity {
     log_entries: Vec<LogEntry>,
     /// Row actions in flight (a view's worker for one quick change).
     row_actions: usize,
-    /// Something outside this owner is busy — the repository scan worker,
-    /// until it too runs behind the modal. Set by the app each frame.
-    external: Option<String>,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
 }
@@ -434,7 +522,6 @@ impl Activity {
             log_filter: String::new(),
             log_entries: Vec::new(),
             row_actions: 0,
-            external: None,
             tx,
             rx,
         }
@@ -449,24 +536,12 @@ impl Activity {
         if self.row_actions > 0 {
             return Some(Busy("a file action".to_string()));
         }
-        self.external.clone().map(Busy)
+        None
     }
 
     /// Whether a long-running operation is on the modal right now.
     pub fn is_running(&self) -> bool {
         self.running.is_some()
-    }
-
-    /// Whether work outside this owner (the scan worker) must hold off: an
-    /// operation is on the modal or a row action is in flight.
-    pub fn blocks_external(&self) -> bool {
-        self.running.is_some() || self.row_actions > 0
-    }
-
-    /// Tell the owner about work it does not run itself (the scan worker), so
-    /// "one at a time" holds across both. `None` when that work is idle.
-    pub fn set_external(&mut self, what: Option<String>) {
-        self.external = what;
     }
 
     /// Start a long-running operation. `work` runs on a worker thread,
@@ -523,6 +598,7 @@ impl Activity {
             phase: "starting".to_string(),
             done: 0,
             total: None,
+            rows: Vec::new(),
             problems: Vec::new(),
             cancel: cancel.clone(),
         });
@@ -542,9 +618,6 @@ impl Activity {
         self.drain();
         if let Some(r) = &self.running {
             return Err(Busy(r.title.clone()));
-        }
-        if let Some(what) = &self.external {
-            return Err(Busy(what.clone()));
         }
         self.row_actions += 1;
         Ok(())
@@ -618,6 +691,45 @@ impl Activity {
                 Msg::Problem(text) => {
                     if let Some(r) = &mut self.running {
                         r.problems.push(text);
+                    }
+                }
+                Msg::Row {
+                    repo,
+                    phase,
+                    done,
+                    total,
+                } => {
+                    if let Some(r) = &mut self.running {
+                        match r.rows.iter_mut().find(|row| row.repo == repo) {
+                            Some(row) => {
+                                row.phase = phase;
+                                row.done = done;
+                                row.total = total;
+                            }
+                            None => r.rows.push(RepoRow {
+                                repo,
+                                phase,
+                                done,
+                                total,
+                                started: Instant::now(),
+                                summary: None,
+                            }),
+                        }
+                    }
+                }
+                Msg::RowDone { repo, summary } => {
+                    if let Some(r) = &mut self.running {
+                        match r.rows.iter_mut().find(|row| row.repo == repo) {
+                            Some(row) => row.summary = Some(summary),
+                            None => r.rows.push(RepoRow {
+                                repo,
+                                phase: String::new(),
+                                done: 0,
+                                total: None,
+                                started: Instant::now(),
+                                summary: Some(summary),
+                            }),
+                        }
                     }
                 }
                 Msg::Finished(report) => {
@@ -741,6 +853,49 @@ impl Activity {
                 ));
             }
             ui.label(RichText::new(timing).color(theme::tan()).size(12.0));
+
+            // An operation over several repositories lists each one: done
+            // rows keep their summary, the running row its own ETA.
+            if r.rows.len() > 1 || (r.rows.len() == 1 && r.repos.len() > 1) {
+                ui.add_space(8.0);
+                egui::Grid::new("activity-rows")
+                    .num_columns(2)
+                    .spacing([12.0, 2.0])
+                    .show(ui, |ui| {
+                        for row in &r.rows {
+                            ui.label(RichText::new(&row.repo).color(theme::text()).size(12.0));
+                            let text = match &row.summary {
+                                Some(summary) => summary.clone(),
+                                None => {
+                                    let mut text = row.phase.clone();
+                                    if let Some(total) = row.total
+                                        && row.done > 0
+                                        && total > 0
+                                    {
+                                        text.push_str(&format!(
+                                            " · {:.0} %",
+                                            row.done as f64 / total as f64 * 100.0
+                                        ));
+                                    }
+                                    if let Some(eta) = row.eta() {
+                                        text.push_str(&format!(
+                                            " · about {} left",
+                                            crate::scrub::format_secs(eta.as_secs_f64())
+                                        ));
+                                    }
+                                    text
+                                }
+                            };
+                            let color = if row.summary.is_some() {
+                                theme::tan()
+                            } else {
+                                theme::amber()
+                            };
+                            ui.label(RichText::new(text).color(color).size(12.0));
+                            ui.end_row();
+                        }
+                    });
+            }
 
             if !r.problems.is_empty() {
                 ui.add_space(8.0);
@@ -1101,29 +1256,5 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(activity.report.is_open(), "a failed quiet finish reports");
-    }
-
-    #[test]
-    fn external_work_counts_as_busy() {
-        let dir = tempfile::tempdir().expect("dir");
-        let ctx = egui::Context::default();
-        let mut activity = Activity::new(dir.path());
-        activity.set_external(Some("scan of 'photos'".into()));
-        assert_eq!(activity.busy(), Some(Busy("scan of 'photos'".into())));
-        assert_eq!(
-            activity.begin_row_action(),
-            Err(Busy("scan of 'photos'".into()))
-        );
-        let refused = activity.start(
-            &ctx,
-            Spec {
-                title: "FIND".into(),
-                repos: vec![],
-            },
-            |_, _| RunReport::new("never"),
-        );
-        assert_eq!(refused, Err(Busy("scan of 'photos'".into())));
-        activity.set_external(None);
-        assert!(activity.busy().is_none());
     }
 }

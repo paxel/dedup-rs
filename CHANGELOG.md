@@ -37,6 +37,17 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   panels side by side (DUPEPOOL below once a source is picked), then the
   command's options and the filter, and RUN last; after REVIEW or RUN the
   sections fold into one summary line with CHANGE.
+- **Repository scans run in the activity window, one after another.**
+  UPDATE / SCAN, CHECK, UPDATE ALL, UPDATE LOCAL and a group's UPDATE ALL
+  are operations on the activity window: it names the repository and the
+  file being hashed, counts up with a percentage, and — for UPDATE ALL —
+  lists every repository on its own row with its progress and an estimate
+  of what is left, then ends on one report. The scan queue, the per-card
+  spinner and CANCEL, and the Status window's ACTIVITY list are gone; the
+  window's CANCEL stops the whole batch. A scan that walked empty still
+  asks before marking everything missing. RENAME, RELOCATE, DUPLICATE,
+  DELETE, MARK REMOTE and the sync-group controls answer with a
+  notification card.
 - **Grooming runs in the activity window and asks its questions in
   order.** REVIEW plans behind the activity window and fills the board when
   the window closes; RUN (DEDUPE, PURGE, EMPTY DIRS, ORGANIZE, PRUNE) runs

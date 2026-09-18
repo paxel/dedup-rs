@@ -8,10 +8,13 @@ subcommand](../cli.md#repo).
 
 ## Action bar
 
-- **ADD REPOSITORY** — opens a dialog to register a new folder (see below). Disabled while
-  a scan is running elsewhere in the app.
-- **UPDATE ALL** — queues an UPDATE / SCAN for every registered repository, one at a time.
-  Already up-to-date repos finish almost instantly.
+- **ADD REPOSITORY** — opens a dialog to register a new folder (see below).
+- **UPDATE ALL** — scans every registered repository, one after another, as a single
+  operation in the [activity window](index.md#the-activity-window): the window names the
+  repository being scanned, lists every repository on its own row with its progress and an
+  estimate of what is left, and ends on one report. Already up-to-date repos finish almost
+  instantly. **CANCEL** stops the whole batch; repositories not yet reached are listed as
+  such.
 - **UPDATE LOCAL** — the same, minus every repository **marked remote** (see below): the
   quick everyday rescan that leaves slow network or cloud mounts alone.
 - **REFRESH STATUS** — re-checks every repository's location/reachability, so a
@@ -43,10 +46,11 @@ Status pills:
 
 ## Per-repository actions
 
-- **UPDATE / SCAN** — walk the folder, hash new/changed files, mark vanished files missing.
-  Fast on a repeat run since unchanged files are skipped.
+- **UPDATE / SCAN** — walk the folder, hash new/changed files, mark vanished files missing,
+  in the activity window. Fast on a repeat run since unchanged files are skipped.
 - **CHECK** — dry-run: report new/changed/missing counts without hashing or writing
-  anything. Use this to see if UPDATE / SCAN has real work to do.
+  anything, also in the activity window. Use this to see if UPDATE / SCAN has real work to
+  do.
 - **MARK REMOTE** / **MARKED REMOTE** — your own judgement that this repository's folder
   lives on a slow mount (NFS, cloud). Marked repositories are skipped by **UPDATE LOCAL**;
   everything else works the same. Deliberately never auto-detected — an NFS mount can look
@@ -61,11 +65,18 @@ Status pills:
 - **DELETE** — remove the registry entry and its index database. The on-disk files it
   tracked are **never touched**; only the tracking record disappears.
 
-A repository mid-scan or mid-check shows a spinner, live progress (a bar with percent/count
-for hashing, a file/dir count while scanning), and a CANCEL button — cancelling a scan keeps
-whatever was already hashed committed to the index. The finished-scan line states the hash
-work explicitly — "hashed N file(s), X MB" — so a slow scan explains itself: `hashed 0` means
-the time went to walking the folder (a slow mount), not to hashing.
+A scan or check runs in the activity window, which blocks the rest of the app while it
+works: it shows the file being hashed, a bar with percent and count, elapsed time and an
+estimate of what is left, and every problem as it occurs; **CANCEL** stops it, and whatever
+was already hashed stays committed to the index. When it ends the window shows the result,
+and the card's finished-scan line states the hash work explicitly — "hashed N file(s), X
+MB" — so a slow scan explains itself: `hashed 0` means the time went to walking the folder
+(a slow mount), not to hashing. Only one operation runs at a time: an UPDATE while
+something else is up is refused with a card naming what is still running.
+
+Every other card action — RENAME, RELOCATE, DUPLICATE, DELETE, MARK REMOTE, MAKE MAIN, the
+sync-group controls — answers with a notification card in the top-right corner. None of
+them changes files on disk, so none writes an event-log line.
 
 ## Sync groups
 
@@ -89,7 +100,8 @@ source is a group's main:
 - A main's card gains a **group controls** row:
   - **ADD REPO** — add a *new* backup that starts as a clone of the main's index, pointed at
     a folder you choose (the main is left unchanged).
-  - **UPDATE ALL** — queue an UPDATE / SCAN for the main and every backup in the group.
+  - **UPDATE ALL** — scan the main and every backup in the group as one operation in the
+    activity window.
   - **UNGROUP** — disband the group; every repository stays, just unlinked.
 - Sinks are shown inside their group's section rather than as top-level repositories, and are
   managed there like any other repository. Each sink card carries its own **mode pill** —

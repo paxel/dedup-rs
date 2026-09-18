@@ -29,12 +29,13 @@ The tab buttons switch views; the current tab is highlighted. On the right:
 - **SETTINGS** (cog icon) opens the settings dialog below.
 - **ABOUT** shows the version, license, and contact info.
 
-## Status: warnings and activity
+## Status: warnings
 
-![The Status centre — health warnings and running activity](../screenshots/status_panel.png)
+![The Status centre — health warnings](../screenshots/status_panel.png)
 
-The **Status** button is the one place the app tells you something is wrong or busy —
-so a problem never fails silently. It has two sections:
+The **Status** button is the one place the app tells you something is wrong — so a
+problem never fails silently. (What is *running* is on the
+[activity window](#the-activity-window), which blocks the app while it works.)
 
 - **Warnings** — health issues, each **Critical** (red) or **Warning** (amber), never
   a mere log line. At launch the app probes the things that fail quietly: the **audio
@@ -49,8 +50,6 @@ so a problem never fails silently. It has two sections:
   system fingerprint — app version, OS, and which tools/devices are present), and
   **COPY FULL REPORT** adds every warning and the recent log. Both go to your **clipboard
   for a bug report — the app sends nothing anywhere**.
-- **Activity** — the heavy background work you can watch and stop: a running or queued
-  **scan** shows here with **CANCEL**, so a long scan can be ended without killing the app.
 
 ## Copying names and paths
 
@@ -109,8 +108,9 @@ unlocking for deletion should be a fresh, conscious choice each session.
 ## The activity window
 
 Long work runs one at a time in a central window that blocks the rest of the app while it
-runs: a Duplicates FIND or DELETE MARKED, a Transfer REVIEW, RUN, GROUP SYNC or bulk board
-action, and — tab by tab — the rest. The window names the operation and its repositories,
+runs: a repository UPDATE or CHECK (UPDATE ALL lists every repository on its own row), a
+Duplicates FIND or DELETE MARKED, a Transfer or Grooming REVIEW and RUN, a GROUP SYNC or a
+bulk board action. The window names the operation and its repositories,
 the current phase ("reading 'photos'", "comparing audio", "copying 2020/a.jpg"), how far it
 is with a percentage where the total is known, elapsed time and an estimate of what is left,
 and each problem as it occurs. **CANCEL** is its only control and stops the whole batch;

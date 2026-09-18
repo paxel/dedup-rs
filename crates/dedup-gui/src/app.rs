@@ -4,6 +4,7 @@
 //! Grooming tab, and delegates the others to [`crate::dupes_view`] and
 //! [`crate::transfer_view`].
 
+use crate::activity::Notification;
 use crate::dupes_view::DupesView;
 use crate::grooming_view::GroomingView;
 use crate::icon;
@@ -12,19 +13,38 @@ use crate::status::{self, Location};
 use crate::theme;
 use crate::transfer_view::TransferView;
 use crate::util::{ExplainExt, format_size};
-use crate::worker::{ChannelProgress, JobKind, JobOutcome, RepoStatus, WorkerMsg, WorkerState};
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::store::{RepoStats, Store};
-use dedup_core::update::{CancellationToken, ProgressEvent, check_repo};
+use dedup_core::update::check_repo;
 use egui::{Align, Color32, Id, Layout, RichText};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Repos scan one at a time (each scan already parallelizes across all CPU
 /// cores), so the queue starts a new scan only while fewer than this many run.
-const MAX_CONCURRENT: usize = 1;
+/// What a scan does: index the folder, index it even when it walked empty
+/// (the user confirmed), or only report what a scan would do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobKind {
+    Update,
+    UpdateForced,
+    Check,
+}
+
+/// How one repository's scan ended.
+enum JobOutcome {
+    Update(Result<dedup_core::update::UpdateStats, String>),
+    Check(Result<dedup_core::update::CheckStats, String>),
+    /// The scan refused: the folder walked empty over this many indexed
+    /// entries, and the user has not confirmed that it really is empty.
+    UpdateWouldEmpty(u64),
+}
+
+/// What a scan worker tells the app root.
+enum AppMsg {
+    Scanned { repo: String, outcome: JobOutcome },
+}
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub(crate) enum Tab {
@@ -119,7 +139,6 @@ enum Action {
     RefreshStatus,
     /// Flip a repo's user-set remote flag (slow mount; UPDATE LOCAL skips it).
     ToggleRemote(String),
-    Cancel(String),
     BeginRename(String),
     BeginRelocate(String),
     BeginDuplicate(String),
@@ -210,12 +229,8 @@ pub struct DedupApp {
     /// Chosen interface appearance; applied to egui each frame.
     theme: ThemeChoice,
 
-    tx: Sender<WorkerMsg>,
-    rx: Receiver<WorkerMsg>,
-    worker: WorkerState,
-    /// Repos waiting for a job, in FIFO order. Drained one at a time.
-    queue: VecDeque<(String, JobKind)>,
-    cancels: HashMap<String, CancellationToken>,
+    tx: Sender<AppMsg>,
+    rx: Receiver<AppMsg>,
     /// Location/reachability results delivered from the status-refresh thread.
     status_tx: Sender<(String, Location)>,
     status_rx: Receiver<(String, Location)>,
@@ -268,9 +283,6 @@ impl DedupApp {
             theme: ThemeChoice::default(),
             tx,
             rx,
-            worker: WorkerState::default(),
-            queue: VecDeque::new(),
-            cancels: HashMap::new(),
             status_tx,
             status_rx,
             activity: activity.clone(),
@@ -344,7 +356,9 @@ impl DedupApp {
         }
         match self.tab {
             Tab::Repositories => {
-                if self.worker.active_count() == 0 {
+                // A scan on the activity modal blocks the tab anyway; reload
+                // once it is free.
+                if !crate::activity::lock(&self.activity).is_running() {
                     self.reload_all();
                 }
             }
@@ -440,7 +454,7 @@ impl DedupApp {
             );
             return;
         }
-        if self.worker.active_count() > 0 {
+        if crate::activity::lock(&self.activity).is_running() {
             self.load_error = Some(
                 "Can't add repositories while an update is running — try again once it finishes."
                     .into(),
@@ -508,422 +522,11 @@ impl DedupApp {
 
     /// Add a `kind` job for a repo to the queue. No-op if it is already queued
     /// or running. The worker thread is started later by [`Self::pump_queue`].
-    fn enqueue(&mut self, name: String, kind: JobKind) {
-        if self.worker.is_tracked(&name) {
-            return;
-        }
-        self.worker.mark_queued(&name, kind);
-        if let Some(row) = self.repos.iter_mut().find(|r| r.name == name) {
-            row.last = None;
-        }
-        self.queue.push_back((name, kind));
-    }
-
-    /// Start queued jobs until [`MAX_CONCURRENT`] are running. Called once per
-    /// frame after completions are drained and new work is enqueued.
-    fn pump_queue(&mut self, ctx: &egui::Context) {
-        // A long-running operation on the modal, or a row action in flight,
-        // holds the scan queue: one index-changing thing at a time.
-        if crate::activity::lock(&self.activity).blocks_external() {
-            return;
-        }
-        while self.worker.running_count() < MAX_CONCURRENT {
-            let Some((name, kind)) = self.queue.pop_front() else {
-                break;
-            };
-            self.worker.mark_running(&name);
-
-            let cancel = CancellationToken::new();
-            self.cancels.insert(name.clone(), cancel.clone());
-
-            let store = Arc::clone(&self.store);
-            let tx = self.tx.clone();
-            let threads = self.threads;
-            let repaint = ctx.clone();
-            std::thread::spawn(move || {
-                log::info!("starting {kind:?} of '{name}' on {threads} thread(s)");
-                let progress = ChannelProgress::new(name.clone(), tx.clone());
-                let outcome = match kind {
-                    JobKind::Update | JobKind::UpdateForced => {
-                        let allow_empty = matches!(kind, JobKind::UpdateForced);
-                        match dedup_core::update::update_repo_authorized(
-                            &store,
-                            &name,
-                            threads,
-                            &progress,
-                            &cancel,
-                            allow_empty,
-                        ) {
-                            // Not an error to report: the UI turns this into a
-                            // confirmation offering to scan anyway.
-                            Err(dedup_core::update::UpdateError::WouldEmptyIndex {
-                                entries,
-                                ..
-                            }) => JobOutcome::UpdateWouldEmpty(entries),
-                            other => JobOutcome::Update(other.map_err(|e| e.to_string())),
-                        }
-                    }
-                    JobKind::Check => JobOutcome::Check(
-                        check_repo(&store, &name, &progress, &cancel).map_err(|e| e.to_string()),
-                    ),
-                };
-                let _ = tx.send(WorkerMsg::Completed {
-                    repo: name,
-                    outcome,
-                });
-                repaint.request_repaint();
-            });
-        }
-    }
-
-    /// Route a folder chosen from the native picker into whichever field asked
-    /// for it (add form, relocate editor, or duplicate editor).
-    fn route_picked_folder(&mut self, target: FolderTarget, dir: PathBuf) {
-        let picked = dir.to_string_lossy().into_owned();
-        match target {
-            // Add form: fill the path and auto-name from the last path component
-            // unless the user already typed a name.
-            FolderTarget::Add => {
-                if self.new_name.trim().is_empty()
-                    && let Some(base) = dir.file_name()
-                {
-                    self.new_name = base.to_string_lossy().into_owned();
-                }
-                self.new_path = picked;
-            }
-            // Relocate editor: fill its path buffer (if still open).
-            FolderTarget::Relocate => {
-                if let Some(Edit::Relocate { buf, .. }) = &mut self.edit {
-                    *buf = picked;
-                }
-            }
-            // Duplicate editor: fill the path, and auto-name the copy from the
-            // folder's basename unless a name was already typed.
-            FolderTarget::Duplicate => {
-                if let Some(Edit::Duplicate { dest, path, .. }) = &mut self.edit {
-                    if dest.trim().is_empty()
-                        && let Some(base) = dir.file_name()
-                    {
-                        *dest = base.to_string_lossy().into_owned();
-                    }
-                    *path = picked;
-                }
-            }
-            // Add-sink editor: same behaviour as the duplicate editor.
-            FolderTarget::AddSink => {
-                if let Some(Edit::AddSink { dest, path, .. }) = &mut self.edit {
-                    if dest.trim().is_empty()
-                        && let Some(base) = dir.file_name()
-                    {
-                        *dest = base.to_string_lossy().into_owned();
-                    }
-                    *path = picked;
-                }
-            }
-        }
-    }
-
-    // `frame` is the picker dialog's parent window; `None` in tests, which
-    // never open a dialog (the same pattern TransferView::apply uses).
-    fn apply(&mut self, ctx: &egui::Context, frame: Option<&eframe::Frame>, action: Action) {
-        match action {
-            Action::Update(name) => self.enqueue(name, JobKind::Update),
-            Action::UpdateAll => {
-                // Skip known-unreachable repos so a dead mount can't hang a
-                // worker; not-yet-probed (Unknown) repos are still included.
-                let names: Vec<String> = self
-                    .repos
-                    .iter()
-                    .filter(|r| r.location.is_none_or(|l| l.reachable()))
-                    .map(|r| r.name.clone())
-                    .collect();
-                for name in names {
-                    self.enqueue(name, JobKind::Update);
-                }
-            }
-            Action::UpdateLocal => {
-                // UPDATE ALL minus repos the user flagged remote (slow
-                // mounts); the same unreachable skip applies.
-                let names: Vec<String> = self
-                    .repos
-                    .iter()
-                    .filter(|r| !r.remote && r.location.is_none_or(|l| l.reachable()))
-                    .map(|r| r.name.clone())
-                    .collect();
-                for name in names {
-                    self.enqueue(name, JobKind::Update);
-                }
-            }
-            Action::ToggleRemote(name) => {
-                let now = self
-                    .repos
-                    .iter()
-                    .find(|r| r.name == name)
-                    .is_some_and(|r| r.remote);
-                match self.store.set_repo_remote(&name, !now) {
-                    Ok(()) => {
-                        if let Some(row) = self.repos.iter_mut().find(|r| r.name == name) {
-                            row.remote = !now;
-                        }
-                    }
-                    Err(e) => self.load_error = Some(format!("Could not save the flag: {e}")),
-                }
-            }
-            Action::Check(name) => self.enqueue(name, JobKind::Check),
-            Action::RefreshStatus => {
-                // Re-probe location/reachability only. It used to also enqueue
-                // a freshness CHECK (a full directory walk) on every reachable
-                // repo — on slow cloud mounts that spawned exactly the
-                // uninvited scans the remote flag exists to prevent, and users
-                // pressing this after reconnecting a drive just wanted the
-                // OFFLINE pill cleared. Staleness stays with CHECK / UPDATE.
-                self.refresh_status(ctx);
-            }
-            Action::Cancel(name) => {
-                if let Some(token) = self.cancels.get(&name) {
-                    // Running: signal cooperative cancellation; the worker
-                    // reports completion when it stops.
-                    token.cancel();
-                } else {
-                    // Still queued: drop it before it ever starts.
-                    self.queue.retain(|(n, _)| n != &name);
-                    self.worker.remove(&name);
-                }
-            }
-            Action::BeginRename(name) => {
-                self.edit = Some(Edit::Rename {
-                    buf: name.clone(),
-                    name,
-                });
-            }
-            Action::BeginRelocate(name) => {
-                let buf = self
-                    .repos
-                    .iter()
-                    .find(|r| r.name == name)
-                    .map(|r| r.path.clone())
-                    .unwrap_or_default();
-                self.edit = Some(Edit::Relocate { name, buf });
-            }
-            Action::BeginDuplicate(name) => {
-                self.edit = Some(Edit::Duplicate {
-                    dest: format!("{name}-copy"),
-                    path: String::new(),
-                    name,
-                });
-            }
-            Action::BeginDelete(name) => self.edit = Some(Edit::ConfirmDelete { name }),
-            Action::CancelEdit => self.edit = None,
-            Action::MakeMain(name) => {
-                // Name the group after its main. Repo names are unique and groups
-                // are a separate keyspace, so this only clashes with a group
-                // already named for another repo — surfaced as an error.
-                if let Err(e) = self.store.create_sync_group(&name, &name) {
-                    self.load_error = Some(e.to_string());
-                }
-                self.reload_all();
-            }
-            Action::SinkInto { repo, group } => {
-                if let Err(e) =
-                    self.store
-                        .add_sync_sink(&group, &repo, dedup_core::store::SyncMode::AddOnly)
-                {
-                    self.load_error = Some(e.to_string());
-                }
-                self.reload_all();
-            }
-            Action::RemoveSink { group, repo } => {
-                if let Err(e) = self.store.remove_sync_sink(&group, &repo) {
-                    self.load_error = Some(e.to_string());
-                }
-                self.reload_all();
-            }
-            Action::SetSinkMode { group, repo, mode } => {
-                if let Err(e) = self.store.set_sink_mode(&group, &repo, mode) {
-                    self.load_error = Some(e.to_string());
-                }
-                self.reload_all();
-            }
-            Action::UpdateGroup(group) => {
-                // Queue every member (main + sinks). enqueue takes names only, so
-                // collect first to avoid borrowing `self.groups` across the call.
-                let members: Vec<String> = self
-                    .groups
-                    .iter()
-                    .find(|(n, _)| *n == group)
-                    .map(|(_, g)| g.members().map(str::to_string).collect())
-                    .unwrap_or_default();
-                // Skip known-unreachable members, like UPDATE ALL — a backup on an
-                // unplugged drive would otherwise hang a worker. Not-yet-probed
-                // (Unknown) members are still included.
-                for member in members {
-                    let reachable = self
-                        .repos
-                        .iter()
-                        .find(|r| r.name == member)
-                        .is_none_or(|r| r.location.is_none_or(|l| l.reachable()));
-                    if reachable {
-                        self.enqueue(member, JobKind::Update);
-                    }
-                }
-            }
-            Action::Ungroup(group) => {
-                if let Err(e) = self.store.delete_sync_group(&group) {
-                    self.load_error = Some(e.to_string());
-                }
-                self.reload_all();
-            }
-            Action::BeginAddSink { group, main } => {
-                self.edit = Some(Edit::AddSink {
-                    main,
-                    group,
-                    dest: String::new(),
-                    path: String::new(),
-                });
-            }
-            Action::CommitAddSink {
-                group,
-                main,
-                dest,
-                path,
-            } => {
-                self.edit = None;
-                if dest.is_empty() || path.is_empty() {
-                    self.load_error = Some("Add repo needs a new name and path.".into());
-                } else {
-                    match self.store.duplicate_repo(&main, &dest, &path) {
-                        Ok(()) => {
-                            if let Err(e) = self.store.add_sync_sink(
-                                &group,
-                                &dest,
-                                dedup_core::store::SyncMode::AddOnly,
-                            ) {
-                                self.load_error = Some(e.to_string());
-                            }
-                        }
-                        Err(e) => self.load_error = Some(e.to_string()),
-                    }
-                    self.reload_all();
-                }
-            }
-            Action::CommitRename(name, new_name) => {
-                self.edit = None;
-                if !new_name.is_empty() && new_name != name {
-                    if let Err(e) = self.store.rename_repo(&name, &new_name) {
-                        self.load_error = Some(e.to_string());
-                    }
-                    self.reload_all();
-                }
-            }
-            Action::CommitRelocate(name, new_path) => {
-                self.edit = None;
-                let mut relocated = false;
-                if !new_path.is_empty() {
-                    match self.store.relocate_repo(&name, &new_path) {
-                        Ok(()) => relocated = true,
-                        Err(e) => self.load_error = Some(e.to_string()),
-                    }
-                }
-                self.reload_all();
-                if relocated {
-                    // A moved repo's stale "missing" status must not linger:
-                    // clear it and re-probe location/reachability against the new
-                    // path (so it reads Local/Remote if the folder is now there).
-                    if let Some(row) = self.repos.iter_mut().find(|r| r.name == name) {
-                        row.location = None;
-                    }
-                    self.refresh_status(ctx);
-                }
-            }
-            Action::CommitDuplicate { source, dest, path } => {
-                self.edit = None;
-                if dest.is_empty() || path.is_empty() {
-                    self.load_error = Some("Duplicate needs a new name and path.".into());
-                } else {
-                    if let Err(e) = self.store.duplicate_repo(&source, &dest, &path) {
-                        self.load_error = Some(e.to_string());
-                    }
-                    self.reload_all();
-                }
-            }
-            Action::CommitDelete(name) => {
-                self.edit = None;
-                if let Err(e) = self.store.remove_repo(&name) {
-                    self.load_error = Some(e.to_string());
-                }
-                self.reload_all();
-            }
-            Action::OpenAdd => {
-                self.show_add = true;
-                self.new_name.clear();
-                self.new_path.clear();
-                self.form_error = None;
-            }
-            Action::CloseAdd => {
-                self.show_add = false;
-                self.form_error = None;
-            }
-            Action::ChooseFolder(target) => {
-                // Run the native picker modally, parented to our window: it grabs
-                // focus and the app can't spawn a second one while it's open.
-                // This blocks the UI thread until the user picks or cancels.
-                // Starts at the parent of the last selection (any picker, any
-                // session) instead of dumping the user back at the home dir.
-                let mut dialog = rfd::FileDialog::new().set_title("Choose a folder");
-                if let Some(frame) = frame {
-                    dialog = dialog.set_parent(frame);
-                }
-                if let Some(last) = crate::util::last_picked_dir() {
-                    let start = last.parent().map(|p| p.to_path_buf()).unwrap_or(last);
-                    if start.is_dir() {
-                        dialog = dialog.set_directory(start);
-                    }
-                }
-                if let Some(dir) = dialog.pick_folder() {
-                    crate::util::remember_picked_dir(&dir);
-                    self.route_picked_folder(target, dir);
-                }
-            }
-            Action::Create => {
-                let path = self.new_path.trim().to_string();
-                // Default the name to the folder's own name when left blank.
-                let name = effective_name(&self.new_name, &self.new_path);
-                if name.is_empty() || path.is_empty() {
-                    self.form_error = Some("A folder is required.".into());
-                } else if let Err(e) = self.store.create_repo(&name, &path) {
-                    self.form_error = Some(e.to_string());
-                } else {
-                    self.new_name.clear();
-                    self.new_path.clear();
-                    self.form_error = None;
-                    self.show_add = false;
-                    self.reload_all();
-                }
-            }
-        }
-    }
-}
-
-impl eframe::App for DedupApp {
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        // Drive egui from the chosen appearance, then follow whatever it
-        // resolved to this frame so the application's own colours read from the
-        // matching palette. Setting the same preference each frame is idempotent.
-        ctx.set_theme(self.theme.preference());
-        theme::sync_active(&ctx);
-        // One-time startup probe of every repo's location/reachability, plus a
-        // health check of the environment (audio device, external tools) so the
-        // Status button warns about anything missing before it silently bites.
-        if !self.did_initial_status {
-            self.did_initial_status = true;
-            self.refresh_status(&ctx);
-            self.probe_environment(&ctx);
-        }
-
-        // Drain worker messages; a completed job updates the repo's row.
-        for (repo, outcome) in self.worker.drain(&self.rx) {
-            self.cancels.remove(&repo);
+    /// Fold finished scans (reported by the activity window) into their
+    /// rows: freshness, the last-scan line, and the empty-walk question.
+    fn drain_scans(&mut self) {
+        // A finished scan (reported by the activity window) updates its row.
+        while let Ok(AppMsg::Scanned { repo, outcome }) = self.rx.try_recv() {
             match outcome {
                 JobOutcome::UpdateWouldEmpty(entries) => {
                     // Nothing was written. Ask before letting a scan empty an
@@ -953,7 +556,7 @@ impl eframe::App for DedupApp {
                             // don't give (added/updated are the hashed ones).
                             let mut text = format!(
                                 "added {}, updated {}, unchanged {}, missing {}, errors {} — \
-                                 hashed {} file(s), {}",
+                                     hashed {} file(s), {}",
                                 s.added,
                                 s.updated,
                                 s.unchanged,
@@ -1012,6 +615,640 @@ impl eframe::App for DedupApp {
                 }
             }
         }
+    }
+
+    /// Post a notification card.
+    fn card(&self, ctx: &egui::Context, note: Notification) {
+        crate::activity::lock(&self.activity).card(ctx, note);
+    }
+
+    /// Scan (or check) `names` one after another as one operation in the
+    /// activity window, each repository on its own row. Refused with a card
+    /// while anything else runs.
+    fn start_scans(&mut self, ctx: &egui::Context, names: Vec<String>, kind: JobKind) {
+        if names.is_empty() {
+            return;
+        }
+        let verb = if kind == JobKind::Check {
+            "CHECK"
+        } else {
+            "UPDATE"
+        };
+        let title = match names.as_slice() {
+            [one] => format!("{verb} '{one}'"),
+            many => format!("{verb} {} repositories", many.len()),
+        };
+        for name in &names {
+            if let Some(row) = self.repos.iter_mut().find(|r| r.name == *name) {
+                row.last = None;
+            }
+        }
+        let store = Arc::clone(&self.store);
+        let tx = self.tx.clone();
+        let threads = self.threads;
+        let allow_empty = kind == JobKind::UpdateForced;
+        let report_title = title.clone();
+        let started = crate::activity::lock(&self.activity).start(
+            ctx,
+            crate::activity::Spec {
+                title,
+                repos: names.clone(),
+            },
+            move |progress, cancel| {
+                let mut report = crate::run_result::RunReport::new(report_title);
+                let (mut added, mut updated, mut unchanged, mut missing, mut changed) =
+                    (0u64, 0u64, 0u64, 0u64, 0u64);
+                let mut errors = 0u64;
+                let mut cancelled = false;
+                let total = names.len() as u64;
+                for (i, name) in names.iter().enumerate() {
+                    if cancel.is_cancelled() {
+                        cancelled = true;
+                        progress.row_done(name, "not reached — cancelled");
+                        continue;
+                    }
+                    let doing = if kind == JobKind::Check {
+                        "checking"
+                    } else {
+                        "updating"
+                    };
+                    progress.phase(
+                        format!("{doing} '{name}' ({} of {total})", i + 1),
+                        i as u64,
+                        Some(total),
+                    );
+                    let scan = crate::activity::ScanProgress {
+                        activity: progress.clone(),
+                        repo: name.clone(),
+                    };
+                    log::info!("starting {kind:?} of '{name}' on {threads} thread(s)");
+                    let outcome = match kind {
+                        JobKind::Update | JobKind::UpdateForced => {
+                            match dedup_core::update::update_repo_authorized(
+                                &store,
+                                name,
+                                threads,
+                                &scan,
+                                cancel,
+                                allow_empty,
+                            ) {
+                                Err(dedup_core::update::UpdateError::WouldEmptyIndex {
+                                    entries,
+                                    ..
+                                }) => JobOutcome::UpdateWouldEmpty(entries),
+                                other => JobOutcome::Update(other.map_err(|e| e.to_string())),
+                            }
+                        }
+                        JobKind::Check => JobOutcome::Check(
+                            check_repo(&store, name, &scan, cancel).map_err(|e| e.to_string()),
+                        ),
+                    };
+                    match &outcome {
+                        JobOutcome::Update(Ok(s)) => {
+                            added += s.added;
+                            updated += s.updated;
+                            unchanged += s.unchanged;
+                            missing += s.marked_missing;
+                            errors += s.errors;
+                            cancelled |= s.cancelled;
+                            let mut line = format!(
+                                "added {}, updated {}, missing {}",
+                                s.added, s.updated, s.marked_missing
+                            );
+                            if s.cancelled {
+                                line.push_str(" — cancelled");
+                            }
+                            if s.empty_walk {
+                                line.push_str(" — FOUND NO FILES AT ALL");
+                                progress.problem(format!(
+                                    "'{name}' walked empty: check the drive is mounted"
+                                ));
+                            }
+                            progress.row_done(name, line);
+                        }
+                        JobOutcome::Update(Err(e)) => {
+                            errors += 1;
+                            progress.problem(format!("'{name}': {e}"));
+                            progress.row_done(name, format!("error: {e}"));
+                        }
+                        JobOutcome::UpdateWouldEmpty(entries) => {
+                            progress.problem(format!(
+                                "'{name}' found no files at all over {entries} indexed \
+                                 entries and was not touched — confirm that it really is \
+                                 empty to mark them missing"
+                            ));
+                            progress.row_done(name, "refused: walked empty");
+                        }
+                        JobOutcome::Check(Ok(c)) => {
+                            changed += c.changed;
+                            missing += c.missing;
+                            unchanged += c.unchanged;
+                            errors += c.errors;
+                            cancelled |= c.cancelled;
+                            progress.row_done(
+                                name,
+                                format!(
+                                    "{} changed, {} missing, {} unchanged",
+                                    c.changed, c.missing, c.unchanged
+                                ),
+                            );
+                        }
+                        JobOutcome::Check(Err(e)) => {
+                            errors += 1;
+                            progress.problem(format!("'{name}': {e}"));
+                            progress.row_done(name, format!("error: {e}"));
+                        }
+                    }
+                    let _ = tx.send(AppMsg::Scanned {
+                        repo: name.clone(),
+                        outcome,
+                    });
+                    progress.repaint();
+                }
+                if kind == JobKind::Check {
+                    report = report
+                        .count("changed", changed)
+                        .count("missing", missing)
+                        .count("unchanged", unchanged);
+                } else {
+                    report = report
+                        .count("added", added)
+                        .count("updated", updated)
+                        .count("unchanged", unchanged)
+                        .count("missing", missing);
+                }
+                if errors > 0 {
+                    report = report.count("errors", errors);
+                }
+                report.cancelled(cancelled)
+            },
+        );
+        if let Err(busy) = started {
+            self.card(ctx, Notification::refused(verb, &busy));
+        }
+    }
+
+    /// Route a folder chosen from the native picker into whichever field asked
+    /// for it (add form, relocate editor, or duplicate editor).
+    fn route_picked_folder(&mut self, target: FolderTarget, dir: PathBuf) {
+        let picked = dir.to_string_lossy().into_owned();
+        match target {
+            // Add form: fill the path and auto-name from the last path component
+            // unless the user already typed a name.
+            FolderTarget::Add => {
+                if self.new_name.trim().is_empty()
+                    && let Some(base) = dir.file_name()
+                {
+                    self.new_name = base.to_string_lossy().into_owned();
+                }
+                self.new_path = picked;
+            }
+            // Relocate editor: fill its path buffer (if still open).
+            FolderTarget::Relocate => {
+                if let Some(Edit::Relocate { buf, .. }) = &mut self.edit {
+                    *buf = picked;
+                }
+            }
+            // Duplicate editor: fill the path, and auto-name the copy from the
+            // folder's basename unless a name was already typed.
+            FolderTarget::Duplicate => {
+                if let Some(Edit::Duplicate { dest, path, .. }) = &mut self.edit {
+                    if dest.trim().is_empty()
+                        && let Some(base) = dir.file_name()
+                    {
+                        *dest = base.to_string_lossy().into_owned();
+                    }
+                    *path = picked;
+                }
+            }
+            // Add-sink editor: same behaviour as the duplicate editor.
+            FolderTarget::AddSink => {
+                if let Some(Edit::AddSink { dest, path, .. }) = &mut self.edit {
+                    if dest.trim().is_empty()
+                        && let Some(base) = dir.file_name()
+                    {
+                        *dest = base.to_string_lossy().into_owned();
+                    }
+                    *path = picked;
+                }
+            }
+        }
+    }
+
+    // `frame` is the picker dialog's parent window; `None` in tests, which
+    // never open a dialog (the same pattern TransferView::apply uses).
+    fn apply(&mut self, ctx: &egui::Context, frame: Option<&eframe::Frame>, action: Action) {
+        match action {
+            Action::Update(name) => self.start_scans(ctx, vec![name], JobKind::Update),
+            Action::UpdateAll => {
+                // Skip known-unreachable repos so a dead mount can't hang the
+                // scan; not-yet-probed (Unknown) repos are still included.
+                let names: Vec<String> = self
+                    .repos
+                    .iter()
+                    .filter(|r| r.location.is_none_or(|l| l.reachable()))
+                    .map(|r| r.name.clone())
+                    .collect();
+                self.start_scans(ctx, names, JobKind::Update);
+            }
+            Action::UpdateLocal => {
+                // UPDATE ALL minus repos the user flagged remote (slow
+                // mounts); the same unreachable skip applies.
+                let names: Vec<String> = self
+                    .repos
+                    .iter()
+                    .filter(|r| !r.remote && r.location.is_none_or(|l| l.reachable()))
+                    .map(|r| r.name.clone())
+                    .collect();
+                self.start_scans(ctx, names, JobKind::Update);
+            }
+            Action::ToggleRemote(name) => {
+                let now = self
+                    .repos
+                    .iter()
+                    .find(|r| r.name == name)
+                    .is_some_and(|r| r.remote);
+                match self.store.set_repo_remote(&name, !now) {
+                    Ok(()) => {
+                        if let Some(row) = self.repos.iter_mut().find(|r| r.name == name) {
+                            row.remote = !now;
+                        }
+                        let did = if now {
+                            "Unmarked remote"
+                        } else {
+                            "Marked remote"
+                        };
+                        self.card(ctx, Notification::noted(did, &name, "repository"));
+                    }
+                    Err(e) => {
+                        self.load_error = Some(format!("Could not save the flag: {e}"));
+                        self.card(
+                            ctx,
+                            Notification::error("Mark remote", &name, "repository", &e.to_string()),
+                        );
+                    }
+                }
+            }
+            Action::Check(name) => self.start_scans(ctx, vec![name], JobKind::Check),
+            Action::RefreshStatus => {
+                // Re-probe location/reachability only. It used to also enqueue
+                // a freshness CHECK (a full directory walk) on every reachable
+                // repo — on slow cloud mounts that spawned exactly the
+                // uninvited scans the remote flag exists to prevent, and users
+                // pressing this after reconnecting a drive just wanted the
+                // OFFLINE pill cleared. Staleness stays with CHECK / UPDATE.
+                self.refresh_status(ctx);
+            }
+            Action::BeginRename(name) => {
+                self.edit = Some(Edit::Rename {
+                    buf: name.clone(),
+                    name,
+                });
+            }
+            Action::BeginRelocate(name) => {
+                let buf = self
+                    .repos
+                    .iter()
+                    .find(|r| r.name == name)
+                    .map(|r| r.path.clone())
+                    .unwrap_or_default();
+                self.edit = Some(Edit::Relocate { name, buf });
+            }
+            Action::BeginDuplicate(name) => {
+                self.edit = Some(Edit::Duplicate {
+                    dest: format!("{name}-copy"),
+                    path: String::new(),
+                    name,
+                });
+            }
+            Action::BeginDelete(name) => self.edit = Some(Edit::ConfirmDelete { name }),
+            Action::CancelEdit => self.edit = None,
+            Action::MakeMain(name) => {
+                match self.store.create_sync_group(&name, &name) {
+                    Ok(()) => self.card(
+                        ctx,
+                        Notification::noted("Made main", &name, "of a sync group"),
+                    ),
+                    Err(e) => {
+                        self.load_error = Some(e.to_string());
+                        self.card(
+                            ctx,
+                            Notification::error("Make main", &name, "sync group", &e.to_string()),
+                        );
+                    }
+                }
+                self.reload_all();
+            }
+            Action::SinkInto { repo, group } => {
+                match self
+                    .store
+                    .add_sync_sink(&group, &repo, dedup_core::store::SyncMode::AddOnly)
+                {
+                    Ok(()) => self.card(
+                        ctx,
+                        Notification::noted("Added as sink", &repo, &format!("of '{group}'")),
+                    ),
+                    Err(e) => {
+                        self.load_error = Some(e.to_string());
+                        self.card(
+                            ctx,
+                            Notification::error(
+                                "Add sink",
+                                &repo,
+                                &format!("of '{group}'"),
+                                &e.to_string(),
+                            ),
+                        );
+                    }
+                }
+                self.reload_all();
+            }
+            Action::RemoveSink { group, repo } => {
+                match self.store.remove_sync_sink(&group, &repo) {
+                    Ok(()) => self.card(
+                        ctx,
+                        Notification::noted("Removed sink", &repo, &format!("from '{group}'")),
+                    ),
+                    Err(e) => {
+                        self.load_error = Some(e.to_string());
+                        self.card(
+                            ctx,
+                            Notification::error(
+                                "Remove sink",
+                                &repo,
+                                &format!("from '{group}'"),
+                                &e.to_string(),
+                            ),
+                        );
+                    }
+                }
+                self.reload_all();
+            }
+            Action::SetSinkMode { group, repo, mode } => {
+                match self.store.set_sink_mode(&group, &repo, mode) {
+                    Ok(()) => self.card(
+                        ctx,
+                        Notification::noted("Set sink mode", &repo, &format!("{mode:?}")),
+                    ),
+                    Err(e) => {
+                        self.load_error = Some(e.to_string());
+                        self.card(
+                            ctx,
+                            Notification::error(
+                                "Set sink mode",
+                                &repo,
+                                &format!("{mode:?}"),
+                                &e.to_string(),
+                            ),
+                        );
+                    }
+                }
+                self.reload_all();
+            }
+            Action::UpdateGroup(group) => {
+                // Queue every member (main + sinks). enqueue takes names only, so
+                // collect first to avoid borrowing `self.groups` across the call.
+                let members: Vec<String> = self
+                    .groups
+                    .iter()
+                    .find(|(n, _)| *n == group)
+                    .map(|(_, g)| g.members().map(str::to_string).collect())
+                    .unwrap_or_default();
+                // Skip known-unreachable members, like UPDATE ALL — a backup on an
+                // unplugged drive would otherwise hang a worker. Not-yet-probed
+                // (Unknown) members are still included.
+                let members: Vec<String> = members
+                    .into_iter()
+                    .filter(|member| {
+                        self.repos
+                            .iter()
+                            .find(|r| r.name == *member)
+                            .is_none_or(|r| r.location.is_none_or(|l| l.reachable()))
+                    })
+                    .collect();
+                self.start_scans(ctx, members, JobKind::Update);
+            }
+            Action::Ungroup(group) => {
+                match self.store.delete_sync_group(&group) {
+                    Ok(()) => {
+                        self.card(ctx, Notification::noted("Ungrouped", &group, "sync group"))
+                    }
+                    Err(e) => {
+                        self.load_error = Some(e.to_string());
+                        self.card(
+                            ctx,
+                            Notification::error("Ungroup", &group, "sync group", &e.to_string()),
+                        );
+                    }
+                }
+                self.reload_all();
+            }
+            Action::BeginAddSink { group, main } => {
+                self.edit = Some(Edit::AddSink {
+                    main,
+                    group,
+                    dest: String::new(),
+                    path: String::new(),
+                });
+            }
+            Action::CommitAddSink {
+                group,
+                main,
+                dest,
+                path,
+            } => {
+                self.edit = None;
+                if dest.is_empty() || path.is_empty() {
+                    self.load_error = Some("Add repo needs a new name and path.".into());
+                } else {
+                    let added = self
+                        .store
+                        .duplicate_repo(&main, &dest, &path)
+                        .and_then(|()| {
+                            self.store.add_sync_sink(
+                                &group,
+                                &dest,
+                                dedup_core::store::SyncMode::AddOnly,
+                            )
+                        });
+                    match added {
+                        Ok(()) => self.card(ctx, Notification::noted("Added sink", &dest, &path)),
+                        Err(e) => {
+                            self.load_error = Some(e.to_string());
+                            self.card(
+                                ctx,
+                                Notification::error("Add sink", &dest, &path, &e.to_string()),
+                            );
+                        }
+                    }
+                    self.reload_all();
+                }
+            }
+            Action::CommitRename(name, new_name) => {
+                self.edit = None;
+                if !new_name.is_empty() && new_name != name {
+                    match self.store.rename_repo(&name, &new_name) {
+                        Ok(()) => self.card(
+                            ctx,
+                            Notification::noted(
+                                "Renamed repository",
+                                &new_name,
+                                &format!("from '{name}'"),
+                            ),
+                        ),
+                        Err(e) => {
+                            self.load_error = Some(e.to_string());
+                            self.card(
+                                ctx,
+                                Notification::error("Rename", &name, &new_name, &e.to_string()),
+                            );
+                        }
+                    }
+                    self.reload_all();
+                }
+            }
+            Action::CommitRelocate(name, new_path) => {
+                self.edit = None;
+                let mut relocated = false;
+                if !new_path.is_empty() {
+                    match self.store.relocate_repo(&name, &new_path) {
+                        Ok(()) => {
+                            relocated = true;
+                            self.card(ctx, Notification::noted("Relocated", &name, &new_path));
+                        }
+                        Err(e) => {
+                            self.load_error = Some(e.to_string());
+                            self.card(
+                                ctx,
+                                Notification::error("Relocate", &name, &new_path, &e.to_string()),
+                            );
+                        }
+                    }
+                }
+                self.reload_all();
+                if relocated {
+                    if let Some(row) = self.repos.iter_mut().find(|r| r.name == name) {
+                        row.location = None;
+                    }
+                    self.refresh_status(ctx);
+                }
+            }
+            Action::CommitDuplicate { source, dest, path } => {
+                self.edit = None;
+                if dest.is_empty() || path.is_empty() {
+                    self.load_error = Some("Duplicate needs a new name and path.".into());
+                } else {
+                    match self.store.duplicate_repo(&source, &dest, &path) {
+                        Ok(()) => self.card(
+                            ctx,
+                            Notification::noted(
+                                "Duplicated",
+                                &dest,
+                                &format!("from '{source}' at {path}"),
+                            ),
+                        ),
+                        Err(e) => {
+                            self.load_error = Some(e.to_string());
+                            self.card(
+                                ctx,
+                                Notification::error("Duplicate", &source, &dest, &e.to_string()),
+                            );
+                        }
+                    }
+                    self.reload_all();
+                }
+            }
+            Action::CommitDelete(name) => {
+                self.edit = None;
+                match self.store.remove_repo(&name) {
+                    Ok(()) => self.card(
+                        ctx,
+                        Notification::noted(
+                            "Deleted repository",
+                            &name,
+                            "index and registry entry",
+                        ),
+                    ),
+                    Err(e) => {
+                        self.load_error = Some(e.to_string());
+                        self.card(
+                            ctx,
+                            Notification::error("Delete repository", &name, "", &e.to_string()),
+                        );
+                    }
+                }
+                self.reload_all();
+            }
+            Action::OpenAdd => {
+                self.show_add = true;
+                self.new_name.clear();
+                self.new_path.clear();
+                self.form_error = None;
+            }
+            Action::CloseAdd => {
+                self.show_add = false;
+                self.form_error = None;
+            }
+            Action::ChooseFolder(target) => {
+                // Run the native picker modally, parented to our window: it grabs
+                // focus and the app can't spawn a second one while it's open.
+                // This blocks the UI thread until the user picks or cancels.
+                // Starts at the parent of the last selection (any picker, any
+                // session) instead of dumping the user back at the home dir.
+                let mut dialog = rfd::FileDialog::new().set_title("Choose a folder");
+                if let Some(frame) = frame {
+                    dialog = dialog.set_parent(frame);
+                }
+                if let Some(last) = crate::util::last_picked_dir() {
+                    let start = last.parent().map(|p| p.to_path_buf()).unwrap_or(last);
+                    if start.is_dir() {
+                        dialog = dialog.set_directory(start);
+                    }
+                }
+                if let Some(dir) = dialog.pick_folder() {
+                    crate::util::remember_picked_dir(&dir);
+                    self.route_picked_folder(target, dir);
+                }
+            }
+            Action::Create => {
+                let path = self.new_path.trim().to_string();
+                // Default the name to the folder's own name when left blank.
+                let name = effective_name(&self.new_name, &self.new_path);
+                if name.is_empty() || path.is_empty() {
+                    self.form_error = Some("A folder is required.".into());
+                } else if let Err(e) = self.store.create_repo(&name, &path) {
+                    self.form_error = Some(e.to_string());
+                } else {
+                    self.card(ctx, Notification::noted("Added repository", &name, &path));
+                    self.new_name.clear();
+                    self.new_path.clear();
+                    self.form_error = None;
+                    self.show_add = false;
+                    self.reload_all();
+                }
+            }
+        }
+    }
+}
+
+impl eframe::App for DedupApp {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        // Drive egui from the chosen appearance, then follow whatever it
+        // resolved to this frame so the application's own colours read from the
+        // matching palette. Setting the same preference each frame is idempotent.
+        ctx.set_theme(self.theme.preference());
+        theme::sync_active(&ctx);
+        // One-time startup probe of every repo's location/reachability, plus a
+        // health check of the environment (audio device, external tools) so the
+        // Status button warns about anything missing before it silently bites.
+        if !self.did_initial_status {
+            self.did_initial_status = true;
+            self.refresh_status(&ctx);
+            self.probe_environment(&ctx);
+        }
+
+        self.drain_scans();
 
         // Apply any location/reachability results from the status thread.
         while let Ok((repo, location)) = self.status_rx.try_recv() {
@@ -1081,13 +1318,6 @@ impl eframe::App for DedupApp {
         // The scan worker still runs outside the activity owner (until the
         // Repositories tab moves behind the modal); tell the owner about it so
         // "one at a time" holds across both.
-        let scanning = self
-            .worker
-            .jobs()
-            .into_iter()
-            .find(|(_, status, _)| *status == crate::worker::RepoStatus::Running)
-            .map(|(name, _, _)| format!("the scan of '{name}'"));
-        crate::activity::lock(&self.activity).set_external(scanning);
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Repositories => self.repositories_view(ui, &mut actions),
             Tab::Duplicates => self.dupes.show(ui, &self.store, self.tooltip_verbosity),
@@ -1129,16 +1359,6 @@ impl eframe::App for DedupApp {
         crate::activity::lock(&self.activity).show(ui);
         for action in actions {
             self.apply(&ctx, Some(frame), action);
-        }
-
-        // Completions (drained above) free the running slot; the actions loop
-        // may have enqueued more. Start whatever can run now.
-        self.pump_queue(&ctx);
-
-        // Poll at ~10 Hz while work is running instead of repainting per event.
-        // This also ticks the queued/scanning timers.
-        if self.worker.active_count() > 0 {
-            ctx.request_repaint_after(Duration::from_millis(100));
         }
 
         // Track the window's logical size for persistence (flushed on exit).
@@ -1351,9 +1571,6 @@ impl DedupApp {
             ui.colored_label(theme::amber(), notice);
         }
 
-        // The registry is locked while any repo is updating, so adding a repo
-        // (which reads every repo's stats) must wait until scans finish.
-        let busy = self.worker.active_count() > 0;
         crate::lcars::section_lcars(
             ui,
             "MANAGE — ADD & UPDATE REPOSITORIES",
@@ -1366,59 +1583,54 @@ impl DedupApp {
                     )
                     .fill(theme::blue());
                     if ui
-                    .add_enabled(!busy, add)
-                    .explain(
-                        self.tooltip_verbosity,
-                        "Register a new repository",
-                        "Register a new repository: pick a folder on disk to track and scan for \
-                     duplicates. Disabled while a scan is running elsewhere in the app.",
-                    )
-                    .clicked()
-                {
-                    actions.push(Action::OpenAdd);
-                }
-                    // Enqueues every repo; it only touches names (no db access), so it
-                    // stays enabled even while a batch is running.
-                    let update_all = egui::Button::new(
-                        RichText::new(format!("{} UPDATE ALL", icon::REFRESH))
-                            .color(theme::black()),
-                    )
-                    .fill(theme::orange());
-                    if ui
-                    .add_enabled(!self.repos.is_empty(), update_all)
-                    .explain(
-                        self.tooltip_verbosity,
-                        "Scan every repository",
-                        "Queue an UPDATE / SCAN for every registered repository, one at a time. \
-                     Already up-to-date repos finish almost instantly.",
-                    )
-                    .clicked()
-                {
-                    actions.push(Action::UpdateAll);
-                }
-                    // Same, minus repos flagged REMOTE — the everyday rescan
-                    // that leaves slow mounts alone.
-                    let any_local = self.repos.iter().any(|r| !r.remote);
-                    let update_local = egui::Button::new(
-                        RichText::new(format!("{} UPDATE LOCAL", icon::REFRESH))
-                            .color(theme::black()),
-                    )
-                    .fill(theme::amber());
-                    if ui
-                        .add_enabled(any_local, update_local)
+                        .add(add)
                         .explain(
                             self.tooltip_verbosity,
-                            "Scan every repository not marked remote",
-                            "Queue an UPDATE / SCAN for every repository except the ones \
-                             marked remote, one at a time — the quick everyday rescan that \
-                             leaves slow network or cloud mounts alone.",
+                            "Register a new repository",
+                            "Register a new repository: pick a folder on disk to track and \
+                             scan for duplicates.",
                         )
                         .clicked()
                     {
+                        actions.push(Action::OpenAdd);
+                    }
+                    // UPDATE ALL / UPDATE LOCAL open the activity window: the
+                    // run look, not a chip.
+                    if crate::lcars::action_button(
+                        ui,
+                        &format!("{} UPDATE ALL", icon::REFRESH),
+                        !self.repos.is_empty(),
+                        theme::orange(),
+                    )
+                    .explain(
+                        self.tooltip_verbosity,
+                        "Scan every repository",
+                        "Scan every registered repository one after another in the activity \
+                         window, each on its own line with its progress. Already up-to-date \
+                         repos finish almost instantly.",
+                    )
+                    .clicked()
+                    {
+                        actions.push(Action::UpdateAll);
+                    }
+                    let any_local = self.repos.iter().any(|r| !r.remote);
+                    if crate::lcars::action_button(
+                        ui,
+                        &format!("{} UPDATE LOCAL", icon::REFRESH),
+                        any_local,
+                        theme::amber(),
+                    )
+                    .explain(
+                        self.tooltip_verbosity,
+                        "Scan every repository not marked remote",
+                        "Scan every repository except the ones marked remote, one after \
+                         another in the activity window — the quick everyday rescan that \
+                         leaves slow network or cloud mounts alone.",
+                    )
+                    .clicked()
+                    {
                         actions.push(Action::UpdateLocal);
                     }
-                    // Re-probe every repo's location/reachability (filesystem only, no
-                    // db access), so it is fine to run any time.
                     let refresh = egui::Button::new(
                         RichText::new(format!("{} REFRESH STATUS", icon::REFRESH))
                             .color(theme::ink_on(theme::lilac())),
@@ -1429,19 +1641,12 @@ impl DedupApp {
                         .explain(
                             self.tooltip_verbosity,
                             "Re-check reachability",
-                            "Re-check every repository's location and reachability — a reconnected \
-                     drive turns reachable again. No files are read.",
+                            "Re-check every repository's location and reachability — a \
+                             reconnected drive turns reachable again. No files are read.",
                         )
                         .clicked()
                     {
                         actions.push(Action::RefreshStatus);
-                    }
-                    if busy {
-                        ui.label(
-                            RichText::new("· busy: a scan is running")
-                                .color(theme::tan())
-                                .size(12.0),
-                        );
                     }
                 });
             },
@@ -1661,18 +1866,6 @@ impl DedupApp {
     }
 
     fn repo_card(&mut self, ui: &mut egui::Ui, row: &RepoRow, actions: &mut Vec<Action>) {
-        // Owned snapshot of this repo's queue state, taken before the frame
-        // closure so it doesn't borrow `self.worker` across `card_controls`.
-        let tracked = self.worker.get(&row.name).map(|r| {
-            (
-                r.kind,
-                r.status,
-                r.queued_at.elapsed(),
-                r.started_at.map(|s| s.elapsed()),
-                r.event.clone(),
-                r.eta(),
-            )
-        });
         egui::Frame::new()
             .fill(theme::panel())
             .corner_radius(theme::PILL)
@@ -1765,101 +1958,9 @@ impl DedupApp {
                     );
                 });
 
-                match tracked {
-                    Some((kind, RepoStatus::Queued, waited, _, _, _)) => {
-                        let verb = if kind == JobKind::Check {
-                            "check"
-                        } else {
-                            "scan"
-                        };
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!(
-                                    "queued to {verb} — waiting {}",
-                                    format_elapsed(waited)
-                                ))
-                                .color(theme::tan()),
-                            );
-                            if cancel_button(
-                                ui,
-                                "Remove from the queue",
-                                "Remove this repository from the queue before its scan/check starts.",
-                                self.tooltip_verbosity,
-                            )
-                            .clicked()
-                            {
-                                actions.push(Action::Cancel(row.name.clone()));
-                            }
-                        });
-                    }
-                    Some((kind, RepoStatus::Running, _, elapsed, event, eta)) => {
-                        let elapsed = elapsed.unwrap_or_default();
-                        let checking = kind == JobKind::Check;
-                        ui.horizontal(|ui| {
-                            ui.add(egui::Spinner::new().color(theme::amber()));
-                            match &event {
-                                // Only a full update hashes; a check never does.
-                                ProgressEvent::Hashing { done, total, .. }
-                                    if *total > 0 && !checking =>
-                                {
-                                    let frac = *done as f32 / *total as f32;
-                                    let pct = (frac * 100.0) as u32;
-                                    ui.add(
-                                        egui::ProgressBar::new(frac)
-                                            .desired_width(240.0)
-                                            .text(format!("{pct}% · {done}/{total}")),
-                                    );
-                                }
-                                ProgressEvent::Scanning { files, dirs } if checking => {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "checking — {files} files, {dirs} dirs"
-                                        ))
-                                        .color(theme::amber()),
-                                    );
-                                }
-                                other => {
-                                    ui.label(
-                                        RichText::new(progress_line(other)).color(theme::amber()),
-                                    );
-                                }
-                            }
-                            let (hover, hover_verbose) = if checking {
-                                (
-                                    "Stop the check",
-                                    "Stop this dry-run check. No index changes have been made, \
-                                     so there's nothing to roll back.",
-                                )
-                            } else {
-                                (
-                                    "Stop the scan (already-hashed files stay indexed)",
-                                    "Stop this scan. Files already hashed before you cancelled \
-                                     stay committed to the index; only unhashed files are left \
-                                     for next time.",
-                                )
-                            };
-                            if cancel_button(ui, hover, hover_verbose, self.tooltip_verbosity).clicked() {
-                                actions.push(Action::Cancel(row.name.clone()));
-                            }
-                        });
-                        let verb = if checking { "checking" } else { "scanning" };
-                        let hashing = !checking && matches!(&event, ProgressEvent::Hashing { total, .. } if *total > 0);
-                        let timing = match eta {
-                            Some(eta) if hashing => format!(
-                                "scanning for {} · ETA {}",
-                                format_elapsed(elapsed),
-                                format_elapsed(eta)
-                            ),
-                            _ => format!("{verb} for {}", format_elapsed(elapsed)),
-                        };
-                        ui.label(RichText::new(timing).color(theme::tan()).size(12.0));
-                    }
-                    None => {
-                        self.card_controls(ui, row, actions);
-                        if let Some(last) = &row.last {
-                            ui.label(RichText::new(last).color(theme::tan()).size(12.0));
-                        }
-                    }
+                self.card_controls(ui, row, actions);
+                if let Some(last) = &row.last {
+                    ui.label(RichText::new(last).color(theme::tan()).size(12.0));
                 }
             });
     }
@@ -2052,35 +2153,37 @@ impl DedupApp {
         // mount would hang the worker), so gate both jobs on reachability.
         let reachable = row.location.is_none_or(|l| l.reachable());
         ui.horizontal(|ui| {
-            let update = egui::Button::new(
-                RichText::new(format!("{} UPDATE / SCAN", icon::REFRESH)).color(theme::black()),
-            );
-            if ui
-                .add_enabled(reachable, update)
-                .explain(
-                    self.tooltip_verbosity,
-                    "Scan the folder and index new or changed files",
-                    "Walk this repository's folder, hash any new or changed files, and \
-                     mark vanished files missing. Already-hashed unchanged files are \
-                     skipped, so a repeat scan is fast.",
-                )
-                .clicked()
+            if crate::lcars::action_button(
+                ui,
+                &format!("{} UPDATE / SCAN", icon::REFRESH),
+                reachable,
+                theme::orange(),
+            )
+            .explain(
+                self.tooltip_verbosity,
+                "Scan the folder and index new or changed files",
+                "Walk this repository's folder in the activity window, hash any new or \
+                 changed files, and mark vanished files missing. Already-hashed unchanged \
+                 files are skipped, so a repeat scan is fast.",
+            )
+            .clicked()
             {
                 actions.push(Action::Update(row.name.clone()));
             }
-            let check = egui::Button::new(
-                RichText::new(format!("{} CHECK", icon::SEARCH)).color(theme::black()),
-            );
-            if ui
-                .add_enabled(reachable, check)
-                .explain(
-                    self.tooltip_verbosity,
-                    "Dry-run: report new, changed, and missing files without hashing or writing",
-                    "Dry-run a scan: report how many files are new, changed, or missing \
+            if crate::lcars::action_button(
+                ui,
+                &format!("{} CHECK", icon::SEARCH),
+                reachable,
+                theme::amber(),
+            )
+            .explain(
+                self.tooltip_verbosity,
+                "Dry-run: report new, changed, and missing files without hashing or writing",
+                "Dry-run a scan: report how many files are new, changed, or missing \
                      compared to the index, without hashing anything or writing to the \
                      index. Use this to see if UPDATE / SCAN has real work to do.",
-                )
-                .clicked()
+            )
+            .clicked()
             {
                 actions.push(Action::Check(row.name.clone()));
             }
@@ -2300,14 +2403,13 @@ impl DedupApp {
     }
 
     fn add_modal(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
-        let busy = self.worker.active_count() > 0;
         // Effective name = what Create would use (typed name, or the folder's
         // own name when blank). Adding is blocked if it clashes with an existing
         // repo, so the user sees the problem before submitting.
         let effective = effective_name(&self.new_name, &self.new_path);
         let clashes = !effective.is_empty() && self.repos.iter().any(|r| r.name == effective);
         let has_path = !self.new_path.trim().is_empty();
-        let can_add = !busy && has_path && !effective.is_empty() && !clashes;
+        let can_add = has_path && !effective.is_empty() && !clashes;
 
         let response = egui::Modal::new(Id::new("add-repo")).show(ctx, |ui| {
             ui.set_width(460.0);
@@ -2686,7 +2788,7 @@ impl DedupApp {
         if let Some(go) = decision {
             self.empty_scan_confirm = None;
             if go {
-                self.enqueue(repo, JobKind::UpdateForced);
+                self.start_scans(ctx, vec![repo], JobKind::UpdateForced);
             }
         } else if response.should_close() {
             self.empty_scan_confirm = None;
@@ -2868,65 +2970,6 @@ impl DedupApp {
                         );
                         ui.label(RichText::new(&e.detail).color(theme::text()).size(12.0));
                     });
-            }
-
-            // Activity: the heavy background work you can watch and stop — the
-            // answer to "why are the fans blasting?" and the way to end a
-            // runaway scan without killing the whole app.
-            ui.add_space(12.0);
-            ui.label(
-                RichText::new("ACTIVITY")
-                    .color(theme::tan())
-                    .size(13.0)
-                    .strong(),
-            );
-            ui.add_space(4.0);
-            let jobs = self.worker.jobs();
-            if jobs.is_empty() {
-                ui.label(
-                    RichText::new("No background work running.")
-                        .color(theme::grey())
-                        .size(12.0),
-                );
-            } else {
-                let mut cancel: Option<String> = None;
-                for (repo, status, kind) in &jobs {
-                    let verb = match kind {
-                        JobKind::Check => "Checking",
-                        _ => "Scanning",
-                    };
-                    let state = if *status == RepoStatus::Running {
-                        "running"
-                    } else {
-                        "queued"
-                    };
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("{verb} '{repo}' — {state}"))
-                                .color(theme::text())
-                                .size(12.0),
-                        );
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui
-                                .button(RichText::new("CANCEL").color(theme::text()))
-                                .on_hover_text("Stop this job. Anything already scanned stays.")
-                                .clicked()
-                            {
-                                cancel = Some(repo.clone());
-                            }
-                        });
-                    });
-                }
-                if let Some(name) = cancel {
-                    // Same path as the repository card's CANCEL: signal a running
-                    // job to stop cooperatively, or drop a still-queued one.
-                    if let Some(token) = self.cancels.get(&name) {
-                        token.cancel();
-                    } else {
-                        self.queue.retain(|(n, _)| n != &name);
-                        self.worker.remove(&name);
-                    }
-                }
             }
         });
         self.show_status = open;
@@ -3149,22 +3192,6 @@ fn status_pills(ui: &mut egui::Ui, row: &RepoRow, verbosity: TooltipVerbosity) {
     }
 }
 
-/// The RED "CANCEL" button shared by queued and running repo cards.
-fn cancel_button(
-    ui: &mut egui::Ui,
-    hover: &str,
-    hover_verbose: &str,
-    verbosity: TooltipVerbosity,
-) -> egui::Response {
-    ui.add(
-        egui::Button::new(
-            RichText::new(format!("{} CANCEL", icon::X)).color(theme::ink_on(theme::red())),
-        )
-        .fill(theme::red()),
-    )
-    .explain(verbosity, hover, hover_verbose)
-}
-
 fn tab_button(
     ui: &mut egui::Ui,
     current: &mut Tab,
@@ -3334,29 +3361,6 @@ fn unique_repo_name(base: &str, taken: &HashSet<String>) -> String {
         .expect("an unbounded range always yields a free name")
 }
 
-/// Format a duration compactly: `"45s"`, `"3m 12s"`, or `"1h 04m"`.
-fn format_elapsed(d: Duration) -> String {
-    let secs = d.as_secs();
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m {:02}s", secs / 60, secs % 60)
-    } else {
-        format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
-    }
-}
-
-fn progress_line(event: &ProgressEvent) -> String {
-    match event {
-        ProgressEvent::Scanning { files, dirs } => {
-            format!("scanning — {files} files, {dirs} dirs")
-        }
-        ProgressEvent::Hashing { done, total, .. } => format!("hashing {done}/{total}"),
-        ProgressEvent::Error { message, .. } => format!("warning: {message}"),
-        ProgressEvent::Finished { .. } => "finishing…".into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{effective_name, sanitize_repo_name, unique_repo_name};
@@ -3428,7 +3432,7 @@ mod tests {
 mod ui_tests {
     use super::*;
     use dedup_core::store::SyncMode;
-    use dedup_core::update::{NoProgress, update_repo};
+    use dedup_core::update::{CancellationToken, NoProgress, update_repo};
     use egui_kittest::Harness;
 
     /// A temp store with two scanned repos, so the Repository Management
@@ -3522,19 +3526,90 @@ mod ui_tests {
         (tmp, DedupApp::new(store))
     }
 
-    /// REFRESH STATUS re-probes reachability only: no CHECK job is queued and
-    /// no directory walk starts. It used to also enqueue a freshness check per
+    /// UPDATE ALL scans every repository as one operation in the activity
+    /// window — each repository on its own row — ends on a report, and each
+    /// card gets its last-scan line.
+    #[test]
+    fn update_all_scans_every_repository_as_one_operation() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, app) = sample_app();
+        let activity = app.activity.clone();
+        let mut h = render_with_activity(app);
+        h.get_by_label_contains("UPDATE ALL").click();
+        h.step();
+        assert_eq!(
+            crate::activity::lock(&activity).busy(),
+            Some(crate::activity::Busy("UPDATE 2 repositories".to_string())),
+            "one operation over both repositories"
+        );
+        for _ in 0..400 {
+            h.step();
+            if !crate::activity::lock(&activity).is_running() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        h.step();
+        assert!(
+            crate::activity::lock(&activity).has_report(),
+            "the operation ends on its report"
+        );
+        assert!(
+            h.query_by_label_contains("UPDATE 2 repositories").is_some(),
+            "the report names the operation"
+        );
+        for row in &h.state().repos {
+            assert!(
+                row.last.as_deref().is_some_and(|l| l.contains("added")),
+                "'{}' shows its last-scan line: {:?}",
+                row.name,
+                row.last
+            );
+        }
+    }
+
+    /// A registry change — here a rename — answers with a card naming what
+    /// changed, and no event-log line: nothing on disk moved.
+    #[test]
+    fn a_rename_answers_with_a_card_and_no_log_line() {
+        let (tmp, mut app) = sample_app();
+        let ctx = egui::Context::default();
+        app.apply(
+            &ctx,
+            None,
+            Action::CommitRename("Videos".to_string(), "Clips".to_string()),
+        );
+        assert!(app.repos.iter().any(|r| r.name == "Clips"));
+        let activity = crate::activity::lock(&app.activity);
+        assert!(
+            activity
+                .card_lines()
+                .iter()
+                .any(|l| l == "Renamed repository from 'Videos'"),
+            "a card names the rename: {:?}",
+            activity.card_lines()
+        );
+        assert!(
+            !tmp.path()
+                .join("cfg")
+                .join(crate::activity::EVENT_LOG_FILE)
+                .exists(),
+            "a registry change is not an event-log line"
+        );
+    }
+
+    /// REFRESH STATUS re-probes reachability only: no CHECK starts and no
+    /// directory walk begins. It used to also start a freshness check per
     /// reachable repo — pressing it after reconnecting a drive buried the user
     /// in scans to cancel.
     #[test]
-    fn refresh_status_probes_without_queueing_scans() {
+    fn refresh_status_probes_without_starting_scans() {
         let (_tmp, mut app) = sample_app();
         let ctx = egui::Context::default();
         app.apply(&ctx, None, Action::RefreshStatus);
         assert!(
-            app.queue.is_empty(),
-            "reachability refresh queues no jobs: {:?}",
-            app.queue
+            !crate::activity::lock(&app.activity).is_running(),
+            "reachability refresh starts no operation"
         );
         // The probes themselves still run: every repo reports a location.
         for _ in 0..2 {
@@ -3544,9 +3619,13 @@ mod ui_tests {
                 .expect("a probe result per repo");
             assert!(loc.reachable(), "'{name}' is a plain local dir");
         }
-        // Contrast: an explicit CHECK still queues real work.
+        // Contrast: an explicit CHECK is real work, on the activity modal.
         app.apply(&ctx, None, Action::Check("Videos".to_string()));
-        assert_eq!(app.queue.len(), 1, "CHECK queues exactly its own job");
+        assert_eq!(
+            crate::activity::lock(&app.activity).busy(),
+            Some(crate::activity::Busy("CHECK 'Videos'".to_string())),
+            "CHECK runs as its own operation"
+        );
     }
 
     /// Returning to the Repositories tab must re-read the registry, so counts
@@ -3738,6 +3817,7 @@ mod ui_tests {
                         theme::apply(ui.ctx(), theme::DARK);
                         init = true;
                     }
+                    app.drain_scans();
                     let mut actions = Vec::new();
                     app.repositories_view(ui, &mut actions);
                     crate::activity::lock(&app.activity).show(ui);
@@ -3809,7 +3889,6 @@ mod ui_tests {
             Err(crate::activity::Busy("FIND similar files".into())),
             "a second operation is refused by name"
         );
-        assert!(crate::activity::lock(&activity).blocks_external());
 
         h.get_by_label("CANCEL").click();
         for _ in 0..5 {
@@ -4497,8 +4576,6 @@ mod ui_tests {
             "Video frames, soundtrack extraction and playback rates need ffmpeg / ffprobe.",
         );
         // A running scan so the Activity section shows something to cancel.
-        app.worker.mark_queued("Automatic Upload", JobKind::Update);
-        app.worker.mark_running("Automatic Upload");
         app.show_status = true;
 
         let mut init = false;
