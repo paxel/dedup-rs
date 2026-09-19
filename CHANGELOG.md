@@ -4,6 +4,14 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 ## [0.8.1] - Unreleased
 
+### Changed
+
+- **A quick FIND no longer costs two clicks.** The activity window now waits
+  two seconds before it appears, so a search that answers in less than that
+  never puts a modal on screen at all, and a FIND that finishes without problems reports in
+  a notification card that expires by itself instead of a window to dismiss.
+  A FIND that hit problems, or was cancelled, still ends in the report.
+
 ### Fixed
 
 - **The activity window keeps one width while it works.** During an UPDATE or a

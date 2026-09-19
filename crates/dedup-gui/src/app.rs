@@ -3866,9 +3866,19 @@ mod ui_tests {
                 },
             )
             .expect("start");
-        // Step, not run: the modal asks for repaints while it is up.
-        for _ in 0..20 {
+        // Step, not run: the modal asks for repaints while it is up. It only
+        // appears once the work has outlived its grace period, so the stepping
+        // has to outlast that too.
+        assert!(
+            h.query_by_label("CANCEL").is_none(),
+            "nothing is on screen while the work is still inside its grace period"
+        );
+        for _ in 0..200 {
             h.step();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if h.query_by_label("CANCEL").is_some() {
+                break;
+            }
         }
         assert!(
             h.query_by_label_contains("FIND SIMILAR FILES").is_some(),
@@ -3896,9 +3906,17 @@ mod ui_tests {
             "a second operation is refused by name"
         );
 
-        h.get_by_label("CANCEL").click();
-        for _ in 0..5 {
+        // Let the just-opened modal settle before aiming at its button.
+        for _ in 0..3 {
             h.step();
+        }
+        h.get_by_label("CANCEL").click();
+        for _ in 0..20 {
+            h.step();
+            if h.query_by_label_contains("cancelling").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(
             h.query_by_label_contains("cancelling").is_some(),
@@ -4002,7 +4020,9 @@ mod ui_tests {
                 crate::activity::Notification::changed("Deleted", "Videos", "bebop_sepia.jpg"),
             );
         }
-        for _ in 0..40 {
+        // Long enough to outlive the modal's grace period, so the shot has a
+        // modal in it at all.
+        for _ in 0..140 {
             h.step();
             std::thread::sleep(std::time::Duration::from_millis(25));
         }

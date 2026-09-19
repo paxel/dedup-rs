@@ -2478,7 +2478,10 @@ impl DupesView {
             filter,
             tx: self.tx.clone(),
         };
-        let started = crate::activity::lock(&self.activity).start(
+        // A search answers with the list it fills: a clean FIND reports in a
+        // card that expires by itself, and only a run with problems is worth
+        // a modal to dismiss.
+        let started = crate::activity::lock(&self.activity).start_carded(
             ctx,
             crate::activity::Spec {
                 title: search.title(),

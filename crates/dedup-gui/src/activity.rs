@@ -68,6 +68,10 @@ const MODAL_MIN_W: f32 = 560.0;
 const MODAL_MAX_W: f32 = 720.0;
 /// How much of the app window the activity modal may take.
 const MODAL_MAX_FRACTION: f32 = 0.8;
+/// How long an operation must run before the modal appears. Work that ends
+/// inside this window never blocks the app at all — a FIND that answers
+/// quickly must not cost a click.
+const MODAL_GRACE: Duration = Duration::from_secs(2);
 /// The event log's file name under the configuration directory.
 pub const EVENT_LOG_FILE: &str = "events.jsonl";
 
@@ -162,9 +166,23 @@ impl Notification {
         }
     }
 
+    /// A finished operation reporting itself in a card instead of the
+    /// blocking report: the report's own one-line headline, with no file and
+    /// no repository behind it.
+    pub fn reported(headline: impl Into<String>) -> Self {
+        Self {
+            action: headline.into(),
+            repo: String::new(),
+            path: String::new(),
+            outcome: Ok(()),
+            changed_disk: false,
+        }
+    }
+
     /// The card's first line: the verb and the file.
     pub fn headline(&self) -> String {
         match &self.outcome {
+            Ok(()) if self.path.is_empty() => self.action.clone(),
             Ok(()) => format!("{} {}", self.action, self.path),
             Err(_) => format!("FAILED: {} {}", self.action.to_lowercase(), self.path),
         }
@@ -374,6 +392,9 @@ struct Running {
     rows: Vec<RepoRow>,
     problems: Vec<String>,
     cancel: CancellationToken,
+    /// Whether a clean finish reports in a card instead of the blocking
+    /// report modal.
+    card_when_clean: bool,
 }
 
 /// One repository's line in a multi-repository operation.
@@ -573,7 +594,20 @@ impl Activity {
     where
         F: FnOnce(&ActivityProgress, &CancellationToken) -> RunReport + Send + 'static,
     {
-        self.launch(ctx, spec, move |progress, cancel| {
+        self.launch(ctx, spec, false, move |progress, cancel| {
+            Some(work(progress, cancel))
+        })
+    }
+
+    /// Start a search: work whose answer is the list it fills, so a clean
+    /// finish needs no acknowledgement. The report becomes a notification
+    /// card that expires by itself; a run with problems, or a cancelled one,
+    /// still opens the report — those want reading.
+    pub fn start_carded<F>(&mut self, ctx: &egui::Context, spec: Spec, work: F) -> Result<(), Busy>
+    where
+        F: FnOnce(&ActivityProgress, &CancellationToken) -> RunReport + Send + 'static,
+    {
+        self.launch(ctx, spec, true, move |progress, cancel| {
             Some(work(progress, cancel))
         })
     }
@@ -587,7 +621,7 @@ impl Activity {
         F: FnOnce(&ActivityProgress, &CancellationToken) -> Result<(), String> + Send + 'static,
     {
         let title = spec.title.clone();
-        self.launch(ctx, spec, move |progress, cancel| {
+        self.launch(ctx, spec, false, move |progress, cancel| {
             match work(progress, cancel) {
                 Ok(()) => None,
                 Err(_) if cancel.is_cancelled() => None,
@@ -600,7 +634,13 @@ impl Activity {
         })
     }
 
-    fn launch<F>(&mut self, ctx: &egui::Context, spec: Spec, work: F) -> Result<(), Busy>
+    fn launch<F>(
+        &mut self,
+        ctx: &egui::Context,
+        spec: Spec,
+        card_when_clean: bool,
+        work: F,
+    ) -> Result<(), Busy>
     where
         F: FnOnce(&ActivityProgress, &CancellationToken) -> Option<RunReport> + Send + 'static,
     {
@@ -622,6 +662,7 @@ impl Activity {
             rows: Vec::new(),
             problems: Vec::new(),
             cancel: cancel.clone(),
+            card_when_clean,
         });
         let progress = self.progress_handle(ctx);
         std::thread::spawn(move || {
@@ -668,6 +709,13 @@ impl Activity {
     /// Show a card without logging — the summary of a batch whose files were
     /// each [`Self::record`]ed.
     pub fn card(&mut self, ctx: &egui::Context, note: Notification) {
+        self.push_card(note);
+        ctx.request_repaint();
+    }
+
+    /// Stack a card without asking for a repaint — for a card raised while
+    /// draining, which the frame doing the draining draws anyway.
+    fn push_card(&mut self, note: Notification) {
         self.cards.push_front(Card {
             note,
             born: Instant::now(),
@@ -676,7 +724,6 @@ impl Activity {
             self.cards.pop_back();
         }
         self.unread += 1;
-        ctx.request_repaint();
     }
 
     /// The card text currently on screen, newest first.
@@ -758,6 +805,7 @@ impl Activity {
                     let Some(mut report) = report else {
                         continue;
                     };
+                    let mut carded = false;
                     if let Some(r) = running {
                         // Every problem the modal listed live belongs in the
                         // report too, whether or not the operation added
@@ -770,8 +818,13 @@ impl Activity {
                         if r.cancel.is_cancelled() {
                             report = report.cancelled(true);
                         }
+                        carded = r.card_when_clean;
                     }
-                    self.report.open(report);
+                    if carded && report.complete() {
+                        self.push_card(Notification::reported(report.headline()));
+                    } else {
+                        self.report.open(report);
+                    }
                 }
             }
         }
@@ -788,9 +841,17 @@ impl Activity {
         if self.show_log {
             self.draw_log(&ctx);
         }
+        // Work still inside its grace period is left undrawn: no modal, and
+        // nothing blocked, so a search that answers at once answers silently.
+        let waiting = self
+            .running
+            .as_ref()
+            .is_some_and(|r| r.started.elapsed() < MODAL_GRACE);
         let blocking = if self.running.is_some() {
-            self.draw_running(&ctx);
-            true
+            if !waiting {
+                self.draw_running(&ctx);
+            }
+            !waiting
         } else {
             self.report.show(ui)
         };
@@ -1174,6 +1235,61 @@ mod tests {
         let cut = phase_line(one_word, 10);
         assert!(cut.chars().count() <= 10, "{cut}");
         assert!(cut.starts_with('…') && cut.ends_with("space"), "{cut}");
+    }
+
+    #[test]
+    fn a_clean_carded_run_ends_in_a_card_and_a_troubled_one_in_the_report() {
+        let dir = tempfile::tempdir().expect("dir");
+        let ctx = egui::Context::default();
+        let mut activity = Activity::new(dir.path());
+        activity
+            .start_carded(
+                &ctx,
+                Spec {
+                    title: "FIND duplicates".into(),
+                    repos: vec!["photos".into()],
+                },
+                |_, _| RunReport::new("FIND duplicates").count("groups", 0),
+            )
+            .expect("start");
+        for _ in 0..50 {
+            activity.drain();
+            if !activity.is_running() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!activity.report.is_open(), "a clean search needs no report");
+        assert_eq!(
+            activity.card_lines(),
+            vec!["FIND duplicates done: groups 0.".to_string()]
+        );
+
+        activity
+            .start_carded(
+                &ctx,
+                Spec {
+                    title: "FIND duplicates".into(),
+                    repos: vec!["photos".into()],
+                },
+                |progress, _| {
+                    progress.problem("photos: a.jpg: unreadable");
+                    RunReport::new("FIND duplicates").count("groups", 0)
+                },
+            )
+            .expect("start");
+        for _ in 0..50 {
+            activity.drain();
+            if !activity.is_running() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            activity.report.is_open(),
+            "a search that hit problems still reports"
+        );
+        assert_eq!(activity.card_lines().len(), 1, "and raises no second card");
     }
 
     #[test]
