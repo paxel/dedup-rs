@@ -61,6 +61,9 @@ const CARD_LIFETIME: Duration = Duration::from_secs(8);
 const CARD_SLIDE: Duration = Duration::from_millis(250);
 /// How many cards stack before the oldest is pushed out early.
 const MAX_CARDS: usize = 4;
+/// Where the card stack starts: clear of the top bar, so a run of cards never
+/// covers HELP, STATUS or LOG while the user is reaching for them.
+const CARD_TOP: f32 = crate::app::TOP_BAR_H + 8.0;
 /// The narrowest the activity modal ever gets: enough for a phase line with a
 /// path in it.
 const MODAL_MIN_W: f32 = 560.0;
@@ -837,7 +840,6 @@ impl Activity {
         let ctx = ui.ctx().clone();
         self.expire_cards();
         self.draw_cards(&ctx);
-        self.draw_corner(&ctx);
         if self.show_log {
             self.draw_log(&ctx);
         }
@@ -1046,7 +1048,7 @@ impl Activity {
     }
 
     fn draw_cards(&mut self, ctx: &egui::Context) {
-        let mut y = 44.0;
+        let mut y = CARD_TOP;
         for card in &self.cards {
             // Slide in from the right edge over the first quarter second,
             // measured from the card's birth so the first frame starts off-screen.
@@ -1094,43 +1096,29 @@ impl Activity {
         }
     }
 
-    /// The always-present corner control: the LOG button with its unread
-    /// badge, so the history is one click away whether or not a card is up.
-    fn draw_corner(&mut self, ctx: &egui::Context) {
-        let mut open = false;
-        egui::Area::new(Id::new("activity-corner"))
-            .order(egui::Order::Foreground)
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 8.0))
-            .show(ctx, |ui| {
-                let label = if self.unread > 0 {
-                    format!("LOG ({})", self.unread)
-                } else {
-                    "LOG".to_string()
-                };
-                let accent = if self.unread > 0 {
-                    theme::amber()
-                } else {
-                    theme::grey()
-                };
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new(label).color(accent).size(11.0))
-                            .wrap_mode(egui::TextWrapMode::Extend)
-                            .fill(theme::panel())
-                            .stroke(egui::Stroke::new(1.0, accent)),
-                    )
-                    .explain(
-                        crate::settings::TooltipVerbosity::default(),
-                        "Every change the app made to your files",
-                        "Open the event log: every file the app deleted, copied, moved, \
-                         renamed or overwrote, newest first, kept across restarts.",
-                    )
-                    .clicked()
-                {
-                    open = true;
-                }
-            });
-        if open {
+    /// The LOG button with its unread badge, drawn by the app in its top bar
+    /// beside STATUS. It used to float in the top-right corner over whatever
+    /// was there; it belongs in the chrome, not on top of it.
+    pub fn log_button(&mut self, ui: &mut egui::Ui, verbosity: crate::settings::TooltipVerbosity) {
+        let label = if self.unread > 0 {
+            format!("LOG ({})", self.unread)
+        } else {
+            "LOG".to_string()
+        };
+        let accent = if self.unread > 0 {
+            theme::amber()
+        } else {
+            theme::tan()
+        };
+        if crate::lcars::action_button(ui, &label, true, accent)
+            .explain(
+                verbosity,
+                "Every change the app made to your files",
+                "Open the event log: every file the app deleted, copied, moved, \
+                 renamed or overwrote, newest first, kept across restarts.",
+            )
+            .clicked()
+        {
             self.show_log = true;
             self.unread = 0;
             self.log_entries = self.log.read();

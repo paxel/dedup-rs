@@ -14,6 +14,12 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 ### Fixed
 
+- **The top bar's buttons stay visible and reachable.** The LOG button floated
+  in the top-right corner on top of whatever was underneath — STATUS, HELP,
+  ABOUT and SETTINGS among them — and the notification cards started high
+  enough to cover them too, so a run of cards could hide HELP for half a
+  minute. LOG is now part of the top bar beside STATUS, with the same unread
+  count, and the cards begin below the bar.
 - **The activity window keeps one width while it works.** During an UPDATE or a
   transfer RUN the window grew and shrank with every file, because the phase
   line was as wide as the path it names. The window now takes 80 % of the app

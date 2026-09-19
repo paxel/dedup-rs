@@ -21,6 +21,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// The height of the app's top bar. The notification cards start below it, so
+/// nothing they say can sit over SETTINGS, ABOUT, HELP, STATUS or LOG.
+pub(crate) const TOP_BAR_H: f32 = 56.0;
+
 /// Repos scan one at a time (each scan already parallelizes across all CPU
 /// cores), so the queue starts a new scan only while fewer than this many run.
 /// What a scan does: index the folder, index it even when it walked empty
@@ -1409,7 +1413,7 @@ impl eframe::App for DedupApp {
 impl DedupApp {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("top")
-            .exact_size(56.0)
+            .exact_size(TOP_BAR_H)
             .frame(egui::Frame::new().fill(theme::bg()).inner_margin(8.0))
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
@@ -1501,6 +1505,10 @@ impl DedupApp {
                             self.show_status = true;
                             self.diag.mark_all_read();
                         }
+                        // The event log, beside STATUS: added after it so it
+                        // renders immediately to its left.
+                        crate::activity::lock(&self.activity)
+                            .log_button(ui, self.tooltip_verbosity);
                         // The remaining width (left of HELP) holds the scrollable
                         // tab strip, laid out left-to-right in its natural order.
                         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
@@ -3825,6 +3833,10 @@ mod ui_tests {
                     }
                     app.drain_scans();
                     let mut actions = Vec::new();
+                    // The LOG button sits in the real app's top bar; this
+                    // harness draws no top bar, so it stands in for one — at
+                    // the top, where a click can reach it.
+                    crate::activity::lock(&app.activity).log_button(ui, app.tooltip_verbosity);
                     app.repositories_view(ui, &mut actions);
                     crate::activity::lock(&app.activity).show(ui);
                     let ctx = ui.ctx().clone();
