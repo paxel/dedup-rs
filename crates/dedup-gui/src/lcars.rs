@@ -152,6 +152,44 @@ pub fn section_lcars_collapsible<R>(
     out
 }
 
+/// The folded state of a view's sections, keyed by section title. Every
+/// section is open until the view folds them all (after a FIND, a REVIEW, a
+/// PREVIEW); from then on each one flips back open on its own header, and the
+/// rest stay folded.
+pub struct Folds {
+    open: std::collections::HashMap<String, bool>,
+    /// What a section not yet in the map is: open until the view folds.
+    default_open: bool,
+}
+
+impl Default for Folds {
+    fn default() -> Self {
+        Self {
+            open: std::collections::HashMap::new(),
+            default_open: true,
+        }
+    }
+}
+
+impl Folds {
+    /// Whether `title`'s section is open right now.
+    pub fn is_open(&self, title: &str) -> bool {
+        *self.open.get(title).unwrap_or(&self.default_open)
+    }
+
+    /// Record what the header click left the section as.
+    pub fn set(&mut self, title: &str, open: bool) {
+        self.open.insert(title.to_string(), open);
+    }
+
+    /// Fold every section, including ones this view has not drawn yet (the
+    /// titles change with the command).
+    pub fn fold_all(&mut self) {
+        self.open.clear();
+        self.default_open = false;
+    }
+}
+
 /// A section whose folded state the caller owns, rather than egui's memory:
 /// drawn open or as its stadium bar according to `open`, which a click on the
 /// header flips. For a view that folds a whole group of sections itself (the

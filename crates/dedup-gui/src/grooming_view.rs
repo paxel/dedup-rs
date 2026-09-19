@@ -357,7 +357,7 @@ pub struct GroomingView {
     command_chosen: bool,
     /// After REVIEW or RUN the selection sections fold into one summary line
     /// until CHANGE.
-    selection_collapsed: bool,
+    folds: crate::lcars::Folds,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     verbosity: TooltipVerbosity,
@@ -429,7 +429,7 @@ impl GroomingView {
             pending_refresh: false,
             activity: crate::activity::scratch(),
             command_chosen: false,
-            selection_collapsed: false,
+            folds: crate::lcars::Folds::default(),
             tx,
             rx,
             verbosity: TooltipVerbosity::default(),
@@ -526,30 +526,23 @@ impl GroomingView {
                 // Reading order is the workflow: WHAT (the tool), WITH WHICH
                 // (the repository, plus the dupe pool for DEDUPE), HOW (the
                 // filter or the rules), then RUN. Each section appears once the
-                // one before it has an answer; after REVIEW or RUN they fold
-                // into one line.
-                if self.selection_collapsed {
-                    self.selection_summary(ui);
-                    if self.ready() {
-                        self.action_bar(ui, &mut acts);
+                // one before it has an answer; after REVIEW or RUN they fold to
+                // their header bars, and each one flips back open on its own.
+                self.command_bar(ui, &mut acts);
+                if self.command_chosen {
+                    match self.command {
+                        Command::Dedupe => self.dedupe_layout(ui, &mut acts),
+                        Command::Purge => self.purge_layout(ui, &mut acts),
+                        Command::EmptyDirs => self.empty_dirs_layout(ui, &mut acts),
+                        Command::Organize => self.organize_layout(ui, &mut acts),
+                        Command::Prune => self.prune_layout(ui, &mut acts),
                     }
-                } else {
-                    self.command_bar(ui, &mut acts);
-                    if self.command_chosen {
-                        match self.command {
-                            Command::Dedupe => self.dedupe_layout(ui, &mut acts),
-                            Command::Purge => self.purge_layout(ui, &mut acts),
-                            Command::EmptyDirs => self.empty_dirs_layout(ui, &mut acts),
-                            Command::Organize => self.organize_layout(ui, &mut acts),
-                            Command::Prune => self.prune_layout(ui, &mut acts),
-                        }
-                    }
-                    if self.command_chosen && self.repo_picked() {
-                        self.how_sections(ui, store, &mut acts);
-                    }
-                    if self.command_chosen && self.ready() {
-                        self.action_bar(ui, &mut acts);
-                    }
+                }
+                if self.command_chosen && self.repo_picked() {
+                    self.how_sections(ui, store, &mut acts);
+                }
+                if self.command_chosen && self.ready() {
+                    self.action_bar(ui, &mut acts);
                 }
 
                 if let Some(err) = &self.error {
@@ -573,31 +566,29 @@ impl GroomingView {
     }
 
     fn command_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(
-            ui,
-            "WHAT — DEDUPE, PURGE, EMPTY DIRS, ORGANIZE OR PRUNE",
-            theme::orange(),
-            |ui| {
-                ui.horizontal(|ui| {
-                    for cmd in [
-                        Command::Dedupe,
-                        Command::Purge,
-                        Command::EmptyDirs,
-                        Command::Organize,
-                        Command::Prune,
-                    ] {
-                        let sel = self.command_chosen && self.command == cmd;
-                        let (short, verbose) = cmd.tooltip();
-                        if crate::lcars::toggle_button(ui, cmd.label(), sel, theme::red())
-                            .explain(self.verbosity, short, verbose)
-                            .clicked()
-                        {
-                            acts.push(Act::SetCommand(cmd));
-                        }
+        let title = "WHAT — DEDUPE, PURGE, EMPTY DIRS, ORGANIZE OR PRUNE";
+        let mut open = self.folds.is_open(title);
+        crate::lcars::section_lcars_folding(ui, title, theme::orange(), &mut open, |ui| {
+            ui.horizontal(|ui| {
+                for cmd in [
+                    Command::Dedupe,
+                    Command::Purge,
+                    Command::EmptyDirs,
+                    Command::Organize,
+                    Command::Prune,
+                ] {
+                    let sel = self.command_chosen && self.command == cmd;
+                    let (short, verbose) = cmd.tooltip();
+                    if crate::lcars::toggle_button(ui, cmd.label(), sel, theme::red())
+                        .explain(self.verbosity, short, verbose)
+                        .clicked()
+                    {
+                        acts.push(Act::SetCommand(cmd));
                     }
-                });
-            },
-        );
+                }
+            });
+        });
+        self.folds.set(title, open);
     }
 
     /// Whether WITH WHICH has an answer: the repository the command acts on.
@@ -635,123 +626,82 @@ impl GroomingView {
         }
     }
 
-    /// The one line the selection folds into after REVIEW or RUN, with
-    /// CHANGE to unfold it.
-    fn selection_summary(&mut self, ui: &mut egui::Ui) {
-        let repo = match self.command {
-            Command::Dedupe => format!(
-                "from '{}' against {}",
-                self.source.clone().unwrap_or_default(),
-                self.pool.join(", ")
-            ),
-            _ => format!("in '{}'", self.repo.clone().unwrap_or_default()),
-        };
-        let how = match self.command {
-            Command::Dedupe | Command::Purge => self
-                .filter_string()
-                .map(|f| format!(" · filter: {f}"))
-                .unwrap_or_default(),
-            Command::Organize => format!(" · {} rule(s)", self.organize_rules().len()),
-            Command::EmptyDirs | Command::Prune => String::new(),
-        };
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!("{} {repo}{how}", self.command.label()))
-                    .color(theme::tan())
-                    .size(12.5),
-            );
-            if crate::lcars::toggle_button(ui, "CHANGE", false, theme::lilac())
-                .explain(
-                    self.verbosity,
-                    "Change the tool or repository",
-                    "Unfold the tool, repository and option sections to set up another \
-                     grooming run. The board below stays until the next REVIEW.",
-                )
-                .clicked()
-            {
-                self.selection_collapsed = false;
-            }
-        });
-    }
-
     fn dedupe_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(
-            ui,
-            "WITH WHICH — SOURCE & DUPE POOL",
-            theme::lilac(),
-            |ui| {
-                // SOURCE: the repo duplicates are deleted from, orange when picked.
-                let src = self.repos.clone();
-                let mains = self.mains.clone();
-                crate::repo_chip::chip_row(ui, "groom_source", "SOURCE", src.len(), |ui, i| {
-                    let name = &src[i];
-                    let sel = self.source.as_deref() == Some(name.as_str());
-                    let chip = crate::repo_chip::repo_chip(
-                        ui,
-                        name,
-                        sel,
-                        theme::orange(),
-                        mains.contains(name),
-                        Some(self.locks.read_only(name)),
-                    );
-                    if chip
-                        .name
-                        .explain(
-                            self.verbosity,
-                            "Pick the repo to delete duplicates from",
-                            "Files in this repo whose content is also in any dupe-pool repo are \
+        let title = "WITH WHICH — SOURCE & DUPE POOL";
+        let mut open = self.folds.is_open(title);
+        crate::lcars::section_lcars_folding(ui, title, theme::lilac(), &mut open, |ui| {
+            // SOURCE: the repo duplicates are deleted from, orange when picked.
+            let src = self.repos.clone();
+            let mains = self.mains.clone();
+            crate::repo_chip::chip_row(ui, "groom_source", "SOURCE", src.len(), |ui, i| {
+                let name = &src[i];
+                let sel = self.source.as_deref() == Some(name.as_str());
+                let chip = crate::repo_chip::repo_chip(
+                    ui,
+                    name,
+                    sel,
+                    theme::orange(),
+                    mains.contains(name),
+                    Some(self.locks.read_only(name)),
+                );
+                if chip
+                    .name
+                    .explain(
+                        self.verbosity,
+                        "Pick the repo to delete duplicates from",
+                        "Files in this repo whose content is also in any dupe-pool repo are \
                          deleted from here.",
-                        )
-                        .clicked()
-                    {
-                        acts.push(Act::PickSource(name.clone()));
-                    }
-                    self.locks.handle_badge(chip.lock, self.verbosity, name);
-                    chip.outer
-                });
-                // DUPEPOOL: the repos to check the source against, lilac when on.
-                let pool: Vec<String> = self
-                    .repos
-                    .iter()
-                    .filter(|n| self.source.as_deref() != Some(n.as_str()))
-                    .cloned()
-                    .collect();
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("DUPEPOOL").color(theme::text()).size(12.0));
-                    if crate::repo_chip::small_button(ui, "ALL", theme::lilac())
-                        .explain(
-                            self.verbosity,
-                            "Add every eligible repo to the pool",
-                            "A source file is deleted when its content exists in any pool repo.",
-                        )
-                        .clicked()
-                    {
-                        self.pool = pool.clone();
-                    }
-                    if crate::repo_chip::small_button(ui, "NONE", theme::lilac())
-                        .explain(
-                            self.verbosity,
-                            "Clear the dupe pool",
-                            "No pool repos selected.",
-                        )
-                        .clicked()
-                    {
-                        self.pool.clear();
-                    }
-                });
-                let mains = self.mains.clone();
-                crate::repo_chip::chip_row(ui, "groom_pool", "", pool.len(), |ui, i| {
-                    let name = &pool[i];
-                    let sel = self.pool.iter().any(|r| r == name);
-                    let chip = crate::repo_chip::repo_chip(
-                        ui,
-                        name,
-                        sel,
-                        theme::lilac(),
-                        mains.contains(name),
-                        Some(self.locks.read_only(name)),
-                    );
-                    if chip
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::PickSource(name.clone()));
+                }
+                self.locks.handle_badge(chip.lock, self.verbosity, name);
+                chip.outer
+            });
+            // DUPEPOOL: the repos to check the source against, lilac when on.
+            let pool: Vec<String> = self
+                .repos
+                .iter()
+                .filter(|n| self.source.as_deref() != Some(n.as_str()))
+                .cloned()
+                .collect();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("DUPEPOOL").color(theme::text()).size(12.0));
+                if crate::repo_chip::small_button(ui, "ALL", theme::lilac())
+                    .explain(
+                        self.verbosity,
+                        "Add every eligible repo to the pool",
+                        "A source file is deleted when its content exists in any pool repo.",
+                    )
+                    .clicked()
+                {
+                    self.pool = pool.clone();
+                }
+                if crate::repo_chip::small_button(ui, "NONE", theme::lilac())
+                    .explain(
+                        self.verbosity,
+                        "Clear the dupe pool",
+                        "No pool repos selected.",
+                    )
+                    .clicked()
+                {
+                    self.pool.clear();
+                }
+            });
+            let mains = self.mains.clone();
+            crate::repo_chip::chip_row(ui, "groom_pool", "", pool.len(), |ui, i| {
+                let name = &pool[i];
+                let sel = self.pool.iter().any(|r| r == name);
+                let chip = crate::repo_chip::repo_chip(
+                    ui,
+                    name,
+                    sel,
+                    theme::lilac(),
+                    mains.contains(name),
+                    Some(self.locks.read_only(name)),
+                );
+                if chip
                     .name
                     .explain(
                         self.verbosity,
@@ -763,11 +713,11 @@ impl GroomingView {
                 {
                     acts.push(Act::TogglePool(name.clone()));
                 }
-                    self.locks.handle_badge(chip.lock, self.verbosity, name);
-                    chip.outer
-                });
-            },
-        );
+                self.locks.handle_badge(chip.lock, self.verbosity, name);
+                chip.outer
+            });
+        });
+        self.folds.set(title, open);
     }
 
     fn purge_layout(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
@@ -818,35 +768,33 @@ impl GroomingView {
     fn rules_section(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, acts: &mut Vec<Act>) {
         let repo = self.repo.clone();
 
-        crate::lcars::section_lcars(
-            ui,
-            "HOW — RULES THAT MATCH FILES & BUILD THEIR NEW PATHS",
-            theme::lilac(),
-            |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("+ RULE").color(theme::black()))
-                                .fill(theme::amber()),
-                        )
-                        .explain(
-                            self.verbosity,
-                            "Add a rule",
-                            "Add another filter → template rule. Rules are tried top to bottom; \
+        let title = "HOW — RULES THAT MATCH FILES & BUILD THEIR NEW PATHS";
+        let mut open = self.folds.is_open(title);
+        crate::lcars::section_lcars_folding(ui, title, theme::lilac(), &mut open, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("+ RULE").color(theme::black()))
+                            .fill(theme::amber()),
+                    )
+                    .explain(
+                        self.verbosity,
+                        "Add a rule",
+                        "Add another filter → template rule. Rules are tried top to bottom; \
                          the first whose filter matches a file decides its new path.",
-                        )
-                        .clicked()
-                    {
-                        acts.push(Act::AddRule);
-                    }
-                    self.preset_row(ui, acts);
-                });
-                let rule_count = self.rules.len();
-                for i in 0..rule_count {
-                    self.rule_section(ui, store, repo.as_deref(), i, acts);
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::AddRule);
                 }
-            },
-        );
+                self.preset_row(ui, acts);
+            });
+            let rule_count = self.rules.len();
+            for i in 0..rule_count {
+                self.rule_section(ui, store, repo.as_deref(), i, acts);
+            }
+        });
+        self.folds.set(title, open);
     }
 
     /// One collapsible RULE section: filter wizard, template row (with the
@@ -1013,37 +961,35 @@ impl GroomingView {
 
     /// A single-repo picker used by PURGE and EMPTY DIRS (they act on one repo).
     fn single_repo_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>, hint: &str) {
-        crate::lcars::section_lcars(
-            ui,
-            "WITH WHICH — THE REPOSITORY TO GROOM",
-            theme::lilac(),
-            |ui| {
-                let repos = self.repos.clone();
-                let mains = self.mains.clone();
-                crate::repo_chip::chip_row(ui, "groom_repo", "", repos.len(), |ui, i| {
-                    let name = &repos[i];
-                    let sel = self.repo.as_deref() == Some(name.as_str());
-                    let chip = crate::repo_chip::repo_chip(
-                        ui,
-                        name,
-                        sel,
-                        theme::orange(),
-                        mains.contains(name),
-                        Some(self.locks.read_only(name)),
-                    );
-                    if chip
-                        .name
-                        .explain(self.verbosity, "Pick the repo to act on", hint)
-                        .clicked()
-                    {
-                        acts.push(Act::PickRepo(name.clone()));
-                    }
-                    self.locks.handle_badge(chip.lock, self.verbosity, name);
-                    chip.outer
-                });
-                ui.label(RichText::new(hint).color(theme::lilac()).size(11.0));
-            },
-        );
+        let title = "WITH WHICH — THE REPOSITORY TO GROOM";
+        let mut open = self.folds.is_open(title);
+        crate::lcars::section_lcars_folding(ui, title, theme::lilac(), &mut open, |ui| {
+            let repos = self.repos.clone();
+            let mains = self.mains.clone();
+            crate::repo_chip::chip_row(ui, "groom_repo", "", repos.len(), |ui, i| {
+                let name = &repos[i];
+                let sel = self.repo.as_deref() == Some(name.as_str());
+                let chip = crate::repo_chip::repo_chip(
+                    ui,
+                    name,
+                    sel,
+                    theme::orange(),
+                    mains.contains(name),
+                    Some(self.locks.read_only(name)),
+                );
+                if chip
+                    .name
+                    .explain(self.verbosity, "Pick the repo to act on", hint)
+                    .clicked()
+                {
+                    acts.push(Act::PickRepo(name.clone()));
+                }
+                self.locks.handle_badge(chip.lock, self.verbosity, name);
+                chip.outer
+            });
+            ui.label(RichText::new(hint).color(theme::lilac()).size(11.0));
+        });
+        self.folds.set(title, open);
     }
 
     /// A single-line filter expression (mime / size / name with `*` wildcards).
@@ -1554,7 +1500,8 @@ impl GroomingView {
         match started {
             Ok(()) => {
                 self.previewing = true;
-                self.selection_collapsed = true;
+                self.folds.fold_all();
+                self.filter.fold();
                 self.status = Some(format!("{}…", title.to_lowercase()));
             }
             Err(busy) => crate::activity::lock(&self.activity)
@@ -1859,7 +1806,8 @@ impl GroomingView {
                     Ok(()) => {
                         self.running = true;
                         self.row_action = false;
-                        self.selection_collapsed = true;
+                        self.folds.fold_all();
+                        self.filter.fold();
                         self.clear_preview();
                         self.status = Some(format!("{}…", title.to_lowercase()));
                     }
@@ -3071,8 +3019,10 @@ mod ui_tests {
             activity.logged()
         );
         assert!(
-            h.state().selection_collapsed,
-            "the selection folds into its summary once REVIEW starts"
+            !h.state()
+                .folds
+                .is_open("WHAT — DEDUPE, PURGE, EMPTY DIRS, ORGANIZE OR PRUNE"),
+            "the selection sections fold once REVIEW starts"
         );
     }
 

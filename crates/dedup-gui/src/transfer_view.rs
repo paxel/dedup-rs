@@ -1550,7 +1550,7 @@ pub struct TransferView {
     command_chosen: bool,
     /// After REVIEW or RUN the selection sections fold into one summary line
     /// until CHANGE.
-    selection_collapsed: bool,
+    folds: crate::lcars::Folds,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     /// Tooltip wording for this frame, set at the top of [`Self::show`] from
@@ -1657,7 +1657,7 @@ impl TransferView {
             pending_refresh: false,
             activity: crate::activity::scratch(),
             command_chosen: false,
-            selection_collapsed: false,
+            folds: crate::lcars::Folds::default(),
             tx,
             rx,
             verbosity: TooltipVerbosity::default(),
@@ -1766,28 +1766,22 @@ impl TransferView {
                 // Reading order is the workflow: WHAT (the command), WITH
                 // WHICH (the repositories), HOW (destination, options, filter),
                 // then RUN. Each section appears once the one before it has an
-                // answer, and after REVIEW or RUN they fold into one line.
-                if self.selection_collapsed {
-                    self.selection_summary(ui);
-                    if self.ready() {
-                        self.action_bar(ui, &mut acts);
+                // answer; after REVIEW or RUN they fold to their header bars,
+                // and each one flips back open on its own.
+                self.command_bar(ui, &mut acts);
+                if self.command_chosen {
+                    self.repo_rows(ui, &mut acts);
+                    match self.command {
+                        Command::GroupSync => self.group_sinks_bar(ui, &mut acts),
+                        Command::GroupSyncBack => self.group_back_sink_bar(ui, &mut acts),
+                        _ => {}
                     }
-                } else {
-                    self.command_bar(ui, &mut acts);
-                    if self.command_chosen {
-                        self.repo_rows(ui, &mut acts);
-                        match self.command {
-                            Command::GroupSync => self.group_sinks_bar(ui, &mut acts),
-                            Command::GroupSyncBack => self.group_back_sink_bar(ui, &mut acts),
-                            _ => {}
-                        }
-                    }
-                    if self.command_chosen && self.source.is_some() {
-                        self.how_sections(ui, store, &mut acts);
-                    }
-                    if self.command_chosen && self.ready() {
-                        self.action_bar(ui, &mut acts);
-                    }
+                }
+                if self.command_chosen && self.source.is_some() {
+                    self.how_sections(ui, store, &mut acts);
+                }
+                if self.command_chosen && self.ready() {
+                    self.action_bar(ui, &mut acts);
                 }
 
                 if let Some(err) = &self.error {
@@ -1917,7 +1911,8 @@ impl TransferView {
         // repo in the SINK section below.
         let with_target = self.destination == Destination::Repo
             && !matches!(self.command, Command::GroupSync | Command::GroupSyncBack);
-        crate::lcars::section_lcars(ui, title, theme::lilac(), |ui| {
+        let mut open = self.folds.is_open(title);
+        crate::lcars::section_lcars_folding(ui, title, theme::lilac(), &mut open, |ui| {
             if with_target {
                 ui.columns(2, |cols| {
                     self.source_column(&mut cols[0], acts);
@@ -1930,6 +1925,7 @@ impl TransferView {
                 self.pool_row(ui, acts);
             }
         });
+        self.folds.set(title, open);
     }
 
     /// SOURCE: every repo, orange when picked.
@@ -2169,51 +2165,6 @@ impl TransferView {
         }
     }
 
-    /// The one line the selection folds into after REVIEW or RUN, with
-    /// CHANGE to unfold it.
-    fn selection_summary(&mut self, ui: &mut egui::Ui) {
-        let source = self.source.clone().unwrap_or_default();
-        let other = match self.command {
-            Command::GroupSync => format!("to {} sink(s)", self.selected_sinks.len()),
-            Command::GroupSyncBack => format!(
-                "from '{}'",
-                self.selected_sinks.first().cloned().unwrap_or_default()
-            ),
-            Command::Diff => format!("against '{}'", self.target.clone().unwrap_or_default()),
-            _ => match self.destination {
-                Destination::Repo => {
-                    format!("to '{}'", self.target.clone().unwrap_or_default())
-                }
-                Destination::Folder => format!("to folder {}", self.folder.trim()),
-            },
-        };
-        let filter = self
-            .filter_string()
-            .map(|f| format!(" · filter: {f}"))
-            .unwrap_or_default();
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!(
-                    "{} from '{source}' {other}{filter}",
-                    self.command.label()
-                ))
-                .color(theme::tan())
-                .size(12.5),
-            );
-            if crate::lcars::toggle_button(ui, "CHANGE", false, theme::lilac())
-                .explain(
-                    self.verbosity,
-                    "Change the command or repositories",
-                    "Unfold the command, repository and option sections to set up \
-                     another transfer. The board below stays until the next REVIEW.",
-                )
-                .clicked()
-            {
-                self.selection_collapsed = false;
-            }
-        });
-    }
-
     fn command_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         let has_group = self.current_group.is_some();
         let title = if has_group {
@@ -2221,7 +2172,8 @@ impl TransferView {
         } else {
             "WHAT — COPY, MOVE, SYNC, MIRROR OR DIFF"
         };
-        crate::lcars::section_lcars(ui, title, theme::orange(), |ui| {
+        let mut open = self.folds.is_open(title);
+        crate::lcars::section_lcars_folding(ui, title, theme::orange(), &mut open, |ui| {
             ui.horizontal(|ui| {
                 let mut cmds = vec![Command::Copy, Command::Move, Command::Sync, Command::Mirror];
                 // Only offered when the source is a sync group's main — GROUP SYNC
@@ -2249,67 +2201,68 @@ impl TransferView {
             });
             self.hint(ui);
         });
+        self.folds.set(title, open);
     }
 
     fn subdir_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(
-            ui,
-            "INTO — SUBFOLDER INSIDE THE TARGET",
-            theme::blue(),
-            |ui| {
-                ui.horizontal(|ui| {
-                    let changed = ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.subdir)
-                                .desired_width(220.0)
-                                .hint_text("relative/subdir (optional)"),
-                        )
-                        .explain(
-                            self.verbosity,
-                            "Relative subfolder inside the target",
-                            "Place transferred files under this relative subfolder inside the \
+        let title = "INTO — SUBFOLDER INSIDE THE TARGET";
+        let mut open = self.folds.is_open(title);
+        crate::lcars::section_lcars_folding(ui, title, theme::blue(), &mut open, |ui| {
+            ui.horizontal(|ui| {
+                let changed = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.subdir)
+                            .desired_width(220.0)
+                            .hint_text("relative/subdir (optional)"),
+                    )
+                    .explain(
+                        self.verbosity,
+                        "Relative subfolder inside the target",
+                        "Place transferred files under this relative subfolder inside the \
                          target repo, preserving each file's source-relative path. Leave \
                          blank to place them at the target root. Paths escaping the target \
                          (absolute or containing `..`) are rejected.",
-                        )
-                        .changed();
-                    if changed {
-                        acts.push(Act::SubdirChanged);
-                    }
-                    let can_browse = self.target.is_some();
-                    if ui
-                        .add_enabled(
-                            can_browse,
-                            egui::Button::new(
-                                RichText::new(format!("{} BROWSE", icon::FOLDER_OPEN))
-                                    .color(theme::black()),
-                            ),
-                        )
-                        .explain(
-                            self.verbosity,
-                            "Pick or create a subfolder",
-                            "Open a native folder picker rooted at the target repo to pick (or \
+                    )
+                    .changed();
+                if changed {
+                    acts.push(Act::SubdirChanged);
+                }
+                let can_browse = self.target.is_some();
+                if ui
+                    .add_enabled(
+                        can_browse,
+                        egui::Button::new(
+                            RichText::new(format!("{} BROWSE", icon::FOLDER_OPEN))
+                                .color(theme::black()),
+                        ),
+                    )
+                    .explain(
+                        self.verbosity,
+                        "Pick or create a subfolder",
+                        "Open a native folder picker rooted at the target repo to pick (or \
                          create) the subfolder transferred files go into.",
-                        )
-                        .clicked()
-                    {
-                        acts.push(Act::BrowseSubdir);
-                    }
-                });
-                ui.label(
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::BrowseSubdir);
+                }
+            });
+            ui.label(
                 RichText::new(
                     "Files keep their source-relative path under this folder inside the target.",
                 )
                 .color(theme::lilac())
                 .size(11.0),
             );
-            },
-        );
+        });
+        self.folds.set(title, open);
     }
 
     /// Selector for where COPY/MOVE lands: into a repo or into a picked folder.
     fn dest_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "DEST — WHERE COPIED FILES LAND", theme::blue(), |ui| {
+        let title = "DEST — WHERE COPIED FILES LAND";
+        let mut open = self.folds.is_open(title);
+        crate::lcars::section_lcars_folding(ui, title, theme::blue(), &mut open, |ui| {
             ui.horizontal(|ui| {
                 for (dest, label, short, verbose) in [
                     (
@@ -2340,132 +2293,122 @@ impl TransferView {
                 }
             });
         });
+        self.folds.set(title, open);
     }
 
     /// The export-folder path input and its native folder picker (FOLDER mode).
     fn folder_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(
-            ui,
-            "FOLDER — EXPORT DESTINATION ON DISK",
-            theme::blue(),
-            |ui| {
-                ui.horizontal(|ui| {
-                    let changed = ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.folder)
-                                .desired_width(320.0)
-                                .hint_text("/absolute/export/folder"),
-                        )
-                        .explain(
-                            self.verbosity,
-                            "Absolute export folder",
-                            "The folder the selected files are copied/moved into. Files keep \
+        let title = "FOLDER — EXPORT DESTINATION ON DISK";
+        let mut open = self.folds.is_open(title);
+        crate::lcars::section_lcars_folding(ui, title, theme::blue(), &mut open, |ui| {
+            ui.horizontal(|ui| {
+                let changed = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.folder)
+                            .desired_width(320.0)
+                            .hint_text("/absolute/export/folder"),
+                    )
+                    .explain(
+                        self.verbosity,
+                        "Absolute export folder",
+                        "The folder the selected files are copied/moved into. Files keep \
                          their source-relative path under it.",
-                        )
-                        .changed();
-                    if changed {
-                        acts.push(Act::FolderChanged);
-                    }
-                    if ui
-                        .add(egui::Button::new(
-                            RichText::new(format!("{} BROWSE", icon::FOLDER_OPEN))
-                                .color(theme::black()),
-                        ))
-                        .explain(
-                            self.verbosity,
-                            "Pick or create the export folder",
-                            "Open a native folder picker to choose (or create) the folder the \
+                    )
+                    .changed();
+                if changed {
+                    acts.push(Act::FolderChanged);
+                }
+                if ui
+                    .add(egui::Button::new(
+                        RichText::new(format!("{} BROWSE", icon::FOLDER_OPEN))
+                            .color(theme::black()),
+                    ))
+                    .explain(
+                        self.verbosity,
+                        "Pick or create the export folder",
+                        "Open a native folder picker to choose (or create) the folder the \
                          selected files go into.",
-                        )
-                        .clicked()
-                    {
-                        acts.push(Act::BrowseFolder);
-                    }
-                });
-            },
-        );
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::BrowseFolder);
+                }
+            });
+        });
+        self.folds.set(title, open);
     }
 
     /// Grouping mode (exact/similar) and the invert toggle for a folder export.
     fn mode_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(
-            ui,
-            "MODE — EXACT OR SIMILAR MATCHING",
-            theme::lilac(),
-            |ui| {
-                ui.horizontal(|ui| {
-                    for mode in [SelectMode::Exact, SelectMode::Similar] {
-                        let sel = self.select_mode == mode;
-                        let fill = if sel { theme::lilac() } else { theme::panel() };
-                        let col = if sel { theme::black() } else { theme::lilac() };
-                        let (short, verbose) = match mode {
-                            SelectMode::Exact => (
-                                "Group by exact content",
-                                "Treat only byte-identical files (same size + hash) as copies of \
+        let title = "MODE — EXACT OR SIMILAR MATCHING";
+        let mut open = self.folds.is_open(title);
+        crate::lcars::section_lcars_folding(ui, title, theme::lilac(), &mut open, |ui| {
+            ui.horizontal(|ui| {
+                for mode in [SelectMode::Exact, SelectMode::Similar] {
+                    let sel = self.select_mode == mode;
+                    let fill = if sel { theme::lilac() } else { theme::panel() };
+                    let col = if sel { theme::black() } else { theme::lilac() };
+                    let (short, verbose) = match mode {
+                        SelectMode::Exact => (
+                            "Group by exact content",
+                            "Treat only byte-identical files (same size + hash) as copies of \
                              each other.",
-                            ),
-                            SelectMode::Similar => (
-                                "Group by perceptual similarity",
-                                "Treat perceptually similar media (at the similarity threshold \
+                        ),
+                        SelectMode::Similar => (
+                            "Group by perceptual similarity",
+                            "Treat perceptually similar media (at the similarity threshold \
                              below) as copies — e.g. one photo per burst.",
-                            ),
-                        };
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new(mode.label()).color(col))
-                                    .fill(fill),
-                            )
-                            .explain(self.verbosity, short, verbose)
-                            .clicked()
-                        {
-                            acts.push(Act::SetMode(mode));
-                        }
-                    }
-                    ui.separator();
-                    let fill = if self.invert {
-                        theme::orange()
-                    } else {
-                        theme::panel()
-                    };
-                    let col = if self.invert {
-                        theme::black()
-                    } else {
-                        theme::orange()
+                        ),
                     };
                     if ui
-                        .add(egui::Button::new(RichText::new("INVERT").color(col)).fill(fill))
-                        .explain(
-                            self.verbosity,
-                            "Export the redundant copies instead",
-                            "Off: export the unique files (one best copy per group plus every \
-                         singleton). On: export the redundant copies instead (every \
-                         non-best member of a group) — what a dedup would remove.",
-                        )
+                        .add(egui::Button::new(RichText::new(mode.label()).color(col)).fill(fill))
+                        .explain(self.verbosity, short, verbose)
                         .clicked()
                     {
-                        acts.push(Act::ToggleInvert);
+                        acts.push(Act::SetMode(mode));
                     }
-                });
-                // In SIMILAR mode the threshold is chosen right here (the same shared
-                // control as the Duplicates tab), not borrowed from another tab.
-                if self.select_mode == SelectMode::Similar {
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        crate::util::similarity_slider(
-                            ui,
-                            &mut self.similar_threshold,
-                            self.verbosity,
-                        );
-                    });
                 }
-                let hint = if self.invert {
-                    "Exports the redundant copies (every non-best member of a group)."
+                ui.separator();
+                let fill = if self.invert {
+                    theme::orange()
                 } else {
-                    "Exports the unique files (best copy of each group plus every singleton)."
+                    theme::panel()
                 };
-                ui.label(RichText::new(hint).color(theme::lilac()).size(11.0));
-            },
-        );
+                let col = if self.invert {
+                    theme::black()
+                } else {
+                    theme::orange()
+                };
+                if ui
+                    .add(egui::Button::new(RichText::new("INVERT").color(col)).fill(fill))
+                    .explain(
+                        self.verbosity,
+                        "Export the redundant copies instead",
+                        "Off: export the unique files (one best copy per group plus every \
+                         singleton). On: export the redundant copies instead (every \
+                         non-best member of a group) — what a dedup would remove.",
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::ToggleInvert);
+                }
+            });
+            // In SIMILAR mode the threshold is chosen right here (the same shared
+            // control as the Duplicates tab), not borrowed from another tab.
+            if self.select_mode == SelectMode::Similar {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    crate::util::similarity_slider(ui, &mut self.similar_threshold, self.verbosity);
+                });
+            }
+            let hint = if self.invert {
+                "Exports the redundant copies (every non-best member of a group)."
+            } else {
+                "Exports the unique files (best copy of each group plus every singleton)."
+            };
+            ui.label(RichText::new(hint).color(theme::lilac()).size(11.0));
+        });
+        self.folds.set(title, open);
     }
 
     fn hint(&self, ui: &mut egui::Ui) {
@@ -2501,23 +2444,21 @@ impl TransferView {
 
     /// MIRROR's info bar: no toggle (it always deletes), just a red warning that
     /// it removes everything in the target the source lacks.
-    fn mirror_bar(&self, ui: &mut egui::Ui) {
-        crate::lcars::section_lcars(
-            ui,
-            &format!("{} DELETES EXTRAS", icon::TRASH),
-            theme::red(),
-            |ui| {
-                ui.label(
-                    RichText::new(
-                        "Everything in the target whose content the source does not have is \
+    fn mirror_bar(&mut self, ui: &mut egui::Ui) {
+        let title = format!("{} DELETES EXTRAS", icon::TRASH);
+        let mut open = self.folds.is_open(&title);
+        crate::lcars::section_lcars_folding(ui, &title, theme::red(), &mut open, |ui| {
+            ui.label(
+                RichText::new(
+                    "Everything in the target whose content the source does not have is \
                      deleted, so the target ends up holding exactly the source's content. \
                      Deletions cannot be undone.",
-                    )
-                    .color(theme::lilac())
-                    .size(11.0),
-                );
-            },
-        );
+                )
+                .color(theme::lilac())
+                .size(11.0),
+            );
+        });
+        self.folds.set(&title, open);
     }
 
     /// GROUP SYNC's option bar: which of the group's sinks the next push
@@ -2528,169 +2469,165 @@ impl TransferView {
     /// time (the drive you edited). A multi-sink pull is a semantic not yet taken
     /// on. Otherwise mirrors GROUP SYNC's sink chips.
     fn group_back_sink_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(
-            ui,
-            "SINK — PULL ITS CHANGES BACK INTO THE MAIN",
-            theme::blue(),
-            |ui| {
-                let Some(group) = self.current_group.clone() else {
-                    return;
-                };
-                crate::repo_chip::chip_row(ui, "xfer_back_sink", "", group.sinks.len(), |ui, i| {
-                    let sink = &group.sinks[i];
-                    let mode = sink_mode_label(sink.mode);
-                    let sel = self
-                        .selected_sinks
-                        .first()
-                        .map(|s| s == &sink.repo)
-                        .unwrap_or(false);
-                    let accent = sink_mode_accent(sink.mode);
-                    let row = ui.horizontal(|ui| {
-                        let chip = crate::repo_chip::repo_chip(
-                            ui,
-                            &sink.repo,
-                            sel,
-                            accent,
-                            false,
-                            Some(self.locks.read_only(&sink.repo)),
-                        );
-                        ui.label(
-                            RichText::new(format!("MODE: {mode}"))
-                                .color(accent)
-                                .size(10.0),
-                        );
-                        chip
-                    });
-                    if row
-                        .inner
-                        .name
-                        .explain(
-                            self.verbosity,
-                            "Pull this sink back into the main",
-                            "Compare this sink against the main and pull its changes back: \
+        let title = "SINK — PULL ITS CHANGES BACK INTO THE MAIN";
+        let mut open = self.folds.is_open(title);
+        crate::lcars::section_lcars_folding(ui, title, theme::blue(), &mut open, |ui| {
+            let Some(group) = self.current_group.clone() else {
+                return;
+            };
+            crate::repo_chip::chip_row(ui, "xfer_back_sink", "", group.sinks.len(), |ui, i| {
+                let sink = &group.sinks[i];
+                let mode = sink_mode_label(sink.mode);
+                let sel = self
+                    .selected_sinks
+                    .first()
+                    .map(|s| s == &sink.repo)
+                    .unwrap_or(false);
+                let accent = sink_mode_accent(sink.mode);
+                let row = ui.horizontal(|ui| {
+                    let chip = crate::repo_chip::repo_chip(
+                        ui,
+                        &sink.repo,
+                        sel,
+                        accent,
+                        false,
+                        Some(self.locks.read_only(&sink.repo)),
+                    );
+                    ui.label(
+                        RichText::new(format!("MODE: {mode}"))
+                            .color(accent)
+                            .size(10.0),
+                    );
+                    chip
+                });
+                if row
+                    .inner
+                    .name
+                    .explain(
+                        self.verbosity,
+                        "Pull this sink back into the main",
+                        "Compare this sink against the main and pull its changes back: \
                              promote files the main never had, and choose whether to bring back \
                              files the main deleted that the sink still holds.",
-                        )
-                        .clicked()
-                    {
-                        acts.push(Act::SelectOnlySink(sink.repo.clone()));
-                    }
-                    self.locks
-                        .handle_badge(row.inner.lock, self.verbosity, &sink.repo);
-                    row.response
-                });
-            },
-        );
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::SelectOnlySink(sink.repo.clone()));
+                }
+                self.locks
+                    .handle_badge(row.inner.lock, self.verbosity, &sink.repo);
+                row.response
+            });
+        });
+        self.folds.set(title, open);
     }
 
     fn group_sinks_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(
-            ui,
-            "SINKS — WHERE THE MAIN IS PUSHED",
-            theme::blue(),
-            |ui| {
-                let Some(group) = self.current_group.clone() else {
-                    return;
-                };
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("SINKS").color(theme::text()).size(12.0));
-                    if crate::repo_chip::small_button(ui, "ALL", theme::blue())
-                        .explain(
-                            self.verbosity,
-                            "Include every sink",
-                            "Include every sink of this group in the next push.",
-                        )
-                        .clicked()
-                    {
-                        acts.push(Act::SelectAllSinks);
-                    }
-                    if crate::repo_chip::small_button(ui, "NONE", theme::blue())
-                        .explain(
-                            self.verbosity,
-                            "Clear the sink selection",
-                            "Deselect every sink (REVIEW/RUN are disabled until at least one is \
+        let title = "SINKS — WHERE THE MAIN IS PUSHED";
+        let mut open = self.folds.is_open(title);
+        crate::lcars::section_lcars_folding(ui, title, theme::blue(), &mut open, |ui| {
+            let Some(group) = self.current_group.clone() else {
+                return;
+            };
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("SINKS").color(theme::text()).size(12.0));
+                if crate::repo_chip::small_button(ui, "ALL", theme::blue())
+                    .explain(
+                        self.verbosity,
+                        "Include every sink",
+                        "Include every sink of this group in the next push.",
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::SelectAllSinks);
+                }
+                if crate::repo_chip::small_button(ui, "NONE", theme::blue())
+                    .explain(
+                        self.verbosity,
+                        "Clear the sink selection",
+                        "Deselect every sink (REVIEW/RUN are disabled until at least one is \
                          picked).",
-                        )
-                        .clicked()
-                    {
-                        acts.push(Act::SelectNoSinks);
-                    }
+                    )
+                    .clicked()
+                {
+                    acts.push(Act::SelectNoSinks);
+                }
+            });
+            crate::repo_chip::chip_row(ui, "xfer_sinks", "", group.sinks.len(), |ui, i| {
+                let sink = &group.sinks[i];
+                let mode = sink_mode_label(sink.mode);
+                let sel = self.selected_sinks.iter().any(|s| s == &sink.repo);
+                let accent = sink_mode_accent(sink.mode);
+                // The chip gets the bare repo name: the identicon is hashed from
+                // whatever string it is handed, so folding the mode into the name
+                // gave this sink a different glyph here than on every other tab.
+                // The mode rides alongside as its own label instead.
+                //
+                // Chip and label are wrapped together, and the *wrapper's*
+                // response is what this closure returns: `chip_row` packs rows
+                // from that rect, so a label drawn outside it would never be
+                // budgeted and the row would overrun the available width.
+                let row = ui.horizontal(|ui| {
+                    let chip = crate::repo_chip::repo_chip(
+                        ui,
+                        &sink.repo,
+                        sel,
+                        accent,
+                        false,
+                        Some(self.locks.read_only(&sink.repo)),
+                    );
+                    // Same wording as the sink's mode pill on the Repositories tab.
+                    ui.label(
+                        RichText::new(format!("MODE: {mode}"))
+                            .color(accent)
+                            .size(10.0),
+                    );
+                    chip
                 });
-                crate::repo_chip::chip_row(ui, "xfer_sinks", "", group.sinks.len(), |ui, i| {
-                    let sink = &group.sinks[i];
-                    let mode = sink_mode_label(sink.mode);
-                    let sel = self.selected_sinks.iter().any(|s| s == &sink.repo);
-                    let accent = sink_mode_accent(sink.mode);
-                    // The chip gets the bare repo name: the identicon is hashed from
-                    // whatever string it is handed, so folding the mode into the name
-                    // gave this sink a different glyph here than on every other tab.
-                    // The mode rides alongside as its own label instead.
-                    //
-                    // Chip and label are wrapped together, and the *wrapper's*
-                    // response is what this closure returns: `chip_row` packs rows
-                    // from that rect, so a label drawn outside it would never be
-                    // budgeted and the row would overrun the available width.
-                    let row = ui.horizontal(|ui| {
-                        let chip = crate::repo_chip::repo_chip(
-                            ui,
-                            &sink.repo,
-                            sel,
-                            accent,
-                            false,
-                            Some(self.locks.read_only(&sink.repo)),
-                        );
-                        // Same wording as the sink's mode pill on the Repositories tab.
-                        ui.label(
-                            RichText::new(format!("MODE: {mode}"))
-                                .color(accent)
-                                .size(10.0),
-                        );
-                        chip
-                    });
-                    // A MIRROR or APPLY CHANGES push can delete this sink's
-                    // existing files, so a locked sink in those modes cannot
-                    // be included — the padlock next to it says why, and
-                    // unlocking it re-enables the toggle. ADD ONLY sinks only
-                    // ever gain files, so the lock does not bar them.
-                    let barred = sink.mode.deletes_in_sink() && self.locks.read_only(&sink.repo);
-                    let (hover, hover_verbose) = if barred {
-                        (
-                            "Locked deleting sink — unlock it to include it in the push",
-                            "This sink's push mode can delete its existing files, and it is \
+                // A MIRROR or APPLY CHANGES push can delete this sink's
+                // existing files, so a locked sink in those modes cannot
+                // be included — the padlock next to it says why, and
+                // unlocking it re-enables the toggle. ADD ONLY sinks only
+                // ever gain files, so the lock does not bar them.
+                let barred = sink.mode.deletes_in_sink() && self.locks.read_only(&sink.repo);
+                let (hover, hover_verbose) = if barred {
+                    (
+                        "Locked deleting sink — unlock it to include it in the push",
+                        "This sink's push mode can delete its existing files, and it is \
                              locked. Click its padlock to unlock it if you want the push to \
                              include it.",
-                        )
-                    } else {
-                        (
-                            "Include this sink in the push",
-                            "Toggle whether this sink is included when GROUP SYNC runs. Its mode \
+                    )
+                } else {
+                    (
+                        "Include this sink in the push",
+                        "Toggle whether this sink is included when GROUP SYNC runs. Its mode \
                              (ADD ONLY / APPLY CHANGES / MIRROR) is set on the Repositories tab.",
-                        )
-                    };
-                    if row
-                        .inner
-                        .name
-                        .explain(self.verbosity, hover, hover_verbose)
-                        .clicked()
-                        && !barred
-                    {
-                        acts.push(Act::ToggleSink(sink.repo.clone()));
-                    }
-                    self.locks
-                        .handle_badge(row.inner.lock, self.verbosity, &sink.repo);
-                    row.response
-                });
-                ui.label(
-                    RichText::new(
-                        "Each selected sink pushes in its own stored mode: ADD ONLY copies and \
+                    )
+                };
+                if row
+                    .inner
+                    .name
+                    .explain(self.verbosity, hover, hover_verbose)
+                    .clicked()
+                    && !barred
+                {
+                    acts.push(Act::ToggleSink(sink.repo.clone()));
+                }
+                self.locks
+                    .handle_badge(row.inner.lock, self.verbosity, &sink.repo);
+                row.response
+            });
+            ui.label(
+                RichText::new(
+                    "Each selected sink pushes in its own stored mode: ADD ONLY copies and \
                      never deletes; MIRROR also deletes what the main no longer has. The main \
                      is never changed.",
-                    )
-                    .color(theme::lilac())
-                    .size(11.0),
-                );
-            },
-        );
+                )
+                .color(theme::lilac())
+                .size(11.0),
+            );
+        });
+        self.folds.set(title, open);
     }
 
     /// The delete policy the current command runs with: MIRROR always deletes
@@ -2709,58 +2646,58 @@ impl TransferView {
     /// same relative path.
     /// DIFF's option bar: how the two repos are paired up.
     fn pairing_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(
-            ui,
-            "PAIR BY — HOW FILES ARE MATCHED",
-            theme::blue(),
-            |ui| {
-                ui.horizontal(|ui| {
-                    for (pairing, label, short, verbose) in [
-                        (
-                            DiffPairing::ByHash,
-                            "BY HASH",
-                            "Match files by content",
-                            "Match files by their content, so the same photo under two \
+        let title = "PAIR BY — HOW FILES ARE MATCHED";
+        let mut open = self.folds.is_open(title);
+        crate::lcars::section_lcars_folding(ui, title, theme::blue(), &mut open, |ui| {
+            ui.horizontal(|ui| {
+                for (pairing, label, short, verbose) in [
+                    (
+                        DiffPairing::ByHash,
+                        "BY HASH",
+                        "Match files by content",
+                        "Match files by their content, so the same photo under two \
                          different names is one row you can resolve with a rename. \
                          This is the view for finding what one repo has and the other \
                          doesn't, whatever things are called.",
-                        ),
-                        (
-                            DiffPairing::ByPath,
-                            "BY PATH",
-                            "Match files by name and folder",
-                            "Match files by their path inside the repo, so the same name on \
+                    ),
+                    (
+                        DiffPairing::ByPath,
+                        "BY PATH",
+                        "Match files by name and folder",
+                        "Match files by their path inside the repo, so the same name on \
                          both sides is one row — and when the two versions differ you can \
                          overwrite one side with the other. This is the view for spotting \
                          edited files.",
-                        ),
-                    ] {
-                        let selected = self.pairing == pairing;
-                        if crate::lcars::toggle_button(ui, label, selected, theme::blue())
-                            .explain(self.verbosity, short, verbose)
-                            .clicked()
-                        {
-                            acts.push(Act::SetPairing(pairing));
-                        }
+                    ),
+                ] {
+                    let selected = self.pairing == pairing;
+                    if crate::lcars::toggle_button(ui, label, selected, theme::blue())
+                        .explain(self.verbosity, short, verbose)
+                        .clicked()
+                    {
+                        acts.push(Act::SetPairing(pairing));
                     }
-                });
-                let hint = match self.pairing {
-                    DiffPairing::ByHash => {
-                        "Rows pair files with identical content; a file only one side has can \
+                }
+            });
+            let hint = match self.pairing {
+                DiffPairing::ByHash => {
+                    "Rows pair files with identical content; a file only one side has can \
                      be copied across or deleted."
-                    }
-                    DiffPairing::ByPath => {
-                        "Rows pair files with the same path; same name with different content \
+                }
+                DiffPairing::ByPath => {
+                    "Rows pair files with the same path; same name with different content \
                      is a conflict you resolve per side."
-                    }
-                };
-                ui.label(RichText::new(hint).color(theme::lilac()).size(11.0));
-            },
-        );
+                }
+            };
+            ui.label(RichText::new(hint).color(theme::lilac()).size(11.0));
+        });
+        self.folds.set(title, open);
     }
 
     fn sync_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "OPTIONS — SYNC BEHAVIOUR", theme::blue(), |ui| {
+        let title = "OPTIONS — SYNC BEHAVIOUR";
+        let mut open = self.folds.is_open(title);
+        crate::lcars::section_lcars_folding(ui, title, theme::blue(), &mut open, |ui| {
             ui.horizontal(|ui| {
                 let fill = if self.sync_delete_missing {
                     theme::red()
@@ -2794,6 +2731,7 @@ impl TransferView {
             };
             ui.label(RichText::new(hint).color(theme::lilac()).size(11.0));
         });
+        self.folds.set(title, open);
     }
 
     /// Whether the *current* run would delete on-disk data: MOVE and MIRROR
@@ -3771,7 +3709,8 @@ impl TransferView {
         match started {
             Ok(()) => {
                 self.previewing = true;
-                self.selection_collapsed = true;
+                self.folds.fold_all();
+                self.filter.fold();
                 self.status = Some(format!("{}…", title.to_lowercase()));
                 true
             }
@@ -3813,7 +3752,8 @@ impl TransferView {
             Ok(()) => {
                 self.running = true;
                 self.row_action = false;
-                self.selection_collapsed = true;
+                self.folds.fold_all();
+                self.filter.fold();
                 self.clear_preview();
                 self.status = Some(format!("{}…", title.to_lowercase()));
                 true
@@ -6625,19 +6565,22 @@ mod ui_tests {
         h.get_by_label("REVIEW").click();
         settle_preview(&mut h);
         assert!(
-            h.query_by_label("CHANGE").is_some(),
-            "after REVIEW the selection folds into a summary with CHANGE"
+            h.query_by_label_contains("WHAT — ").is_some(),
+            "after REVIEW the sections keep their header bars"
         );
         assert!(
-            h.query_by_label_contains("WHAT — ").is_none(),
-            "the sections are folded away"
+            h.query_by_label("MIRROR").is_none() && h.query_by_label("REPO").is_none(),
+            "their bodies are folded away"
         );
-        h.get_by_label("CHANGE").click();
+        h.get_by_label_contains("WHAT — ").click();
         h.run();
         assert!(
-            h.query_by_label_contains("WHAT — ").is_some()
-                && h.state().target.as_deref() == Some("target"),
-            "CHANGE unfolds the sections and keeps the answers"
+            h.query_by_label("MIRROR").is_some() && h.state().target.as_deref() == Some("target"),
+            "its own header flips that section open again, answers kept"
+        );
+        assert!(
+            h.query_by_label_contains("DEST — ").is_some() && h.query_by_label("REPO").is_none(),
+            "and the other sections stay folded"
         );
     }
 
@@ -8052,8 +7995,10 @@ mod ui_tests {
             .collect();
         assert_eq!(copied.len(), 2, "both copies are logged: {copied:?}");
         assert!(
-            h.state().selection_collapsed,
-            "the selection folds into its summary once the run starts"
+            !h.state()
+                .folds
+                .is_open("WHAT — COPY, MOVE, SYNC, MIRROR OR DIFF"),
+            "the selection sections fold once the run starts"
         );
     }
 

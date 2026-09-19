@@ -72,7 +72,8 @@ matter), with an assisted filter and a preview before anything runs.
 
 The tab asks its questions in order: WHAT (the command), WITH WHICH (SOURCE and TARGET, side \
 by side), HOW (destination, options, filter), then RUN. Each section appears once the one \
-above it is answered, and after REVIEW or RUN they fold into one line — CHANGE unfolds them.
+above it is answered, and after REVIEW or RUN they fold to their header bars — click one \
+to flip that section open again.
 
 Pick a SOURCE and a TARGET repo, optionally add DUPEPOOL repositories — a source file only \
 counts as new when none of the target or the extra references already has its content.
@@ -116,7 +117,7 @@ const GROOMING: &str = "\
 Prune and reorganize a single repository. The tab asks its questions in order: WHAT (the \
 tool), WITH WHICH (the repository, plus the dupe pool for DEDUPE), HOW (the filter or the \
 rules), then RUN. Each section appears once the one above it is answered, and after REVIEW \
-or RUN they fold into one line — CHANGE unfolds them.
+or RUN they fold to their header bars — click one to flip that section open again.
 
 DEDUPE deletes files in a source repo whose content also exists in any selected dupe-pool \
 repo. PURGE deletes everything matching a filter — it requires at least one filter \

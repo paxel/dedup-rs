@@ -297,6 +297,10 @@ pub struct FilterBuilder {
     /// Set for one frame when a rename just started, so its text field can
     /// grab keyboard focus.
     focus_rename_pending: bool,
+    /// Whether the FILTER section is open. The host folds it together with
+    /// its own sections after a FIND, a REVIEW or a PREVIEW; the header bar
+    /// flips it back on its own.
+    open: bool,
     /// The repo whose MIME stats / match count the wizard reflects, updated when
     /// the host passes a different repo to [`Self::ui`].
     repo: Option<String>,
@@ -338,6 +342,7 @@ impl FilterBuilder {
             renaming_preset: None,
             rename_buf: String::new(),
             focus_rename_pending: false,
+            open: true,
             repo: None,
             mime_stats: Vec::new(),
             tags: Vec::new(),
@@ -352,6 +357,12 @@ impl FilterBuilder {
             verbosity: TooltipVerbosity::default(),
             case_insensitive: false,
         }
+    }
+
+    /// Fold the FILTER section shut, the way a host folds its own sections
+    /// once it has an answer on screen.
+    pub fn fold(&mut self) {
+        self.open = false;
     }
 
     /// Replace the active conditions with those parsed from a filter expression
@@ -466,10 +477,12 @@ impl FilterBuilder {
     }
 
     fn filter_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(
+        let mut open = self.open;
+        crate::lcars::section_lcars_folding(
             ui,
             "FILTER — NARROW WHICH FILES COUNT",
             theme::lilac(),
+            &mut open,
             |ui| {
                 let mut editing_idx = None;
                 ui.horizontal_wrapped(|ui| {
@@ -638,6 +651,7 @@ impl FilterBuilder {
                 self.preset_row(ui, acts);
             },
         );
+        self.open = open;
     }
 
     /// The saved-preset row: one pill per preset (click to apply, right-click

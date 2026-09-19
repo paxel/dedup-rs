@@ -6,10 +6,11 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 ### Changed
 
-- **A FIND folds the selection sections instead of hiding them.** WHAT, WITH
-  WHICH and HOW used to be replaced by one summary line with a CHANGE button,
-  so changing one thing about a search meant bringing the whole selection
-  back. The three now fold to their own header bars, and clicking one flips
+- **A FIND, a REVIEW or a PREVIEW folds the selection sections instead of
+  hiding them.** In Duplicates, Transfer and Grooming the selection sections
+  used to be replaced by one summary line with a CHANGE button, so changing
+  one thing meant bringing the whole selection back. Every section — the
+  FILTER included — now folds to its own header bar, and clicking one flips
   just that section open again.
 - **A quick FIND no longer costs two clicks.** The activity window now waits
   two seconds before it appears, so a search that answers in less than that
