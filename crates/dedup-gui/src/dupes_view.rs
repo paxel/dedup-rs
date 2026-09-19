@@ -350,9 +350,10 @@ pub struct DupesView {
     /// ADR 0003 reading order: the repositories appear once a mode has been
     /// picked, the filter and FIND once a repository is included.
     mode_chosen: bool,
-    /// After FIND the three selection sections fold into one summary line
-    /// that reopens on click, so the groups get the screen.
-    selection_collapsed: bool,
+    /// Whether each selection section — WHAT, WITH WHICH, HOW — is open. A
+    /// FIND folds all three so the groups get the screen; each one flips back
+    /// open on its own header, without restoring the other two.
+    sections_open: [bool; 3],
     /// A background operation in flight, if any.
     busy: Option<Op>,
     tx: Sender<Msg>,
@@ -424,7 +425,7 @@ impl DupesView {
             page: 0,
             scroll_to_top: false,
             mode_chosen: false,
-            selection_collapsed: false,
+            sections_open: [true; 3],
             busy: None,
             tx,
             rx,
@@ -599,17 +600,14 @@ impl DupesView {
         );
         // Reading order is the workflow (ADR 0003): WHAT, then WITH WHICH,
         // then HOW and FIND — each shown once the one before has an answer.
-        // After a FIND they fold into one line so the groups get the screen.
-        if self.selection_collapsed {
-            self.selection_summary(ui);
-        } else {
-            self.mode_section(ui, &mut acts);
-            if self.mode_chosen {
-                self.repo_bar(ui, &mut acts);
-            }
-            if self.mode_chosen && self.repos.iter().any(|r| r.included) {
-                self.how_section(ui, store, &mut acts);
-            }
+        // A FIND folds all three shut; their header bars stay, so changing one
+        // thing about the search is one click on that section.
+        self.mode_section(ui, &mut acts);
+        if self.mode_chosen {
+            self.repo_bar(ui, &mut acts);
+        }
+        if self.mode_chosen && self.repos.iter().any(|r| r.included) {
+            self.how_section(ui, store, &mut acts);
         }
         self.result_actions(ui, &mut acts);
         crate::util::shortcut_bar(
@@ -834,10 +832,12 @@ impl DupesView {
     }
 
     fn repo_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(
+        let mut open = self.sections_open[1];
+        crate::lcars::section_lcars_folding(
             ui,
             "WITH WHICH — REPOSITORIES TO SEARCH",
             theme::lilac(),
+            &mut open,
             |ui| {
                 // Bulk MARK ALL / NONE (repos start excluded, so this is the quick way
                 // to include/clear all of them at once).
@@ -870,6 +870,7 @@ impl DupesView {
                 });
             },
         );
+        self.sections_open[1] = open;
     }
 
     /// One repo chip — the shared identicon + name include-toggle plus the
@@ -914,10 +915,12 @@ impl DupesView {
     /// WHAT: duplicates or similar, the threshold beside SIMILAR, and QUICK
     /// DELETE — the settings that shape what a group is, on one row.
     fn mode_section(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(
+        let mut open = self.sections_open[0];
+        crate::lcars::section_lcars_folding(
             ui,
             "WHAT — DUPLICATES OR SIMILAR FILES",
             theme::amber(),
+            &mut open,
             |ui| {
                 // Top-aligned: the slider is taller than a chip, and a centred
                 // row would drop the chips after it by a couple of pixels.
@@ -984,79 +987,55 @@ impl DupesView {
                 });
             },
         );
+        self.sections_open[0] = open;
     }
 
     /// HOW: the shared FILTER wizard, and FIND beside it — the last decision
     /// and the run on one line.
     fn how_section(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, acts: &mut Vec<Act>) {
-        crate::lcars::section_lcars(ui, "HOW — FILTER, THEN FIND", theme::orange(), |ui| {
-            ui.horizontal_top(|ui| {
-                let run_w = 140.0;
-                ui.vertical(|ui| {
-                    ui.set_max_width((ui.available_width() - run_w).max(240.0));
-                    // FIND keeps only groups with ≥1 member matching the
-                    // filter. The first included repo backs the pick-lists.
-                    let sugg = self.suggestion_repo();
-                    let outcome = self.filter.ui(ui, store, sugg.as_deref(), self.verbosity);
-                    if outcome.status.is_some() {
-                        self.status = outcome.status;
-                    }
-                    if outcome.error.is_some() {
-                        self.error = outcome.error;
-                    }
-                });
-                if crate::lcars::action_button(
-                    ui,
-                    &format!("{} FIND", icon::SEARCH),
-                    self.busy.is_none(),
-                    theme::amber(),
-                )
-                .explain(
-                    self.verbosity,
-                    "Search the included repos",
-                    "Search every included (checked) repository for duplicates or \
+        let mut open = self.sections_open[2];
+        crate::lcars::section_lcars_folding(
+            ui,
+            "HOW — FILTER, THEN FIND",
+            theme::orange(),
+            &mut open,
+            |ui| {
+                ui.horizontal_top(|ui| {
+                    let run_w = 140.0;
+                    ui.vertical(|ui| {
+                        ui.set_max_width((ui.available_width() - run_w).max(240.0));
+                        // FIND keeps only groups with ≥1 member matching the
+                        // filter. The first included repo backs the pick-lists.
+                        let sugg = self.suggestion_repo();
+                        let outcome = self.filter.ui(ui, store, sugg.as_deref(), self.verbosity);
+                        if outcome.status.is_some() {
+                            self.status = outcome.status;
+                        }
+                        if outcome.error.is_some() {
+                            self.error = outcome.error;
+                        }
+                    });
+                    if crate::lcars::action_button(
+                        ui,
+                        &format!("{} FIND", icon::SEARCH),
+                        self.busy.is_none(),
+                        theme::amber(),
+                    )
+                    .explain(
+                        self.verbosity,
+                        "Search the included repos",
+                        "Search every included (checked) repository for duplicates or \
                      similars per the selected mode. Excluded repos are skipped. The \
                      search runs in a window that shows its progress.",
-                )
-                .clicked()
-                {
-                    acts.push(Act::Find);
-                }
-            });
-        });
-    }
-
-    /// The folded selection after a FIND: what was searched, in one line,
-    /// and CHANGE to unfold it.
-    fn selection_summary(&mut self, ui: &mut egui::Ui) {
-        let mode = match self.mode {
-            Mode::Exact => "DUPLICATES".to_string(),
-            Mode::Similar => format!("SIMILAR ≥ {:.1} %", self.threshold),
-        };
-        let repos = self.result_names.join(", ");
-        let filter = self
-            .filter
-            .filter_string()
-            .map(|f| format!(" · filter: {f}"))
-            .unwrap_or_default();
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!("{mode} in {repos}{filter}"))
-                    .color(theme::tan())
-                    .size(12.5),
-            );
-            if crate::lcars::toggle_button(ui, "CHANGE", false, theme::lilac())
-                .explain(
-                    self.verbosity,
-                    "Change what to search",
-                    "Unfold the mode, repository and filter sections to set up another \
-                     search. The groups below stay until the next FIND.",
-                )
-                .clicked()
-            {
-                self.selection_collapsed = false;
-            }
-        });
+                    )
+                    .clicked()
+                    {
+                        acts.push(Act::Find);
+                    }
+                });
+            },
+        );
+        self.sections_open[2] = open;
     }
 
     /// The actions over a result: SHOW ACCEPTED, AUTO-RESOLVE, DELETE
@@ -2498,7 +2477,7 @@ impl DupesView {
         self.busy = Some(Op::Find);
         self.status = None;
         self.error = None;
-        self.selection_collapsed = true;
+        self.sections_open = [false; 3];
     }
 
     fn start_auto_resolve(&mut self, store: &Arc<Store>, ctx: &egui::Context) {
@@ -2844,10 +2823,10 @@ mod ui_tests {
         assert!(h.query_by_label(&find).is_some());
     }
 
-    /// After a FIND the three selection sections fold into one summary line,
-    /// and CHANGE unfolds them again.
+    /// After a FIND the three selection sections fold to their header bars,
+    /// and each one flips back open on its own without restoring the others.
     #[test]
-    fn selection_folds_after_find_and_unfolds_on_change() {
+    fn selection_folds_after_find_and_each_section_flips_back_open() {
         let (_tmp, store) = sample_store(&SAMPLE_REPOS);
         let store_ui = Arc::clone(&store);
         let mut init = false;
@@ -2882,17 +2861,29 @@ mod ui_tests {
         h.run();
         assert!(
             h.query_by_label("DUPLICATES").is_none(),
-            "the mode section is folded away after FIND"
+            "the mode section's body is folded away after FIND"
         );
-        assert!(
-            h.query_by_label("CHANGE").is_some(),
-            "the summary offers CHANGE"
-        );
-        h.get_by_label("CHANGE").click();
+        for title in [
+            "WHAT — DUPLICATES OR SIMILAR FILES",
+            "WITH WHICH — REPOSITORIES TO SEARCH",
+            "HOW — FILTER, THEN FIND",
+        ] {
+            assert!(
+                h.query_by_label(title).is_some(),
+                "the folded section keeps its header bar: {title}"
+            );
+        }
+        h.get_by_label("WHAT — DUPLICATES OR SIMILAR FILES").click();
         h.run();
         assert!(
             h.query_by_label("DUPLICATES").is_some(),
-            "CHANGE unfolds the sections"
+            "its own header flips that section back open"
+        );
+        assert!(
+            h.query_by_label("WITH WHICH — REPOSITORIES TO SEARCH")
+                .is_some()
+                && h.query_by_label("ALL").is_none(),
+            "and leaves the other sections folded"
         );
     }
 

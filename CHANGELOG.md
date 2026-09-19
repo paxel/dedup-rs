@@ -6,6 +6,11 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 ### Changed
 
+- **A FIND folds the selection sections instead of hiding them.** WHAT, WITH
+  WHICH and HOW used to be replaced by one summary line with a CHANGE button,
+  so changing one thing about a search meant bringing the whole selection
+  back. The three now fold to their own header bars, and clicking one flips
+  just that section open again.
 - **A quick FIND no longer costs two clicks.** The activity window now waits
   two seconds before it appears, so a search that answers in less than that
   never puts a modal on screen at all, and a FIND that finishes without problems reports in

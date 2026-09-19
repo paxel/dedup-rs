@@ -152,6 +152,30 @@ pub fn section_lcars_collapsible<R>(
     out
 }
 
+/// A section whose folded state the caller owns, rather than egui's memory:
+/// drawn open or as its stadium bar according to `open`, which a click on the
+/// header flips. For a view that folds a whole group of sections itself (the
+/// selection sections after a FIND) and still lets each one be flipped back
+/// open on its own.
+pub fn section_lcars_folding<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    accent: Color32,
+    open: &mut bool,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<R> {
+    let (out, header) = if *open {
+        let (r, header) = section_impl(ui, title, accent, add);
+        (Some(r), header)
+    } else {
+        (None, collapsed_header(ui, title, accent))
+    };
+    if header.clicked() {
+        *open = !*open;
+    }
+    out
+}
+
 /// The open form of a section: elbow chrome, caret-down before the title, and
 /// the clickable header bar whose response is returned alongside the body's
 /// result.

@@ -43,7 +43,8 @@ with real previews, and delete the worse copies.
 The tab asks top to bottom: WHAT (DUPLICATES or SIMILAR FILES — SIMILAR shows its \
 threshold slider beside the chip; QUICK DELETE sits on the same row), then WITH WHICH \
 (the repository chips, once a mode is chosen), then HOW (the FILTER and FIND, once a \
-repository is included). After a FIND the three fold into one line; CHANGE unfolds them.
+repository is included). After a FIND the three fold shut and only their header bars \
+remain; click one to flip that section open again — the other two stay folded.
 
 Click a repo chip's name to include or exclude it from the next FIND; click its padlock to \
 protect it from deletion — locked files are never preselected or auto-resolved.
