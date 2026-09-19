@@ -61,6 +61,13 @@ const CARD_LIFETIME: Duration = Duration::from_secs(8);
 const CARD_SLIDE: Duration = Duration::from_millis(250);
 /// How many cards stack before the oldest is pushed out early.
 const MAX_CARDS: usize = 4;
+/// The narrowest the activity modal ever gets: enough for a phase line with a
+/// path in it.
+const MODAL_MIN_W: f32 = 560.0;
+/// The widest it gets, however large the window is.
+const MODAL_MAX_W: f32 = 720.0;
+/// How much of the app window the activity modal may take.
+const MODAL_MAX_FRACTION: f32 = 0.8;
 /// The event log's file name under the configuration directory.
 pub const EVENT_LOG_FILE: &str = "events.jsonl";
 
@@ -328,6 +335,22 @@ impl DiffProgress for RunProgress {
                 ));
             }
         }
+    }
+}
+
+/// A phase line shortened to `max_chars`: the leading verb stays and what
+/// follows it — the path — loses its head, so the file name at the end is what
+/// survives. A line without a space is shortened as a whole.
+fn phase_line(phase: &str, max_chars: usize) -> String {
+    if phase.chars().count() <= max_chars {
+        return phase.to_string();
+    }
+    match phase.split_once(' ') {
+        Some((verb, rest)) if verb.chars().count() + 1 < max_chars => {
+            let budget = max_chars - verb.chars().count() - 1;
+            format!("{verb} {}", crate::board::elide_left(rest, budget))
+        }
+        _ => crate::board::elide_left(phase, max_chars),
     }
 }
 
@@ -798,7 +821,11 @@ impl Activity {
         // A running operation ignores Escape and backdrop clicks: only CANCEL
         // ends it, and only the finished report closes on Escape.
         egui::Modal::new(Id::new("activity-modal")).show(ctx, |ui| {
-            ui.set_width(560.0);
+            // One width for the whole run: the phase line names the file being
+            // worked on, and a modal sized to that name jumps on every file.
+            let width =
+                (ctx.viewport_rect().width() * MODAL_MAX_FRACTION).clamp(MODAL_MIN_W, MODAL_MAX_W);
+            ui.set_width(width);
             ui.label(
                 RichText::new(r.title.to_uppercase())
                     .color(theme::amber())
@@ -815,7 +842,23 @@ impl Activity {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().color(theme::amber()));
-                ui.label(RichText::new(&r.phase).color(theme::text()).size(13.0));
+                // The line is laid out in a horizontal ui, which never wraps —
+                // an overlong path would push the modal wider instead. Shorten
+                // it to what the width holds; `truncate` catches the rest,
+                // since the budget is measured in average glyphs.
+                let glyph = ui
+                    .ctx()
+                    .fonts_mut(|f| f.glyph_width(&egui::FontId::proportional(13.0), 'n'));
+                let budget = ((ui.available_width() / glyph.max(1.0)) as usize).max(8);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(phase_line(&r.phase, budget))
+                            .color(theme::text())
+                            .size(13.0),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(&r.phase);
             });
             ui.add_space(6.0);
             match r.fraction() {
@@ -1115,6 +1158,23 @@ impl Activity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_phase_line_keeps_its_verb_and_the_end_of_the_path() {
+        let short = "hashing a/b.jpg";
+        assert_eq!(phase_line(short, 40), short);
+
+        let long = "hashing pictures/2019/holiday/scans/beach-sunset-final.jpg";
+        let cut = phase_line(long, 30);
+        assert!(cut.chars().count() <= 30, "{cut}");
+        assert!(cut.starts_with("hashing …"), "{cut}");
+        assert!(cut.ends_with("final.jpg"), "{cut}");
+
+        let one_word = "verylongsinglewordwithoutaspace";
+        let cut = phase_line(one_word, 10);
+        assert!(cut.chars().count() <= 10, "{cut}");
+        assert!(cut.starts_with('…') && cut.ends_with("space"), "{cut}");
+    }
 
     #[test]
     fn a_change_is_logged_and_a_mark_is_not() {

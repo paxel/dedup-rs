@@ -1395,7 +1395,7 @@ fn header_cell(
 /// Shorten a path from the **left**, keeping the tail. Two sibling repos under
 /// one parent differ in their last segments, so clipping from the right (which
 /// is what a plain truncate does) can render them identically.
-fn elide_left(path: &str, max: usize) -> String {
+pub(crate) fn elide_left(path: &str, max: usize) -> String {
     if path.chars().count() <= max {
         return path.to_string();
     }
