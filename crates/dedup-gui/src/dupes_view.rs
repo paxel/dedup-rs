@@ -1836,21 +1836,19 @@ impl DupesView {
             );
         });
 
-        // Seek bar (only meaningful for the currently-loaded file).
+        // The seek bar: a timeline the width of the card's text column, not a
+        // slider that reads like a setting. Idle until this file is the one
+        // playing, so the row keeps its height either way.
         let total = snap.total_ms.max(total_ms);
-        if is_current && total > 0 {
-            let mut frac = (snap.pos_ms as f32 / total as f32).clamp(0.0, 1.0);
-            if ui
-                .add(egui::Slider::new(&mut frac, 0.0..=1.0).show_value(false))
-                .explain(
-                    self.verbosity,
-                    "Seek",
-                    "Drag to seek to a position in this track.",
-                )
-                .changed()
-            {
-                acts.push(Act::SeekAudio(frac));
-            }
+        let live = is_current && total > 0;
+        let frac = if live {
+            (snap.pos_ms as f32 / total as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let width = ui.available_width();
+        if let Some(f) = crate::media_cell::seek_bar(ui, width, frac, live) {
+            acts.push(Act::SeekAudio(f));
         }
     }
 

@@ -35,6 +35,17 @@ pub fn scrub_timestamp_secs(fraction: f32, duration_secs: f64) -> f64 {
     f64::from(fraction.clamp(0.0, 1.0)) * duration_secs.max(0.0)
 }
 
+/// Where a click or drag at `x` on a seek bar spanning `left ..= left + width`
+/// lands, as a fraction of the track. A pointer that ran off either end
+/// clamps to that end, so dragging past the bar seeks to its start or finish
+/// instead of jumping back.
+pub fn seek_fraction_at(x: f32, left: f32, width: f32) -> f32 {
+    if width <= 0.0 {
+        return 0.0;
+    }
+    ((x - left) / width).clamp(0.0, 1.0)
+}
+
 /// Which of `count` filmstrip slots the playhead `fraction` falls in.
 pub fn filmstrip_slot(fraction: f32, count: usize) -> usize {
     if count == 0 {
@@ -114,6 +125,18 @@ mod tests {
         // The far edge stays in the last slot instead of indexing past it.
         assert_eq!(filmstrip_slot(1.0, 8), 7);
         assert_eq!(filmstrip_slot(0.5, 0), 0);
+    }
+
+    #[test]
+    fn a_seek_click_maps_to_its_fraction_of_the_track() {
+        assert_eq!(seek_fraction_at(100.0, 100.0, 200.0), 0.0);
+        assert_eq!(seek_fraction_at(200.0, 100.0, 200.0), 0.5);
+        assert_eq!(seek_fraction_at(300.0, 100.0, 200.0), 1.0);
+        // A drag that left the bar stops at the end it left by.
+        assert_eq!(seek_fraction_at(40.0, 100.0, 200.0), 0.0);
+        assert_eq!(seek_fraction_at(900.0, 100.0, 200.0), 1.0);
+        // A zero-width track has no position to report.
+        assert_eq!(seek_fraction_at(120.0, 100.0, 0.0), 0.0);
     }
 
     #[test]

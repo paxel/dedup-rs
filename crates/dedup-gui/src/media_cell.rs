@@ -33,6 +33,52 @@ pub(crate) fn fmt_ms(ms: u64) -> String {
     }
 }
 
+/// The height a [`seek_bar`] claims: the track plus room for its knob.
+pub(crate) const SEEK_BAR_H: f32 = 14.0;
+
+/// The transport's seek bar: a slim track `width` wide — drawn under the
+/// track's own picture, at the picture's width — with the played part filled
+/// and a knob at the playhead. Click or drag anywhere on it to seek; the
+/// returned fraction is what the pointer asked for, `None` when it asked for
+/// nothing. `live` is whether this file is the one loaded in the player: an
+/// idle bar is drawn empty and takes no clicks, so the layout does not jump
+/// when playback starts.
+pub(crate) fn seek_bar(ui: &mut egui::Ui, width: f32, frac: f32, live: bool) -> Option<f32> {
+    let sense = if live {
+        egui::Sense::click_and_drag()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, SEEK_BAR_H), sense);
+    let hot = live && (resp.hovered() || resp.dragged());
+    // The bar thickens under the pointer, the way a video player's does, so it
+    // reads as a timeline rather than as a setting to drag.
+    let h = if hot { 8.0 } else { 5.0 };
+    let track = egui::Rect::from_center_size(rect.center(), egui::vec2(width, h));
+    let frac = frac.clamp(0.0, 1.0);
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter_at(rect);
+        let r = egui::CornerRadius::same((h / 2.0) as u8);
+        p.rect_filled(track, r, theme::panel());
+        if live {
+            let mut played = track;
+            played.max.x = track.left() + track.width() * frac;
+            p.rect_filled(played, r, theme::amber());
+            p.circle_filled(
+                egui::pos2(played.max.x, track.center().y),
+                if hot { 7.0 } else { 5.0 },
+                theme::amber(),
+            );
+        }
+    }
+    if !live {
+        return None;
+    }
+    let seeking = resp.dragged() || resp.clicked();
+    let pos = resp.interact_pointer_pos()?;
+    seeking.then(|| crate::scrub::seek_fraction_at(pos.x, rect.left(), rect.width()))
+}
+
 /// The display facts about one file, decoupled from its store [`FileEntry`] so
 /// they can travel a preview worker channel and be rendered anywhere. Everything
 /// here is `Send`.

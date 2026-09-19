@@ -1448,7 +1448,10 @@ impl BrowseView {
                 // picture of an image does — the transport above it keeps its
                 // own clicks.
                 let (rect, resp) = ui.allocate_exact_size(
-                    egui::vec2(vis_w, (height - 38.0 - transport).max(40.0)),
+                    egui::vec2(
+                        vis_w,
+                        (height - 38.0 - transport - crate::media_cell::SEEK_BAR_H).max(40.0),
+                    ),
                     egui::Sense::click(),
                 );
                 if resp
@@ -1506,14 +1509,24 @@ impl BrowseView {
                 // The playhead over the visual, so the position is read where
                 // the sound is drawn rather than only on the seek bar.
                 let snap = self.player.snapshot();
-                if snap.loaded && snap.hex.as_deref() == Some(hex.as_str()) && snap.total_ms > 0 {
-                    let frac = (snap.pos_ms as f32 / snap.total_ms as f32).clamp(0.0, 1.0);
+                let live = snap.loaded && snap.hex.as_deref() == Some(hex.as_str());
+                let frac = if live && snap.total_ms > 0 {
+                    (snap.pos_ms as f32 / snap.total_ms as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                if live && snap.total_ms > 0 {
                     let x = rect.left() + rect.width() * frac;
                     p.vline(
                         x,
                         rect.top()..=rect.bottom(),
                         egui::Stroke::new(1.5, theme::amber()),
                     );
+                }
+                // The seek bar belongs to the picture: same width, right under
+                // it, so the position is read along the sound it belongs to.
+                if let Some(f) = crate::media_cell::seek_bar(ui, vis_w, frac, live) {
+                    self.player.seek_fraction(f);
                 }
             });
             ui.vertical(|ui| self.audio_tag_panel(ui, sel, abs, &hex));
@@ -1581,20 +1594,6 @@ impl BrowseView {
                 .color(theme::tan())
                 .size(11.0),
             );
-            if is_current && snap.total_ms > 0 {
-                let mut frac = (snap.pos_ms as f32 / snap.total_ms as f32).clamp(0.0, 1.0);
-                if ui
-                    .add(egui::Slider::new(&mut frac, 0.0..=1.0).show_value(false))
-                    .explain(
-                        self.verbosity,
-                        "Seek",
-                        "Drag to seek to a position in this track.",
-                    )
-                    .changed()
-                {
-                    self.player.seek_fraction(frac);
-                }
-            }
         });
         (ui.next_widget_position().y - top).max(0.0)
     }

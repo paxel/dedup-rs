@@ -6,6 +6,13 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 ### Changed
 
+- **Audio has a seek bar, not a volume-slider lookalike.** The round-handled
+  slider under a previewed track is gone. In Browse the position now runs
+  along its own bar directly under the spectrogram — the same width as the
+  picture, always there, the played part filled, a knob at the playhead that
+  thickens as the pointer reaches it. Click or drag anywhere on it to seek.
+  The audio rows in a Duplicates group carry the same bar.
+
 - **A FIND, a REVIEW or a PREVIEW folds the selection sections instead of
   hiding them.** In Duplicates, Transfer and Grooming the selection sections
   used to be replaced by one summary line with a CHANGE button, so changing
