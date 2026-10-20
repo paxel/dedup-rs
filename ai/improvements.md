@@ -25,7 +25,7 @@ Start page hub, one command list, one board. Landed one child per commit, in ord
 - [x] #7 Progressive inputs and from/to roles
 - [x] #8 Favorites
 - [x] #9 Preview and APPLY everywhere
-- [ ] #10 The board module, with Browse on it
+- [x] #10 The board module, with Browse on it
 - [ ] #11 Duplicates on the board
 - [ ] #12 Transfer and Grooming plans on the board
 - [ ] #13 Diff on the board

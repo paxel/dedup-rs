@@ -327,6 +327,7 @@ fn board_row(
         right_paths: right.path.into_iter().collect(),
         unchanged,
         cmds,
+        left_tags: Vec::new(),
     };
     let body = board::RowBody {
         left: board::SideBody {
@@ -494,6 +495,7 @@ fn diff_metas(rows: &[RepoDiffRow], left_ro: bool, right_ro: bool) -> Vec<board:
                 right_paths: paths(&row.right),
                 unchanged: row.relation == R::Equal,
                 cmds,
+                left_tags: Vec::new(),
             }
         })
         .collect()
@@ -539,7 +541,9 @@ fn diff_action(
         // a command competing for row space. A row with only one side opens
         // that file alone (it used to open nothing — `?` on the absent side
         // swallowed the click).
-        Cmd::OpenRow | Cmd::Compare => {
+        // A plan never reports SELECT (that is a listing's click); treat it
+        // like the row click it is.
+        Cmd::OpenRow | Cmd::Compare | Cmd::Select { .. } => {
             if left.is_none() && right.is_none() {
                 None
             } else {
@@ -3114,6 +3118,7 @@ impl TransferView {
                     // DIFF runs each command as it is clicked; there is no RUN
                     // for a hidden row to be skipped by.
                     hide_skips_run: false,
+                    listing: false,
                 },
                 &mut self.thumbs,
                 &mut |i| {
@@ -3264,6 +3269,7 @@ impl TransferView {
                 // the cap notice compares this against what was materialised.
                 full_len: self.preview_totals.iter().sum(),
                 hide_skips_run: true,
+                listing: false,
             },
             &mut self.thumbs,
             &mut |i| bodies.get(i).cloned().unwrap_or_default(),

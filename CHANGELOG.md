@@ -41,6 +41,13 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   DIRECTORIES gained a preview of the directories it would remove.
   Duplicates says APPLY MARKED (was DELETE MARKED). Keyboard: P previews,
   A applies.
+- **Browse lists its files on the same board as every other result.** Each
+  row carries the file's thumbnail, name, size, dimensions or duration, date
+  and tag chips; a deleted file the index remembers reads blue. The SORT
+  headers above the rows order them; a click selects (Ctrl toggles, Shift
+  extends), a second click on the selected row opens the viewer. The board itself learned to be
+  a listing: caller order, a selection and a cursor, tag chips, and a click
+  on a file's name that counts as a click on its row.
 - **The start page states the facts before you choose.** One line over the
   cards sums the repositories, files and bytes the app looks after. A card's
   UPDATED stat reads as people say it — "just now", "3 hours ago", "9 days
