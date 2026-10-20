@@ -2,7 +2,7 @@
 
 All notable changes to the `dedup-rs` project will be documented in this file.
 
-## [0.8.1] - Unreleased
+## [3.0.0]
 
 ### Changed
 
