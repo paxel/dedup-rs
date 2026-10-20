@@ -1,14 +1,17 @@
-//! The eframe application: a tabbed LCARS shell (Repositories / Duplicates /
-//! Transfer / Grooming) wired to the core store and a background update worker.
-//! This module owns the Repository Management tab and the (currently empty)
-//! Grooming tab, and delegates the others to [`crate::dupes_view`] and
-//! [`crate::transfer_view`].
+//! The eframe application: the start page (ADR 0004) — repo cards, one
+//! selection, one command list — wired to the core store and a background
+//! update worker. This module owns the start page and the repository-level
+//! commands; a command whose work has a body of its own opens it in place
+//! under the header strip, delegating to [`crate::dupes_view`],
+//! [`crate::transfer_view`], [`crate::grooming_view`] and
+//! [`crate::browse_view`].
 
 use crate::activity::Notification;
 use crate::dupes_view::DupesView;
 use crate::grooming_view::GroomingView;
 use crate::icon;
 use crate::settings::{ThemeChoice, TooltipVerbosity};
+use crate::start_page;
 use crate::status::{self, Location};
 use crate::theme;
 use crate::transfer_view::TransferView;
@@ -17,13 +20,16 @@ use crossbeam_channel::{Receiver, Sender};
 use dedup_core::store::{RepoStats, Store};
 use dedup_core::update::check_repo;
 use egui::{Align, Color32, Id, Layout, RichText};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 /// The height of the app's top bar. The notification cards start below it, so
 /// nothing they say can sit over SETTINGS, ABOUT, HELP, STATUS or LOG.
 pub(crate) const TOP_BAR_H: f32 = 56.0;
+
+/// The width of the start page's command list.
+const COMMANDS_W: f32 = 236.0;
 
 /// Repos scan one at a time (each scan already parallelizes across all CPU
 /// cores), so the queue starts a new scan only while fewer than this many run.
@@ -50,13 +56,32 @@ enum AppMsg {
     Scanned { repo: String, outcome: JobOutcome },
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
-pub(crate) enum Tab {
-    Repositories,
+/// What fills the window: the start page, or the body of the command the
+/// user picked there (ADR 0004).
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub(crate) enum Screen {
+    Start,
+    Body(Body),
+}
+
+/// A command's body: the view that does its work under the header strip.
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub(crate) enum Body {
     Duplicates,
     Transfer,
     Grooming,
     Browse,
+}
+
+impl Body {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Body::Duplicates => "DUPLICATES",
+            Body::Transfer => "TRANSFER",
+            Body::Grooming => "GROOMING",
+            Body::Browse => "BROWSE",
+        }
+    }
 }
 
 /// Freshness of a repo's index relative to disk, from the last CHECK.
@@ -134,12 +159,6 @@ enum Edit {
 /// A deferred mutation collected during rendering and applied after the UI pass
 /// so the immediate-mode closures never borrow `self` mutably twice.
 enum Action {
-    Update(String),
-    UpdateAll,
-    /// Queue an UPDATE / SCAN for every repo *not* flagged remote — the fast
-    /// everyday rescan that leaves slow mounts alone.
-    UpdateLocal,
-    Check(String),
     RefreshStatus,
     /// Flip a repo's user-set remote flag (slow mount; UPDATE LOCAL skips it).
     ToggleRemote(String),
@@ -174,8 +193,6 @@ enum Action {
         repo: String,
         mode: dedup_core::store::SyncMode,
     },
-    /// Queue an UPDATE / SCAN for every member of a group (main + sinks).
-    UpdateGroup(String),
     /// Disband a group (its repos stay, just ungrouped).
     Ungroup(String),
     /// Open the inline "add a sink" editor on the group's main card.
@@ -194,15 +211,25 @@ enum Action {
     CloseAdd,
     ChooseFolder(FolderTarget),
     Create,
+    /// A command picked on the start page, to run on the selection.
+    Run(start_page::Command),
 }
 
 pub struct DedupApp {
     store: Arc<Store>,
-    tab: Tab,
-    /// The tab shown last frame; when it changes we re-sync the newly-shown
-    /// view's repo list from the store (so a repo added in the Repositories tab
+    screen: Screen,
+    /// The screen shown last frame; when it changes we re-sync the newly-shown
+    /// view's repo list from the store (so a repo added on the start page
     /// appears immediately — no manual refresh button needed).
-    synced_tab: Option<Tab>,
+    synced: Option<Screen>,
+    /// The start page's selection: the repo cards currently selected, by
+    /// name. The only place repositories are chosen (ADR 0004).
+    selection: BTreeSet<String>,
+    /// The command whose body is open, named on the header strip.
+    open_command: Option<start_page::Command>,
+    /// The session-wide lock registry, shared with every view; the start
+    /// page's cards show and toggle it.
+    locks: crate::locks::RepoLocks,
     repos: Vec<RepoRow>,
     load_error: Option<String>,
     /// Transient non-error notice (e.g. a drag-and-drop add summary).
@@ -265,8 +292,11 @@ impl DedupApp {
         let activity = crate::activity::shared(store.config_dir());
         let mut app = Self {
             store,
-            tab: Tab::Repositories,
-            synced_tab: None,
+            screen: Screen::Start,
+            synced: None,
+            selection: BTreeSet::new(),
+            open_command: None,
+            locks: locks.clone(),
             repos: Vec::new(),
             load_error: None,
             notice: None,
@@ -354,24 +384,182 @@ impl DedupApp {
     /// runs only while no update is in flight — the same gate every other call
     /// site uses. Skipping a busy frame is harmless, because a job's completion
     /// handler reloads anyway.
-    fn sync_shown_tab(&mut self) {
-        if self.synced_tab == Some(self.tab) {
+    fn sync_shown_screen(&mut self) {
+        if self.synced == Some(self.screen) {
             return;
         }
-        match self.tab {
-            Tab::Repositories => {
-                // A scan on the activity modal blocks the tab anyway; reload
+        match self.screen {
+            Screen::Start => {
+                // A scan on the activity modal blocks the page anyway; reload
                 // once it is free.
                 if !crate::activity::lock(&self.activity).is_running() {
                     self.reload_all();
                 }
             }
-            Tab::Duplicates => self.dupes.sync_repos(&self.store),
-            Tab::Transfer => self.transfer.sync_repos(&self.store),
-            Tab::Grooming => self.grooming.sync_repos(&self.store),
-            Tab::Browse => self.browse.sync_repos(&self.store),
+            Screen::Body(Body::Duplicates) => self.dupes.sync_repos(&self.store),
+            Screen::Body(Body::Transfer) => self.transfer.sync_repos(&self.store),
+            Screen::Body(Body::Grooming) => self.grooming.sync_repos(&self.store),
+            Screen::Body(Body::Browse) => self.browse.sync_repos(&self.store),
         }
-        self.synced_tab = Some(self.tab);
+        self.synced = Some(self.screen);
+    }
+
+    /// Show `body` for `cmd`: the command's work, under the header strip.
+    /// The body was just handed the selection, so it needs no re-sync.
+    fn open_body(&mut self, body: Body, cmd: start_page::Command) {
+        self.screen = Screen::Body(body);
+        self.synced = Some(self.screen);
+        self.open_command = Some(cmd);
+    }
+
+    /// Run `cmd` on the selection: a repository-level command runs (or opens
+    /// its inline editor) on the spot; a command with a body of its own is
+    /// handed the selection and opened under the header strip.
+    fn run_command(&mut self, ctx: &egui::Context, cmd: start_page::Command) {
+        use start_page::Command as C;
+        let facts = self.repo_facts();
+        let selected: Vec<&start_page::RepoFact> = facts
+            .iter()
+            .filter(|f| self.selection.contains(&f.name))
+            .collect();
+        if let Err(reason) = start_page::availability(cmd, &selected) {
+            // The list greys such a command; a stale click (the selection
+            // changed under it) still answers rather than doing nothing.
+            self.card(ctx, Notification::noted(cmd.label(), "", &reason));
+            return;
+        }
+        let names: Vec<String> = self.selection.iter().cloned().collect();
+        let one = names.first().cloned().unwrap_or_default();
+        // A selection that is one backup group: its main and the selected
+        // backups, which gives the directed commands their direction.
+        let group = selected
+            .iter()
+            .find_map(|f| f.main_of.as_ref().map(|g| (f.name.clone(), g.clone())))
+            .map(|(main, g)| {
+                let sinks: Vec<String> = selected
+                    .iter()
+                    .filter(|f| f.sink_of.as_deref() == Some(g.as_str()))
+                    .map(|f| f.name.clone())
+                    .collect();
+                (g, main, sinks)
+            });
+        match cmd {
+            C::Browse => {
+                self.browse.open_root(&self.store, &one);
+                self.open_body(Body::Browse, cmd);
+            }
+            C::FindDuplicates | C::FindSimilar => {
+                // Backups are searched through their main (the rule already
+                // refused a selection of backups only).
+                let searchable: Vec<String> = selected
+                    .iter()
+                    .filter(|f| f.sink_of.is_none())
+                    .map(|f| f.name.clone())
+                    .collect();
+                self.dupes
+                    .open_from(&self.store, &searchable, cmd == C::FindSimilar);
+                self.open_body(Body::Duplicates, cmd);
+            }
+            C::Diff | C::Copy | C::Move | C::Sync | C::Mirror | C::GroupSync | C::GroupSyncBack => {
+                use crate::transfer_view::Command as T;
+                let tcmd = match cmd {
+                    C::Diff => T::Diff,
+                    C::Copy => T::Copy,
+                    C::Move => T::Move,
+                    C::Sync => T::Sync,
+                    C::Mirror => T::Mirror,
+                    C::GroupSync => T::GroupSync,
+                    _ => T::GroupSyncBack,
+                };
+                let group = group.map(|(_, main, sinks)| (main, sinks));
+                self.transfer.open_from(&self.store, tcmd, &names, group);
+                self.open_body(Body::Transfer, cmd);
+            }
+            C::PruneMissing | C::Reorganize | C::DedupeAgainst | C::Purge | C::EmptyDirs => {
+                use crate::grooming_view::Command as G;
+                let gcmd = match cmd {
+                    C::PruneMissing => G::Prune,
+                    C::Reorganize => G::Organize,
+                    C::DedupeAgainst => G::Dedupe,
+                    C::Purge => G::Purge,
+                    _ => G::EmptyDirs,
+                };
+                self.grooming.open_from(&self.store, gcmd, &names);
+                self.open_body(Body::Grooming, cmd);
+            }
+            C::Check => self.start_scans(ctx, names, JobKind::Check),
+            C::Update => self.start_scans(ctx, names, JobKind::Update),
+            C::Rename => self.apply(ctx, None, Action::BeginRename(one)),
+            C::Relocate => self.apply(ctx, None, Action::BeginRelocate(one)),
+            C::CloneIndex => self.apply(ctx, None, Action::BeginDuplicate(one)),
+            C::Remove => self.apply(ctx, None, Action::BeginDelete(one)),
+            C::MarkRemote => self.apply(ctx, None, Action::ToggleRemote(one)),
+            C::MakeMain => self.apply(ctx, None, Action::MakeMain(one)),
+            C::AddSink => {
+                if let Some((group, main, _)) = group {
+                    self.apply(ctx, None, Action::BeginAddSink { group, main });
+                }
+            }
+            C::Ungroup => {
+                if let Some((group, _, _)) = group {
+                    self.apply(ctx, None, Action::Ungroup(group));
+                }
+            }
+            C::LeaveGroup => {
+                if let Some(group) = selected.first().and_then(|f| f.sink_of.clone()) {
+                    self.apply(ctx, None, Action::RemoveSink { group, repo: one });
+                }
+            }
+            C::JoinGroup => {
+                let free = selected
+                    .iter()
+                    .find(|f| f.main_of.is_none() && f.sink_of.is_none())
+                    .map(|f| f.name.clone());
+                if let (Some((group, _, _)), Some(repo)) = (group, free) {
+                    self.apply(ctx, None, Action::SinkInto { repo, group });
+                }
+            }
+        }
+    }
+
+    /// The header strip: while a command's body is open, one bar leading back
+    /// to the start page, then the selected repositories and the command, so
+    /// the user always sees what the body below acts on.
+    fn header_strip(&mut self, ui: &mut egui::Ui) {
+        let Some(cmd) = self.open_command else {
+            return;
+        };
+        if self.screen == Screen::Start {
+            return;
+        }
+        if crate::lcars::action_button(
+            ui,
+            &format!("{} START", icon::CARET_LEFT),
+            true,
+            theme::orange(),
+        )
+        .explain(
+            self.tooltip_verbosity,
+            "Back to the start page",
+            "Return to the start page. The selection and this command's work are kept.",
+        )
+        .clicked()
+        {
+            self.screen = Screen::Start;
+        }
+        ui.add_space(8.0);
+        let names: Vec<String> = self.selection.iter().cloned().collect();
+        for name in &names {
+            let is_main = self.group_of_main(name).is_some();
+            crate::repo_chip::repo_chip(ui, name, true, theme::amber(), is_main, None);
+        }
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(cmd.label())
+                .color(cmd.intent().accent())
+                .size(15.0)
+                .strong(),
+        );
     }
 
     /// Reload every repo row from the registry. Safe only when no update is
@@ -424,8 +612,11 @@ impl DedupApp {
                     }
                 }
                 // The repo set may have changed (add/remove/rename/relocate);
-                // force the selector tabs to re-sync when next shown.
-                self.synced_tab = None;
+                // force the bodies to re-sync when next shown, and drop a
+                // selected repo that no longer exists.
+                self.synced = None;
+                let names: HashSet<&str> = self.repos.iter().map(|r| r.name.as_str()).collect();
+                self.selection.retain(|n| names.contains(n.as_str()));
             }
             Err(e) => self.load_error = Some(e.to_string()),
         }
@@ -488,7 +679,7 @@ impl DedupApp {
         if !added.is_empty() {
             self.reload_all();
             self.refresh_status(ctx);
-            self.tab = Tab::Repositories; // show the result of the drop
+            self.screen = Screen::Start; // show the result of the drop
             self.load_error = None;
             self.notice = Some(format!(
                 "Added {} repositor{}: {}",
@@ -849,29 +1040,7 @@ impl DedupApp {
     // never open a dialog (the same pattern TransferView::apply uses).
     fn apply(&mut self, ctx: &egui::Context, frame: Option<&eframe::Frame>, action: Action) {
         match action {
-            Action::Update(name) => self.start_scans(ctx, vec![name], JobKind::Update),
-            Action::UpdateAll => {
-                // Skip known-unreachable repos so a dead mount can't hang the
-                // scan; not-yet-probed (Unknown) repos are still included.
-                let names: Vec<String> = self
-                    .repos
-                    .iter()
-                    .filter(|r| r.location.is_none_or(|l| l.reachable()))
-                    .map(|r| r.name.clone())
-                    .collect();
-                self.start_scans(ctx, names, JobKind::Update);
-            }
-            Action::UpdateLocal => {
-                // UPDATE ALL minus repos the user flagged remote (slow
-                // mounts); the same unreachable skip applies.
-                let names: Vec<String> = self
-                    .repos
-                    .iter()
-                    .filter(|r| !r.remote && r.location.is_none_or(|l| l.reachable()))
-                    .map(|r| r.name.clone())
-                    .collect();
-                self.start_scans(ctx, names, JobKind::Update);
-            }
+            Action::Run(cmd) => self.run_command(ctx, cmd),
             Action::ToggleRemote(name) => {
                 let now = self
                     .repos
@@ -899,7 +1068,6 @@ impl DedupApp {
                     }
                 }
             }
-            Action::Check(name) => self.start_scans(ctx, vec![name], JobKind::Check),
             Action::RefreshStatus => {
                 // Re-probe location/reachability only. It used to also enqueue
                 // a freshness CHECK (a full directory walk) on every reachable
@@ -1014,29 +1182,6 @@ impl DedupApp {
                     }
                 }
                 self.reload_all();
-            }
-            Action::UpdateGroup(group) => {
-                // Queue every member (main + sinks). enqueue takes names only, so
-                // collect first to avoid borrowing `self.groups` across the call.
-                let members: Vec<String> = self
-                    .groups
-                    .iter()
-                    .find(|(n, _)| *n == group)
-                    .map(|(_, g)| g.members().map(str::to_string).collect())
-                    .unwrap_or_default();
-                // Skip known-unreachable members, like UPDATE ALL — a backup on an
-                // unplugged drive would otherwise hang a worker. Not-yet-probed
-                // (Unknown) members are still included.
-                let members: Vec<String> = members
-                    .into_iter()
-                    .filter(|member| {
-                        self.repos
-                            .iter()
-                            .find(|r| r.name == *member)
-                            .is_none_or(|r| r.location.is_none_or(|l| l.reachable()))
-                    })
-                    .collect();
-                self.start_scans(ctx, members, JobKind::Update);
             }
             Action::Ungroup(group) => {
                 match self.store.delete_sync_group(&group) {
@@ -1311,40 +1456,40 @@ impl eframe::App for DedupApp {
 
         let mut actions: Vec<Action> = Vec::new();
         self.top_bar(ui);
-        // Audio preview belongs to the Duplicates tab; stop it elsewhere.
-        if self.tab != Tab::Duplicates {
+        // Audio preview belongs to the Duplicates body; stop it elsewhere.
+        if self.screen != Screen::Body(Body::Duplicates) {
             self.dupes.stop_audio();
         }
-        // Folder read-ahead and the audio preview belong to the Browse tab;
+        // Folder read-ahead and the audio preview belong to the Browse body;
         // elsewhere the disk (and the speakers) are the user's.
-        if self.tab != Tab::Browse {
+        if self.screen != Screen::Body(Body::Browse) {
             self.browse.cancel_prefetch();
             self.browse.stop_audio();
         }
-        // On each tab switch, re-sync the newly-shown view's repo list from the
-        // store, so repos added/removed elsewhere appear without a refresh
-        // button. (The Repositories tab refreshes its own cards separately.)
-        self.sync_shown_tab();
-        // The scan worker still runs outside the activity owner (until the
-        // Repositories tab moves behind the modal); tell the owner about it so
-        // "one at a time" holds across both.
-        egui::CentralPanel::default().show(ui, |ui| match self.tab {
-            Tab::Repositories => self.repositories_view(ui, &mut actions),
-            Tab::Duplicates => self.dupes.show(ui, &self.store, self.tooltip_verbosity),
-            Tab::Transfer => {
+        // On each screen change, re-sync the newly-shown view's repo list
+        // from the store, so repos added/removed elsewhere appear without a
+        // refresh button. (The start page refreshes its own cards separately.)
+        self.sync_shown_screen();
+        egui::CentralPanel::default().show(ui, |ui| match self.screen {
+            Screen::Start => self.start_page_view(ui, &mut actions),
+            Screen::Body(Body::Duplicates) => {
+                self.dupes.show(ui, &self.store, self.tooltip_verbosity)
+            }
+            Screen::Body(Body::Transfer) => {
                 self.transfer
                     .show(ui, &self.store, self.tooltip_verbosity, Some(frame))
             }
-            Tab::Grooming => self.grooming.show(ui, &self.store, self.tooltip_verbosity),
-            Tab::Browse => self.browse.show(ui, &self.store, self.tooltip_verbosity),
+            Screen::Body(Body::Grooming) => {
+                self.grooming.show(ui, &self.store, self.tooltip_verbosity)
+            }
+            Screen::Body(Body::Browse) => self.browse.show(ui, &self.store, self.tooltip_verbosity),
         });
-        // A file's SHOW IN BROWSE pick on another tab lands here: switch to the
-        // Browse tab with that file selected in its folder. `reveal` has just
-        // re-synced the view, so the tab-switch sync is already done.
+        // A file's SHOW IN BROWSE pick in a body lands here: open Browse with
+        // that file selected in its folder. `reveal` has just re-synced the
+        // view, so no further sync is needed.
         if let Some((repo, rel)) = self.dupes.take_browse_request() {
             self.browse.reveal(&self.store, &repo, &rel);
-            self.tab = Tab::Browse;
-            self.synced_tab = Some(Tab::Browse);
+            self.open_body(Body::Browse, start_page::Command::Browse);
         }
         if self.show_settings {
             self.settings_modal(&ctx);
@@ -1509,164 +1654,170 @@ impl DedupApp {
                         // renders immediately to its left.
                         crate::activity::lock(&self.activity)
                             .log_button(ui, self.tooltip_verbosity);
-                        // The remaining width (left of HELP) holds the scrollable
-                        // tab strip, laid out left-to-right in its natural order.
+                        // The remaining width (left of LOG) is the header
+                        // strip: empty on the start page, and while a
+                        // command's body is open the bar that names the
+                        // selection and the command and leads back (ADR 0004).
                         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                            egui::ScrollArea::horizontal()
-                                .auto_shrink([false, true])
-                                .show(ui, |ui| {
-                                    tab_button(
-                                        ui,
-                                        &mut self.tab,
-                                        Tab::Repositories,
-                                        "REPOSITORIES",
-                                        theme::orange(),
-                                        self.tooltip_verbosity,
-                                        "Add, update, and manage repository links",
-                                    );
-                                    tab_button(
-                                        ui,
-                                        &mut self.tab,
-                                        Tab::Duplicates,
-                                        "DUPLICATES",
-                                        theme::lilac(),
-                                        self.tooltip_verbosity,
-                                        "Find and review exact or perceptually similar duplicates",
-                                    );
-                                    tab_button(
-                                        ui,
-                                        &mut self.tab,
-                                        Tab::Transfer,
-                                        "TRANSFER",
-                                        theme::blue(),
-                                        self.tooltip_verbosity,
-                                        "Copy, move, sync or push a backup group between \
-                                         repositories by content",
-                                    );
-                                    tab_button(
-                                        ui,
-                                        &mut self.tab,
-                                        Tab::Grooming,
-                                        "GROOMING",
-                                        theme::tan(),
-                                        self.tooltip_verbosity,
-                                        "Prune and reorganize repositories (coming soon)",
-                                    );
-                                    tab_button(
-                                        ui,
-                                        &mut self.tab,
-                                        Tab::Browse,
-                                        "BROWSE",
-                                        theme::amber(),
-                                        self.tooltip_verbosity,
-                                        "Browse a repo's files by directory, from the index",
-                                    );
-                                });
+                            self.header_strip(ui);
                         });
                     });
                 });
             });
     }
 
-    fn repositories_view(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new("REPOSITORY MANAGEMENT")
-                .color(theme::amber())
-                .size(18.0)
-                .strong(),
-        );
-        ui.add_space(4.0);
-
-        if let Some(err) = &self.load_error {
-            ui.colored_label(theme::red(), err);
+    /// The start page (ADR 0004): the repo cards on the left, multi-select,
+    /// and the command list on the right, enabled by what the selection
+    /// allows. Picking a command either runs on the spot (a scan, a
+    /// repository edit) or opens its body under the header strip.
+    fn start_page_view(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let facts = self.repo_facts();
+        let selected: Vec<&start_page::RepoFact> = facts
+            .iter()
+            .filter(|f| self.selection.contains(&f.name))
+            .collect();
+        let verbosity = self.tooltip_verbosity;
+        let mut picked = None;
+        egui::Panel::right("commands")
+            .exact_size(COMMANDS_W)
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::bg())
+                    .inner_margin(egui::Margin::symmetric(10, 6)),
+            )
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("COMMANDS")
+                                .color(theme::text())
+                                .size(16.0)
+                                .strong(),
+                        );
+                        ui.label(
+                            RichText::new(selection_summary(selected.len()))
+                                .color(theme::tan())
+                                .size(12.0),
+                        );
+                        picked = start_page::command_panel(ui, &selected, verbosity);
+                    });
+            });
+        if let Some(cmd) = picked {
+            actions.push(Action::Run(cmd));
         }
-        if let Some(notice) = &self.notice {
-            ui.colored_label(theme::amber(), notice);
-        }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::bg()))
+            .show(ui, |ui| {
+                if let Some(err) = &self.load_error {
+                    ui.colored_label(theme::red(), err);
+                }
+                if let Some(notice) = &self.notice {
+                    ui.colored_label(theme::amber(), notice);
+                }
+                self.selection_row(ui, actions);
+                self.cards(ui, actions);
+            });
+    }
 
-        crate::lcars::section_lcars(
-            ui,
-            "MANAGE — ADD & UPDATE REPOSITORIES",
-            theme::blue(),
-            |ui| {
-                ui.horizontal(|ui| {
-                    let add = egui::Button::new(
-                        RichText::new(format!("{} ADD REPOSITORY", icon::PLUS))
-                            .color(theme::ink_on(theme::blue())),
-                    )
-                    .fill(theme::blue());
-                    if ui
-                        .add(add)
-                        .explain(
-                            self.tooltip_verbosity,
-                            "Register a new repository",
-                            "Register a new repository: pick a folder on disk to track and \
-                             scan for duplicates.",
-                        )
-                        .clicked()
-                    {
-                        actions.push(Action::OpenAdd);
-                    }
-                    // UPDATE ALL / UPDATE LOCAL open the activity window: the
-                    // run look, not a chip.
-                    if crate::lcars::action_button(
-                        ui,
-                        &format!("{} UPDATE ALL", icon::REFRESH),
-                        !self.repos.is_empty(),
-                        theme::orange(),
-                    )
-                    .explain(
-                        self.tooltip_verbosity,
-                        "Scan every repository",
-                        "Scan every registered repository one after another in the activity \
-                         window, each on its own line with its progress. Already up-to-date \
-                         repos finish almost instantly.",
-                    )
-                    .clicked()
-                    {
-                        actions.push(Action::UpdateAll);
-                    }
-                    let any_local = self.repos.iter().any(|r| !r.remote);
-                    if crate::lcars::action_button(
-                        ui,
-                        &format!("{} UPDATE LOCAL", icon::REFRESH),
-                        any_local,
-                        theme::amber(),
-                    )
-                    .explain(
-                        self.tooltip_verbosity,
-                        "Scan every repository not marked remote",
-                        "Scan every repository except the ones marked remote, one after \
-                         another in the activity window — the quick everyday rescan that \
-                         leaves slow network or cloud mounts alone.",
-                    )
-                    .clicked()
-                    {
-                        actions.push(Action::UpdateLocal);
-                    }
-                    let refresh = egui::Button::new(
-                        RichText::new(format!("{} REFRESH STATUS", icon::REFRESH))
-                            .color(theme::ink_on(theme::lilac())),
-                    )
-                    .fill(theme::lilac());
-                    if ui
-                        .add_enabled(!self.repos.is_empty(), refresh)
-                        .explain(
-                            self.tooltip_verbosity,
-                            "Re-check reachability",
-                            "Re-check every repository's location and reachability — a \
-                             reconnected drive turns reachable again. No files are read.",
-                        )
-                        .clicked()
-                    {
-                        actions.push(Action::RefreshStatus);
-                    }
-                });
-            },
-        );
+    /// The rules' view of every repository: lock, reachability, group role.
+    fn repo_facts(&self) -> Vec<start_page::RepoFact> {
+        self.repos
+            .iter()
+            .map(|r| start_page::RepoFact {
+                name: r.name.clone(),
+                locked: self.locks.read_only(&r.name),
+                reachable: r.location.is_none_or(|l| l.reachable()),
+                main_of: self.group_of_main(&r.name).cloned(),
+                sink_of: self.sink_of(&r.name).map(|(n, _)| n.clone()),
+            })
+            .collect()
+    }
+
+    /// The row above the cards: select ALL / LOCAL / NONE, REFRESH STATUS,
+    /// and ADD REPOSITORY.
+    fn selection_row(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let verbosity = self.tooltip_verbosity;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("SELECT").color(theme::tan()).size(12.0));
+            if crate::lcars::toggle_button(ui, "ALL", false, theme::orange())
+                .explain(
+                    verbosity,
+                    "Select every repository",
+                    "Select every repository, so a command such as UPDATE or CHECK runs \
+                     on all of them.",
+                )
+                .clicked()
+            {
+                self.selection = self.repos.iter().map(|r| r.name.clone()).collect();
+            }
+            if crate::lcars::toggle_button(ui, "LOCAL", false, theme::orange())
+                .explain(
+                    verbosity,
+                    "Select every repository not marked remote",
+                    "Select every repository except the ones marked remote — the quick \
+                     everyday selection that leaves slow network or cloud mounts alone.",
+                )
+                .clicked()
+            {
+                self.selection = self
+                    .repos
+                    .iter()
+                    .filter(|r| !r.remote)
+                    .map(|r| r.name.clone())
+                    .collect();
+            }
+            if crate::lcars::toggle_button(ui, "NONE", false, theme::orange())
+                .explain(
+                    verbosity,
+                    "Deselect every repository",
+                    "Clear the selection.",
+                )
+                .clicked()
+            {
+                self.selection.clear();
+            }
+            ui.add_space(12.0);
+            if crate::lcars::action_button(
+                ui,
+                &format!("{} REFRESH STATUS", icon::REFRESH),
+                !self.repos.is_empty(),
+                theme::lilac(),
+            )
+            .explain(
+                verbosity,
+                "Re-check reachability",
+                "Re-check every repository's location and reachability — a reconnected \
+                 drive turns reachable again. No files are read.",
+            )
+            .clicked()
+            {
+                actions.push(Action::RefreshStatus);
+            }
+            if crate::lcars::action_button(
+                ui,
+                &format!("{} ADD REPOSITORY", icon::PLUS),
+                true,
+                theme::blue(),
+            )
+            .explain(
+                verbosity,
+                "Register a new repository",
+                "Register a new repository: pick a folder on disk to track and scan \
+                 for duplicates. Folders dropped onto the window are added too.",
+            )
+            .clicked()
+            {
+                actions.push(Action::OpenAdd);
+            }
+        });
         ui.add_space(4.0);
+    }
 
+    /// The repo cards, a backup group framed together, an ungrouped repo bare.
+    fn cards(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         let rows = self.repos.clone();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -1696,6 +1847,7 @@ impl DedupApp {
                                 theme::green(),
                                 false,
                                 |ui| {
+                                    self.group_select_row(ui, &row.name);
                                     self.repo_card(ui, row, actions);
                                     self.group_section(ui, &row.name, &rows, actions);
                                 },
@@ -1723,6 +1875,47 @@ impl DedupApp {
             .map(|(n, _)| n)
     }
 
+    /// The frame's one control, drawn above the main's card: select or
+    /// deselect the whole group — its main and every backup — which is what
+    /// gives GROUP SYNC its direction for free (ADR 0004).
+    fn group_select_row(&mut self, ui: &mut egui::Ui, main: &str) {
+        let Some(group) = self
+            .groups
+            .iter()
+            .find(|(_, g)| g.main == main)
+            .map(|(_, g)| g.clone())
+        else {
+            return;
+        };
+        let verbosity = self.tooltip_verbosity;
+        // The frame's one control: select or deselect the whole group — its
+        // main and every backup — which is what gives GROUP SYNC its direction
+        // for free (ADR 0004).
+        let members: Vec<String> = group.members().map(str::to_string).collect();
+        let all_selected = members.iter().all(|m| self.selection.contains(m));
+        ui.horizontal(|ui| {
+            ui.add_space(16.0);
+            if crate::lcars::toggle_button(ui, "SELECT GROUP", all_selected, theme::green())
+                .explain(
+                    verbosity,
+                    "Select the main and every backup of this group",
+                    "Select the whole backup group — its main and every backup — so \
+                     GROUP SYNC and the group's other commands are offered. Click \
+                     again to deselect them all.",
+                )
+                .clicked()
+            {
+                if all_selected {
+                    for m in &members {
+                        self.selection.remove(m);
+                    }
+                } else {
+                    self.selection.extend(members.iter().cloned());
+                }
+            }
+        });
+    }
+
     /// The body of a group's LCARS section, drawn under its main's card: the
     /// group controls (ADD REPO, UPDATE ALL, UNGROUP), shown for any main — even
     /// one with no sinks yet — then each sink's own card.
@@ -1736,63 +1929,15 @@ impl DedupApp {
         rows: &[RepoRow],
         actions: &mut Vec<Action>,
     ) {
-        let Some((group_name, group)) = self
+        let Some(group) = self
             .groups
             .iter()
             .find(|(_, g)| g.main == main)
-            .map(|(n, g)| (n.clone(), g.clone()))
+            .map(|(_, g)| g.clone())
         else {
             return;
         };
         let verbosity = self.tooltip_verbosity;
-        ui.horizontal(|ui| {
-            ui.add_space(16.0);
-            if crate::lcars::action_button(
-                ui,
-                &format!("{} ADD REPO", icon::PLUS),
-                true,
-                theme::blue(),
-            )
-            .explain(
-                verbosity,
-                "Add a backup repository to this group",
-                "Add a backup to this group: a clone of the main's index, pointed at a new \
-                 folder.",
-            )
-            .clicked()
-            {
-                actions.push(Action::BeginAddSink {
-                    group: group_name.clone(),
-                    main: main.to_string(),
-                });
-            }
-            if crate::lcars::action_button(
-                ui,
-                &format!("{} UPDATE ALL", icon::REFRESH),
-                true,
-                theme::amber(),
-            )
-            .explain(
-                verbosity,
-                "Scan the whole group",
-                "Queue an UPDATE / SCAN for the main and every backup in this group.",
-            )
-            .clicked()
-            {
-                actions.push(Action::UpdateGroup(group_name.clone()));
-            }
-            if crate::lcars::action_button(ui, "UNGROUP", true, theme::lilac())
-                .explain(
-                    verbosity,
-                    "Disband this group",
-                    "Disband this group. Every repository stays; they are just no longer \
-                     linked as main and backups.",
-                )
-                .clicked()
-            {
-                actions.push(Action::Ungroup(group_name.clone()));
-            }
-        });
         // The add-sink editor opens on the row directly below the ADD REPO
         // button that summoned it — never up on the main's card, where the
         // fields looked like they belonged to something else.
@@ -1880,10 +2025,17 @@ impl DedupApp {
     }
 
     fn repo_card(&mut self, ui: &mut egui::Ui, row: &RepoRow, actions: &mut Vec<Action>) {
+        let selected = self.selection.contains(&row.name);
+        // A selected card is outlined in the selection colour, thicker.
+        let stroke = if selected {
+            egui::Stroke::new(2.5, theme::amber())
+        } else {
+            egui::Stroke::new(1.5, theme::orange())
+        };
         egui::Frame::new()
             .fill(theme::panel())
             .corner_radius(theme::PILL)
-            .stroke(egui::Stroke::new(1.5, theme::orange()))
+            .stroke(stroke)
             .inner_margin(12.0)
             .outer_margin(egui::Margin {
                 left: 0,
@@ -1893,18 +2045,50 @@ impl DedupApp {
             })
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(&row.name)
-                            .color(theme::amber())
-                            .size(17.0)
-                            .strong(),
+                    // The shared repo chip is the card's selector: click the
+                    // name to select or deselect the repository, the padlock
+                    // to toggle its session lock. Inside a group both the main
+                    // and its backups are cards; the chip's badge tells them
+                    // apart.
+                    let chip = crate::repo_chip::repo_chip(
+                        ui,
+                        &row.name,
+                        selected,
+                        theme::amber(),
+                        self.group_of_main(&row.name).is_some(),
+                        Some(self.locks.read_only(&row.name)),
                     );
-                    // Inside a group section both the main and its sinks are
-                    // cards; the badge is what tells them apart.
-                    if self.group_of_main(&row.name).is_some() {
-                        main_pill(ui, self.tooltip_verbosity);
+                    if chip
+                        .name
+                        .explain(
+                            self.tooltip_verbosity,
+                            "Select this repository",
+                            "Select or deselect this repository. The command list beside the \
+                             cards offers what the selection allows.",
+                        )
+                        .clicked()
+                    {
+                        if selected {
+                            self.selection.remove(&row.name);
+                        } else {
+                            self.selection.insert(row.name.clone());
+                        }
                     }
+                    self.locks
+                        .handle_badge(chip.lock, self.tooltip_verbosity, &row.name);
                     status_pills(ui, row, self.tooltip_verbosity);
+                    // The user's own flag, worded apart from the probe's
+                    // LOCAL / REMOTE pill: MARK REMOTE on the command list
+                    // flips it.
+                    if row.remote {
+                        pill(ui, "MARKED REMOTE", theme::blue()).explain(
+                            self.tooltip_verbosity,
+                            "Marked as a slow mount — the LOCAL selection skips it",
+                            "You marked this repository as living on a slow network or \
+                             cloud mount. The LOCAL selection leaves it out; everything \
+                             else works the same. MARK REMOTE flips it back.",
+                        );
+                    }
                     // MIME breakdown, share-sorted, pinned to the top-right. It is
                     // reserved first (right-to-left) so the path — added inside,
                     // filling the gap between the status pills and the tags — can
@@ -2163,257 +2347,61 @@ impl DedupApp {
             _ => {}
         }
 
-        // An unreachable folder can't be scanned or walked (and a dead network
-        // mount would hang the worker), so gate both jobs on reachability.
-        let reachable = row.location.is_none_or(|l| l.reachable());
+        // A backup's own push mode lives on its card: it is a property of the
+        // backup, not a command. Everything else a card used to offer is on
+        // the start page's command list (ADR 0004).
+        let Some((group, sink_mode)) = self.sink_of(&row.name).map(|(n, g)| {
+            let mode = g.sinks.iter().find(|s| s.repo == row.name).map(|s| s.mode);
+            (n.clone(), mode)
+        }) else {
+            return;
+        };
+        let verbosity = self.tooltip_verbosity;
         ui.horizontal(|ui| {
-            if crate::lcars::action_button(
-                ui,
-                &format!("{} UPDATE / SCAN", icon::REFRESH),
-                reachable,
-                theme::orange(),
-            )
-            .explain(
-                self.tooltip_verbosity,
-                "Scan the folder and index new or changed files",
-                "Walk this repository's folder in the activity window, hash any new or \
-                 changed files, and mark vanished files missing. Already-hashed unchanged \
-                 files are skipped, so a repeat scan is fast.",
-            )
-            .clicked()
-            {
-                actions.push(Action::Update(row.name.clone()));
-            }
-            if crate::lcars::action_button(
-                ui,
-                &format!("{} CHECK", icon::SEARCH),
-                reachable,
-                theme::amber(),
-            )
-            .explain(
-                self.tooltip_verbosity,
-                "Dry-run: report new, changed, and missing files without hashing or writing",
-                "Dry-run a scan: report how many files are new, changed, or missing \
-                     compared to the index, without hashing anything or writing to the \
-                     index. Use this to see if UPDATE / SCAN has real work to do.",
-            )
-            .clicked()
-            {
-                actions.push(Action::Check(row.name.clone()));
-            }
-            // The user's own judgement of the mount's speed — never detected
-            // (the LOCAL/REMOTE status pill is the probe's opinion; this flag
-            // is deliberately worded differently).
-            let remote_btn = if row.remote {
-                egui::Button::new(
-                    RichText::new("MARKED REMOTE").color(theme::ink_on(theme::blue())),
-                )
-                .fill(theme::blue())
-            } else {
-                egui::Button::new(RichText::new("MARK REMOTE").color(theme::black()))
-            };
-            if ui
-                .add(remote_btn)
-                .explain(
-                    self.tooltip_verbosity,
-                    if row.remote {
-                        "Marked as a slow mount — UPDATE LOCAL skips this repository"
-                    } else {
-                        "Mark this repository as living on a slow mount"
-                    },
-                    "Whether this repository's folder lives on a slow network or cloud \
-                     mount, by your own judgement. Marked repositories are skipped by \
-                     the UPDATE LOCAL button; everything else works the same. Click to \
-                     flip.",
-                )
-                .clicked()
-            {
-                actions.push(Action::ToggleRemote(row.name.clone()));
-            }
-            if ui
-                .button(RichText::new(format!("{} RENAME", icon::PENCIL)).color(theme::black()))
-                .explain(
-                    self.tooltip_verbosity,
-                    "Rename this repository",
-                    "Rename this repository's registry entry. The on-disk folder it \
-                     points at is not moved.",
-                )
-                .clicked()
-            {
-                actions.push(Action::BeginRename(row.name.clone()));
-            }
-            if ui
-                .button(RichText::new(format!("{} RELOCATE", icon::RELOCATE)).color(theme::black()))
-                .explain(
-                    self.tooltip_verbosity,
-                    "Point this repository at a different folder",
-                    "Point this repository at a different on-disk folder while keeping its \
-                     existing index — use this after moving the data to a new location.",
-                )
-                .clicked()
-            {
-                actions.push(Action::BeginRelocate(row.name.clone()));
-            }
-            if ui
-                .button(RichText::new(format!("{} DUPLICATE", icon::COPY)).color(theme::black()))
-                .explain(
-                    self.tooltip_verbosity,
-                    "Copy this repository's index into a new one at a new path",
-                    "Clone this repository's entire index into a brand-new repository at a \
-                     new path. The source repository is left completely unchanged — this is \
-                     for branching off a snapshot, not moving anything.",
-                )
-                .clicked()
-            {
-                actions.push(Action::BeginDuplicate(row.name.clone()));
-            }
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new(format!("{} DELETE", icon::TRASH))
-                            .color(theme::ink_on(theme::red())),
-                    )
-                    .fill(theme::red()),
-                )
-                .explain(
-                    self.tooltip_verbosity,
-                    "Remove this repository and delete its index",
-                    "Remove this repository's registry entry and delete its index database. \
-                     The on-disk files it tracked are never touched — only the tracking \
-                     record disappears.",
-                )
-                .clicked()
-            {
-                actions.push(Action::BeginDelete(row.name.clone()));
+            // One chip per mode, ordered by how much a push may delete: ADD
+            // ONLY only copies, APPLY CHANGES also carries the main's own
+            // deletions over, MIRROR deletes everything the main does not have.
+            use dedup_core::store::SyncMode;
+            ui.label(RichText::new("MODE:").color(theme::tan()).size(11.0));
+            for (mode, label, hover, hover_verbose) in [
+                (
+                    SyncMode::AddOnly,
+                    "ADD ONLY",
+                    "Only copy what this backup lacks",
+                    "Push copies content this backup lacks and never deletes \
+                     anything, so it may keep files the main no longer has.",
+                ),
+                (
+                    SyncMode::ApplyChanges,
+                    "APPLY CHANGES",
+                    "Copy what it lacks and carry the main's deletions over",
+                    "Push copies content this backup lacks and also deletes from \
+                     it what the main itself deleted — the backup follows the \
+                     main's edits. Files the main never had stay untouched.",
+                ),
+                (
+                    SyncMode::Mirror,
+                    "MIRROR",
+                    "Make this backup hold exactly the main's content",
+                    "Push copies content this backup lacks and deletes everything \
+                     the main does not have, so the backup converges on exactly \
+                     the main's content.",
+                ),
+            ] {
+                let selected = sink_mode == Some(mode);
+                if crate::lcars::toggle_button(ui, label, selected, theme::orange())
+                    .explain(verbosity, hover, hover_verbose)
+                    .clicked()
+                    && !selected
+                {
+                    actions.push(Action::SetSinkMode {
+                        group: group.clone(),
+                        repo: row.name.clone(),
+                        mode,
+                    });
+                }
             }
         });
-
-        // Sync-group membership actions. A main's group controls live on its
-        // group section (below the card), so only sinks and ungrouped repos get a
-        // button here.
-        let is_main = self.groups.iter().any(|(_, g)| g.main == row.name);
-        let sink_group = self.sink_of(&row.name).map(|(n, _)| n.clone());
-        // This repo's own push mode when it is a sink, for its mode pill.
-        let sink_mode = self
-            .sink_of(&row.name)
-            .and_then(|(_, g)| g.sinks.iter().find(|s| s.repo == row.name).map(|s| s.mode));
-        // Every group as (group name, main), to offer as SINK INTO targets.
-        let group_targets: Vec<(String, String)> = self
-            .groups
-            .iter()
-            .map(|(n, g)| (n.clone(), g.main.clone()))
-            .collect();
-        let verbosity = self.tooltip_verbosity;
-        if !is_main {
-            ui.horizontal(|ui| {
-                if let Some(group) = &sink_group {
-                    // This backup's own push mode, one chip per mode (ordered
-                    // by how much a push may delete): ADD ONLY only copies,
-                    // APPLY CHANGES also carries the main's own deletions
-                    // over, MIRROR deletes everything the main does not have.
-                    use dedup_core::store::SyncMode;
-                    ui.label(RichText::new("MODE:").color(theme::tan()).size(11.0));
-                    for (mode, label, hover, hover_verbose) in [
-                        (
-                            SyncMode::AddOnly,
-                            "ADD ONLY",
-                            "Only copy what this backup lacks",
-                            "Push copies content this backup lacks and never deletes \
-                             anything, so it may keep files the main no longer has.",
-                        ),
-                        (
-                            SyncMode::ApplyChanges,
-                            "APPLY CHANGES",
-                            "Copy what it lacks and carry the main's deletions over",
-                            "Push copies content this backup lacks and also deletes from \
-                             it what the main itself deleted — the backup follows the \
-                             main's edits. Files the main never had stay untouched.",
-                        ),
-                        (
-                            SyncMode::Mirror,
-                            "MIRROR",
-                            "Make this backup hold exactly the main's content",
-                            "Push copies content this backup lacks and deletes everything \
-                             the main does not have, so the backup converges on exactly \
-                             the main's content.",
-                        ),
-                    ] {
-                        let selected = sink_mode == Some(mode);
-                        if crate::lcars::toggle_button(ui, label, selected, theme::orange())
-                            .explain(verbosity, hover, hover_verbose)
-                            .clicked()
-                            && !selected
-                        {
-                            actions.push(Action::SetSinkMode {
-                                group: group.clone(),
-                                repo: row.name.clone(),
-                                mode,
-                            });
-                        }
-                    }
-                    if ui
-                        .button(
-                            RichText::new(format!("{} SINK OUT", icon::X)).color(theme::black()),
-                        )
-                        .explain(
-                            verbosity,
-                            "Take this backup out of its group",
-                            "Remove this repository from its sync group. Both repositories \
-                             stay; they are just no longer linked as main and backup.",
-                        )
-                        .clicked()
-                    {
-                        actions.push(Action::RemoveSink {
-                            group: group.clone(),
-                            repo: row.name.clone(),
-                        });
-                    }
-                } else {
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new(format!("{} MAKE MAIN", icon::STAR))
-                                    .color(theme::ink_on(theme::green())),
-                            )
-                            .fill(theme::green()),
-                        )
-                        .explain(
-                            verbosity,
-                            "Make this repository a sync-group main",
-                            "Turn this repository into the main of a new sync group. You can \
-                             then add backup repositories (sinks) that it is pushed to.",
-                        )
-                        .clicked()
-                    {
-                        actions.push(Action::MakeMain(row.name.clone()));
-                    }
-                    if !group_targets.is_empty() {
-                        ui.menu_button(
-                            RichText::new(format!("{} SINK INTO", icon::ARROW_RIGHT))
-                                .color(theme::text()),
-                            |ui| {
-                                for (group, main) in &group_targets {
-                                    if ui.button(format!("{} {main}", icon::STAR)).clicked() {
-                                        actions.push(Action::SinkInto {
-                                            repo: row.name.clone(),
-                                            group: group.clone(),
-                                        });
-                                        ui.close();
-                                    }
-                                }
-                            },
-                        )
-                        .response
-                        .explain(
-                            verbosity,
-                            "Add this repository to a group as a backup",
-                            "Add this repository to an existing sync group as a backup (sink) \
-                             of that group's main.",
-                        );
-                    }
-                }
-            });
-        }
     }
 
     fn add_modal(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
@@ -3051,19 +3039,16 @@ impl DedupApp {
         }
     }
 
-    /// A real second OS window (not a modal) describing the current tab's
+    /// A real second OS window (not a modal) describing the current screen's
     /// purpose and controls, so it can sit beside the main window instead of
-    /// blocking it. Content tracks `self.tab` live, so switching tabs while
-    /// it's open updates what's shown.
+    /// blocking it. Content tracks `self.screen` live, so opening a command
+    /// while it's open updates what's shown.
     fn help_window(&mut self, ctx: &egui::Context) {
-        let tab_label = match self.tab {
-            Tab::Repositories => "REPOSITORIES",
-            Tab::Duplicates => "DUPLICATES",
-            Tab::Transfer => "TRANSFER",
-            Tab::Grooming => "GROOMING",
-            Tab::Browse => "BROWSE",
+        let tab_label = match self.screen {
+            Screen::Start => "START",
+            Screen::Body(body) => body.label(),
         };
-        let text = crate::help_content::help_text(self.tab);
+        let text = crate::help_content::help_text(self.screen);
         // Park it just to the right of the main window when its position is
         // knowable (not on Wayland, where inner/outer rect is always None); a
         // fixed fallback otherwise. This is only honored by the backend when
@@ -3117,6 +3102,16 @@ impl DedupApp {
     }
 }
 
+/// The line under the command list's title: how many repositories the
+/// commands act on.
+fn selection_summary(selected: usize) -> String {
+    match selected {
+        0 => "No repository selected".to_string(),
+        1 => "1 repository selected".to_string(),
+        n => format!("{n} repositories selected"),
+    }
+}
+
 /// A small rounded status chip with black text on `fill`.
 fn pill(ui: &mut egui::Ui, text: &str, fill: Color32) -> egui::Response {
     egui::Frame::new()
@@ -3127,24 +3122,6 @@ fn pill(ui: &mut egui::Ui, text: &str, fill: Color32) -> egui::Response {
             ui.label(RichText::new(text).color(theme::black()).size(11.0))
         })
         .inner
-}
-
-/// The "main of a sync group" pill next to a repo's name on its card. Matches
-/// the star badge the shared repo chip draws on every other tab, so a main is
-/// recognisable in one glance wherever it appears.
-fn main_pill(ui: &mut egui::Ui, verbosity: TooltipVerbosity) {
-    // Built from the shared `pill` helper, like every other pill on this card,
-    // rather than a second hand-rolled one.
-    let resp = pill(ui, &format!("{} MAIN", icon::STAR), theme::amber());
-    // Announced as the bare word, not glyph-plus-word, so it reads the same as
-    // the chip badge everywhere else.
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "MAIN"));
-    resp.explain(
-        verbosity,
-        "The original this group is backed up from",
-        "This repository is the main of a sync group: the original that GROUP SYNC pushes \
-         out to the backup repositories listed under it.",
-    );
 }
 
 /// Render a repo's location + freshness as chips next to its name. Anything
@@ -3203,24 +3180,6 @@ fn status_pills(ui: &mut egui::Ui, row: &RepoRow, verbosity: TooltipVerbosity) {
                 ),
             );
         }
-    }
-}
-
-fn tab_button(
-    ui: &mut egui::Ui,
-    current: &mut Tab,
-    tab: Tab,
-    label: &str,
-    color: Color32,
-    verbosity: TooltipVerbosity,
-    hover_verbose: &str,
-) {
-    let selected = *current == tab;
-    if crate::lcars::toggle_button(ui, label, selected, color)
-        .explain(verbosity, label, hover_verbose)
-        .clicked()
-    {
-        *current = tab;
     }
 }
 
@@ -3482,8 +3441,8 @@ mod ui_tests {
 
         // Declining leaves every entry indexed.
         app.empty_scan_confirm = None;
-        app.tab = Tab::Repositories;
-        app.sync_shown_tab();
+        app.screen = Screen::Start;
+        app.sync_shown_screen();
         let count = app
             .repos
             .iter()
@@ -3549,7 +3508,9 @@ mod ui_tests {
         let (_tmp, app) = sample_app();
         let activity = app.activity.clone();
         let mut h = render_with_activity(app);
-        h.get_by_label_contains("UPDATE ALL").click();
+        h.get_by_label("ALL").click();
+        h.step();
+        h.get_by_label("UPDATE").click();
         h.step();
         assert_eq!(
             crate::activity::lock(&activity).busy(),
@@ -3634,7 +3595,7 @@ mod ui_tests {
             assert!(loc.reachable(), "'{name}' is a plain local dir");
         }
         // Contrast: an explicit CHECK is real work, on the activity modal.
-        app.apply(&ctx, None, Action::Check("Videos".to_string()));
+        app.start_scans(&ctx, vec!["Videos".to_string()], JobKind::Check);
         assert_eq!(
             crate::activity::lock(&app.activity).busy(),
             Some(crate::activity::Busy("CHECK 'Videos'".to_string())),
@@ -3648,8 +3609,8 @@ mod ui_tests {
     #[test]
     fn switching_to_the_repositories_tab_refreshes_its_stats() {
         let (_tmp, mut app) = sample_app();
-        app.tab = Tab::Repositories;
-        app.sync_shown_tab();
+        app.screen = Screen::Start;
+        app.sync_shown_screen();
         let before = app
             .repos
             .iter()
@@ -3664,10 +3625,10 @@ mod ui_tests {
             .expect("remove entry");
 
         // Leaving and returning is what triggers the re-read.
-        app.tab = Tab::Duplicates;
-        app.sync_shown_tab();
-        app.tab = Tab::Repositories;
-        app.sync_shown_tab();
+        app.screen = Screen::Body(Body::Duplicates);
+        app.sync_shown_screen();
+        app.screen = Screen::Start;
+        app.sync_shown_screen();
 
         let after = app
             .repos
@@ -3686,16 +3647,16 @@ mod ui_tests {
     #[test]
     fn staying_on_the_repositories_tab_does_not_re_read_each_frame() {
         let (_tmp, mut app) = sample_app();
-        app.tab = Tab::Repositories;
-        app.sync_shown_tab();
-        assert!(app.synced_tab == Some(Tab::Repositories));
+        app.screen = Screen::Start;
+        app.sync_shown_screen();
+        assert!(app.synced == Some(Screen::Start));
 
         // Change the store, then run more frames *without* leaving the tab.
         app.store
             .create_repo("Later", &_tmp.path().join("Later").to_string_lossy())
             .ok();
         for _ in 0..3 {
-            app.sync_shown_tab();
+            app.sync_shown_screen();
         }
         assert!(
             !app.repos.iter().any(|r| r.name == "Later"),
@@ -3729,7 +3690,7 @@ mod ui_tests {
                         init = true;
                     }
                     let mut actions = Vec::new();
-                    app.repositories_view(ui, &mut actions);
+                    app.start_page_view(ui, &mut actions);
                 },
                 app,
             );
@@ -3791,6 +3752,12 @@ mod ui_tests {
     /// Render the Repositories tab and run a frame. The harness collects (and
     /// discards) the deferred `Action`s, so this asserts on what is *shown* for a
     /// given store state, which is the group-management UI's real surface.
+    /// Whether the command bar labelled `label` is greyed (not clickable).
+    fn disabled(harness: &Harness<'_, DedupApp>, label: &str) -> bool {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        harness.get_by_label(label).accesskit_node().is_disabled()
+    }
+
     fn render_repos(app: DedupApp) -> Harness<'static, DedupApp> {
         let mut init = false;
         let mut harness = Harness::builder()
@@ -3803,7 +3770,7 @@ mod ui_tests {
                         init = true;
                     }
                     let mut actions = Vec::new();
-                    app.repositories_view(ui, &mut actions);
+                    app.start_page_view(ui, &mut actions);
                     // Dispatch like the real update loop, so a test's click
                     // reaches the store instead of evaporating with the frame.
                     let ctx = ui.ctx().clone();
@@ -3837,7 +3804,7 @@ mod ui_tests {
                     // harness draws no top bar, so it stands in for one — at
                     // the top, where a click can reach it.
                     crate::activity::lock(&app.activity).log_button(ui, app.tooltip_verbosity);
-                    app.repositories_view(ui, &mut actions);
+                    app.start_page_view(ui, &mut actions);
                     crate::activity::lock(&app.activity).show(ui);
                     let ctx = ui.ctx().clone();
                     for action in actions {
@@ -4047,23 +4014,16 @@ mod ui_tests {
         hold_tx.send(()).ok();
     }
 
-    /// Every repo card carries the LOCAL/REMOTE flag button, the toolbar offers
-    /// UPDATE LOCAL, and a repo flagged remote in the registry renders REMOTE
-    /// after a reload — the store→row→card wiring end to end.
+    /// A repository marked remote shows it on its card, and SELECT LOCAL
+    /// leaves it out — the everyday selection that skips slow mounts.
     #[test]
-    fn remote_flag_renders_and_update_local_is_offered() {
+    fn remote_flag_renders_and_local_selection_skips_it() {
         use egui_kittest::kittest::Queryable;
         let (_tmp, app) = sample_app();
         let mut harness = render_repos(app);
-        assert!(
-            harness.query_by_label_contains("UPDATE LOCAL").is_some(),
-            "the everyday rescan button is on the toolbar"
-        );
-        // Two sample repos → two unmarked flags, none marked yet.
-        assert_eq!(harness.query_all_by_label("MARK REMOTE").count(), 2);
         assert!(harness.query_by_label("MARKED REMOTE").is_none());
 
-        // Flag one repo in the registry and reload the rows: its card flips.
+        // Flag one repo in the registry and reload the rows: its card says so.
         harness
             .state_mut()
             .store
@@ -4071,72 +4031,94 @@ mod ui_tests {
             .unwrap();
         harness.state_mut().reload_all();
         harness.run();
-        assert!(
-            harness.query_by_label("MARKED REMOTE").is_some(),
+        assert_eq!(
+            harness.query_all_by_label("MARKED REMOTE").count(),
+            1,
             "the flagged repo's card reads MARKED REMOTE"
         );
+        harness.get_by_label("LOCAL").click();
+        harness.run();
+        let selection: Vec<String> = harness.state().selection.iter().cloned().collect();
         assert_eq!(
-            harness.query_all_by_label("MARK REMOTE").count(),
-            1,
-            "the other repo stays unmarked"
+            selection,
+            vec!["Automatic Upload".to_string()],
+            "LOCAL selects every repository except the remote one"
         );
     }
 
-    /// An ungrouped repo offers MAKE MAIN; with no groups yet, no group controls
-    /// (UNGROUP / MODE pill) are shown anywhere.
+    /// MAKE MAIN is on the list but greyed until an ungrouped repository is
+    /// selected; then it runs on the selection and the store gains the group.
     #[test]
-    fn ungrouped_repos_offer_make_main_and_no_group_controls() {
+    fn make_main_waits_for_a_selected_ungrouped_repo_then_runs() {
         use egui_kittest::kittest::Queryable;
         let (_tmp, app) = sample_app();
-        let harness = render_repos(app);
+        let mut harness = render_repos(app);
         assert!(
-            harness.query_all_by_label_contains("MAKE MAIN").count() >= 1,
-            "an ungrouped repo can be made a group main"
+            disabled(&harness, "MAKE MAIN"),
+            "with nothing selected MAKE MAIN is greyed"
         );
         assert!(
-            harness.query_by_label_contains("UNGROUP").is_none(),
-            "no group controls without a group"
+            disabled(&harness, "UNGROUP"),
+            "with nothing selected UNGROUP is greyed"
+        );
+        harness.get_by_label("Videos").click();
+        harness.run();
+        assert!(
+            !disabled(&harness, "MAKE MAIN"),
+            "one ungrouped repo selected enables MAKE MAIN"
+        );
+        harness.get_by_label("MAKE MAIN").click();
+        harness.run();
+        harness.run();
+        let groups = harness.state().store.list_sync_groups().expect("groups");
+        assert!(
+            groups.iter().any(|(_, g)| g.main == "Videos"),
+            "MAKE MAIN made the selected repo a group main"
         );
     }
 
-    /// A group's main shows the group controls (UNGROUP) and never MAKE MAIN;
-    /// its sink carries its own mode pill and SINK OUT (once expanded).
+    /// A group's frame selects all of its members at once, which enables
+    /// GROUP SYNC; the backup's card carries its own mode chips.
     #[test]
-    fn group_main_shows_controls_and_sink_shows_mode_and_sink_out() {
+    fn a_group_frame_selects_its_members_and_offers_group_sync() {
         use egui_kittest::kittest::Queryable;
         let (_tmp, mut app) = sample_app();
         app.store
-            .create_sync_group("Automatic Upload", "Automatic Upload")
+            .create_sync_group("offsite", "Automatic Upload")
             .expect("create group");
         app.store
-            .add_sync_sink("Automatic Upload", "Videos", SyncMode::AddOnly)
+            .add_sync_sink("offsite", "Videos", SyncMode::AddOnly)
             .expect("add sink");
         app.reload_all();
         let mut harness = render_repos(app);
+        assert!(
+            disabled(&harness, "GROUP SYNC"),
+            "nothing selected: GROUP SYNC is greyed"
+        );
         // Groups are folded by default; open this one to reach its contents.
-        harness.get_by_label_contains("Automatic Upload").click();
+        harness.get_by_label_contains("offsite").click();
         harness.run();
         harness.run();
-
-        assert!(
-            harness.query_by_label_contains("UNGROUP").is_some(),
-            "the main shows the UNGROUP control"
+        harness.get_by_label("SELECT GROUP").click();
+        harness.run();
+        let selection: Vec<String> = harness.state().selection.iter().cloned().collect();
+        assert_eq!(
+            selection,
+            vec!["Automatic Upload".to_string(), "Videos".to_string()],
+            "the frame selects the main and its backup"
         );
-        // Both repos are grouped, so nothing offers MAKE MAIN.
         assert!(
-            harness.query_by_label_contains("MAKE MAIN").is_none(),
-            "a grouped repo is not offered as a new main"
+            !disabled(&harness, "GROUP SYNC"),
+            "a whole group selected enables GROUP SYNC"
         );
-
-        // The group section starts open, so the sink's card is already drawn.
         assert!(
-            harness.query_by_label_contains("SINK OUT").is_some(),
-            "the expanded sink offers SINK OUT"
+            disabled(&harness, "UNGROUP"),
+            "two repositories selected: the one-repository UNGROUP is greyed"
         );
         for chip in ["ADD ONLY", "APPLY CHANGES", "MIRROR"] {
             assert!(
                 harness.query_all_by_label_contains(chip).count() >= 1,
-                "the sink offers the {chip} mode chip"
+                "the backup offers the {chip} mode chip"
             );
         }
     }
@@ -4147,15 +4129,15 @@ mod ui_tests {
         use egui_kittest::kittest::Queryable;
         let (_tmp, mut app) = sample_app();
         app.store
-            .create_sync_group("Automatic Upload", "Automatic Upload")
+            .create_sync_group("offsite", "Automatic Upload")
             .expect("create group");
         app.store
-            .add_sync_sink("Automatic Upload", "Videos", SyncMode::Mirror)
+            .add_sync_sink("offsite", "Videos", SyncMode::Mirror)
             .expect("add sink");
         app.reload_all();
         let mut harness = render_repos(app);
         // Groups are folded by default; open this one to reach its contents.
-        harness.get_by_label_contains("Automatic Upload").click();
+        harness.get_by_label_contains("offsite").click();
         harness.run();
         harness.run();
         harness.get_by_label("APPLY CHANGES").click_accesskit();
@@ -4198,7 +4180,7 @@ mod ui_tests {
                         init = true;
                     }
                     let mut actions = Vec::new();
-                    app.repositories_view(ui, &mut actions);
+                    app.start_page_view(ui, &mut actions);
                 },
                 app,
             );
@@ -4241,9 +4223,9 @@ mod ui_tests {
         harness.run();
         assert!(
             harness
-                .query_by_label_contains("Register the folders you want to triage")
+                .query_by_label_contains("The start page is where everything begins")
                 .is_some(),
-            "the HELP window shows the current (REPOSITORIES) tab's help copy"
+            "the HELP window shows the start page's help copy"
         );
         harness.get_by_label("CLOSE").click();
         harness.run();
@@ -4287,19 +4269,20 @@ mod ui_tests {
         harness
     }
 
-    /// At the minimum window width the five tabs no longer fit beside
-    /// SETTINGS/ABOUT. Those two buttons must stay fully on-screen and pinned to
-    /// the right (the tab strip scrolls, clipped, instead of a tab sliding behind
-    /// ABOUT or SETTINGS spilling off the edge — the reported regression).
+    /// At the minimum window width SETTINGS/ABOUT must stay fully on-screen
+    /// and pinned to the right, with the header strip clipped to their left.
     #[test]
     fn top_bar_pins_settings_about_when_narrow() {
         use egui_kittest::kittest::Queryable;
         let width = 760.0;
-        let (_tmp, app) = sample_app();
+        let (_tmp, mut app) = sample_app();
+        app.selection.insert("Automatic Upload".into());
+        app.selection.insert("Videos".into());
+        app.open_body(Body::Transfer, start_page::Command::Diff);
         let harness = topbar_harness(app, width);
         let settings = harness.get_by_label_contains("SETTINGS").rect();
         let about = harness.get_by_label("ABOUT").rect();
-        let repos = harness.get_by_label("REPOSITORIES").rect();
+        let start = harness.get_by_label_contains("START").rect();
         assert!(
             settings.right() <= width + 0.5,
             "SETTINGS spills off the right edge (right={} > {width})",
@@ -4309,39 +4292,134 @@ mod ui_tests {
             about.right() <= settings.left() + 0.5,
             "ABOUT ({about:?}) overlaps SETTINGS ({settings:?})"
         );
-        // The tab strip lives entirely to the left of ABOUT (it scrolls/clips
-        // there), so no tab is drawn behind ABOUT.
         assert!(
-            repos.left() < about.left(),
-            "tab strip starts at/after ABOUT — it is not clipped to the left of it"
+            start.left() < about.left(),
+            "the header strip starts at/after ABOUT — it is not to the left of it"
         );
     }
 
-    /// Wide enough for every tab: all five are laid out (none clipped) and
-    /// SETTINGS/ABOUT still sit to their right.
+    /// While a command's body is open the header strip names the selection
+    /// and the command, and its START bar returns to the start page with the
+    /// selection intact. On the start page the strip is empty.
     #[test]
-    fn top_bar_shows_all_tabs_when_wide() {
+    fn header_strip_names_selection_and_command_and_returns() {
         use egui_kittest::kittest::Queryable;
-        let (_tmp, app) = sample_app();
-        let harness = topbar_harness(app, 1100.0);
-        for tab in [
-            "REPOSITORIES",
-            "DUPLICATES",
-            "TRANSFER",
-            "GROOMING",
-            "BROWSE",
-        ] {
-            assert!(
-                harness.query_by_label(tab).is_some(),
-                "tab {tab} missing at wide width"
-            );
-        }
-        let browse = harness.get_by_label("BROWSE").rect();
+        let (_tmp, mut app) = sample_app();
+        app.selection.insert("Videos".into());
+        app.open_body(Body::Browse, start_page::Command::Browse);
+        let mut harness = topbar_harness(app, 1100.0);
+        let start = harness.get_by_label_contains("START").rect();
+        let chip = harness.get_by_label("Videos").rect();
+        let cmd = harness.get_by_label("BROWSE").rect();
         let about = harness.get_by_label("ABOUT").rect();
+        assert!(start.right() <= chip.left(), "START, then the selection");
         assert!(
-            browse.right() <= about.left() + 0.5,
-            "BROWSE ({browse:?}) overlaps ABOUT ({about:?}) even when wide"
+            chip.right() <= cmd.left(),
+            "the selection, then the command"
         );
+        assert!(
+            cmd.right() <= about.left() + 0.5,
+            "the strip ({cmd:?}) stays left of ABOUT ({about:?})"
+        );
+        harness.get_by_label_contains("START").click();
+        harness.run();
+        assert_eq!(
+            harness.state().screen,
+            Screen::Start,
+            "START returns to the start page"
+        );
+        assert!(
+            harness.state().selection.contains("Videos"),
+            "the selection survives the return"
+        );
+        assert!(
+            harness.query_by_label("BROWSE").is_none(),
+            "on the start page the strip is empty"
+        );
+    }
+
+    /// FIND DUPLICATES hands exactly the selection to the Duplicates body,
+    /// in exact mode, and opens it under the header strip.
+    #[test]
+    fn find_duplicates_hands_the_selection_to_the_duplicates_body() {
+        let (_tmp, mut app) = sample_app();
+        let ctx = egui::Context::default();
+        app.selection.insert("Automatic Upload".into());
+        app.selection.insert("Videos".into());
+        app.run_command(&ctx, start_page::Command::FindDuplicates);
+        assert_eq!(app.screen, Screen::Body(Body::Duplicates));
+        assert_eq!(app.open_command, Some(start_page::Command::FindDuplicates));
+        assert_eq!(
+            app.dupes.included_repos(),
+            vec!["Automatic Upload".to_string(), "Videos".to_string()]
+        );
+        assert!(!app.dupes.is_similar(), "FIND DUPLICATES is the exact mode");
+        app.run_command(&ctx, start_page::Command::FindSimilar);
+        assert!(app.dupes.is_similar(), "FIND SIMILAR is the similar mode");
+    }
+
+    /// BROWSE opens the Browse body at the selected repository's root.
+    #[test]
+    fn browse_opens_at_the_selected_repo() {
+        let (_tmp, mut app) = sample_app();
+        let ctx = egui::Context::default();
+        app.selection.insert("Videos".into());
+        app.run_command(&ctx, start_page::Command::Browse);
+        assert_eq!(app.screen, Screen::Body(Body::Browse));
+        assert_eq!(app.browse.repo(), Some("Videos"));
+    }
+
+    /// A selected backup group gives GROUP SYNC its direction for free: the
+    /// main is the source and the selected backups are the targets.
+    #[test]
+    fn group_sync_gets_its_direction_from_the_group() {
+        let (_tmp, mut app) = sample_app();
+        app.store
+            .create_sync_group("offsite", "Automatic Upload")
+            .expect("create group");
+        app.store
+            .add_sync_sink("offsite", "Videos", SyncMode::AddOnly)
+            .expect("add sink");
+        app.reload_all();
+        let ctx = egui::Context::default();
+        app.selection.insert("Automatic Upload".into());
+        app.selection.insert("Videos".into());
+        app.run_command(&ctx, start_page::Command::GroupSync);
+        assert_eq!(app.screen, Screen::Body(Body::Transfer));
+        assert_eq!(
+            app.transfer.roles().0.as_deref(),
+            Some("Automatic Upload"),
+            "the main is the source"
+        );
+        assert_eq!(
+            app.transfer.command(),
+            crate::transfer_view::Command::GroupSync
+        );
+        assert_eq!(app.transfer.selected_sinks(), ["Videos".to_string()]);
+    }
+
+    /// A single unlocked repository is handed to Grooming as the one PURGE
+    /// acts on; the lock greys PURGE until the card's padlock opens it.
+    #[test]
+    fn purge_hands_the_single_unlocked_repo_to_grooming() {
+        let (_tmp, mut app) = sample_app();
+        let ctx = egui::Context::default();
+        app.selection.insert("Videos".into());
+        app.run_command(&ctx, start_page::Command::Purge);
+        assert_eq!(app.screen, Screen::Start, "a locked repo cannot be purged");
+        assert!(
+            crate::activity::lock(&app.activity)
+                .card_lines()
+                .iter()
+                .any(|l| l.contains("locked")),
+            "the refusal names the lock: {:?}",
+            crate::activity::lock(&app.activity).card_lines()
+        );
+        app.locks.toggle("Videos");
+        app.run_command(&ctx, start_page::Command::Purge);
+        assert_eq!(app.screen, Screen::Body(Body::Grooming));
+        assert_eq!(app.grooming.repo(), Some("Videos"));
+        assert_eq!(app.grooming.command(), crate::grooming_view::Command::Purge);
     }
 
     /// A long repo path must truncate to the gap between the status pills and the
@@ -4361,7 +4439,7 @@ mod ui_tests {
                         init = true;
                     }
                     let mut actions = Vec::new();
-                    app.repositories_view(ui, &mut actions);
+                    app.start_page_view(ui, &mut actions);
                 },
                 app,
             );
@@ -4413,12 +4491,13 @@ mod ui_tests {
         dir.join(name)
     }
 
-    /// Doc screenshot: the Repository Management tab with two scanned repos,
-    /// to `docs/screenshots/repositories_tab.png`. Run with `--ignored`.
+    /// Doc screenshot: the start page with two scanned repos, one selected,
+    /// to `docs/screenshots/start_page.png`. Run with `--ignored`.
     #[test]
     #[ignore = "generates a doc screenshot (needs wgpu)"]
-    fn doc_screenshot_repositories_tab() {
-        let (_tmp, app) = sample_app();
+    fn doc_screenshot_start_page() {
+        let (_tmp, mut app) = sample_app();
+        app.selection.insert("Videos".into());
         let mut init = false;
         let mut harness = Harness::builder()
             .with_size(egui::vec2(1120.0, 620.0))
@@ -4431,13 +4510,13 @@ mod ui_tests {
                         init = true;
                     }
                     let mut actions = Vec::new();
-                    app.repositories_view(ui, &mut actions);
+                    app.start_page_view(ui, &mut actions);
                 },
                 app,
             );
         harness.run();
         let img = harness.render().expect("wgpu render failed");
-        let out = doc_screenshot_path("repositories_tab.png");
+        let out = doc_screenshot_path("start_page.png");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }
@@ -4486,7 +4565,7 @@ mod ui_tests {
                         init = true;
                     }
                     let mut actions = Vec::new();
-                    app.repositories_view(ui, &mut actions);
+                    app.start_page_view(ui, &mut actions);
                 },
                 app,
             );

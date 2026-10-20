@@ -142,7 +142,7 @@ when the board is ready.
 
 Keep a repository backed up to one or more others, without the manual "duplicate the repo,
 relocate the copy, rescan it" dance. Groups themselves (creating one, adding/removing sinks,
-setting each sink's mode) are managed on the [Repositories tab](repositories.md#sync-groups);
+setting each sink's mode) are managed on the [start page](start-page.md#backup-groups);
 this tab is where a group is actually *pushed*.
 
 ![GROUP SYNC selected: TARGET hidden, SINKS shown](../screenshots/transfer_group_sync.png)

@@ -20,7 +20,7 @@ Open work only. Closed items live in `git log`; documentation lives in `docs/`.
 
 Start page hub, one command list, one board. Landed one child per commit, in order:
 
-- [ ] #5 Start page shell replaces the tab bar
+- [x] #5 Start page shell replaces the tab bar
 - [ ] #6 Start page facts: totals, stale badges, last runs
 - [ ] #7 Progressive inputs and from/to roles
 - [ ] #8 Favorites

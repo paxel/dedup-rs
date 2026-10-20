@@ -831,6 +831,36 @@ impl DupesView {
         }
     }
 
+    /// Open this body from the start page (ADR 0004): search exactly `repos`,
+    /// similar or exact, with the WHAT and WITH WHICH sections folded shut —
+    /// both were answered on the start page, and each reopens on its header.
+    pub fn open_from(&mut self, store: &Store, repos: &[String], similar: bool) {
+        self.sync_repos(store);
+        for r in &mut self.repos {
+            r.included = repos.contains(&r.name);
+        }
+        self.mode = if similar { Mode::Similar } else { Mode::Exact };
+        self.mode_chosen = true;
+        self.folds.set("WHAT — DUPLICATES OR SIMILAR FILES", false);
+        self.folds.set("WITH WHICH — REPOSITORIES TO SEARCH", false);
+    }
+
+    /// The repositories the next FIND searches, in list order.
+    #[cfg(test)]
+    pub(crate) fn included_repos(&self) -> Vec<String> {
+        self.repos
+            .iter()
+            .filter(|r| r.included)
+            .map(|r| r.name.clone())
+            .collect()
+    }
+
+    /// Whether the next FIND looks for similar (not exact) files.
+    #[cfg(test)]
+    pub(crate) fn is_similar(&self) -> bool {
+        self.mode == Mode::Similar
+    }
+
     fn repo_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         let title = "WITH WHICH — REPOSITORIES TO SEARCH";
         let mut open = self.folds.is_open(title);

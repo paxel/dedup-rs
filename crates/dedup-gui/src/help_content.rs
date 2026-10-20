@@ -1,40 +1,46 @@
-//! Per-tab copy shown in the HELP window (see [`crate::app::DedupApp`]'s HELP
-//! button): what the current tab is for and how its controls fit together.
+//! Per-screen copy shown in the HELP window (see [`crate::app::DedupApp`]'s
+//! HELP button): what the current screen is for and how its controls fit
+//! together.
 
-use crate::app::Tab;
+use crate::app::{Body, Screen};
 
-/// The help text for `tab`.
-pub fn help_text(tab: Tab) -> &'static str {
-    match tab {
-        Tab::Repositories => REPOSITORIES,
-        Tab::Duplicates => DUPLICATES,
-        Tab::Transfer => TRANSFER,
-        Tab::Grooming => GROOMING,
-        Tab::Browse => BROWSE,
+/// The help text for `screen`.
+pub fn help_text(screen: Screen) -> &'static str {
+    match screen {
+        Screen::Start => START,
+        Screen::Body(Body::Duplicates) => DUPLICATES,
+        Screen::Body(Body::Transfer) => TRANSFER,
+        Screen::Body(Body::Grooming) => GROOMING,
+        Screen::Body(Body::Browse) => BROWSE,
     }
 }
 
-const REPOSITORIES: &str = "\
-Register the folders you want to triage — each becomes a repository: a named folder \
-tracked by its own index of file contents.
+const START: &str = "\
+The start page is where everything begins: your repositories as cards on the left, the \
+commands on the right.
 
-Add a repository with ADD REPOSITORY, or simply drag folders from your file manager and \
-drop them anywhere onto the window. After adding files or changing a folder's contents, \
-run UPDATE ALL so the indexes match the disk again — it scans every repository one after \
-another in the activity window, each on its own row with its progress, and ends on one \
-report; repositories that are already up to date finish almost instantly. REFRESH STATUS \
-re-checks each repository's reachability, without changing anything.
+A repository is a named folder on disk, tracked by its own index of file contents. Add one \
+with ADD REPOSITORY, or drag folders from your file manager and drop them anywhere onto \
+the window. Each card shows the repository's path, its FILES, SIZE, MISSING and SCANNED \
+stats, status pills (LOCAL / REMOTE / OFFLINE / MISSING for reachability, UP TO DATE / \
+UPDATE REQUIRED from the last CHECK) and its padlock: every repository starts locked each \
+launch, and while it is locked nothing in the app deletes or overwrites its files. A backup \
+group — a main and the backups it is pushed to — is framed together; SELECT GROUP inside \
+the frame selects all of its members at once.
 
-Each card shows FILES, SIZE, MISSING and SCANNED stats, plus \
-status pills: LOCAL / REMOTE / OFFLINE / MISSING for reachability, and UP TO DATE / UPDATE \
-REQUIRED from the last CHECK.
+Click a card's name to select or deselect it; ALL, LOCAL and NONE change the whole \
+selection. The command list beside the cards is always complete and always in the same \
+order: INVESTIGATE (browse, find duplicates or similar files, diff, check), MAINTAIN \
+(update, prune, reorganize, and the repository's own rename, relocate, clone, remove, \
+remote flag and group membership), MOVE (copy, move, sync, mirror, group sync) and CLEAN \
+(dedupe against, purge by filter, empty directories). A command the selection does not \
+allow is greyed, and hovering it says why — one repository needed, two, a backup group, \
+or a locked repository.
 
-Per-repository actions: UPDATE / SCAN (hash new/changed files) and CHECK (dry-run, no \
-writes) run in the activity window with CANCEL; RENAME (registry name only, the on-disk \
-folder isn't moved), RELOCATE (point at a different folder, keep the index), DUPLICATE \
-(clone the whole index into a new repository at a new path), and DELETE (remove the \
-registry entry and its index — the on-disk files are never touched) each answer with a \
-notification card.";
+A command that scans runs in the activity window. A command that edits a repository \
+opens its editor on the card. Every other command opens its own body under a header \
+strip that names the selection and the command; the START bar on the strip returns \
+here with the selection kept.";
 
 const DUPLICATES: &str = "\
 Find exact or perceptually similar duplicates across one or more repositories, review them \
@@ -84,7 +90,7 @@ the same relative path, and can also delete target files whose content the sourc
 (DELETE MISSING).
 
 GROUP SYNC replaces the single TARGET with a SINKS picker, and only appears when the SOURCE \
-is a backup group's main (groups are created on the Repositories tab). Each sink pushes in \
+is a backup group's main (groups are created on the start page). Each sink pushes in \
 its own stored mode: ADD ONLY copies content it lacks and never deletes, so a sink may keep \
 files the main no longer has; APPLY CHANGES also deletes sink content the main itself \
 deleted, so the sink follows the main's edits while keeping what the main never had; MIRROR \

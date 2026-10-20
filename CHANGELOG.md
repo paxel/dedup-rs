@@ -6,6 +6,22 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 ### Changed
 
+- **The tabs are gone; the app opens on a start page.** Your repositories are
+  cards on the left — click a name chip to select one or many, or ALL /
+  LOCAL / NONE for the lot — and every command is on one list on the right,
+  grouped by intent: INVESTIGATE (browse, find duplicates or similar files,
+  diff, check), MAINTAIN (update, prune, reorganize, and a repository's own
+  rename, relocate, clone, remove, remote flag and group membership), MOVE
+  (copy, move, sync, mirror, group sync) and CLEAN (dedupe against, purge by
+  filter, empty directories). A command the selection does not allow is
+  greyed and says why on hover. UPDATE and CHECK run on the selection at
+  once; a repository edit opens on its card; every other command opens its
+  view under a header strip that names the selection and the command, with
+  the repositories already filled in, and the START bar on the strip returns
+  to the start page with the selection kept. A backup group's frame carries
+  SELECT GROUP, which selects the main and every backup at once and gives
+  GROUP SYNC its direction. The card's padlock is the session lock.
+
 - **Audio has a seek bar, not a volume-slider lookalike.** The round-handled
   slider under a previewed track is gone. In Browse the position now runs
   along its own bar directly under the spectrogram — the same width as the

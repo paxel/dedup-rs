@@ -57,8 +57,8 @@ const TEMPLATE_TOKENS: &[(&str, &str)] = &[
     ("/", "/"),
 ];
 
-#[derive(PartialEq, Clone, Copy)]
-enum Command {
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub(crate) enum Command {
     /// Delete source files whose content is also in any selected pool repo.
     Dedupe,
     /// Delete every file matching a filter.
@@ -1884,6 +1884,41 @@ impl GroomingView {
             }
             Err(e) => self.error = Some(e.to_string()),
         }
+    }
+
+    /// Open this body from the start page (ADR 0004) for `command` on `repos`.
+    /// A single repository is the one the command acts on; DEDUPE's source
+    /// and pool stay the user's choice in the body's WITH WHICH section.
+    /// Whatever the start page answered folds shut and reopens on its header.
+    pub fn open_from(&mut self, store: &Store, command: Command, repos: &[String]) {
+        self.sync_repos(store);
+        self.command = command;
+        self.command_chosen = true;
+        self.source = None;
+        self.repo = None;
+        self.pool.clear();
+        self.folds
+            .set("WHAT — DEDUPE, PURGE, EMPTY DIRS, ORGANIZE OR PRUNE", false);
+        if command != Command::Dedupe
+            && let [one] = repos
+        {
+            self.repo = Some(one.clone());
+            self.folds
+                .set("WITH WHICH — THE REPOSITORY TO GROOM", false);
+        }
+        self.clear_preview();
+    }
+
+    /// The repository the command acts on, for tests.
+    #[cfg(test)]
+    pub(crate) fn repo(&self) -> Option<&str> {
+        self.repo.as_deref()
+    }
+
+    /// The command in force, for tests.
+    #[cfg(test)]
+    pub(crate) fn command(&self) -> Command {
+        self.command
     }
 }
 

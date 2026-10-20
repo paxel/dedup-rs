@@ -31,7 +31,7 @@ One chip per registered repository:
 - Click the **padlock** to toggle read-only: a closed lock means files in that repo are
   protected from deletion (never preselected, never marked, even by auto-resolve); an open
   lock means they can be deleted like any other file.
-- **REFRESH** reloads the repository list (e.g. after adding one in the Repositories tab).
+- **REFRESH** reloads the repository list (e.g. after adding one on the start page).
 
 ## Mode, threshold, and FIND
 

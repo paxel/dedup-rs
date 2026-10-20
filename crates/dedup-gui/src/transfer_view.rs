@@ -41,8 +41,8 @@ use crate::board::PREVIEW_CAP;
 /// lightbox's limit; larger images are downscaled by the decoder to stay within
 /// driver limits.
 
-#[derive(PartialEq, Clone, Copy)]
-enum Command {
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub(crate) enum Command {
     Copy,
     Move,
     Sync,
@@ -1876,6 +1876,88 @@ impl TransferView {
         }
     }
 
+    /// Open this body from the start page (ADR 0004) for `command` on `repos`.
+    /// A backup group (`group`: its main and the selected backups) gives the
+    /// direction for free; a single repository is a folder export's source;
+    /// a DIFF pair needs no direction; any other pair leaves the roles to the
+    /// user in the body's WITH WHICH section. Whatever the start page
+    /// answered folds shut and reopens on its header.
+    pub fn open_from(
+        &mut self,
+        store: &Store,
+        command: Command,
+        repos: &[String],
+        group: Option<(String, Vec<String>)>,
+    ) {
+        self.sync_repos(store);
+        self.source = None;
+        self.target = None;
+        self.extra_refs.clear();
+        self.destination = Destination::Repo;
+        let mut roles_known = true;
+        match (group, repos) {
+            (Some((main, sinks)), _) => {
+                self.source = Some(main);
+                self.refresh_group(store);
+                self.selected_sinks.retain(|s| sinks.contains(s));
+            }
+            (None, [one]) => {
+                self.source = Some(one.clone());
+                self.destination = Destination::Folder;
+                self.refresh_group(store);
+            }
+            (None, [a, b]) if command == Command::Diff => {
+                let (a, b) = if a <= b { (a, b) } else { (b, a) };
+                self.source = Some(a.clone());
+                self.target = Some(b.clone());
+                self.refresh_group(store);
+            }
+            _ => {
+                self.refresh_group(store);
+                roles_known = false;
+            }
+        }
+        // After `refresh_group`, which snaps a GROUP command back to COPY
+        // when the source names no group.
+        self.command = command;
+        self.command_chosen = true;
+        self.clear_preview();
+        for title in [
+            "WHAT — COPY, MOVE, SYNC, MIRROR, GROUP SYNC, GROUP SYNC BACK OR DIFF",
+            "WHAT — COPY, MOVE, SYNC, MIRROR OR DIFF",
+        ] {
+            self.folds.set(title, false);
+        }
+        if roles_known {
+            for title in [
+                "WITH WHICH — THE GROUP'S MAIN",
+                "WITH WHICH — THE TWO REPOSITORIES TO COMPARE",
+                "WITH WHICH — SOURCE REPOSITORY",
+                "WITH WHICH — SOURCE & TARGET REPOSITORIES",
+            ] {
+                self.folds.set(title, false);
+            }
+        }
+    }
+
+    /// The source and target as handed over, for tests.
+    #[cfg(test)]
+    pub(crate) fn roles(&self) -> (Option<String>, Option<String>) {
+        (self.source.clone(), self.target.clone())
+    }
+
+    /// The command in force, for tests.
+    #[cfg(test)]
+    pub(crate) fn command(&self) -> Command {
+        self.command
+    }
+
+    /// The backups the next GROUP SYNC pushes to, for tests.
+    #[cfg(test)]
+    pub(crate) fn selected_sinks(&self) -> &[String] {
+        &self.selected_sinks
+    }
+
     /// Re-resolve GROUP SYNC's group from the current source: the sync group
     /// (if any) whose main *is* the source, and every one of its sinks
     /// selected by default. Falls back off GROUP SYNC when the source no
@@ -2601,7 +2683,7 @@ impl TransferView {
                     (
                         "Include this sink in the push",
                         "Toggle whether this sink is included when GROUP SYNC runs. Its mode \
-                             (ADD ONLY / APPLY CHANGES / MIRROR) is set on the Repositories tab.",
+                             (ADD ONLY / APPLY CHANGES / MIRROR) is set on the start page.",
                     )
                 };
                 if row

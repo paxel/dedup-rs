@@ -20,7 +20,6 @@ pub const PLUS: &str = "\u{E3D4}";
 pub const FOLDER_OPEN: &str = "\u{E256}";
 pub const REFRESH: &str = "\u{E094}"; // arrows-clockwise
 pub const PENCIL: &str = "\u{E3B4}"; // pencil-simple
-pub const RELOCATE: &str = "\u{E0A0}"; // arrows-left-right
 pub const COPY: &str = "\u{E1CA}";
 pub const TRASH: &str = "\u{E4A6}";
 pub const GEAR: &str = "\u{E270}";
