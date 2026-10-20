@@ -7,6 +7,15 @@ The app opens on the start page, and every piece of work starts here: your repos
 folder on disk, tracked by its own index — the GUI equivalent of the [`repo`
 subcommand](../cli.md#repo).
 
+## Totals and recent changes
+
+Above the cards one line sums everything the app looks after: how many repositories,
+files and bytes. Below the selection row, **RECENT** lists the newest changes the app made
+to your files — each a chip reading the action and the file name, red when it failed,
+with the time, repository and whole path on hover — and a **LOG** button that opens the
+full [event log](index.md#the-activity-window). Until the app has changed anything it says
+so.
+
 ## Selection
 
 Click a card's name chip to select or deselect the repository; a selected card is outlined
@@ -67,7 +76,7 @@ few types by share, pinned top-right), and stats:
 | FILES   | Indexed files (files that vanished from disk since the last scan are excluded).                                                                    |
 | SIZE    | Total on-disk size of indexed files.                                                                                                               |
 | MISSING | Files indexed before but no longer found on disk — kept as history, excluded from stats and duplicate search until a rescan confirms they're back. |
-| SCANNED | When this repository was last scanned ("never" if it hasn't been).                                                                                 |
+| UPDATED | How long ago this repository was last scanned — "just now", "3 hours ago", "9 days ago", or "never" — with the exact date and time on hover.      |
 
 Status pills:
 
@@ -76,6 +85,8 @@ Status pills:
   until it's back.
 - **MISSING** — the local folder no longer exists or can't be read; RELOCATE it or restore
   the folder before scanning.
+- **NEVER SCANNED** — the repository has no index yet: select it and run UPDATE before
+  anything in it can be found, compared or moved.
 - **UP TO DATE** / **UPDATE REQUIRED** — from the last CHECK: whether there are new,
   changed, or missing files since the last scan.
 - **MARKED REMOTE** — your own judgement that this repository's folder lives on a slow

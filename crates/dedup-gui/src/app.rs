@@ -31,6 +31,9 @@ pub(crate) const TOP_BAR_H: f32 = 56.0;
 /// The width of the start page's command list.
 const COMMANDS_W: f32 = 236.0;
 
+/// How many of the newest event-log lines the start page shows.
+const LAST_RUNS: usize = 5;
+
 /// Repos scan one at a time (each scan already parallelizes across all CPU
 /// cores), so the queue starts a new scan only while fewer than this many run.
 /// What a scan does: index the folder, index it even when it walked empty
@@ -231,6 +234,8 @@ pub struct DedupApp {
     /// page's cards show and toggle it.
     locks: crate::locks::RepoLocks,
     repos: Vec<RepoRow>,
+    /// The newest event-log lines, re-read whenever the cards reload.
+    last_runs: Vec<crate::activity::LogEntry>,
     load_error: Option<String>,
     /// Transient non-error notice (e.g. a drag-and-drop add summary).
     notice: Option<String>,
@@ -298,6 +303,7 @@ impl DedupApp {
             open_command: None,
             locks: locks.clone(),
             repos: Vec::new(),
+            last_runs: Vec::new(),
             load_error: None,
             notice: None,
             empty_scan_confirm: None,
@@ -617,6 +623,7 @@ impl DedupApp {
                 self.synced = None;
                 let names: HashSet<&str> = self.repos.iter().map(|r| r.name.as_str()).collect();
                 self.selection.retain(|n| names.contains(n.as_str()));
+                self.last_runs = crate::activity::lock(&self.activity).recent(LAST_RUNS);
             }
             Err(e) => self.load_error = Some(e.to_string()),
         }
@@ -1717,7 +1724,9 @@ impl DedupApp {
                 if let Some(notice) = &self.notice {
                     ui.colored_label(theme::amber(), notice);
                 }
+                self.totals_line(ui);
                 self.selection_row(ui, actions);
+                self.last_runs_row(ui);
                 self.cards(ui, actions);
             });
     }
@@ -1734,6 +1743,68 @@ impl DedupApp {
                 sink_of: self.sink_of(&r.name).map(|(n, _)| n.clone()),
             })
             .collect()
+    }
+
+    /// One line of facts over everything: how many repositories, files and
+    /// bytes the app looks after.
+    fn totals_line(&self, ui: &mut egui::Ui) {
+        let files: u64 = self.repos.iter().map(|r| r.stats.file_count).sum();
+        let bytes: u64 = self.repos.iter().map(|r| r.stats.total_size).sum();
+        ui.label(
+            RichText::new(totals_text(self.repos.len(), files, bytes))
+                .color(theme::amber())
+                .size(16.0)
+                .strong(),
+        )
+        .explain(
+            self.tooltip_verbosity,
+            "Everything the app looks after",
+            "The number of registered repositories, and the indexed files and bytes \
+             across all of them (missing files excluded).",
+        );
+        ui.add_space(4.0);
+    }
+
+    /// The newest changes the app made to your files, from the event log,
+    /// each a chip whose hover text has the whole line; LOG opens the log.
+    fn last_runs_row(&mut self, ui: &mut egui::Ui) {
+        let verbosity = self.tooltip_verbosity;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("RECENT").color(theme::tan()).size(12.0));
+            if self.last_runs.is_empty() {
+                ui.label(
+                    RichText::new("No changes made to your files yet")
+                        .color(theme::text())
+                        .size(12.0),
+                );
+            }
+            for entry in &self.last_runs {
+                let name = entry.path.rsplit('/').next().unwrap_or(&entry.path);
+                let label = if name.is_empty() {
+                    entry.action.clone()
+                } else {
+                    format!("{} {name}", entry.action)
+                };
+                let fill = if entry.ok { theme::tan() } else { theme::red() };
+                let detail = match &entry.error {
+                    Some(e) => format!(
+                        "{} · {} · {} — failed: {e}",
+                        log_time_local(&entry.at),
+                        entry.repo,
+                        entry.path
+                    ),
+                    None => format!(
+                        "{} · {} · {}",
+                        log_time_local(&entry.at),
+                        entry.repo,
+                        entry.path
+                    ),
+                };
+                pill(ui, &label, fill).explain(verbosity, &detail, &detail);
+            }
+            crate::activity::lock(&self.activity).log_button(ui, verbosity);
+        });
+        ui.add_space(4.0);
     }
 
     /// The row above the cards: select ALL / LOCAL / NONE, REFRESH STATUS,
@@ -2144,14 +2215,17 @@ impl DedupApp {
                          stats and duplicate search until a rescan confirms they're back.",
                         self.tooltip_verbosity,
                     );
+                    let exact = format_last_scan(row.stats.last_scan_ms);
                     stat(
                         ui,
-                        "SCANNED",
-                        &format_last_scan(row.stats.last_scan_ms),
+                        "UPDATED",
+                        &scan_age(row.stats.last_scan_ms, now_ms()),
                         theme::tan(),
-                        "When this repository was last scanned",
-                        "Date and time of the most recent completed UPDATE / SCAN of this \
-                         repository. \"never\" means it hasn't been scanned yet.",
+                        &exact,
+                        &format!(
+                            "The most recent completed UPDATE of this repository: {exact}. \
+                             \"never\" means it has not been scanned yet."
+                        ),
                         self.tooltip_verbosity,
                     );
                 });
@@ -3160,6 +3234,14 @@ fn status_pills(ui: &mut egui::Ui, row: &RepoRow, verbosity: TooltipVerbosity) {
         }
         None => {}
     }
+    if row.stats.last_scan_ms == 0 {
+        pill(ui, "NEVER SCANNED", theme::orange()).explain(
+            verbosity,
+            "No index yet — select it and run UPDATE",
+            "This repository has never been scanned, so its index is empty: nothing in \
+             it can be found, compared or moved until an UPDATE has run.",
+        );
+    }
     match row.freshness {
         Freshness::Unknown => {}
         Freshness::UpToDate => {
@@ -3211,6 +3293,59 @@ fn format_last_scan(ms: u64) -> String {
     } else {
         crate::util::format_mtime(i64::try_from(ms).unwrap_or(i64::MAX))
     }
+}
+
+/// Epoch milliseconds now.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// How long ago a scan at `ms` was, as people say it: "never", "just now",
+/// "5 minutes ago", "3 hours ago", "2 days ago".
+fn scan_age(ms: u64, now: u64) -> String {
+    if ms == 0 {
+        return "never".to_string();
+    }
+    let secs = now.saturating_sub(ms) / 1000;
+    let (n, unit) = if secs < 60 {
+        return "just now".to_string();
+    } else if secs < 3600 {
+        (secs / 60, "minute")
+    } else if secs < 86_400 {
+        (secs / 3600, "hour")
+    } else {
+        (secs / 86_400, "day")
+    };
+    if n == 1 {
+        format!("1 {unit} ago")
+    } else {
+        format!("{n} {unit}s ago")
+    }
+}
+
+/// The totals line: "3 repositories · 1 234 files · 4.2 GB".
+fn totals_text(repos: usize, files: u64, bytes: u64) -> String {
+    let r = if repos == 1 {
+        "1 repository".to_string()
+    } else {
+        format!("{repos} repositories")
+    };
+    let f = if files == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{files} files")
+    };
+    format!("{r} · {f} · {}", format_size(bytes))
+}
+
+/// An event-log timestamp (RFC 3339, UTC) as local "YYYY-MM-DD HH:MM".
+fn log_time_local(at: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(at)
+        .map(|t| crate::util::format_mtime(t.timestamp_millis()))
+        .unwrap_or_else(|_| at.to_string())
 }
 
 /// Number of MIME tags shown on a repo card.
@@ -3387,6 +3522,27 @@ mod tests {
         for total in [1u64, 7, 999, 100_000, 10_000_000] {
             assert_ne!(mime_pct(1, total), "0%");
         }
+    }
+
+    #[test]
+    fn scan_age_reads_as_people_say_it() {
+        use super::scan_age;
+        let now = 1_000_000_000_000u64;
+        assert_eq!(scan_age(0, now), "never");
+        assert_eq!(scan_age(now - 30_000, now), "just now");
+        assert_eq!(scan_age(now - 60_000, now), "1 minute ago");
+        assert_eq!(scan_age(now - 5 * 60_000, now), "5 minutes ago");
+        assert_eq!(scan_age(now - 3 * 3_600_000, now), "3 hours ago");
+        assert_eq!(scan_age(now - 86_400_000, now), "1 day ago");
+        assert_eq!(scan_age(now - 9 * 86_400_000, now), "9 days ago");
+    }
+
+    #[test]
+    fn totals_text_counts_in_words() {
+        use super::totals_text;
+        assert_eq!(totals_text(0, 0, 0), "0 repositories · 0 files · 0 B");
+        assert_eq!(totals_text(1, 1, 91), "1 repository · 1 file · 91 B");
+        assert_eq!(totals_text(2, 7, 91), "2 repositories · 7 files · 91 B");
     }
 
     #[test]
@@ -3800,10 +3956,8 @@ mod ui_tests {
                     }
                     app.drain_scans();
                     let mut actions = Vec::new();
-                    // The LOG button sits in the real app's top bar; this
-                    // harness draws no top bar, so it stands in for one — at
-                    // the top, where a click can reach it.
-                    crate::activity::lock(&app.activity).log_button(ui, app.tooltip_verbosity);
+                    // The start page's RECENT row carries its own LOG button,
+                    // so this harness needs no stand-in for the top bar's.
                     app.start_page_view(ui, &mut actions);
                     crate::activity::lock(&app.activity).show(ui);
                     let ctx = ui.ctx().clone();
@@ -4461,6 +4615,100 @@ mod ui_tests {
 
     /// The window size is flushed on exit and restored (via `Settings`) on the
     /// next launch, so the app reopens where the user left it.
+    /// The totals line sums what the cards show.
+    #[test]
+    fn totals_line_sums_every_card() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, app) = sample_app();
+        let files: u64 = app.repos.iter().map(|r| r.stats.file_count).sum();
+        let bytes: u64 = app.repos.iter().map(|r| r.stats.total_size).sum();
+        let harness = render_repos(app);
+        assert!(
+            harness
+                .query_by_label(&totals_text(2, files, bytes))
+                .is_some(),
+            "the totals line names the two repositories and the sum of their stats"
+        );
+    }
+
+    /// A repository that was never scanned wears a badge, and its UPDATED
+    /// stat reads "never"; after an UPDATE the badge goes and it reads
+    /// "just now".
+    #[test]
+    fn a_never_scanned_repo_wears_a_badge_until_it_is_updated() {
+        use egui_kittest::kittest::Queryable;
+        let (tmp, mut app) = sample_app();
+        let later = tmp.path().join("Later");
+        std::fs::create_dir_all(&later).unwrap();
+        std::fs::write(later.join("f0.bin"), "later").unwrap();
+        app.store
+            .create_repo("Later", &later.to_string_lossy())
+            .unwrap();
+        app.reload_all();
+        let mut harness = render_repos(app);
+        assert_eq!(harness.query_all_by_label("NEVER SCANNED").count(), 1);
+        assert_eq!(harness.query_all_by_label("never").count(), 1);
+
+        update_repo(
+            &harness.state().store,
+            "Later",
+            1,
+            &NoProgress,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        harness.state_mut().reload_all();
+        harness.run();
+        assert!(harness.query_by_label("NEVER SCANNED").is_none());
+        assert_eq!(
+            harness.query_all_by_label("just now").count(),
+            3,
+            "every sample repo was scanned moments ago"
+        );
+        drop(tmp);
+    }
+
+    /// The RECENT row lists the newest event-log lines, newest first, and
+    /// says so when there are none.
+    #[test]
+    fn the_recent_row_lists_the_newest_log_entries() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, app) = sample_app();
+        let activity = app.activity.clone();
+        let mut harness = render_repos(app);
+        assert!(
+            harness
+                .query_by_label("No changes made to your files yet")
+                .is_some()
+        );
+        {
+            let mut a = crate::activity::lock(&activity);
+            for (action, path) in [
+                ("Deleted", "old/IMG_2019_field.jpg"),
+                ("Copied", "new/clip.mp4"),
+            ] {
+                a.record(&crate::activity::Notification::changed(
+                    action,
+                    "Automatic Upload",
+                    path,
+                ));
+            }
+        }
+        harness.state_mut().reload_all();
+        harness.run();
+        let deleted = harness.get_by_label("Deleted IMG_2019_field.jpg").rect();
+        let copied = harness.get_by_label("Copied clip.mp4").rect();
+        assert!(
+            copied.left() < deleted.left(),
+            "newest first: the copy ({copied:?}) comes before the delete ({deleted:?})"
+        );
+        assert!(
+            harness
+                .query_by_label("No changes made to your files yet")
+                .is_none()
+        );
+    }
+
     #[test]
     fn window_size_persists_on_exit() {
         let tmp = tempfile::tempdir().unwrap();

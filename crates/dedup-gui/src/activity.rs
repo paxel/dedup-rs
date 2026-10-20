@@ -749,6 +749,11 @@ impl Activity {
         self.log.read()
     }
 
+    /// The newest `n` event-log lines — the start page's recent changes.
+    pub fn recent(&self, n: usize) -> Vec<LogEntry> {
+        self.log.read().into_iter().take(n).collect()
+    }
+
     fn drain(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {

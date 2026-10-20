@@ -21,6 +21,13 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   to the start page with the selection kept. A backup group's frame carries
   SELECT GROUP, which selects the main and every backup at once and gives
   GROUP SYNC its direction. The card's padlock is the session lock.
+- **The start page states the facts before you choose.** One line over the
+  cards sums the repositories, files and bytes the app looks after. A card's
+  UPDATED stat reads as people say it — "just now", "3 hours ago", "9 days
+  ago" — with the exact time on hover, and a repository that has never been
+  scanned wears a NEVER SCANNED badge until its first UPDATE. A RECENT row
+  lists the newest changes the app made to your files, straight from the
+  event log, beside the LOG button.
 
 - **Audio has a seek bar, not a volume-slider lookalike.** The round-handled
   slider under a previewed track is gone. In Browse the position now runs
