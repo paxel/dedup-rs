@@ -661,7 +661,7 @@ impl DedupApp {
         let verbosity = self.tooltip_verbosity;
         let facts = self.repo_facts();
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("FAVORITES").color(theme::tan()).size(12.0));
+            ui.label(RichText::new("Favorites").color(theme::tan()).size(12.0));
             if self.favorites.is_empty() {
                 ui.label(
                     RichText::new("None yet — open a command, then FAVORITE on the header strip")
@@ -1969,7 +1969,7 @@ impl DedupApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new("COMMANDS")
+                            RichText::new("Commands")
                                 .color(theme::text())
                                 .size(16.0)
                                 .strong(),
@@ -2060,7 +2060,7 @@ impl DedupApp {
     fn last_runs_row(&mut self, ui: &mut egui::Ui) {
         let verbosity = self.tooltip_verbosity;
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("RECENT").color(theme::tan()).size(12.0));
+            ui.label(RichText::new("Recent").color(theme::tan()).size(12.0));
             if self.last_runs.is_empty() {
                 ui.label(
                     RichText::new("No changes made to your files yet")
@@ -2102,7 +2102,7 @@ impl DedupApp {
     fn selection_row(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         let verbosity = self.tooltip_verbosity;
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("SELECT").color(theme::tan()).size(12.0));
+            ui.label(RichText::new("Select").color(theme::tan()).size(12.0));
             if crate::lcars::toggle_button(ui, "ALL", false, theme::orange())
                 .explain(
                     verbosity,
@@ -2475,7 +2475,7 @@ impl DedupApp {
                 ui.horizontal(|ui| {
                     stat(
                         ui,
-                        "FILES",
+                        "Files",
                         &row.stats.file_count.to_string(),
                         theme::orange(),
                         "Indexed files (missing files excluded)",
@@ -2486,7 +2486,7 @@ impl DedupApp {
                     );
                     stat(
                         ui,
-                        "SIZE",
+                        "Size",
                         &format_size(row.stats.total_size),
                         theme::blue(),
                         "Total size of indexed files",
@@ -2496,7 +2496,7 @@ impl DedupApp {
                     );
                     stat(
                         ui,
-                        "MISSING",
+                        "Missing",
                         &row.stats.missing_count.to_string(),
                         theme::lilac(),
                         "Indexed before but no longer on disk",
@@ -2508,7 +2508,7 @@ impl DedupApp {
                     let exact = format_last_scan(row.stats.last_scan_ms);
                     stat(
                         ui,
-                        "UPDATED",
+                        "Updated",
                         &scan_age(row.stats.last_scan_ms, now_ms()),
                         theme::tan(),
                         &exact,

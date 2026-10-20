@@ -29,5 +29,5 @@ Start page hub, one command list, one board. Landed one child per commit, in ord
 - [x] #11 Duplicates on the board
 - [x] #12 Transfer and Grooming plans on the board (already routed through `board.rs`; verified)
 - [x] #13 Diff on the board (already routed through `board.rs`; `diff_board.rs` holds the row model and popups only; verified)
-- [ ] #14 Skin pass
+- [x] #14 Skin pass
 - [ ] #15 GUI guide rewritten

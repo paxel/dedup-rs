@@ -58,6 +58,12 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   or its name — opens the viewer; the right-click menu is the same as before
   plus COPY NAME. Everything scrolls as one list instead of a sideways strip
   per group.
+- **LCARS stays as the skin, not as layout law.** The palette, the
+  condensed font and the stadium buttons remain; the elbow rail that ran
+  down the left of every section is gone, so a section is a header bar with
+  its body on a panel and every board gets the rail's width back. List
+  headers and card stats read in sentence case (Commands, Investigate,
+  Files, Updated); command names, buttons and badges stay uppercase.
 - **The start page states the facts before you choose.** One line over the
   cards sums the repositories, files and bytes the app looks after. A card's
   UPDATED stat reads as people say it — "just now", "3 hours ago", "9 days

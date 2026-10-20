@@ -11,7 +11,7 @@
 
 use crate::icon;
 use crate::theme;
-use egui::{Align2, Color32, CornerRadius, Rect, Sense, Stroke, StrokeKind, Vec2, pos2};
+use egui::{Align2, Color32, CornerRadius, Sense, Stroke, StrokeKind, Vec2, pos2};
 
 /// A dim, same-hue fill for the hover state of an unselected button.
 fn tint(accent: Color32) -> Color32 {
@@ -102,14 +102,13 @@ pub fn action_button(
     resp
 }
 
-/// Rail width, header-bar height, and the concave inner-elbow radius (points).
-const RAIL_W: f32 = 16.0;
+/// Header-bar height (points).
 const HEAD_H: f32 = 22.0;
-const ELBOW_R: f32 = 12.0;
 
-/// A section framed by the LCARS elbow rail. `title` is set into the header cap
-/// bar (black on `accent`); `add` renders the section body, inset to the right of
-/// the rail and below the header.
+/// A titled section (ADR 0004: LCARS as skin, not layout): a stadium header
+/// bar in `accent` with the title set into it, and the body on a panel below.
+/// The elbow rail that used to run down the left is gone — it cost every
+/// board a rail's width and framed nothing a header bar does not.
 ///
 /// Every section is collapsible: clicking the header bar folds the body down to
 /// a single stadium bar (the caret before the title shows the state), and the
@@ -214,27 +213,28 @@ pub fn section_lcars_folding<R>(
     out
 }
 
-/// The open form of a section: elbow chrome, caret-down before the title, and
-/// the clickable header bar whose response is returned alongside the body's
-/// result.
+/// The open form of a section: the header bar with a caret-down before the
+/// title, and the body on its panel; the clickable header bar's response is
+/// returned alongside the body's result.
 fn section_impl<R>(
     ui: &mut egui::Ui,
     title: &str,
     accent: Color32,
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> (R, egui::Response) {
-    // Reserve a paint slot *behind* the body: the elbow chrome (and the dark body
-    // background that forms the concave curve) draw here, so the body's own
-    // widgets always render on top of it and are never overpainted.
-    let bg = ui.painter().add(egui::Shape::Noop);
+    let header = header_bar(ui, &format!("{} {title}", icon::CARET_DOWN), title, accent);
     let inner = egui::Frame::new()
-        // No fill — the body-panel shape painted into `bg` is the background.
+        .fill(theme::panel())
+        .corner_radius(CornerRadius {
+            nw: 0,
+            ne: 0,
+            sw: 8,
+            se: 8,
+        })
         .inner_margin(egui::Margin {
-            // Clear the rail *and* the concave elbow so the first item isn't
-            // clipped by the curve; still hug the header vertically.
-            left: (RAIL_W + ELBOW_R + 2.0) as i8,
+            left: 10,
             right: 10,
-            top: (HEAD_H + 3.0) as i8,
+            top: 8,
             bottom: 10,
         })
         .outer_margin(egui::Margin {
@@ -244,35 +244,17 @@ fn section_impl<R>(
             bottom: 8,
         })
         .show(ui, |ui| {
-            // Always claim the full panel width, so the elbow rail/header spans
-            // the whole panel even when the body's own content is narrow.
+            // Always claim the full panel width, so the header bar spans the
+            // whole panel even when the body's own content is narrow.
             ui.set_min_width(ui.available_width());
             add(ui)
         });
-    let r = inner.response.rect;
-    let painted = format!("{} {title}", icon::CARET_DOWN);
-    ui.painter()
-        .set(bg, egui::Shape::Vec(elbow_shapes(ui, r, &painted, accent)));
-    // Expose the painted title to accesskit (so tests and screen readers can find
-    // the section by name) without affecting layout. The whole header bar is
-    // the collapse click target.
-    let title_rect = Rect::from_min_max(
-        pos2(r.min.x + RAIL_W, r.min.y),
-        pos2(r.max.x, r.min.y + HEAD_H),
-    );
-    let header = ui.interact(
-        title_rect,
-        ui.id().with(("lcars_title", title)),
-        Sense::click(),
-    );
-    header.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, title));
     (inner.inner, header)
 }
 
-/// The collapsed form of a collapsible section: just the header bar, a full
-/// stadium with a "click to open" caret before the title. Same width and bottom
-/// spacing as the open section, so collapsing doesn't shift siblings sideways.
-fn collapsed_header(ui: &mut egui::Ui, title: &str, accent: Color32) -> egui::Response {
+/// The full-width stadium header bar of a section, `painted` set into it in
+/// the accent's ink; `title` is what accesskit (tests, screen readers) sees.
+fn header_bar(ui: &mut egui::Ui, painted: &str, title: &str, accent: Color32) -> egui::Response {
     let (rect, resp) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), HEAD_H), Sense::click());
     if ui.is_rect_visible(rect) {
@@ -284,77 +266,22 @@ fn collapsed_header(ui: &mut egui::Ui, title: &str, accent: Color32) -> egui::Re
         let p = ui.painter();
         p.rect_filled(rect, CornerRadius::same((HEAD_H / 2.0) as u8), fill);
         p.text(
-            pos2(rect.min.x + RAIL_W + 10.0, rect.center().y),
+            pos2(rect.min.x + 12.0, rect.center().y),
             Align2::LEFT_CENTER,
-            format!("{} {title}", icon::CARET_RIGHT),
+            painted,
             egui::FontId::proportional(13.0),
             theme::ink_on(accent),
         );
     }
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, title));
-    ui.add_space(8.0); // match the open section's bottom outer margin
     resp
 }
 
-/// The elbow chrome as a back-to-front shape list: accent rail, accent header cap
-/// bar, the dark body panel (its rounded top-left corner reveals the accent
-/// behind it — the concave elbow), and the title. Painted behind the body.
-fn elbow_shapes(ui: &egui::Ui, rect: Rect, title: &str, accent: Color32) -> Vec<egui::Shape> {
-    let out = (RAIL_W / 2.0) as u8; // rounded outer corners
-    let cap = (HEAD_H / 2.0) as u8; // rounded right cap on the header bar
-    let galley = ui.painter().layout_no_wrap(
-        title.to_owned(),
-        egui::FontId::proportional(13.0),
-        theme::ink_on(accent),
-    );
-    // Safety net: the panel is always full-width (see `section_lcars`), so this
-    // only bites for a title too long even for that — widen the chrome rather
-    // than let the galley overflow past the header bar uncontained.
-    let min_width = RAIL_W + 10.0 + galley.size().x + 10.0;
-    let rect = if rect.width() < min_width {
-        Rect::from_min_max(rect.min, pos2(rect.min.x + min_width, rect.max.y))
-    } else {
-        rect
-    };
-    let rail = Rect::from_min_max(rect.min, pos2(rect.min.x + RAIL_W, rect.max.y));
-    let head = Rect::from_min_max(rect.min, pos2(rect.max.x, rect.min.y + HEAD_H));
-    let body = Rect::from_min_max(pos2(rect.min.x + RAIL_W, rect.min.y + HEAD_H), rect.max);
-    let tpos = pos2(
-        rect.min.x + RAIL_W + 10.0,
-        rect.min.y + HEAD_H / 2.0 - galley.size().y / 2.0,
-    );
-    vec![
-        egui::Shape::rect_filled(
-            rail,
-            CornerRadius {
-                nw: out,
-                sw: out,
-                ne: 0,
-                se: 0,
-            },
-            accent,
-        ),
-        egui::Shape::rect_filled(
-            head,
-            CornerRadius {
-                nw: out,
-                ne: cap,
-                sw: 0,
-                se: cap,
-            },
-            accent,
-        ),
-        // The body panel's rounded top-left corner carves the concave elbow.
-        egui::Shape::rect_filled(
-            body,
-            CornerRadius {
-                nw: ELBOW_R as u8,
-                ne: 0,
-                sw: 0,
-                se: 0,
-            },
-            theme::panel(),
-        ),
-        egui::Shape::galley(tpos, galley, theme::ink_on(accent)),
-    ]
+/// The collapsed form of a collapsible section: just the header bar, with a
+/// "click to open" caret before the title. Same width and bottom spacing as
+/// the open section, so collapsing doesn't shift siblings sideways.
+fn collapsed_header(ui: &mut egui::Ui, title: &str, accent: Color32) -> egui::Response {
+    let resp = header_bar(ui, &format!("{} {title}", icon::CARET_RIGHT), title, accent);
+    ui.add_space(8.0); // match the open section's bottom outer margin
+    resp
 }

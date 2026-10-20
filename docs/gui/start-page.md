@@ -144,7 +144,7 @@ A **backup group** links one **main** repository to one or more **backup** repos
 - **LEAVE GROUP** (a backup selected) — take it back out of its group.
 - **UNGROUP** (a main selected) — disband the group; every repository stays, just unlinked.
 - A group is framed by its own section, titled with the group name: the main's card and
-  every backup's card sit inside one rail, so a group reads as a single block and an
+  every backup's card sit under one header bar, so a group reads as a single block and an
   ungrouped repository as a bare card. Groups start **folded** — the list stays about your
   originals — and clicking the section header opens one. **SELECT GROUP** inside the frame
   selects the main and every backup at once, which is what enables GROUP SYNC.

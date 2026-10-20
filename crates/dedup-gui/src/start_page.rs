@@ -23,10 +23,10 @@ pub(crate) enum Intent {
 impl Intent {
     fn label(self) -> &'static str {
         match self {
-            Intent::Investigate => "INVESTIGATE",
-            Intent::Maintain => "MAINTAIN",
-            Intent::Move => "MOVE",
-            Intent::Clean => "CLEAN",
+            Intent::Investigate => "Investigate",
+            Intent::Maintain => "Maintain",
+            Intent::Move => "Move",
+            Intent::Clean => "Clean",
         }
     }
 

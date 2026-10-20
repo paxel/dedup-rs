@@ -1533,7 +1533,7 @@ fn controls_bar(
             }
             ui.add_space(12.0);
         }
-        ui.label(RichText::new("SORT").color(theme::text()).size(11.0));
+        ui.label(RichText::new("Sort").color(theme::text()).size(11.0));
         if two_sided {
             for (is_left, label) in [(true, "LEFT"), (false, "RIGHT")] {
                 if crate::lcars::toggle_button(
@@ -1873,7 +1873,7 @@ mod tests {
             );
         harness.run_steps(2);
         assert!(
-            harness.query_by_label("SORT").is_none(),
+            harness.query_by_label("Sort").is_none(),
             "a listing sorts itself: no sort bar"
         );
         let zulu = harness.get_by_label_contains("zulu/0").rect();

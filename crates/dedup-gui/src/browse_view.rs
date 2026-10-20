@@ -1129,7 +1129,7 @@ impl BrowseView {
         let (sort_col, sort_asc) = (self.sort_col, self.sort_asc);
         let mut clicked_header: Option<SortCol> = None;
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("SORT").color(theme::text()).size(11.0));
+            ui.label(RichText::new("Sort").color(theme::text()).size(11.0));
             for (col, title) in cols {
                 if crate::util::sort_header(ui, title, sort_col == col, sort_asc).clicked() {
                     clicked_header = Some(col);
@@ -3012,7 +3012,9 @@ mod tests {
         let store_ui = Arc::clone(&store);
         let mut init = false;
         let mut h = Harness::builder()
-            .with_size(egui::vec2(1000.0, 1000.0))
+            // Tall enough that the second board row sits above the preview
+            // dock: the board draws rows at their full height now.
+            .with_size(egui::vec2(1000.0, 1300.0))
             .build_ui_state(
                 move |ui, view: &mut BrowseView| {
                     if !init {
@@ -3020,7 +3022,7 @@ mod tests {
                         crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
-                    ui.allocate_ui(egui::vec2(ui.available_width(), 900.0), |ui| {
+                    ui.allocate_ui(egui::vec2(ui.available_width(), 1200.0), |ui| {
                         view.show(ui, &store_ui, TooltipVerbosity::default());
                     });
                 },
