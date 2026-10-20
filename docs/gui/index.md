@@ -63,8 +63,9 @@ repository never requires a keyboard shortcut.
 
 ## Repository locks
 
-Every repository starts **locked** at each launch. The padlock on a repo's chip — the same
-chip on every tab — shows and toggles it: **closed blue = protected, open = unlocked**.
+Every repository starts **locked** at each launch. The padlock on a repo's chip — on its
+start-page card and wherever the repository is named — shows and toggles it: **closed blue =
+protected, open = unlocked**.
 
 A lock protects the repo's **existing files**: while locked, nothing in the app can delete or
 overwrite them — those buttons are withheld or disabled with the reason on hover, a MIRROR or
@@ -192,17 +193,17 @@ its raw bytes — never as text.
 ## What's not here
 
 The important-file scanner (`dedup scan`) and the triage report (`dedup report`) are
-CLI-only today — there's no dedicated GUI tab for them yet.
+CLI-only today — there is no command for them on the start page yet.
 
 ## See also
 
 - [Start page](start-page.md) — register, select and scan repositories, the command list,
   backup groups.
-- [Duplicates tab](duplicates.md) — find and review exact/similar duplicates, and the shared
+- [Duplicates](duplicates.md) — find and review exact/similar duplicates, and the shared
   viewer in full (Image / Video filmstrip + scrub / Audio / Metadata / Text / Render /
   Strings / Hex).
-- [Transfer tab](transfer.md) — copy/move/sync/mirror between repos by content, group sync and
+- [Transfer](transfer.md) — copy/move/sync/mirror between repos by content, group sync and
   sync-back, the DIFF reconcile board, the filter builder.
-- [Grooming tab](grooming.md) — dedupe, purge, empty dirs, organize, prune.
-- [Browse tab](browse.md) — a keyboard-driven folder-tree browser with tagging.
+- [Grooming](grooming.md) — dedupe, purge, empty dirs, organize, prune.
+- [Browse](browse.md) — a keyboard-driven folder-tree browser with tagging.
 - [CLI reference](../cli.md) — every command the GUI's operations are also available from.

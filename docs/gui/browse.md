@@ -6,10 +6,12 @@ Walk one repository's indexed files as a **folder tree**, look at any file in th
 viewer, and annotate files with **tags** — a keyboard-driven file browser over the index, not
 the disk, so it shows exactly what has been scanned.
 
-## Repo and filter
+## Getting here
 
-- **REPO** — the single repository to browse (its chip carries the **★ MAIN** badge when it is
-  a sync group's main).
+Select one repository on the [start page](start-page.md) and pick **BROWSE**; the header
+strip names it and **START** returns to the start page. The body shows:
+
+
 - **FILTER** — the same condition builder as the other commands, narrowing which files appear.
 
 ## Navigating
@@ -49,7 +51,7 @@ previews are generated in the background, nearest to your selection first, and t
 themselves are warmed within a budget (≤ 256 MB per file, ~2 GB per folder) so a cloud
 mount like pCloud pulls them into its local cache — stepping through a folder stays
 instant instead of waiting on the network per file. Your own clicks always take priority,
-and changing folder (or leaving the tab) cancels the read-ahead immediately. It runs only
+and changing folder (or leaving Browse) cancels the read-ahead immediately. It runs only
 in the normal folder view, not in a flattened listing.
 
 From here you can:
@@ -60,7 +62,7 @@ From here you can:
   no event-log line. Writing ID3 tags into an audio file (**EDIT TAGS**) and saving a turned
   image over its original in the viewer do change the file: both card and log the change
   (**LOG**, top right).
-- An **accepted** badge above the tags means this content was accepted in the Duplicates tab
+- An **accepted** badge above the tags means this content was accepted in Duplicates
   as allowed to repeat in this repository (see [Accepted content](duplicates.md#accepted-content));
   `accepted:yes` / `accepted:no` in the filter lists such files.
 - **Open with default app** — hand the file to the system's default application (the

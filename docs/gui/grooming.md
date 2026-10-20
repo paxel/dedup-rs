@@ -1,4 +1,4 @@
-# Grooming tab
+# Grooming
 
 ![A PURGE preview on the review board](../screenshots/groom_purge_board.png)
 
@@ -7,14 +7,16 @@ empty directories, reorganize files into a dated/templated tree, or drop stale i
 Every tool previews on the shared [review board](index.md#the-review-board) first — nothing
 touches disk until you APPLY ALL.
 
-## Reading order
+## Getting here
 
-The tab asks its questions top to bottom: **WHAT** (the tool), **WITH WHICH** (the
-repository, plus the dupe pool for DEDUPE), **HOW** (the filter or the rules) and only then
-**APPLY ALL**. Each section appears once the one above it has an answer — a fresh tab shows only
-the tool chips — and keeps its answer when an earlier one changes. Once PREVIEW or APPLY ALL
-starts, the sections above fold into one summary line; **CHANGE** unfolds them, and the APPLY ALL
-section stays so a reviewed plan can be run.
+Select one repository on the [start page](start-page.md) and pick **PRUNE MISSING**,
+**REORGANIZE**, **PURGE BY FILTER** or **EMPTY DIRECTORIES** (the last two need the
+repository unlocked); select two or more and pick **DEDUPE AGAINST**, then say which one is
+deleted from (**FROM**) and **GO**. The header strip names the selection and the tool;
+**START** returns to the start page with the selection kept. Inside, the body shows **WHAT**
+(the tool, folded — open it to switch), then **HOW** (the filter or the rules), then
+**PREVIEW** and **APPLY ALL**. Once PREVIEW starts, the sections above fold to their header
+bars; click one to open it.
 
 ## What: the tool
 
@@ -47,7 +49,7 @@ Pick a grooming tool with the chips (or the number keys `1`–`5`):
 
 ## How: filter or rules
 
-- **FILTER** — the same condition builder the [Transfer tab](transfer.md#filter-builder) uses.
+- **FILTER** — the same condition builder [Transfer](transfer.md#filter-builder) uses.
   Required for PURGE; optional for DEDUPE, where it narrows which files a preview considers.
 - **RULES** — ORGANIZE's ordered list of filter + path template pairs (see the tool above).
   EMPTY DIRS and PRUNE have nothing to set.

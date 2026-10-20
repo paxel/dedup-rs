@@ -1,19 +1,21 @@
-# Transfer tab
+# Transfer
 
-![Transfer tab](../screenshots/files_tab.png)
+![Transfer: a COPY preview on the board](../screenshots/files_tab.png)
 
 Copy, move, or delete files between repositories by content (size + BLAKE3 — paths never
 matter), with an assisted filter builder and a review before anything runs. This is the GUI
 equivalent of [`diff cp`/`mv`/`rm`](../cli.md#diff).
 
-## Reading order
+## Getting here
 
-The tab asks its questions top to bottom: **WHAT** (the command), **WITH WHICH** (the
-repositories), **HOW** (destination, options, filter) and only then **APPLY ALL**. Each section
-appears once the one above it has an answer — a fresh tab shows only the command chips — and
-keeps its answer when an earlier one changes unless that change makes it invalid (picking a
-new source drops a target that is now the same repo). Once PREVIEW or APPLY ALL starts, the sections
-fold into one summary line above the board; **CHANGE** unfolds them.
+Select the repositories on the [start page](start-page.md) — one for a folder export, two
+for a repository-to-repository command, a backup group for GROUP SYNC — and pick **COPY**,
+**MOVE**, **SYNC**, **MIRROR**, **DIFF**, **GROUP SYNC** or **GROUP SYNC BACK**. A pair asks
+which repository is the source (**FROM**), then **GO**; a group needs no roles. The header
+strip names the selection, the command and the roles; **START** returns to the start page
+with the selection kept. Inside, the body shows **WHAT** (the command, folded — open it to
+switch), then **HOW** (destination, options, filter), then **PREVIEW** and **APPLY ALL**.
+Once PREVIEW starts, the sections above fold to their header bars; click one to open it.
 
 ## What: the command
 
@@ -113,8 +115,8 @@ repository it changed, and writes a line to the event log (**LOG**). If somethin
 running the card says so instead, and nothing happens.
 
 **Clicking a row** opens the two versions side by side over the whole window, in the same
-shared viewer every surface opens — so what you get depends on the file type, not on which tab
-you happen to be in. The [viewer](duplicates.md#the-viewer-lightbox) is tabbed by
+shared viewer every surface opens — so what you get depends on the file type, not on which
+command you came from. The [viewer](duplicates.md#the-viewer-lightbox) is tabbed by
 representation: two images compare as pictures (wheel-zoom, drag-pan, Space to flicker), two
 videos as aligned filmstrips with a shared playhead, two audio files as spectrograms with
 gapless A/B playback, two documents as line-aligned extracted text, and any two files as an
@@ -143,7 +145,7 @@ when the board is ready.
 Keep a repository backed up to one or more others, without the manual "duplicate the repo,
 relocate the copy, rescan it" dance. Groups themselves (creating one, adding/removing sinks,
 setting each sink's mode) are managed on the [start page](start-page.md#backup-groups);
-this tab is where a group is actually *pushed*.
+GROUP SYNC is where a group is actually *pushed*.
 
 ![GROUP SYNC selected: TARGET hidden, SINKS shown](../screenshots/transfer_group_sync.png)
 

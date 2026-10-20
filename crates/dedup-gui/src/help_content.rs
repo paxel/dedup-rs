@@ -46,14 +46,11 @@ const DUPLICATES: &str = "\
 Find exact or perceptually similar duplicates across one or more repositories, review them \
 with real previews, and delete the worse copies.
 
-The tab asks top to bottom: WHAT (DUPLICATES or SIMILAR FILES — SIMILAR shows its \
-threshold slider beside the chip; QUICK DELETE sits on the same row), then WITH WHICH \
-(the repository chips, once a mode is chosen), then HOW (the FILTER and FIND, once a \
-repository is included). After a FIND the three fold shut and only their header bars \
-remain; click one to flip that section open again — the other two stay folded.
-
-Click a repo chip's name to include or exclude it from the next FIND; click its padlock to \
-protect it from deletion — locked files are never preselected or auto-resolved.
+You arrive from the start page with the repositories already chosen and the mode set: WHAT \
+(DUPLICATES or SIMILAR FILES, with QUICK DELETE on the same row) sits folded — click its \
+header to flip it open — and HOW holds the FILTER and FIND. START on the header strip \
+returns to the start page with the selection kept; a locked repository's files are never \
+preselected or auto-resolved.
 
 DUPLICATES mode finds exact, byte-for-byte matches (same size + hash). SIMILAR mode finds \
 perceptually similar images, videos and audio — lower threshold catches more, and riskier, \
@@ -76,10 +73,11 @@ const TRANSFER: &str = "\
 Copy, move, or sync files between two repositories by content (size + hash — paths never \
 matter), with an assisted filter and a preview before anything runs.
 
-The tab asks its questions in order: WHAT (the command), WITH WHICH (SOURCE and TARGET, side \
-by side), HOW (destination, options, filter), then PREVIEW. Each section appears once the one \
-above it is answered, and after PREVIEW or APPLY ALL they fold to their header bars — click one \
-to flip that section open again.
+You arrive from the start page with the repositories and their roles already chosen: WHAT \
+(the command) sits folded — click its header to switch — then HOW (destination, options, \
+filter), then PREVIEW and APPLY ALL. After PREVIEW or APPLY ALL the sections fold to their \
+header bars; click one to flip it open again. START on the header strip returns to the start \
+page with the selection kept.
 
 Pick a SOURCE and a TARGET repo, optionally add DUPEPOOL repositories — a source file only \
 counts as new when none of the target or the extra references already has its content.
@@ -120,10 +118,11 @@ result report. A row's COPY, DELETE, RENAME, OVERWRITE or APPLY answers with a n
 card, and every file changed is in the event log behind the LOG button.";
 
 const GROOMING: &str = "\
-Prune and reorganize a single repository. The tab asks its questions in order: WHAT (the \
-tool), WITH WHICH (the repository, plus the dupe pool for DEDUPE), HOW (the filter or the \
-rules), then PREVIEW. Each section appears once the one above it is answered, and after PREVIEW \
-or APPLY ALL they fold to their header bars — click one to flip that section open again.
+Prune and reorganize a single repository. You arrive from the start page with the \
+repository (and DEDUPE's source and pool) already chosen: WHAT (the tool) sits folded — click \
+its header to switch — then HOW (the filter or the rules), then PREVIEW and APPLY ALL. After \
+PREVIEW or APPLY ALL the sections fold to their header bars; click one to flip it open again. \
+START on the header strip returns to the start page with the selection kept.
 
 DEDUPE deletes files in a source repo whose content also exists in any selected dupe-pool \
 repo. PURGE deletes everything matching a filter — it requires at least one filter \
@@ -161,7 +160,9 @@ APPLY answers with a notification card, and every file changed is in the event l
 the LOG button.";
 
 const BROWSE: &str = "\
-Browse one repository folder by folder — subfolders on the left, files in the middle.
+Browse the repository chosen on the start page folder by folder — subfolders on the left, \
+files on the board in the middle, the preview dock below. START on the header strip returns \
+to the start page.
 
 Select a file to preview it in the dock below: images and videos get a thumbnail, audio a \
 waveform or spectrogram (switchable) beside its ID3 tags, text a scrollable view, and \

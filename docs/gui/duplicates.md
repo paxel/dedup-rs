@@ -1,23 +1,22 @@
-# Duplicates tab
+# Duplicates
 
-![Duplicate Management tab](../screenshots/duplicates_tab.png)
+![Duplicates: groups of copies on the board](../screenshots/duplicates_tab.png)
 
 Find exact or perceptually similar duplicates across one or more repositories, review them
 with real previews, and delete the worse copies — batched per repo, always confirmed unless
 you turn on Quick Delete. This is the GUI equivalent of `repo dupes`, with a full review
 workflow on top.
 
-## Reading order
+## Getting here
 
-The tab asks its questions top to bottom, and each section appears once the one above it
-has an answer:
+Select the repositories on the [start page](start-page.md) and pick **FIND DUPLICATES** or
+**FIND SIMILAR** (the latter asks for its **similarity threshold** first, then **GO**). The
+header strip names the selection, the mode and the threshold; **START** returns to the
+start page with the selection kept. Inside, the body shows:
 
-1. **WHAT** — DUPLICATES or SIMILAR FILES. Choosing SIMILAR reveals the **similarity
-   threshold** slider right beside the chip. **QUICK DELETE** sits on the same row.
-2. **WITH WHICH** — the repository chips, shown once a mode is chosen. Flipping the mode
-   keeps the chips you picked.
-3. **HOW** — the shared FILTER wizard and the **FIND** button on one row, shown once at
-   least one repository is included.
+1. **WHAT** — the chosen mode, folded; open it to flip between DUPLICATES and SIMILAR
+   FILES or to toggle **QUICK DELETE**.
+2. **HOW** — the shared FILTER wizard and the **FIND** button on one row.
 
 After a FIND the three sections fold into one summary line (mode, repositories, filter)
 so the groups get the screen; **CHANGE** unfolds them for the next search.
@@ -313,7 +312,7 @@ Audio duplicate rows get an inline **PLAY/PAUSE** button, an elapsed/total reado
 seek bar — confirm two "similar" tracks are actually the same recording (and which sounds
 better) without leaving the app or opening an external player. Only one file plays at a time;
 starting another replaces it. Playback survives scrolling and stops automatically when you
-switch away from the Duplicates tab. Requires ALSA on Linux at build time (see the README);
+leave Duplicates. Requires ALSA on Linux at build time (see the README);
 with no audio device at runtime, the controls still render and playback is simply a no-op.
 
 The [viewer](#the-viewer-lightbox) shares the same single audio device: opening a track there
