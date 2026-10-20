@@ -79,7 +79,7 @@ content tells the app it may repeat inside that repository:
   click, and next month's episode folder is accepted already.
 - An accepted copy is protected exactly like one in a read-only repo: never preselected,
   never marked by AUTO-RESOLVE or MARK ALL, kept by every delete (Grooming DEDUPE and the CLI
-  included), and badged **accepted** on its card. Right-click the badge to **UNLOCK** just
+  included), and badged **accepted** on its row. Right-click the badge to **UNLOCK** just
   that file for deletion (reset on the next FIND) or to **UN-ACCEPT** the content.
 - Acceptance is **per repository**: the same cover in a backup repo is still an ordinary
   duplicate against the podcast repo's copies.
@@ -91,38 +91,36 @@ content tells the app it may repeat inside that repository:
 
 ## Result groups
 
-Results page 50 groups at a time (← / → to navigate). Each group shows a header (copy count,
-size, reclaimable bytes) and one card per file:
+Results page 50 groups at a time (← / → to navigate), on the same **board** every other
+result uses. Each group is a band — copy count, size, reclaimable bytes — with its bulk
+controls (**MARK ALL**, **MARK NONE**, **HIDE**, **ACCEPT GROUP**, and **DELETE NOW** under
+Quick Delete), and one row per copy under it:
 
-- Thumbnail (click to open the [viewer](#the-viewer-lightbox)), path, repo, size, dimensions,
-  mtime.
+- Thumbnail (a real picture, a video still, an audio fingerprint glyph, a document's first
+  page where poppler is installed, otherwise a typed placeholder), the repo chip, the path,
+  size, dimensions or duration, and mtime. A marked copy reads red and wears a **WILL
+  DELETE** veil; a file that is gone from disk wears an amber **MISSING** veil.
 - **from `<repo>`** — if this file's provenance is known (it was copied/synced in from
   another repo).
 - Audio files get inline **PLAY/PAUSE** + a seek bar (see [Audio preview](#audio-preview)).
-- Text files preview their **first lines** right on the card — two copies of a note or a
-  config read apart at a glance, without opening either.
-- PDFs show their **actual first page** (rendered in the background; needs poppler, falls
-  back gracefully). Any other file — a database, an executable, an unknown blob — shows a
-  **byte view**: its head bytes as a greyscale pattern with the extension in big colour-coded
-  letters. Identical content produces an identical pattern, so two duplicates *look* the same.
-- A file that is gone from disk wears an amber **MISSING** veil over its (cached) preview —
-  what vanished stays recognisable.
 - The best copy is starred **BEST**.
-- **KEEP / DELETE** toggles this copy's mark. Nothing is deleted until you press DELETE
+- **KEEP / DELETE** toggles this copy's mark. Nothing is deleted until you press APPLY
   MARKED (or DELETE NOW under Quick Delete).
 - A file in a read-only repo shows a **read-only** badge instead of KEEP/DELETE —
   right-click or long-press it to unlock just that one file (a deliberately inconvenient
   escape hatch, never bulk-set, reset on the next FIND). An [accepted](#accepted-content)
   copy shows an **accepted** badge with the same unlock, plus **UN-ACCEPT**.
-- Right-click anywhere on a card for **OPEN** (hand the file to the system's default app),
-  **SHOW IN FOLDER** (reveal it in the file manager), **SHOW IN BROWSE**, and **ACCEPT IN
-  REPO** / **UN-ACCEPT** — the full-fidelity escape hatch for any file type, and the
-  designated way to actually play a video full-screen.
+- Archives that also hold the group's content are listed under the band as evidence
+  rows: they inform the keep-or-delete decision and carry no action of their own.
+- Right-click anywhere on a row for **OPEN** (hand the file to the system's default app),
+  **SHOW IN FOLDER** (reveal it in the file manager), **SHOW IN BROWSE**, **ACCEPT IN
+  REPO** / **UN-ACCEPT**, and **COPY NAME** — the full-fidelity escape hatch for any file
+  type, and the designated way to actually play a video full-screen.
 
 ## The viewer (lightbox)
 
-Click any card — the thumbnail, or the typed placeholder a document or archive shows instead
-of a picture — to open the full-window viewer. It is the **same viewer every surface opens**:
+Click any row — its thumbnail, its name, or the typed placeholder a document or archive
+shows instead of a picture — to open the full-window viewer. It is the **same viewer every surface opens**:
 Browse, the review boards and Transfer's DIFF all land on this one screen, so it behaves
 identically wherever you came from. It opens on the clicked file alone, on the file's own
 representation: a photo on Image, a track on Audio, a document on Text.
@@ -160,7 +158,7 @@ switcher at all, because the only other candidate is already on the other side.
 
 ### The single-file view
 
-Clicking a card opens the file **alone** — no second side, no divider — the same identity block,
+Clicking a row opens the file **alone** — no second side, no divider — the same identity block,
 tab bar and action bar, with one image (or spectrogram, filmstrip, text, hex dump) filling the
 pane. **SHOW B** brings up a comparison. Every tab renders the same whether one file or two are
 shown; a single file simply has nothing to diff against, so it shows its own content.
@@ -311,7 +309,7 @@ viewer; whatever the viewer was playing falls silent with it.
 
 ## Audio preview
 
-Audio duplicate cards get an inline **PLAY/PAUSE** button, an elapsed/total readout, and a
+Audio duplicate rows get an inline **PLAY/PAUSE** button, an elapsed/total readout, and a
 seek bar — confirm two "similar" tracks are actually the same recording (and which sounds
 better) without leaving the app or opening an external player. Only one file plays at a time;
 starting another replaces it. Playback survives scrolling and stops automatically when you
@@ -319,11 +317,11 @@ switch away from the Duplicates tab. Requires ALSA on Linux at build time (see t
 with no audio device at runtime, the controls still render and playback is simply a no-op.
 
 The [viewer](#the-viewer-lightbox) shares the same single audio device: opening a track there
-and pressing PLAY replaces what a card was playing, and closing the viewer silences what it
-started while leaving a card's own playback alone.
+and pressing PLAY replaces what a row was playing, and closing the viewer silences what it
+started while leaving a row's own playback alone.
 
 ## Video preview
 
-Video duplicate cards show a real still frame (sampled mid-timeline) instead of a generic
+Video duplicate rows show a real still frame (sampled mid-timeline) instead of a generic
 icon. Frames are extracted with `ffmpeg` on demand and cached; without ffmpeg on `PATH`, the
-card falls back to the placeholder.
+row falls back to the placeholder.

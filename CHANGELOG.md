@@ -48,6 +48,16 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   extends), a second click on the selected row opens the viewer. The board itself learned to be
   a listing: caller order, a selection and a cursor, tag chips, and a click
   on a file's name that counts as a click on its row.
+- **Duplicates are rows on the board too.** The card grid is gone: each
+  group is a band with its count, sizes and bulk controls (MARK ALL, MARK
+  NONE, HIDE, ACCEPT GROUP, DELETE NOW), and under it one row per copy with
+  the thumbnail, repo chip, path, size, dimensions or duration, date, BEST,
+  the KEEP / DELETE mark, the read-only or accepted badge with its unlock
+  menu, and the audio transport. A marked copy reads red with a WILL DELETE
+  veil; archive evidence sits under the band. Clicking a row — its picture
+  or its name — opens the viewer; the right-click menu is the same as before
+  plus COPY NAME. Everything scrolls as one list instead of a sideways strip
+  per group.
 - **The start page states the facts before you choose.** One line over the
   cards sums the repositories, files and bytes the app looks after. A card's
   UPDATED stat reads as people say it — "just now", "3 hours ago", "9 days

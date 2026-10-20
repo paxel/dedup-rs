@@ -242,7 +242,9 @@ pub struct MediaStyle {
 }
 
 impl MediaStyle {
-    /// The Duplicate tab's card preview.
+    /// A captioned card cell (mime under the placeholder, duration under the
+    /// audio glyph), as the caption tests exercise it.
+    #[cfg(test)]
     pub fn card() -> Self {
         Self {
             width: 160.0,

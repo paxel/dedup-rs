@@ -372,7 +372,43 @@ pub struct RowMeta {
     /// The left file's annotation tags, drawn as chips on a line of their own
     /// (a listing's TAGS column). Empty on a plan.
     pub left_tags: Vec<String>,
+    /// Height the caller's [`Hooks::extras`] draws under the left cell's
+    /// facts (Duplicates' mark, badges and transport), reserved in the row's
+    /// height so a row never runs into the next.
+    pub extra_height: f32,
+    /// This row opens a group: a band above it with the title and the
+    /// caller's [`Hooks::group_header`] widgets.
+    pub group: Option<GroupHead>,
 }
+
+/// The band above the first row of a group of rows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GroupHead {
+    pub title: String,
+    /// Notes under the title — Duplicates' archive evidence rows — one line
+    /// each, in the band's height.
+    pub notes: Vec<String>,
+}
+
+impl GroupHead {
+    fn height(&self) -> f32 {
+        BTN_H + LINE_H * self.notes.len() as f32 + ROW_PAD
+    }
+}
+
+/// Caller-drawn parts of a row the board has no opinion about: widgets under
+/// the left cell's facts (`extras`), the band above a group (`group_header`)
+/// and the row body's context menu (`row_menu`). Each receives the row's index
+/// into the `metas` slice the board was rendered with.
+#[derive(Default)]
+pub struct Hooks<'a> {
+    pub extras: Option<RowHook<'a>>,
+    pub group_header: Option<RowHook<'a>>,
+    pub row_menu: Option<RowHook<'a>>,
+}
+
+/// A caller-drawn part of a row: given the row's index into `metas`.
+pub type RowHook<'a> = &'a mut dyn FnMut(usize, &mut egui::Ui);
 
 impl RowMeta {
     /// Whether either side is a resurrection (blue) — content the main deleted
@@ -388,12 +424,13 @@ impl RowMeta {
         // A side cell is a thumbnail beside (path lines + one facts line), plus
         // a line of tag chips when the row carries any.
         let tag_lines = usize::from(!self.left_tags.is_empty());
-        let side = THUMB.max(LINE_H * ((lines + tag_lines) as f32 + 1.0));
+        let side = THUMB.max(LINE_H * ((lines + tag_lines) as f32 + 1.0)) + self.extra_height;
         // n buttons have n-1 gaps between them, not n — counting a trailing gap
         // still left the grid one line short of what it draws.
         let cmd_lines = layout(&self.cmds).len();
         let centre = BTN_H * cmd_lines as f32 + CMD_GAP * cmd_lines.saturating_sub(1) as f32;
-        side.max(centre) + ROW_PAD * 2.0
+        let head = self.group.as_ref().map(GroupHead::height).unwrap_or(0.0);
+        head + side.max(centre) + ROW_PAD * 2.0
     }
 }
 
@@ -509,10 +546,16 @@ pub struct BoardView<'a> {
     /// Whether hiding a row also excludes it from a later RUN. False on DIFF,
     /// which runs each command as it is clicked. Only affects HIDE's tooltip.
     pub hide_skips_run: bool,
-    /// A plain listing (Browse) rather than a plan: rows stay in the caller's
-    /// order (no sort bar, no plan summary), a single click selects a row and
-    /// reports [`Cmd::Select`], a double click opens it.
-    pub listing: bool,
+    /// Rows stay in the caller's order, with no sort bar and no plan summary
+    /// (a listing, or Duplicates' groups).
+    pub caller_order: bool,
+    /// A single click selects a row and reports [`Cmd::Select`]; a second
+    /// click on the cursor row, or a double click, opens it (Browse). Off,
+    /// every click opens the row.
+    pub select_on_click: bool,
+    /// The left side holds files from several repos (Duplicates' copies), so
+    /// each row draws its own repo chip there.
+    pub left_multi_repo: bool,
 }
 
 /// The right region's header, present on a two-sided board.
@@ -678,7 +721,20 @@ pub fn board(
     thumbs: &mut ThumbCache,
     body: &mut dyn FnMut(usize) -> RowBody,
 ) -> Option<BoardAction> {
-    if !view.listing {
+    board_with(ui, state, metas, view, thumbs, body, Hooks::default())
+}
+
+/// [`board`] with the caller's [`Hooks`] drawn into the rows.
+pub fn board_with(
+    ui: &mut egui::Ui,
+    state: &mut BoardState,
+    metas: &[RowMeta],
+    view: BoardView,
+    thumbs: &mut ThumbCache,
+    body: &mut dyn FnMut(usize) -> RowBody,
+    mut hooks: Hooks<'_>,
+) -> Option<BoardAction> {
+    if !view.caller_order {
         summary(ui, view.totals);
     }
     if view.full_len > metas.len() {
@@ -698,12 +754,12 @@ pub fn board(
         state.sort_left = true;
     }
     let any_resurrection = metas.iter().any(|m| m.is_resurrection());
-    if !view.listing {
+    if !view.caller_order {
         controls_bar(ui, state, two_sided, view.totals[3] > 0, any_resurrection);
     }
     headers(ui, &view, metas);
 
-    let index = Index::build(metas, state, view.listing);
+    let index = Index::build(metas, state, view.caller_order);
     let scroll_to = state.scroll_to.take();
     ui.label(
         RichText::new(format!("{} rows", index.order.len()))
@@ -729,6 +785,7 @@ pub fn board(
         centre,
         two_sided,
         multi_repo: view.right.as_ref().is_some_and(|r| r.multi_repo),
+        left_multi_repo: view.left_multi_repo,
         hide_skips_run: view.hide_skips_run,
     };
     let clip = ui.clip_rect();
@@ -739,9 +796,39 @@ pub fn board(
     for vis in visible {
         let i = index.order[vis];
         let h = metas[i].height();
-        let row_rect = egui::Rect::from_min_size(
+        let full_rect = egui::Rect::from_min_size(
             egui::pos2(rect.left(), rect.top() + index.offsets[vis]),
             egui::vec2(rect.width(), h),
+        );
+        // A group's band sits above its first row: the title, then the
+        // caller's widgets; the row proper starts below it.
+        let head_h = metas[i]
+            .group
+            .as_ref()
+            .map(GroupHead::height)
+            .unwrap_or(0.0);
+        if let Some(head) = &metas[i].group {
+            let band =
+                egui::Rect::from_min_size(full_rect.min, egui::vec2(full_rect.width(), head_h));
+            ui.painter().rect_filled(band, 0.0, theme::panel());
+            let mut band_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(band.shrink2(egui::vec2(6.0, 2.0)))
+                    .layout(Layout::top_down(Align::Min)),
+            );
+            band_ui.horizontal(|ui| {
+                ui.label(RichText::new(&head.title).color(theme::amber()).strong());
+                if let Some(hook) = hooks.group_header.as_mut() {
+                    hook(i, ui);
+                }
+            });
+            for note in &head.notes {
+                band_ui.label(RichText::new(note).color(theme::lilac()).size(11.0));
+            }
+        }
+        let row_rect = egui::Rect::from_min_max(
+            egui::pos2(full_rect.left(), full_rect.top() + head_h),
+            full_rect.max,
         );
         // Striping, which TableBuilder used to provide.
         if vis % 2 == 1 {
@@ -749,7 +836,7 @@ pub fn board(
         }
         // A listing tints its selected rows and outlines its cursor, so the
         // selection reads at a glance whichever pane has the keyboard.
-        if view.listing {
+        if view.select_on_click {
             if state.selected.contains(&metas[i].key) {
                 ui.painter()
                     .rect_filled(row_rect, 0.0, theme::amber().gamma_multiply(0.18));
@@ -775,7 +862,10 @@ pub fn board(
             ui.id().with(("board-row", i)),
             egui::Sense::click(),
         );
-        if view.listing {
+        if let Some(menu) = hooks.row_menu.as_mut() {
+            row_resp.context_menu(|ui| menu(i, ui));
+        }
+        if view.select_on_click {
             let mods = ui.input(|inp| inp.modifiers);
             let on_cursor = state.cursor.as_deref() == Some(metas[i].key.as_str());
             if row_resp.double_clicked() || (row_resp.clicked() && on_cursor && mods.is_none()) {
@@ -808,11 +898,35 @@ pub fn board(
                 .max_rect(row_rect.shrink2(egui::vec2(0.0, ROW_PAD)))
                 .layout(Layout::left_to_right(Align::Min)),
         );
-        if let Some(cmd) = draw_row(&mut row_ui, thumbs, &metas[i], &body(i), geom) {
+        let mut extras = hooks
+            .extras
+            .as_mut()
+            .map(|hook| move |ui: &mut egui::Ui| hook(i, ui));
+        let extras_dyn: Option<&mut dyn FnMut(&mut egui::Ui)> = match extras.as_mut() {
+            Some(f) => Some(f),
+            None => None,
+        };
+        let mut menu = hooks
+            .row_menu
+            .as_mut()
+            .map(|hook| move |ui: &mut egui::Ui| hook(i, ui));
+        let menu_dyn: Option<&mut dyn FnMut(&mut egui::Ui)> = match menu.as_mut() {
+            Some(f) => Some(f),
+            None => None,
+        };
+        if let Some(cmd) = draw_row(
+            &mut row_ui,
+            thumbs,
+            &metas[i],
+            &body(i),
+            geom,
+            extras_dyn,
+            menu_dyn,
+        ) {
             // On a listing the picture and the name are part of the row: their
             // click selects like the rest of the row does, and a second click
             // on the cursor row opens it.
-            let cmd = if view.listing && cmd == Cmd::OpenRow {
+            let cmd = if view.select_on_click && cmd == Cmd::OpenRow {
                 let mods = ui.input(|inp| inp.modifiers);
                 let on_cursor = state.cursor.as_deref() == Some(metas[i].key.as_str());
                 if on_cursor && mods.is_none() {
@@ -871,6 +985,8 @@ struct RowGeom {
     two_sided: bool,
     /// The right side spans several repos, so each row names its own.
     multi_repo: bool,
+    /// The left side does too.
+    left_multi_repo: bool,
     hide_skips_run: bool,
 }
 
@@ -885,12 +1001,15 @@ fn draw_row(
     meta: &RowMeta,
     body: &RowBody,
     geom: RowGeom,
+    extras: Option<&mut dyn FnMut(&mut egui::Ui)>,
+    row_menu: Option<&mut dyn FnMut(&mut egui::Ui)>,
 ) -> Option<Cmd> {
     let RowGeom {
         side,
         centre,
         two_sided,
         multi_repo,
+        left_multi_repo,
         hide_skips_run,
     } = geom;
     let mut clicked = None;
@@ -909,10 +1028,12 @@ fn draw_row(
             body: &body.left,
             size: meta.left_size,
             modified: meta.left_modified,
-            multi_repo: false,
+            multi_repo: left_multi_repo,
             counterpart: &meta.right_paths,
             tags: &meta.left_tags,
         },
+        extras,
+        row_menu,
     ) {
         // The thumbnail senses clicks itself (it sits over the row's click
         // region), so its click is the row click: open the viewer.
@@ -1020,6 +1141,8 @@ fn draw_row(
                 counterpart: &meta.left_paths,
                 tags: &[],
             },
+            None,
+            None,
         )
         && clicked.is_none()
     {
@@ -1047,7 +1170,14 @@ fn cmd_button(ui: &mut egui::Ui, at: egui::Rect, cmd: Cmd, hide_skips_run: bool)
 /// itself, so it sits *over* the row's own click region — dropping its
 /// response would make exactly the picture the dead spot of an otherwise
 /// clickable row.
-fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view: SideView) -> bool {
+fn side_cell(
+    ui: &mut egui::Ui,
+    thumbs: &mut ThumbCache,
+    rect: egui::Rect,
+    view: SideView,
+    extras: Option<&mut dyn FnMut(&mut egui::Ui)>,
+    row_menu: Option<&mut dyn FnMut(&mut egui::Ui)>,
+) -> bool {
     // A side with no file and no story stays empty. A side with no file but a
     // story about itself (it deleted this content) draws a bare tombstone
     // cell below.
@@ -1077,17 +1207,24 @@ fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view:
     let cell = &mut cell;
     let mut text_width = rect.width();
     let mut thumb_clicked = false;
+    let mut row_menu = row_menu;
     if let Some(f) = &view.body.facts {
         // The golden rule: this cell shows this side's preview, veiled only
         // with **its own** state — the row builders decide that per side (a
         // missing file veils itself amber inside `media_cell` regardless).
-        thumb_clicked = media_cell(
+        if let Some(resp) = media_cell(
             cell,
             thumbs,
             f,
             MediaStyle::row(THUMB).with_overlay(view.body.overlay),
-        )
-        .is_some_and(|r| r.clicked());
+        ) {
+            thumb_clicked = resp.clicked();
+            // The picture senses clicks itself, so the row's menu has to hang
+            // off it too or a right-click on the picture would open nothing.
+            if let Some(menu) = row_menu.as_mut() {
+                resp.context_menu(|ui| menu(ui));
+            }
+        }
         text_width -= THUMB + cell.spacing().item_spacing.x;
     }
     cell.vertical(|ui| {
@@ -1128,7 +1265,14 @@ fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view:
             if path_resp.clicked() {
                 thumb_clicked = true;
             }
-            crate::util::copy_menu(&path_resp, path);
+            // The row's own menu, where the caller has one (it carries COPY
+            // NAME itself); the plain copy menu otherwise.
+            match row_menu.as_mut() {
+                Some(menu) => {
+                    path_resp.context_menu(|ui| menu(ui));
+                }
+                None => crate::util::copy_menu(&path_resp, path),
+            }
         }
         if let Some(line) = facts_line(view.size, view.modified, view.body.facts.as_ref()) {
             // An empty file is useless — copying or promoting it preserves
@@ -1167,6 +1311,9 @@ fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view:
                     tag_chip(ui, tag);
                 }
             });
+        }
+        if let Some(extras) = extras {
+            extras(ui);
         }
     });
     thumb_clicked
@@ -1628,7 +1775,9 @@ mod tests {
                             totals: [0, 1, 0, 0],
                             full_len: 1,
                             hide_skips_run: true,
-                            listing: false,
+                            caller_order: false,
+                            select_on_click: false,
+                            left_multi_repo: false,
                         },
                         &mut thumbs,
                         &mut |_| body.clone(),
@@ -1706,7 +1855,9 @@ mod tests {
                             totals: [0, 0, 0, 0],
                             full_len: 2,
                             hide_skips_run: false,
-                            listing: true,
+                            caller_order: true,
+                            select_on_click: true,
+                            left_multi_repo: false,
                         },
                         &mut thumbs,
                         &mut |_| RowBody::default(),
@@ -1829,6 +1980,8 @@ mod tests {
             unchanged: false,
             cmds: some_cmds(1),
             left_tags: Vec::new(),
+            extra_height: 0.0,
+            group: None,
         };
         let differing = row("a/photo1.jpg", "a/photo.jpg");
         let identical = row("a/photo.jpg", "a/photo.jpg");
@@ -1952,6 +2105,8 @@ mod tests {
             unchanged: false,
             cmds: some_cmds(cmds),
             left_tags: Vec::new(),
+            extra_height: 0.0,
+            group: None,
         }
     }
 
@@ -2283,7 +2438,9 @@ mod tests {
                             totals: [0, 3, 0, 0],
                             full_len: 3,
                             hide_skips_run: true,
-                            listing: false,
+                            caller_order: false,
+                            select_on_click: false,
+                            left_multi_repo: false,
                         },
                         &mut thumbs,
                         &mut |_| RowBody::default(),
@@ -2319,6 +2476,8 @@ mod tests {
                 Cmd::Hide,
             ],
             left_tags: Vec::new(),
+            extra_height: 0.0,
+            group: None,
         }
     }
 
@@ -2645,7 +2804,9 @@ mod tests {
                             totals: [0, 2, 0, 0],
                             full_len: 2,
                             hide_skips_run: true,
-                            listing: false,
+                            caller_order: false,
+                            select_on_click: false,
+                            left_multi_repo: false,
                         },
                         &mut thumbs,
                         &mut |i| RowBody {
@@ -2909,7 +3070,9 @@ mod tests {
                             totals: [0, 1, 2, 0],
                             full_len: 3,
                             hide_skips_run: false,
-                            listing: false,
+                            caller_order: false,
+                            select_on_click: false,
+                            left_multi_repo: false,
                         },
                         thumbs,
                         &mut |i| bodies.get(i).cloned().unwrap_or_default(),
@@ -2990,7 +3153,9 @@ mod tests {
                                 totals: [0, 1, 2, 0],
                                 full_len: 3,
                                 hide_skips_run: false,
-                                listing: false,
+                                caller_order: false,
+                                select_on_click: false,
+                                left_multi_repo: false,
                             },
                             thumbs,
                             &mut |i| bodies.get(i).cloned().unwrap_or_default(),
