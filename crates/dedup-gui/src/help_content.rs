@@ -61,7 +61,7 @@ matches. FIND runs in the activity window, which shows each phase and its progre
 CANCEL, blocks the rest of the app meanwhile, and ends as the result report.
 
 Results are shown a page of groups at a time. Each file can be toggled KEEP / DELETE; the \
-best copy is starred. AUTO-RESOLVE REST marks every non-best copy at once. DELETE MARKED \
+best copy is starred. AUTO-RESOLVE REST marks every non-best copy at once. APPLY MARKED \
 runs the delete and the search that follows in the activity window, behind a confirmation \
 — or turn on QUICK DELETE to skip confirmation per group; each DELETE NOW is answered by a \
 notification card, and every deleted file is written to the event log (LOG, top right).
@@ -77,8 +77,8 @@ Copy, move, or sync files between two repositories by content (size + hash — p
 matter), with an assisted filter and a preview before anything runs.
 
 The tab asks its questions in order: WHAT (the command), WITH WHICH (SOURCE and TARGET, side \
-by side), HOW (destination, options, filter), then RUN. Each section appears once the one \
-above it is answered, and after REVIEW or RUN they fold to their header bars — click one \
+by side), HOW (destination, options, filter), then PREVIEW. Each section appears once the one \
+above it is answered, and after PREVIEW or APPLY ALL they fold to their header bars — click one \
 to flip that section open again.
 
 Pick a SOURCE and a TARGET repo, optionally add DUPEPOOL repositories — a source file only \
@@ -95,8 +95,8 @@ its own stored mode: ADD ONLY copies content it lacks and never deletes, so a si
 files the main no longer has; APPLY CHANGES also deletes sink content the main itself \
 deleted, so the sink follows the main's edits while keeping what the main never had; MIRROR \
 deletes all sink content the main does not have, so it ends up holding exactly the main's \
-content — deletions cannot be undone. REVIEW plans every selected sink and shows what would \
-be copied and deleted, without touching disk; RUN asks for confirmation — naming the sink \
+content — deletions cannot be undone. PREVIEW plans every selected sink and shows what would \
+be copied and deleted, without touching disk; APPLY ALL asks for confirmation — naming the sink \
 count and any sink a push would empty entirely — then pushes in the activity window. Sinks \
 are handled independently, so one unreachable backup drive does not stop the others, and \
 the main is never changed. GROUP SYNC BACK pulls one sink's changes back into the main.
@@ -113,8 +113,8 @@ values highlighted — and the same actions per side. Nothing happens until you 
 button; rows that are equal on both sides are hidden until you ask for them.
 
 Use the FILTER wizard to narrow which files are considered — conditions combine with \
-AND. REVIEW plans in the activity window and shows the matching transfers, paged, plus a \
-total count, without touching disk. RUN asks for confirmation, then performs the transfer \
+AND. PREVIEW plans in the activity window and shows the matching transfers, paged, plus a \
+total count, without touching disk. APPLY ALL asks for confirmation, then performs the transfer \
 in the activity window — each file as it goes, every problem, and CANCEL — and ends on the \
 result report. A row's COPY, DELETE, RENAME, OVERWRITE or APPLY answers with a notification \
 card, and every file changed is in the event log behind the LOG button.";
@@ -122,8 +122,8 @@ card, and every file changed is in the event log behind the LOG button.";
 const GROOMING: &str = "\
 Prune and reorganize a single repository. The tab asks its questions in order: WHAT (the \
 tool), WITH WHICH (the repository, plus the dupe pool for DEDUPE), HOW (the filter or the \
-rules), then RUN. Each section appears once the one above it is answered, and after REVIEW \
-or RUN they fold to their header bars — click one to flip that section open again.
+rules), then PREVIEW. Each section appears once the one above it is answered, and after PREVIEW \
+or APPLY ALL they fold to their header bars — click one to flip that section open again.
 
 DEDUPE deletes files in a source repo whose content also exists in any selected dupe-pool \
 repo. PURGE deletes everything matching a filter — it requires at least one filter \
@@ -154,8 +154,8 @@ never outside it.
 Save the current rule list as a preset with STORE PRESET, to reuse on any repo; right-click a \
 preset to rename it.
 
-Every destructive command runs behind a REVIEW and a confirmation dialog. REVIEW plans in \
-the activity window and fills the board; RUN performs the plan in the activity window — \
+Every command previews before it applies. PREVIEW plans in \
+the activity window and fills the board; APPLY ALL performs the plan in the activity window — \
 each file as it goes, every problem, and CANCEL — and ends on the result report. A row's \
 APPLY answers with a notification card, and every file changed is in the event log behind \
 the LOG button.";

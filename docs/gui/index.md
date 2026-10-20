@@ -113,7 +113,7 @@ unlocking for deletion should be a fresh, conscious choice each session.
 
 Long work runs one at a time in a central window that blocks the rest of the app while it
 runs: a repository UPDATE or CHECK (UPDATE ALL lists every repository on its own row), a
-Duplicates FIND or DELETE MARKED, a Transfer or Grooming REVIEW and RUN, a GROUP SYNC or a
+Duplicates FIND or APPLY MARKED, a Transfer or Grooming PREVIEW and APPLY ALL, a GROUP SYNC or a
 bulk board action. The window names the operation and its repositories,
 the current phase ("reading 'photos'", "comparing audio", "copying 2020/a.jpg"), how far it
 is with a percentage where the total is known, elapsed time and an estimate of what is left,
@@ -161,7 +161,7 @@ appears.
   exists only on this side (or will be added), red will be deleted, amber differs — the same
   path with different content, or the same content under a different name.
 - **HIDE** removes a row from the board, and on a preview also from what RUN will do. It is
-  one-way: press REVIEW again to start over.
+  one-way: press PREVIEW again to start over.
 - **Sorting** is the bar above the board — which side to read, then the key (path, size, date
   or status), then the direction. Large previews scroll rather than paging.
 

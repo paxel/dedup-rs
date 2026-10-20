@@ -2,7 +2,9 @@
 //! empty-directory pruning against a real repo in a tempdir.
 
 use dedup_core::diff::{DiffRun, NoDiffProgress};
-use dedup_core::groom::{delete_by_filter, delete_empty_dirs, preview_prune, prune};
+use dedup_core::groom::{
+    delete_by_filter, delete_empty_dirs, find_empty_dirs, preview_prune, prune,
+};
 use dedup_core::update::{CancellationToken, NoProgress, update_repo};
 use std::path::PathBuf;
 
@@ -101,6 +103,34 @@ fn delete_by_filter_without_a_filter_deletes_nothing() -> TestResult {
     }
     assert!(sb.root.join("a.txt").exists());
     assert!(sb.root.join("b.txt").exists());
+    Ok(())
+}
+
+#[test]
+fn find_empty_dirs_lists_what_a_delete_would_remove_without_removing() -> TestResult {
+    let sb = Sandbox::new()?;
+    sb.write("full/keep.txt", b"x")?;
+    std::fs::create_dir_all(sb.root.join("empty/deep"))?;
+    std::fs::create_dir_all(sb.root.join("solo"))?;
+
+    let found = find_empty_dirs(&sb.store, "R")?;
+    let mut names: Vec<String> = found
+        .iter()
+        .filter_map(|p| p.strip_prefix(&sb.root).ok())
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .collect();
+    names.sort();
+    assert_eq!(names, ["empty", "empty/deep", "solo"]);
+    assert!(
+        found.iter().position(|p| p.ends_with("deep"))
+            < found.iter().position(|p| p.ends_with("empty")),
+        "deepest first, as the delete walks"
+    );
+    assert!(
+        sb.root.join("empty/deep").exists(),
+        "the preview removes nothing"
+    );
+    assert!(sb.root.join("solo").exists());
     Ok(())
 }
 

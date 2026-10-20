@@ -34,6 +34,13 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   reopens it on its preview, never past it. A favorite that cannot run today
   is greyed with the reason; right-click renames or deletes it. Favorites
   survive restarts.
+- **One lifecycle vocabulary: PREVIEW, then APPLY.** Transfer and Grooming
+  say PREVIEW (was REVIEW) and APPLY ALL (was RUN), and APPLY ALL is offered
+  only once the plan is on the board — there is no longer a path from a
+  specified command to a disk change that skips the preview. EMPTY
+  DIRECTORIES gained a preview of the directories it would remove.
+  Duplicates says APPLY MARKED (was DELETE MARKED). Keyboard: P previews,
+  A applies.
 - **The start page states the facts before you choose.** One line over the
   cards sums the repositories, files and bytes the app looks after. A card's
   UPDATED stat reads as people say it — "just now", "3 hours ago", "9 days

@@ -578,6 +578,9 @@ impl DupesView {
                 if i.key_pressed(egui::Key::F) && self.busy.is_none() {
                     acts.push(Act::Find);
                 }
+                if i.key_pressed(egui::Key::A) && self.busy.is_none() && !self.marked.is_empty() {
+                    acts.push(Act::AskDelete);
+                }
                 if i.key_pressed(egui::Key::M) {
                     self.mode = if self.mode == Mode::Exact {
                         Mode::Similar
@@ -617,7 +620,7 @@ impl DupesView {
         crate::util::shortcut_bar(
             ui,
             &format!(
-                "F find · {}/{} page · M mode",
+                "F find · A apply marked · {}/{} page · M mode",
                 icon::CARET_LEFT,
                 icon::CARET_RIGHT
             ),
@@ -1116,18 +1119,18 @@ impl DupesView {
                 }
                 if crate::lcars::action_button(
                     ui,
-                    &format!("DELETE MARKED ({n})"),
+                    &format!("APPLY MARKED ({n})"),
                     idle && n > 0,
                     theme::red(),
                 )
                 .explain(
                     self.verbosity,
                     "Delete every marked file, with confirmation",
-                    "Delete every currently marked file across all groups, batched per \
-                     repo in one transaction. Always asks for confirmation first — use \
-                     QUICK DELETE if you want per-group deletes without asking. The \
-                     delete and the search that follows run in a window that shows \
-                     their progress and reports what was deleted.",
+                    "Apply the marks: delete every currently marked file across all \
+                     groups, batched per repo in one transaction. Always asks for \
+                     confirmation first — use QUICK DELETE if you want per-group deletes \
+                     without asking. The delete and the search that follows run in a \
+                     window that shows their progress and reports what was deleted.",
                 )
                 .clicked()
                 {
@@ -1709,7 +1712,7 @@ impl DupesView {
                                         self.verbosity,
                                         "Toggle this copy's mark",
                                         "Toggle whether this copy is marked for deletion. \
-                                         Nothing is deleted until you press DELETE MARKED (or \
+                                         Nothing is deleted until you press APPLY MARKED (or \
                                          DELETE NOW under Quick Delete).",
                                     )
                                     .clicked()
@@ -2642,7 +2645,7 @@ impl DupesView {
                 if let Err(busy) = started {
                     crate::activity::lock(&self.activity).card(
                         ctx,
-                        crate::activity::Notification::refused("DELETE MARKED", &busy),
+                        crate::activity::Notification::refused("APPLY MARKED", &busy),
                     );
                     return;
                 }

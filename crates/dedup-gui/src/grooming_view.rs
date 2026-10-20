@@ -250,6 +250,9 @@ enum PreviewSpec {
         repo: String,
         rules: Vec<OrganizeRule>,
     },
+    EmptyDirs {
+        repo: String,
+    },
 }
 
 /// One ORGANIZE rule in the UI: a shared filter wizard plus a path template.
@@ -500,7 +503,7 @@ impl GroomingView {
                 if i.key_pressed(egui::Key::P) {
                     acts.push(Act::Preview);
                 }
-                if i.key_pressed(egui::Key::R) {
+                if i.key_pressed(egui::Key::A) {
                     acts.push(Act::Ask);
                 }
             });
@@ -524,7 +527,7 @@ impl GroomingView {
                 );
                 crate::util::shortcut_bar(
                     ui,
-                    "1 dedupe · 2 purge · 3 empty-dirs · 4 organize · 5 prune · P review · R run",
+                    "1 dedupe · 2 purge · 3 empty-dirs · 4 organize · 5 prune · P preview · A apply",
                 );
 
                 // Reading order is the workflow: WHAT (the tool), WITH WHICH
@@ -1000,46 +1003,48 @@ impl GroomingView {
     fn action_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         crate::lcars::section_lcars(
             ui,
-            "RUN — REVIEW THE PLAN, THEN RUN IT",
+            "PREVIEW THE PLAN, THEN APPLY IT",
             theme::amber(),
             |ui| {
                 ui.horizontal(|ui| {
                     let ready = self.ready();
-                    // EMPTY DIRS has no meaningful file preview (its count is
-                    // only known after walking), so REVIEW is offered for the
-                    // other tools.
-                    if self.command != Command::EmptyDirs
-                        && crate::lcars::action_button(ui, "REVIEW", ready, theme::blue())
-                            .explain(
-                                self.verbosity,
-                                "Review what would change",
-                                "Plan the run in the activity window and list the matching \
-                                 files (up to a limit) and a total count on the board below, \
-                                 without changing anything on disk.",
-                            )
-                            .clicked()
+                    if crate::lcars::action_button(ui, "PREVIEW", ready, theme::blue())
+                        .explain(
+                            self.verbosity,
+                            "Show what would change, without changing anything",
+                            "Plan the command in the activity window and list what it would \
+                         change on the board below (up to a limit, with the total), \
+                         without touching disk. APPLY ALL is offered once the plan is on \
+                         the board.",
+                        )
+                        .clicked()
                     {
                         acts.push(Act::Preview);
                     }
-                    // The session lock bars a run that would change the
-                    // groomed repo's existing files; the blocked button says
-                    // which padlock to click.
+                    // The plan has to be on the board before it can be applied —
+                    // ADR 0004: preview, then APPLY — and the session lock bars a
+                    // run that would change the groomed repo's existing files; the
+                    // blocked button says which padlock to click.
                     let lock_block = self.lock_block();
+                    let previewed = !self.preview.is_empty();
                     let resp = crate::lcars::action_button(
                         ui,
-                        "RUN",
-                        ready && lock_block.is_none(),
+                        "APPLY ALL",
+                        ready && previewed && lock_block.is_none(),
                         theme::red(),
                     );
                     let resp = if let Some(why) = &lock_block {
                         resp.on_hover_text(why.clone())
+                    } else if !previewed {
+                        resp.on_hover_text("PREVIEW first: APPLY ALL runs the plan on the board")
                     } else {
                         resp.explain(
                             self.verbosity,
-                            "Run the command",
-                            "After a confirmation, run the command in the activity window: \
-                             it names each file as it goes, lists any problems, and ends \
-                             with the result. CANCEL stops further work.",
+                            "Apply the plan on the board",
+                            "After a confirmation, apply every row on the board (hidden rows \
+                         are skipped) in the activity window: it names each file as it \
+                         goes, lists any problems, and ends with the result. CANCEL stops \
+                         further work.",
                         )
                     };
                     if resp.clicked() {
@@ -1053,14 +1058,10 @@ impl GroomingView {
     fn preview_panel(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         if self.preview.is_empty() {
             ui.add_space(6.0);
-            // EMPTY DIRS has no review board — its only action is RUN, so the
-            // hint must not send the user hunting for a REVIEW button.
-            let hint = if self.command == Command::EmptyDirs {
-                "Pick a repo, then press RUN."
-            } else {
-                "Pick a repo and command, then press REVIEW."
-            };
-            ui.colored_label(theme::text(), hint);
+            ui.colored_label(
+                theme::text(),
+                "Press PREVIEW to see what the command would change.",
+            );
             return;
         }
         let bodies = std::mem::take(&mut self.preview_bodies);
@@ -1478,10 +1479,14 @@ impl GroomingView {
                     vec![repo],
                 )
             }
-            // EMPTY DIRS has no file preview.
-            Command::EmptyDirs => return,
+            Command::EmptyDirs => {
+                let Some(repo) = self.repo.clone() else {
+                    return;
+                };
+                (PreviewSpec::EmptyDirs { repo: repo.clone() }, vec![repo])
+            }
         };
-        let title = format!("REVIEW {}", self.command.label());
+        let title = format!("PREVIEW {}", self.command.label());
         let store = Arc::clone(store);
         let tx = self.tx.clone();
         let started = crate::activity::lock(&self.activity).start_quiet(
@@ -1508,8 +1513,10 @@ impl GroomingView {
                 self.filter.fold();
                 self.status = Some(format!("{}…", title.to_lowercase()));
             }
-            Err(busy) => crate::activity::lock(&self.activity)
-                .card(ctx, crate::activity::Notification::refused("REVIEW", &busy)),
+            Err(busy) => crate::activity::lock(&self.activity).card(
+                ctx,
+                crate::activity::Notification::refused("PREVIEW", &busy),
+            ),
         }
     }
 
@@ -1815,8 +1822,10 @@ impl GroomingView {
                         self.clear_preview();
                         self.status = Some(format!("{}…", title.to_lowercase()));
                     }
-                    Err(busy) => crate::activity::lock(&self.activity)
-                        .card(ctx, crate::activity::Notification::refused("RUN", &busy)),
+                    Err(busy) => crate::activity::lock(&self.activity).card(
+                        ctx,
+                        crate::activity::Notification::refused("APPLY ALL", &busy),
+                    ),
                 }
             }
         }
@@ -2054,6 +2063,33 @@ fn build_preview(
                 organize: false,
             }
         }
+        PreviewSpec::EmptyDirs { repo } => {
+            progress.phase(format!("walking '{repo}'"), 0, None);
+            let root = store
+                .get_repo(&repo)
+                .map(|m| std::path::PathBuf::from(m.abs_path))
+                .map_err(|e| e.to_string())?;
+            let dirs =
+                dedup_core::groom::find_empty_dirs(store, &repo).map_err(|e| e.to_string())?;
+            let total = dirs.len();
+            let paths: Vec<String> = dirs
+                .iter()
+                .map(|d| {
+                    d.strip_prefix(&root)
+                        .unwrap_or(d)
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+                .take(PREVIEW_CAP)
+                .collect();
+            Planned {
+                facts_repo: repo,
+                paths: one_sided(paths),
+                total,
+                target_header: None,
+                organize: false,
+            }
+        }
         PreviewSpec::Organize { repo, rules } => {
             progress.phase(format!("reading '{repo}'"), 0, None);
             let moves = plan_organize(store, &repo, &rules).map_err(|e| e.to_string())?;
@@ -2217,7 +2253,7 @@ fn insert_at_cursor(ctx: &egui::Context, id: egui::Id, template: &mut String, te
 mod ui_tests {
     use super::*;
     use egui_kittest::Harness;
-    use egui_kittest::kittest::Queryable;
+    use egui_kittest::kittest::{NodeT, Queryable};
 
     fn sample_store() -> (tempfile::TempDir, Arc<Store>) {
         let tmp = tempfile::tempdir().unwrap();
@@ -2980,7 +3016,7 @@ mod ui_tests {
         h.state_mut().source = Some("a".to_string());
         h.state_mut().pool = vec!["b".to_string()];
         h.run();
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         wait_done(&mut h);
         assert_eq!(
             h.state().preview_total,
@@ -2989,7 +3025,7 @@ mod ui_tests {
         );
 
         // Locked source: RUN never reaches a confirmation.
-        h.get_by_label("RUN").click_accesskit();
+        h.get_by_label("APPLY ALL").click_accesskit();
         h.step();
         h.step();
         assert!(
@@ -3000,7 +3036,7 @@ mod ui_tests {
 
         h.state().locks.toggle("a");
         h.run();
-        h.get_by_label("RUN").click_accesskit();
+        h.get_by_label("APPLY ALL").click_accesskit();
         for _ in 0..100 {
             h.step();
             if h.state().confirm.is_some() {
@@ -3032,10 +3068,10 @@ mod ui_tests {
         h.state_mut().filter.set_expression("name:*.tmp");
         h.state().locks.toggle("a");
         h.run();
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         wait_done(&mut h);
         assert_eq!(h.state().preview_total, 1, "only the junk file matches");
-        h.get_by_label("RUN").click_accesskit();
+        h.get_by_label("APPLY ALL").click_accesskit();
         for _ in 0..100 {
             h.step();
             if h.state().confirm.is_some() {
@@ -3110,7 +3146,7 @@ mod ui_tests {
             "no repository chip before a tool is chosen"
         );
         assert!(h.query_by_label_contains("FILTER — ").is_none());
-        assert!(h.query_by_label("REVIEW").is_none());
+        assert!(h.query_by_label("PREVIEW").is_none());
 
         h.get_by_label("PURGE").click();
         h.run();
@@ -3133,13 +3169,13 @@ mod ui_tests {
             "HOW sits below the repository"
         );
         assert!(
-            h.query_by_label("REVIEW").is_none(),
+            h.query_by_label("PREVIEW").is_none(),
             "RUN waits for PURGE's filter condition"
         );
 
         h.state_mut().filter.set_expression("name:*.tmp");
         h.run();
-        let review = h.get_by_label("REVIEW").rect();
+        let review = h.get_by_label("PREVIEW").rect();
         assert!(review.top() > filter.top(), "RUN comes last");
     }
 
@@ -3153,7 +3189,7 @@ mod ui_tests {
         h.state_mut().filter.set_expression("name:*.tmp");
         h.state().locks.toggle("a");
         h.run();
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         wait_done(&mut h);
         h.get_by_label("APPLY").click_accesskit();
         wait_done(&mut h);
@@ -3188,7 +3224,19 @@ mod ui_tests {
         h.state_mut().repo = Some("a".to_string());
         h.state().locks.toggle("a");
         h.run();
-        h.get_by_label("RUN").click_accesskit();
+        // ADR 0004: the plan has to be on the board before it can be applied.
+        assert!(
+            h.get_by_label("APPLY ALL").accesskit_node().is_disabled(),
+            "APPLY ALL waits for the preview"
+        );
+        h.get_by_label("PREVIEW").click_accesskit();
+        wait_done(&mut h);
+        h.run();
+        assert!(
+            !h.state().preview.is_empty(),
+            "the preview lists the directories that would go"
+        );
+        h.get_by_label("APPLY ALL").click_accesskit();
         for _ in 0..100 {
             h.step();
             if h.state().confirm.is_some() {
@@ -3223,7 +3271,10 @@ mod ui_tests {
         let mut h = grooming_harness(Arc::clone(&store), Command::Prune);
         h.state_mut().repo = Some("a".to_string());
         h.run();
-        h.get_by_label("RUN").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
+        wait_done(&mut h);
+        h.run();
+        h.get_by_label("APPLY ALL").click_accesskit();
         for _ in 0..100 {
             h.step();
             if h.state().confirm.is_some() {

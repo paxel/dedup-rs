@@ -224,16 +224,14 @@ pub fn prune(store: &Store, repo: &str, run: &DiffRun<'_>) -> Result<PruneStats,
     Ok(stats)
 }
 
-/// Remove every empty directory under `repo`'s root (bottom-up, so a directory
-/// left empty only after its empty children are removed is also pruned). The
-/// repo root itself is never removed. Returns the number of directories
-/// deleted. The index is untouched — directories are not indexed.
-pub fn delete_empty_dirs(store: &Store, repo: &str) -> Result<u64, DiffError> {
+/// Every directory under `repo`'s root that [`delete_empty_dirs`] would
+/// remove, deepest first: a directory that is empty, or whose every entry is
+/// itself such a directory. The repo root is never listed. Nothing on disk
+/// changes — this is the preview.
+pub fn find_empty_dirs(store: &Store, repo: &str) -> Result<Vec<PathBuf>, DiffError> {
     let meta = store.get_repo(repo)?;
     let root = PathBuf::from(&meta.abs_path);
-
-    // Deepest paths first so a parent is visited only after its children have
-    // had their chance to be removed.
+    // Deepest paths first so a parent is judged only after its children.
     let mut dirs: Vec<PathBuf> = walkdir::WalkDir::new(&root)
         .into_iter()
         .filter_map(Result::ok)
@@ -241,15 +239,31 @@ pub fn delete_empty_dirs(store: &Store, repo: &str) -> Result<u64, DiffError> {
         .map(|e| e.into_path())
         .collect();
     dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
-
-    let mut removed = 0u64;
+    let mut doomed: Vec<PathBuf> = Vec::new();
     for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let empty_after = entries
+            .filter_map(Result::ok)
+            .all(|e| doomed.iter().any(|d| *d == e.path()));
+        if empty_after {
+            doomed.push(dir);
+        }
+    }
+    Ok(doomed)
+}
+
+/// Remove every empty directory under `repo`'s root (bottom-up, so a directory
+/// left empty only after its empty children are removed is also pruned). The
+/// repo root itself is never removed. Returns the number of directories
+/// deleted. The index is untouched — directories are not indexed.
+pub fn delete_empty_dirs(store: &Store, repo: &str) -> Result<u64, DiffError> {
+    let mut removed = 0u64;
+    for dir in find_empty_dirs(store, repo)? {
         // Only remove a directory that is actually empty now; ignore errors
         // (a non-empty dir errors, which is exactly what we want to skip).
-        let is_empty = std::fs::read_dir(&dir)
-            .map(|mut it| it.next().is_none())
-            .unwrap_or(false);
-        if is_empty && std::fs::remove_dir(&dir).is_ok() {
+        if std::fs::remove_dir(&dir).is_ok() {
             removed += 1;
         }
     }

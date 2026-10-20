@@ -9,10 +9,10 @@ equivalent of [`diff cp`/`mv`/`rm`](../cli.md#diff).
 ## Reading order
 
 The tab asks its questions top to bottom: **WHAT** (the command), **WITH WHICH** (the
-repositories), **HOW** (destination, options, filter) and only then **RUN**. Each section
+repositories), **HOW** (destination, options, filter) and only then **APPLY ALL**. Each section
 appears once the one above it has an answer — a fresh tab shows only the command chips — and
 keeps its answer when an earlier one changes unless that change makes it invalid (picking a
-new source drops a target that is now the same repo). Once REVIEW or RUN starts, the sections
+new source drops a target that is now the same repo). Once PREVIEW or APPLY ALL starts, the sections
 fold into one summary line above the board; **CHANGE** unfolds them.
 
 ## What: the command
@@ -133,9 +133,9 @@ side offers several names, RENAME asks which name to take. After every action th
 re-compares the two repos, so the row's commands always reflect the current state.
 
 Equal rows are hidden until **SHOW UNCHANGED** is pressed, and each action is applied to disk
-and to both repo indexes immediately — there is no RUN button and no batch confirmation.
-**HIDE** parks a row you have decided to leave alone; it comes back on the next REVIEW. The
-comparison itself (REVIEW) reads both indexes in the activity window, which closes by itself
+and to both repo indexes immediately — there is no APPLY ALL button and no batch confirmation.
+**HIDE** parks a row you have decided to leave alone; it comes back on the next PREVIEW. The
+comparison itself (PREVIEW) reads both indexes in the activity window, which closes by itself
 when the board is ready.
 
 ## Group sync
@@ -156,9 +156,9 @@ lacks and never deletes, so a sink may keep files the main no longer has; **MIRR
 deletes sink content the main does not have, so it ends up holding exactly the main's
 content — those deletions cannot be undone.
 
-**REVIEW** and **RUN** work as they do for every other command: REVIEW plans every selected
+**PREVIEW** and **APPLY ALL** work as they do for every other command: PREVIEW plans every selected
 sink and shows what would be copied and deleted, without touching disk — each row naming the
-sink it belongs to. A group push is all-or-nothing, so these rows carry no per-row commands; RUN asks for
+sink it belongs to. A group push is all-or-nothing, so these rows carry no per-row commands; APPLY ALL asks for
 confirmation — naming the sink count and, for a MIRROR push, any sink it would empty
 entirely — then pushes in the activity window, sink by sink and file by file, with CANCEL.
 Sinks are handled independently, so one unreachable backup drive does not stop the others,
@@ -174,9 +174,9 @@ main; you pick **one sink** to reconcile.
 
 ![GROUP SYNC BACK: a green new-file row and a blue resurrection row](../screenshots/group_sync_back.png)
 
-REVIEW sorts the sink's files against the main into three kinds:
+PREVIEW sorts the sink's files against the main into three kinds:
 
-- **New** (green) — content the main never had. These are your direct edits. **RUN** promotes
+- **New** (green) — content the main never had. These are your direct edits. **APPLY ALL** promotes
   them all into the main in one batch.
 - **Resurrection** (blue) — content the main once had and **deleted**, that the sink still
   holds. These are **never** promoted by the batch — resurrecting a file undoes a deletion, and
@@ -202,11 +202,11 @@ GROUP SYNC BACK *before* you push again.
 
 ## Review and run
 
-The RUN section appears once the command has everything it needs — a source and a target,
-folder or sink. **REVIEW** and **RUN** are the two run buttons; everything above them is a
+The APPLY ALL section appears once the command has everything it needs — a source and a target,
+folder or sink. **PREVIEW** and **APPLY ALL** are the two run buttons; everything above them is a
 selection.
 
-- **REVIEW** plans the transfer in the [activity window](index.md#the-activity-window) —
+- **PREVIEW** plans the transfer in the [activity window](index.md#the-activity-window) —
   "reading 'source'", "reading 'target'", "pairing files" with a percentage — and, when the
   plan is ready, closes by itself and shows every planned transfer and a total count on the
   shared [review board](index.md#the-review-board), without touching disk.
@@ -217,15 +217,15 @@ selection.
   lines — hover the small cell to read the whole preview) and the file's size, dimensions or
   duration, and date — the same info as a Duplicate card. Per row, **APPLY** runs just that
   transfer now as a quick action — a notification card names the file once it has landed,
-  and the board refreshes — and **HIDE** drops it from the board and from what RUN will do.
+  and the board refreshes — and **HIDE** drops it from the board and from what APPLY ALL will do.
   Starting a run clears the review.
-- **RUN** plans first (so the confirmation can state the real count), asks for confirmation,
+- **APPLY ALL** plans first (so the confirmation can state the real count), asks for confirmation,
   then runs the command in the activity window: it names the file being copied, moved or
   deleted, counts up to the total, lists each problem as it occurs, and offers **CANCEL** —
   files already transferred or deleted before cancelling stay as they are; this doesn't roll
   back, it just stops further work. When the run ends the same window shows the result
   report, and every file it changed is in the event log (**LOG**, top right). Only one
-  operation runs at a time: a second REVIEW or RUN while one is up is refused with a card
+  operation runs at a time: a second PREVIEW or APPLY ALL while one is up is refused with a card
   that names what is still running.
 - Both repos' indexes are kept in sync as a run proceeds: COPY/MOVE record each transferred
   file in the target's index (with its real on-disk mtime, plus provenance — which repo it

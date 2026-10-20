@@ -61,7 +61,7 @@ and the repository, and every file it removed is written to the **event log**, w
 Below the results: **SHOW ACCEPTED** lists the groups whose every copy is
 [accepted](#accepted-content) (hidden by default, with a count of how many are skipped),
 **AUTO-RESOLVE REST** marks every non-best copy for deletion (skipping read-only repos and
-accepted copies) so you only have to review the marks, and **DELETE MARKED (n)** deletes
+accepted copies) so you only have to review the marks, and **APPLY MARKED (n)** deletes
 everything currently marked, batched per repo in one transaction, behind a confirmation.
 The delete and the search that follows run in the activity window as one operation whose
 report lists what was deleted, what could not be, and the fresh group count; every deleted

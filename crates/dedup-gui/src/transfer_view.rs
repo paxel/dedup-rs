@@ -1739,7 +1739,7 @@ impl TransferView {
                 if i.key_pressed(egui::Key::P) {
                     acts.push(Act::Preview);
                 }
-                if i.key_pressed(egui::Key::R) {
+                if i.key_pressed(egui::Key::A) {
                     acts.push(Act::Ask);
                 }
             });
@@ -1764,7 +1764,7 @@ impl TransferView {
                 );
                 crate::util::shortcut_bar(
                     ui,
-                    "1 copy · 2 move · 3 sync · 4 mirror · 5 diff · P review · R run",
+                    "1 copy · 2 move · 3 sync · 4 mirror · 5 diff · P preview · A apply",
                 );
 
                 // Reading order is the workflow: WHAT (the command), WITH
@@ -2625,7 +2625,7 @@ impl TransferView {
                     .explain(
                         self.verbosity,
                         "Clear the sink selection",
-                        "Deselect every sink (REVIEW/RUN are disabled until at least one is \
+                        "Deselect every sink (PREVIEW/APPLY ALL are disabled until at least one is \
                          picked).",
                     )
                     .clicked()
@@ -2878,18 +2878,18 @@ impl TransferView {
     fn action_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         crate::lcars::section_lcars(
             ui,
-            "RUN — REVIEW THE PLAN, THEN RUN IT",
+            "PREVIEW THE PLAN, THEN APPLY IT",
             theme::amber(),
             |ui| {
                 ui.horizontal(|ui| {
                     let ready = self.ready();
-                    if crate::lcars::action_button(ui, "REVIEW", ready, theme::blue())
+                    if crate::lcars::action_button(ui, "PREVIEW", ready, theme::blue())
                         .explain(
                             self.verbosity,
-                            "Review the transfers",
+                            "Show what would change, without changing anything",
                             "Plan the transfer in the activity window and show every planned \
                          `from → to` on the board below, without changing anything on \
-                         disk. Starting a run clears the review.",
+                         disk. APPLY ALL is offered once the plan is on the board.",
                         )
                         .clicked()
                     {
@@ -2898,25 +2898,31 @@ impl TransferView {
                     if self.command.is_diff() {
                         return;
                     }
-                    // The session locks can bar the whole run (e.g. MIRROR into a
-                    // locked target). The blocked button's hover says exactly why
-                    // and which padlock to click.
+                    // The plan has to be on the board before it can be applied —
+                    // ADR 0004: preview, then APPLY — and the session locks can
+                    // bar the whole run (e.g. MIRROR into a locked target). The
+                    // blocked button's hover says exactly why and which padlock to
+                    // click.
                     let lock_block = self.lock_block();
+                    let previewed = !self.preview.is_empty();
                     let resp = crate::lcars::action_button(
                         ui,
-                        "RUN",
-                        ready && lock_block.is_none(),
+                        "APPLY ALL",
+                        ready && previewed && lock_block.is_none(),
                         theme::amber(),
                     );
                     let resp = if let Some(why) = &lock_block {
                         resp.on_hover_text(why.clone())
+                    } else if !previewed {
+                        resp.on_hover_text("PREVIEW first: APPLY ALL runs the plan on the board")
                     } else {
                         resp.explain(
                             self.verbosity,
-                            "Run the command",
-                            "After a confirmation, run the command in the activity window: \
-                         it shows each file as it is transferred, any problems, and \
-                         ends with the result. CANCEL stops further work.",
+                            "Apply the plan on the board",
+                            "After a confirmation, apply every row on the board (hidden rows \
+                         are skipped) in the activity window: it shows each file as it is \
+                         transferred, any problems, and ends with the result. CANCEL stops \
+                         further work.",
                         )
                     };
                     if resp.clicked() {
@@ -3017,7 +3023,7 @@ impl TransferView {
                 ui.add_space(6.0);
                 ui.colored_label(
                     theme::text(),
-                    "Pick two repos and press REVIEW to compare them.",
+                    "Pick two repos and press PREVIEW to compare them.",
                 );
                 return;
             }
@@ -3160,9 +3166,9 @@ impl TransferView {
         if self.preview.is_empty() {
             ui.add_space(6.0);
             let hint = if self.command == Command::GroupSync {
-                "Pick at least one sink above, then press REVIEW."
+                "Pick at least one sink above, then press PREVIEW."
             } else {
-                "Pick a source, a target and a command, then press REVIEW."
+                "Pick a source, a target and a command, then press PREVIEW."
             };
             ui.colored_label(theme::text(), hint);
             return;
@@ -3795,8 +3801,10 @@ impl TransferView {
                 true
             }
             Err(busy) => {
-                crate::activity::lock(&self.activity)
-                    .card(ctx, crate::activity::Notification::refused("REVIEW", &busy));
+                crate::activity::lock(&self.activity).card(
+                    ctx,
+                    crate::activity::Notification::refused("PREVIEW", &busy),
+                );
                 false
             }
         }
@@ -3839,8 +3847,10 @@ impl TransferView {
                 true
             }
             Err(busy) => {
-                crate::activity::lock(&self.activity)
-                    .card(ctx, crate::activity::Notification::refused("RUN", &busy));
+                crate::activity::lock(&self.activity).card(
+                    ctx,
+                    crate::activity::Notification::refused("APPLY ALL", &busy),
+                );
                 false
             }
         }
@@ -3959,7 +3969,7 @@ impl TransferView {
         repos.extend(group.sinks.iter().map(|s| s.repo.clone()));
         self.start_preview(
             ctx,
-            format!("REVIEW group sync of '{}'", group.main),
+            format!("PREVIEW group sync of '{}'", group.main),
             repos,
             move |progress, cancel| {
                 let report = |p: PlanProgress| crate::activity::plan_phase(progress, p);
@@ -3992,7 +4002,7 @@ impl TransferView {
         let repos = vec![sink.clone(), group.main.clone()];
         self.start_preview(
             ctx,
-            format!("REVIEW pull of '{sink}' into '{}'", group.main),
+            format!("PREVIEW pull of '{sink}' into '{}'", group.main),
             repos,
             move |progress, cancel| {
                 let report = |p: PlanProgress| crate::activity::plan_phase(progress, p);
@@ -4373,7 +4383,11 @@ impl TransferView {
         }
         self.start_preview(
             ctx,
-            format!("REVIEW {} from '{}'", config.command.label(), config.source),
+            format!(
+                "PREVIEW {} from '{}'",
+                config.command.label(),
+                config.source
+            ),
             repos,
             move |progress, cancel| {
                 let report = |p: PlanProgress| crate::activity::plan_phase(progress, p);
@@ -5560,7 +5574,7 @@ mod ui_tests {
                 view,
             );
         harness.run();
-        harness.get_by_label("REVIEW").click_accesskit();
+        harness.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut harness);
         harness.run();
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
@@ -5644,7 +5658,7 @@ mod ui_tests {
             v.sync_repos(&store2);
             v.command = Command::GroupSyncBack;
         });
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut h);
         assert_eq!(
             h.state().preview.len(),
@@ -5759,7 +5773,7 @@ mod ui_tests {
             v.sync_repos(&store2);
             v.command = Command::GroupSyncBack;
         });
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut h);
 
         let (i, conflict) = h
@@ -5850,7 +5864,7 @@ mod ui_tests {
             v.sync_repos(&store2);
             v.command = Command::GroupSyncBack;
         });
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut h);
 
         // The conflict row hands both sides to the viewer …
@@ -5929,11 +5943,14 @@ mod ui_tests {
             v.sync_repos(&store2);
             v.command = Command::GroupSyncBack;
         });
-        h.get_by_label("RUN").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
+        settle_preview(&mut h);
+        h.run();
+        h.get_by_label("APPLY ALL").click_accesskit();
         settle_preview(&mut h);
         assert!(
             h.state().confirm.is_some(),
-            "RUN raises a confirmation once the plan lands"
+            "APPLY ALL raises a confirmation once the plan lands"
         );
         assert!(
             h.state()
@@ -5991,7 +6008,10 @@ mod ui_tests {
             v.sync_repos(&store2);
             v.command = Command::GroupSyncBack;
         });
-        h.get_by_label("RUN").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
+        settle_preview(&mut h);
+        h.run();
+        h.get_by_label("APPLY ALL").click_accesskit();
         settle_preview(&mut h);
         h.get_by_label("PROCEED").click_accesskit();
         for _ in 0..100 {
@@ -6070,7 +6090,7 @@ mod ui_tests {
                 view,
             );
         h.run();
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut h);
         // The sink is locked (the default): no DELETE is offered, the
         // promote stays.
@@ -6181,7 +6201,7 @@ mod ui_tests {
                 view,
             );
         h.run();
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut h);
         // One row (the resurrection); its `< COPY` pulls just that file.
         h.get_by_label("< COPY").click_accesskit();
@@ -6321,7 +6341,7 @@ mod ui_tests {
             v.sync_repos(&store2);
             v.command = Command::GroupSync;
         });
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut h);
         assert_eq!(
             h.state().preview_totals[1],
@@ -6363,11 +6383,14 @@ mod ui_tests {
             v.sync_repos(&store2);
             v.command = Command::GroupSync;
         });
-        h.get_by_label("RUN").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
+        settle_preview(&mut h);
+        h.run();
+        h.get_by_label("APPLY ALL").click_accesskit();
         settle_preview(&mut h);
         assert!(
             h.state().confirm.is_some(),
-            "RUN raises a confirmation once the plan lands"
+            "APPLY ALL raises a confirmation once the plan lands"
         );
         assert!(
             h.state()
@@ -6422,7 +6445,7 @@ mod ui_tests {
             // it so the push is attempted and the empty-main refusal can fire.
             v.locks.toggle("target");
         });
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut h);
         assert!(
             h.state().error.is_some(),
@@ -6464,7 +6487,7 @@ mod ui_tests {
             v.command = Command::GroupSync;
             v.selected_sinks = vec!["target".to_string()];
         });
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut h);
         assert!(
             h.state()
@@ -6508,7 +6531,7 @@ mod ui_tests {
         for _ in 0..5 {
             h.step();
         }
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut h);
         assert_eq!(
             h.state().preview_totals[1],
@@ -6600,7 +6623,7 @@ mod ui_tests {
             "no repository chip before a command is chosen"
         );
         assert!(h.query_by_label_contains("DEST — ").is_none());
-        assert!(h.query_by_label("REVIEW").is_none());
+        assert!(h.query_by_label("PREVIEW").is_none());
 
         h.get_by_label("COPY").click();
         h.run();
@@ -6632,17 +6655,17 @@ mod ui_tests {
             "HOW sits below the repositories"
         );
         assert!(
-            h.query_by_label("REVIEW").is_none(),
+            h.query_by_label("PREVIEW").is_none(),
             "RUN waits for a target"
         );
 
         let target_chip = top_chip(&h, "target", true);
         click_at(&mut h, "target", target_chip);
         h.run();
-        let review = h.get_by_label("REVIEW").rect();
+        let review = h.get_by_label("PREVIEW").rect();
         assert!(review.top() > dest.top(), "RUN comes last");
 
-        h.get_by_label("REVIEW").click();
+        h.get_by_label("PREVIEW").click();
         settle_preview(&mut h);
         assert!(
             h.query_by_label_contains("WHAT — ").is_some(),
@@ -7157,7 +7180,7 @@ mod ui_tests {
         );
         assert!(h.query_by_label("BY PATH").is_some());
         assert!(
-            h.query_by_label("RUN").is_none(),
+            h.query_by_label("APPLY ALL").is_none(),
             "DIFF has no batch RUN — rows are applied one at a time"
         );
         assert!(
@@ -7165,7 +7188,7 @@ mod ui_tests {
             "DIFF compares the repos whole, so the filter wizard is hidden"
         );
         assert!(
-            h.query_by_label("REVIEW").is_some(),
+            h.query_by_label("PREVIEW").is_some(),
             "REVIEW still builds the comparison"
         );
     }
@@ -7584,7 +7607,7 @@ mod ui_tests {
                 view,
             );
         h.run();
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut h);
         // Extra frames so the row previews (thumbnails, text heads, byte
         // views) land before the render.
@@ -7801,7 +7824,7 @@ mod ui_tests {
         // Nothing on the board yet — the plan hasn't been asked for.
         assert!(h.state().diff_rows.is_empty(), "board starts empty");
 
-        h.get_by_label("REVIEW").click();
+        h.get_by_label("PREVIEW").click();
         // The result arrives over the channel from a worker thread, never inline
         // on the UI thread; settle pumps frames until it lands.
         settle_preview(&mut h);
@@ -7841,7 +7864,7 @@ mod ui_tests {
 
         // The button can be scrolled off the short test window; accesskit clicks
         // reach it regardless.
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut h);
 
         assert!(!h.state().previewing, "preview finished");
@@ -8016,11 +8039,14 @@ mod ui_tests {
             v.command = Command::Copy;
         });
 
-        h.get_by_label("RUN").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
+        settle_preview(&mut h);
+        h.run();
+        h.get_by_label("APPLY ALL").click_accesskit();
         settle_preview(&mut h); // the plan lands and raises the confirmation
         assert!(
             h.state().confirm.is_some(),
-            "RUN raises a confirmation once the plan lands"
+            "APPLY ALL raises a confirmation once the plan lands"
         );
         assert!(
             h.state()
