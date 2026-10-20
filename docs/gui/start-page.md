@@ -16,6 +16,18 @@ with the time, repository and whole path on hover — and a **LOG** button that 
 full [event log](index.md#the-activity-window). Until the app has changed anything it says
 so.
 
+## Favorites
+
+A command you run again and again — pushing a group, browsing one repository, mirroring
+two — can be saved under a name: open it, then **FAVORITE** on the header strip and give it
+a name. The start page lists favorites as bars under the selection row; clicking one
+restores its repositories, its command and its inputs and lands on that command's preview,
+exactly as running it by hand would — a favorite saves the specification, never the
+confirmation. A favorite that cannot run today — a repository it names is gone, a group it
+needs was dissolved, a repository is locked — is greyed, with the reason on hover.
+Right-click a favorite to **RENAME** or **DELETE** it. Favorites are remembered across
+launches.
+
 ## Selection
 
 Click a card's name chip to select or deselect the repository; a selected card is outlined

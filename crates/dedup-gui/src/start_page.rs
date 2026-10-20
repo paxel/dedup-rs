@@ -42,7 +42,7 @@ impl Intent {
 
 /// One operation on the command list. The order of the variants inside each
 /// intent is the order they are drawn in.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Command {
     // Investigate
     Browse,
@@ -521,7 +521,7 @@ pub(crate) fn availability(cmd: Command, selected: &[&RepoFact]) -> Result<(), S
 
 /// A command and the inputs the start page collects for it (ADR 0004): what
 /// a favorite saves, and what a body is handed.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Spec {
     pub cmd: Command,
     /// A directed command's source among the selection; the rest of the
@@ -588,6 +588,35 @@ pub(crate) fn inputs_summary(spec: &Spec, selected: &[&RepoFact]) -> String {
         parts.push(format!("at {t:.0} %"));
     }
     parts.join(" · ")
+}
+
+/// A fully specified command saved under a name (ADR 0004): the selection
+/// and the spec, reopened in one click. It saves the specification, never the
+/// confirmation — it still lands on the preview.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Favorite {
+    pub name: String,
+    pub repos: Vec<String>,
+    pub spec: Spec,
+}
+
+/// Whether `fav` can run today, or why not: a repository it names may be
+/// gone, the selection may no longer fit the command (a group dissolved, a
+/// repository locked), or an input may be missing.
+pub(crate) fn favorite_state(fav: &Favorite, facts: &[RepoFact]) -> Result<(), String> {
+    let mut selected = Vec::new();
+    for name in &fav.repos {
+        match facts.iter().find(|f| &f.name == name) {
+            Some(f) => selected.push(f),
+            None => return Err(format!("repository '{name}' no longer exists")),
+        }
+    }
+    availability(fav.spec.cmd, &selected)?;
+    if ready(&fav.spec, &selected) {
+        Ok(())
+    } else {
+        Err("an input is missing — open the command again".into())
+    }
 }
 
 /// What a click on the command list asks for.
@@ -985,6 +1014,43 @@ mod tests {
         assert!(ready(&similar, &[&a]));
         assert_eq!(inputs_summary(&similar, &[&a]), "at 90 %");
         assert!(ready(&Spec::new(Command::Browse), &[&a]));
+    }
+
+    #[test]
+    fn a_favorite_is_greyed_when_its_repo_is_gone_or_the_rule_fails() {
+        let a = free("a");
+        let b = free("b");
+        let facts = vec![a.clone(), b.clone()];
+        let mut spec = Spec::new(Command::Copy);
+        spec.source = Some("a".into());
+        let fav = Favorite {
+            name: "a to b".into(),
+            repos: vec!["a".into(), "b".into()],
+            spec: spec.clone(),
+        };
+        assert_eq!(favorite_state(&fav, &facts), Ok(()));
+        let gone = Favorite {
+            repos: vec!["a".into(), "zzz".into()],
+            ..fav.clone()
+        };
+        assert_eq!(
+            favorite_state(&gone, &facts),
+            Err("repository 'zzz' no longer exists".into())
+        );
+        let locked = Favorite {
+            name: "purge a".into(),
+            repos: vec!["a".into()],
+            spec: Spec::new(Command::Purge),
+        };
+        assert_eq!(
+            favorite_state(&locked, &facts),
+            Err("'a' is locked — unlock it on its card".into())
+        );
+        let unanswered = Favorite {
+            spec: Spec::new(Command::Copy),
+            ..fav
+        };
+        assert!(favorite_state(&unanswered, &facts).is_err());
     }
 
     #[test]

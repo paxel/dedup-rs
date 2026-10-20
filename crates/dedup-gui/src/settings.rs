@@ -68,6 +68,8 @@ pub struct Settings {
     /// picker without a smarter contextual anchor opens at this selection's
     /// **parent**, instead of dumping the user back at the home directory.
     pub last_picked_dir: Option<String>,
+    /// The start page's favorites: named, fully specified commands.
+    pub favorites: Vec<crate::start_page::Favorite>,
 }
 
 impl Default for Settings {
@@ -81,6 +83,7 @@ impl Default for Settings {
             theme: ThemeChoice::default(),
             window_size: None,
             last_picked_dir: None,
+            favorites: Vec::new(),
         }
     }
 }
@@ -126,6 +129,15 @@ mod tests {
             theme: ThemeChoice::Light,
             window_size: Some([1280.0, 800.0]),
             last_picked_dir: Some("/data/inherited/pile".to_string()),
+            favorites: vec![crate::start_page::Favorite {
+                name: "push to backup".into(),
+                repos: vec!["Photos".into(), "Backup".into()],
+                spec: crate::start_page::Spec {
+                    cmd: crate::start_page::Command::Mirror,
+                    source: Some("Photos".into()),
+                    threshold: None,
+                },
+            }],
         };
         s.save(dir.path());
         assert_eq!(Settings::load(dir.path()), s);

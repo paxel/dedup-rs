@@ -159,6 +159,14 @@ enum Edit {
     },
 }
 
+/// A favorite being named (`index: None`) or renamed (`Some`), in its modal.
+struct FavoriteEdit {
+    index: Option<usize>,
+    name: String,
+    repos: Vec<String>,
+    spec: start_page::Spec,
+}
+
 /// A deferred mutation collected during rendering and applied after the UI pass
 /// so the immediate-mode closures never borrow `self` mutably twice.
 enum Action {
@@ -216,6 +224,10 @@ enum Action {
     Create,
     /// A fully specified command from the start page, to run on the selection.
     Run(start_page::Spec),
+    /// Reopen the favorite at this index: its selection, then its command.
+    RunFavorite(usize),
+    RenameFavorite(usize),
+    DeleteFavorite(usize),
 }
 
 pub struct DedupApp {
@@ -232,6 +244,12 @@ pub struct DedupApp {
     /// inputs as words ("from A to B").
     open_command: Option<start_page::Command>,
     open_inputs: String,
+    /// The open command's whole specification, for saving as a favorite.
+    open_spec: Option<start_page::Spec>,
+    /// The start page's favorites: named, fully specified commands.
+    favorites: Vec<start_page::Favorite>,
+    /// The favorite being named or renamed, in its modal.
+    favorite_editor: Option<FavoriteEdit>,
     /// The command chosen on the start page that still needs inputs, with
     /// the selection it was chosen for: a change of selection drops it.
     pending: Option<(start_page::Spec, BTreeSet<String>)>,
@@ -307,6 +325,9 @@ impl DedupApp {
             selection: BTreeSet::new(),
             open_command: None,
             open_inputs: String::new(),
+            open_spec: None,
+            favorites: Vec::new(),
+            favorite_editor: None,
             pending: None,
             locks: locks.clone(),
             repos: Vec::new(),
@@ -351,6 +372,7 @@ impl DedupApp {
             .set_threshold(settings.transfer_similarity_threshold);
         app.tooltip_verbosity = settings.tooltip_verbosity;
         app.theme = settings.theme;
+        app.favorites = settings.favorites.clone();
         crate::util::seed_last_picked_dir(settings.last_picked_dir.as_deref().map(Into::into));
         app.saved_settings = settings;
         app.reload_all();
@@ -369,6 +391,7 @@ impl DedupApp {
             window_size: self.window_size,
             last_picked_dir: crate::util::last_picked_dir()
                 .map(|p| p.to_string_lossy().into_owned()),
+            favorites: self.favorites.clone(),
         }
     }
 
@@ -417,13 +440,14 @@ impl DedupApp {
         self.synced = Some(self.screen);
     }
 
-    /// Show `body` for `cmd`: the command's work, under the header strip.
+    /// Show `body` for `spec`: the command's work, under the header strip.
     /// The body was just handed the selection, so it needs no re-sync.
-    fn open_body(&mut self, body: Body, cmd: start_page::Command, inputs: String) {
+    fn open_body(&mut self, body: Body, spec: &start_page::Spec, inputs: String) {
         self.screen = Screen::Body(body);
         self.synced = Some(self.screen);
-        self.open_command = Some(cmd);
+        self.open_command = Some(spec.cmd);
         self.open_inputs = inputs;
+        self.open_spec = Some(spec.clone());
     }
 
     /// Run `spec` on the selection: a repository-level command runs (or opens
@@ -477,7 +501,7 @@ impl DedupApp {
         match cmd {
             C::Browse => {
                 self.browse.open_root(&self.store, &one);
-                self.open_body(Body::Browse, cmd, inputs);
+                self.open_body(Body::Browse, spec, inputs);
             }
             C::FindDuplicates | C::FindSimilar => {
                 // Backups are searched through their main (the rule already
@@ -492,7 +516,7 @@ impl DedupApp {
                 }
                 self.dupes
                     .open_from(&self.store, &searchable, cmd == C::FindSimilar);
-                self.open_body(Body::Duplicates, cmd, inputs);
+                self.open_body(Body::Duplicates, spec, inputs);
             }
             C::Diff | C::Copy | C::Move | C::Sync | C::Mirror | C::GroupSync | C::GroupSyncBack => {
                 use crate::transfer_view::Command as T;
@@ -509,7 +533,7 @@ impl DedupApp {
                 let target = source.as_ref().and(targets.first().cloned());
                 self.transfer
                     .open_from(&self.store, tcmd, &names, source, target, group);
-                self.open_body(Body::Transfer, cmd, inputs);
+                self.open_body(Body::Transfer, spec, inputs);
             }
             C::PruneMissing | C::Reorganize | C::DedupeAgainst | C::Purge | C::EmptyDirs => {
                 use crate::grooming_view::Command as G;
@@ -522,7 +546,7 @@ impl DedupApp {
                 };
                 self.grooming
                     .open_from(&self.store, gcmd, &names, source, &targets);
-                self.open_body(Body::Grooming, cmd, inputs);
+                self.open_body(Body::Grooming, spec, inputs);
             }
             C::Check => self.start_scans(ctx, names, JobKind::Check),
             C::Update => self.start_scans(ctx, names, JobKind::Update),
@@ -603,6 +627,173 @@ impl DedupApp {
                     .color(theme::text())
                     .size(13.0),
             );
+        }
+        ui.add_space(8.0);
+        if let Some(spec) = self.open_spec.clone()
+            && crate::lcars::action_button(
+                ui,
+                &format!("{} FAVORITE", icon::STAR),
+                true,
+                theme::lilac(),
+            )
+            .explain(
+                self.tooltip_verbosity,
+                "Save this command, with these repositories, under a name",
+                "Save this command — these repositories, this command, these inputs — as \
+                 a favorite on the start page, to reopen in one click. It still lands on \
+                 the preview.",
+            )
+            .clicked()
+        {
+            let repos: Vec<String> = self.selection.iter().cloned().collect();
+            self.favorite_editor = Some(FavoriteEdit {
+                index: None,
+                name: format!("{} {}", cmd.label(), repos.join(", ")),
+                repos,
+                spec,
+            });
+        }
+    }
+
+    /// The favorites row on the start page: one bar per favorite, greyed with
+    /// the reason when it cannot run today; right-click for RENAME / DELETE.
+    fn favorites_row(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let verbosity = self.tooltip_verbosity;
+        let facts = self.repo_facts();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("FAVORITES").color(theme::tan()).size(12.0));
+            if self.favorites.is_empty() {
+                ui.label(
+                    RichText::new("None yet — open a command, then FAVORITE on the header strip")
+                        .color(theme::text())
+                        .size(12.0),
+                );
+            }
+            for (i, fav) in self.favorites.iter().enumerate() {
+                let state = start_page::favorite_state(fav, &facts);
+                let accent = fav.spec.cmd.intent().accent();
+                let resp = crate::lcars::action_button(ui, &fav.name, state.is_ok(), accent);
+                let resp = match &state {
+                    Ok(()) => {
+                        let selected: Vec<&start_page::RepoFact> = facts
+                            .iter()
+                            .filter(|f| fav.repos.contains(&f.name))
+                            .collect();
+                        let inputs = start_page::inputs_summary(&fav.spec, &selected);
+                        let what = if inputs.is_empty() {
+                            format!("{} · {}", fav.spec.cmd.label(), fav.repos.join(", "))
+                        } else {
+                            format!(
+                                "{} · {} · {inputs}",
+                                fav.spec.cmd.label(),
+                                fav.repos.join(", ")
+                            )
+                        };
+                        resp.explain(verbosity, &what, &what)
+                    }
+                    Err(reason) => resp.on_hover_text(reason.as_str()),
+                };
+                if resp.clicked() {
+                    actions.push(Action::RunFavorite(i));
+                }
+                resp.context_menu(|ui| {
+                    if ui.button("RENAME FAVORITE").clicked() {
+                        actions.push(Action::RenameFavorite(i));
+                        ui.close();
+                    }
+                    if ui.button("DELETE FAVORITE").clicked() {
+                        actions.push(Action::DeleteFavorite(i));
+                        ui.close();
+                    }
+                });
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    /// The modal that names a new favorite or renames one.
+    fn favorite_modal(&mut self, ctx: &egui::Context) {
+        let Some(edit) = self.favorite_editor.as_mut() else {
+            return;
+        };
+        let renaming = edit.index.is_some();
+        let name = edit.name.trim().to_string();
+        let taken = self
+            .favorites
+            .iter()
+            .enumerate()
+            .any(|(i, f)| Some(i) != edit.index && f.name == name);
+        let can_save = !name.is_empty() && !taken;
+        let mut save = false;
+        let mut cancel = false;
+        let verbosity = self.tooltip_verbosity;
+        let summary = format!("{} · {}", edit.spec.cmd.label(), edit.repos.join(", "));
+        let response = egui::Modal::new(Id::new("favorite")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.label(
+                RichText::new(if renaming {
+                    "RENAME FAVORITE"
+                } else {
+                    "SAVE FAVORITE"
+                })
+                .color(theme::lilac())
+                .size(18.0)
+                .strong(),
+            );
+            ui.label(RichText::new(&summary).color(theme::text()).size(12.0));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("NAME").color(theme::tan()));
+                ui.add(
+                    egui::TextEdit::singleline(&mut edit.name)
+                        .desired_width(300.0)
+                        .hint_text("a name for this command"),
+                )
+                .explain(
+                    verbosity,
+                    "The favorite's name on the start page",
+                    "The name this favorite is listed under on the start page. Must be \
+                     unique among your favorites.",
+                );
+            });
+            if taken {
+                ui.colored_label(theme::red(), "A favorite with this name already exists.");
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if crate::lcars::action_button(ui, "SAVE", can_save, theme::lilac())
+                    .explain(verbosity, "Save under this name", "Save the favorite.")
+                    .clicked()
+                {
+                    save = true;
+                }
+                if crate::lcars::action_button(ui, "CANCEL", true, theme::tan())
+                    .explain(verbosity, "Close without saving", "Discard and close.")
+                    .clicked()
+                {
+                    cancel = true;
+                }
+            });
+        });
+        if response.should_close() {
+            cancel = true;
+        }
+        if save && let Some(edit) = self.favorite_editor.take() {
+            let fav = start_page::Favorite {
+                name,
+                repos: edit.repos,
+                spec: edit.spec,
+            };
+            match edit.index {
+                Some(i) if i < self.favorites.len() => self.favorites[i] = fav,
+                _ => self.favorites.push(fav),
+            }
+            self.card(
+                ctx,
+                Notification::noted("Saved favorite", "", "on the start page"),
+            );
+        } else if cancel {
+            self.favorite_editor = None;
         }
     }
 
@@ -1086,6 +1277,29 @@ impl DedupApp {
     fn apply(&mut self, ctx: &egui::Context, frame: Option<&eframe::Frame>, action: Action) {
         match action {
             Action::Run(spec) => self.run_command(ctx, &spec),
+            Action::RunFavorite(i) => {
+                if let Some(fav) = self.favorites.get(i).cloned() {
+                    self.selection = fav.repos.iter().cloned().collect();
+                    self.pending = None;
+                    self.run_command(ctx, &fav.spec);
+                }
+            }
+            Action::RenameFavorite(i) => {
+                if let Some(fav) = self.favorites.get(i) {
+                    self.favorite_editor = Some(FavoriteEdit {
+                        index: Some(i),
+                        name: fav.name.clone(),
+                        repos: fav.repos.clone(),
+                        spec: fav.spec.clone(),
+                    });
+                }
+            }
+            Action::DeleteFavorite(i) => {
+                if i < self.favorites.len() {
+                    let fav = self.favorites.remove(i);
+                    self.card(ctx, Notification::noted("Removed favorite", "", &fav.name));
+                }
+            }
             Action::ToggleRemote(name) => {
                 let now = self
                     .repos
@@ -1534,7 +1748,11 @@ impl eframe::App for DedupApp {
         // view, so no further sync is needed.
         if let Some((repo, rel)) = self.dupes.take_browse_request() {
             self.browse.reveal(&self.store, &repo, &rel);
-            self.open_body(Body::Browse, start_page::Command::Browse, String::new());
+            self.open_body(
+                Body::Browse,
+                &start_page::Spec::new(start_page::Command::Browse),
+                String::new(),
+            );
         }
         if self.show_settings {
             self.settings_modal(&ctx);
@@ -1550,6 +1768,9 @@ impl eframe::App for DedupApp {
         }
         if self.show_help {
             self.help_window(&ctx);
+        }
+        if self.favorite_editor.is_some() {
+            self.favorite_modal(&ctx);
         }
         if self.show_add {
             self.add_modal(&ctx, &mut actions);
@@ -1583,7 +1804,8 @@ impl eframe::App for DedupApp {
                 != self.saved_settings.transfer_similarity_threshold
             || current.tooltip_verbosity != self.saved_settings.tooltip_verbosity
             || current.theme != self.saved_settings.theme
-            || current.last_picked_dir != self.saved_settings.last_picked_dir;
+            || current.last_picked_dir != self.saved_settings.last_picked_dir
+            || current.favorites != self.saved_settings.favorites;
         if control_changed {
             current.save(self.store.config_dir());
             self.saved_settings = current;
@@ -1793,6 +2015,7 @@ impl DedupApp {
                 }
                 self.totals_line(ui);
                 self.selection_row(ui, actions);
+                self.favorites_row(ui, actions);
                 self.last_runs_row(ui);
                 self.cards(ui, actions);
             });
@@ -4499,7 +4722,11 @@ mod ui_tests {
         let (_tmp, mut app) = sample_app();
         app.selection.insert("Automatic Upload".into());
         app.selection.insert("Videos".into());
-        app.open_body(Body::Transfer, start_page::Command::Diff, String::new());
+        app.open_body(
+            Body::Transfer,
+            &start_page::Spec::new(start_page::Command::Diff),
+            String::new(),
+        );
         let harness = topbar_harness(app, width);
         let settings = harness.get_by_label_contains("SETTINGS").rect();
         let about = harness.get_by_label("ABOUT").rect();
@@ -4527,7 +4754,11 @@ mod ui_tests {
         use egui_kittest::kittest::Queryable;
         let (_tmp, mut app) = sample_app();
         app.selection.insert("Videos".into());
-        app.open_body(Body::Browse, start_page::Command::Browse, String::new());
+        app.open_body(
+            Body::Browse,
+            &start_page::Spec::new(start_page::Command::Browse),
+            String::new(),
+        );
         let mut harness = topbar_harness(app, 1100.0);
         let start = harness.get_by_label_contains("START").rect();
         let chip = harness.get_by_label("Videos").rect();
@@ -4953,6 +5184,178 @@ mod ui_tests {
             crate::grooming_view::Command::Dedupe
         );
         assert_eq!(app.grooming.pool(), ["Automatic Upload".to_string()]);
+    }
+
+    fn copy_favorite(name: &str, repos: &[&str], source: &str) -> start_page::Favorite {
+        let mut spec = start_page::Spec::new(start_page::Command::Copy);
+        spec.source = Some(source.into());
+        start_page::Favorite {
+            name: name.into(),
+            repos: repos.iter().map(|r| r.to_string()).collect(),
+            spec,
+        }
+    }
+
+    /// A favorite restores its selection and lands on the command's preview,
+    /// roles as saved — never past it.
+    #[test]
+    fn a_favorite_restores_the_selection_and_lands_on_the_preview() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, mut app) = sample_app();
+        app.favorites.push(copy_favorite(
+            "clips to upload",
+            &["Automatic Upload", "Videos"],
+            "Videos",
+        ));
+        let mut harness = render_repos(app);
+        harness.get_by_label("clips to upload").click();
+        harness.run();
+        let app = harness.state();
+        assert_eq!(app.screen, Screen::Body(Body::Transfer));
+        let selection: Vec<String> = app.selection.iter().cloned().collect();
+        assert_eq!(
+            selection,
+            vec!["Automatic Upload".to_string(), "Videos".to_string()]
+        );
+        assert_eq!(
+            app.transfer.roles(),
+            (
+                Some("Videos".to_string()),
+                Some("Automatic Upload".to_string())
+            )
+        );
+        assert_eq!(app.open_inputs, "from Videos to Automatic Upload");
+    }
+
+    /// A favorite naming a repository that no longer exists is greyed, and
+    /// the reason names the repository.
+    #[test]
+    fn a_favorite_whose_repo_is_gone_is_greyed() {
+        let (_tmp, mut app) = sample_app();
+        app.favorites.push(copy_favorite(
+            "to the old disk",
+            &["Videos", "Old disk"],
+            "Videos",
+        ));
+        let harness = render_repos(app);
+        assert!(disabled(&harness, "to the old disk"));
+        let facts = harness.state().repo_facts();
+        assert_eq!(
+            start_page::favorite_state(&harness.state().favorites[0], &facts),
+            Err("repository 'Old disk' no longer exists".into())
+        );
+    }
+
+    /// FAVORITE on the header strip names the open command; SAVE lists it on
+    /// the start page and it survives a restart through the settings file.
+    #[test]
+    fn saving_from_the_header_strip_persists_the_favorite() {
+        use egui_kittest::kittest::Queryable;
+        let (tmp, mut app) = sample_app();
+        let ctx = egui::Context::default();
+        app.selection.insert("Videos".into());
+        app.run_command(&ctx, &start_page::Spec::new(start_page::Command::Browse));
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 400.0))
+            .build_ui_state(
+                move |ui, app: &mut DedupApp| {
+                    if !init {
+                        icon::install(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
+                        init = true;
+                    }
+                    app.top_bar(ui);
+                    let ctx = ui.ctx().clone();
+                    app.favorite_modal(&ctx);
+                },
+                app,
+            );
+        harness.run();
+        harness.get_by_label_contains("FAVORITE").click();
+        harness.run();
+        assert!(
+            harness.query_by_label("SAVE FAVORITE").is_some(),
+            "the naming modal opens"
+        );
+        harness
+            .state_mut()
+            .favorite_editor
+            .as_mut()
+            .expect("editor")
+            .name = "look at clips".into();
+        harness.run();
+        harness.get_by_label("SAVE").click();
+        harness.run();
+        let app = harness.state();
+        assert_eq!(app.favorites.len(), 1);
+        assert_eq!(app.favorites[0].name, "look at clips");
+        assert_eq!(app.favorites[0].repos, vec!["Videos".to_string()]);
+        assert_eq!(app.favorites[0].spec.cmd, start_page::Command::Browse);
+        app.current_settings().save(app.store.config_dir());
+        let reloaded = crate::settings::Settings::load(tmp.path().join("cfg").as_path());
+        assert_eq!(
+            reloaded.favorites, app.favorites,
+            "the favorite survives a restart"
+        );
+    }
+
+    /// The favorite's right-click menu renames and deletes it.
+    #[test]
+    fn a_favorite_is_renamed_and_deleted_from_its_menu() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, mut app) = sample_app();
+        app.favorites.push(copy_favorite(
+            "clips to upload",
+            &["Automatic Upload", "Videos"],
+            "Videos",
+        ));
+        let mut init = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 900.0))
+            .build_ui_state(
+                move |ui, app: &mut DedupApp| {
+                    if !init {
+                        icon::install(ui.ctx());
+                        theme::apply(ui.ctx(), theme::DARK);
+                        init = true;
+                    }
+                    let mut actions = Vec::new();
+                    app.start_page_view(ui, &mut actions);
+                    let ctx = ui.ctx().clone();
+                    for action in actions {
+                        app.apply(&ctx, None, action);
+                    }
+                    app.favorite_modal(&ctx);
+                },
+                app,
+            );
+        harness.run();
+        harness.get_by_label("clips to upload").click_secondary();
+        harness.run();
+        harness.get_by_label("RENAME FAVORITE").click();
+        harness.run();
+        assert!(
+            harness.state().favorite_editor.is_some(),
+            "the naming modal opens for a rename"
+        );
+        harness
+            .state_mut()
+            .favorite_editor
+            .as_mut()
+            .expect("editor")
+            .name = "clips".into();
+        harness.run();
+        harness.get_by_label("SAVE").click();
+        harness.run();
+        assert_eq!(harness.state().favorites[0].name, "clips");
+
+        harness.get_by_label("clips").click_secondary();
+        harness.run();
+        harness.get_by_label("DELETE FAVORITE").click();
+        harness.run();
+        assert!(harness.state().favorites.is_empty());
+        assert_eq!(harness.state().screen, Screen::Start, "nothing ran");
     }
 
     #[test]

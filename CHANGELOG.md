@@ -29,6 +29,11 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   no roles. Changing the selection drops the pending command. The header
   strip says the inputs too, and the view underneath no longer shows its own
   repository pickers.
+- **Favorites.** FAVORITE on the header strip saves the open command — its
+  repositories, its inputs — under a name on the start page; one click
+  reopens it on its preview, never past it. A favorite that cannot run today
+  is greyed with the reason; right-click renames or deletes it. Favorites
+  survive restarts.
 - **The start page states the facts before you choose.** One line over the
   cards sums the repositories, files and bytes the app looks after. A card's
   UPDATED stat reads as people say it — "just now", "3 hours ago", "9 days

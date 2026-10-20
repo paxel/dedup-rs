@@ -23,7 +23,7 @@ Start page hub, one command list, one board. Landed one child per commit, in ord
 - [x] #5 Start page shell replaces the tab bar
 - [x] #6 Start page facts: totals, stale badges, last runs
 - [x] #7 Progressive inputs and from/to roles
-- [ ] #8 Favorites
+- [x] #8 Favorites
 - [ ] #9 Preview and APPLY everywhere
 - [ ] #10 The board module, with Browse on it
 - [ ] #11 Duplicates on the board
