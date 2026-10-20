@@ -300,6 +300,9 @@ pub struct GroomingView {
     /// with `repos` whenever the tab is shown.
     mains: std::collections::HashSet<String>,
     loaded: bool,
+    /// The start page handed over the repositories, so the body's own WITH
+    /// WHICH section is not shown.
+    from_start: bool,
     command: Command,
     /// DEDUPE: the repo whose duplicates are deleted.
     source: Option<String>,
@@ -402,6 +405,7 @@ impl GroomingView {
             repos: Vec::new(),
             mains: std::collections::HashSet::new(),
             loaded: false,
+            from_start: false,
             command: Command::Dedupe,
             source: None,
             pool: Vec::new(),
@@ -529,7 +533,7 @@ impl GroomingView {
                 // one before it has an answer; after REVIEW or RUN they fold to
                 // their header bars, and each one flips back open on its own.
                 self.command_bar(ui, &mut acts);
-                if self.command_chosen {
+                if self.command_chosen && !self.from_start {
                     match self.command {
                         Command::Dedupe => self.dedupe_layout(ui, &mut acts),
                         Command::Purge => self.purge_layout(ui, &mut acts),
@@ -1887,26 +1891,39 @@ impl GroomingView {
     }
 
     /// Open this body from the start page (ADR 0004) for `command` on `repos`.
-    /// A single repository is the one the command acts on; DEDUPE's source
-    /// and pool stay the user's choice in the body's WITH WHICH section.
-    /// Whatever the start page answered folds shut and reopens on its header.
-    pub fn open_from(&mut self, store: &Store, command: Command, repos: &[String]) {
+    /// A single repository is the one the command acts on; DEDUPE AGAINST's
+    /// `source` and `pool` were settled on the start page. The body's own
+    /// WITH WHICH section is not shown; a different selection is made there.
+    pub fn open_from(
+        &mut self,
+        store: &Store,
+        command: Command,
+        repos: &[String],
+        source: Option<String>,
+        pool: &[String],
+    ) {
         self.sync_repos(store);
         self.command = command;
         self.command_chosen = true;
+        self.from_start = true;
         self.source = None;
         self.repo = None;
         self.pool.clear();
         self.folds
             .set("WHAT — DEDUPE, PURGE, EMPTY DIRS, ORGANIZE OR PRUNE", false);
-        if command != Command::Dedupe
-            && let [one] = repos
-        {
+        if command == Command::Dedupe {
+            self.source = source;
+            self.pool = pool.to_vec();
+        } else if let [one] = repos {
             self.repo = Some(one.clone());
-            self.folds
-                .set("WITH WHICH — THE REPOSITORY TO GROOM", false);
         }
         self.clear_preview();
+    }
+
+    /// DEDUPE AGAINST's pool, for tests.
+    #[cfg(test)]
+    pub(crate) fn pool(&self) -> &[String] {
+        &self.pool
     }
 
     /// The repository the command acts on, for tests.

@@ -519,15 +519,98 @@ pub(crate) fn availability(cmd: Command, selected: &[&RepoFact]) -> Result<(), S
     }
 }
 
-/// Draw the command list for `selected`; returns the command clicked, if any.
-/// Every command is drawn every time, in the same place; an unavailable one is
-/// disabled with its reason as the hover text.
+/// A command and the inputs the start page collects for it (ADR 0004): what
+/// a favorite saves, and what a body is handed.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Spec {
+    pub cmd: Command,
+    /// A directed command's source among the selection; the rest of the
+    /// selection are its targets (DEDUPE AGAINST's pool).
+    pub source: Option<String>,
+    /// FIND SIMILAR's threshold, in percent.
+    pub threshold: Option<f64>,
+}
+
+impl Spec {
+    pub(crate) fn new(cmd: Command) -> Self {
+        Self {
+            cmd,
+            source: None,
+            threshold: None,
+        }
+    }
+}
+
+/// Whether `cmd` on `selected` needs one of them named as the source. A
+/// backup group names its own; a DIFF has no direction; a single repository
+/// is the source of a folder export.
+pub(crate) fn needs_source(cmd: Command, selected: &[&RepoFact]) -> bool {
+    match cmd {
+        Command::Copy | Command::Move | Command::Sync | Command::Mirror => selected.len() == 2,
+        Command::DedupeAgainst => true,
+        _ => false,
+    }
+}
+
+/// Whether `cmd` needs a similarity threshold.
+pub(crate) fn needs_threshold(cmd: Command) -> bool {
+    cmd == Command::FindSimilar
+}
+
+/// Whether `cmd` has anything left to ask on the start page before it runs.
+pub(crate) fn needs_inputs(cmd: Command, selected: &[&RepoFact]) -> bool {
+    needs_source(cmd, selected) || needs_threshold(cmd)
+}
+
+/// Whether every input `spec` needs has an answer.
+pub(crate) fn ready(spec: &Spec, selected: &[&RepoFact]) -> bool {
+    let source_ok = !needs_source(spec.cmd, selected)
+        || spec
+            .source
+            .as_deref()
+            .is_some_and(|s| selected.iter().any(|r| r.name == s));
+    let threshold_ok = !needs_threshold(spec.cmd) || spec.threshold.is_some();
+    source_ok && threshold_ok
+}
+
+/// The inputs as the header strip says them: "from A to B, C", "at 90 %".
+pub(crate) fn inputs_summary(spec: &Spec, selected: &[&RepoFact]) -> String {
+    let mut parts = Vec::new();
+    if let Some(src) = &spec.source {
+        let targets: Vec<&str> = selected
+            .iter()
+            .map(|r| r.name.as_str())
+            .filter(|n| n != src)
+            .collect();
+        parts.push(format!("from {src} to {}", targets.join(", ")));
+    }
+    if let Some(t) = spec.threshold {
+        parts.push(format!("at {t:.0} %"));
+    }
+    parts.join(" · ")
+}
+
+/// What a click on the command list asks for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Pick {
+    /// A command was chosen.
+    Command(Command),
+    /// The pending command's GO: its inputs are complete.
+    Go,
+}
+
+/// Draw the command list for `selected`; returns what was clicked, if
+/// anything. Every command is drawn every time, in the same place; an
+/// unavailable one is disabled with its reason as the hover text. The
+/// `pending` command's inputs are drawn right under its bar, with GO.
 pub(crate) fn command_panel(
     ui: &mut egui::Ui,
     selected: &[&RepoFact],
+    pending: Option<&mut Spec>,
     verbosity: TooltipVerbosity,
-) -> Option<Command> {
+) -> Option<Pick> {
     let mut picked = None;
+    let mut pending = pending;
     for intent in [
         Intent::Investigate,
         Intent::Maintain,
@@ -544,7 +627,12 @@ pub(crate) fn command_panel(
         for cmd in ALL.iter().copied().filter(|c| c.intent() == intent) {
             let state = availability(cmd, selected);
             let enabled = state.is_ok();
-            let resp = crate::lcars::action_button(ui, cmd.label(), enabled, intent.accent());
+            let is_pending = pending.as_ref().is_some_and(|p| p.cmd == cmd);
+            let resp = if is_pending {
+                crate::lcars::toggle_button(ui, cmd.label(), true, intent.accent())
+            } else {
+                crate::lcars::action_button(ui, cmd.label(), enabled, intent.accent())
+            };
             let resp = match &state {
                 Ok(()) => {
                     let (short, long) = cmd.tooltip();
@@ -553,11 +641,100 @@ pub(crate) fn command_panel(
                 Err(reason) => resp.on_hover_text(reason.as_str()),
             };
             if resp.clicked() {
-                picked = Some(cmd);
+                picked = Some(Pick::Command(cmd));
+            }
+            if is_pending
+                && let Some(spec) = pending.as_mut()
+                && inputs_box(ui, spec, selected, intent.accent(), verbosity)
+            {
+                picked = Some(Pick::Go);
             }
         }
     }
     picked
+}
+
+/// The pending command's remaining inputs, then GO. Returns whether GO was
+/// clicked.
+fn inputs_box(
+    ui: &mut egui::Ui,
+    spec: &mut Spec,
+    selected: &[&RepoFact],
+    accent: Color32,
+    verbosity: TooltipVerbosity,
+) -> bool {
+    let mut go = false;
+    egui::Frame::new()
+        .fill(theme::panel())
+        .stroke(egui::Stroke::new(1.0, accent))
+        .corner_radius(8)
+        .inner_margin(8.0)
+        .show(ui, |ui| {
+            if needs_source(spec.cmd, selected) {
+                let (from_hint, to_label) = if spec.cmd == Command::DedupeAgainst {
+                    (
+                        "Click the repository whose duplicates are deleted",
+                        "KEEP IN",
+                    )
+                } else {
+                    ("Click the repository the content comes from", "TO")
+                };
+                ui.label(RichText::new("FROM").color(theme::tan()).size(11.0));
+                ui.horizontal_wrapped(|ui| {
+                    for r in selected {
+                        let is_src = spec.source.as_deref() == Some(r.name.as_str());
+                        let chip = crate::repo_chip::repo_chip(
+                            ui,
+                            &r.name,
+                            is_src,
+                            accent,
+                            r.main_of.is_some(),
+                            None,
+                        );
+                        if chip.name.explain(verbosity, from_hint, from_hint).clicked() {
+                            spec.source = Some(r.name.clone());
+                        }
+                    }
+                });
+                if let Some(src) = &spec.source {
+                    let targets: Vec<&str> = selected
+                        .iter()
+                        .map(|r| r.name.as_str())
+                        .filter(|n| n != src)
+                        .collect();
+                    ui.label(
+                        RichText::new(format!("{to_label} {}", targets.join(", ")))
+                            .color(theme::text())
+                            .size(12.0),
+                    );
+                }
+            }
+            if needs_threshold(spec.cmd) {
+                let mut t = spec.threshold.unwrap_or(99.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("THRESHOLD").color(theme::tan()).size(11.0));
+                    ui.add(egui::Slider::new(&mut t, 50.0..=100.0).suffix(" %"))
+                        .explain(
+                            verbosity,
+                            "How alike two files must be",
+                            "Similarity in percent: lower catches more, and riskier, matches.",
+                        );
+                });
+                spec.threshold = Some(t);
+            }
+            ui.add_space(4.0);
+            if crate::lcars::action_button(ui, "GO", ready(spec, selected), accent)
+                .explain(
+                    verbosity,
+                    "Run this command on the selection",
+                    "Open the command with these repositories and inputs.",
+                )
+                .clicked()
+            {
+                go = true;
+            }
+        });
+    go
 }
 
 #[cfg(test)]
@@ -763,6 +940,51 @@ mod tests {
         assert_eq!(reason(Command::Update, &[&a]), "'a' is unreachable");
         assert_eq!(reason(Command::Check, &[&a]), "'a' is unreachable");
         assert!(ok(Command::Browse, &[&a]));
+    }
+
+    #[test]
+    fn a_pair_needs_a_source_a_group_or_a_diff_does_not() {
+        let a = free("a");
+        let b = free("b");
+        let pair = [&a, &b];
+        for cmd in [Command::Copy, Command::Move, Command::Sync, Command::Mirror] {
+            assert!(needs_source(cmd, &pair), "{cmd:?}");
+            assert!(
+                !needs_source(cmd, &[&a]),
+                "{cmd:?} on one repo exports to a folder"
+            );
+        }
+        assert!(!needs_source(Command::Diff, &pair));
+        assert!(needs_source(Command::DedupeAgainst, &pair));
+        let m = main("m", "g");
+        let s = sink("s", "g");
+        assert!(!needs_source(Command::GroupSync, &[&m, &s]));
+        assert!(!needs_inputs(Command::Browse, &[&a]));
+        assert!(needs_inputs(Command::FindSimilar, &[&a]));
+    }
+
+    #[test]
+    fn ready_once_every_input_has_an_answer() {
+        let a = free("a");
+        let b = free("b");
+        let pair = [&a, &b];
+        let mut spec = Spec::new(Command::Copy);
+        assert!(!ready(&spec, &pair));
+        spec.source = Some("zzz".into());
+        assert!(
+            !ready(&spec, &pair),
+            "a source outside the selection does not count"
+        );
+        spec.source = Some("b".into());
+        assert!(ready(&spec, &pair));
+        assert_eq!(inputs_summary(&spec, &pair), "from b to a");
+
+        let mut similar = Spec::new(Command::FindSimilar);
+        assert!(!ready(&similar, &[&a]));
+        similar.threshold = Some(90.0);
+        assert!(ready(&similar, &[&a]));
+        assert_eq!(inputs_summary(&similar, &[&a]), "at 90 %");
+        assert!(ready(&Spec::new(Command::Browse), &[&a]));
     }
 
     #[test]

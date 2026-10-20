@@ -214,8 +214,8 @@ enum Action {
     CloseAdd,
     ChooseFolder(FolderTarget),
     Create,
-    /// A command picked on the start page, to run on the selection.
-    Run(start_page::Command),
+    /// A fully specified command from the start page, to run on the selection.
+    Run(start_page::Spec),
 }
 
 pub struct DedupApp {
@@ -228,8 +228,13 @@ pub struct DedupApp {
     /// The start page's selection: the repo cards currently selected, by
     /// name. The only place repositories are chosen (ADR 0004).
     selection: BTreeSet<String>,
-    /// The command whose body is open, named on the header strip.
+    /// The command whose body is open, named on the header strip, with its
+    /// inputs as words ("from A to B").
     open_command: Option<start_page::Command>,
+    open_inputs: String,
+    /// The command chosen on the start page that still needs inputs, with
+    /// the selection it was chosen for: a change of selection drops it.
+    pending: Option<(start_page::Spec, BTreeSet<String>)>,
     /// The session-wide lock registry, shared with every view; the start
     /// page's cards show and toggle it.
     locks: crate::locks::RepoLocks,
@@ -301,6 +306,8 @@ impl DedupApp {
             synced: None,
             selection: BTreeSet::new(),
             open_command: None,
+            open_inputs: String::new(),
+            pending: None,
             locks: locks.clone(),
             repos: Vec::new(),
             last_runs: Vec::new(),
@@ -412,17 +419,19 @@ impl DedupApp {
 
     /// Show `body` for `cmd`: the command's work, under the header strip.
     /// The body was just handed the selection, so it needs no re-sync.
-    fn open_body(&mut self, body: Body, cmd: start_page::Command) {
+    fn open_body(&mut self, body: Body, cmd: start_page::Command, inputs: String) {
         self.screen = Screen::Body(body);
         self.synced = Some(self.screen);
         self.open_command = Some(cmd);
+        self.open_inputs = inputs;
     }
 
-    /// Run `cmd` on the selection: a repository-level command runs (or opens
+    /// Run `spec` on the selection: a repository-level command runs (or opens
     /// its inline editor) on the spot; a command with a body of its own is
-    /// handed the selection and opened under the header strip.
-    fn run_command(&mut self, ctx: &egui::Context, cmd: start_page::Command) {
+    /// handed the selection and the inputs and opened under the header strip.
+    fn run_command(&mut self, ctx: &egui::Context, spec: &start_page::Spec) {
         use start_page::Command as C;
+        let cmd = spec.cmd;
         let facts = self.repo_facts();
         let selected: Vec<&start_page::RepoFact> = facts
             .iter()
@@ -434,8 +443,24 @@ impl DedupApp {
             self.card(ctx, Notification::noted(cmd.label(), "", &reason));
             return;
         }
+        if !start_page::ready(spec, &selected) {
+            self.card(
+                ctx,
+                Notification::noted(cmd.label(), "", "not every input has an answer"),
+            );
+            return;
+        }
+        let inputs = start_page::inputs_summary(spec, &selected);
         let names: Vec<String> = self.selection.iter().cloned().collect();
         let one = names.first().cloned().unwrap_or_default();
+        // A directed command's source, and the rest of the selection as its
+        // targets.
+        let source = spec.source.clone();
+        let targets: Vec<String> = names
+            .iter()
+            .filter(|n| Some(*n) != source.as_ref())
+            .cloned()
+            .collect();
         // A selection that is one backup group: its main and the selected
         // backups, which gives the directed commands their direction.
         let group = selected
@@ -452,7 +477,7 @@ impl DedupApp {
         match cmd {
             C::Browse => {
                 self.browse.open_root(&self.store, &one);
-                self.open_body(Body::Browse, cmd);
+                self.open_body(Body::Browse, cmd, inputs);
             }
             C::FindDuplicates | C::FindSimilar => {
                 // Backups are searched through their main (the rule already
@@ -462,9 +487,12 @@ impl DedupApp {
                     .filter(|f| f.sink_of.is_none())
                     .map(|f| f.name.clone())
                     .collect();
+                if let Some(t) = spec.threshold {
+                    self.dupes.set_threshold(t);
+                }
                 self.dupes
                     .open_from(&self.store, &searchable, cmd == C::FindSimilar);
-                self.open_body(Body::Duplicates, cmd);
+                self.open_body(Body::Duplicates, cmd, inputs);
             }
             C::Diff | C::Copy | C::Move | C::Sync | C::Mirror | C::GroupSync | C::GroupSyncBack => {
                 use crate::transfer_view::Command as T;
@@ -478,8 +506,10 @@ impl DedupApp {
                     _ => T::GroupSyncBack,
                 };
                 let group = group.map(|(_, main, sinks)| (main, sinks));
-                self.transfer.open_from(&self.store, tcmd, &names, group);
-                self.open_body(Body::Transfer, cmd);
+                let target = source.as_ref().and(targets.first().cloned());
+                self.transfer
+                    .open_from(&self.store, tcmd, &names, source, target, group);
+                self.open_body(Body::Transfer, cmd, inputs);
             }
             C::PruneMissing | C::Reorganize | C::DedupeAgainst | C::Purge | C::EmptyDirs => {
                 use crate::grooming_view::Command as G;
@@ -490,8 +520,9 @@ impl DedupApp {
                     C::Purge => G::Purge,
                     _ => G::EmptyDirs,
                 };
-                self.grooming.open_from(&self.store, gcmd, &names);
-                self.open_body(Body::Grooming, cmd);
+                self.grooming
+                    .open_from(&self.store, gcmd, &names, source, &targets);
+                self.open_body(Body::Grooming, cmd, inputs);
             }
             C::Check => self.start_scans(ctx, names, JobKind::Check),
             C::Update => self.start_scans(ctx, names, JobKind::Update),
@@ -566,6 +597,13 @@ impl DedupApp {
                 .size(15.0)
                 .strong(),
         );
+        if !self.open_inputs.is_empty() {
+            ui.label(
+                RichText::new(&self.open_inputs)
+                    .color(theme::text())
+                    .size(13.0),
+            );
+        }
     }
 
     /// Reload every repo row from the registry. Safe only when no update is
@@ -1047,7 +1085,7 @@ impl DedupApp {
     // never open a dialog (the same pattern TransferView::apply uses).
     fn apply(&mut self, ctx: &egui::Context, frame: Option<&eframe::Frame>, action: Action) {
         match action {
-            Action::Run(cmd) => self.run_command(ctx, cmd),
+            Action::Run(spec) => self.run_command(ctx, &spec),
             Action::ToggleRemote(name) => {
                 let now = self
                     .repos
@@ -1496,7 +1534,7 @@ impl eframe::App for DedupApp {
         // view, so no further sync is needed.
         if let Some((repo, rel)) = self.dupes.take_browse_request() {
             self.browse.reveal(&self.store, &repo, &rel);
-            self.open_body(Body::Browse, start_page::Command::Browse);
+            self.open_body(Body::Browse, start_page::Command::Browse, String::new());
         }
         if self.show_settings {
             self.settings_modal(&ctx);
@@ -1684,6 +1722,16 @@ impl DedupApp {
             .filter(|f| self.selection.contains(&f.name))
             .collect();
         let verbosity = self.tooltip_verbosity;
+        // A command chosen for a different selection is a different question:
+        // changing the selection drops it and its inputs.
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|(_, for_sel)| *for_sel != self.selection)
+        {
+            self.pending = None;
+        }
+        let pending_spec = self.pending.as_mut().map(|(spec, _)| spec);
         let mut picked = None;
         egui::Panel::right("commands")
             .exact_size(COMMANDS_W)
@@ -1709,11 +1757,30 @@ impl DedupApp {
                                 .color(theme::tan())
                                 .size(12.0),
                         );
-                        picked = start_page::command_panel(ui, &selected, verbosity);
+                        picked = start_page::command_panel(ui, &selected, pending_spec, verbosity);
                     });
             });
-        if let Some(cmd) = picked {
-            actions.push(Action::Run(cmd));
+        match picked {
+            Some(start_page::Pick::Command(cmd)) => {
+                if start_page::needs_inputs(cmd, &selected) {
+                    // Reveal only what the command still needs, right under
+                    // it; GO runs it once every input has an answer.
+                    let mut spec = start_page::Spec::new(cmd);
+                    if start_page::needs_threshold(cmd) {
+                        spec.threshold = Some(self.dupes.threshold());
+                    }
+                    self.pending = Some((spec, self.selection.clone()));
+                } else {
+                    self.pending = None;
+                    actions.push(Action::Run(start_page::Spec::new(cmd)));
+                }
+            }
+            Some(start_page::Pick::Go) => {
+                if let Some((spec, _)) = self.pending.take() {
+                    actions.push(Action::Run(spec));
+                }
+            }
+            None => {}
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::bg()))
@@ -4432,7 +4499,7 @@ mod ui_tests {
         let (_tmp, mut app) = sample_app();
         app.selection.insert("Automatic Upload".into());
         app.selection.insert("Videos".into());
-        app.open_body(Body::Transfer, start_page::Command::Diff);
+        app.open_body(Body::Transfer, start_page::Command::Diff, String::new());
         let harness = topbar_harness(app, width);
         let settings = harness.get_by_label_contains("SETTINGS").rect();
         let about = harness.get_by_label("ABOUT").rect();
@@ -4460,7 +4527,7 @@ mod ui_tests {
         use egui_kittest::kittest::Queryable;
         let (_tmp, mut app) = sample_app();
         app.selection.insert("Videos".into());
-        app.open_body(Body::Browse, start_page::Command::Browse);
+        app.open_body(Body::Browse, start_page::Command::Browse, String::new());
         let mut harness = topbar_harness(app, 1100.0);
         let start = harness.get_by_label_contains("START").rect();
         let chip = harness.get_by_label("Videos").rect();
@@ -4500,7 +4567,10 @@ mod ui_tests {
         let ctx = egui::Context::default();
         app.selection.insert("Automatic Upload".into());
         app.selection.insert("Videos".into());
-        app.run_command(&ctx, start_page::Command::FindDuplicates);
+        app.run_command(
+            &ctx,
+            &start_page::Spec::new(start_page::Command::FindDuplicates),
+        );
         assert_eq!(app.screen, Screen::Body(Body::Duplicates));
         assert_eq!(app.open_command, Some(start_page::Command::FindDuplicates));
         assert_eq!(
@@ -4508,8 +4578,11 @@ mod ui_tests {
             vec!["Automatic Upload".to_string(), "Videos".to_string()]
         );
         assert!(!app.dupes.is_similar(), "FIND DUPLICATES is the exact mode");
-        app.run_command(&ctx, start_page::Command::FindSimilar);
+        let mut similar = start_page::Spec::new(start_page::Command::FindSimilar);
+        similar.threshold = Some(90.0);
+        app.run_command(&ctx, &similar);
         assert!(app.dupes.is_similar(), "FIND SIMILAR is the similar mode");
+        assert_eq!(app.dupes.threshold(), 90.0, "the threshold is handed over");
     }
 
     /// BROWSE opens the Browse body at the selected repository's root.
@@ -4518,7 +4591,7 @@ mod ui_tests {
         let (_tmp, mut app) = sample_app();
         let ctx = egui::Context::default();
         app.selection.insert("Videos".into());
-        app.run_command(&ctx, start_page::Command::Browse);
+        app.run_command(&ctx, &start_page::Spec::new(start_page::Command::Browse));
         assert_eq!(app.screen, Screen::Body(Body::Browse));
         assert_eq!(app.browse.repo(), Some("Videos"));
     }
@@ -4538,7 +4611,7 @@ mod ui_tests {
         let ctx = egui::Context::default();
         app.selection.insert("Automatic Upload".into());
         app.selection.insert("Videos".into());
-        app.run_command(&ctx, start_page::Command::GroupSync);
+        app.run_command(&ctx, &start_page::Spec::new(start_page::Command::GroupSync));
         assert_eq!(app.screen, Screen::Body(Body::Transfer));
         assert_eq!(
             app.transfer.roles().0.as_deref(),
@@ -4559,7 +4632,7 @@ mod ui_tests {
         let (_tmp, mut app) = sample_app();
         let ctx = egui::Context::default();
         app.selection.insert("Videos".into());
-        app.run_command(&ctx, start_page::Command::Purge);
+        app.run_command(&ctx, &start_page::Spec::new(start_page::Command::Purge));
         assert_eq!(app.screen, Screen::Start, "a locked repo cannot be purged");
         assert!(
             crate::activity::lock(&app.activity)
@@ -4570,7 +4643,7 @@ mod ui_tests {
             crate::activity::lock(&app.activity).card_lines()
         );
         app.locks.toggle("Videos");
-        app.run_command(&ctx, start_page::Command::Purge);
+        app.run_command(&ctx, &start_page::Spec::new(start_page::Command::Purge));
         assert_eq!(app.screen, Screen::Body(Body::Grooming));
         assert_eq!(app.grooming.repo(), Some("Videos"));
         assert_eq!(app.grooming.command(), crate::grooming_view::Command::Purge);
@@ -4707,6 +4780,179 @@ mod ui_tests {
                 .query_by_label("No changes made to your files yet")
                 .is_none()
         );
+    }
+
+    /// Click the chip labelled `label` inside the command list (the cards
+    /// carry a chip with the same name), told apart by its position.
+    fn click_in_panel(harness: &Harness<'_, DedupApp>, label: &str) {
+        use egui_kittest::kittest::Queryable;
+        let width = harness.ctx.content_rect().width();
+        harness
+            .query_all_by_label(label)
+            .find(|n| n.rect().left() > width - COMMANDS_W)
+            .unwrap_or_else(|| panic!("no '{label}' inside the command list"))
+            .click();
+    }
+
+    /// COPY on two repositories asks which is the source, right under the
+    /// command; GO waits for the answer, then opens Transfer with the roles
+    /// as chosen, and choosing the other repository swaps them.
+    #[test]
+    fn copy_on_two_repos_asks_for_the_source_then_goes() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, app) = sample_app();
+        let mut harness = render_repos(app);
+        harness.get_by_label("Automatic Upload").click();
+        harness.run();
+        harness.get_by_label("Videos").click();
+        harness.run();
+        assert!(
+            harness.query_by_label("FROM").is_none(),
+            "no inputs before a command"
+        );
+        harness.get_by_label("COPY").click();
+        harness.run();
+        assert!(
+            harness.query_by_label("FROM").is_some(),
+            "COPY asks for the source"
+        );
+        assert!(disabled(&harness, "GO"), "GO waits for the source");
+        assert_eq!(harness.state().screen, Screen::Start);
+
+        click_in_panel(&harness, "Videos");
+        harness.run();
+        assert!(
+            harness.query_by_label("TO Automatic Upload").is_some(),
+            "the other repository is the target"
+        );
+        assert!(!disabled(&harness, "GO"), "every input has an answer");
+        harness.get_by_label("GO").click();
+        harness.run();
+        assert_eq!(harness.state().screen, Screen::Body(Body::Transfer));
+        assert_eq!(
+            harness.state().transfer.roles(),
+            (
+                Some("Videos".to_string()),
+                Some("Automatic Upload".to_string())
+            )
+        );
+        assert_eq!(
+            harness.state().open_inputs,
+            "from Videos to Automatic Upload",
+            "the header strip says the roles"
+        );
+
+        // Back on the start page, choosing the other repository swaps them.
+        harness.state_mut().screen = Screen::Start;
+        harness.run();
+        harness.get_by_label("COPY").click();
+        harness.run();
+        click_in_panel(&harness, "Automatic Upload");
+        harness.run();
+        harness.get_by_label("GO").click();
+        harness.run();
+        assert_eq!(
+            harness.state().transfer.roles(),
+            (
+                Some("Automatic Upload".to_string()),
+                Some("Videos".to_string())
+            )
+        );
+    }
+
+    /// Changing the selection drops the pending command and its inputs.
+    #[test]
+    fn changing_the_selection_clears_the_pending_command() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, app) = sample_app();
+        let mut harness = render_repos(app);
+        harness.get_by_label("ALL").click();
+        harness.run();
+        harness.get_by_label("COPY").click();
+        harness.run();
+        assert!(harness.query_by_label("FROM").is_some());
+        harness.get_by_label("NONE").click();
+        harness.run();
+        assert!(
+            harness.query_by_label("FROM").is_none(),
+            "a new selection is a new question"
+        );
+        assert!(harness.state().pending.is_none());
+    }
+
+    /// A selected backup group needs no roles: GROUP SYNC opens at once.
+    #[test]
+    fn group_sync_needs_no_roles_and_opens_at_once() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, mut app) = sample_app();
+        app.store
+            .create_sync_group("offsite", "Automatic Upload")
+            .expect("create group");
+        app.store
+            .add_sync_sink("offsite", "Videos", SyncMode::AddOnly)
+            .expect("add sink");
+        app.reload_all();
+        let mut harness = render_repos(app);
+        harness.get_by_label_contains("offsite").click();
+        harness.run();
+        harness.run();
+        harness.get_by_label("SELECT GROUP").click();
+        harness.run();
+        harness.get_by_label("GROUP SYNC").click();
+        harness.run();
+        assert!(
+            harness.query_by_label("FROM").is_none(),
+            "no role strip for a group"
+        );
+        assert_eq!(harness.state().screen, Screen::Body(Body::Transfer));
+        assert_eq!(
+            harness.state().transfer.selected_sinks(),
+            ["Videos".to_string()]
+        );
+    }
+
+    /// FIND SIMILAR asks for its threshold, hands it to the Duplicates body
+    /// and says it on the header strip.
+    #[test]
+    fn find_similar_asks_for_the_threshold() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, mut app) = sample_app();
+        app.dupes.set_threshold(80.0);
+        let mut harness = render_repos(app);
+        harness.get_by_label("Videos").click();
+        harness.run();
+        harness.get_by_label("FIND SIMILAR").click();
+        harness.run();
+        assert!(harness.query_by_label("THRESHOLD").is_some());
+        assert_eq!(
+            harness.state().screen,
+            Screen::Start,
+            "GO has not been clicked"
+        );
+        harness.get_by_label("GO").click();
+        harness.run();
+        assert_eq!(harness.state().screen, Screen::Body(Body::Duplicates));
+        assert!(harness.state().dupes.is_similar());
+        assert_eq!(harness.state().open_inputs, "at 80 %");
+    }
+
+    /// DEDUPE AGAINST's source is deleted from; the rest of the selection is
+    /// the pool it is checked against.
+    #[test]
+    fn dedupe_against_hands_source_and_pool_to_grooming() {
+        let (_tmp, mut app) = sample_app();
+        let ctx = egui::Context::default();
+        app.selection.insert("Automatic Upload".into());
+        app.selection.insert("Videos".into());
+        let mut spec = start_page::Spec::new(start_page::Command::DedupeAgainst);
+        spec.source = Some("Videos".into());
+        app.run_command(&ctx, &spec);
+        assert_eq!(app.screen, Screen::Body(Body::Grooming));
+        assert_eq!(
+            app.grooming.command(),
+            crate::grooming_view::Command::Dedupe
+        );
+        assert_eq!(app.grooming.pool(), ["Automatic Upload".to_string()]);
     }
 
     #[test]

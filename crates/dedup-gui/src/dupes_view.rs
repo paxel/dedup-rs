@@ -303,6 +303,9 @@ enum Act {
 pub struct DupesView {
     repos: Vec<RepoSel>,
     repos_loaded: bool,
+    /// The start page handed over the repositories, so the body's own WITH
+    /// WHICH section is not shown.
+    from_start: bool,
     mode: Mode,
     threshold: f64,
     /// The result set (plan for exact, full groups for similar), if a search has
@@ -405,6 +408,7 @@ impl DupesView {
         Self {
             repos: Vec::new(),
             repos_loaded: false,
+            from_start: false,
             mode: Mode::Exact,
             threshold: 99.0,
             results: None,
@@ -603,7 +607,7 @@ impl DupesView {
         // A FIND folds all three shut; their header bars stay, so changing one
         // thing about the search is one click on that section.
         self.mode_section(ui, &mut acts);
-        if self.mode_chosen {
+        if self.mode_chosen && !self.from_start {
             self.repo_bar(ui, &mut acts);
         }
         if self.mode_chosen && self.repos.iter().any(|r| r.included) {
@@ -832,8 +836,9 @@ impl DupesView {
     }
 
     /// Open this body from the start page (ADR 0004): search exactly `repos`,
-    /// similar or exact, with the WHAT and WITH WHICH sections folded shut —
-    /// both were answered on the start page, and each reopens on its header.
+    /// similar or exact. WHAT folds shut (it reopens on its header, for the
+    /// quick-delete toggle); the WITH WHICH section is not shown at all, since
+    /// a different selection is made on the start page.
     pub fn open_from(&mut self, store: &Store, repos: &[String], similar: bool) {
         self.sync_repos(store);
         for r in &mut self.repos {
@@ -841,8 +846,8 @@ impl DupesView {
         }
         self.mode = if similar { Mode::Similar } else { Mode::Exact };
         self.mode_chosen = true;
+        self.from_start = true;
         self.folds.set("WHAT — DUPLICATES OR SIMILAR FILES", false);
-        self.folds.set("WITH WHICH — REPOSITORIES TO SEARCH", false);
     }
 
     /// The repositories the next FIND searches, in list order.

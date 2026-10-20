@@ -21,6 +21,14 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   to the start page with the selection kept. A backup group's frame carries
   SELECT GROUP, which selects the main and every backup at once and gives
   GROUP SYNC its direction. The card's padlock is the session lock.
+- **A command asks only for what it still needs, right under its bar.** COPY,
+  MOVE, SYNC or MIRROR on two repositories, and DEDUPE AGAINST, ask which
+  selected repository the content comes from (one click on its chip; the
+  rest are the targets, or the pool); FIND SIMILAR asks for its threshold;
+  GO runs the command once every input has an answer. A backup group needs
+  no roles. Changing the selection drops the pending command. The header
+  strip says the inputs too, and the view underneath no longer shows its own
+  repository pickers.
 - **The start page states the facts before you choose.** One line over the
   cards sums the repositories, files and bytes the app looks after. A card's
   UPDATED stat reads as people say it — "just now", "3 hours ago", "9 days

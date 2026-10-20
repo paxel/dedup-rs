@@ -55,15 +55,26 @@ What happens when you click one:
   with a notification card. None of them changes files on disk, so none writes an
   event-log line.
 - Every other command opens its own body under a **header strip** that names the selected
-  repositories and the command. The body is the [Duplicates](duplicates.md),
-  [Transfer](transfer.md), [Grooming](grooming.md) or [Browse](browse.md) view with the
-  repositories already filled in from the selection, and the sections the start page
-  answered folded shut. The **START** bar on the strip returns to the start page with the
-  selection kept.
+  repositories, the command and its inputs ("from Videos to Backup", "at 90 %"). The body is
+  the [Duplicates](duplicates.md), [Transfer](transfer.md), [Grooming](grooming.md) or
+  [Browse](browse.md) view with the repositories already filled in from the selection; its
+  own repository section is not shown — a different selection is made here. The **START**
+  bar on the strip returns to the start page with the selection kept.
 
-A backup group gives the directed commands their direction for free: select the group and
-GROUP SYNC pushes its main to the selected backups. Any other pair of repositories picks its
-source and target inside the body's WITH WHICH section — selection order never decides.
+### Inputs
+
+A command that still needs something reveals it right under its bar, and nothing else:
+
+- **FROM** — COPY, MOVE, SYNC or MIRROR on two repositories, and DEDUPE AGAINST, ask which
+  of the selected repositories the content comes from (for DEDUPE AGAINST: which one is
+  deleted from). Click its chip; the rest of the selection is the target (or the pool it
+  is kept in). Selection order never decides.
+- **THRESHOLD** — FIND SIMILAR asks how alike two files must be, in percent.
+
+**GO** runs the command once every input has an answer. A backup group needs no FROM:
+select the group and GROUP SYNC pushes its main to the selected backups at once. A single
+repository under COPY or MOVE exports into a folder you pick in the body. Changing the
+selection drops the pending command and its inputs: a new selection is a new question.
 
 ## Repository cards
 

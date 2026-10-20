@@ -1447,6 +1447,9 @@ pub struct TransferView {
     /// with `repos` whenever the tab is shown.
     mains: std::collections::HashSet<String>,
     loaded: bool,
+    /// The start page handed over the repositories and the roles, so the
+    /// body's own WITH WHICH and SINKS sections are not shown.
+    from_start: bool,
     source: Option<String>,
     target: Option<String>,
     /// Extra reference repos beyond the target: a file counts as "new" only
@@ -1614,6 +1617,7 @@ impl TransferView {
             repos: Vec::new(),
             mains: std::collections::HashSet::new(),
             loaded: false,
+            from_start: false,
             source: None,
             target: None,
             extra_refs: Vec::new(),
@@ -1769,7 +1773,7 @@ impl TransferView {
                 // answer; after REVIEW or RUN they fold to their header bars,
                 // and each one flips back open on its own.
                 self.command_bar(ui, &mut acts);
-                if self.command_chosen {
+                if self.command_chosen && !self.from_start {
                     self.repo_rows(ui, &mut acts);
                     match self.command {
                         Command::GroupSync => self.group_sinks_bar(ui, &mut acts),
@@ -1877,16 +1881,18 @@ impl TransferView {
     }
 
     /// Open this body from the start page (ADR 0004) for `command` on `repos`.
-    /// A backup group (`group`: its main and the selected backups) gives the
-    /// direction for free; a single repository is a folder export's source;
-    /// a DIFF pair needs no direction; any other pair leaves the roles to the
-    /// user in the body's WITH WHICH section. Whatever the start page
-    /// answered folds shut and reopens on its header.
+    /// The start page settled the roles: a backup group (`group`: its main and
+    /// the selected backups) names them itself, a pair comes with `source`
+    /// and `target`, a single repository is a folder export's source, and a
+    /// DIFF pair needs no direction. The body's own WITH WHICH section is not
+    /// shown; a different selection is made on the start page.
     pub fn open_from(
         &mut self,
         store: &Store,
         command: Command,
         repos: &[String],
+        source: Option<String>,
+        target: Option<String>,
         group: Option<(String, Vec<String>)>,
     ) {
         self.sync_repos(store);
@@ -1894,49 +1900,41 @@ impl TransferView {
         self.target = None;
         self.extra_refs.clear();
         self.destination = Destination::Repo;
-        let mut roles_known = true;
-        match (group, repos) {
-            (Some((main, sinks)), _) => {
+        match (group, source, repos) {
+            (Some((main, sinks)), _, _) => {
                 self.source = Some(main);
                 self.refresh_group(store);
                 self.selected_sinks.retain(|s| sinks.contains(s));
             }
-            (None, [one]) => {
+            (None, Some(src), _) => {
+                self.source = Some(src);
+                self.target = target;
+                self.refresh_group(store);
+            }
+            (None, None, [one]) => {
                 self.source = Some(one.clone());
                 self.destination = Destination::Folder;
                 self.refresh_group(store);
             }
-            (None, [a, b]) if command == Command::Diff => {
+            (None, None, [a, b]) => {
                 let (a, b) = if a <= b { (a, b) } else { (b, a) };
                 self.source = Some(a.clone());
                 self.target = Some(b.clone());
                 self.refresh_group(store);
             }
-            _ => {
-                self.refresh_group(store);
-                roles_known = false;
-            }
+            _ => self.refresh_group(store),
         }
         // After `refresh_group`, which snaps a GROUP command back to COPY
         // when the source names no group.
         self.command = command;
         self.command_chosen = true;
+        self.from_start = true;
         self.clear_preview();
         for title in [
             "WHAT — COPY, MOVE, SYNC, MIRROR, GROUP SYNC, GROUP SYNC BACK OR DIFF",
             "WHAT — COPY, MOVE, SYNC, MIRROR OR DIFF",
         ] {
             self.folds.set(title, false);
-        }
-        if roles_known {
-            for title in [
-                "WITH WHICH — THE GROUP'S MAIN",
-                "WITH WHICH — THE TWO REPOSITORIES TO COMPARE",
-                "WITH WHICH — SOURCE REPOSITORY",
-                "WITH WHICH — SOURCE & TARGET REPOSITORIES",
-            ] {
-                self.folds.set(title, false);
-            }
         }
     }
 
