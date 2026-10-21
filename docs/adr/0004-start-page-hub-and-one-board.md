@@ -40,11 +40,11 @@ the result fills the rest of the window. Clicking the strip returns to the
 start page with the selection intact.
 
 **One board.** Every result is one **board**: a table of file rows (thumbnail,
-name, repository, size, planned action, status). Duplicates are groups of rows,
-a diff's rows carry left and right, a reorganize's rows carry from and to, a
-browse is plain rows in a folder. The board has one selection model, one mark,
-one row-action menu, and a click on any row opens the shared full-window
-viewer. There is no card grid and no per-command result layout.
+name, repository, size, planned action, status). A diff's rows carry left and
+right, a reorganize's rows carry from and to, a browse is plain rows in a
+folder. The board has one selection model, one mark, one row-action menu, and
+a click on any row opens the shared full-window viewer. Duplicates is the one
+exception (see the amendment below).
 
 **Preview, then APPLY.** Every command that writes to disk fills the board
 with its proposed rows without touching anything, lets the user adjust marks,
@@ -99,3 +99,20 @@ pass.
   longer exists shows as unavailable, with the reason.
 - The GUI guide is rewritten around the start page, the command list and the
   board instead of five tabs.
+
+## Amendment: Duplicates keeps its side-by-side groups
+
+The 3.0.0 release put the duplicate groups on the board, one row per copy, with
+the copies of a group stacked under each other. In use that lost what the
+Duplicates view is for: seeing a group's copies next to each other, the best
+copy first on the left, and judging them at a glance. The decision to drop the
+card grid was taken without that consequence being stated.
+
+Duplicates therefore keeps its own result layout: each group is one horizontal
+strip of copy cards, scrolling sideways when it holds many copies, for exact
+and similar groups alike. Everything else from this decision still applies to
+it: it is opened from the start page under the header strip, its writing step
+is APPLY MARKED, and a click on a copy opens the shared viewer. One board
+remains the rule for plans, diffs and listings; a result whose point is
+comparing several copies of the same content gets the layout that shows them
+side by side.

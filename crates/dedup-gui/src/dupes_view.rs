@@ -4,12 +4,13 @@
 
 use crate::filter_ui::FilterBuilder;
 use crate::icon;
-use crate::media_cell::{FileFacts, fmt_ms};
+use crate::lightbox::has_text_representation;
+use crate::media_cell::{FileFacts, MediaStyle, fmt_ms, media_cell};
 use crate::player::Player;
 use crate::settings::TooltipVerbosity;
 use crate::theme;
 use crate::thumbs::ThumbCache;
-use crate::util::{ExplainExt, format_size};
+use crate::util::{ExplainExt, format_mtime, format_size};
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::dupes::{
     AcceptedIndex, DupeDeleteStats, DupeFile, DupeGroup, DupeGroupKey, delete_paths,
@@ -26,16 +27,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 const PAGE_SIZE: usize = 50;
-
-/// What a copy's extras take under its facts on the board, in points: the gap
-/// before them, the BEST line, a protection badge, the KEEP / DELETE button,
-/// and the audio transport (PLAY row plus seek bar). Reserved in the row's
-/// height so a row never runs into the next.
-const EXTRA_GAP: f32 = 4.0;
-const BEST_H: f32 = 21.0;
-const BADGE_H: f32 = 20.0;
-const MARK_H: f32 = 28.0;
-const AUDIO_H: f32 = 48.0;
 /// Load groups from the DB in batches of this many during auto-resolve.
 const AUTO_BATCH: usize = 128;
 
@@ -374,8 +365,6 @@ pub struct DupesView {
     error: Option<String>,
     confirm: Option<(String, ConfirmAction)>,
     thumbs: ThumbCache,
-    /// The shared board's per-view state for the group rows.
-    board_state: crate::board::BoardState,
     /// The open shared viewer ([`crate::compare_view::DiffCompare`]), if any —
     /// the same full-window surface every other caller opens.
     lightbox: Option<crate::compare_view::DiffCompare>,
@@ -448,7 +437,6 @@ impl DupesView {
             error: None,
             confirm: None,
             thumbs: ThumbCache::new(3),
-            board_state: crate::board::BoardState::default(),
             lightbox: None,
             lightbox_group: Vec::new(),
             lightbox_sim: None,
@@ -1198,263 +1186,50 @@ impl DupesView {
 
         let start = page * PAGE_SIZE;
         let end = (start + PAGE_SIZE).min(total);
+        if self.group_heights.len() != total {
+            self.group_heights = vec![0.0; total];
+        }
         // Materialize just this page's groups (exact loads from the DB).
         self.ensure_page(store, page);
-
-        // Everything the row hooks need, cloned so they borrow nothing of
-        // `self` while the board holds its state and thumbnail cache.
-        let similar = matches!(self.results, Some(Results::Similar(_)));
-        let page_groups = self.page_groups.clone();
-        let marked = self.marked.clone();
-        let unlocked = self.unlocked.clone();
-        let accepted = self.accepted.clone();
-        let ro_names = self.read_only_names();
-        let mains: HashSet<String> = self
-            .repos
-            .iter()
-            .filter(|r| r.is_main)
-            .map(|r| r.name.clone())
-            .collect();
-        let quick = self.quick_delete;
-        let idle = self.busy.is_none();
-        let verbosity = self.verbosity;
-        let snap = self.player.snapshot();
-
-        // One board row per copy, under a band per group (ADR 0004); a group
-        // deleted this session is a band that says so and nothing under it.
-        let mut rows: Vec<(usize, Option<usize>)> = Vec::new();
-        let mut metas: Vec<crate::board::RowMeta> = Vec::new();
-        for gi in start..end {
-            // HIDE dismisses a group from the list until the next FIND; a
-            // fully accepted group is skipped the same way unless SHOW
-            // ACCEPTED is on.
-            if self.hidden.contains(&gi)
-                || (!self.show_accepted && self.accepted_groups.contains(&gi))
-            {
-                continue;
-            }
-            if self.resolved.contains(&gi) {
-                rows.push((gi, None));
-                metas.push(crate::board::RowMeta {
-                    key: format!("group-{gi}"),
-                    left_status: crate::board::Status::Absent,
-                    right_status: crate::board::Status::Absent,
-                    left_paths: Vec::new(),
-                    right_paths: Vec::new(),
-                    left_size: 0,
-                    right_size: 0,
-                    left_modified: 0,
-                    right_modified: 0,
-                    unchanged: false,
-                    cmds: Vec::new(),
-                    left_tags: Vec::new(),
-                    extra_height: 0.0,
-                    group: Some(crate::board::GroupHead {
-                        title: format!("{} deleted", icon::CHECK),
-                        notes: Vec::new(),
-                    }),
-                });
-                continue;
-            }
-            let Some(group) = page_groups.get(gi - start) else {
-                continue;
-            };
-            let count = group.len();
-            let wasted = wasted_bytes(group);
-            // Exact copies share one size; similar members don't, so their
-            // band shows the combined size instead of a per-copy one.
-            let title = if similar {
-                let sum: u64 = group.iter().map(|f| f.entry.size).sum();
-                format!(
-                    "{count} similar · {} total · {} reclaimable",
-                    format_size(sum),
-                    format_size(wasted)
-                )
-            } else {
-                let size = group.first().map(|f| f.entry.size).unwrap_or(0);
-                format!(
-                    "{count} copies · {} each · {} reclaimable",
-                    format_size(size),
-                    format_size(wasted)
-                )
-            };
-            // Evidence notes: archives that also contain this group's
-            // content. Read-only — they inform the keep/delete decision but
-            // carry no action of their own.
-            let mut notes = Vec::new();
-            let mut seen = HashSet::new();
-            for f in group {
-                if let Some(list) = self.archive_evidence.get(&(f.entry.size, f.entry.hash)) {
-                    for o in list {
-                        if seen.insert((
-                            o.repo.clone(),
-                            o.archive_rel.clone(),
-                            o.member_name.clone(),
-                        )) {
-                            notes.push(format!(
-                                "{}  in archive:  {} › {}  ({})",
-                                icon::FOLDER_OPEN,
-                                o.archive_rel,
-                                o.member_name,
-                                o.repo,
-                            ));
-                        }
-                    }
-                }
-            }
-            for (fi, file) in group.iter().enumerate() {
-                let k = key(file);
-                let is_marked = marked.contains(&k);
-                let repo_ro = ro_names.contains(&file.repo);
-                let acc = accepted.is_accepted(file);
-                let unl = (repo_ro || acc) && unlocked.contains(&k);
-                let ro = (repo_ro || acc) && !unl;
-                let is_audio = file
-                    .entry
-                    .mime
-                    .as_deref()
-                    .is_some_and(dedup_core::fingerprint::is_audio_mime);
-                // BEST, a badge or the mark button, and the audio transport:
-                // what the extras hook draws, reserved in the row's height.
-                let extra_height = EXTRA_GAP
-                    + if fi == 0 { BEST_H } else { 0.0 }
-                    + if ro || unl { BADGE_H } else { 0.0 }
-                    + if ro { 0.0 } else { MARK_H }
-                    + if is_audio { AUDIO_H } else { 0.0 };
-                metas.push(crate::board::RowMeta {
-                    key: format!("{}|{}", file.repo, file.rel_path),
-                    left_status: if is_marked {
-                        crate::board::Status::WillDelete
-                    } else if file.entry.missing {
-                        crate::board::Status::Missing
-                    } else {
-                        crate::board::Status::Same
-                    },
-                    right_status: crate::board::Status::Absent,
-                    left_paths: vec![file.rel_path.clone()],
-                    right_paths: Vec::new(),
-                    left_size: file.entry.size,
-                    right_size: 0,
-                    left_modified: file.entry.modified_ms,
-                    right_modified: 0,
-                    unchanged: false,
-                    cmds: Vec::new(),
-                    left_tags: Vec::new(),
-                    extra_height,
-                    group: (fi == 0).then(|| crate::board::GroupHead {
-                        title: title.clone(),
-                        notes: notes.clone(),
-                    }),
-                });
-                rows.push((gi, Some(fi)));
-            }
-        }
-
-        // The hooks push into one shared list; `acts` itself cannot be lent to
-        // three closures at once.
-        let pending: std::cell::RefCell<Vec<Act>> = std::cell::RefCell::new(Vec::new());
-        let file_at = |i: usize| -> Option<(usize, usize, &DupeFile)> {
-            let (gi, fi) = rows.get(i).copied()?;
-            let fi = fi?;
-            let file = page_groups.get(gi - start)?.get(fi)?;
-            Some((gi, fi, file))
-        };
-        let mut body = |i: usize| -> crate::board::RowBody {
-            let Some((_, _, file)) = file_at(i) else {
-                return crate::board::RowBody::default();
-            };
-            let facts = FileFacts::from_entry(&file.entry, file.absolute_path());
-            let is_marked = marked.contains(&key(file));
-            crate::board::RowBody {
-                left: crate::board::SideBody {
-                    facts: Some(facts),
-                    repo: Some(file.repo.clone()),
-                    repo_is_main: mains.contains(&file.repo),
-                    overlay: is_marked.then_some(crate::media_cell::CellOverlay::WillDelete),
-                },
-                right: crate::board::SideBody::default(),
-            }
-        };
-        let mut extras = |i: usize, ui: &mut egui::Ui| {
-            let Some((_, fi, file)) = file_at(i) else {
-                return;
-            };
-            let mut acts = pending.borrow_mut();
-            copy_extras(
-                ui,
-                file,
-                fi == 0,
-                &marked,
-                &unlocked,
-                &ro_names,
-                &accepted,
-                &snap,
-                idle,
-                verbosity,
-                &mut acts,
-            );
-        };
-        let mut group_header = |i: usize, ui: &mut egui::Ui| {
-            let Some((gi, _, _)) = file_at(i) else {
-                return;
-            };
-            let Some(group) = page_groups.get(gi - start) else {
-                return;
-            };
-            let mut acts = pending.borrow_mut();
-            group_controls(
-                ui, gi, group, &marked, &accepted, quick, idle, verbosity, &mut acts,
-            );
-        };
-        let mut row_menu = |i: usize, ui: &mut egui::Ui| {
-            let Some((_, _, file)) = file_at(i) else {
-                return;
-            };
-            let mut acts = pending.borrow_mut();
-            copy_menu(ui, file, &accepted, idle, verbosity, &mut acts);
-        };
-
         let mut list = egui::ScrollArea::vertical().auto_shrink([false, false]);
         if std::mem::take(&mut self.scroll_to_top) {
             list = list.vertical_scroll_offset(0.0);
         }
-        let action = list
-            .show(ui, |ui| {
-                crate::board::board_with(
-                    ui,
-                    &mut self.board_state,
-                    &metas,
-                    crate::board::BoardView {
-                        left_role: "COPIES",
-                        left_repo: "",
-                        left_is_main: false,
-                        left_path: "",
-                        right: None,
-                        totals: [0, 0, 0, 0],
-                        full_len: metas.len(),
-                        hide_skips_run: false,
-                        caller_order: true,
-                        select_on_click: false,
-                        left_multi_repo: true,
-                    },
-                    &mut self.thumbs,
-                    &mut body,
-                    crate::board::Hooks {
-                        extras: Some(&mut extras),
-                        group_header: Some(&mut group_header),
-                        row_menu: Some(&mut row_menu),
-                    },
-                )
-            })
-            .inner;
-        acts.extend(pending.into_inner());
-        // A click on a copy opens the shared viewer with the group as its pool.
-        if let Some(a) = action
-            && a.cmd == crate::board::Cmd::OpenRow
-            && let Some((gi, Some(fi))) = rows.get(a.row).copied()
-        {
-            acts.push(Act::OpenLightbox(gi, fi));
-        }
+        list.show(ui, |ui| {
+            let avail_w = ui.available_width();
+            let spacing = ui.spacing().item_spacing.y;
+            for gi in start..end {
+                // HIDE GROUP dismisses a group from the list until the next
+                // FIND — skip it entirely (no card, no reserved space). A
+                // fully accepted group is skipped the same way unless SHOW
+                // ACCEPTED is on.
+                if self.hidden.contains(&gi)
+                    || (!self.show_accepted && self.accepted_groups.contains(&gi))
+                {
+                    continue;
+                }
+                // Virtualize: a group we've measured before and that lies
+                // outside the viewport just reserves its known height — we
+                // skip building (and cloning) its widgets entirely. Unmeasured
+                // groups always render once so their height is recorded.
+                let known = self.group_heights[gi];
+                let top = ui.next_widget_position();
+                let visible = known <= 0.0
+                    || ui.is_rect_visible(egui::Rect::from_min_size(
+                        top,
+                        egui::vec2(avail_w, known),
+                    ));
+                if visible {
+                    let before = top.y;
+                    self.group_card(ui, gi, start, acts);
+                    self.group_heights[gi] = ui.next_widget_position().y - before;
+                } else {
+                    // `allocate_space` adds a trailing item-spacing itself, so
+                    // reserve the slot minus that to match the rendered advance.
+                    ui.allocate_space(egui::vec2(avail_w, (known - spacing).max(0.0)));
+                }
+            }
+        });
     }
 
     /// Load the current page's groups into `page_groups` if not already cached.
@@ -1506,6 +1281,673 @@ impl DupesView {
                 .map(key)
                 .collect();
             self.marked.extend(keys);
+        }
+    }
+
+    fn group_card(&mut self, ui: &mut egui::Ui, gi: usize, page_start: usize, acts: &mut Vec<Act>) {
+        // A group deleted this session collapses to a one-line note.
+        if self.resolved.contains(&gi) {
+            egui::Frame::new()
+                .fill(theme::panel())
+                .corner_radius(theme::PILL)
+                .stroke(egui::Stroke::new(1.0, theme::tan()))
+                .inner_margin(10.0)
+                .outer_margin(egui::Margin {
+                    left: 0,
+                    right: 0,
+                    top: 0,
+                    bottom: 8,
+                })
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!("{} deleted", icon::CHECK))
+                            .color(theme::tan())
+                            .strong(),
+                    );
+                });
+            return;
+        }
+
+        // The page's groups are already materialized; clone the (small) one so the
+        // render closure can borrow `self` mutably for thumbnails/mark state.
+        let group: DupeGroup = self
+            .page_groups
+            .get(gi - page_start)
+            .cloned()
+            .unwrap_or_default();
+        let count = group.len();
+        let wasted = wasted_bytes(&group);
+        // Exact copies share one size; similar members don't, so their header
+        // shows the combined size instead of a per-copy one.
+        let header = if matches!(self.results, Some(Results::Similar(_))) {
+            let total: u64 = group.iter().map(|f| f.entry.size).sum();
+            format!(
+                "{count} similar · {} total · {} reclaimable",
+                format_size(total),
+                format_size(wasted)
+            )
+        } else {
+            let size = group.first().map(|f| f.entry.size).unwrap_or(0);
+            format!(
+                "{count} copies · {} each · {} reclaimable",
+                format_size(size),
+                format_size(wasted)
+            )
+        };
+        // Flags read before the render closure (which borrows `self` mutably).
+        let quick = self.quick_delete;
+        let idle = self.busy.is_none();
+        let has_marked = group.iter().any(|f| self.marked.contains(&key(f)));
+        let all_accepted = self.accepted.all_accepted(&group);
+        egui::Frame::new()
+            .fill(theme::panel())
+            .corner_radius(theme::PILL)
+            .stroke(egui::Stroke::new(1.5, theme::orange()))
+            .inner_margin(10.0)
+            .outer_margin(egui::Margin {
+                left: 0,
+                right: 0,
+                top: 0,
+                bottom: 8,
+            })
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(header).color(theme::amber()).strong());
+                    // Group-level bulk actions: mark every copy, keep every copy,
+                    // or dismiss the whole group — no need to touch each card.
+                    if crate::repo_chip::small_button(ui, "MARK ALL", theme::red())
+                        .explain(
+                            self.verbosity,
+                            "Mark every copy in this group for deletion",
+                            "Mark all deletable copies in this group for deletion. \
+                             Protected (locked) copies are left untouched, and nothing is \
+                             removed until you run DELETE.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::MarkGroup(gi));
+                    }
+                    if crate::repo_chip::small_button(ui, "MARK NONE", theme::tan())
+                        .explain(
+                            self.verbosity,
+                            "Keep every copy in this group",
+                            "Clear all deletion marks in this group, so every copy is kept.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::UnmarkGroup(gi));
+                    }
+                    if crate::repo_chip::small_button(ui, "HIDE", theme::blue())
+                        .explain(
+                            self.verbosity,
+                            "Hide this group until the next search",
+                            "Dismiss this group from the list until the next FIND. It isn't \
+                             deleted or changed — just hidden to keep your review focused.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::HideGroup(gi));
+                    }
+                    // ACCEPT GROUP marks the content in every repo present, so a
+                    // 250-cover podcast is settled in one click; once every copy
+                    // is accepted the same slot withdraws it.
+                    if all_accepted {
+                        if idle
+                            && crate::repo_chip::small_button(ui, "UN-ACCEPT GROUP", theme::lilac())
+                                .explain(
+                                    self.verbosity,
+                                    "Withdraw the acceptance of this content in every repo here",
+                                    "Un-accept this group's content in every repository it \
+                                 appears in, so its copies count as ordinary duplicates \
+                                 again.",
+                                )
+                                .clicked()
+                        {
+                            acts.push(Act::UnacceptGroup(gi));
+                        }
+                    } else if idle
+                        && crate::repo_chip::small_button(ui, "ACCEPT GROUP", theme::lilac())
+                            .explain(
+                                self.verbosity,
+                                "Accept this content as allowed to repeat in every repo here",
+                                "Accept this group's content in every repository it appears \
+                                 in: every copy becomes protected — never auto-marked, kept \
+                                 by every duplicate delete — until you un-accept it.",
+                            )
+                            .clicked()
+                    {
+                        acts.push(Act::AcceptGroup(gi));
+                    }
+                    // Quick Delete: one-click removal of this group's marked files.
+                    if quick && has_marked {
+                        let del = egui::Button::new(
+                            RichText::new(format!("{} DELETE NOW", icon::TRASH))
+                                .color(theme::ink_on(theme::red())),
+                        )
+                        .fill(theme::red());
+                        if ui
+                            .add_enabled(idle, del)
+                            .explain(
+                                self.verbosity,
+                                "Delete this group's marked files now",
+                                "Delete this group's marked files immediately, no \
+                                 confirmation — QUICK DELETE is on. Files still marked \
+                                 KEEP are untouched.",
+                            )
+                            .clicked()
+                        {
+                            acts.push(Act::DeleteGroup(gi));
+                        }
+                    }
+                });
+                // One row per group; wide groups scroll horizontally with their
+                // own (solid, always-allocated) scrollbar instead of wrapping.
+                egui::ScrollArea::horizontal()
+                    .id_salt(("group_row", gi))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (fi, file) in group.iter().enumerate() {
+                                self.file_card(ui, gi, fi, file, fi == 0, acts);
+                            }
+                        });
+                    });
+
+                // Evidence rows: archives that also contain this group's
+                // content. Read-only — they inform the keep/delete decision
+                // (the loose copy is also archived; or the whole zip is that
+                // much more redundant) but carry no action of their own.
+                let mut occ: Vec<&dedup_core::archive::ArchiveOccurrence> = Vec::new();
+                let mut seen = HashSet::new();
+                for f in &group {
+                    if let Some(list) = self.archive_evidence.get(&(f.entry.size, f.entry.hash)) {
+                        for o in list {
+                            if seen.insert((
+                                o.repo.clone(),
+                                o.archive_rel.clone(),
+                                o.member_name.clone(),
+                            )) {
+                                occ.push(o);
+                            }
+                        }
+                    }
+                }
+                if !occ.is_empty() {
+                    ui.add_space(4.0);
+                    for o in occ {
+                        ui.label(
+                            RichText::new(format!(
+                                "{}  in archive:  {} › {}  ({})",
+                                icon::FOLDER_OPEN,
+                                o.archive_rel,
+                                o.member_name,
+                                o.repo,
+                            ))
+                            .color(theme::lilac())
+                            .size(11.0),
+                        )
+                        .on_hover_text(
+                            "This content also lives inside this archive. It cannot be marked \
+                             here — delete a loose copy, or the whole archive.",
+                        );
+                    }
+                }
+            });
+    }
+
+    fn file_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        gi: usize,
+        fi: usize,
+        file: &DupeFile,
+        is_best: bool,
+        acts: &mut Vec<Act>,
+    ) {
+        let k = key(file);
+        let marked = self.marked.contains(&k);
+        let repo_ro = self.repo_is_ro(&file.repo);
+        let accepted = self.is_accepted(file);
+        let unlocked = (repo_ro || accepted) && self.unlocked.contains(&k);
+        // Protected: by the repo's read-only lock, by an accepted mark on the
+        // content, or both — one per-file unlock lifts whichever applies.
+        let ro = (repo_ro || accepted) && !unlocked;
+        let idle = self.busy.is_none();
+        let content = (file.repo.clone(), file.entry.size, file.entry.hash);
+        egui::Frame::new()
+            .fill(theme::bg())
+            .corner_radius(theme::PILL)
+            .inner_margin(8.0)
+            .outer_margin(egui::Margin::same(4))
+            .show(ui, |ui| {
+                // The whole card senses clicks *behind* its children (a
+                // trailing `interact` would sit on top and swallow the KEEP
+                // button and badge menus), carrying the external-open menu.
+                let card =
+                    ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(200.0);
+                            // Selectable labels sense clicks and would swallow
+                            // right-clicks over the card's text, so the menu
+                            // would only open over the sparse non-text areas.
+                            // The read-only/unlocked badges keep their own
+                            // menus via an explicit click sense.
+                            ui.style_mut().interaction.selectable_labels = false;
+                            self.thumbnail(ui, gi, fi, file, acts);
+                            ui.label(
+                                RichText::new(&file.rel_path)
+                                    .color(theme::text())
+                                    .size(12.0)
+                                    .strong(),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} · {}",
+                                    file.repo,
+                                    format_size(file.entry.size)
+                                ))
+                                .color(theme::tan())
+                                .size(11.0),
+                            );
+                            let dims = file
+                                .entry
+                                .img_size
+                                .map(|(w, h)| format!("{w}×{h}"))
+                                .unwrap_or_else(|| "—".into());
+                            ui.label(
+                                RichText::new(format!(
+                                    "{dims} · {}",
+                                    format_mtime(file.entry.modified_ms)
+                                ))
+                                .color(theme::tan())
+                                .size(11.0),
+                            );
+
+                            if let Some(origin) = &file.entry.origin {
+                                ui.label(
+                                    RichText::new(format!("from {origin}"))
+                                        .color(theme::lilac())
+                                        .size(11.0),
+                                );
+                            }
+
+                            self.audio_controls(ui, file, acts);
+
+                            if is_best {
+                                ui.label(
+                                    RichText::new(format!("{} BEST", icon::STAR))
+                                        .color(theme::blue())
+                                        .size(12.0)
+                                        .strong(),
+                                );
+                            }
+                            if ro {
+                                // A worse copy inside a protected repo (or an
+                                // accepted content) can still be unlocked one file
+                                // at a time, via its badge's context menu or a
+                                // long press (never a plain click).
+                                let (badge, short, verbose) = if accepted {
+                                    (
+                                        format!("{} accepted", icon::CHECK),
+                                        "Accepted content — right-click or long-press to unlock \
+                                         this file",
+                                        "This content is accepted as allowed to repeat in this \
+                                         repository, so its copies can't be marked for deletion. \
+                                         Right-click to un-accept it, or to unlock just this one \
+                                         file (long-press does the same); running FIND again \
+                                         re-locks it.",
+                                    )
+                                } else {
+                                    (
+                                        "read-only".to_string(),
+                                        "Right-click or long-press to unlock this file",
+                                        "This file is protected by its repo's read-only lock, \
+                                         so it can't be marked for deletion. Right-click or \
+                                         long-press to unlock just this one file. Running FIND \
+                                         again re-locks it.",
+                                    )
+                                };
+                                let color = if accepted {
+                                    theme::lilac()
+                                } else {
+                                    theme::blue()
+                                };
+                                let resp = ui
+                                    .add(
+                                        egui::Label::new(
+                                            RichText::new(badge).color(color).size(11.0),
+                                        )
+                                        .sense(egui::Sense::click()),
+                                    )
+                                    .explain(self.verbosity, short, verbose);
+                                if long_pressed(ui, &resp) {
+                                    acts.push(Act::Unlock(k.clone()));
+                                }
+                                resp.context_menu(|ui| {
+                                    if ui
+                                        .button(format!("{} UNLOCK for deletion", icon::LOCK_OPEN))
+                                        .explain(
+                                            self.verbosity,
+                                            "Unlock this file only",
+                                            "Unlock just this file for deletion, without \
+                                             unlocking the whole repo or un-accepting the \
+                                             content. Reset the next time you run FIND.",
+                                        )
+                                        .clicked()
+                                    {
+                                        acts.push(Act::Unlock(k.clone()));
+                                        ui.close();
+                                    }
+                                    if accepted
+                                        && ui
+                                            .add_enabled(
+                                                idle,
+                                                egui::Button::new(format!("{} UN-ACCEPT", icon::X)),
+                                            )
+                                            .explain(
+                                                self.verbosity,
+                                                "Withdraw the acceptance of this content in this repo",
+                                                "Un-accept this content in this repository: \
+                                                 every copy of it here counts as an ordinary \
+                                                 duplicate again.",
+                                            )
+                                            .clicked()
+                                    {
+                                        let (r, sz, h) = content.clone();
+                                        acts.push(Act::Unaccept(r, sz, h));
+                                        ui.close();
+                                    }
+                                });
+                            } else {
+                                if unlocked {
+                                    let resp = ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(format!("{} unlocked", icon::LOCK_OPEN))
+                                            .color(theme::red())
+                                            .size(11.0),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                )
+                                .explain(
+                                    self.verbosity,
+                                    "Read-only override for this file — right-click to re-lock",
+                                    "This file was individually unlocked from its repo's \
+                                     read-only protection. Right-click to re-lock it (or FIND \
+                                     again, which resets all per-file unlocks).",
+                                );
+                                    resp.context_menu(|ui| {
+                                        if ui
+                                            .button(format!("{} RE-LOCK", icon::LOCK))
+                                            .explain(
+                                                self.verbosity,
+                                                "Restore read-only protection",
+                                                "Re-lock this file, restoring its repo's \
+                                                 read-only protection and clearing any \
+                                                 pending mark.",
+                                            )
+                                            .clicked()
+                                        {
+                                            acts.push(Act::Relock(k.clone()));
+                                            ui.close();
+                                        }
+                                    });
+                                }
+                                let (label, fill) = if marked {
+                                    (format!("{} DELETE", icon::CHECK), theme::red())
+                                } else {
+                                    ("KEEP".to_string(), theme::panel())
+                                };
+                                let color = if marked {
+                                    theme::black()
+                                } else {
+                                    theme::text()
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(RichText::new(label).color(color))
+                                            .fill(fill),
+                                    )
+                                    .explain(
+                                        self.verbosity,
+                                        "Toggle this copy's mark",
+                                        "Toggle whether this copy is marked for deletion. \
+                                         Nothing is deleted until you press APPLY MARKED (or \
+                                         DELETE NOW under Quick Delete).",
+                                    )
+                                    .clicked()
+                                {
+                                    acts.push(Act::ToggleMark(k.clone()));
+                                }
+                            }
+                        });
+                    });
+                // Full-fidelity escape hatch: hand the file to the system's
+                // default app.
+                card.response.context_menu(|ui| {
+                    if ui
+                        .button(format!("{} OPEN", icon::ARROW_RIGHT))
+                        .explain(
+                            self.verbosity,
+                            "Open with the system default app",
+                            "Hand this file to the operating system's default application \
+                             for its type — the full-fidelity escape hatch for anything the \
+                             in-app preview can't show.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::Open(file.absolute_path()));
+                        ui.close();
+                    }
+                    if ui
+                        .button(format!("{} SHOW IN FOLDER", icon::FOLDER_OPEN))
+                        .explain(
+                            self.verbosity,
+                            "Reveal in the file manager",
+                            "Open this file's containing folder in the system file manager.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::Reveal(file.absolute_path()));
+                        ui.close();
+                    }
+                    if ui
+                        .button(format!("{} SHOW IN BROWSE", icon::SEARCH))
+                        .explain(
+                            self.verbosity,
+                            "Jump to this file in the Browse tab",
+                            "Switch to the Browse tab with this file selected in its \
+                             folder, so you can judge it by the company it keeps — \
+                             siblings, naming, and the directory it lives in.",
+                        )
+                        .clicked()
+                    {
+                        acts.push(Act::BrowseTo((file.repo.clone(), file.rel_path.clone())));
+                        ui.close();
+                    }
+                    let accept_label = if accepted {
+                        format!("{} UN-ACCEPT", icon::X)
+                    } else {
+                        format!("{} ACCEPT IN REPO", icon::CHECK)
+                    };
+                    if ui
+                        .add_enabled(idle, egui::Button::new(accept_label))
+                        .explain(
+                            self.verbosity,
+                            if accepted {
+                                "Withdraw the acceptance of this content in this repo"
+                            } else {
+                                "Accept this content as allowed to repeat in this repo"
+                            },
+                            if accepted {
+                                "Un-accept this content in this repository: every copy of it \
+                                 here counts as an ordinary duplicate again."
+                            } else {
+                                "Accept this content in this repository (a podcast's per-folder \
+                                 cover, say): every copy of it here becomes protected — never \
+                                 auto-marked, kept by every duplicate delete — until you \
+                                 un-accept it. Copies in other repositories are unaffected."
+                            },
+                        )
+                        .clicked()
+                    {
+                        let (r, sz, h) = content.clone();
+                        acts.push(if accepted {
+                            Act::Unaccept(r, sz, h)
+                        } else {
+                            Act::Accept(r, sz, h)
+                        });
+                        ui.close();
+                    }
+                    if ui
+                        .button(format!("{} COPY NAME", icon::COPY))
+                        .explain(
+                            self.verbosity,
+                            "Copy this file's path to the clipboard",
+                            "Copy the repository-relative path, e.g. to search another                              repository for the same name.",
+                        )
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(file.rel_path.clone());
+                        ui.close();
+                    }
+                });
+            });
+    }
+
+    /// Play/pause + seek bar for audio files. One file plays at a time; the
+    /// controls reflect the global player and survive scrolling (the player is
+    /// not per-card). No-op for non-audio files.
+    fn audio_controls(&mut self, ui: &mut egui::Ui, file: &DupeFile, acts: &mut Vec<Act>) {
+        let is_audio = file
+            .entry
+            .mime
+            .as_deref()
+            .is_some_and(dedup_core::fingerprint::is_audio_mime);
+        if !is_audio {
+            return;
+        }
+        let hex = hash_hex(&file.entry.hash);
+        let total_ms = file
+            .entry
+            .audio
+            .as_ref()
+            .map(|a| a.duration_ms as u64)
+            .unwrap_or(0);
+        let snap = self.player.snapshot();
+        let is_current = snap.loaded && snap.hex.as_deref() == Some(hex.as_str());
+        let playing = is_current && snap.playing;
+
+        ui.horizontal(|ui| {
+            let label = if playing { "PAUSE" } else { "PLAY" };
+            let fill = if playing {
+                theme::amber()
+            } else {
+                theme::panel()
+            };
+            let col = if playing {
+                theme::black()
+            } else {
+                theme::text()
+            };
+            if ui
+                .add(egui::Button::new(RichText::new(label).color(col)).fill(fill))
+                .explain(
+                    self.verbosity,
+                    "Play/pause this track",
+                    "Play this file in the built-in preview player. Only one file plays at \
+                     a time — starting another stops this one. Click again to pause/resume.",
+                )
+                .clicked()
+            {
+                acts.push(Act::PlayAudio(hex.clone(), file.absolute_path(), total_ms));
+            }
+            let (pos, total) = if is_current {
+                (snap.pos_ms, snap.total_ms.max(total_ms))
+            } else {
+                (0, total_ms)
+            };
+            ui.label(
+                RichText::new(format!("{} / {}", fmt_ms(pos), fmt_ms(total)))
+                    .color(theme::tan())
+                    .size(11.0),
+            );
+        });
+
+        // The seek bar: a timeline the width of the card's text column, not a
+        // slider that reads like a setting. Idle until this file is the one
+        // playing, so the row keeps its height either way.
+        let total = snap.total_ms.max(total_ms);
+        let live = is_current && total > 0;
+        let frac = if live {
+            (snap.pos_ms as f32 / total as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let width = ui.available_width();
+        if let Some(f) = crate::media_cell::seek_bar(ui, width, frac, live) {
+            acts.push(Act::SeekAudio(f));
+        }
+    }
+
+    fn thumbnail(
+        &mut self,
+        ui: &mut egui::Ui,
+        gi: usize,
+        fi: usize,
+        file: &DupeFile,
+        acts: &mut Vec<Act>,
+    ) {
+        // The shared media cell draws the image / video still / audio glyph /
+        // placeholder; the card keeps the click meaning (open the lightbox) and
+        // its own tooltip. A placeholder or not-yet-decoded thumbnail returns
+        // `None` — but a *typed* placeholder (a document, an archive) still has
+        // a Text representation to open, so the card makes the placeholder
+        // itself the click target rather than leaving those groups with no way
+        // into the lightbox at all.
+        let facts = FileFacts::from_entry(&file.entry, file.absolute_path());
+        let thumbs = &mut self.thumbs;
+        let cell = ui.scope(|ui| media_cell(ui, thumbs, &facts, MediaStyle::card()));
+        let resp = match cell.inner {
+            Some(resp) => resp,
+            None if has_text_representation(&facts) => {
+                let hit = ui.interact(
+                    cell.response.rect,
+                    ui.id().with(("dupe-open", gi, fi)),
+                    egui::Sense::click(),
+                );
+                // The placeholder is a picture of nothing, so name the target —
+                // otherwise this click area has no accessible label at all.
+                hit.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "OPEN PREVIEW")
+                });
+                hit.on_hover_cursor(egui::CursorIcon::PointingHand).explain(
+                    self.verbosity,
+                    "Open the text preview",
+                    "Open the full-window lightbox: this file has no picture, so its Text tab \
+                     shows the start of its contents — as text, or as hex when it is not text \
+                     — beside the copy you compare it with.",
+                )
+            }
+            None => return,
+        };
+        let resp = if facts.is_audio() {
+            resp.explain(
+                self.verbosity,
+                "Open the audio lightbox",
+                "Open the full-window audio view: compare this group's copies as waveforms and \
+                 switch playback between them without losing your place in the track.",
+            )
+        } else {
+            resp.explain(
+                self.verbosity,
+                "Click to open the lightbox",
+                "Click to open the full-window lightbox: zoom, pan, step through this group's \
+                 copies, and (for images) A/B compare against the best copy.",
+            )
+        };
+        if resp.clicked() {
+            acts.push(Act::OpenLightbox(gi, fi));
         }
     }
 
@@ -2258,439 +2700,6 @@ impl DupesView {
             }
         }
         out
-    }
-}
-
-/// A copy's own widgets under its facts on the board: BEST on the first copy,
-/// a read-only / accepted / unlocked badge with its menu, the KEEP / DELETE
-/// mark, and the audio transport.
-#[allow(clippy::too_many_arguments)]
-fn copy_extras(
-    ui: &mut egui::Ui,
-    file: &DupeFile,
-    is_best: bool,
-    marked: &HashSet<FileKey>,
-    unlocked: &HashSet<FileKey>,
-    ro_names: &HashSet<String>,
-    accepted: &AcceptedIndex,
-    snap: &crate::player::PlayerSnapshot,
-    idle: bool,
-    verbosity: TooltipVerbosity,
-    acts: &mut Vec<Act>,
-) {
-    let k = key(file);
-    let is_marked = marked.contains(&k);
-    let repo_ro = ro_names.contains(&file.repo);
-    let acc = accepted.is_accepted(file);
-    let unl = (repo_ro || acc) && unlocked.contains(&k);
-    // Protected: by the repo's read-only lock, by an accepted mark on the
-    // content, or both — one per-file unlock lifts whichever applies.
-    let ro = (repo_ro || acc) && !unl;
-    let content = (file.repo.clone(), file.entry.size, file.entry.hash);
-    if is_best {
-        ui.label(
-            RichText::new(format!("{} BEST", icon::STAR))
-                .color(theme::blue())
-                .size(12.0)
-                .strong(),
-        );
-    }
-    if ro {
-        // A worse copy inside a protected repo (or an accepted content) can
-        // still be unlocked one file at a time, via its badge's context menu
-        // or a long press (never a plain click).
-        let (badge, short, verbose) = if acc {
-            (
-                format!("{} accepted", icon::CHECK),
-                "Accepted content — right-click or long-press to unlock this file",
-                "This content is accepted as allowed to repeat in this repository, so its \
-                 copies can't be marked for deletion. Right-click to un-accept it, or to \
-                 unlock just this one file (long-press does the same); running FIND again \
-                 re-locks it.",
-            )
-        } else {
-            (
-                "read-only".to_string(),
-                "Right-click or long-press to unlock this file",
-                "This file is protected by its repo's read-only lock, so it can't be marked \
-                 for deletion. Right-click or long-press to unlock just this one file. \
-                 Running FIND again re-locks it.",
-            )
-        };
-        let color = if acc { theme::lilac() } else { theme::blue() };
-        let resp = ui
-            .add(
-                egui::Label::new(RichText::new(badge).color(color).size(11.0))
-                    .sense(egui::Sense::click()),
-            )
-            .explain(verbosity, short, verbose);
-        if long_pressed(ui, &resp) {
-            acts.push(Act::Unlock(k.clone()));
-        }
-        resp.context_menu(|ui| {
-            if ui
-                .button(format!("{} UNLOCK for deletion", icon::LOCK_OPEN))
-                .explain(
-                    verbosity,
-                    "Unlock this file only",
-                    "Unlock just this file for deletion, without unlocking the whole repo or \
-                     un-accepting the content. Reset the next time you run FIND.",
-                )
-                .clicked()
-            {
-                acts.push(Act::Unlock(k.clone()));
-                ui.close();
-            }
-            if acc
-                && ui
-                    .add_enabled(idle, egui::Button::new(format!("{} UN-ACCEPT", icon::X)))
-                    .explain(
-                        verbosity,
-                        "Withdraw the acceptance of this content in this repo",
-                        "Un-accept this content in this repository: every copy of it here \
-                         counts as an ordinary duplicate again.",
-                    )
-                    .clicked()
-            {
-                let (r, sz, h) = content.clone();
-                acts.push(Act::Unaccept(r, sz, h));
-                ui.close();
-            }
-        });
-    } else {
-        if unl {
-            let resp = ui
-                .add(
-                    egui::Label::new(
-                        RichText::new(format!("{} unlocked", icon::LOCK_OPEN))
-                            .color(theme::red())
-                            .size(11.0),
-                    )
-                    .sense(egui::Sense::click()),
-                )
-                .explain(
-                    verbosity,
-                    "Read-only override for this file — right-click to re-lock",
-                    "This file was individually unlocked from its repo's read-only \
-                     protection. Right-click to re-lock it (or FIND again, which resets all \
-                     per-file unlocks).",
-                );
-            resp.context_menu(|ui| {
-                if ui
-                    .button(format!("{} RE-LOCK", icon::LOCK))
-                    .explain(
-                        verbosity,
-                        "Restore read-only protection",
-                        "Re-lock this file, restoring its repo's read-only protection and \
-                         clearing any pending mark.",
-                    )
-                    .clicked()
-                {
-                    acts.push(Act::Relock(k.clone()));
-                    ui.close();
-                }
-            });
-        }
-        let (label, fill) = if is_marked {
-            (format!("{} DELETE", icon::CHECK), theme::red())
-        } else {
-            ("KEEP".to_string(), theme::panel())
-        };
-        let color = if is_marked {
-            theme::black()
-        } else {
-            theme::text()
-        };
-        if ui
-            .add(egui::Button::new(RichText::new(label).color(color)).fill(fill))
-            .explain(
-                verbosity,
-                "Toggle this copy's mark",
-                "Toggle whether this copy is marked for deletion. Nothing is deleted until \
-                 you press APPLY MARKED (or DELETE NOW under Quick Delete).",
-            )
-            .clicked()
-        {
-            acts.push(Act::ToggleMark(k.clone()));
-        }
-    }
-    audio_controls(ui, file, snap, verbosity, acts);
-}
-
-/// The group band's controls: mark every copy, keep every copy, dismiss the
-/// group, accept or un-accept its content everywhere, and — under QUICK
-/// DELETE — delete its marked copies now.
-#[allow(clippy::too_many_arguments)]
-fn group_controls(
-    ui: &mut egui::Ui,
-    gi: usize,
-    group: &DupeGroup,
-    marked: &HashSet<FileKey>,
-    accepted: &AcceptedIndex,
-    quick: bool,
-    idle: bool,
-    verbosity: TooltipVerbosity,
-    acts: &mut Vec<Act>,
-) {
-    let has_marked = group.iter().any(|f| marked.contains(&key(f)));
-    let all_accepted = accepted.all_accepted(group);
-    if crate::repo_chip::small_button(ui, "MARK ALL", theme::red())
-        .explain(
-            verbosity,
-            "Mark every copy in this group for deletion",
-            "Mark all deletable copies in this group for deletion. Protected (locked) \
-             copies are left untouched, and nothing is removed until you run APPLY MARKED.",
-        )
-        .clicked()
-    {
-        acts.push(Act::MarkGroup(gi));
-    }
-    if crate::repo_chip::small_button(ui, "MARK NONE", theme::tan())
-        .explain(
-            verbosity,
-            "Keep every copy in this group",
-            "Clear all deletion marks in this group, so every copy is kept.",
-        )
-        .clicked()
-    {
-        acts.push(Act::UnmarkGroup(gi));
-    }
-    if crate::repo_chip::small_button(ui, "HIDE", theme::blue())
-        .explain(
-            verbosity,
-            "Hide this group until the next search",
-            "Dismiss this group from the list until the next FIND. It isn't deleted or \
-             changed — just hidden to keep your review focused.",
-        )
-        .clicked()
-    {
-        acts.push(Act::HideGroup(gi));
-    }
-    // ACCEPT GROUP marks the content in every repo present, so a 250-cover
-    // podcast is settled in one click; once every copy is accepted the same
-    // slot withdraws it.
-    if all_accepted {
-        if idle
-            && crate::repo_chip::small_button(ui, "UN-ACCEPT GROUP", theme::lilac())
-                .explain(
-                    verbosity,
-                    "Withdraw the acceptance of this content in every repo here",
-                    "Un-accept this group's content in every repository it appears in, so \
-                     its copies count as ordinary duplicates again.",
-                )
-                .clicked()
-        {
-            acts.push(Act::UnacceptGroup(gi));
-        }
-    } else if idle
-        && crate::repo_chip::small_button(ui, "ACCEPT GROUP", theme::lilac())
-            .explain(
-                verbosity,
-                "Accept this content as allowed to repeat in every repo here",
-                "Accept this group's content in every repository it appears in: every copy \
-                 becomes protected — never auto-marked, kept by every duplicate delete — \
-                 until you un-accept it.",
-            )
-            .clicked()
-    {
-        acts.push(Act::AcceptGroup(gi));
-    }
-    if quick && has_marked {
-        let del = egui::Button::new(
-            RichText::new(format!("{} DELETE NOW", icon::TRASH)).color(theme::ink_on(theme::red())),
-        )
-        .fill(theme::red());
-        if ui
-            .add_enabled(idle, del)
-            .explain(
-                verbosity,
-                "Delete this group's marked files now",
-                "Delete this group's marked files immediately, no confirmation — QUICK \
-                 DELETE is on. Files still marked KEEP are untouched.",
-            )
-            .clicked()
-        {
-            acts.push(Act::DeleteGroup(gi));
-        }
-    }
-}
-
-/// A copy's right-click menu: the full-fidelity escape hatches, the jump to
-/// Browse, accept / un-accept in its repo, and copying its name.
-fn copy_menu(
-    ui: &mut egui::Ui,
-    file: &DupeFile,
-    accepted: &AcceptedIndex,
-    idle: bool,
-    verbosity: TooltipVerbosity,
-    acts: &mut Vec<Act>,
-) {
-    let acc = accepted.is_accepted(file);
-    let content = (file.repo.clone(), file.entry.size, file.entry.hash);
-    if ui
-        .button(format!("{} OPEN", icon::ARROW_RIGHT))
-        .explain(
-            verbosity,
-            "Open with the system default app",
-            "Hand this file to the operating system's default application for its type — \
-             the full-fidelity escape hatch for anything the in-app preview can't show.",
-        )
-        .clicked()
-    {
-        acts.push(Act::Open(file.absolute_path()));
-        ui.close();
-    }
-    if ui
-        .button(format!("{} SHOW IN FOLDER", icon::FOLDER_OPEN))
-        .explain(
-            verbosity,
-            "Reveal in the file manager",
-            "Open this file's containing folder in the system file manager.",
-        )
-        .clicked()
-    {
-        acts.push(Act::Reveal(file.absolute_path()));
-        ui.close();
-    }
-    if ui
-        .button(format!("{} SHOW IN BROWSE", icon::SEARCH))
-        .explain(
-            verbosity,
-            "Jump to this file in Browse",
-            "Open Browse with this file selected in its folder, so you can judge it by the \
-             company it keeps — siblings, naming, and the directory it lives in.",
-        )
-        .clicked()
-    {
-        acts.push(Act::BrowseTo((file.repo.clone(), file.rel_path.clone())));
-        ui.close();
-    }
-    let accept_label = if acc {
-        format!("{} UN-ACCEPT", icon::X)
-    } else {
-        format!("{} ACCEPT IN REPO", icon::CHECK)
-    };
-    if ui
-        .add_enabled(idle, egui::Button::new(accept_label))
-        .explain(
-            verbosity,
-            if acc {
-                "Withdraw the acceptance of this content in this repo"
-            } else {
-                "Accept this content as allowed to repeat in this repo"
-            },
-            if acc {
-                "Un-accept this content in this repository: every copy of it here counts as \
-                 an ordinary duplicate again."
-            } else {
-                "Accept this content in this repository (a podcast's per-folder cover, \
-                 say): every copy of it here becomes protected — never auto-marked, kept by \
-                 every duplicate delete — until you un-accept it. Copies in other \
-                 repositories are unaffected."
-            },
-        )
-        .clicked()
-    {
-        let (r, sz, h) = content;
-        acts.push(if acc {
-            Act::Unaccept(r, sz, h)
-        } else {
-            Act::Accept(r, sz, h)
-        });
-        ui.close();
-    }
-    if ui
-        .button(format!("{} COPY NAME", icon::COPY))
-        .explain(
-            verbosity,
-            "Copy this file's path to the clipboard",
-            "Copy the repository-relative path, e.g. to search another repository for the \
-             same name.",
-        )
-        .clicked()
-    {
-        ui.ctx().copy_text(file.rel_path.clone());
-        ui.close();
-    }
-}
-
-/// Play/pause + seek bar for an audio copy. One file plays at a time; the
-/// controls reflect the shared player and survive scrolling. No-op for a
-/// non-audio file.
-fn audio_controls(
-    ui: &mut egui::Ui,
-    file: &DupeFile,
-    snap: &crate::player::PlayerSnapshot,
-    verbosity: TooltipVerbosity,
-    acts: &mut Vec<Act>,
-) {
-    let is_audio = file
-        .entry
-        .mime
-        .as_deref()
-        .is_some_and(dedup_core::fingerprint::is_audio_mime);
-    if !is_audio {
-        return;
-    }
-    let hex = hash_hex(&file.entry.hash);
-    let total_ms = file
-        .entry
-        .audio
-        .as_ref()
-        .map(|a| a.duration_ms as u64)
-        .unwrap_or(0);
-    let is_current = snap.loaded && snap.hex.as_deref() == Some(hex.as_str());
-    let playing = is_current && snap.playing;
-
-    ui.horizontal(|ui| {
-        let label = if playing { "PAUSE" } else { "PLAY" };
-        let fill = if playing {
-            theme::amber()
-        } else {
-            theme::panel()
-        };
-        let col = if playing {
-            theme::black()
-        } else {
-            theme::text()
-        };
-        if ui
-            .add(egui::Button::new(RichText::new(label).color(col)).fill(fill))
-            .explain(
-                verbosity,
-                "Play/pause this track",
-                "Play this file in the built-in preview player. Only one file plays at a \
-                 time — starting another stops this one. Click again to pause/resume.",
-            )
-            .clicked()
-        {
-            acts.push(Act::PlayAudio(hex.clone(), file.absolute_path(), total_ms));
-        }
-        let (pos, total) = if is_current {
-            (snap.pos_ms, snap.total_ms.max(total_ms))
-        } else {
-            (0, total_ms)
-        };
-        ui.label(
-            RichText::new(format!("{} / {}", fmt_ms(pos), fmt_ms(total)))
-                .color(theme::tan())
-                .size(11.0),
-        );
-    });
-
-    // The seek bar: a timeline the width of the row's text column, not a
-    // slider that reads like a setting. Idle until this file is the one
-    // playing, so the row keeps its height either way.
-    let total = snap.total_ms.max(total_ms);
-    let live = is_current && total > 0;
-    let frac = if live {
-        (snap.pos_ms as f32 / total as f32).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let width = ui.available_width();
-    if let Some(f) = crate::media_cell::seek_bar(ui, width, frac, live) {
-        acts.push(Act::SeekAudio(f));
     }
 }
 
@@ -4066,8 +4075,6 @@ mod ui_tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
         let mut init = false;
-        // Tall enough for every copy of two groups to be on screen: the
-        // board draws only the rows in view.
         let mut harness = Harness::builder()
             .with_size(egui::vec2(700.0, 1000.0))
             .build_ui_state(
