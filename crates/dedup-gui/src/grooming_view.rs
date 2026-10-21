@@ -1105,9 +1105,7 @@ impl GroomingView {
                 totals: self.preview_totals,
                 full_len: self.preview_total,
                 hide_skips_run: true,
-                caller_order: false,
-                select_on_click: false,
-                left_multi_repo: false,
+                listing: false,
             },
             &mut self.thumbs,
             &mut |i| bodies.get(i).cloned().unwrap_or_default(),
@@ -2139,8 +2137,6 @@ fn build_preview(
                     unchanged: false,
                     cmds: vec![board::Cmd::Apply, board::Cmd::Hide],
                     left_tags: Vec::new(),
-                    extra_height: 0.0,
-                    group: None,
                 };
                 let body = board::RowBody {
                     left: board::SideBody {
@@ -2204,8 +2200,6 @@ fn build_preview(
                 // same place.
                 cmds: vec![board::Cmd::Apply, board::Cmd::Hide],
                 left_tags: Vec::new(),
-                extra_height: 0.0,
-                group: None,
             };
             let body = board::RowBody {
                 left: board::SideBody {
@@ -2695,8 +2689,6 @@ mod ui_tests {
             unchanged: false,
             cmds: vec![board::Cmd::Apply, board::Cmd::Hide],
             left_tags: Vec::new(),
-            extra_height: 0.0,
-            group: None,
         };
         assert_eq!(
             with_ref.right_paths,
@@ -2749,8 +2741,6 @@ mod ui_tests {
                 unchanged: false,
                 cmds: vec![board::Cmd::Apply, board::Cmd::Hide],
                 left_tags: Vec::new(),
-                extra_height: 0.0,
-                group: None,
             })
             .collect();
         v.preview_bodies = vec![board::RowBody::default(); paths.len()];

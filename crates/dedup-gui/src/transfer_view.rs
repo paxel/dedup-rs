@@ -328,8 +328,6 @@ fn board_row(
         unchanged,
         cmds,
         left_tags: Vec::new(),
-        extra_height: 0.0,
-        group: None,
     };
     let body = board::RowBody {
         left: board::SideBody {
@@ -498,8 +496,6 @@ fn diff_metas(rows: &[RepoDiffRow], left_ro: bool, right_ro: bool) -> Vec<board:
                 unchanged: row.relation == R::Equal,
                 cmds,
                 left_tags: Vec::new(),
-                extra_height: 0.0,
-                group: None,
             }
         })
         .collect()
@@ -3122,9 +3118,7 @@ impl TransferView {
                     // DIFF runs each command as it is clicked; there is no RUN
                     // for a hidden row to be skipped by.
                     hide_skips_run: false,
-                    caller_order: false,
-                    select_on_click: false,
-                    left_multi_repo: false,
+                    listing: false,
                 },
                 &mut self.thumbs,
                 &mut |i| {
@@ -3275,9 +3269,7 @@ impl TransferView {
                 // the cap notice compares this against what was materialised.
                 full_len: self.preview_totals.iter().sum(),
                 hide_skips_run: true,
-                caller_order: false,
-                select_on_click: false,
-                left_multi_repo: false,
+                listing: false,
             },
             &mut self.thumbs,
             &mut |i| bodies.get(i).cloned().unwrap_or_default(),

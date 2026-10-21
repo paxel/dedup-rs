@@ -1166,8 +1166,6 @@ impl BrowseView {
                 unchanged: false,
                 cmds: Vec::new(),
                 left_tags: f.tag_list.clone(),
-                extra_height: 0.0,
-                group: None,
             })
             .collect();
         self.board_state.selected = self.selected.clone();
@@ -1215,9 +1213,7 @@ impl BrowseView {
                 totals: [0, 0, 0, 0],
                 full_len: files.len(),
                 hide_skips_run: false,
-                caller_order: true,
-                select_on_click: true,
-                left_multi_repo: false,
+                listing: true,
             },
             &mut self.thumbs,
             &mut body,
