@@ -128,7 +128,8 @@ _Avoid_: breadcrumb, summary bar.
 **Board**:
 The one result surface: a table of file rows with thumbnail, name,
 repository, size, planned action and status. Every command's result is a
-board; a click on a row opens the viewer.
+board except a duplicates find, whose groups show their copies side by side as
+cards; a click on a row opens the viewer.
 _Avoid_: review board, grid, listing, preview table.
 
 **Favorite**:

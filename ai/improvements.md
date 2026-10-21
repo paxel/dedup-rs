@@ -26,7 +26,7 @@ Start page hub, one command list, one board. Landed one child per commit, in ord
 - [x] #8 Favorites
 - [x] #9 Preview and APPLY everywhere
 - [x] #10 The board module, with Browse on it
-- [x] #11 Duplicates on the board
+- [x] #11 Duplicates on the board (reverted after 3.0.0: the side-by-side card groups came back, see the ADR 0004 amendment)
 - [x] #12 Transfer and Grooming plans on the board (already routed through `board.rs`; verified)
 - [x] #13 Diff on the board (already routed through `board.rs`; `diff_board.rs` holds the row model and popups only; verified)
 - [x] #14 Skin pass
