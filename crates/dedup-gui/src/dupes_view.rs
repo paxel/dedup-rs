@@ -4071,6 +4071,20 @@ mod ui_tests {
         );
     }
 
+    /// Runs the harness until it stops repainting. The viewer reads a pair's
+    /// text on a worker thread whose finish requests a repaint, so a plain
+    /// `run()` can see repaints for longer than its step budget when the
+    /// worker is slow (a loaded CI runner); this waits for the worker instead.
+    fn settle<S>(h: &mut Harness<'_, S>) {
+        for _ in 0..100 {
+            if h.try_run().is_ok() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the viewer did not settle");
+    }
+
     fn similar_harness<'a>(view: DupesView) -> Harness<'a, DupesView> {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
@@ -7172,11 +7186,11 @@ mod ui_tests {
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
         let mut harness = lightbox_harness(view, egui::vec2(1000.0, 720.0));
-        harness.run();
+        settle(&mut harness);
         open_viewer(&mut harness, 0, 0);
 
         harness.get_by_label_contains("Text").click();
-        harness.run();
+        settle(&mut harness);
         assert!(
             harness.query_all_by_label_contains("hello alpha").count() > 0,
             "A's readable text is previewed on the Text tab"
@@ -7185,9 +7199,9 @@ mod ui_tests {
         // Raw bytes live on the Hex tab now: with B revealed it is the aligned,
         // paginated hex diff of the two files — equal bytes lined up, marked.
         harness.get_by_label_contains("SHOW B").click();
-        harness.run();
+        settle(&mut harness);
         harness.get_by_label_contains("Hex").click();
-        harness.run();
+        settle(&mut harness);
         // The page number itself is an editable DragValue, flanked by "page"
         // and "/ total" captions.
         assert!(
