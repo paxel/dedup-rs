@@ -508,9 +508,9 @@ fn diff_totals(rows: &[RepoDiffRow]) -> [usize; 4] {
     let mut totals = [0usize; 4];
     for row in rows {
         match row.relation {
-            R::Equal => totals[3] += 1,
-            R::OnlyLeft | R::OnlyRight => totals[1] += 1,
-            R::Renamed | R::Conflict => totals[2] += 1,
+            R::Equal => totals[3] = totals[3].saturating_add(1),
+            R::OnlyLeft | R::OnlyRight => totals[1] = totals[1].saturating_add(1),
+            R::Renamed | R::Conflict => totals[2] = totals[2].saturating_add(1),
         }
     }
     totals
@@ -683,7 +683,7 @@ fn build_group_preview(
         // builds a `DiffRun` with no selection), so offering HIDE would promise
         // to skip a deletion and then make it anyway.
         for rel in &plan.copies {
-            added += 1;
+            added = added.saturating_add(1);
             if rows.len() < PREVIEW_CAP {
                 // A push can also resurrect: content this sink deleted that
                 // the main still holds comes back. Golden rule: the main's
@@ -710,7 +710,7 @@ fn build_group_preview(
             }
         }
         for rel in &plan.deletes {
-            removed += 1;
+            removed = removed.saturating_add(1);
             if rows.len() < PREVIEW_CAP {
                 let (meta, body) = board_row(
                     SideSpec::absent(),
@@ -778,16 +778,16 @@ fn build_group_back_preview(
         let main_facts = facts_for(main_db.as_deref(), main_base.as_deref(), &item.rel_path);
         let conflict = main_facts.as_ref().is_some_and(|f| !f.missing);
         let main_status = if conflict {
-            conflict_count += 1;
+            conflict_count = conflict_count.saturating_add(1);
             board::Status::Differs
         } else {
             match item.kind {
                 dedup_core::diff::PullKind::New => {
-                    new_count += 1;
+                    new_count = new_count.saturating_add(1);
                     board::Status::OnlyHere
                 }
                 dedup_core::diff::PullKind::Resurrection => {
-                    resurrect_count += 1;
+                    resurrect_count = resurrect_count.saturating_add(1);
                     board::Status::Resurrect
                 }
             }
@@ -1033,7 +1033,7 @@ fn preview_repo(
     for item in &items {
         match item {
             DiffItem::New { rel_path } => {
-                acted += 1;
+                acted = acted.saturating_add(1);
                 if rows.len() < PREVIEW_CAP {
                     let to = if subdir.is_empty() {
                         rel_path.clone()
@@ -1059,7 +1059,7 @@ fn preview_repo(
                 }
             }
             DiffItem::Equal { rel_path, .. } => {
-                unchanged += 1;
+                unchanged = unchanged.saturating_add(1);
                 if rows.len() < PREVIEW_CAP {
                     let (meta, body) = board_row(
                         SideSpec::at(
@@ -1085,7 +1085,7 @@ fn preview_repo(
             // visible blue row: the file's preview under a WAS DELETED veil,
             // informational only (no APPLY — the engine will not copy it).
             DiffItem::DeletedInReference { rel_path } => {
-                skipped_deleted += 1;
+                skipped_deleted = skipped_deleted.saturating_add(1);
                 if rows.len() < PREVIEW_CAP {
                     // Golden rule: the source file exists and nothing happens
                     // to it — plain preview. The *target* side tells its own
@@ -1999,8 +1999,10 @@ impl TransferView {
         crate::lcars::section_lcars_folding(ui, title, theme::lilac(), &mut open, |ui| {
             if with_target {
                 ui.columns(2, |cols| {
-                    self.source_column(&mut cols[0], acts);
-                    self.target_column(&mut cols[1], acts);
+                    if let [source, target] = cols {
+                        self.source_column(source, acts);
+                        self.target_column(target, acts);
+                    }
                 });
             } else {
                 self.source_column(ui, acts);
@@ -2018,7 +2020,10 @@ impl TransferView {
             let src = self.repos.clone();
             let mains = self.mains.clone();
             crate::repo_chip::chip_row(ui, "xfer_source", "SOURCE", src.len(), |ui, i| {
-                let name = &src[i];
+                // `chip_row` only asks for indices below the length it was given.
+                let Some(name) = src.get(i) else {
+                    return ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover());
+                };
                 let sel = self.source.as_deref() == Some(name.as_str());
                 let chip = crate::repo_chip::repo_chip(
                     ui,
@@ -2059,7 +2064,10 @@ impl TransferView {
                     .collect();
                 let mains = self.mains.clone();
                 crate::repo_chip::chip_row(ui, "xfer_target", "TARGET", tgt.len(), |ui, i| {
-                    let name = &tgt[i];
+                    // `chip_row` only asks for indices below the length it was given.
+                    let Some(name) = tgt.get(i) else {
+                        return ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover());
+                    };
                     let sel = self.target.as_deref() == Some(name.as_str());
                     let chip = crate::repo_chip::repo_chip(
                         ui,
@@ -2132,7 +2140,10 @@ impl TransferView {
                 });
                 let mains = self.mains.clone();
                 crate::repo_chip::chip_row(ui, "xfer_pool", "", eligible.len(), |ui, i| {
-                    let name = &eligible[i];
+                    // `chip_row` only asks for indices below the length it was given.
+                    let Some(name) = eligible.get(i) else {
+                        return ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover());
+                    };
                     let sel = self.extra_refs.iter().any(|r| r == name);
                     let chip = crate::repo_chip::repo_chip(
                         ui,
@@ -2560,7 +2571,10 @@ impl TransferView {
                 return;
             };
             crate::repo_chip::chip_row(ui, "xfer_back_sink", "", group.sinks.len(), |ui, i| {
-                let sink = &group.sinks[i];
+                // `chip_row` only asks for indices below `group.sinks.len()`.
+                let Some(sink) = group.sinks.get(i) else {
+                    return ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover());
+                };
                 let mode = sink_mode_label(sink.mode);
                 let sel = self
                     .selected_sinks
@@ -2638,7 +2652,10 @@ impl TransferView {
                 }
             });
             crate::repo_chip::chip_row(ui, "xfer_sinks", "", group.sinks.len(), |ui, i| {
-                let sink = &group.sinks[i];
+                // `chip_row` only asks for indices below `group.sinks.len()`.
+                let Some(sink) = group.sinks.get(i) else {
+                    return ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover());
+                };
                 let mode = sink_mode_label(sink.mode);
                 let sel = self.selected_sinks.iter().any(|s| s == &sink.repo);
                 let accent = sink_mode_accent(sink.mode);
@@ -2957,7 +2974,11 @@ impl TransferView {
     /// no `Conflict`, BY PATH no `Renamed`.
     fn offered_bulk_ops(&self, listed: &[usize]) -> Vec<BulkOp> {
         let mut ops = Vec::new();
-        let has = |want: DiffRelation| listed.iter().any(|&i| self.diff_rows[i].relation == want);
+        let has = |want: DiffRelation| {
+            listed
+                .iter()
+                .any(|&i| self.diff_rows.get(i).is_some_and(|r| r.relation == want))
+        };
         if has(DiffRelation::OnlyLeft) {
             ops.push(BulkOp::CopyMissingRight);
         }
@@ -2976,7 +2997,9 @@ impl TransferView {
         use crate::diff_board::BoardAction;
         let mut plan = Vec::new();
         for &i in listed {
-            let row = &self.diff_rows[i];
+            let Some(row) = self.diff_rows.get(i) else {
+                continue;
+            };
             match (op, row.relation) {
                 (BulkOp::CopyMissingRight, DiffRelation::OnlyLeft) => {
                     for f in &row.left {
@@ -3122,7 +3145,10 @@ impl TransferView {
                 },
                 &mut self.thumbs,
                 &mut |i| {
-                    let row = &rows[i];
+                    // The board only asks for rows it was given.
+                    let Some(row) = rows.get(i) else {
+                        return board::RowBody::default();
+                    };
                     let side = |files: &[dedup_core::diff::DiffFile],
                                 db: Option<&redb::Database>,
                                 base: Option<&str>,
@@ -3658,7 +3684,7 @@ impl TransferView {
         self.pending_group_confirm = None;
         self.wholesale_sinks.clear();
         self.preview.clear();
-        self.preview_gen += 1;
+        self.preview_gen = self.preview_gen.saturating_add(1);
         self.diff_rows.clear();
         // A popup (and an open comparison) belongs to the rows it was opened
         // from.
@@ -4051,7 +4077,10 @@ impl TransferView {
         // slot, and the resurrection count is spoken in the status line and
         // shown as the blue rows themselves.
         self.preview_totals = [0, outcome.added, outcome.conflicts, 0];
-        self.preview_total = outcome.added + outcome.removed + outcome.conflicts;
+        self.preview_total = outcome
+            .added
+            .saturating_add(outcome.removed)
+            .saturating_add(outcome.conflicts);
         self.preview_source_header = outcome.main_header.clone();
         self.preview_target_header = outcome
             .group
@@ -4061,7 +4090,7 @@ impl TransferView {
             .unwrap_or_default();
         self.wholesale_sinks = Vec::new();
         self.preview = outcome.rows;
-        self.preview_gen += 1;
+        self.preview_gen = self.preview_gen.saturating_add(1);
         self.preview_bodies = outcome.bodies;
         let conflicts_line = if outcome.conflicts > 0 {
             format!(
@@ -4115,7 +4144,7 @@ impl TransferView {
             }
         };
         self.preview_totals = [outcome.removed, outcome.added, 0, 0];
-        self.preview_total = outcome.added + outcome.removed;
+        self.preview_total = outcome.added.saturating_add(outcome.removed);
         // The left header names the main like every other surface does — by its
         // path, not its bare name. The right one says how many sinks the push
         // covers; each row names the sink it belongs to with its own chip.
@@ -4132,7 +4161,7 @@ impl TransferView {
         // The board sorts through its own index; the caller just hands over the
         // rows and their bodies, index-aligned.
         self.preview = outcome.rows;
-        self.preview_gen += 1;
+        self.preview_gen = self.preview_gen.saturating_add(1);
         self.preview_bodies = outcome.bodies;
         self.status = Some(format!(
             "{} file(s) to copy, {} to delete across {} sink(s).",
@@ -4349,10 +4378,10 @@ impl TransferView {
                     &run,
                 ) {
                     Ok(stats) => {
-                        copied += stats.copied;
-                        deleted += stats.deleted;
-                        skipped_files += stats.skipped;
-                        errors += stats.errors;
+                        copied = copied.saturating_add(stats.copied);
+                        deleted = deleted.saturating_add(stats.deleted);
+                        skipped_files = skipped_files.saturating_add(stats.skipped);
+                        errors = errors.saturating_add(stats.errors);
                         cancelled |= stats.cancelled;
                     }
                     Err(e) => failures.push(format!("{}: {e}", sink.repo)),
@@ -4429,7 +4458,7 @@ impl TransferView {
         self.preview_source_header = data.source_header;
         self.preview_target_header = data.target_header;
         self.preview = data.rows;
-        self.preview_gen += 1;
+        self.preview_gen = self.preview_gen.saturating_add(1);
         self.preview_bodies = data.bodies;
         self.status = Some(data.status);
         self.error = None;
@@ -4684,15 +4713,19 @@ impl TransferView {
                     // Not produced by `bulk_plan`.
                     _ => continue,
                 };
-                progress.phase(format!("{verb} {rel}"), i as u64 + 1, Some(total));
+                progress.phase(
+                    format!("{verb} {rel}"),
+                    (i as u64).saturating_add(1),
+                    Some(total),
+                );
                 match outcome {
                     Ok(()) => {
-                        done += 1;
+                        done = done.saturating_add(1);
                         progress.record(&crate::activity::Notification::changed(did, &repo, &rel));
                     }
                     Err(e) => {
                         log::warn!("bulk action failed: {e}");
-                        failed += 1;
+                        failed = failed.saturating_add(1);
                         let e = e.to_string();
                         progress.problem(format!("{rel}: {e}"));
                         progress
@@ -4790,7 +4823,7 @@ impl TransferView {
                     for rel_path in &rel_paths {
                         match delete_file(&store, &repo, rel_path) {
                             Ok(()) => {
-                                deleted += 1;
+                                deleted = deleted.saturating_add(1);
                                 progress.record(&Notification::changed("Deleted", &repo, rel_path));
                             }
                             Err(e) => {

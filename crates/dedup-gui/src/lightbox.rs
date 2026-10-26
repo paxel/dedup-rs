@@ -468,11 +468,12 @@ pub fn other_member_indices(total_group_len: usize, left_idx: usize) -> Vec<usiz
 /// Format the Right-side switcher label for `other_sel` index within `others` list.
 /// Returns `<current / total_others>` e.g. `<1 / 3>` for a 4-file group with 3 other files.
 pub fn format_other_switcher_label(other_sel: usize, total_others: usize) -> String {
-    if total_others == 0 {
-        "0/0".to_string()
-    } else {
-        let current = (other_sel % total_others) + 1;
-        format!("<{current} / {total_others}>")
+    match other_sel.checked_rem(total_others) {
+        None => "0/0".to_string(),
+        Some(rem) => {
+            let current = rem.saturating_add(1);
+            format!("<{current} / {total_others}>")
+        }
     }
 }
 
@@ -652,7 +653,7 @@ pub fn draw_metadata_column(ui: &mut egui::Ui, source: &Path, body: MetaBody<'_>
             const KEBAB_W: f32 = 36.0;
             let gap = ui.spacing().item_spacing.x;
             let field_w = (ui.available_width() - LABEL_W - KEBAB_W - 2.0 * gap - 4.0).max(60.0);
-            for (i, (label, val)) in fields.into_iter().enumerate() {
+            for ((label, val), opts) in fields.into_iter().zip(options.iter()) {
                 ui.horizontal(|ui| {
                     ui.add_sized(
                         [LABEL_W, 18.0],
@@ -663,9 +664,9 @@ pub fn draw_metadata_column(ui: &mut egui::Ui, source: &Path, body: MetaBody<'_>
                     // options for this field" kebab (⋮), not a directional
                     // caret — the value is pulled *into* this field, never
                     // pushed to the other side.
-                    if !options[i].is_empty() {
+                    if !opts.is_empty() {
                         ui.menu_button("⋮", |ui| {
-                            for o in &options[i] {
+                            for o in opts {
                                 if ui.button(RichText::new(o).color(theme::text())).clicked() {
                                     *val = o.clone();
                                 }
@@ -893,8 +894,10 @@ pub fn load_text_preview(path: &Path) -> TextPreview {
     use std::io::Read;
 
     let mut buf = Vec::new();
-    let read = std::fs::File::open(path)
-        .and_then(|f| f.take(TEXT_PREVIEW_BYTES as u64 + 1).read_to_end(&mut buf));
+    let read = std::fs::File::open(path).and_then(|f| {
+        f.take((TEXT_PREVIEW_BYTES as u64).saturating_add(1))
+            .read_to_end(&mut buf)
+    });
     if let Err(e) = read {
         return TextPreview {
             body: String::new(),
@@ -922,7 +925,7 @@ pub fn load_text_preview(path: &Path) -> TextPreview {
         Err(_) => {
             let shown = buf.len().min(HEX_DUMP_BYTES);
             TextPreview {
-                body: hex_dump(&buf[..shown]),
+                body: hex_dump(buf.get(..shown).unwrap_or_default()),
                 is_text: false,
                 truncated: truncated || shown < buf.len(),
                 error: None,
@@ -937,8 +940,10 @@ pub fn load_text_preview(path: &Path) -> TextPreview {
 pub(crate) fn hex_head_preview(path: &Path) -> TextPreview {
     use std::io::Read;
     let mut buf = Vec::new();
-    let read = std::fs::File::open(path)
-        .and_then(|f| f.take(HEX_DUMP_BYTES as u64 + 1).read_to_end(&mut buf));
+    let read = std::fs::File::open(path).and_then(|f| {
+        f.take((HEX_DUMP_BYTES as u64).saturating_add(1))
+            .read_to_end(&mut buf)
+    });
     if let Err(e) = read {
         return TextPreview {
             body: String::new(),
@@ -950,7 +955,7 @@ pub(crate) fn hex_head_preview(path: &Path) -> TextPreview {
     let truncated = buf.len() > HEX_DUMP_BYTES;
     let shown = buf.len().min(HEX_DUMP_BYTES);
     TextPreview {
-        body: hex_dump(&buf[..shown]),
+        body: hex_dump(buf.get(..shown).unwrap_or_default()),
         is_text: false,
         truncated,
         error: None,
@@ -961,7 +966,7 @@ pub(crate) fn hex_head_preview(path: &Path) -> TextPreview {
 fn hex_dump(bytes: &[u8]) -> String {
     let mut out = String::new();
     for (i, chunk) in bytes.chunks(16).enumerate() {
-        out.push_str(&format!("{:08x}  ", i * 16));
+        out.push_str(&format!("{:08x}  ", i.saturating_mul(16)));
         for (j, b) in chunk.iter().enumerate() {
             out.push_str(&format!("{b:02x} "));
             if j == 7 {
@@ -1098,15 +1103,17 @@ impl CompareState {
     }
 
     pub fn pan_by(&mut self, delta: Vec2) {
-        self.pan += delta;
+        self.pan = Vec2::new(self.pan.x + delta.x, self.pan.y + delta.y);
     }
 
     /// Screen rectangle for `img` fitted into `pane`, then scaled by the shared
     /// zoom and shifted by the shared pan (so both panes track together).
     pub fn pane_rect(&self, pane: Rect, img: Vec2) -> Rect {
         let fit = (pane.width() / img.x).min(pane.height() / img.y);
-        let size = img * (fit * self.zoom);
-        Rect::from_center_size(pane.center() + self.pan, size)
+        let scale = fit * self.zoom;
+        let size = egui::vec2(img.x * scale, img.y * scale);
+        let c = pane.center();
+        Rect::from_center_size(egui::pos2(c.x + self.pan.x, c.y + self.pan.y), size)
     }
 }
 
@@ -1157,7 +1164,7 @@ pub fn draw_compare(
     }
     let tag = |ui: &egui::Ui, pane: Rect, text: &str| {
         ui.painter().text(
-            pane.min + egui::vec2(6.0, 6.0),
+            egui::pos2(pane.min.x + 6.0, pane.min.y + 6.0),
             egui::Align2::LEFT_TOP,
             text,
             egui::FontId::proportional(18.0),
@@ -1206,7 +1213,7 @@ pub fn draw_in_pane(ui: &egui::Ui, pane: Rect, rect: Rect, tex: &Option<TextureH
 /// `size` fitted into `target`, centred.
 pub fn fit_rect(target: Rect, size: Vec2) -> Rect {
     let s = (target.width() / size.x).min(target.height() / size.y);
-    Rect::from_center_size(target.center(), size * s)
+    Rect::from_center_size(target.center(), egui::vec2(size.x * s, size.y * s))
 }
 
 #[cfg(test)]

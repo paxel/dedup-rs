@@ -142,11 +142,11 @@ pub fn convert_to_pdf(doc: &Path, out_dir: &Path) -> Option<PathBuf> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let started = Instant::now();
     let ok = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.success(),
-            Ok(None) if Instant::now() < deadline => {
+            Ok(None) if started.elapsed() < Duration::from_secs(60) => {
                 std::thread::sleep(Duration::from_millis(100));
             }
             _ => {

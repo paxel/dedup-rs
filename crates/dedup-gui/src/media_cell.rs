@@ -346,7 +346,7 @@ pub fn media_cell(
             egui::StrokeKind::Inside,
         );
         let glyph = egui::Rect::from_min_max(
-            rect.min + egui::vec2(8.0, 8.0),
+            egui::pos2(rect.min.x + 8.0, rect.min.y + 8.0),
             egui::pos2(rect.max.x - 8.0, rect.max.y - bottom),
         );
         paint_audio_glyph(&painter, glyph, seed);
@@ -548,8 +548,9 @@ fn paint_overlay(
     );
     let font = egui::FontId::proportional(if large { 17.0 } else { 10.0 });
     let galley = painter.layout_no_wrap(overlay.label().to_string(), font, color);
-    let pos = rect.center() - galley.size() / 2.0;
-    let chip = egui::Rect::from_min_size(pos, galley.size()).expand(if large { 5.0 } else { 2.0 });
+    let (center, size) = (rect.center(), galley.size());
+    let pos = egui::pos2(center.x - size.x / 2.0, center.y - size.y / 2.0);
+    let chip = egui::Rect::from_min_size(pos, size).expand(if large { 5.0 } else { 2.0 });
     painter.rect_filled(chip, 4.0, egui::Color32::from_black_alpha(170));
     painter.galley(pos, galley, color);
 }
@@ -585,10 +586,11 @@ fn paint_extension_badge(
     let font = egui::FontId::proportional(size);
     let galley = painter.layout_no_wrap(ext, font, color);
     let pos = if centered {
-        rect.center() - galley.size() / 2.0
+        let (center, size) = (rect.center(), galley.size());
+        egui::pos2(center.x - size.x / 2.0, center.y - size.y / 2.0)
     } else {
         // Tucked into the top-left, leaving the centre to the status word.
-        rect.min + egui::vec2(6.0, 5.0)
+        egui::pos2(rect.min.x + 6.0, rect.min.y + 5.0)
     };
     let chip = egui::Rect::from_min_size(pos, galley.size()).expand(if large { 6.0 } else { 3.0 });
     painter.rect_filled(chip, 4.0, egui::Color32::from_black_alpha(150));
@@ -609,14 +611,21 @@ pub(crate) fn paint_audio_glyph(painter: &egui::Painter, rect: egui::Rect, seed:
         theme::blue(),
         theme::orange(),
     ];
-    let accent = palette[seed[0] as usize % palette.len()];
+    // `palette` is non-empty, so the cycle always yields and the fallback
+    // never applies.
+    let accent = palette
+        .iter()
+        .cycle()
+        .nth(seed[0] as usize)
+        .copied()
+        .unwrap_or(theme::amber());
     let bars = 15usize;
     let gap = 3.0;
     let bar_w = ((rect.width() - gap * (bars as f32 - 1.0)) / bars as f32).max(1.0);
     let mid_y = rect.center().y;
     let max_amp = rect.height() * 0.45;
-    for i in 0..bars {
-        let amp = (0.15 + (seed[i % seed.len()] as f32 / 255.0) * 0.85) * max_amp;
+    for (i, &byte) in seed.iter().cycle().take(bars).enumerate() {
+        let amp = (0.15 + (byte as f32 / 255.0) * 0.85) * max_amp;
         let x = rect.left() + i as f32 * (bar_w + gap);
         painter.rect_filled(
             egui::Rect::from_min_max(

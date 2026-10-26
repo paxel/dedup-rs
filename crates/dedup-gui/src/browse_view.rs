@@ -562,7 +562,10 @@ impl BrowseView {
             return;
         }
         // Invalidate any previous worker, then claim this folder.
-        let generation = self.prefetch_gen.fetch_add(1, Ordering::Relaxed) + 1;
+        let generation = self
+            .prefetch_gen
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         self.prefetch_key = Some(key);
         self.prefetch_alive = true;
         // Nearest-first from the current selection: the order the user would
@@ -570,22 +573,22 @@ impl BrowseView {
         let sel = self.file_sel.min(files.len().saturating_sub(1));
         let mut order: Vec<usize> = Vec::with_capacity(files.len());
         let mut lo = sel as isize;
-        let mut hi = sel as isize + 1;
+        let mut hi = (sel as isize).saturating_add(1);
         while lo >= 0 || (hi as usize) < files.len() {
             if lo >= 0 {
                 order.push(lo as usize);
-                lo -= 1;
+                lo = lo.saturating_sub(1);
             }
             if (hi as usize) < files.len() {
                 order.push(hi as usize);
-                hi += 1;
+                hi = hi.saturating_add(1);
             }
         }
         let jobs: Vec<(std::path::PathBuf, String, String, u64)> = order
             .into_iter()
-            .filter(|&i| !files[i].missing)
-            .map(|i| {
-                let f = &files[i];
+            .filter_map(|i| files.get(i))
+            .filter(|f| !f.missing)
+            .map(|f| {
                 (
                     std::path::Path::new(&root).join(&f.rel),
                     dedup_core::thumbnail::hash_hex(&f.hash),
@@ -620,7 +623,7 @@ impl BrowseView {
                 }
                 // 2. Warm the bytes themselves (budgeted), in chunks so a
                 // cancel lands mid-file rather than after it.
-                if size <= WARM_FILE_CAP && warmed + size <= WARM_TOTAL_CAP {
+                if size <= WARM_FILE_CAP && warmed.saturating_add(size) <= WARM_TOTAL_CAP {
                     use std::io::Read;
                     if let Ok(mut f) = std::fs::File::open(&path) {
                         let mut buf = vec![0u8; 4 * 1024 * 1024];
@@ -630,7 +633,7 @@ impl BrowseView {
                             }
                             match f.read(&mut buf) {
                                 Ok(0) => break,
-                                Ok(n) => warmed += n as u64,
+                                Ok(n) => warmed = warmed.saturating_add(n as u64),
                                 Err(_) => break,
                             }
                         }
@@ -725,7 +728,10 @@ impl BrowseView {
                         self.dir_sel = self.dir_sel.saturating_sub(1);
                     }
                     if down && !dirs.is_empty() {
-                        self.dir_sel = (self.dir_sel + 1).min(dirs.len() - 1);
+                        self.dir_sel = self
+                            .dir_sel
+                            .saturating_add(1)
+                            .min(dirs.len().saturating_sub(1));
                     }
                     if left {
                         self.go_parent();
@@ -742,7 +748,10 @@ impl BrowseView {
                         self.selected.clear();
                     }
                     if down && files_len > 0 {
-                        self.file_sel = (self.file_sel + 1).min(files_len - 1);
+                        self.file_sel = self
+                            .file_sel
+                            .saturating_add(1)
+                            .min(files_len.saturating_sub(1));
                         self.scroll_file = true;
                         self.selected.clear();
                     }
@@ -785,7 +794,10 @@ impl BrowseView {
                 theme::amber(),
                 |ui| {
                     crate::repo_chip::chip_row(ui, "browse_repo", "", repos.len(), |ui, i| {
-                        let name = &repos[i];
+                        // `chip_row` only asks for indices below `repos.len()`.
+                        let Some(name) = repos.get(i) else {
+                            return ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover());
+                        };
                         let sel = self.repo.as_deref() == Some(name.as_str());
                         let chip = crate::repo_chip::repo_chip(
                             ui,
@@ -904,7 +916,7 @@ impl BrowseView {
                                 for (i, seg) in segs.iter().enumerate() {
                                     ui.label(RichText::new("›").color(theme::hairline()));
                                     if ui.link(RichText::new(seg).color(theme::lilac())).clicked() {
-                                        self.cur.truncate(i + 1);
+                                        self.cur.truncate(i.saturating_add(1));
                                         self.dir_sel = 0;
                                         self.file_sel = 0;
                                         self.selected.clear();
@@ -1187,11 +1199,14 @@ impl BrowseView {
         let entries = &self.entries;
         let index = &self.entry_index;
         let mut body = |i: usize| -> crate::board::RowBody {
-            let f = &files[i];
-            let facts = index
-                .get(&f.rel)
-                .and_then(|&k| entries.get(k))
-                .map(|(_, e)| crate::media_cell::FileFacts::from_entry(e, root_path.join(&f.rel)));
+            let facts = files.get(i).and_then(|f| {
+                index
+                    .get(&f.rel)
+                    .and_then(|&k| entries.get(k))
+                    .map(|(_, e)| {
+                        crate::media_cell::FileFacts::from_entry(e, root_path.join(&f.rel))
+                    })
+            });
             crate::board::RowBody {
                 left: crate::board::SideBody {
                     facts,
@@ -1236,7 +1251,7 @@ impl BrowseView {
                 } else if shift {
                     // Shift-click extends the selection over the range from the cursor.
                     let (lo, hi) = (self.file_sel.min(a.row), self.file_sel.max(a.row));
-                    for f in &files[lo..=hi] {
+                    for f in files.get(lo..=hi).unwrap_or_default() {
                         self.selected.insert(f.rel.clone());
                     }
                 } else {
@@ -2192,7 +2207,7 @@ impl BrowseView {
             if !tags.iter().any(|t| t == tag) {
                 tags.push(tag.to_string());
                 match store.set_annotations(&repo, &rel, &tags) {
-                    Ok(()) => tagged += 1,
+                    Ok(()) => tagged = tagged.saturating_add(1),
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
@@ -2215,7 +2230,12 @@ impl BrowseView {
 /// vendored Phosphor subset has no tag icon, so we paint one so annotations read
 /// as tags everywhere.
 fn tag_glyph(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
-    let s = |x: f32, y: f32| rect.min + egui::vec2(rect.width() * x, rect.height() * y);
+    let s = |x: f32, y: f32| {
+        egui::pos2(
+            rect.min.x + rect.width() * x,
+            rect.min.y + rect.height() * y,
+        )
+    };
     let pts = vec![
         s(0.08, 0.5),
         s(0.44, 0.14),
@@ -2363,8 +2383,13 @@ fn paint_chip(
         if fill.a() > 0 {
             ui.painter().rect_filled(rect, 6.0, fill);
         }
-        ui.painter()
-            .text(rect.min + pad, egui::Align2::LEFT_TOP, text, font, fg);
+        ui.painter().text(
+            egui::pos2(rect.min.x + pad.x, rect.min.y + pad.y),
+            egui::Align2::LEFT_TOP,
+            text,
+            font,
+            fg,
+        );
     }
     // Accessibility + testability: expose it as a labelled, selectable widget.
     resp.widget_info(|| {
@@ -2416,9 +2441,12 @@ fn read_head(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
     let mut buf = vec![0u8; max];
     let mut filled = 0;
     while filled < max {
-        match f.read(&mut buf[filled..])? {
+        let Some(rest) = buf.get_mut(filled..) else {
+            break;
+        };
+        match f.read(rest)? {
             0 => break,
-            n => filled += n,
+            n => filled = filled.saturating_add(n),
         }
     }
     buf.truncate(filled);
@@ -2436,7 +2464,7 @@ fn build_text(bytes: &[u8]) -> Preview {
 /// A classic 16-byte-per-row hex dump of the header plus the printable ASCII
 /// runs (≥4 chars) found in it — the "unknown binary" fallback preview.
 fn build_bytes(bytes: &[u8]) -> Preview {
-    let head = &bytes[..bytes.len().min(256)];
+    let head = bytes.get(..256).unwrap_or(bytes);
     let mut hex = Vec::new();
     for (row, chunk) in head.chunks(16).enumerate() {
         let mut cols = String::new();
@@ -2453,7 +2481,11 @@ fn build_bytes(bytes: &[u8]) -> Preview {
                 }
             })
             .collect();
-        hex.push(format!("{:04x}  {:<48} {ascii}", row * 16, cols));
+        hex.push(format!(
+            "{:04x}  {:<48} {ascii}",
+            row.saturating_mul(16),
+            cols
+        ));
     }
     let strings = dedup_core::strings::printable_strings(bytes, 4, 40);
     Preview::Bytes { hex, strings }

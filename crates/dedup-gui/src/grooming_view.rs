@@ -641,7 +641,10 @@ impl GroomingView {
             let src = self.repos.clone();
             let mains = self.mains.clone();
             crate::repo_chip::chip_row(ui, "groom_source", "SOURCE", src.len(), |ui, i| {
-                let name = &src[i];
+                // `chip_row` only asks for `i < len`; the fallback never shows.
+                let Some(name) = src.get(i) else {
+                    return ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover());
+                };
                 let sel = self.source.as_deref() == Some(name.as_str());
                 let chip = crate::repo_chip::repo_chip(
                     ui,
@@ -698,7 +701,10 @@ impl GroomingView {
             });
             let mains = self.mains.clone();
             crate::repo_chip::chip_row(ui, "groom_pool", "", pool.len(), |ui, i| {
-                let name = &pool[i];
+                // `chip_row` only asks for `i < len`; the fallback never shows.
+                let Some(name) = pool.get(i) else {
+                    return ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover());
+                };
                 let sel = self.pool.iter().any(|r| r == name);
                 let chip = crate::repo_chip::repo_chip(
                     ui,
@@ -814,10 +820,13 @@ impl GroomingView {
         i: usize,
         acts: &mut Vec<Act>,
     ) {
-        let title = format!("RULE {} — MATCH & RENAME", i + 1);
+        let title = format!("RULE {} — MATCH & RENAME", i.saturating_add(1));
         crate::lcars::section_lcars_collapsible(ui, &title, theme::blue(), true, |ui| {
             // The rule's filter (which files this rule applies to).
-            let outcome = self.rules[i].filter.ui(ui, store, repo, self.verbosity);
+            let Some(rule) = self.rules.get_mut(i) else {
+                return;
+            };
+            let outcome = rule.filter.ui(ui, store, repo, self.verbosity);
             if outcome.changed {
                 self.clear_preview();
             }
@@ -828,9 +837,12 @@ impl GroomingView {
             let template_id = egui::Id::new(("organize_template", i));
             ui.horizontal(|ui| {
                 ui.label(RichText::new("TEMPLATE").color(theme::text()).size(12.0));
+                let Some(rule) = self.rules.get_mut(i) else {
+                    return;
+                };
                 let changed = ui
                     .add(
-                        egui::TextEdit::singleline(&mut self.rules[i].template)
+                        egui::TextEdit::singleline(&mut rule.template)
                             .id(template_id)
                             .desired_width(360.0)
                             .hint_text(DEFAULT_TEMPLATE),
@@ -871,13 +883,9 @@ impl GroomingView {
                                 .fill(theme::panel()),
                         )
                         .clicked()
+                        && let Some(rule) = self.rules.get_mut(i)
                     {
-                        insert_at_cursor(
-                            ui.ctx(),
-                            template_id,
-                            &mut self.rules[i].template,
-                            insert,
-                        );
+                        insert_at_cursor(ui.ctx(), template_id, &mut rule.template, insert);
                         self.clear_preview();
                     }
                 }
@@ -974,7 +982,10 @@ impl GroomingView {
             let repos = self.repos.clone();
             let mains = self.mains.clone();
             crate::repo_chip::chip_row(ui, "groom_repo", "", repos.len(), |ui, i| {
-                let name = &repos[i];
+                // `chip_row` only asks for `i < len`; the fallback never shows.
+                let Some(name) = repos.get(i) else {
+                    return ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover());
+                };
                 let sel = self.repo.as_deref() == Some(name.as_str());
                 let chip = crate::repo_chip::repo_chip(
                     ui,
@@ -1233,13 +1244,13 @@ impl GroomingView {
 
     /// The next unused `Preset #n` name, based on what's already saved.
     fn next_preset_name(&self) -> String {
-        let mut n = self.presets.len() + 1;
+        let mut n = self.presets.len().saturating_add(1);
         loop {
             let candidate = format!("Preset #{n}");
             if !self.presets.iter().any(|p| p.name == candidate) {
                 return candidate;
             }
-            n += 1;
+            n = n.saturating_add(1);
         }
     }
 
@@ -1691,7 +1702,7 @@ impl GroomingView {
                         );
                         match delete_empty_dirs(&store, r) {
                             Ok(n) => {
-                                removed += n;
+                                removed = removed.saturating_add(n);
                                 if n > 0 {
                                     progress.record(&crate::activity::Notification::changed(
                                         "Removed empty directories",
@@ -2245,7 +2256,7 @@ fn insert_at_cursor(ctx: &egui::Context, id: egui::Id, template: &mut String, te
         .map(|(b, _)| b)
         .unwrap_or(template.len());
     template.insert_str(byte, text);
-    let after = egui::text::CCursor::new(at + text.chars().count());
+    let after = egui::text::CCursor::new(at.saturating_add(text.chars().count()));
     state
         .cursor
         .set_char_range(Some(egui::text::CCursorRange::one(after)));

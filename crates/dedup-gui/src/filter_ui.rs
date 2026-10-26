@@ -211,12 +211,19 @@ fn parse_conditions(expr: &str) -> (Vec<FilterCond>, bool) {
         if !expr.is_char_boundary(i) {
             continue;
         }
-        if !(i == 0 || bytes[i - 1].is_ascii_whitespace()) {
+        let at_word_start = match i.checked_sub(1) {
+            None => true,
+            Some(prev) => bytes.get(prev).is_some_and(u8::is_ascii_whitespace),
+        };
+        if !at_word_start {
             continue;
         }
-        let (rest, negated) = match expr[i..].strip_prefix('!') {
+        let Some(tail) = expr.get(i..) else {
+            continue;
+        };
+        let (rest, negated) = match tail.strip_prefix('!') {
             Some(r) => (r, true),
-            None => (&expr[i..], false),
+            None => (tail, false),
         };
         if rest.starts_with("case:") {
             starts.push((i, None, negated));
@@ -231,14 +238,27 @@ fn parse_conditions(expr: &str) -> (Vec<FilterCond>, bool) {
     let mut conds = Vec::new();
     let mut case_insensitive = false;
     for (idx, &(start, kind, negated)) in starts.iter().enumerate() {
-        let end = starts.get(idx + 1).map(|(s, ..)| *s).unwrap_or(expr.len());
+        let end = starts
+            .get(idx.saturating_add(1))
+            .map(|(s, ..)| *s)
+            .unwrap_or(expr.len());
         // Skip the optional '!' and the "<prefix>:" opening this group.
-        let after_bang = start + usize::from(negated);
+        let after_bang = start.saturating_add(usize::from(negated));
         let Some(kind) = kind else {
-            case_insensitive |= expr[after_bang + "case:".len()..end].trim() == "insensitive";
+            case_insensitive |= expr
+                .get(after_bang.saturating_add("case:".len())..end)
+                .is_some_and(|v| v.trim() == "insensitive");
             continue;
         };
-        let value = expr[after_bang + kind.prefix().len() + 1..end]
+        // The range is in bounds by construction: group starts are char
+        // boundaries and every prefix is ASCII.
+        let value = expr
+            .get(
+                after_bang
+                    .saturating_add(kind.prefix().len())
+                    .saturating_add(1)..end,
+            )
+            .unwrap_or_default()
             .trim()
             .to_string();
         if !value.is_empty() {
@@ -844,7 +864,7 @@ impl FilterBuilder {
                     if shown >= HISTORY_LIMIT {
                         break;
                     }
-                    shown += 1;
+                    shown = shown.saturating_add(1);
                     if ui
                         .add(
                             egui::Button::new(
@@ -1062,7 +1082,7 @@ impl FilterBuilder {
     fn schedule_count(&mut self) {
         let has_name = self.filters.iter().any(|c| c.kind == FilterKind::Name);
         if self.repo.is_some() && has_name {
-            self.count_deadline = Some(Instant::now() + COUNT_DEBOUNCE);
+            self.count_deadline = Instant::now().checked_add(COUNT_DEBOUNCE);
             self.count_result = None;
         } else {
             self.count_deadline = None;
@@ -1079,14 +1099,14 @@ impl FilterBuilder {
         };
         let now = Instant::now();
         if now < deadline {
-            ctx.request_repaint_after(deadline - now);
+            ctx.request_repaint_after(deadline.saturating_duration_since(now));
             return;
         }
         self.count_deadline = None;
         let Some(repo) = self.repo.clone() else {
             return;
         };
-        self.count_token += 1;
+        self.count_token = self.count_token.saturating_add(1);
         let token = self.count_token;
         self.count_in_flight = true;
         let filter_str = self.filter_string();
@@ -1149,13 +1169,13 @@ impl FilterBuilder {
 
     /// The next unused `Preset #n` name, based on what's already saved.
     fn next_preset_name(&self) -> String {
-        let mut n = self.history.presets.len() + 1;
+        let mut n = self.history.presets.len().saturating_add(1);
         loop {
             let candidate = format!("Preset #{n}");
             if !self.history.presets.iter().any(|p| p.name == candidate) {
                 return candidate;
             }
-            n += 1;
+            n = n.saturating_add(1);
         }
     }
 

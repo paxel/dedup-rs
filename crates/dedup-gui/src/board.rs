@@ -187,7 +187,7 @@ fn layout(cmds: &[Cmd]) -> Vec<Line> {
     lines.extend(
         whole
             .chunks(2)
-            .map(|pair| Line::Centre(pair[0], pair.get(1).copied())),
+            .filter_map(|pair| pair.first().map(|&a| Line::Centre(a, pair.get(1).copied()))),
     );
     lines
 }
@@ -388,7 +388,7 @@ impl RowMeta {
         // A side cell is a thumbnail beside (path lines + one facts line), plus
         // a line of tag chips when the row carries any.
         let tag_lines = usize::from(!self.left_tags.is_empty());
-        let side = THUMB.max(LINE_H * ((lines + tag_lines) as f32 + 1.0));
+        let side = THUMB.max(LINE_H * (lines.saturating_add(tag_lines) as f32 + 1.0));
         // n buttons have n-1 gaps between them, not n — counting a trailing gap
         // still left the grid one line short of what it draws.
         let cmd_lines = layout(&self.cmds).len();
@@ -552,20 +552,23 @@ impl Index {
     /// `caller_order` keeps the rows as given instead of sorting them (a
     /// listing sorts itself by its own columns).
     fn build(metas: &[RowMeta], state: &BoardState, caller_order: bool) -> Self {
-        let mut order: Vec<usize> = (0..metas.len())
-            .filter(|&i| state.show_unchanged || !metas[i].unchanged)
-            .filter(|&i| !state.resurrection_only || metas[i].is_resurrection())
-            .filter(|&i| !state.hidden.contains(&metas[i].key))
+        let mut order: Vec<usize> = metas
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| state.show_unchanged || !m.unchanged)
+            .filter(|(_, m)| !state.resurrection_only || m.is_resurrection())
+            .filter(|(_, m)| !state.hidden.contains(&m.key))
+            .map(|(i, _)| i)
             .collect();
         if !caller_order {
             sort_order(&mut order, metas, state);
         }
 
-        let mut offsets = Vec::with_capacity(order.len() + 1);
+        let mut offsets = Vec::with_capacity(order.len().saturating_add(1));
         let mut y = 0.0;
         offsets.push(0.0);
         for &i in &order {
-            y += metas[i].height();
+            y += metas.get(i).map_or(0.0, RowMeta::height);
             offsets.push(y);
         }
         Self { order, offsets }
@@ -601,7 +604,10 @@ fn sort_order(order: &mut [usize], metas: &[RowMeta], state: &BoardState) {
         paths.first().map(|p| p.to_lowercase()).unwrap_or_default()
     };
     order.sort_by(|&a, &b| {
-        let (ma, mb) = (&metas[a], &metas[b]);
+        // `order` holds indices into `metas` by construction.
+        let (Some(ma), Some(mb)) = (metas.get(a), metas.get(b)) else {
+            return std::cmp::Ordering::Equal;
+        };
         let tie = || first_path(ma, true).cmp(&first_path(mb, true));
         let left = state.sort_left;
         let ord = match state.sort_key {
@@ -737,10 +743,16 @@ pub fn board(
         (clip.bottom() - rect.top()).max(0.0),
     );
     for vis in visible {
-        let i = index.order[vis];
-        let h = metas[i].height();
+        // `range` keeps `vis` inside `order`, and `order` indexes `metas`.
+        let (Some(&i), Some(&offset)) = (index.order.get(vis), index.offsets.get(vis)) else {
+            continue;
+        };
+        let Some(meta) = metas.get(i) else {
+            continue;
+        };
+        let h = meta.height();
         let row_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.left(), rect.top() + index.offsets[vis]),
+            egui::pos2(rect.left(), rect.top() + offset),
             egui::vec2(rect.width(), h),
         );
         // Striping, which TableBuilder used to provide.
@@ -750,11 +762,11 @@ pub fn board(
         // A listing tints its selected rows and outlines its cursor, so the
         // selection reads at a glance whichever pane has the keyboard.
         if view.listing {
-            if state.selected.contains(&metas[i].key) {
+            if state.selected.contains(&meta.key) {
                 ui.painter()
                     .rect_filled(row_rect, 0.0, theme::amber().gamma_multiply(0.18));
             }
-            if state.cursor.as_deref() == Some(metas[i].key.as_str()) {
+            if state.cursor.as_deref() == Some(meta.key.as_str()) {
                 ui.painter().rect_stroke(
                     row_rect.shrink(1.0),
                     0.0,
@@ -762,7 +774,7 @@ pub fn board(
                     egui::StrokeKind::Inside,
                 );
             }
-            if scroll_to.as_deref() == Some(metas[i].key.as_str()) {
+            if scroll_to.as_deref() == Some(meta.key.as_str()) {
                 ui.scroll_to_rect(row_rect, Some(Align::Center));
             }
         }
@@ -777,7 +789,7 @@ pub fn board(
         );
         if view.listing {
             let mods = ui.input(|inp| inp.modifiers);
-            let on_cursor = state.cursor.as_deref() == Some(metas[i].key.as_str());
+            let on_cursor = state.cursor.as_deref() == Some(meta.key.as_str());
             if row_resp.double_clicked() || (row_resp.clicked() && on_cursor && mods.is_none()) {
                 // A double click, or a plain click on the row that already has
                 // the cursor: the second click on a file opens it.
@@ -808,13 +820,13 @@ pub fn board(
                 .max_rect(row_rect.shrink2(egui::vec2(0.0, ROW_PAD)))
                 .layout(Layout::left_to_right(Align::Min)),
         );
-        if let Some(cmd) = draw_row(&mut row_ui, thumbs, &metas[i], &body(i), geom) {
+        if let Some(cmd) = draw_row(&mut row_ui, thumbs, meta, &body(i), geom) {
             // On a listing the picture and the name are part of the row: their
             // click selects like the rest of the row does, and a second click
             // on the cursor row opens it.
             let cmd = if view.listing && cmd == Cmd::OpenRow {
                 let mods = ui.input(|inp| inp.modifiers);
-                let on_cursor = state.cursor.as_deref() == Some(metas[i].key.as_str());
+                let on_cursor = state.cursor.as_deref() == Some(meta.key.as_str());
                 if on_cursor && mods.is_none() {
                     Cmd::OpenRow
                 } else {
@@ -834,7 +846,9 @@ pub fn board(
     if let Some(a) = &action
         && a.cmd == Cmd::Hide
     {
-        state.hidden.insert(metas[a.row].key.clone());
+        if let Some(m) = metas.get(a.row) {
+            state.hidden.insert(m.key.clone());
+        }
         return None;
     }
     action
@@ -1134,7 +1148,9 @@ fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view:
             // An empty file is useless — copying or promoting it preserves
             // nothing — so its "0 B" is called out in heavy red rather than
             // blending into the facts line.
-            let text: egui::WidgetText = if view.size == 0 && line.starts_with("0 B") {
+            let text: egui::WidgetText = if view.size == 0
+                && let Some(rest) = line.strip_prefix("0 B")
+            {
                 let mut job = egui::text::LayoutJob::default();
                 job.append(
                     "0 B",
@@ -1146,7 +1162,7 @@ fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view:
                     },
                 );
                 job.append(
-                    &line["0 B".len()..],
+                    rest,
                     0.0,
                     egui::TextFormat {
                         font_id: egui::FontId::proportional(10.5),
@@ -1203,34 +1219,51 @@ fn name_diff_ranges(a: &str, b: &str) -> Vec<std::ops::Range<usize>> {
     if av.len() > MAX || bv.len() > MAX {
         return Vec::new();
     }
-    let mut table = vec![vec![0usize; bv.len() + 1]; av.len() + 1];
-    for i in (0..av.len()).rev() {
-        for j in (0..bv.len()).rev() {
-            table[i][j] = if av[i] == bv[j] {
-                table[i + 1][j + 1] + 1
-            } else {
-                table[i + 1][j].max(table[i][j + 1])
+    let mut table = vec![vec![0usize; bv.len().saturating_add(1)]; av.len().saturating_add(1)];
+    for (i, &ac) in av.iter().enumerate().rev() {
+        // Row `i` is filled from the row below it, already complete.
+        let Some((row, below)) = table.get_mut(i..).and_then(|t| t.split_first_mut()) else {
+            continue;
+        };
+        let Some(next) = below.first() else {
+            continue;
+        };
+        // The cell to the right of `j`; the last column stays 0.
+        let mut right = 0usize;
+        for (j, &bc) in bv.iter().enumerate().rev() {
+            let (Some(&down), Some(&diag), Some(cell)) =
+                (next.get(j), next.get(j.saturating_add(1)), row.get_mut(j))
+            else {
+                continue;
             };
+            *cell = if ac == bc {
+                diag.saturating_add(1)
+            } else {
+                down.max(right)
+            };
+            right = *cell;
         }
     }
+    let cell = |i: usize, j: usize| table.get(i).and_then(|r| r.get(j)).copied().unwrap_or(0);
     // Walk the table, recording the runs of `a` that are not part of the LCS.
     let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
     let (mut i, mut j, mut byte) = (0usize, 0usize, 0usize);
-    while i < av.len() {
-        let width = av[i].len_utf8();
-        if j < bv.len() && av[i] == bv[j] {
+    while let Some(&ac) = av.get(i) {
+        let width = ac.len_utf8();
+        let bc = bv.get(j);
+        if bc == Some(&ac) {
             // Part of the common subsequence: keep it plain.
-            i += 1;
-            j += 1;
-            byte += width;
-        } else if j < bv.len() && table[i + 1][j] < table[i][j + 1] {
+            i = i.saturating_add(1);
+            j = j.saturating_add(1);
+            byte = byte.saturating_add(width);
+        } else if bc.is_some() && cell(i.saturating_add(1), j) < cell(i, j.saturating_add(1)) {
             // Consuming a character of `b` keeps more in common — `b` has an
             // insertion here, which is nothing to paint in `a`.
-            j += 1;
+            j = j.saturating_add(1);
         } else {
-            push_range(&mut ranges, byte..byte + width);
-            i += 1;
-            byte += width;
+            push_range(&mut ranges, byte..byte.saturating_add(width));
+            i = i.saturating_add(1);
+            byte = byte.saturating_add(width);
         }
     }
     ranges
@@ -1248,8 +1281,8 @@ fn push_range(ranges: &mut Vec<std::ops::Range<usize>>, r: std::ops::Range<usize
 /// The file name part of a relative path (what [`name_diff_ranges`] compares),
 /// plus its byte offset within the path so ranges can be shifted back.
 fn file_name_at(path: &str) -> (usize, &str) {
-    match path.rfind('/') {
-        Some(i) => (i + 1, &path[i + 1..]),
+    match path.rsplit_once('/') {
+        Some((dir, name)) => (dir.len().saturating_add(1), name),
         None => (0, path),
     }
 }
@@ -1294,15 +1327,25 @@ fn highlight_job(
         return job;
     }
 
+    // `offset` and the ranges sit on char boundaries by construction.
+    let Some(dir) = full.get(..offset) else {
+        plain(&mut job, shown);
+        return job;
+    };
     let hl = ui.visuals().selection.bg_fill.gamma_multiply(0.9);
-    plain(&mut job, &full[..offset]);
+    plain(&mut job, dir);
     let mut at = 0usize;
     for r in ranges {
-        if r.start > at {
-            plain(&mut job, &name[at..r.start]);
+        if r.start > at
+            && let Some(gap) = name.get(at..r.start)
+        {
+            plain(&mut job, gap);
         }
+        let Some(diff) = name.get(r.clone()) else {
+            continue;
+        };
         job.append(
-            &name[r.clone()],
+            diff,
             0.0,
             egui::TextFormat {
                 font_id: font.clone(),
@@ -1313,8 +1356,10 @@ fn highlight_job(
         );
         at = r.end;
     }
-    if at < name.len() {
-        plain(&mut job, &name[at..]);
+    if at < name.len()
+        && let Some(tail) = name.get(at..)
+    {
+        plain(&mut job, tail);
     }
     job
 }
@@ -1530,7 +1575,7 @@ pub(crate) fn elide_left(path: &str, max: usize) -> String {
     }
     let tail: String = path
         .chars()
-        .skip(path.chars().count().saturating_sub(max - 1))
+        .skip(path.chars().count().saturating_sub(max.saturating_sub(1)))
         .collect();
     format!("…{tail}")
 }

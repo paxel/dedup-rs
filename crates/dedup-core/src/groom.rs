@@ -78,8 +78,8 @@ pub fn delete_by_filter(
             }
         }
         deleted.push(rel_path.clone());
-        stats.deleted += 1;
-        since_flush += 1;
+        stats.deleted = stats.deleted.saturating_add(1);
+        since_flush = since_flush.saturating_add(1);
         run.progress.on(DiffEvent::Progress {
             action: DiffAction::Delete,
             done: stats.deleted,
@@ -125,7 +125,7 @@ pub fn preview_by_filter(
     let mut total = 0usize;
     store::for_each_file_entry(&db, |rel_path, entry: FileEntry| {
         if !entry.missing && annotated.matches(rel_path, &entry) {
-            total += 1;
+            total = total.saturating_add(1);
             if sample.len() < limit {
                 sample.push(rel_path.to_string());
             }
@@ -160,7 +160,7 @@ pub fn preview_prune(
     let mut total = 0usize;
     store::for_each_file_entry(&db, |rel_path, entry: FileEntry| {
         if entry.missing {
-            total += 1;
+            total = total.saturating_add(1);
             if sample.len() < limit {
                 sample.push(rel_path.to_string());
             }
@@ -200,7 +200,7 @@ pub fn prune(store: &Store, repo: &str, run: &DiffRun<'_>) -> Result<PruneStats,
             break;
         }
         batch.push(rel_path.clone());
-        stats.pruned += 1;
+        stats.pruned = stats.pruned.saturating_add(1);
         run.progress.on(DiffEvent::Progress {
             action: DiffAction::Delete,
             done: stats.pruned,
@@ -264,7 +264,7 @@ pub fn delete_empty_dirs(store: &Store, repo: &str) -> Result<u64, DiffError> {
         // Only remove a directory that is actually empty now; ignore errors
         // (a non-empty dir errors, which is exactly what we want to skip).
         if std::fs::remove_dir(&dir).is_ok() {
-            removed += 1;
+            removed = removed.saturating_add(1);
         }
     }
     Ok(removed)

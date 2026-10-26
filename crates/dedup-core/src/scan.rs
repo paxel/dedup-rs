@@ -203,15 +203,13 @@ fn keyword_flag(name: &str) -> Option<(Category, String)> {
 /// Berkeley DB magic (0x00053162) at offset 12, either endianness — the format
 /// Bitcoin Core's `wallet.dat` uses.
 fn is_berkeley_db(bytes: &[u8]) -> bool {
-    if bytes.len() < 16 {
-        return false;
-    }
-    let at = &bytes[12..16];
-    at == [0x00, 0x05, 0x31, 0x62] || at == [0x62, 0x31, 0x05, 0x00]
+    bytes
+        .get(12..16)
+        .is_some_and(|at| at == [0x00, 0x05, 0x31, 0x62] || at == [0x62, 0x31, 0x05, 0x00])
 }
 
 fn openssh_key_reason(bytes: &[u8]) -> Option<String> {
-    let head = &bytes[..bytes.len().min(200)];
+    let head = bytes.get(..200).unwrap_or(bytes);
     let text = String::from_utf8_lossy(head);
     for marker in [
         "BEGIN OPENSSH PRIVATE KEY",
@@ -263,7 +261,7 @@ fn seed_phrase_span(text: &str) -> bool {
             continue;
         }
         if set.contains(token.to_lowercase().as_str()) {
-            run += 1;
+            run = run.saturating_add(1);
             if run >= 12 {
                 return true;
             }

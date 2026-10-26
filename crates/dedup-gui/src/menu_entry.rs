@@ -135,7 +135,7 @@ fn quote_exec(path: &str) -> String {
     if plain {
         return path.to_owned();
     }
-    let mut out = String::with_capacity(path.len() + 2);
+    let mut out = String::with_capacity(path.len().saturating_add(2));
     out.push('"');
     for c in path.chars() {
         if matches!(c, '"' | '\\' | '$' | '`') {

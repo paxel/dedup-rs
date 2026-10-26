@@ -13,7 +13,12 @@ pub const RATE_STOPS: [f32; 6] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0];
 /// that is not a stop (drift, stale state) snaps back to the 1× default.
 pub fn next_rate(rate: f32) -> f32 {
     match RATE_STOPS.iter().position(|s| (s - rate).abs() < 0.01) {
-        Some(i) => RATE_STOPS[(i + 1) % RATE_STOPS.len()],
+        // Past the last stop wraps to the first.
+        Some(i) => RATE_STOPS
+            .get(i.saturating_add(1))
+            .or(RATE_STOPS.first())
+            .copied()
+            .unwrap_or(1.0),
         None => 1.0,
     }
 }
@@ -51,7 +56,7 @@ pub fn filmstrip_slot(fraction: f32, count: usize) -> usize {
     if count == 0 {
         return 0;
     }
-    ((fraction.clamp(0.0, 1.0) * count as f32) as usize).min(count - 1)
+    ((fraction.clamp(0.0, 1.0) * count as f32) as usize).min(count.saturating_sub(1))
 }
 
 /// Clock display of a timestamp, for the enlarged frame's `A @ 1:00` label —
@@ -59,7 +64,7 @@ pub fn filmstrip_slot(fraction: f32, count: usize) -> usize {
 /// hour reads `1:15:03`, never `75:03`.
 pub fn format_secs(secs: f64) -> String {
     // Round to whole seconds first (59.6 s reads 1:00, as before).
-    crate::media_cell::fmt_ms(secs.max(0.0).round() as u64 * 1000)
+    crate::media_cell::fmt_ms((secs.max(0.0).round() as u64).saturating_mul(1000))
 }
 
 #[cfg(test)]

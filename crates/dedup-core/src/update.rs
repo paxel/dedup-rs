@@ -172,7 +172,7 @@ fn walk_and_split(
         let entry = match item {
             Ok(entry) => entry,
             Err(err) => {
-                errors += 1;
+                errors = errors.saturating_add(1);
                 progress.on(ProgressEvent::Error {
                     path: err
                         .path()
@@ -184,7 +184,7 @@ fn walk_and_split(
             }
         };
         if entry.file_type().is_dir() {
-            dirs += 1;
+            dirs = dirs.saturating_add(1);
             continue;
         }
         if !entry.file_type().is_file() {
@@ -193,7 +193,7 @@ fn walk_and_split(
         let metadata = match entry.metadata() {
             Ok(metadata) => metadata,
             Err(err) => {
-                errors += 1;
+                errors = errors.saturating_add(1);
                 progress.on(ProgressEvent::Error {
                     path: entry.path().display().to_string(),
                     message: err.to_string(),
@@ -250,7 +250,7 @@ fn walk_and_split(
                     && entry.size == file.size
                     && entry.modified_ms == file.modified_ms =>
             {
-                unchanged += 1;
+                unchanged = unchanged.saturating_add(1);
             }
             _ => to_hash.push(file),
         }
@@ -388,18 +388,18 @@ pub fn update_repo_authorized(
         let mut archive_members: Vec<(&str, Vec<store::ArchiveMember>)> = Vec::new();
         let mut done_bytes: u64 = 0;
         for (index, (file, result)) in receiver.iter().enumerate() {
-            let done = index as u64 + 1;
+            let done = (index as u64).saturating_add(1);
             // Count every file's size toward progress, hashed or errored, so the
             // byte counter reaches `total_bytes` exactly at completion.
-            done_bytes += file.size;
+            done_bytes = done_bytes.saturating_add(file.size);
             match result {
                 Ok(hashed) => {
                     if existing.contains_key(&file.rel) {
-                        stats.updated += 1;
+                        stats.updated = stats.updated.saturating_add(1);
                     } else {
-                        stats.added += 1;
+                        stats.added = stats.added.saturating_add(1);
                     }
-                    stats.hashed_bytes += file.size;
+                    stats.hashed_bytes = stats.hashed_bytes.saturating_add(file.size);
                     if let Some(members) = hashed.archive_members {
                         archive_members.push((file.rel.as_str(), members));
                     }
@@ -427,7 +427,7 @@ pub fn update_repo_authorized(
                     }
                 }
                 Err(err) => {
-                    stats.errors += 1;
+                    stats.errors = stats.errors.saturating_add(1);
                     progress.on(ProgressEvent::Error {
                         path: file.abs.display().to_string(),
                         message: err.to_string(),
@@ -652,7 +652,9 @@ pub(crate) fn copy_mtime(from: &std::path::Path, to: &std::path::Path) -> std::i
 pub(crate) fn system_time_to_ms(time: std::time::SystemTime) -> i64 {
     match time.duration_since(std::time::UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
-        Err(err) => -i64::try_from(err.duration().as_millis()).unwrap_or(i64::MAX),
+        Err(err) => {
+            0i64.saturating_sub(i64::try_from(err.duration().as_millis()).unwrap_or(i64::MAX))
+        }
     }
 }
 

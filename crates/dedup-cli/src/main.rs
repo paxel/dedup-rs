@@ -1,3 +1,22 @@
+#![forbid(unsafe_code)]
+// Shipped code may not panic: no unwrap, expect or panic, no unreachable, no
+// indexing or slicing that can go out of bounds, no arithmetic that can overflow.
+// Unit tests are exempt via `cfg(test)`; integration tests are separate crates.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects
+    )
+)]
+
 use clap::{Parser, Subcommand};
 use dedup_core::diff::{
     CopyDest, DiffItem, DiffRun, NoDiffProgress, SyncDelete, diff_copy, diff_delete, diff_print,
@@ -593,13 +612,13 @@ fn run_archive(store: &Store, command: ArchiveCommands) -> anyhow::Result<()> {
             // Count against the repo's own loose content plus any extra refs.
             let references = diff_refs(&repo, &refs);
             let report = dedup_core::archive::repo_archive_coverage(store, &repo, &references)?;
-            let mut redundant = 0;
+            let mut redundant = 0usize;
             for cov in &report {
                 if redundant_only && !cov.redundant {
                     continue;
                 }
                 if cov.redundant {
-                    redundant += 1;
+                    redundant = redundant.saturating_add(1);
                 }
                 let tag = if cov.redundant {
                     "  [REDUNDANT]"
@@ -654,12 +673,12 @@ fn run_diff(store: &Store, command: DiffCommands) -> anyhow::Result<()> {
             for item in &items {
                 match item {
                     DiffItem::New { rel_path } => {
-                        new += 1;
+                        new = new.saturating_add(1);
                         println!("New: {}", rel_path);
                     }
-                    DiffItem::Equal { .. } => equal += 1,
+                    DiffItem::Equal { .. } => equal = equal.saturating_add(1),
                     DiffItem::DeletedInReference { rel_path } => {
-                        deleted += 1;
+                        deleted = deleted.saturating_add(1);
                         println!("Deleted in reference: {}", rel_path);
                     }
                 }
@@ -823,7 +842,7 @@ fn dupes(
             Some(first) => first,
             None => continue,
         };
-        total_wasted += wasted_bytes(group);
+        total_wasted = total_wasted.saturating_add(wasted_bytes(group));
         println!(
             "{} ({}, {} wasted)",
             hex(&first.entry.hash),
@@ -913,7 +932,7 @@ fn update_repos(
             stats.unchanged,
             stats.marked_missing,
             stats.errors,
-            stats.added + stats.updated,
+            stats.added.saturating_add(stats.updated),
             format_size(stats.hashed_bytes)
         );
         if stats.cancelled {
@@ -978,10 +997,13 @@ fn truncate_path(path: &str, max_len: usize) -> String {
     if char_count <= max_len {
         return path.to_string();
     }
-    let left = max_len / 2 - 2;
-    let right = max_len - left - 3;
+    let left = (max_len / 2).saturating_sub(2);
+    let right = max_len.saturating_sub(left).saturating_sub(3);
     let head: String = path.chars().take(left).collect();
-    let tail: String = path.chars().skip(char_count - right).collect();
+    let tail: String = path
+        .chars()
+        .skip(char_count.saturating_sub(right))
+        .collect();
     format!("{}...{}", head, tail)
 }
 

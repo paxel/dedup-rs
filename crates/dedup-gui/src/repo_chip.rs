@@ -59,7 +59,8 @@ pub fn identicon(painter: &egui::Painter, rect: Rect, name: &str) {
     // Snap the grid origin to whole pixels. Otherwise the columns land on
     // fractional coordinates and anti-aliasing renders the left and right
     // (mirrored) columns with slightly different coverage — visibly asymmetric.
-    let origin = (tile.center() - Vec2::splat(grid / 2.0)).round();
+    let center = tile.center();
+    let origin = egui::pos2(center.x - grid / 2.0, center.y - grid / 2.0).round();
     // Bits above the hue byte choose which cells are on: 3 free columns (the
     // other two mirror them) × 5 rows = 15 bits.
     let mut bits = hash >> 9;
@@ -70,8 +71,8 @@ pub fn identicon(painter: &egui::Painter, rect: Rect, name: &str) {
             if !on {
                 continue;
             }
-            for c in [col, 4 - col] {
-                let min = origin + Vec2::new(c as f32 * cell, row as f32 * cell);
+            for c in [col, 4u32.saturating_sub(col)] {
+                let min = egui::pos2(origin.x + c as f32 * cell, origin.y + row as f32 * cell);
                 painter.rect_filled(Rect::from_min_size(min, Vec2::splat(cell)), 0.0, color);
             }
         }
@@ -199,12 +200,15 @@ pub fn chip_row(
     let mut used = label_w;
     for (i, s) in sizes.iter().enumerate() {
         let w = spacing + s.x + 8.0;
-        if !rows.last().unwrap().is_empty() && used + w > avail {
+        if rows.last().is_some_and(|r| !r.is_empty()) && used + w > avail {
             rows.push(Vec::new());
             used = 0.0;
         }
         used += w;
-        rows.last_mut().unwrap().push(i);
+        // `rows` starts with one row and only grows, so there is always a last.
+        if let Some(row) = rows.last_mut() {
+            row.push(i);
+        }
     }
 
     let mut changed = false;
@@ -216,8 +220,11 @@ pub fn chip_row(
                 }
                 for &i in row {
                     let resp = chip(ui, i);
-                    if (resp.rect.size() - sizes[i]).length() > 0.5 {
-                        sizes[i] = resp.rect.size();
+                    let new = resp.rect.size();
+                    if let Some(size) = sizes.get_mut(i)
+                        && egui::vec2(new.x - size.x, new.y - size.y).length() > 0.5
+                    {
+                        *size = new;
                         changed = true;
                     }
                     ui.add_space(8.0);
@@ -261,10 +268,16 @@ fn main_badge(ui: &mut egui::Ui) -> egui::Response {
         egui::FontId::proportional(13.0),
         theme::black(),
     );
-    let (rect, resp) = ui.allocate_exact_size(galley.size() + pad * 2.0, Sense::hover());
+    let gs = galley.size();
+    let size = Vec2::new(gs.x + pad.x * 2.0, gs.y + pad.y * 2.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
     if ui.is_rect_visible(rect) {
         ui.painter().rect_filled(rect, 4.0, theme::amber());
-        ui.painter().galley(rect.min + pad, galley, theme::black());
+        ui.painter().galley(
+            egui::pos2(rect.min.x + pad.x, rect.min.y + pad.y),
+            galley,
+            theme::black(),
+        );
     }
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "MAIN"));
     resp

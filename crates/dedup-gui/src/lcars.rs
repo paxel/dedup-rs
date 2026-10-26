@@ -34,7 +34,7 @@ pub fn toggle_button(
         .size();
     // Roomy horizontal padding gives the classic long-bar proportions.
     let pad = Vec2::new(16.0, 6.0);
-    let size = text_w + pad * 2.0;
+    let size = Vec2::new(text_w.x + pad.x * 2.0, text_w.y + pad.y * 2.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     if ui.is_rect_visible(rect) {
         let (fill, fg, border) = if selected {
@@ -73,7 +73,7 @@ pub fn action_button(
         .layout_no_wrap(label.to_owned(), font.clone(), theme::black())
         .size();
     let pad = Vec2::new(16.0, 6.0);
-    let size = text_w + pad * 2.0;
+    let size = Vec2::new(text_w.x + pad.x * 2.0, text_w.y + pad.y * 2.0);
     let sense = if enabled {
         Sense::click()
     } else {

@@ -59,15 +59,13 @@ impl HexDiff {
         let mut truncated = truncated;
         'outer: for seg in &alignment.segments {
             let diff = seg.kind == SegmentKind::Diff;
-            let (mut ai, mut bi) = (seg.a.start, seg.b.start);
-            while ai < seg.a.end || bi < seg.b.end {
-                let ua = (ai < seg.a.end).then(|| (ai as u32, a[ai]));
-                let ub = (bi < seg.b.end).then(|| (bi as u32, b[bi]));
-                if ua.is_some() {
-                    ai += 1;
-                }
-                if ub.is_some() {
-                    bi += 1;
+            let mut side_a = a.iter().enumerate().take(seg.a.end).skip(seg.a.start);
+            let mut side_b = b.iter().enumerate().take(seg.b.end).skip(seg.b.start);
+            loop {
+                let ua = side_a.next().map(|(ai, &byte)| (ai as u32, byte));
+                let ub = side_b.next().map(|(bi, &byte)| (bi as u32, byte));
+                if ua.is_none() && ub.is_none() {
+                    break;
                 }
                 units.push(Unit { a: ua, b: ub, diff });
                 if units.len() >= MAX_UNITS {
@@ -112,7 +110,7 @@ impl HexDiff {
         if self.diff_rows.is_empty() {
             return None;
         }
-        let after = (current_page + 1) * ROWS_PER_PAGE;
+        let after = current_page.saturating_add(1).saturating_mul(ROWS_PER_PAGE);
         let target = self
             .diff_rows
             .iter()
@@ -128,7 +126,7 @@ impl HexDiff {
         if self.diff_rows.is_empty() {
             return None;
         }
-        let before = current_page * ROWS_PER_PAGE;
+        let before = current_page.saturating_mul(ROWS_PER_PAGE);
         let target = self
             .diff_rows
             .iter()
@@ -152,7 +150,7 @@ impl HexDiff {
     /// Build a monospace [`LayoutJob`] for one side of one row: offset, then 16
     /// hex bytes (blank where that side has a gap), then the ASCII gutter.
     fn side_job(&self, row: usize, left: bool, font: &FontId) -> LayoutJob {
-        let base = row * ROW;
+        let base = row.saturating_mul(ROW);
         let mut job = LayoutJob::default();
         let plain = |job: &mut LayoutJob, s: &str, c: Color32| {
             job.append(
@@ -167,7 +165,7 @@ impl HexDiff {
         };
         // Offset: the first present byte's offset on this side in this row.
         let offset = (0..ROW)
-            .filter_map(|i| self.units.get(base + i))
+            .filter_map(|i| self.units.get(base.saturating_add(i)))
             .find_map(|u| if left { u.a } else { u.b })
             .map(|(off, _)| off);
         match offset {
@@ -177,7 +175,7 @@ impl HexDiff {
         // Hex bytes.
         let mut ascii = String::new();
         for i in 0..ROW {
-            match self.units.get(base + i) {
+            match self.units.get(base.saturating_add(i)) {
                 Some(u) => {
                     let side = if left { u.a } else { u.b };
                     match side {
@@ -223,8 +221,8 @@ impl HexDiff {
             .layout_no_wrap("0".to_owned(), font.clone(), theme::grey())
             .rect
             .height();
-        let start = page * ROWS_PER_PAGE;
-        let end = (start + ROWS_PER_PAGE).min(self.rows());
+        let start = page.saturating_mul(ROWS_PER_PAGE);
+        let end = start.saturating_add(ROWS_PER_PAGE).min(self.rows());
         // Anchor the column split to the centre of the pane we were given —
         // the same x where the viewer draws its A|B divider — *before* entering
         // the scroll area. Deriving the split from the scroll content's own
@@ -237,9 +235,10 @@ impl HexDiff {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for row in start..end {
+                    let base = row.saturating_mul(ROW);
                     let is_diff = self
                         .units
-                        .get(row * ROW..(row * ROW + ROW).min(self.units.len()))
+                        .get(base..base.saturating_add(ROW).min(self.units.len()))
                         .is_some_and(|c| c.iter().any(|u| u.diff));
                     let (rect, _) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), row_h),
@@ -300,7 +299,7 @@ pub struct Capped {
 pub fn read_capped(path: &std::path::Path) -> Capped {
     match std::fs::read(path) {
         Ok(bytes) if bytes.len() > MAX_READ => Capped {
-            bytes: bytes[..MAX_READ].to_vec(),
+            bytes: bytes.get(..MAX_READ).unwrap_or(&bytes).to_vec(),
             truncated: true,
             read_ok: true,
         },

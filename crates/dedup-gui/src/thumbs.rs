@@ -121,9 +121,8 @@ impl ThumbCache {
                             idx,
                             count,
                         ),
-                        Job::TextHead | Job::ByteView | Job::PdfPage => {
-                            unreachable!("handled above")
-                        }
+                        // Handled, and `continue`d past, above.
+                        Job::TextHead | Job::ByteView | Job::PdfPage => continue,
                     };
                     match result {
                         Ok((w, h, rgba)) => {
@@ -308,10 +307,12 @@ fn byte_view_image(path: &Path) -> Option<ColorImage> {
     let mut buf = vec![0u8; BYTE_VIEW_BYTES];
     let mut f = std::fs::File::open(path).ok()?;
     let mut filled = 0usize;
-    while filled < buf.len() {
-        match f.read(&mut buf[filled..]) {
+    while let Some(rest) = buf.get_mut(filled..)
+        && !rest.is_empty()
+    {
+        match f.read(rest) {
             Ok(0) => break,
-            Ok(n) => filled += n,
+            Ok(n) => filled = filled.saturating_add(n),
             Err(_) => return None,
         }
     }
@@ -323,7 +324,11 @@ fn byte_view_image(path: &Path) -> Option<ColorImage> {
     // constant, and newer clippy rejects the runtime-sized form.
     for (i, px) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         // Bytes past the end stay near-black, reading as "the file ends here".
-        let v = if i < filled { buf[i] } else { 8 };
+        let v = buf
+            .get(..filled)
+            .and_then(|head| head.get(i))
+            .copied()
+            .unwrap_or(8);
         // Lift the floor a touch so a zero-heavy header still shows structure
         // against the pure-black card background.
         let g = 24u8.saturating_add((v as u16 * 200 / 255) as u8);

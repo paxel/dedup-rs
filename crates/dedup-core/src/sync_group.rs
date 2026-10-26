@@ -56,8 +56,8 @@ pub fn diff_overview(
         let (mut unique, mut shared) = (0usize, 0usize);
         for item in diff_print(store, repo, &[reference], None)? {
             match item {
-                DiffItem::New { .. } => unique += 1,
-                DiffItem::Equal { .. } => shared += 1,
+                DiffItem::New { .. } => unique = unique.saturating_add(1),
+                DiffItem::Equal { .. } => shared = shared.saturating_add(1),
                 // The reference has this content but only as missing entries; not
                 // a "shared" hit and not what `missing` (below) measures.
                 DiffItem::DeletedInReference { .. } => {}

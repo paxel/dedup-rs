@@ -60,10 +60,10 @@ pub fn copy_path(original: &Path) -> PathBuf {
         dir.join(name)
     };
     let mut p = make("_rot");
-    let mut i = 1;
+    let mut i = 1u32;
     while p.exists() {
         p = make(&format!("_rot_{i}"));
-        i += 1;
+        i = i.saturating_add(1);
     }
     p
 }
@@ -81,10 +81,11 @@ fn write(img: &DynamicImage, path: &Path, format: image::ImageFormat) -> Result<
 /// Set `path`'s modified time to naive epoch milliseconds `ms`.
 fn stamp_mtime(path: &Path, ms: i64) -> Result<(), String> {
     let time = if ms >= 0 {
-        std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms as u64)
+        std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_millis(ms as u64))
     } else {
-        std::time::UNIX_EPOCH - std::time::Duration::from_millis(ms.unsigned_abs())
-    };
+        std::time::UNIX_EPOCH.checked_sub(std::time::Duration::from_millis(ms.unsigned_abs()))
+    }
+    .ok_or_else(|| format!("modified time {ms} ms is out of range"))?;
     std::fs::File::options()
         .write(true)
         .open(path)
@@ -114,7 +115,7 @@ pub fn save_edited(
             .ok()
             .map(|t| match t.duration_since(std::time::UNIX_EPOCH) {
                 Ok(d) => d.as_millis() as i64,
-                Err(e) => -(e.duration().as_millis() as i64),
+                Err(e) => (e.duration().as_millis() as i64).saturating_neg(),
             }),
     };
     let img = image::open(original).map_err(|e| e.to_string())?;

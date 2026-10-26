@@ -74,27 +74,31 @@ impl TextDiff {
         let mut rows = Vec::new();
         let (mut ai, mut bj) = (0usize, 0usize);
         // The trailing sentinel `(len, len)` flushes the final unmatched run; it
-        // is not itself an equal line (guarded by `mi < la.len()`).
+        // is not itself an equal line (guarded by `la.get(mi)`).
         for (mi, mj) in matches
             .into_iter()
             .chain(std::iter::once((la.len(), lb.len())))
         {
-            emit_changed_block(&mut rows, &la[ai..mi], &lb[bj..mj]);
-            if mi < la.len() {
+            // Matches ascend on both sides, so the blocks are always in range.
+            let (Some(block_a), Some(block_b)) = (la.get(ai..mi), lb.get(bj..mj)) else {
+                break;
+            };
+            emit_changed_block(&mut rows, block_a, block_b);
+            if let (Some(line_a), Some(line_b)) = (la.get(mi), lb.get(mj)) {
                 rows.push(Row {
                     left: vec![Cell {
-                        text: la[mi].to_string(),
+                        text: line_a.to_string(),
                         mark: Mark::Equal,
                     }],
                     right: vec![Cell {
-                        text: lb[mj].to_string(),
+                        text: line_b.to_string(),
                         mark: Mark::Equal,
                     }],
                     changed: false,
                 });
             }
-            ai = mi + 1;
-            bj = mj + 1;
+            ai = mi.saturating_add(1);
+            bj = mj.saturating_add(1);
             if rows.len() >= MAX_ROWS {
                 return Self {
                     rows,
@@ -216,28 +220,48 @@ impl TextDiff {
 fn lcs_line_matches(la: &[&str], lb: &[&str]) -> Vec<(usize, usize)> {
     let (n, m) = (la.len(), lb.len());
     // dp[i][j] = LCS length of la[i..] vs lb[j..]. Row-major, (n+1)×(m+1).
-    let mut dp = vec![0u32; (n + 1) * (m + 1)];
-    let at = |i: usize, j: usize| i * (m + 1) + j;
-    for i in (0..n).rev() {
-        for j in (0..m).rev() {
-            dp[at(i, j)] = if la[i] == lb[j] {
-                dp[at(i + 1, j + 1)] + 1
-            } else {
-                dp[at(i + 1, j)].max(dp[at(i, j + 1)])
-            };
+    let width = m.saturating_add(1);
+    let mut dp = vec![0u32; n.saturating_add(1).saturating_mul(width)];
+    let at = |i: usize, j: usize| i.saturating_mul(width).saturating_add(j);
+    // Fill bottom-up: row `n` and column `m` stay 0; each row `i` is built
+    // right-to-left from the row below it (`i + 1`).
+    let mut table = dp.rchunks_mut(width);
+    if let Some(mut below) = table.next() {
+        for (row, line_a) in table.zip(la.iter().rev()) {
+            // `row[j + 1]` and `below[j + 1]`, starting at column `m` (0).
+            let (mut right, mut below_right) = (0u32, 0u32);
+            for ((cell, &down), line_b) in row.iter_mut().zip(below.iter()).zip(lb).rev() {
+                *cell = if line_a == line_b {
+                    below_right.saturating_add(1)
+                } else {
+                    down.max(right)
+                };
+                right = *cell;
+                below_right = down;
+            }
+            below = row;
         }
     }
     let mut matches = Vec::new();
-    let (mut i, mut j) = (0, 0);
-    while i < n && j < m {
-        if la[i] == lb[j] {
+    let (mut i, mut j) = (0usize, 0usize);
+    while let (Some(line_a), Some(line_b)) = (la.get(i), lb.get(j)) {
+        // In range: `i < n` and `j < m`, so both neighbours are table cells.
+        let down = dp
+            .get(at(i.saturating_add(1), j))
+            .copied()
+            .unwrap_or_default();
+        let right = dp
+            .get(at(i, j.saturating_add(1)))
+            .copied()
+            .unwrap_or_default();
+        if line_a == line_b {
             matches.push((i, j));
-            i += 1;
-            j += 1;
-        } else if dp[at(i + 1, j)] >= dp[at(i, j + 1)] {
-            i += 1;
+            i = i.saturating_add(1);
+            j = j.saturating_add(1);
+        } else if down >= right {
+            i = i.saturating_add(1);
         } else {
-            j += 1;
+            j = j.saturating_add(1);
         }
     }
     matches
@@ -247,9 +271,11 @@ fn lcs_line_matches(la: &[&str], lb: &[&str]) -> Vec<(usize, usize)> {
 /// happen to be equal at the same index, nothing more. Cheap, and honest about
 /// being approximate (the caller flags it).
 fn positional_matches(la: &[&str], lb: &[&str]) -> Vec<(usize, usize)> {
-    (0..la.len().min(lb.len()))
-        .filter(|&i| la[i] == lb[i])
-        .map(|i| (i, i))
+    la.iter()
+        .zip(lb)
+        .enumerate()
+        .filter(|(_, (line_a, line_b))| line_a == line_b)
+        .map(|(i, _)| (i, i))
         .collect()
 }
 
@@ -258,10 +284,10 @@ fn positional_matches(la: &[&str], lb: &[&str]) -> Vec<(usize, usize)> {
 /// character-diffed); any surplus lines on one side become one-sided gap rows.
 fn emit_changed_block(rows: &mut Vec<Row>, a_lines: &[&str], b_lines: &[&str]) {
     let paired = a_lines.len().min(b_lines.len());
-    for idx in 0..paired {
-        rows.push(changed_pair(a_lines[idx], b_lines[idx]));
+    for (line_a, line_b) in a_lines.iter().zip(b_lines) {
+        rows.push(changed_pair(line_a, line_b));
     }
-    for line in &a_lines[paired..] {
+    for line in a_lines.iter().skip(paired) {
         rows.push(Row {
             left: vec![Cell {
                 text: line.to_string(),
@@ -271,7 +297,7 @@ fn emit_changed_block(rows: &mut Vec<Row>, a_lines: &[&str], b_lines: &[&str]) {
             changed: true,
         });
     }
-    for line in &b_lines[paired..] {
+    for line in b_lines.iter().skip(paired) {
         rows.push(Row {
             left: Vec::new(),
             right: vec![Cell {
@@ -294,8 +320,9 @@ fn changed_pair(a: &str, b: &str) -> Row {
     let mut left = Vec::new();
     let mut right = Vec::new();
     for seg in &alignment.segments {
-        let at = String::from_utf8_lossy(&ab[seg.a.clone()]).into_owned();
-        let bt = String::from_utf8_lossy(&bb[seg.b.clone()]).into_owned();
+        // Segments index into the aligned inputs, so they are always in range.
+        let at = String::from_utf8_lossy(ab.get(seg.a.clone()).unwrap_or_default()).into_owned();
+        let bt = String::from_utf8_lossy(bb.get(seg.b.clone()).unwrap_or_default()).into_owned();
         match seg.kind {
             SegmentKind::Equal => {
                 if !at.is_empty() {
