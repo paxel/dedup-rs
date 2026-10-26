@@ -36,6 +36,11 @@ egui_extras = "0.35"
 log = "0.4"
 tempfile = "3.10"
 
+# Only to pick winit's X11 backend through eframe's event-loop hook; the same
+# winit eframe already uses.
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["x11"] }
+
 [dev-dependencies]
 egui_kittest = { version = "0.35", features = ["wgpu", "snapshot"] }
 zip = "8.6"

@@ -105,7 +105,7 @@ impl Diagnostics {
             e.severity = severity;
             e.title = title.into();
             e.detail = detail.into();
-            e.count += 1;
+            e.count = e.count.saturating_add(1);
             e.unread = true;
         } else {
             inner.events.push(Stored {

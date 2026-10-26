@@ -736,7 +736,7 @@ impl DiffCompare {
         // up, so a pool where only `other` is free simply does not move.
         let mut probe = at as isize;
         for _ in 0..n {
-            probe = (probe + step).rem_euclid(n);
+            probe = probe.saturating_add(step).rem_euclid(n);
             let candidate = self.pool.get(probe as usize)?;
             if !mask || candidate.facts.abs_path != other.facts.abs_path {
                 return Some(candidate.clone());
@@ -802,9 +802,9 @@ impl DiffCompare {
         for c in candidates {
             if let Some(t) = crate::id3tags::read(&c.facts.abs_path) {
                 let vals = [&t.title, &t.artist, &t.album, &t.year, &t.track, &t.genre];
-                for (i, v) in vals.into_iter().enumerate() {
-                    if !v.is_empty() && !options[i].iter().any(|o| o == v) {
-                        options[i].push(v.clone());
+                for (v, opts) in vals.into_iter().zip(options.iter_mut()) {
+                    if !v.is_empty() && !opts.iter().any(|o| o == v) {
+                        opts.push(v.clone());
                     }
                 }
             }
@@ -827,9 +827,9 @@ impl DiffCompare {
             Ok(()) => {
                 self.tag_error = None;
                 // The stored-tags read is stale for this file now.
-                for (slot, side) in [(0, &self.left), (1, &self.right)] {
+                for (tags, side) in self.tags.iter_mut().zip([&self.left, &self.right]) {
                     if side.facts.hash_hex == te.hex {
-                        self.tags[slot] = None;
+                        *tags = None;
                     }
                 }
             }
@@ -850,8 +850,11 @@ impl DiffCompare {
             let side = if is_left { &self.left } else { &self.right };
             (side.facts.abs_path.clone(), side.rel_path.clone())
         };
-        let fields = self.exif_all[slot]
-            .clone()
+        let fields = self
+            .exif_all
+            .get(slot)
+            .cloned()
+            .flatten()
             .unwrap_or_else(|| dedup_core::fingerprint::exif_fields(&abs));
         let base = std::path::Path::new(&rel)
             .file_name()
@@ -939,10 +942,9 @@ impl DiffCompare {
     /// one file's runs scrollable, or — comparing two — their runs aligned as a
     /// content diff (green/amber). No verdict.
     fn render_strings(&mut self, ui: &mut egui::Ui, two_sided: bool) {
-        for slot in [0usize, 1usize] {
-            if self.strings[slot].is_none() {
-                let side = if slot == 0 { &self.left } else { &self.right };
-                self.strings[slot] = Some(strings_body(&side.facts));
+        for (strings, side) in self.strings.iter_mut().zip([&self.left, &self.right]) {
+            if strings.is_none() {
+                *strings = Some(strings_body(&side.facts));
             }
         }
         if two_sided {
@@ -1011,22 +1013,24 @@ impl DiffCompare {
     /// [`MediaMsg::OfficePdf`]. LibreOffice takes seconds — the "Preparing…"
     /// note holds the pane meanwhile.
     fn spawn_office_convert(&mut self, ctx: &Context, slot: usize) {
-        if self.office_pending[slot] || self.office_pdf[slot].is_some() {
+        if self.office_pending.get(slot).is_none_or(|&pending| pending)
+            || self.office_pdf.get(slot).is_none_or(Option::is_some)
+        {
             return;
         }
         let side = if slot == 0 { &self.left } else { &self.right };
         let src = side.facts.abs_path.clone();
         let hash = side.facts.hash_hex.clone();
         let Some(cache) = Self::office_cache_dir() else {
-            self.office_pdf[slot] = Some(None);
+            set_slot(&mut self.office_pdf, slot, Some(None));
             return;
         };
         let cached = cache.join(format!("{hash}.pdf"));
         if cached.is_file() {
-            self.office_pdf[slot] = Some(Some(cached));
+            set_slot(&mut self.office_pdf, slot, Some(Some(cached)));
             return;
         }
-        self.office_pending[slot] = true;
+        set_slot(&mut self.office_pending, slot, true);
         let left = slot == 0;
         let cache = cache.to_path_buf();
         let tx = self.media_tx.clone();
@@ -1066,10 +1070,10 @@ impl DiffCompare {
         // What pdftoppm actually reads: the file itself for a PDF, the
         // session-cached conversion for an office document.
         let pdf = if self.is_office_side(slot) {
-            match &self.office_pdf[slot] {
-                Some(Some(p)) => p.clone(),
-                Some(None) => return,
-                None => {
+            match self.office_pdf.get(slot) {
+                Some(Some(Some(p))) => p.clone(),
+                Some(Some(None)) | None => return,
+                Some(None) => {
                     self.spawn_office_convert(ctx, slot);
                     return;
                 }
@@ -1077,8 +1081,10 @@ impl DiffCompare {
         } else {
             src.clone()
         };
-        if !self.render_probed[slot] {
-            self.render_probed[slot] = true;
+        if let Some(probed) = self.render_probed.get_mut(slot)
+            && !*probed
+        {
+            *probed = true;
             let tx = self.media_tx.clone();
             let ctx = ctx.clone();
             let path = src.clone();
@@ -1089,7 +1095,9 @@ impl DiffCompare {
                 ctx.request_repaint();
             });
         }
-        let page = self.render_page[slot];
+        let Some(&page) = self.render_page.get(slot) else {
+            return;
+        };
         if self.render_cache.contains_key(&(slot, page))
             || self.render_pending.contains(&(slot, page))
         {
@@ -1101,7 +1109,8 @@ impl DiffCompare {
         std::thread::spawn(move || {
             let image = (|| {
                 let dir = tempfile::tempdir().ok()?;
-                let png = dedup_core::render::render_pdf_page(&pdf, dir.path(), page + 1)?;
+                let png =
+                    dedup_core::render::render_pdf_page(&pdf, dir.path(), page.saturating_add(1))?;
                 let (w, h, rgba) = dedup_core::thumbnail::load_full_rgba(&png, 2000).ok()?;
                 Some(ColorImage::from_rgba_unmultiplied(
                     [w as usize, h as usize],
@@ -1124,9 +1133,9 @@ impl DiffCompare {
     /// first says it is converting (or that the conversion failed).
     fn draw_render_page(&self, ui: &mut egui::Ui, area: Rect, slot: usize) {
         if self.is_office_side(slot) {
-            match &self.office_pdf[slot] {
-                Some(Some(_)) => {}
-                Some(None) => {
+            match self.office_pdf.get(slot) {
+                Some(Some(Some(_))) => {}
+                Some(Some(None)) | None => {
                     ui.painter().text(
                         area.center(),
                         Align2::CENTER_CENTER,
@@ -1136,7 +1145,7 @@ impl DiffCompare {
                     );
                     return;
                 }
-                None => {
+                Some(None) => {
                     ui.ctx().request_repaint();
                     ui.painter().text(
                         area.center(),
@@ -1150,7 +1159,9 @@ impl DiffCompare {
                 }
             }
         }
-        let page = self.render_page[slot];
+        let Some(&page) = self.render_page.get(slot) else {
+            return;
+        };
         match self.render_cache.get(&(slot, page)) {
             Some(Some(tex)) => {
                 let sz = tex.size();
@@ -1163,9 +1174,12 @@ impl DiffCompare {
                 // Rendered and came back empty: past this side's last page
                 // (stepping is blind when the page count is unknown), or the
                 // renderer is missing.
-                let note = match self.render_count[slot] {
+                let note = match self.render_count.get(slot).copied().flatten() {
                     Some(n) if page >= n => {
-                        format!("This document ends at page {n} — no page {}.", page + 1)
+                        format!(
+                            "This document ends at page {n} — no page {}.",
+                            page.saturating_add(1)
+                        )
                     }
                     _ => "This page could not be drawn — the page renderer (poppler) \
                          may be missing."
@@ -1188,7 +1202,7 @@ impl DiffCompare {
                     Align2::CENTER_CENTER,
                     format!(
                         "Rendering page {}… a large document can take a moment.",
-                        page + 1
+                        page.saturating_add(1)
                     ),
                     FontId::proportional(13.0),
                     theme::tan(),
@@ -1209,12 +1223,15 @@ impl DiffCompare {
                 .layout(Layout::left_to_right(Align::Center)),
         );
         let ui = &mut child;
-        let total = self.render_count[slot];
+        let total = self.render_count.get(slot).copied().flatten();
+        let Some(page) = self.render_page.get_mut(slot) else {
+            return;
+        };
         if ui.button("< PREV").clicked() {
-            self.render_page[slot] = self.render_page[slot].saturating_sub(1);
+            *page = page.saturating_sub(1);
         }
         let cap = total.unwrap_or(9_999).max(1);
-        let mut page1 = self.render_page[slot] + 1;
+        let mut page1 = page.saturating_add(1);
         ui.label(RichText::new("page").color(theme::tan()));
         let typed = ui
             .add(egui::DragValue::new(&mut page1).range(1..=cap))
@@ -1227,10 +1244,10 @@ impl DiffCompare {
             .color(theme::tan()),
         );
         if typed.changed() {
-            self.render_page[slot] = page1.saturating_sub(1);
+            *page = page1.saturating_sub(1);
         }
-        if ui.button("NEXT >").clicked() && total.is_none_or(|n| self.render_page[slot] + 1 < n) {
-            self.render_page[slot] += 1;
+        if ui.button("NEXT >").clicked() && total.is_none_or(|n| page.saturating_add(1) < n) {
+            *page = page.saturating_add(1);
         }
         // A slider for sweeping a long document quickly, sized to what is
         // left of this side's band.
@@ -1240,12 +1257,12 @@ impl DiffCompare {
             ui.add_space(8.0);
             let room = (area.max.x - ui.cursor().min.x - 12.0).clamp(40.0, 160.0);
             ui.spacing_mut().slider_width = room;
-            let mut page1 = self.render_page[slot] + 1;
+            let mut page1 = page.saturating_add(1);
             let slid = ui
                 .add(egui::Slider::new(&mut page1, 1..=n).show_value(false))
                 .on_hover_text("Drag to sweep quickly through the pages.");
             if slid.changed() {
-                self.render_page[slot] = page1.saturating_sub(1);
+                *page = page1.saturating_sub(1);
             }
         }
     }
@@ -1296,7 +1313,7 @@ impl DiffCompare {
             }
             // The page number is a control, not just a caption: type or drag it
             // to land on an exact page.
-            let mut page1 = self.hex_page + 1;
+            let mut page1 = self.hex_page.saturating_add(1);
             ui.label(RichText::new("page").color(theme::tan()));
             let typed = ui
                 .add(egui::DragValue::new(&mut page1).range(1..=pages))
@@ -1305,8 +1322,8 @@ impl DiffCompare {
             if typed.changed() {
                 go = Some(page1.saturating_sub(1));
             }
-            if ui.button("NEXT PAGE >").clicked() && self.hex_page + 1 < pages {
-                go = Some(self.hex_page + 1);
+            if ui.button("NEXT PAGE >").clicked() && self.hex_page.saturating_add(1) < pages {
+                go = Some(self.hex_page.saturating_add(1));
             }
             // A slider for fast, coarse scrolling through a big file — dragging
             // it sweeps the pages far quicker than stepping.
@@ -1401,7 +1418,7 @@ impl DiffCompare {
     /// time (cached presence, never re-statted) reads as "isn't present"; every
     /// other case names the type this pane can't preview.
     fn no_preview_text(&self, slot: usize) -> String {
-        if !self.present[slot] {
+        if !self.present.get(slot).copied().unwrap_or(false) {
             return "This file isn't present — its drive may be disconnected.".to_string();
         }
         let side = if slot == 0 { &self.left } else { &self.right };
@@ -1413,9 +1430,9 @@ impl DiffCompare {
     /// the side's primary texture (image, audio-file spectrogram).
     fn tab_tex(&self, slot: usize) -> Option<&TextureHandle> {
         if self.spec_mode(slot) {
-            self.video[slot].spec_tex.as_ref()
+            self.video.get(slot).and_then(|st| st.spec_tex.as_ref())
         } else {
-            self.tex[slot].as_ref()
+            self.tex.get(slot).and_then(Option::as_ref)
         }
     }
 
@@ -1423,9 +1440,9 @@ impl DiffCompare {
     /// or not) — the tab-aware counterpart of `settled`.
     fn tab_settled(&self, slot: usize) -> bool {
         if self.spec_mode(slot) {
-            self.video[slot].spec_settled
+            self.video.get(slot).is_some_and(|st| st.spec_settled)
         } else {
-            self.settled[slot]
+            self.settled.get(slot).copied().unwrap_or(false)
         }
     }
 
@@ -1459,12 +1476,11 @@ impl DiffCompare {
             RepresentationKind::Video => {
                 self.video[0].scrub_tex.is_some() && self.video[1].scrub_tex.is_some()
             }
-            RepresentationKind::Render => (0..2).all(|slot| {
-                matches!(
-                    self.render_cache.get(&(slot, self.render_page[slot])),
-                    Some(Some(_))
-                )
-            }),
+            RepresentationKind::Render => {
+                self.render_page.iter().enumerate().all(|(slot, &page)| {
+                    matches!(self.render_cache.get(&(slot, page)), Some(Some(_)))
+                })
+            }
             _ => self.compare_ready(),
         }
     }
@@ -1490,9 +1506,9 @@ impl DiffCompare {
         // present" note instead of spinning a decode that will only fail. Probe
         // presence once here and cache it; the render path must never `stat`.
         let present = side.present();
-        self.present[slot] = present;
+        set_slot(&mut self.present, slot, present);
         if !present {
-            self.settled[slot] = true;
+            set_slot(&mut self.settled, slot, true);
             return;
         }
         let side = if is_left { &self.left } else { &self.right };
@@ -1500,12 +1516,12 @@ impl DiffCompare {
             // A video has no single primary still any more — the Video tab
             // draws the filmstrip, the Audio tab the extracted soundtrack's
             // spectrogram, each produced by its own workers.
-            self.settled[slot] = true;
+            set_slot(&mut self.settled, slot, true);
             self.spawn_video_side(ctx, slot);
             return;
         }
         if !side.previewable() {
-            self.settled[slot] = true;
+            set_slot(&mut self.settled, slot, true);
             return;
         }
         let tx = self.tx.clone();
@@ -1554,10 +1570,14 @@ impl DiffCompare {
         let is_left = slot == 0;
         let side = if is_left { &self.left } else { &self.right };
         let n = crate::scrub::FILMSTRIP_FRAMES;
-        self.video[slot] = VideoSideState {
-            film: vec![None; n],
-            ..VideoSideState::default()
-        };
+        set_slot(
+            &mut self.video,
+            slot,
+            VideoSideState {
+                film: vec![None; n],
+                ..VideoSideState::default()
+            },
+        );
 
         let tx = self.media_tx.clone();
         let ctx2 = ctx.clone();
@@ -1636,7 +1656,9 @@ impl DiffCompare {
         if !side.facts.is_video() {
             return;
         }
-        let st = &mut self.video[slot];
+        let Some(st) = self.video.get_mut(slot) else {
+            return;
+        };
         st.scrub_frac = Some(fraction);
         st.scrub_tex = None;
         st.scrub_settled = false;
@@ -1687,7 +1709,7 @@ impl DiffCompare {
         };
         // A quiet backdrop so the wave reads against any theme.
         ui.painter().rect_filled(pane, 4.0, theme::panel());
-        let Some(env) = self.audio_env[slot].as_ref() else {
+        let Some(env) = self.audio_env.get(slot).and_then(Option::as_ref) else {
             let note = if self.side_has_sound(slot) {
                 "decoding waveform…"
             } else {
@@ -1813,7 +1835,9 @@ impl DiffCompare {
     ) -> Option<f32> {
         let side = if slot == 0 { &self.left } else { &self.right };
         if !side.facts.is_video() {
-            self.film_rects[slot].clear();
+            if let Some(rects) = self.film_rects.get_mut(slot) {
+                rects.clear();
+            }
             ui.painter().text(
                 pane.center(),
                 Align2::CENTER_CENTER,
@@ -1835,7 +1859,12 @@ impl DiffCompare {
             )
             .shrink(1.0);
             rects.push(r);
-            match self.video[slot].film.get(idx).and_then(Option::as_ref) {
+            match self
+                .video
+                .get(slot)
+                .and_then(|st| st.film.get(idx))
+                .and_then(Option::as_ref)
+            {
                 Some(tex) => {
                     let fitted = crate::lightbox::fit_rect(r, tex.size_vec2());
                     ui.painter_at(r)
@@ -1848,7 +1877,7 @@ impl DiffCompare {
                 }
             }
         }
-        self.film_rects[slot] = rects;
+        set_slot(&mut self.film_rects, slot, rects);
         // The shared playhead: one fraction, each side's own timeline.
         if let Some(f) = self.playhead {
             let x = strip.min.x + f.clamp(0.0, 1.0) * strip.width();
@@ -1892,8 +1921,10 @@ impl DiffCompare {
                 );
             }
             Some(f) => {
-                let st = &self.video[slot];
-                match (&st.scrub_tex, st.scrub_settled) {
+                let scrub = self.video.get(slot).map_or((None, false), |st| {
+                    (st.scrub_tex.as_ref(), st.scrub_settled)
+                });
+                match scrub {
                     (Some(tex), _) => {
                         let fitted = crate::lightbox::fit_rect(below, tex.size_vec2());
                         draw_in_pane(ui, below, fitted, &Some(tex.clone()));
@@ -1919,7 +1950,7 @@ impl DiffCompare {
                 }
                 // `A @ 1:00` — the moment in this clip's own timeline.
                 let tag = if slot == 0 { "A" } else { "B" };
-                let label = match self.video[slot].duration_secs {
+                let label = match self.video.get(slot).and_then(|st| st.duration_secs) {
                     Some(d) => format!(
                         "{tag} @ {}",
                         crate::scrub::format_secs(crate::scrub::scrub_timestamp_secs(f, d))
@@ -1927,7 +1958,7 @@ impl DiffCompare {
                     None => tag.to_string(),
                 };
                 ui.painter().text(
-                    below.min + egui::vec2(6.0, 6.0),
+                    egui::pos2(below.min.x + 6.0, below.min.y + 6.0),
                     Align2::LEFT_TOP,
                     label,
                     FontId::proportional(16.0),
@@ -1943,29 +1974,29 @@ impl DiffCompare {
     /// behind it. Called whenever a side is pointed at another file: without
     /// this a stepped side keeps showing its predecessor.
     fn refresh_side(&mut self, ctx: &Context, slot: usize) {
-        self.tex[slot] = None;
-        self.settled[slot] = false;
-        self.base_size[slot] = None;
-        self.base_image[slot] = None;
+        set_slot(&mut self.tex, slot, None);
+        set_slot(&mut self.settled, slot, false);
+        set_slot(&mut self.base_size, slot, None);
+        set_slot(&mut self.base_image, slot, None);
         if let Some(ops) = self.ops.get_mut(slot) {
             ops.clear();
         }
-        self.text[slot] = None;
-        self.strings[slot] = None;
+        set_slot(&mut self.text, slot, None);
+        set_slot(&mut self.strings, slot, None);
         self.render_cache.retain(|&(s, _), _| s != slot);
         self.render_order.retain(|&(s, _)| s != slot);
         self.render_pending.retain(|&(s, _)| s != slot);
-        self.render_count[slot] = None;
-        self.render_probed[slot] = false;
-        self.office_pdf[slot] = None;
-        self.office_pending[slot] = false;
-        self.audio_env[slot] = None;
-        self.hex_head[slot] = None;
-        self.tags[slot] = None;
-        self.exif_all[slot] = None;
+        set_slot(&mut self.render_count, slot, None);
+        set_slot(&mut self.render_probed, slot, false);
+        set_slot(&mut self.office_pdf, slot, None);
+        set_slot(&mut self.office_pending, slot, false);
+        set_slot(&mut self.audio_env, slot, None);
+        set_slot(&mut self.hex_head, slot, None);
+        set_slot(&mut self.tags, slot, None);
+        set_slot(&mut self.exif_all, slot, None);
         // The video media behind this side is stale too; a deferred transport
         // action would play the file this side no longer shows.
-        self.video[slot] = VideoSideState::default();
+        set_slot(&mut self.video, slot, VideoSideState::default());
         self.pending_play = None;
         // The Archive tab lists the *left* side's members; a changed left side
         // invalidates that list and its extraction status.
@@ -2110,13 +2141,13 @@ impl DiffCompare {
                         .extension()
                         .map(|e| format!(".{}", e.to_string_lossy()))
                         .unwrap_or_default();
-                    let mut i = 1;
+                    let mut i = 1u32;
                     loop {
                         let c = dir.join(format!("{stem}_{i}{ext}"));
                         if !c.exists() {
                             break c;
                         }
-                        i += 1;
+                        i = i.saturating_add(1);
                     }
                 } else {
                     dest
@@ -2140,14 +2171,14 @@ impl DiffCompare {
     fn poll(&mut self, ctx: &Context) {
         while let Ok(loaded) = self.rx.try_recv() {
             let slot = usize::from(!loaded.left);
-            self.settled[slot] = true;
+            set_slot(&mut self.settled, slot, true);
             if loaded.envelope.is_some() {
-                self.audio_env[slot] = loaded.envelope;
+                set_slot(&mut self.audio_env, slot, loaded.envelope);
             }
             if let Some(image) = loaded.image {
                 let [w, h] = image.size;
-                self.base_size[slot] = Some((w as u32, h as u32));
-                self.base_image[slot] = Some(image);
+                set_slot(&mut self.base_size, slot, Some((w as u32, h as u32)));
+                set_slot(&mut self.base_image, slot, Some(image));
                 self.upload(ctx, slot);
             }
         }
@@ -2160,7 +2191,7 @@ impl DiffCompare {
                         image,
                         TextureOptions::LINEAR,
                     );
-                    if let Some(f) = self.video[slot].film.get_mut(idx) {
+                    if let Some(f) = self.video.get_mut(slot).and_then(|st| st.film.get_mut(idx)) {
                         *f = Some(tex);
                     }
                 }
@@ -2168,7 +2199,9 @@ impl DiffCompare {
                     left,
                     duration_secs,
                 } => {
-                    self.video[usize::from(!left)].duration_secs = duration_secs;
+                    if let Some(st) = self.video.get_mut(usize::from(!left)) {
+                        st.duration_secs = duration_secs;
+                    }
                 }
                 MediaMsg::Soundtrack {
                     left,
@@ -2178,14 +2211,19 @@ impl DiffCompare {
                 } => {
                     let slot = usize::from(!left);
                     if envelope.is_some() {
-                        self.audio_env[slot] = envelope;
+                        set_slot(&mut self.audio_env, slot, envelope);
                     }
-                    let st = &mut self.video[slot];
-                    st.audio = Some(wav);
-                    st.spec_tex = spec.map(|image| {
-                        ctx.load_texture(format!("diff-spec-{slot}"), image, TextureOptions::LINEAR)
-                    });
-                    st.spec_settled = true;
+                    if let Some(st) = self.video.get_mut(slot) {
+                        st.audio = Some(wav);
+                        st.spec_tex = spec.map(|image| {
+                            ctx.load_texture(
+                                format!("diff-spec-{slot}"),
+                                image,
+                                TextureOptions::LINEAR,
+                            )
+                        });
+                        st.spec_settled = true;
+                    }
                 }
                 MediaMsg::ScrubFrame {
                     left,
@@ -2193,7 +2231,9 @@ impl DiffCompare {
                     image,
                 } => {
                     let slot = usize::from(!left);
-                    let st = &mut self.video[slot];
+                    let Some(st) = self.video.get_mut(slot) else {
+                        continue;
+                    };
                     // A decode for an older playhead position must not
                     // overwrite the one answering the current click.
                     if st.scrub_frac == Some(fraction) {
@@ -2254,7 +2294,7 @@ impl DiffCompare {
                     let slot = usize::from(!left);
                     let side = if slot == 0 { &self.left } else { &self.right };
                     if side.facts.abs_path == path {
-                        self.render_count[slot] = pages;
+                        set_slot(&mut self.render_count, slot, pages);
                     }
                 }
                 MediaMsg::OfficePdf { left, path, pdf } => {
@@ -2266,8 +2306,8 @@ impl DiffCompare {
                     // re-arm ensure_render and race a second conversion of
                     // the current file against the one already in flight.
                     if side.facts.abs_path == path {
-                        self.office_pending[slot] = false;
-                        self.office_pdf[slot] = Some(pdf);
+                        set_slot(&mut self.office_pending, slot, false);
+                        set_slot(&mut self.office_pdf, slot, Some(pdf));
                     }
                 }
                 MediaMsg::DocText {
@@ -2325,7 +2365,11 @@ impl DiffCompare {
                 None => base.clone(),
             }
         };
-        self.tex[slot] = Some(ctx.load_texture(name, image, TextureOptions::LINEAR));
+        set_slot(
+            &mut self.tex,
+            slot,
+            Some(ctx.load_texture(name, image, TextureOptions::LINEAR)),
+        );
     }
 
     /// `(texture, pixel-size)` for one side, in the shape [`draw_compare`] wants.
@@ -2363,7 +2407,11 @@ impl DiffCompare {
     fn side_has_sound(&self, slot: usize) -> bool {
         let side = if slot == 0 { &self.left } else { &self.right };
         side.facts.is_audio()
-            || (side.facts.is_video() && !matches!(self.video[slot].audio, Some(None)))
+            || (side.facts.is_video()
+                && self
+                    .video
+                    .get(slot)
+                    .is_some_and(|v| !matches!(v.audio, Some(None))))
     }
 
     /// Resolve what the transport plays for one side at the current rate stop:
@@ -2379,10 +2427,10 @@ impl DiffCompare {
                 u64::from(side.facts.audio_ms.unwrap_or(0)),
             )
         } else if side.facts.is_video() {
-            match &self.video[slot].audio {
-                Some(Some((wav, ms))) => (wav.clone(), *ms),
-                Some(None) => return AudioSrc::None,
-                None => return AudioSrc::Rendering,
+            match self.video.get(slot).map(|v| &v.audio) {
+                Some(Some(Some((wav, ms)))) => (wav.clone(), *ms),
+                Some(Some(None)) | None => return AudioSrc::None,
+                Some(None) => return AudioSrc::Rendering,
             }
         } else {
             return AudioSrc::None;
@@ -3014,10 +3062,14 @@ impl DiffCompare {
                         },
                     );
                 } else if self.tab == RepresentationKind::Metadata {
-                    for slot in [0usize, 1usize] {
-                        let side = if slot == 0 { &self.left } else { &self.right };
-                        if self.tags[slot].is_none() {
-                            self.tags[slot] = Some(
+                    for ((tags, exif_all), side) in self
+                        .tags
+                        .iter_mut()
+                        .zip(self.exif_all.iter_mut())
+                        .zip([&self.left, &self.right])
+                    {
+                        if tags.is_none() {
+                            *tags = Some(
                                 crate::id3tags::container_supported(side.facts.mime.as_deref())
                                     .then(|| crate::id3tags::read(&side.facts.abs_path))
                                     .flatten(),
@@ -3026,7 +3078,7 @@ impl DiffCompare {
                         // The full EXIF listing, read from the file once. When
                         // the file itself yields nothing, the two indexed
                         // facts still show.
-                        if self.exif_all[slot].is_none() {
+                        if exif_all.is_none() {
                             let fields = if side.facts.is_image() {
                                 let mut f =
                                     dedup_core::fingerprint::exif_fields(&side.facts.abs_path);
@@ -3044,7 +3096,7 @@ impl DiffCompare {
                             } else {
                                 Vec::new()
                             };
-                            self.exif_all[slot] = Some(fields);
+                            *exif_all = Some(fields);
                         }
                     }
                     let (lt, rt) = (
@@ -3336,7 +3388,10 @@ impl DiffCompare {
                         if let Some(f) = self.draw_video_side(ui, viewport, slot, verbosity) {
                             clicked = Some(f);
                         }
-                        self.film_rects[1 - slot].clear();
+                        // The other side's filmstrip is not drawn this frame.
+                        if let Some(rects) = self.film_rects.get_mut(usize::from(slot == 0)) {
+                            rects.clear();
+                        }
                     }
                     if let Some(f) = clicked {
                         self.playhead = Some(f);
@@ -3609,7 +3664,7 @@ impl DiffCompare {
 
                     // Row 1 right: the destructive action in its own region — the
                     // caller's mark pill, or DIFF's OVERWRITE OTHER / DELETE.
-                    let mark = self.marks[usize::from(!is_left)];
+                    let mark = self.marks.get(usize::from(!is_left)).copied().flatten();
                     let mark_label = if two_sided && !flicker_active {
                         if is_left { "DELETE A" } else { "DELETE B" }
                     } else {
@@ -3661,7 +3716,7 @@ impl DiffCompare {
                             |ui| {
                                 if tab_is_image {
                                     let slot = usize::from(!is_left);
-                                    let turned = !self.ops[slot].is_empty();
+                                    let turned = self.ops.get(slot).is_some_and(|o| !o.is_empty());
                                     if ui.button(format!("ROTATE {label}")).clicked() {
                                         turn = Some((is_left, Orient::RotateCw));
                                     }
@@ -4312,6 +4367,14 @@ fn save_actions(read_only: bool, has_edits: bool) -> SaveActions {
     }
 }
 
+/// Store `value` in one side's slot of a per-side array; a slot past the end
+/// (never the case for a side index) is ignored.
+fn set_slot<T>(slots: &mut [T], slot: usize, value: T) {
+    if let Some(s) = slots.get_mut(slot) {
+        *s = value;
+    }
+}
+
 /// The fixed location of the office-conversion cache (see
 /// [`DiffCompare::office_cache_dir`]).
 fn office_cache_path() -> std::path::PathBuf {
@@ -4419,10 +4482,10 @@ fn metadata_sidecar(name: &str, fields: &[(String, String)]) -> String {
 /// a sidecar export never clobbers something already there.
 fn non_colliding_sidecar(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
     let mut dest = dir.join(name);
-    let mut n = 1;
+    let mut n = 1u32;
     while dest.exists() {
         dest = dir.join(format!("{name}.{n}"));
-        n += 1;
+        n = n.saturating_add(1);
     }
     dest
 }

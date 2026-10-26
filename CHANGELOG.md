@@ -8,6 +8,8 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 - Duplicates shows each group's copies side by side again, best copy on the left, instead of
   stacked rows.
+- On a Wayland desktop, programs opened from dedup (viewers, the file manager) start on
+  Wayland; only dedup's own window still uses X11 for drag-and-drop.
 
 ---
 

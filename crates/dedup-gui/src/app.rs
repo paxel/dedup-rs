@@ -784,9 +784,9 @@ impl DedupApp {
                 repos: edit.repos,
                 spec: edit.spec,
             };
-            match edit.index {
-                Some(i) if i < self.favorites.len() => self.favorites[i] = fav,
-                _ => self.favorites.push(fav),
+            match edit.index.and_then(|i| self.favorites.get_mut(i)) {
+                Some(slot) => *slot = fav,
+                None => self.favorites.push(fav),
             }
             self.card(
                 ctx,
@@ -899,7 +899,7 @@ impl DedupApp {
         let mut non_dirs = 0usize;
         for path in dropped {
             if !path.is_dir() {
-                non_dirs += 1;
+                non_dirs = non_dirs.saturating_add(1);
                 continue;
             }
             let name = unique_repo_name(&sanitize_repo_name(&path), &taken);
@@ -993,7 +993,7 @@ impl DedupApp {
                                 s.unchanged,
                                 s.marked_missing,
                                 s.errors,
-                                s.added + s.updated,
+                                s.added.saturating_add(s.updated),
                                 crate::util::format_size(s.hashed_bytes)
                             );
                             // The scan saw an empty directory where the index
@@ -1110,7 +1110,7 @@ impl DedupApp {
                         "updating"
                     };
                     progress.phase(
-                        format!("{doing} '{name}' ({} of {total})", i + 1),
+                        format!("{doing} '{name}' ({} of {total})", i.saturating_add(1)),
                         i as u64,
                         Some(total),
                     );
@@ -1142,11 +1142,11 @@ impl DedupApp {
                     };
                     match &outcome {
                         JobOutcome::Update(Ok(s)) => {
-                            added += s.added;
-                            updated += s.updated;
-                            unchanged += s.unchanged;
-                            missing += s.marked_missing;
-                            errors += s.errors;
+                            added = added.saturating_add(s.added);
+                            updated = updated.saturating_add(s.updated);
+                            unchanged = unchanged.saturating_add(s.unchanged);
+                            missing = missing.saturating_add(s.marked_missing);
+                            errors = errors.saturating_add(s.errors);
                             cancelled |= s.cancelled;
                             let mut line = format!(
                                 "added {}, updated {}, missing {}",
@@ -1164,7 +1164,7 @@ impl DedupApp {
                             progress.row_done(name, line);
                         }
                         JobOutcome::Update(Err(e)) => {
-                            errors += 1;
+                            errors = errors.saturating_add(1);
                             progress.problem(format!("'{name}': {e}"));
                             progress.row_done(name, format!("error: {e}"));
                         }
@@ -1177,10 +1177,10 @@ impl DedupApp {
                             progress.row_done(name, "refused: walked empty");
                         }
                         JobOutcome::Check(Ok(c)) => {
-                            changed += c.changed;
-                            missing += c.missing;
-                            unchanged += c.unchanged;
-                            errors += c.errors;
+                            changed = changed.saturating_add(c.changed);
+                            missing = missing.saturating_add(c.missing);
+                            unchanged = unchanged.saturating_add(c.unchanged);
+                            errors = errors.saturating_add(c.errors);
                             cancelled |= c.cancelled;
                             progress.row_done(
                                 name,
@@ -1191,7 +1191,7 @@ impl DedupApp {
                             );
                         }
                         JobOutcome::Check(Err(e)) => {
-                            errors += 1;
+                            errors = errors.saturating_add(1);
                             progress.problem(format!("'{name}': {e}"));
                             progress.row_done(name, format!("error: {e}"));
                         }
@@ -1787,7 +1787,8 @@ impl eframe::App for DedupApp {
         // position so `viewport().inner_rect` is None; scaling by the zoom
         // factor converts egui points to the logical points `with_inner_size`
         // expects, independent of HiDPI or `--ui-scale`.
-        let sz = ctx.viewport_rect().size() * ctx.zoom_factor();
+        let (viewport, zoom) = (ctx.viewport_rect().size(), ctx.zoom_factor());
+        let sz = egui::vec2(viewport.x * zoom, viewport.y * zoom);
         if sz.x >= 1.0 && sz.y >= 1.0 {
             self.window_size = Some([sz.x, sz.y]);
         }
@@ -3753,10 +3754,14 @@ fn unique_repo_name(base: &str, taken: &HashSet<String>) -> String {
     if !taken.contains(base) {
         return base.to_string();
     }
-    (2..)
-        .map(|n| format!("{base}-{n}"))
-        .find(|c| !taken.contains(c))
-        .expect("an unbounded range always yields a free name")
+    let mut n: u64 = 2;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+        n = n.saturating_add(1);
+    }
 }
 
 #[cfg(test)]

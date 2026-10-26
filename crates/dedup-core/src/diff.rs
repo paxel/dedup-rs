@@ -518,28 +518,23 @@ pub fn diff_print_reporting(
     let total = entries.len() as u64;
     let mut items = Vec::new();
     for (done, (rel_path, entry)) in entries.into_iter().enumerate() {
-        pairing_step(progress, done as u64 + 1, total);
+        pairing_step(progress, (done as u64).saturating_add(1), total);
         check(cancel)?;
         match ref_index.get(&(entry.size, entry.hash)) {
             None => items.push(DiffItem::New { rel_path }),
             Some(state) if state.present => {
                 // Prefer a path from the primary; fall back to any reference
                 // (all handles are already open — no per-file reopening).
-                let mut reference_path =
-                    store::get_paths_by_size_hash(&refs[0].db, entry.size, &entry.hash)?
-                        .into_iter()
-                        .next()
-                        .unwrap_or_default();
-                if reference_path.is_empty() {
-                    for extra in &refs[1..] {
-                        if let Some(p) =
-                            store::get_paths_by_size_hash(&extra.db, entry.size, &entry.hash)?
-                                .into_iter()
-                                .next()
-                        {
-                            reference_path = p;
-                            break;
-                        }
+                let mut reference_path = String::new();
+                for reference in &refs {
+                    if let Some(p) =
+                        store::get_paths_by_size_hash(&reference.db, entry.size, &entry.hash)?
+                            .into_iter()
+                            .next()
+                        && !p.is_empty()
+                    {
+                        reference_path = p;
+                        break;
                     }
                 }
                 items.push(DiffItem::Equal {
@@ -636,8 +631,8 @@ pub fn diff_copy(
         if move_files {
             moved.push(rel_path.clone());
         }
-        stats.copied += 1;
-        since_flush += 1;
+        stats.copied = stats.copied.saturating_add(1);
+        since_flush = since_flush.saturating_add(1);
         run.progress.on(DiffEvent::Progress {
             action,
             done: stats.copied,
@@ -739,8 +734,8 @@ pub fn diff_delete(
             }
         }
         deleted.push(rel_path.clone());
-        stats.deleted += 1;
-        since_flush += 1;
+        stats.deleted = stats.deleted.saturating_add(1);
+        since_flush = since_flush.saturating_add(1);
         run.progress.on(DiffEvent::Progress {
             action: DiffAction::Delete,
             done: stats.deleted,
@@ -869,7 +864,7 @@ pub fn diff_sync_from(
             })
             .count(),
     };
-    let total = (copy_total + delete_total) as u64;
+    let total = copy_total.saturating_add(delete_total) as u64;
     let mut done = 0u64;
 
     // Mirror deletes first so a copy can reclaim a path a delete frees (the
@@ -908,7 +903,7 @@ pub fn diff_sync_from(
                 &mut stats,
                 run,
             )? {
-                done += 1;
+                done = done.saturating_add(1);
                 run.progress.on(DiffEvent::Progress {
                     action: DiffAction::Copy,
                     done,
@@ -936,7 +931,7 @@ pub fn diff_sync_from(
             // One progress step per acting entry (not per deleted path), so
             // `done` never overshoots `total`.
             if let Some(first) = deleted.first() {
-                done += 1;
+                done = done.saturating_add(1);
                 run.progress.on(DiffEvent::Progress {
                     action: DiffAction::Delete,
                     done,
@@ -977,7 +972,7 @@ fn delete_absent(
             Ok(()) => true,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
             Err(err) => {
-                stats.errors += 1;
+                stats.errors = stats.errors.saturating_add(1);
                 run.progress.on(DiffEvent::Error {
                     path: path.to_string_lossy().into_owned(),
                     message: err.to_string(),
@@ -987,8 +982,8 @@ fn delete_absent(
         };
         if removed {
             store::mark_missing(&target.db, std::iter::once(rel_path.as_str()))?;
-            stats.deleted += 1;
-            *done += 1;
+            stats.deleted = stats.deleted.saturating_add(1);
+            *done = done.saturating_add(1);
             run.progress.on(DiffEvent::Progress {
                 action: DiffAction::Delete,
                 done: *done,
@@ -1105,7 +1100,7 @@ pub fn plan_sync_from_reporting(
 
     if copy_new {
         for (done, (rel_path, entry)) in source_entries.iter().enumerate() {
-            pairing_step(progress, done as u64 + 1, total);
+            pairing_step(progress, (done as u64).saturating_add(1), total);
             check(cancel)?;
             if entry.missing {
                 continue;
@@ -1168,19 +1163,19 @@ fn sync_copy(
 ) -> Result<bool, StoreError> {
     let key = (entry.size, entry.hash);
     if target_index.get(&key).is_some_and(|state| state.present) {
-        stats.equal += 1;
+        stats.equal = stats.equal.saturating_add(1);
         return Ok(false);
     }
 
     let target_file = target_root.join(rel_path);
     if target_file.exists() {
-        stats.skipped += 1;
+        stats.skipped = stats.skipped.saturating_add(1);
         return Ok(false);
     }
     if let Some(parent) = target_file.parent()
         && let Err(err) = std::fs::create_dir_all(parent)
     {
-        stats.errors += 1;
+        stats.errors = stats.errors.saturating_add(1);
         run.progress.on(DiffEvent::Error {
             path: target_file.to_string_lossy().into_owned(),
             message: err.to_string(),
@@ -1189,7 +1184,7 @@ fn sync_copy(
     }
     let source_file = source_root.join(rel_path);
     if let Err(err) = std::fs::copy(&source_file, &target_file) {
-        stats.errors += 1;
+        stats.errors = stats.errors.saturating_add(1);
         run.progress.on(DiffEvent::Error {
             path: target_file.to_string_lossy().into_owned(),
             message: err.to_string(),
@@ -1198,7 +1193,7 @@ fn sync_copy(
     }
     // Best effort, before the entry below reads the mtime back off disk.
     let _ = crate::update::copy_mtime(&source_file, &target_file);
-    stats.copied += 1;
+    stats.copied = stats.copied.saturating_add(1);
 
     // Index the copy with the mtime the file actually has on the target so
     // the next update run sees it as unchanged.
@@ -1229,7 +1224,7 @@ fn sync_delete(
     let mut kept = 0usize;
     for rel_path in store::get_paths_by_size_hash(&target.db, entry.size, &entry.hash)? {
         if !run.selected_target(&rel_path) {
-            kept += 1;
+            kept = kept.saturating_add(1);
             continue;
         }
         let path = target_root.join(&rel_path);
@@ -1238,7 +1233,7 @@ fn sync_delete(
             // NotFound counts as deleted: the file is gone either way.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
             Err(err) => {
-                stats.errors += 1;
+                stats.errors = stats.errors.saturating_add(1);
                 run.progress.on(DiffEvent::Error {
                     path: path.to_string_lossy().into_owned(),
                     message: err.to_string(),
@@ -1248,7 +1243,7 @@ fn sync_delete(
         };
         if removed {
             store::mark_missing(&target.db, std::iter::once(rel_path.as_str()))?;
-            stats.deleted += 1;
+            stats.deleted = stats.deleted.saturating_add(1);
             removed_paths.push(rel_path);
         }
     }
@@ -1469,8 +1464,8 @@ pub fn export_to_folder(
         if move_files {
             moved.push(rel_path.clone());
         }
-        stats.copied += 1;
-        since_flush += 1;
+        stats.copied = stats.copied.saturating_add(1);
+        since_flush = since_flush.saturating_add(1);
         run.progress.on(DiffEvent::Progress {
             action,
             done: stats.copied,

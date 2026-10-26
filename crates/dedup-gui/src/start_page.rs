@@ -350,10 +350,9 @@ pub(crate) fn availability(cmd: Command, selected: &[&RepoFact]) -> Result<(), S
         .filter(|r| r.sink_of.is_none())
         .collect();
     let exactly_one = || -> Result<&RepoFact, String> {
-        if n == 1 {
-            Ok(selected[0])
-        } else {
-            Err("Needs exactly one repository".into())
+        match selected {
+            [only] => Ok(*only),
+            _ => Err("Needs exactly one repository".into()),
         }
     };
     let not_a_sink = |r: &RepoFact| -> Result<(), String> {
@@ -405,7 +404,7 @@ pub(crate) fn availability(cmd: Command, selected: &[&RepoFact]) -> Result<(), S
             .copied()
             .filter(|r| r.sink_of.as_deref() == Some(group))
             .collect();
-        if members.is_empty() || members.len() + 1 != n {
+        if members.is_empty() || members.len().saturating_add(1) != n {
             return Err("Needs a backup group: its main and at least one of its backups".into());
         }
         Ok((*main, members))

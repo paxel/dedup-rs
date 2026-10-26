@@ -173,7 +173,9 @@ pub fn read_exif(path: &Path) -> Option<ExifInfo> {
         .get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)
         .or_else(|| exif.get_field(exif::Tag::DateTime, exif::In::PRIMARY))
         .and_then(|f| match &f.value {
-            exif::Value::Ascii(vec) if !vec.is_empty() => exif::DateTime::from_ascii(&vec[0]).ok(),
+            exif::Value::Ascii(vec) => vec
+                .first()
+                .and_then(|first| exif::DateTime::from_ascii(first).ok()),
             _ => None,
         })
         .map(|dt| exif_datetime_to_ms(&dt));
@@ -211,8 +213,12 @@ pub fn exif_fields(path: &Path) -> Vec<(String, String)> {
 /// Convert an EXIF `DateTime` (naive, no timezone) to epoch milliseconds,
 /// treated as if UTC (via the shared civil-date math in [`crate::filter`]).
 fn exif_datetime_to_ms(dt: &exif::DateTime) -> i64 {
-    crate::filter::ymd_to_ms(dt.year as i64, dt.month as i64, dt.day as i64)
-        + (dt.hour as i64 * 3600 + dt.minute as i64 * 60 + dt.second as i64) * 1000
+    let seconds = i64::from(dt.hour)
+        .saturating_mul(3600)
+        .saturating_add(i64::from(dt.minute).saturating_mul(60))
+        .saturating_add(i64::from(dt.second));
+    crate::filter::ymd_to_ms(i64::from(dt.year), i64::from(dt.month), i64::from(dt.day))
+        .saturating_add(seconds.saturating_mul(1000))
 }
 
 // --- Images -----------------------------------------------------------------
@@ -239,24 +245,36 @@ pub fn image_hash(img: &image::DynamicImage) -> ImgHash {
     let n = IMG_GRID;
     let pixels = canonicalize_moments(gray_grid(img, n), n);
     let mut hash = [0u64; 8];
-    let mut bit = 0usize;
-    for y in 0..n - 1 {
-        for x in 0..n - 1 {
-            if pixels[y * n + x] > pixels[y * n + x + 1] {
-                hash[bit / 64] |= 1u64 << (bit % 64);
-            }
-            bit += 1;
-        }
-    }
-    for y in 0..n - 1 {
-        for x in 0..n - 1 {
-            if pixels[y * n + x] > pixels[(y + 1) * n + x] {
-                hash[bit / 64] |= 1u64 << (bit % 64);
-            }
-            bit += 1;
+    let bits = horizontal_bits(&pixels, n).chain(vertical_bits(&pixels, n));
+    for (bit, set) in bits.enumerate() {
+        if set && let Some(word) = hash.get_mut(bit / 64) {
+            *word |= 1u64 << (bit % 64);
         }
     }
     hash
+}
+
+/// One bit per horizontal neighbor pair (left brighter than right) of an
+/// `n`×`n` row-major grid, over its first `n - 1` rows, row by row.
+fn horizontal_bits(pixels: &[u8], n: usize) -> impl Iterator<Item = bool> + '_ {
+    pixels
+        .chunks(n.max(1))
+        .take(n.saturating_sub(1))
+        .flat_map(|row| row.windows(2).map(|pair| pair.first() > pair.get(1)))
+}
+
+/// One bit per vertical neighbor pair (top brighter than bottom) of an
+/// `n`×`n` row-major grid, over its first `n - 1` columns, row by row.
+fn vertical_bits(pixels: &[u8], n: usize) -> impl Iterator<Item = bool> + '_ {
+    let rows = pixels.chunks(n.max(1));
+    rows.clone()
+        .zip(rows.skip(1))
+        .flat_map(move |(top, bottom)| {
+            top.iter()
+                .zip(bottom)
+                .take(n.saturating_sub(1))
+                .map(|(upper, lower)| upper > lower)
+        })
 }
 
 /// 64-bit horizontal dHash of a 9×9 grid, canonicalized lexicographically;
@@ -265,17 +283,11 @@ pub fn image_hash(img: &image::DynamicImage) -> ImgHash {
 /// rescanned — do not change its semantics.
 pub fn dhash_from_image(img: &image::DynamicImage) -> u64 {
     let pixels = canonicalize_lex(gray_grid(img, 9), 9);
-    let mut hash = 0u64;
-    for y in 0..8 {
-        for x in 0..8 {
-            let left = pixels[y * 9 + x];
-            let right = pixels[y * 9 + (x + 1)];
-            if left > right {
-                hash |= 1u64 << (y * 8 + x);
-            }
-        }
-    }
-    hash
+    // Bit `y * 8 + x` is set when pixel (x, y) is brighter than its right neighbor.
+    horizontal_bits(&pixels, 9)
+        .zip(0..u64::BITS)
+        .filter(|&(set, _)| set)
+        .fold(0u64, |hash, (_, bit)| hash | 1u64 << bit)
 }
 
 /// `n`×`n` bilinear grayscale of `img`, row-major.
@@ -301,16 +313,16 @@ fn gray_grid(img: &image::DynamicImage, n: usize) -> Vec<u8> {
 /// odd `n` so the center is a cell.
 fn canonicalize_moments(img: Vec<u8>, n: usize) -> Vec<u8> {
     debug_assert!(n % 2 == 1);
-    let c = ((n - 1) / 2) as i64;
+    let c = (n.saturating_sub(1) / 2) as i64;
     let moment = |img: &[u8], horizontal: bool| -> i64 {
-        let mut m = 0i64;
-        for y in 0..n {
-            for x in 0..n {
-                let w = if horizontal { x as i64 } else { y as i64 } - c;
-                m += i64::from(img[y * n + x]) * w;
-            }
-        }
-        m
+        let cells = img.chunks(n.max(1)).enumerate().flat_map(|(y, row)| {
+            row.iter().enumerate().map(move |(x, &value)| {
+                let pos = if horizontal { x } else { y };
+                let w = (pos as i64).saturating_sub(c);
+                i64::from(value).saturating_mul(w)
+            })
+        });
+        cells.fold(0i64, i64::saturating_add)
     };
     let mut out = img;
     if moment(&out, true) > 0 {
@@ -348,44 +360,33 @@ fn canonicalize_lex(img: Vec<u8>, n: usize) -> Vec<u8> {
     best
 }
 
+/// Column `x` of an `n`×`n` row-major grid, top to bottom.
+fn column(img: &[u8], n: usize, x: usize) -> impl DoubleEndedIterator<Item = &u8> {
+    img.iter().skip(x).step_by(n.max(1))
+}
+
+/// Clockwise: the new row `x` is the old column `x`, bottom to top.
 fn rotate90(img: &[u8], n: usize) -> Vec<u8> {
-    let mut rotated = vec![0u8; n * n];
-    for y in 0..n {
-        for x in 0..n {
-            rotated[x * n + (n - 1 - y)] = img[y * n + x];
-        }
-    }
-    rotated
+    (0..n)
+        .flat_map(|x| column(img, n, x).rev())
+        .copied()
+        .collect()
 }
 
 fn flip_horizontal(img: &[u8], n: usize) -> Vec<u8> {
-    let mut flipped = vec![0u8; n * n];
-    for y in 0..n {
-        for x in 0..n {
-            flipped[y * n + (n - 1 - x)] = img[y * n + x];
-        }
-    }
-    flipped
+    img.chunks(n.max(1))
+        .flat_map(|row| row.iter().rev())
+        .copied()
+        .collect()
 }
 
 fn flip_vertical(img: &[u8], n: usize) -> Vec<u8> {
-    let mut flipped = vec![0u8; n * n];
-    for y in 0..n {
-        for x in 0..n {
-            flipped[(n - 1 - y) * n + x] = img[y * n + x];
-        }
-    }
-    flipped
+    img.chunks(n.max(1)).rev().flatten().copied().collect()
 }
 
+/// Transpose: the new row `x` is the old column `x`.
 fn flip_diagonal(img: &[u8], n: usize) -> Vec<u8> {
-    let mut flipped = vec![0u8; n * n];
-    for y in 0..n {
-        for x in 0..n {
-            flipped[x * n + y] = img[y * n + x];
-        }
-    }
-    flipped
+    (0..n).flat_map(|x| column(img, n, x)).copied().collect()
 }
 
 // --- Video ------------------------------------------------------------------
@@ -401,9 +402,9 @@ pub fn video_temporal_hash(path: &Path) -> Option<[ImgHash; 3]> {
         return None;
     }
     let mut hashes = [[0u64; 8]; 3];
-    for (i, pct) in [0.1, 0.5, 0.9].into_iter().enumerate() {
+    for (slot, pct) in hashes.iter_mut().zip([0.1, 0.5, 0.9]) {
         if let Some(frame) = extract_frame(path, duration * pct) {
-            hashes[i] = image_hash(&frame);
+            *slot = image_hash(&frame);
         }
     }
     Some(hashes)
@@ -838,17 +839,24 @@ fn decode_audio_prefix(path: &Path) -> Option<DecodedPrefix> {
                 break;
             }
             started = Some((rate, channels));
-            frames_left = u64::from(rate) * u64::from(AUDIO_FINGERPRINT_SECS);
+            frames_left = u64::from(rate).saturating_mul(u64::from(AUDIO_FINGERPRINT_SECS));
         }
         let frames = decoded.frames() as u64;
         let buf = match sample_buf.as_mut() {
-            Some(buf) if buf.capacity() >= decoded.capacity() * channels as usize => buf,
+            Some(buf) if buf.capacity() >= decoded.capacity().saturating_mul(channels as usize) => {
+                buf
+            }
             _ => sample_buf.insert(SampleBuffer::<i16>::new(decoded.capacity() as u64, spec)),
         };
         buf.copy_interleaved_ref(decoded);
         let take = frames.min(frames_left) as usize;
-        printer.consume(&buf.samples()[..take * channels as usize]);
-        frames_left -= take as u64;
+        let samples = buf.samples();
+        printer.consume(
+            samples
+                .get(..take.saturating_mul(channels as usize))
+                .unwrap_or(samples),
+        );
+        frames_left = frames_left.saturating_sub(take as u64);
         if frames_left == 0 {
             break;
         }

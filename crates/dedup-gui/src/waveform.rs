@@ -208,7 +208,7 @@ fn extract_viz(path: &Path) -> Option<AudioViz> {
     for sample in decoder {
         // rodio 0.22 decoders yield normalized f32 samples (was i16 pre-0.21).
         acc += sample;
-        ch_i += 1;
+        ch_i = ch_i.saturating_add(1);
         if ch_i < channels {
             continue;
         }
@@ -222,50 +222,64 @@ fn extract_viz(path: &Path) -> Option<AudioViz> {
         if amp > peak {
             peak = amp;
         }
-        in_step += 1;
+        in_step = in_step.saturating_add(1);
         if in_step == step {
             fine.push(peak);
             peak = 0.0;
             in_step = 0;
             if fine.len() >= env_cap * 2 {
-                for j in 0..fine.len() / 2 {
-                    fine[j] = fine[2 * j].max(fine[2 * j + 1]);
-                }
-                fine.truncate(fine.len() / 2);
-                step *= 2;
+                fine = fine
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .filter_map(|pair| pair.iter().copied().reduce(f32::max))
+                    .collect();
+                step = step.saturating_mul(2);
             }
         }
 
         // --- spectrogram ---
-        window[wpos] = mono;
-        wpos = (wpos + 1) % FFT_N;
-        since_hop += 1;
+        if let Some(slot) = window.get_mut(wpos) {
+            *slot = mono;
+        }
+        wpos = wpos.saturating_add(1) % FFT_N;
+        since_hop = since_hop.saturating_add(1);
         if since_hop == HOP {
             since_hop = 0;
-            for k in 0..FFT_N {
-                re[k] = window[(wpos + k) % FFT_N] * hann[k];
-                im[k] = 0.0;
+            // The ring buffer read oldest-first: from `wpos` round to it again.
+            let ordered = window.iter().cycle().skip(wpos);
+            for (((r, i), &w), &h) in re.iter_mut().zip(im.iter_mut()).zip(ordered).zip(&hann) {
+                *r = w * h;
+                *i = 0.0;
             }
             fft(&mut re, &mut im);
             // Peak-accumulate this frame's linear magnitude into the column.
-            for (b, slot) in col_acc.iter_mut().enumerate() {
-                let mag = (re[b] * re[b] + im[b] * im[b]).sqrt();
+            for ((slot, &r), &i) in col_acc.iter_mut().zip(&re).zip(&im) {
+                let mag = (r * r + i * i).sqrt();
                 if mag > *slot {
                     *slot = mag;
                 }
             }
-            col_frames += 1;
+            col_frames = col_frames.saturating_add(1);
             if col_frames == col_step {
                 cols.push(col_acc);
                 col_acc = [0f32; SPEC_BINS];
                 col_frames = 0;
                 if cols.len() >= SPEC_COLS * 2 {
-                    for j in 0..cols.len() / 2 {
-                        let (lo, hi) = (cols[2 * j], cols[2 * j + 1]);
-                        cols[j] = std::array::from_fn(|k| lo[k].max(hi[k]));
-                    }
-                    cols.truncate(cols.len() / 2);
-                    col_step *= 2;
+                    cols = cols
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .filter_map(|pair| {
+                            pair.iter().copied().reduce(|mut lo, hi| {
+                                for (l, h) in lo.iter_mut().zip(hi) {
+                                    *l = l.max(h);
+                                }
+                                lo
+                            })
+                        })
+                        .collect();
+                    col_step = col_step.saturating_mul(2);
                 }
             }
         }
@@ -284,9 +298,12 @@ fn extract_viz(path: &Path) -> Option<AudioViz> {
     let mut envelope = vec![0f32; WAVE_BUCKETS];
     let m = fine.len();
     for (i, &v) in fine.iter().enumerate() {
-        let b = (i * WAVE_BUCKETS) / m;
-        if v > envelope[b] {
-            envelope[b] = v;
+        // `i < m`, so the bucket is always below `WAVE_BUCKETS`.
+        let bucket = i.saturating_mul(WAVE_BUCKETS).checked_div(m);
+        if let Some(slot) = bucket.and_then(|b| envelope.get_mut(b))
+            && v > *slot
+        {
+            *slot = v;
         }
     }
     let emax = envelope.iter().copied().fold(0f32, f32::max);
@@ -300,11 +317,15 @@ fn extract_viz(path: &Path) -> Option<AudioViz> {
     let mut spec = vec![0f32; SPEC_BINS * SPEC_COLS];
     let nc = cols.len().max(1);
     for (i, col) in cols.iter().enumerate() {
-        let x = (i * SPEC_COLS) / nc;
-        for (b, &v) in col.iter().enumerate() {
-            let idx = b * SPEC_COLS + x;
-            if v > spec[idx] {
-                spec[idx] = v;
+        // `i < nc`, so the column is always below `SPEC_COLS`.
+        let Some(x) = i.saturating_mul(SPEC_COLS).checked_div(nc) else {
+            continue;
+        };
+        for (row, &v) in spec.as_chunks_mut::<SPEC_COLS>().0.iter_mut().zip(col) {
+            if let Some(slot) = row.get_mut(x)
+                && v > *slot
+            {
+                *slot = v;
             }
         }
     }
@@ -361,23 +382,31 @@ fn fft(re: &mut [f32], im: &mut [f32]) {
     while len <= n {
         let ang = -2.0 * std::f32::consts::PI / len as f32;
         let (wr, wi) = (ang.cos(), ang.sin());
-        let mut i = 0;
-        while i < n {
+        // Each `len`-block pairs its lower half `a` with its upper half `b`.
+        for (block_re, block_im) in re.chunks_exact_mut(len).zip(im.chunks_exact_mut(len)) {
+            let (Some((re_a, re_b)), Some((im_a, im_b))) = (
+                block_re.split_at_mut_checked(len / 2),
+                block_im.split_at_mut_checked(len / 2),
+            ) else {
+                continue;
+            };
             let (mut cr, mut ci) = (1.0f32, 0.0f32);
-            for k in 0..len / 2 {
-                let a = i + k;
-                let b = i + k + len / 2;
-                let tr = cr * re[b] - ci * im[b];
-                let ti = cr * im[b] + ci * re[b];
-                re[b] = re[a] - tr;
-                im[b] = im[a] - ti;
-                re[a] += tr;
-                im[a] += ti;
+            for (((ra, rb), ia), ib) in re_a
+                .iter_mut()
+                .zip(re_b.iter_mut())
+                .zip(im_a.iter_mut())
+                .zip(im_b.iter_mut())
+            {
+                let tr = cr * *rb - ci * *ib;
+                let ti = cr * *ib + ci * *rb;
+                *rb = *ra - tr;
+                *ib = *ia - ti;
+                *ra += tr;
+                *ia += ti;
                 let ncr = cr * wr - ci * wi;
                 ci = cr * wi + ci * wr;
                 cr = ncr;
             }
-            i += len;
         }
         len <<= 1;
     }
@@ -394,12 +423,15 @@ fn spec_color(v: f32) -> egui::Color32 {
         (1.00, 252.0, 255.0, 200.0),
     ];
     let v = v.clamp(0.0, 1.0);
-    let mut i = 0;
-    while i + 1 < STOPS.len() && v > STOPS[i + 1].0 {
-        i += 1;
-    }
-    let (v0, r0, g0, b0) = STOPS[i];
-    let (v1, r1, g1, b1) = STOPS[(i + 1).min(STOPS.len() - 1)];
+    // The first band whose top stop `v` does not exceed. `v <= 1.0` always
+    // finds one; only a NaN falls through, to the first band as before.
+    let ((v0, r0, g0, b0), (v1, r1, g1, b1)) = STOPS
+        .windows(2)
+        .find_map(|band| match band {
+            [lo, hi] if v <= hi.0 => Some((*lo, *hi)),
+            _ => None,
+        })
+        .unwrap_or((STOPS[0], STOPS[1]));
     let t = if v1 > v0 { (v - v0) / (v1 - v0) } else { 0.0 };
     let lerp = |a: f32, b: f32| (a + (b - a) * t) as u8;
     egui::Color32::from_rgb(lerp(r0, r1), lerp(g0, g1), lerp(b0, b1))
@@ -421,17 +453,16 @@ pub fn viz_rgba(path: &Path) -> Option<(egui::ColorImage, Vec<f32>)> {
 /// and the Browse audio preview.
 pub fn spec_image(viz: &AudioViz) -> egui::ColorImage {
     let (w, h) = (viz.spec_w, viz.spec_h);
-    let mut rgba = vec![0u8; w * h * 4];
-    for y in 0..h {
-        let bin = h - 1 - y; // row 0 (top) = highest freq
-        for x in 0..w {
-            let c = spec_color(viz.spec[bin * w + x]);
-            let i = (y * w + x) * 4;
-            rgba[i] = c.r();
-            rgba[i + 1] = c.g();
-            rgba[i + 2] = c.b();
-            rgba[i + 3] = 255;
-        }
+    let mut rgba = vec![0u8; w.saturating_mul(h).saturating_mul(4)];
+    // Bins in reverse: row 0 (top) = highest freq. `max(1)`: a zero-width
+    // image has no pixels to fill anyway.
+    let cells = viz.spec.chunks_exact(w.max(1)).take(h).rev().flatten();
+    for ([r, g, b, a], &v) in rgba.as_chunks_mut::<4>().0.iter_mut().zip(cells) {
+        let c = spec_color(v);
+        *r = c.r();
+        *g = c.g();
+        *b = c.b();
+        *a = 255;
     }
     egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba)
 }

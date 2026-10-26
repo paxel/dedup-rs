@@ -53,8 +53,8 @@ fn hash_reader<R: Read>(mut r: R) -> Option<(u64, [u8; 32])> {
         if n == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
-        size += n as u64;
+        hasher.update(buf.get(..n).unwrap_or_default());
+        size = size.saturating_add(n as u64);
     }
     Some((size, *hasher.finalize().as_bytes()))
 }
@@ -189,7 +189,7 @@ fn non_colliding(dest: &Path) -> PathBuf {
         .unwrap_or_else(|| "file".into());
     let ext = dest.extension().map(|e| e.to_string_lossy().into_owned());
     let dir = dest.parent().unwrap_or_else(|| Path::new("."));
-    let mut i = 1;
+    let mut i = 1u32;
     loop {
         let name = match &ext {
             Some(e) => format!("{stem}_{i}.{e}"),
@@ -199,7 +199,7 @@ fn non_colliding(dest: &Path) -> PathBuf {
         if !candidate.exists() {
             return candidate;
         }
-        i += 1;
+        i = i.saturating_add(1);
     }
 }
 
@@ -217,7 +217,7 @@ pub fn extract_all(
     let entries = list_entries(archive_path, rel_path, mime).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "cannot open archive")
     })?;
-    let mut written = 0;
+    let mut written = 0usize;
     for entry in entries {
         if entry.locked && password.is_none() {
             continue;
@@ -229,7 +229,7 @@ pub fn extract_all(
         }
         let dest = non_colliding(&dest_dir.join(&rel));
         if extract_member(archive_path, rel_path, mime, &entry.name, &dest, password).is_ok() {
-            written += 1;
+            written = written.saturating_add(1);
         }
     }
     Ok(written)
@@ -387,21 +387,26 @@ pub fn export_hashcat_hash(
     }
     let name_len = u16::from_le_bytes([lfh[26], lfh[27]]) as u64;
     let extra_len = u16::from_le_bytes([lfh[28], lfh[29]]) as usize;
-    file.seek(SeekFrom::Start(header_start + 30 + name_len))
-        .ok()?;
+    file.seek(SeekFrom::Start(
+        header_start.checked_add(30)?.checked_add(name_len)?,
+    ))
+    .ok()?;
     let mut extra = vec![0u8; extra_len];
     file.read_exact(&mut extra).ok()?;
     let mut strength = None;
-    let mut p = 0;
-    while p + 4 <= extra.len() {
-        let id = u16::from_le_bytes([extra[p], extra[p + 1]]);
-        let sz = u16::from_le_bytes([extra[p + 2], extra[p + 3]]) as usize;
+    let mut rest = extra.as_slice();
+    while let [id_lo, id_hi, size_lo, size_hi, body @ ..] = rest {
+        let id = u16::from_le_bytes([*id_lo, *id_hi]);
+        let sz = usize::from(u16::from_le_bytes([*size_lo, *size_hi]));
         // AES extra: version(2) vendor(2="AE") strength(1) compression(2).
-        if id == 0x9901 && sz >= 7 && p + 4 + 5 <= extra.len() {
-            strength = Some(extra[p + 4 + 4]);
+        if id == 0x9901
+            && sz >= 7
+            && let Some(&value) = body.get(4)
+        {
+            strength = Some(value);
             break;
         }
-        p += 4 + sz;
+        rest = body.get(sz..).unwrap_or_default();
     }
     let (mode, salt_len) = match strength? {
         1 => (1u8, 8usize),
@@ -414,14 +419,10 @@ pub fn export_hashcat_hash(
     file.seek(SeekFrom::Start(data_start)).ok()?;
     let mut blob = vec![0u8; comp_size as usize];
     file.read_exact(&mut blob).ok()?;
-    if blob.len() < salt_len + 2 + 10 {
-        return None;
-    }
     let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-    let salt = &blob[..salt_len];
-    let verifier = &blob[salt_len..salt_len + 2];
-    let data = &blob[salt_len + 2..blob.len() - 10];
-    let auth = &blob[blob.len() - 10..];
+    let (salt, rest) = blob.split_at_checked(salt_len)?;
+    let (verifier, rest) = rest.split_at_checked(2)?;
+    let (data, auth) = rest.split_at_checked(rest.len().checked_sub(10)?)?;
     Some(format!(
         "$zip2$*0*{mode}*0*{}*{}*{}*{}*{}*$/zip2$",
         hex(salt),

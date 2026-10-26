@@ -507,12 +507,12 @@ impl DupesView {
     /// group per search, so only loaded groups can have changed.
     fn refresh_accepted_groups_on_page(&mut self) {
         let Some(page) = self.cached_page else { return };
-        let start = page * PAGE_SIZE;
+        let start = page.saturating_mul(PAGE_SIZE);
         for (i, group) in self.page_groups.iter().enumerate() {
             if self.accepted.all_accepted(group) {
-                self.accepted_groups.insert(start + i);
+                self.accepted_groups.insert(start.saturating_add(i));
             } else {
-                self.accepted_groups.remove(&(start + i));
+                self.accepted_groups.remove(&start.saturating_add(i));
             }
         }
     }
@@ -590,10 +590,10 @@ impl DupesView {
                     self.mode_chosen = true;
                 }
                 if i.key_pressed(egui::Key::ArrowLeft) && cur > 0 {
-                    acts.push(Act::SetPage(cur - 1));
+                    acts.push(Act::SetPage(cur.saturating_sub(1)));
                 }
-                if i.key_pressed(egui::Key::ArrowRight) && cur + 1 < pages {
-                    acts.push(Act::SetPage(cur + 1));
+                if i.key_pressed(egui::Key::ArrowRight) && cur.saturating_add(1) < pages {
+                    acts.push(Act::SetPage(cur.saturating_add(1)));
                 }
             });
         }
@@ -788,7 +788,7 @@ impl DupesView {
                                             outcome: Err(format!(
                                                 "{} of {} could not be deleted",
                                                 stats.errors,
-                                                stats.deleted + stats.errors
+                                                stats.deleted.saturating_add(stats.errors)
                                             )),
                                             changed_disk: false,
                                         },
@@ -910,7 +910,10 @@ impl DupesView {
     /// read-only padlock (the "3 in the group" variant). Returns the chip frame
     /// response (its rect feeds the wrap packing in [`repo_chip::chip_row`]).
     fn repo_chip(&self, ui: &mut egui::Ui, i: usize, acts: &mut Vec<Act>) -> egui::Response {
-        let repo = &self.repos[i];
+        // `chip_row` only asks for indices below `self.repos.len()`.
+        let Some(repo) = self.repos.get(i) else {
+            return ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover());
+        };
         let read_only = self.locks.read_only(&repo.name);
         let chip = crate::repo_chip::repo_chip(
             ui,
@@ -1165,14 +1168,22 @@ impl DupesView {
                 )
                 .clicked()
             {
-                acts.push(Act::SetPage(page - 1));
+                acts.push(Act::SetPage(page.saturating_sub(1)));
             }
             ui.label(
-                RichText::new(format!("page {}/{} · {} groups", page + 1, pages, total))
-                    .color(theme::tan()),
+                RichText::new(format!(
+                    "page {}/{} · {} groups",
+                    page.saturating_add(1),
+                    pages,
+                    total
+                ))
+                .color(theme::tan()),
             );
             if ui
-                .add_enabled(page + 1 < pages, egui::Button::new(icon::CARET_RIGHT))
+                .add_enabled(
+                    page.saturating_add(1) < pages,
+                    egui::Button::new(icon::CARET_RIGHT),
+                )
                 .explain(
                     self.verbosity,
                     "Next page",
@@ -1180,12 +1191,12 @@ impl DupesView {
                 )
                 .clicked()
             {
-                acts.push(Act::SetPage(page + 1));
+                acts.push(Act::SetPage(page.saturating_add(1)));
             }
         });
 
-        let start = page * PAGE_SIZE;
-        let end = (start + PAGE_SIZE).min(total);
+        let start = page.saturating_mul(PAGE_SIZE);
+        let end = start.saturating_add(PAGE_SIZE).min(total);
         if self.group_heights.len() != total {
             self.group_heights = vec![0.0; total];
         }
@@ -1212,7 +1223,8 @@ impl DupesView {
                 // outside the viewport just reserves its known height — we
                 // skip building (and cloning) its widgets entirely. Unmeasured
                 // groups always render once so their height is recorded.
-                let known = self.group_heights[gi];
+                // `group_heights` was sized to `total` above, and `gi < total`.
+                let known = self.group_heights.get(gi).copied().unwrap_or_default();
                 let top = ui.next_widget_position();
                 let visible = known <= 0.0
                     || ui.is_rect_visible(egui::Rect::from_min_size(
@@ -1222,7 +1234,10 @@ impl DupesView {
                 if visible {
                     let before = top.y;
                     self.group_card(ui, gi, start, acts);
-                    self.group_heights[gi] = ui.next_widget_position().y - before;
+                    let height = ui.next_widget_position().y - before;
+                    if let Some(h) = self.group_heights.get_mut(gi) {
+                        *h = height;
+                    }
                 } else {
                     // `allocate_space` adds a trailing item-spacing itself, so
                     // reserve the slot minus that to match the rendered advance.
@@ -1238,13 +1253,20 @@ impl DupesView {
             return;
         }
         let total = self.total_groups();
-        let start = page * PAGE_SIZE;
-        let end = (start + PAGE_SIZE).min(total);
+        let start = page.saturating_mul(PAGE_SIZE);
+        let end = start.saturating_add(PAGE_SIZE).min(total);
+        // A page past the end loads as an empty page.
         let loaded = match &self.results {
-            Some(Results::Exact(plan)) => {
-                load_groups(store, &self.result_names, &plan[start..end]).map_err(|e| e.to_string())
-            }
-            Some(Results::Similar(groups)) => Ok(groups[start..end].to_vec()),
+            Some(Results::Exact(plan)) => load_groups(
+                store,
+                &self.result_names,
+                plan.get(start..end).unwrap_or(&[]),
+            )
+            .map_err(|e| e.to_string()),
+            Some(Results::Similar(groups)) => Ok(groups
+                .get(start..end)
+                .map(<[_]>::to_vec)
+                .unwrap_or_default()),
             None => Ok(Vec::new()),
         };
         match loaded {
@@ -1312,7 +1334,7 @@ impl DupesView {
         // render closure can borrow `self` mutably for thumbnails/mark state.
         let group: DupeGroup = self
             .page_groups
-            .get(gi - page_start)
+            .get(gi.wrapping_sub(page_start))
             .cloned()
             .unwrap_or_default();
         let count = group.len();
@@ -2137,11 +2159,12 @@ impl DupesView {
             Act::OpenLightbox(gi, fi) => {
                 // The clicked member opens alone (the second side hidden); the
                 // whole group travels as the pool either side steps through.
-                let page_start = self.cached_page.unwrap_or(0) * PAGE_SIZE;
+                let page_start = self.cached_page.unwrap_or(0).saturating_mul(PAGE_SIZE);
                 if let Some(group) = self
                     .page_groups
                     .get(gi.wrapping_sub(page_start))
                     .filter(|g| !g.is_empty())
+                    && let Some(clicked) = group.get(fi.min(group.len().saturating_sub(1)))
                 {
                     let side = |f: &DupeFile| crate::compare_view::DiffSide {
                         repo: f.repo.clone(),
@@ -2150,12 +2173,8 @@ impl DupesView {
                         facts: FileFacts::from_entry(&f.entry, f.absolute_path()),
                     };
                     let pool: Vec<crate::compare_view::DiffSide> = group.iter().map(side).collect();
-                    let fi = fi.min(group.len() - 1);
-                    let mut lb = crate::compare_view::DiffCompare::new_with_pool(
-                        side(&group[fi]),
-                        None,
-                        pool,
-                    );
+                    let mut lb =
+                        crate::compare_view::DiffCompare::new_with_pool(side(clicked), None, pool);
                     lb.hide_second();
                     // Say which kind of match this is: exact duplicates, or a
                     // SIMILAR search at the current threshold (so a loosely
@@ -2165,8 +2184,8 @@ impl DupesView {
                         // / video) matches. PDF and audio similar groups form by
                         // exact text-hash / duration, so naming a percentage
                         // there would assert something false — omit it.
-                        let perceptual = group[fi].entry.img_fingerprint.is_some()
-                            || group[fi].entry.video_hash.is_some();
+                        let perceptual = clicked.entry.img_fingerprint.is_some()
+                            || clicked.entry.video_hash.is_some();
                         if perceptual {
                             lb.set_title(format!(
                                 "COMPARE — SIMILAR GROUP (≥ {}%)",
@@ -2279,7 +2298,7 @@ impl DupesView {
     fn delete_group(&mut self, store: &Arc<Store>, ctx: &egui::Context, gi: usize) {
         let keys: Vec<FileKey> = {
             let Some(page) = self.cached_page else { return };
-            let page_start = page * PAGE_SIZE;
+            let page_start = page.saturating_mul(PAGE_SIZE);
             let Some(group) = self.page_groups.get(gi.wrapping_sub(page_start)) else {
                 return;
             };
@@ -2299,7 +2318,10 @@ impl DupesView {
         let Some(page) = self.cached_page else {
             return Vec::new();
         };
-        let Some(group) = self.page_groups.get(gi.wrapping_sub(page * PAGE_SIZE)) else {
+        let Some(group) = self
+            .page_groups
+            .get(gi.wrapping_sub(page.saturating_mul(PAGE_SIZE)))
+        else {
             return Vec::new();
         };
         let mut out: Vec<(String, u64, [u8; 32])> = Vec::new();
@@ -2348,15 +2370,16 @@ impl DupesView {
             };
             match written {
                 Ok(_) => {
-                    changed += 1;
+                    changed = changed.saturating_add(1);
                     if accept {
                         self.accepted.insert(repo, *size, hash);
                     } else {
                         self.accepted.remove(repo, *size, hash);
                     }
-                    let what = self
-                        .path_for(repo, *size, hash)
-                        .unwrap_or_else(|| format!("content {}", &hash_hex(hash)[..12]));
+                    let what = self.path_for(repo, *size, hash).unwrap_or_else(|| {
+                        let hex = hash_hex(hash);
+                        format!("content {}", hex.get(..12).unwrap_or(hex.as_str()))
+                    });
                     crate::activity::lock(&self.activity).card(
                         ctx,
                         crate::activity::Notification::noted(
@@ -2409,7 +2432,7 @@ impl DupesView {
     fn set_group_mark(&mut self, gi: usize, mark: bool) {
         let keys: Vec<FileKey> = {
             let Some(page) = self.cached_page else { return };
-            let page_start = page * PAGE_SIZE;
+            let page_start = page.saturating_mul(PAGE_SIZE);
             let Some(group) = self.page_groups.get(gi.wrapping_sub(page_start)) else {
                 return;
             };
@@ -2539,7 +2562,7 @@ impl DupesView {
                 let repaint = ctx.clone();
                 std::thread::spawn(move || {
                     let mut marks: Vec<FileKey> = Vec::new();
-                    let mut done = 0;
+                    let mut done = 0usize;
                     for chunk in plan.chunks(AUTO_BATCH) {
                         match load_groups(&store, &names, chunk) {
                             Ok(mut groups) => {
@@ -2560,7 +2583,7 @@ impl DupesView {
                                 return;
                             }
                         }
-                        done += chunk.len();
+                        done = done.saturating_add(chunk.len());
                         let _ = tx.send(Msg::AutoProgress { done, total });
                         repaint.request_repaint();
                     }
@@ -2694,9 +2717,9 @@ impl DupesView {
             if let Some(occ) = self
                 .archive_evidence
                 .get(&(first.entry.size, first.entry.hash))
-                .filter(|v| !v.is_empty())
+                .and_then(|v| v.first())
             {
-                out.push(format!("{} (in {})", first.rel_path, occ[0].archive_rel));
+                out.push(format!("{} (in {})", first.rel_path, occ.archive_rel));
             }
         }
         out

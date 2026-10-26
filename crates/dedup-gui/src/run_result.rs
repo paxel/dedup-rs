@@ -67,7 +67,7 @@ impl RunReport {
         if self.problems.len() < MAX_PROBLEMS {
             self.problems.push(problem.into());
         } else {
-            self.problems_dropped += 1;
+            self.problems_dropped = self.problems_dropped.saturating_add(1);
         }
     }
 
@@ -80,7 +80,7 @@ impl RunReport {
         for p in other.problems {
             self.problem(p);
         }
-        self.problems_dropped += other.problems_dropped;
+        self.problems_dropped = self.problems_dropped.saturating_add(other.problems_dropped);
         self.cancelled |= other.cancelled;
         self.notes.extend(other.notes);
         self
@@ -109,7 +109,7 @@ impl RunReport {
     }
 
     fn total_problems(&self) -> u64 {
-        self.problems.len() as u64 + self.problems_dropped
+        (self.problems.len() as u64).saturating_add(self.problems_dropped)
     }
 
     /// The one-line version, for the tab's status strip. Says "incomplete"

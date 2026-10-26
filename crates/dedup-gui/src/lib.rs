@@ -1,6 +1,25 @@
 //! dedup-gui
 //! LCARS-themed eframe/egui desktop shell for dedup.
 
+#![forbid(unsafe_code)]
+// Shipped code may not panic: no unwrap, expect or panic, no unreachable, no
+// indexing or slicing that can go out of bounds, no arithmetic that can overflow.
+// Unit tests are exempt via `cfg(test)`; integration tests are separate crates.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects
+    )
+)]
+
 mod activity;
 mod app;
 mod board;
@@ -47,16 +66,7 @@ use std::sync::Arc;
 ///
 /// `ui_scale` (from `--ui-scale`) multiplies the interface size; `None` keeps
 /// the default.
-///
-/// Call this before the process spawns any thread: on Linux it edits the
-/// process environment (see [`prefer_x11_for_drag_and_drop`]), which is only
-/// sound while the process is single-threaded.
 pub fn run(ui_scale: Option<f32>) -> Result<(), String> {
-    // Must be the very first thing: it edits the process environment, which
-    // is only safe while no other thread exists.
-    #[cfg(target_os = "linux")]
-    prefer_x11_for_drag_and_drop();
-
     // Diagnostics only: a log that cannot be opened must not stop the app.
     match dedup_core::logging::init() {
         Ok(path) => log::info!("dedup GUI started; logging to {}", path.display()),
@@ -93,8 +103,13 @@ pub fn run(ui_scale: Option<f32>) -> Result<(), String> {
     if let Some(icon) = load_icon() {
         viewport = viewport.with_icon(Arc::new(icon));
     }
+    #[cfg(target_os = "linux")]
+    let event_loop_builder = prefer_x11_for_drag_and_drop();
+    #[cfg(not(target_os = "linux"))]
+    let event_loop_builder = None;
     let options = eframe::NativeOptions {
         viewport,
+        event_loop_builder,
         ..Default::default()
     };
 
@@ -126,19 +141,22 @@ pub fn run(ui_scale: Option<f32>) -> Result<(), String> {
 /// fractional scaling) at the cost of drag-and-drop. Drop this workaround
 /// once eframe ships a winit with Wayland drag-and-drop
 /// (rust-windowing/winit#4571).
+///
+/// Only this app's own window moves to X11: the hook picks winit's backend
+/// without touching the environment, so programs the app starts still see
+/// the Wayland session.
 #[cfg(target_os = "linux")]
-fn prefer_x11_for_drag_and_drop() {
+fn prefer_x11_for_drag_and_drop() -> Option<eframe::EventLoopBuilderHook> {
     let set = |name| std::env::var_os(name).is_some_and(|v| !v.is_empty());
     if !force_x11(set("WAYLAND_DISPLAY"), set("DISPLAY"), set("DEDUP_WAYLAND")) {
-        return;
+        return None;
     }
-    // SAFETY: `run` requires (and documents) that it is called before the
-    // process spawns any thread, and calls this first — so no concurrent read
-    // or write of the environment is possible.
-    unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
+    Some(Box::new(|builder| {
+        winit::platform::x11::EventLoopBuilderExtX11::with_x11(builder);
+    }))
 }
 
-/// Whether to drop the Wayland display in favour of X11: only when both
+/// Whether to use X11 instead of the Wayland display: only when both
 /// displays are available and the user didn't opt back into Wayland.
 #[cfg(target_os = "linux")]
 fn force_x11(wayland: bool, x11: bool, keep_wayland: bool) -> bool {

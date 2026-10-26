@@ -135,17 +135,17 @@ fn unescape_octal(field: &str) -> String {
     let mut out = String::with_capacity(field.len());
     let bytes = field.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 3 < bytes.len() {
-            let oct = &field[i + 1..i + 4];
-            if let Ok(code) = u8::from_str_radix(oct, 8) {
-                out.push(code as char);
-                i += 4;
-                continue;
-            }
+    while let Some(&byte) = bytes.get(i) {
+        if byte == b'\\'
+            && let Some(oct) = field.get(i.saturating_add(1)..i.saturating_add(4))
+            && let Ok(code) = u8::from_str_radix(oct, 8)
+        {
+            out.push(code as char);
+            i = i.saturating_add(4);
+            continue;
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        out.push(byte as char);
+        i = i.saturating_add(1);
     }
     out
 }

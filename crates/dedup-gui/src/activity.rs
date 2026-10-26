@@ -367,8 +367,10 @@ fn phase_line(phase: &str, max_chars: usize) -> String {
         return phase.to_string();
     }
     match phase.split_once(' ') {
-        Some((verb, rest)) if verb.chars().count() + 1 < max_chars => {
-            let budget = max_chars - verb.chars().count() - 1;
+        Some((verb, rest)) if verb.chars().count().saturating_add(1) < max_chars => {
+            let budget = max_chars
+                .saturating_sub(verb.chars().count())
+                .saturating_sub(1);
             format!("{verb} {}", crate::board::elide_left(rest, budget))
         }
         _ => crate::board::elide_left(phase, max_chars),
@@ -419,7 +421,7 @@ impl RepoRow {
         }
         let per_unit = self.started.elapsed().as_secs_f64() / self.done as f64;
         Some(Duration::from_secs_f64(
-            per_unit * (total - self.done) as f64,
+            per_unit * total.saturating_sub(self.done) as f64,
         ))
     }
 }
@@ -439,7 +441,7 @@ impl Running {
         }
         let per_item = self.started.elapsed().as_secs_f64() / self.done as f64;
         Some(Duration::from_secs_f64(
-            per_item * (total - self.done) as f64,
+            per_item * total.saturating_sub(self.done) as f64,
         ))
     }
 }
@@ -684,7 +686,7 @@ impl Activity {
         if let Some(r) = &self.running {
             return Err(Busy(r.title.clone()));
         }
-        self.row_actions += 1;
+        self.row_actions = self.row_actions.saturating_add(1);
         Ok(())
     }
 
@@ -726,7 +728,7 @@ impl Activity {
         while self.cards.len() > MAX_CARDS {
             self.cards.pop_back();
         }
-        self.unread += 1;
+        self.unread = self.unread.saturating_add(1);
     }
 
     /// The card text currently on screen, newest first.

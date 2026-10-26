@@ -36,8 +36,8 @@ pub fn timeline_buckets(
             }
             let (y, m, _) = filter::ms_to_ymd(filter::best_date_ms(&entry));
             let slot = map.entry((y, m)).or_default();
-            slot.0 += 1;
-            slot.1 += entry.size;
+            slot.0 = slot.0.saturating_add(1);
+            slot.1 = slot.1.saturating_add(entry.size);
             Ok(())
         })?;
     }
@@ -97,7 +97,7 @@ pub fn export_by_date(
                 .join(year.to_string())
                 .join(format!("{month:02}"));
             if std::fs::create_dir_all(&dir).is_err() {
-                stats.errors += 1;
+                stats.errors = stats.errors.saturating_add(1);
                 continue;
             }
             let file_name = Path::new(&rel_path)
@@ -113,13 +113,13 @@ pub fn export_by_date(
                             // organised by date, so a fresh mtime would make the
                             // file disagree with the folder it sits in.
                             let _ = crate::update::copy_mtime(&from, &dest);
-                            stats.copied += 1;
+                            stats.copied = stats.copied.saturating_add(1);
                         }
-                        Err(_) => stats.errors += 1,
+                        Err(_) => stats.errors = stats.errors.saturating_add(1),
                     }
                 }
-                Dest::AlreadyThere => stats.skipped += 1,
-                Dest::Exhausted => stats.errors += 1,
+                Dest::AlreadyThere => stats.skipped = stats.skipped.saturating_add(1),
+                Dest::Exhausted => stats.errors = stats.errors.saturating_add(1),
             }
         }
     }
@@ -287,17 +287,16 @@ fn size_bucket(bytes: u64) -> &'static str {
 fn render_template(template: &str, entry: &FileEntry, rel_path: &str) -> String {
     let mut out = String::new();
     let mut rest = template;
-    while let Some(open) = rest.find('{') {
-        out.push_str(&rest[..open]);
-        let after = &rest[open + 1..];
-        let Some(close) = after.find('}') else {
+    while let Some((before, after)) = rest.split_once('{') {
+        out.push_str(before);
+        let Some((expr, tail)) = after.split_once('}') else {
             // Unclosed brace: treat the remainder literally.
-            out.push_str(&rest[open..]);
+            out.push('{');
+            out.push_str(after);
             return out;
         };
-        let expr = &after[..close];
         out.push_str(&resolve_placeholder(expr, entry, rel_path));
-        rest = &after[close + 1..];
+        rest = tail;
     }
     out.push_str(rest);
     out
@@ -307,9 +306,9 @@ fn render_template(template: &str, entry: &FileEntry, rel_path: &str) -> String 
 fn resolve_placeholder(expr: &str, entry: &FileEntry, rel_path: &str) -> String {
     for alt in expr.split('|') {
         let alt = alt.trim();
-        if alt.len() >= 2 && alt.starts_with('"') && alt.ends_with('"') {
+        if let Some(literal) = alt.strip_prefix('"').and_then(|a| a.strip_suffix('"')) {
             // A literal always terminates the choice.
-            return alt[1..alt.len() - 1].to_string();
+            return literal.to_string();
         }
         let value = resolve_token(alt, entry, rel_path);
         if !value.is_empty() {
@@ -448,18 +447,18 @@ pub fn organize_apply(
         }
         // Re-read the current entry; skip if it vanished since planning.
         let Some(entry) = store::get_entry(&db, from_rel)? else {
-            stats.skipped += 1;
+            stats.skipped = stats.skipped.saturating_add(1);
             continue;
         };
         match resolve_target(&root, target_rel, from_rel, &entry, &claimed) {
-            Resolution::Skip => stats.skipped += 1,
+            Resolution::Skip => stats.skipped = stats.skipped.saturating_add(1),
             Resolution::Move(final_rel) => {
                 let from_abs = root.join(from_rel);
                 let to_abs = root.join(&final_rel);
                 if let Some(parent) = to_abs.parent()
                     && std::fs::create_dir_all(parent).is_err()
                 {
-                    stats.errors += 1;
+                    stats.errors = stats.errors.saturating_add(1);
                     continue;
                 }
                 if std::fs::rename(&from_abs, &to_abs).is_err() {
@@ -467,14 +466,14 @@ pub fn organize_apply(
                         path: from_abs.to_string_lossy().into_owned(),
                         message: "could not move file".to_string(),
                     });
-                    stats.errors += 1;
+                    stats.errors = stats.errors.saturating_add(1);
                     continue;
                 }
                 claimed.insert(final_rel.clone());
                 to_remove.push(from_rel.clone());
                 to_add.push((final_rel, entry));
-                stats.moved += 1;
-                since_flush += 1;
+                stats.moved = stats.moved.saturating_add(1);
+                since_flush = since_flush.saturating_add(1);
                 run.progress.on(DiffEvent::Progress {
                     action: DiffAction::Move,
                     done: stats.moved,
@@ -552,7 +551,11 @@ fn split_stem_ext(rel: &str) -> (String, String) {
     match path.extension() {
         Some(ext) => {
             let ext = ext.to_string_lossy().into_owned();
-            let stem = rel[..rel.len() - ext.len() - 1].to_string();
+            let stem = rel
+                .strip_suffix(ext.as_str())
+                .and_then(|stem| stem.strip_suffix('.'))
+                .unwrap_or(rel)
+                .to_string();
             (stem, ext)
         }
         None => (rel.to_string(), String::new()),

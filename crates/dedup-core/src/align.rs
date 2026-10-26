@@ -58,17 +58,21 @@ const BLOCK: usize = 64;
 /// Align two byte streams. See the module docs for the guarantees.
 pub fn align(a: &[u8], b: &[u8]) -> Alignment {
     // Trim the common prefix and the common suffix (not overlapping the prefix).
-    let mut pre = 0;
-    while pre < a.len() && pre < b.len() && a[pre] == b[pre] {
-        pre += 1;
-    }
-    let mut suf = 0;
-    while suf < a.len() - pre && suf < b.len() - pre && a[a.len() - 1 - suf] == b[b.len() - 1 - suf]
-    {
-        suf += 1;
-    }
-    let mid_a = &a[pre..a.len() - suf];
-    let mid_b = &b[pre..b.len() - suf];
+    let pre = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let rest_a = a.get(pre..).unwrap_or_default();
+    let rest_b = b.get(pre..).unwrap_or_default();
+    let suf = rest_a
+        .iter()
+        .rev()
+        .zip(rest_b.iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let mid_a = rest_a
+        .get(..rest_a.len().saturating_sub(suf))
+        .unwrap_or_default();
+    let mid_b = rest_b
+        .get(..rest_b.len().saturating_sub(suf))
+        .unwrap_or_default();
 
     let mut segments = Vec::new();
     if pre > 0 {
@@ -92,8 +96,8 @@ pub fn align(a: &[u8], b: &[u8]) -> Alignment {
     if suf > 0 {
         segments.push(Segment {
             kind: SegmentKind::Equal,
-            a: a.len() - suf..a.len(),
-            b: b.len() - suf..b.len(),
+            a: a.len().saturating_sub(suf)..a.len(),
+            b: b.len().saturating_sub(suf)..b.len(),
         });
     }
     coalesce(&mut segments);
@@ -104,93 +108,94 @@ pub fn align(a: &[u8], b: &[u8]) -> Alignment {
 /// backtracked into equal/diff runs. `base_a`/`base_b` shift the ranges back
 /// into the whole-file coordinates.
 fn lcs_segments(a: &[u8], b: &[u8], base_a: usize, base_b: usize) -> Vec<Segment> {
-    let (n, m) = (a.len(), b.len());
-    if n == 0 && m == 0 {
+    if a.is_empty() && b.is_empty() {
         return Vec::new();
     }
-    if n == 0 || m == 0 {
+    if a.is_empty() || b.is_empty() {
         return vec![Segment {
             kind: SegmentKind::Diff,
-            a: base_a..base_a + n,
-            b: base_b..base_b + m,
+            a: base_a..base_a.saturating_add(a.len()),
+            b: base_b..base_b.saturating_add(b.len()),
         }];
     }
-    // dp[i*w + j] = LCS length of a[i..] and b[j..].
-    let w = m + 1;
-    let mut dp = vec![0u32; (n + 1) * w];
-    for i in (0..n).rev() {
-        for j in (0..m).rev() {
-            dp[i * w + j] = if a[i] == b[j] {
-                dp[(i + 1) * w + (j + 1)] + 1
-            } else {
-                dp[(i + 1) * w + j].max(dp[i * w + (j + 1)])
-            };
-        }
-    }
-    // Backtrack into a step list, then coalesce steps into segments.
-    enum Step {
-        Match,
-        DelA,
-        InsB,
-    }
-    let mut steps = Vec::with_capacity(n + m);
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < n && j < m {
-        if a[i] == b[j] && dp[i * w + j] == dp[(i + 1) * w + (j + 1)] + 1 {
-            steps.push(Step::Match);
-            i += 1;
-            j += 1;
-        } else if dp[(i + 1) * w + j] >= dp[i * w + (j + 1)] {
-            steps.push(Step::DelA);
-            i += 1;
-        } else {
-            steps.push(Step::InsB);
-            j += 1;
-        }
-    }
-    while i < n {
-        steps.push(Step::DelA);
-        i += 1;
-    }
-    while j < m {
-        steps.push(Step::InsB);
-        j += 1;
-    }
+    let dp = lcs_table(a, b);
+    // dp[i][j] = LCS length of a[i..] and b[j..]; every index below is in range by
+    // construction, the zero is never read.
+    let cell = |i: usize, j: usize| dp.get(i).and_then(|row| row.get(j)).copied().unwrap_or(0);
 
+    // Backtrack, growing the segment list one byte step at a time.
     let mut segs = Vec::new();
-    let (mut ai, mut bj) = (base_a, base_b);
-    let mut k = 0;
-    while k < steps.len() {
-        if matches!(steps[k], Step::Match) {
-            let (sa, sb) = (ai, bj);
-            while k < steps.len() && matches!(steps[k], Step::Match) {
-                ai += 1;
-                bj += 1;
-                k += 1;
-            }
-            segs.push(Segment {
-                kind: SegmentKind::Equal,
-                a: sa..ai,
-                b: sb..bj,
-            });
+    let mut cursor = (base_a, base_b);
+    let (mut i, mut j) = (0usize, 0usize);
+    while let (Some(x), Some(y)) = (a.get(i), b.get(j)) {
+        let (next_i, next_j) = (i.saturating_add(1), j.saturating_add(1));
+        if x == y && cell(i, j) == cell(next_i, next_j).saturating_add(1) {
+            step(&mut segs, &mut cursor, SegmentKind::Equal, 1, 1);
+            (i, j) = (next_i, next_j);
+        } else if cell(next_i, j) >= cell(i, next_j) {
+            step(&mut segs, &mut cursor, SegmentKind::Diff, 1, 0);
+            i = next_i;
         } else {
-            let (sa, sb) = (ai, bj);
-            while k < steps.len() && !matches!(steps[k], Step::Match) {
-                match steps[k] {
-                    Step::DelA => ai += 1,
-                    Step::InsB => bj += 1,
-                    Step::Match => {}
-                }
-                k += 1;
-            }
-            segs.push(Segment {
-                kind: SegmentKind::Diff,
-                a: sa..ai,
-                b: sb..bj,
-            });
+            step(&mut segs, &mut cursor, SegmentKind::Diff, 0, 1);
+            j = next_j;
         }
+    }
+    let rest_a = a.len().saturating_sub(i);
+    let rest_b = b.len().saturating_sub(j);
+    if rest_a > 0 || rest_b > 0 {
+        step(&mut segs, &mut cursor, SegmentKind::Diff, rest_a, rest_b);
     }
     segs
+}
+
+/// The LCS table, one row per position in `a` plus the empty row at the end:
+/// `table[i][j]` is the LCS length of `a[i..]` and `b[j..]`.
+fn lcs_table(a: &[u8], b: &[u8]) -> Vec<Vec<u32>> {
+    let mut rows = vec![vec![0u32; b.len().saturating_add(1)]];
+    for &x in a.iter().rev() {
+        let below = rows.last().map(Vec::as_slice).unwrap_or_default();
+        // Built right to left: each cell needs the one to its right.
+        let mut row = vec![0u32];
+        let mut right = 0u32;
+        for (&y, pair) in b.iter().zip(below.windows(2)).rev() {
+            let cell = match *pair {
+                [_, diagonal] if x == y => diagonal.saturating_add(1),
+                [down, _] => down.max(right),
+                _ => right,
+            };
+            row.push(cell);
+            right = cell;
+        }
+        row.reverse();
+        rows.push(row);
+    }
+    rows.reverse();
+    rows
+}
+
+/// Extend the last segment by `da`/`db` bytes when it has the same kind, or
+/// start a new one, and advance the `(a, b)` cursor.
+fn step(
+    segs: &mut Vec<Segment>,
+    cursor: &mut (usize, usize),
+    kind: SegmentKind,
+    da: usize,
+    db: usize,
+) {
+    let (ai, bj) = *cursor;
+    let end = (ai.saturating_add(da), bj.saturating_add(db));
+    match segs.last_mut() {
+        Some(last) if last.kind == kind => {
+            last.a.end = end.0;
+            last.b.end = end.1;
+        }
+        _ => segs.push(Segment {
+            kind,
+            a: ai..end.0,
+            b: bj..end.1,
+        }),
+    }
+    *cursor = end;
 }
 
 /// Coarse, O(n) fallback for a middle too large to align exactly: index `b`'s
@@ -200,10 +205,11 @@ fn lcs_segments(a: &[u8], b: &[u8], base_a: usize, base_b: usize) -> Vec<Segment
 /// diff segments. Block-granular, hence [`Alignment::degraded`].
 fn block_segments(a: &[u8], b: &[u8], base_a: usize, base_b: usize) -> Vec<Segment> {
     let mut index: HashMap<u64, Vec<usize>> = HashMap::new();
-    let mut j = 0;
-    while j + BLOCK <= b.len() {
-        index.entry(fnv64(&b[j..j + BLOCK])).or_default().push(j);
-        j += BLOCK;
+    for (k, block) in b.as_chunks::<BLOCK>().0.iter().enumerate() {
+        index
+            .entry(fnv64(block))
+            .or_default()
+            .push(k.saturating_mul(BLOCK));
     }
 
     let mut segs = Vec::new();
@@ -211,9 +217,9 @@ fn block_segments(a: &[u8], b: &[u8], base_a: usize, base_b: usize) -> Vec<Segme
     let mut jb = 0usize; // byte cursor in b (bytes consumed by matches)
     let (mut pend_a, mut pend_b) = (0usize, 0usize); // start of the pending diff
 
-    while ia + BLOCK <= a.len() {
+    while let Some(block) = a.get(ia..ia.saturating_add(BLOCK)) {
         let hit = index
-            .get(&fnv64(&a[ia..ia + BLOCK]))
+            .get(&fnv64(block))
             .and_then(|positions| positions.iter().copied().find(|&pos| pos >= jb));
         match hit {
             Some(bpos) => {
@@ -222,38 +228,39 @@ fn block_segments(a: &[u8], b: &[u8], base_a: usize, base_b: usize) -> Vec<Segme
                 if pend_a < ia || pend_b < bpos {
                     segs.push(Segment {
                         kind: SegmentKind::Diff,
-                        a: base_a + pend_a..base_a + ia,
-                        b: base_b + pend_b..base_b + bpos,
+                        a: base_a.saturating_add(pend_a)..base_a.saturating_add(ia),
+                        b: base_b.saturating_add(pend_b)..base_b.saturating_add(bpos),
                     });
                 }
                 // Extend the equal run as far as the bytes keep matching.
                 let (mut ea, mut eb) = (ia, bpos);
-                while ea + BLOCK <= a.len()
-                    && eb + BLOCK <= b.len()
-                    && a[ea..ea + BLOCK] == b[eb..eb + BLOCK]
+                while let (Some(x), Some(y)) = (
+                    a.get(ea..ea.saturating_add(BLOCK)),
+                    b.get(eb..eb.saturating_add(BLOCK)),
+                ) && x == y
                 {
-                    ea += BLOCK;
-                    eb += BLOCK;
+                    ea = ea.saturating_add(BLOCK);
+                    eb = eb.saturating_add(BLOCK);
                 }
                 segs.push(Segment {
                     kind: SegmentKind::Equal,
-                    a: base_a + ia..base_a + ea,
-                    b: base_b + bpos..base_b + eb,
+                    a: base_a.saturating_add(ia)..base_a.saturating_add(ea),
+                    b: base_b.saturating_add(bpos)..base_b.saturating_add(eb),
                 });
                 ia = ea;
                 jb = eb;
                 pend_a = ia;
                 pend_b = jb;
             }
-            None => ia += BLOCK,
+            None => ia = ia.saturating_add(BLOCK),
         }
     }
     // The tail on both sides is one final diff.
     if pend_a < a.len() || pend_b < b.len() {
         segs.push(Segment {
             kind: SegmentKind::Diff,
-            a: base_a + pend_a..base_a + a.len(),
-            b: base_b + pend_b..base_b + b.len(),
+            a: base_a.saturating_add(pend_a)..base_a.saturating_add(a.len()),
+            b: base_b.saturating_add(pend_b)..base_b.saturating_add(b.len()),
         });
     }
     segs
