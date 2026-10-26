@@ -51,11 +51,11 @@ jobs:
       - name: Tests
         run: cargo test --workspace --locked
 
-  # Feeds the README's Coveralls badge. Main-only: coverage on every branch
-  # push would double CI time for a number nobody reads off a branch.
+  # Feeds the README's Coveralls badge. Default-branch only: coverage on every
+  # branch push would double CI time for a number nobody reads off a branch.
   coverage:
     name: Coverage (Coveralls)
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/summer'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
