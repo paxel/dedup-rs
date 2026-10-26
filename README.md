@@ -1,8 +1,12 @@
 # dedup-rs
 
-[![CI](https://github.com/paxel/dedup-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/paxel/dedup-rs/actions/workflows/ci.yml)
-[![Coverage](https://coveralls.io/repos/github/paxel/dedup-rs/badge.svg?branch=main)](https://coveralls.io/github/paxel/dedup-rs?branch=main)
+[![CI](https://github.com/paxel/dedup-rs/actions/workflows/ci.yml/badge.svg?branch=summer)](https://github.com/paxel/dedup-rs/actions/workflows/ci.yml)
+[![Coverage](https://coveralls.io/repos/github/paxel/dedup-rs/badge.svg?branch=summer)](https://coveralls.io/github/paxel/dedup-rs?branch=summer)
 [![crates.io](https://img.shields.io/crates/v/dedup-rs-cli.svg)](https://crates.io/crates/dedup-rs-cli)
+[![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success)](https://github.com/paxel/dedup-rs/blob/summer/crates/dedup-core/src/lib.rs)
+[![panic-free](https://img.shields.io/badge/panic--free-linted-success)](https://github.com/paxel/dedup-rs/blob/summer/crates/dedup-core/src/lib.rs)
+[![Release](https://img.shields.io/github/v/release/paxel/dedup-rs)](https://github.com/paxel/dedup-rs/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 A high-performance, native Rust file-deduplication tool with both a desktop GUI and a
 fast command-line interface, packaged as a single self-contained binary.
