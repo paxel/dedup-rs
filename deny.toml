@@ -6,11 +6,9 @@
 yanked = "deny"
 unmaintained = "all"
 # Each ignore names the advisory and why it cannot be fixed yet. All of these
-# come in through eframe's Linux window stack (winit's Wayland decorations and
-# accesskit's AT-SPI bridge).
+# come in through accesskit's AT-SPI bridge in eframe's Linux window stack;
+# egui_kittest needs accesskit too.
 ignore = [
-    # ttf-parser via sctk-adwaita: reads the system's title-bar font.
-    { id = "RUSTSEC-2026-0192", reason = "unmaintained; sctk-adwaita under eframe reads system fonts only" },
     # zbus_names, zvariant, zvariant_derive: accesskit's AT-SPI bridge.
     { id = "RUSTSEC-2026-0371", reason = "unmaintained; accesskit AT-SPI bridge under eframe" },
     { id = "RUSTSEC-2026-0370", reason = "unmaintained; accesskit AT-SPI bridge under eframe" },
