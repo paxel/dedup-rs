@@ -1,5 +1,5 @@
-# CodeQL: the Rust code and the workflows themselves. Report only — findings
-# land in the repository's Security tab and fail no build
+# CodeQL: the Rust code and the workflows themselves. Findings land in the
+# repository's Security tab and fail no build; an open alert fails a release
 # (docs/adr/0005-security-hardening.md). Rust is analysed without a build.
 name: CodeQL
 
