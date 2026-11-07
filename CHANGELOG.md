@@ -15,6 +15,8 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 - Dependencies with known vulnerabilities are updated: zip, calamine (and its quick-xml), zstd,
   webbrowser and ctutils; yanked releases are replaced.
+- Every release file carries a signed build provenance attestation, checked with
+  `gh attestation verify <file> -R paxel/dedup-rs`.
 
 ---
 

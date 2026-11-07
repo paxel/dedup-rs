@@ -1,6 +1,10 @@
 # dedup-rs
 
 [![CI](https://github.com/paxel/dedup-rs/actions/workflows/ci.yml/badge.svg?branch=summer)](https://github.com/paxel/dedup-rs/actions/workflows/ci.yml)
+[![Security](https://github.com/paxel/dedup-rs/actions/workflows/security.yml/badge.svg?branch=summer)](https://github.com/paxel/dedup-rs/actions/workflows/security.yml)
+[![CodeQL](https://github.com/paxel/dedup-rs/actions/workflows/codeql.yml/badge.svg?branch=summer)](https://github.com/paxel/dedup-rs/actions/workflows/codeql.yml)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=paxel_dedup-rs&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=paxel_dedup-rs)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/paxel/dedup-rs/badge)](https://scorecard.dev/viewer/?uri=github.com/paxel/dedup-rs)
 [![Coverage](https://coveralls.io/repos/github/paxel/dedup-rs/badge.svg?branch=summer)](https://coveralls.io/github/paxel/dedup-rs?branch=summer)
 [![crates.io](https://img.shields.io/crates/v/dedup-rs-cli.svg)](https://crates.io/crates/dedup-rs-cli)
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success)](https://github.com/paxel/dedup-rs/blob/summer/crates/dedup-core/src/lib.rs)
@@ -37,6 +41,14 @@ The macOS builds are **unsigned**: on first launch, right-click the app → **Op
 past Gatekeeper (once; afterwards it opens normally). The Windows zip carries two
 executables — `dedup.exe` (the CLI, console) and `dedup-gui.exe` (the app, no console
 window; the double-click target).
+
+Every release file carries a signed build provenance attestation: it proves the file was
+built by this repository's release workflow from the tagged commit. Check a download with
+the GitHub CLI:
+
+```bash
+gh attestation verify dedup-3.0.1-linux-x86_64.tar.gz -R paxel/dedup-rs
+```
 
 Optional tools unlock extra features at runtime and the app degrades gracefully without
 them: `ffmpeg` (video), `poppler` (PDF page rendering), LibreOffice (office/legacy document
@@ -126,6 +138,12 @@ The same operations are available headless via `dedup <command>`.
 - [**Releasing**](docs/releasing.md) — the tag-driven release workflow and its one-time setup.
 - [**Agent Guidelines**](AGENTS.md) — Rust patterns, error-handling policy, and coding standards.
 - [**Changelog**](CHANGELOG.md) — record of user-facing changes.
+
+## Security
+
+How the project scans, gates and signs its releases is recorded in
+[ADR 0005](docs/adr/0005-security-hardening.md); how to report a vulnerability is in
+[SECURITY.md](SECURITY.md).
 
 ## License
 
