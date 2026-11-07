@@ -53,3 +53,23 @@ process was rejected as too large a change for a single-user desktop tool.
   app-side fixes.
 - Upgrading Rust is a commit that changes `rust-toolchain.toml` and the
   workflows' toolchain pin together.
+
+## Addendum, 2026-11-07: the first Scorecard and CodeQL results
+
+- The SonarQube Cloud scan runs in CI's coverage job on pushes to summer. A
+  `workflow_run` workflow that checked out the tested commit was flagged by
+  Scorecard as a dangerous pattern, even though it only ran for this
+  repository's own pushes.
+- CodeQL skips `crates/*/tests/**`: their archive passwords are fixtures. False
+  positives in shipped code are dismissed with a reason, so an open CodeQL alert
+  is a real finding and also fails a release.
+- EXR decoding is dropped: its crate pulls in the unmaintained `paste`. EXR
+  files are still hashed and found as exact duplicates. image's `rayon` feature
+  is off too, because its weak dependency locked the unused AVIF encoder.
+- eframe 0.37 without winit's default features: the Adwaita window frame and its
+  unmaintained ttf-parser are gone. The three accesskit advisories stay ignored;
+  egui_kittest needs accesskit.
+- summer is protected by a ruleset: changes arrive through a pull request with
+  green CI, without force-push or deletion. No approval is required, as there is
+  a single maintainer.
+- No OpenSSF Best Practices badge: it is a self-assessment, not a protection.
