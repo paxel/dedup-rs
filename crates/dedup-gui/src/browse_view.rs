@@ -1712,11 +1712,12 @@ impl BrowseView {
             if let Some(te) = self.tag_edit.as_mut() {
                 let row = |ui: &mut egui::Ui, label: &str, v: &mut String| {
                     ui.horizontal(|ui| {
-                        ui.add_sized(
+                        let name = ui.add_sized(
                             egui::vec2(48.0, 16.0),
                             egui::Label::new(RichText::new(label).color(theme::tan()).size(11.0)),
                         );
-                        ui.add(egui::TextEdit::singleline(v).desired_width(160.0));
+                        ui.add(egui::TextEdit::singleline(v).desired_width(160.0))
+                            .labelled_by(name.id);
                     });
                 };
                 row(ui, "TITLE", &mut te.tags.title);
@@ -2318,7 +2319,7 @@ fn annotation_chip(ui: &mut egui::Ui, text: &str, mode: ChipMode) -> egui::Respo
             );
         }
     }
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, text));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, text));
     resp
 }
 
@@ -2392,9 +2393,7 @@ fn paint_chip(
         );
     }
     // Accessibility + testability: expose it as a labelled, selectable widget.
-    resp.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, text)
-    });
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, text));
     resp
 }
 

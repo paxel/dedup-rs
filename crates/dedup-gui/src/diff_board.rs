@@ -110,7 +110,7 @@ pub fn popup(
     let mut answer: Option<BoardAction> = None;
     let mut close = false;
 
-    egui::Modal::new(egui::Id::new("diff-board-popup")).show(&ui.ctx().clone(), |ui| {
+    egui::Modal::new(egui::Id::unique("diff-board-popup")).show(&ui.ctx().clone(), |ui| {
         ui.set_width(460.0);
         let (title, blurb, title_color) = match kind {
             PopupKind::ConfirmDeleteAll => (

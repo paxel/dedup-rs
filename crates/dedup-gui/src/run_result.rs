@@ -173,7 +173,7 @@ impl ResultModal {
             return false;
         };
         let mut close = false;
-        let response = egui::Modal::new(Id::new("run-result")).show(&ui.ctx().clone(), |ui| {
+        let response = egui::Modal::new(Id::unique("run-result")).show(&ui.ctx().clone(), |ui| {
             ui.set_width(520.0);
             ui.label(
                 RichText::new(if report.complete() {

@@ -413,7 +413,7 @@ pub fn media_cell(
             // "the way into the viewer" reads consistently for tests and
             // screen readers whatever the cell happens to show.
             resp.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "OPEN PREVIEW")
+                egui::WidgetInfo::labeled(egui::Role::Button, true, "OPEN PREVIEW")
             });
             return Some(resp);
         }
@@ -444,7 +444,7 @@ pub fn media_cell(
             );
             paint_overlay(ui.painter(), resp.rect, overlay, style.captions);
             resp.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "OPEN PREVIEW")
+                egui::WidgetInfo::labeled(egui::Role::Button, true, "OPEN PREVIEW")
             });
             return Some(resp);
         }
@@ -479,7 +479,7 @@ pub fn media_cell(
             paint_extension_badge(&painter, rect, facts, style.captions, overlay.is_none());
             paint_overlay(&painter, rect, overlay, style.captions);
             resp.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "OPEN PREVIEW")
+                egui::WidgetInfo::labeled(egui::Role::Button, true, "OPEN PREVIEW")
             });
             return Some(resp);
         }
@@ -511,7 +511,7 @@ pub fn media_cell(
         );
     }
     paint_overlay(&painter, rect, overlay, style.captions);
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "OPEN PREVIEW"));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "OPEN PREVIEW"));
     Some(resp)
 }
 

@@ -33,7 +33,7 @@ use those with `-p` — while directories, lib targets (`dedup_core`, `dedup_gui
 
 - **`crates/dedup-core`** — pure domain logic: redb store, scanning/hashing, perceptual fingerprints, duplicate/diff/similarity operations. MUST NOT import `egui`, `eframe`, or `clap`. Long-running operations are plain functions taking a `&Store` plus a `Progress` callback trait; errors use `thiserror`.
 - **`crates/dedup-cli`** — `clap` subcommands with `indicatif` progress; `anyhow` at the entry point. Invoked without a subcommand it launches the GUI.
-- **`crates/dedup-gui`** — `egui`/`eframe` **0.35** desktop app. Core operations run on worker threads (`worker.rs`) talking to the UI via `crossbeam_channel`; the UI thread never blocks.
+- **`crates/dedup-gui`** — `egui`/`eframe` **0.37** desktop app. Core operations run on worker threads (`worker.rs`) talking to the UI via `crossbeam_channel`; the UI thread never blocks.
 
 ### Data model (`dedup-core/src/store.rs`)
 

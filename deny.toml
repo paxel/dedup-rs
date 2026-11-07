@@ -6,19 +6,15 @@
 yanked = "deny"
 unmaintained = "all"
 # Each ignore names the advisory and why it cannot be fixed yet. All of these
-# come in through eframe 0.35's Linux window stack (winit's Wayland decorations
-# and accesskit's AT-SPI bridge) and leave with an eframe upgrade.
+# come in through eframe's Linux window stack (winit's Wayland decorations and
+# accesskit's AT-SPI bridge).
 ignore = [
-    # quick-xml 0.39 in zbus_xml (accesskit AT-SPI): parses the D-Bus interface
-    # XML the bridge ships with, never a user file.
-    { id = "RUSTSEC-2026-0194", reason = "zbus_xml under eframe 0.35; parses built-in D-Bus XML only" },
-    { id = "RUSTSEC-2026-0195", reason = "zbus_xml under eframe 0.35; parses built-in D-Bus XML only" },
     # ttf-parser via sctk-adwaita: reads the system's title-bar font.
-    { id = "RUSTSEC-2026-0192", reason = "unmaintained; sctk-adwaita under eframe 0.35 reads system fonts only" },
+    { id = "RUSTSEC-2026-0192", reason = "unmaintained; sctk-adwaita under eframe reads system fonts only" },
     # zbus_names, zvariant, zvariant_derive: accesskit's AT-SPI bridge.
-    { id = "RUSTSEC-2026-0371", reason = "unmaintained; accesskit AT-SPI bridge under eframe 0.35" },
-    { id = "RUSTSEC-2026-0370", reason = "unmaintained; accesskit AT-SPI bridge under eframe 0.35" },
-    { id = "RUSTSEC-2026-0372", reason = "unmaintained; accesskit AT-SPI bridge under eframe 0.35" },
+    { id = "RUSTSEC-2026-0371", reason = "unmaintained; accesskit AT-SPI bridge under eframe" },
+    { id = "RUSTSEC-2026-0370", reason = "unmaintained; accesskit AT-SPI bridge under eframe" },
+    { id = "RUSTSEC-2026-0372", reason = "unmaintained; accesskit AT-SPI bridge under eframe" },
 ]
 
 [licenses]

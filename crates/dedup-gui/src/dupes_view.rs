@@ -1935,13 +1935,13 @@ impl DupesView {
             None if has_text_representation(&facts) => {
                 let hit = ui.interact(
                     cell.response.rect,
-                    ui.id().with(("dupe-open", gi, fi)),
+                    ui.scope_id().with(("dupe-open", gi, fi)),
                     egui::Sense::click(),
                 );
                 // The placeholder is a picture of nothing, so name the target —
                 // otherwise this click area has no accessible label at all.
                 hit.widget_info(|| {
-                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "OPEN PREVIEW")
+                    egui::WidgetInfo::labeled(egui::Role::Button, true, "OPEN PREVIEW")
                 });
                 hit.on_hover_cursor(egui::CursorIcon::PointingHand).explain(
                     self.verbosity,
@@ -2083,7 +2083,7 @@ impl DupesView {
     }
 
     fn confirm_modal(&mut self, ui: &mut egui::Ui, prompt: &str, verb: &str, acts: &mut Vec<Act>) {
-        egui::Modal::new(Id::new("dupes-confirm")).show(&ui.ctx().clone(), |ui| {
+        egui::Modal::new(Id::unique("dupes-confirm")).show(&ui.ctx().clone(), |ui| {
             ui.set_width(360.0);
             ui.label(
                 RichText::new("CONFIRM")
@@ -6250,6 +6250,8 @@ mod ui_tests {
         harness
             .state_mut()
             .apply(&ctx, &store2, Act::OpenLightbox(0, 0));
+        // The viewer's first frame is an invisible sizing pass.
+        harness.step();
         harness.step();
         harness.get_by_label_contains("SHOW B").click();
         // Give the background workers time to decode both WAVs into spectrograms.

@@ -21,8 +21,8 @@ path = "src/bin/dedup_gui.rs"
 [dependencies]
 dedup-rs-core = { path = "../dedup-core", version = "3.1.0" }
 redb = "2.1"
-eframe = "0.35"
-egui = "0.35"
+eframe = "0.37"
+egui = "0.37"
 crossbeam-channel = "0.5"
 chrono = "0.4"
 open = "5"
@@ -36,7 +36,7 @@ rodio = { version = "0.22", default-features = false, features = ["playback", "s
 # No "rayon": nothing calls its parallel APIs, and it locks ravif and rav1e.
 image = { version = "0.25", default-features = false, features = ["bmp", "dds", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
 id3 = "1"
-egui_extras = "0.35"
+egui_extras = "0.37"
 log = "0.4"
 tempfile = "3.10"
 
@@ -46,6 +46,6 @@ tempfile = "3.10"
 winit = { version = "0.30", default-features = false, features = ["x11"] }
 
 [dev-dependencies]
-egui_kittest = { version = "0.35", features = ["wgpu", "snapshot"] }
+egui_kittest = { version = "0.37", features = ["wgpu", "snapshot"] }
 zip = "9"
 lopdf = "0.47"

@@ -784,7 +784,7 @@ pub fn board(
         // clicks still win.
         let row_resp = ui.interact(
             row_rect,
-            ui.id().with(("board-row", i)),
+            ui.scope_id().with(("board-row", i)),
             egui::Sense::click(),
         );
         if view.listing {

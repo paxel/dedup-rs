@@ -52,9 +52,7 @@ pub fn toggle_button(
         p.rect_stroke(rect, r, Stroke::new(1.5, border), StrokeKind::Inside);
         p.text(rect.center(), Align2::CENTER_CENTER, label, font, fg);
     }
-    resp.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, label)
-    });
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, label));
     resp
 }
 
@@ -98,7 +96,7 @@ pub fn action_button(
         p.rect_filled(rect, r, fill);
         p.text(rect.center(), Align2::CENTER_CENTER, label, font, fg);
     }
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
     resp
 }
 
@@ -132,7 +130,7 @@ pub fn section_lcars_collapsible<R>(
     default_open: bool,
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> Option<R> {
-    let id = ui.id().with(("lcars_sec", title));
+    let id = ui.scope_id().with(("lcars_sec", title));
     let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
         ui.ctx(),
         id,
@@ -273,7 +271,7 @@ fn header_bar(ui: &mut egui::Ui, painted: &str, title: &str, accent: Color32) ->
             theme::ink_on(accent),
         );
     }
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, title));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, title));
     resp
 }
 

@@ -141,7 +141,7 @@ pub fn repo_chip(
                     ui.painter().galley(tpos, galley, fg);
                 }
                 resp.widget_info(|| {
-                    egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, name)
+                    egui::WidgetInfo::selected(egui::Role::Button, true, selected, name)
                 });
                 if main {
                     main_badge(ui);
@@ -173,7 +173,7 @@ pub fn chip_row(
     n: usize,
     mut chip: impl FnMut(&mut egui::Ui, usize) -> egui::Response,
 ) {
-    let id = ui.id().with(id_salt);
+    let id = ui.scope_id().with(id_salt);
     let mut sizes: Vec<Vec2> = ui.data(|d| d.get_temp(id)).unwrap_or_default();
     sizes.resize(n, Vec2::ZERO);
 
@@ -279,7 +279,7 @@ fn main_badge(ui: &mut egui::Ui) -> egui::Response {
             theme::black(),
         );
     }
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "MAIN"));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, "MAIN"));
     resp
 }
 
@@ -428,14 +428,14 @@ mod tests {
                 let r = repo_chip(ui, "Photos", false, theme::orange(), true, None);
                 let outer = r.outer.rect;
                 ui.ctx()
-                    .memory_mut(|m| m.data.insert_temp("outer".into(), outer));
+                    .memory_mut(|m| m.data.insert_temp(egui::Id::unique("outer"), outer));
             });
         harness.run();
 
         let badge = harness.get_by_label("MAIN").rect();
         let outer: egui::Rect = harness
             .ctx
-            .memory(|m| m.data.get_temp("outer".into()))
+            .memory(|m| m.data.get_temp(egui::Id::unique("outer")))
             .expect("chip frame rect recorded");
         assert!(
             outer.contains_rect(badge),
