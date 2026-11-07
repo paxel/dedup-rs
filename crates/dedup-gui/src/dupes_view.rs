@@ -303,6 +303,9 @@ enum Act {
 pub struct DupesView {
     repos: Vec<RepoSel>,
     repos_loaded: bool,
+    /// The start page handed over the repositories, so the body's own WITH
+    /// WHICH section is not shown.
+    from_start: bool,
     mode: Mode,
     threshold: f64,
     /// The result set (plan for exact, full groups for similar), if a search has
@@ -405,6 +408,7 @@ impl DupesView {
         Self {
             repos: Vec::new(),
             repos_loaded: false,
+            from_start: false,
             mode: Mode::Exact,
             threshold: 99.0,
             results: None,
@@ -503,12 +507,12 @@ impl DupesView {
     /// group per search, so only loaded groups can have changed.
     fn refresh_accepted_groups_on_page(&mut self) {
         let Some(page) = self.cached_page else { return };
-        let start = page * PAGE_SIZE;
+        let start = page.saturating_mul(PAGE_SIZE);
         for (i, group) in self.page_groups.iter().enumerate() {
             if self.accepted.all_accepted(group) {
-                self.accepted_groups.insert(start + i);
+                self.accepted_groups.insert(start.saturating_add(i));
             } else {
-                self.accepted_groups.remove(&(start + i));
+                self.accepted_groups.remove(&start.saturating_add(i));
             }
         }
     }
@@ -574,6 +578,9 @@ impl DupesView {
                 if i.key_pressed(egui::Key::F) && self.busy.is_none() {
                     acts.push(Act::Find);
                 }
+                if i.key_pressed(egui::Key::A) && self.busy.is_none() && !self.marked.is_empty() {
+                    acts.push(Act::AskDelete);
+                }
                 if i.key_pressed(egui::Key::M) {
                     self.mode = if self.mode == Mode::Exact {
                         Mode::Similar
@@ -583,10 +590,10 @@ impl DupesView {
                     self.mode_chosen = true;
                 }
                 if i.key_pressed(egui::Key::ArrowLeft) && cur > 0 {
-                    acts.push(Act::SetPage(cur - 1));
+                    acts.push(Act::SetPage(cur.saturating_sub(1)));
                 }
-                if i.key_pressed(egui::Key::ArrowRight) && cur + 1 < pages {
-                    acts.push(Act::SetPage(cur + 1));
+                if i.key_pressed(egui::Key::ArrowRight) && cur.saturating_add(1) < pages {
+                    acts.push(Act::SetPage(cur.saturating_add(1)));
                 }
             });
         }
@@ -603,7 +610,7 @@ impl DupesView {
         // A FIND folds all three shut; their header bars stay, so changing one
         // thing about the search is one click on that section.
         self.mode_section(ui, &mut acts);
-        if self.mode_chosen {
+        if self.mode_chosen && !self.from_start {
             self.repo_bar(ui, &mut acts);
         }
         if self.mode_chosen && self.repos.iter().any(|r| r.included) {
@@ -613,7 +620,7 @@ impl DupesView {
         crate::util::shortcut_bar(
             ui,
             &format!(
-                "F find · {}/{} page · M mode",
+                "F find · A apply marked · {}/{} page · M mode",
                 icon::CARET_LEFT,
                 icon::CARET_RIGHT
             ),
@@ -781,7 +788,7 @@ impl DupesView {
                                             outcome: Err(format!(
                                                 "{} of {} could not be deleted",
                                                 stats.errors,
-                                                stats.deleted + stats.errors
+                                                stats.deleted.saturating_add(stats.errors)
                                             )),
                                             changed_disk: false,
                                         },
@@ -831,6 +838,37 @@ impl DupesView {
         }
     }
 
+    /// Open this body from the start page (ADR 0004): search exactly `repos`,
+    /// similar or exact. WHAT folds shut (it reopens on its header, for the
+    /// quick-delete toggle); the WITH WHICH section is not shown at all, since
+    /// a different selection is made on the start page.
+    pub fn open_from(&mut self, store: &Store, repos: &[String], similar: bool) {
+        self.sync_repos(store);
+        for r in &mut self.repos {
+            r.included = repos.contains(&r.name);
+        }
+        self.mode = if similar { Mode::Similar } else { Mode::Exact };
+        self.mode_chosen = true;
+        self.from_start = true;
+        self.folds.set("WHAT — DUPLICATES OR SIMILAR FILES", false);
+    }
+
+    /// The repositories the next FIND searches, in list order.
+    #[cfg(test)]
+    pub(crate) fn included_repos(&self) -> Vec<String> {
+        self.repos
+            .iter()
+            .filter(|r| r.included)
+            .map(|r| r.name.clone())
+            .collect()
+    }
+
+    /// Whether the next FIND looks for similar (not exact) files.
+    #[cfg(test)]
+    pub(crate) fn is_similar(&self) -> bool {
+        self.mode == Mode::Similar
+    }
+
     fn repo_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         let title = "WITH WHICH — REPOSITORIES TO SEARCH";
         let mut open = self.folds.is_open(title);
@@ -872,7 +910,10 @@ impl DupesView {
     /// read-only padlock (the "3 in the group" variant). Returns the chip frame
     /// response (its rect feeds the wrap packing in [`repo_chip::chip_row`]).
     fn repo_chip(&self, ui: &mut egui::Ui, i: usize, acts: &mut Vec<Act>) -> egui::Response {
-        let repo = &self.repos[i];
+        // `chip_row` only asks for indices below `self.repos.len()`.
+        let Some(repo) = self.repos.get(i) else {
+            return ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover());
+        };
         let read_only = self.locks.read_only(&repo.name);
         let chip = crate::repo_chip::repo_chip(
             ui,
@@ -1081,18 +1122,18 @@ impl DupesView {
                 }
                 if crate::lcars::action_button(
                     ui,
-                    &format!("DELETE MARKED ({n})"),
+                    &format!("APPLY MARKED ({n})"),
                     idle && n > 0,
                     theme::red(),
                 )
                 .explain(
                     self.verbosity,
                     "Delete every marked file, with confirmation",
-                    "Delete every currently marked file across all groups, batched per \
-                     repo in one transaction. Always asks for confirmation first — use \
-                     QUICK DELETE if you want per-group deletes without asking. The \
-                     delete and the search that follows run in a window that shows \
-                     their progress and reports what was deleted.",
+                    "Apply the marks: delete every currently marked file across all \
+                     groups, batched per repo in one transaction. Always asks for \
+                     confirmation first — use QUICK DELETE if you want per-group deletes \
+                     without asking. The delete and the search that follows run in a \
+                     window that shows their progress and reports what was deleted.",
                 )
                 .clicked()
                 {
@@ -1127,14 +1168,22 @@ impl DupesView {
                 )
                 .clicked()
             {
-                acts.push(Act::SetPage(page - 1));
+                acts.push(Act::SetPage(page.saturating_sub(1)));
             }
             ui.label(
-                RichText::new(format!("page {}/{} · {} groups", page + 1, pages, total))
-                    .color(theme::tan()),
+                RichText::new(format!(
+                    "page {}/{} · {} groups",
+                    page.saturating_add(1),
+                    pages,
+                    total
+                ))
+                .color(theme::tan()),
             );
             if ui
-                .add_enabled(page + 1 < pages, egui::Button::new(icon::CARET_RIGHT))
+                .add_enabled(
+                    page.saturating_add(1) < pages,
+                    egui::Button::new(icon::CARET_RIGHT),
+                )
                 .explain(
                     self.verbosity,
                     "Next page",
@@ -1142,12 +1191,12 @@ impl DupesView {
                 )
                 .clicked()
             {
-                acts.push(Act::SetPage(page + 1));
+                acts.push(Act::SetPage(page.saturating_add(1)));
             }
         });
 
-        let start = page * PAGE_SIZE;
-        let end = (start + PAGE_SIZE).min(total);
+        let start = page.saturating_mul(PAGE_SIZE);
+        let end = start.saturating_add(PAGE_SIZE).min(total);
         if self.group_heights.len() != total {
             self.group_heights = vec![0.0; total];
         }
@@ -1174,7 +1223,8 @@ impl DupesView {
                 // outside the viewport just reserves its known height — we
                 // skip building (and cloning) its widgets entirely. Unmeasured
                 // groups always render once so their height is recorded.
-                let known = self.group_heights[gi];
+                // `group_heights` was sized to `total` above, and `gi < total`.
+                let known = self.group_heights.get(gi).copied().unwrap_or_default();
                 let top = ui.next_widget_position();
                 let visible = known <= 0.0
                     || ui.is_rect_visible(egui::Rect::from_min_size(
@@ -1184,7 +1234,10 @@ impl DupesView {
                 if visible {
                     let before = top.y;
                     self.group_card(ui, gi, start, acts);
-                    self.group_heights[gi] = ui.next_widget_position().y - before;
+                    let height = ui.next_widget_position().y - before;
+                    if let Some(h) = self.group_heights.get_mut(gi) {
+                        *h = height;
+                    }
                 } else {
                     // `allocate_space` adds a trailing item-spacing itself, so
                     // reserve the slot minus that to match the rendered advance.
@@ -1200,13 +1253,20 @@ impl DupesView {
             return;
         }
         let total = self.total_groups();
-        let start = page * PAGE_SIZE;
-        let end = (start + PAGE_SIZE).min(total);
+        let start = page.saturating_mul(PAGE_SIZE);
+        let end = start.saturating_add(PAGE_SIZE).min(total);
+        // A page past the end loads as an empty page.
         let loaded = match &self.results {
-            Some(Results::Exact(plan)) => {
-                load_groups(store, &self.result_names, &plan[start..end]).map_err(|e| e.to_string())
-            }
-            Some(Results::Similar(groups)) => Ok(groups[start..end].to_vec()),
+            Some(Results::Exact(plan)) => load_groups(
+                store,
+                &self.result_names,
+                plan.get(start..end).unwrap_or(&[]),
+            )
+            .map_err(|e| e.to_string()),
+            Some(Results::Similar(groups)) => Ok(groups
+                .get(start..end)
+                .map(<[_]>::to_vec)
+                .unwrap_or_default()),
             None => Ok(Vec::new()),
         };
         match loaded {
@@ -1274,7 +1334,7 @@ impl DupesView {
         // render closure can borrow `self` mutably for thumbnails/mark state.
         let group: DupeGroup = self
             .page_groups
-            .get(gi - page_start)
+            .get(gi.wrapping_sub(page_start))
             .cloned()
             .unwrap_or_default();
         let count = group.len();
@@ -1674,7 +1734,7 @@ impl DupesView {
                                         self.verbosity,
                                         "Toggle this copy's mark",
                                         "Toggle whether this copy is marked for deletion. \
-                                         Nothing is deleted until you press DELETE MARKED (or \
+                                         Nothing is deleted until you press APPLY MARKED (or \
                                          DELETE NOW under Quick Delete).",
                                     )
                                     .clicked()
@@ -2099,11 +2159,12 @@ impl DupesView {
             Act::OpenLightbox(gi, fi) => {
                 // The clicked member opens alone (the second side hidden); the
                 // whole group travels as the pool either side steps through.
-                let page_start = self.cached_page.unwrap_or(0) * PAGE_SIZE;
+                let page_start = self.cached_page.unwrap_or(0).saturating_mul(PAGE_SIZE);
                 if let Some(group) = self
                     .page_groups
                     .get(gi.wrapping_sub(page_start))
                     .filter(|g| !g.is_empty())
+                    && let Some(clicked) = group.get(fi.min(group.len().saturating_sub(1)))
                 {
                     let side = |f: &DupeFile| crate::compare_view::DiffSide {
                         repo: f.repo.clone(),
@@ -2112,12 +2173,8 @@ impl DupesView {
                         facts: FileFacts::from_entry(&f.entry, f.absolute_path()),
                     };
                     let pool: Vec<crate::compare_view::DiffSide> = group.iter().map(side).collect();
-                    let fi = fi.min(group.len() - 1);
-                    let mut lb = crate::compare_view::DiffCompare::new_with_pool(
-                        side(&group[fi]),
-                        None,
-                        pool,
-                    );
+                    let mut lb =
+                        crate::compare_view::DiffCompare::new_with_pool(side(clicked), None, pool);
                     lb.hide_second();
                     // Say which kind of match this is: exact duplicates, or a
                     // SIMILAR search at the current threshold (so a loosely
@@ -2127,8 +2184,8 @@ impl DupesView {
                         // / video) matches. PDF and audio similar groups form by
                         // exact text-hash / duration, so naming a percentage
                         // there would assert something false — omit it.
-                        let perceptual = group[fi].entry.img_fingerprint.is_some()
-                            || group[fi].entry.video_hash.is_some();
+                        let perceptual = clicked.entry.img_fingerprint.is_some()
+                            || clicked.entry.video_hash.is_some();
                         if perceptual {
                             lb.set_title(format!(
                                 "COMPARE — SIMILAR GROUP (≥ {}%)",
@@ -2241,7 +2298,7 @@ impl DupesView {
     fn delete_group(&mut self, store: &Arc<Store>, ctx: &egui::Context, gi: usize) {
         let keys: Vec<FileKey> = {
             let Some(page) = self.cached_page else { return };
-            let page_start = page * PAGE_SIZE;
+            let page_start = page.saturating_mul(PAGE_SIZE);
             let Some(group) = self.page_groups.get(gi.wrapping_sub(page_start)) else {
                 return;
             };
@@ -2261,7 +2318,10 @@ impl DupesView {
         let Some(page) = self.cached_page else {
             return Vec::new();
         };
-        let Some(group) = self.page_groups.get(gi.wrapping_sub(page * PAGE_SIZE)) else {
+        let Some(group) = self
+            .page_groups
+            .get(gi.wrapping_sub(page.saturating_mul(PAGE_SIZE)))
+        else {
             return Vec::new();
         };
         let mut out: Vec<(String, u64, [u8; 32])> = Vec::new();
@@ -2310,15 +2370,16 @@ impl DupesView {
             };
             match written {
                 Ok(_) => {
-                    changed += 1;
+                    changed = changed.saturating_add(1);
                     if accept {
                         self.accepted.insert(repo, *size, hash);
                     } else {
                         self.accepted.remove(repo, *size, hash);
                     }
-                    let what = self
-                        .path_for(repo, *size, hash)
-                        .unwrap_or_else(|| format!("content {}", &hash_hex(hash)[..12]));
+                    let what = self.path_for(repo, *size, hash).unwrap_or_else(|| {
+                        let hex = hash_hex(hash);
+                        format!("content {}", hex.get(..12).unwrap_or(hex.as_str()))
+                    });
                     crate::activity::lock(&self.activity).card(
                         ctx,
                         crate::activity::Notification::noted(
@@ -2371,7 +2432,7 @@ impl DupesView {
     fn set_group_mark(&mut self, gi: usize, mark: bool) {
         let keys: Vec<FileKey> = {
             let Some(page) = self.cached_page else { return };
-            let page_start = page * PAGE_SIZE;
+            let page_start = page.saturating_mul(PAGE_SIZE);
             let Some(group) = self.page_groups.get(gi.wrapping_sub(page_start)) else {
                 return;
             };
@@ -2501,7 +2562,7 @@ impl DupesView {
                 let repaint = ctx.clone();
                 std::thread::spawn(move || {
                     let mut marks: Vec<FileKey> = Vec::new();
-                    let mut done = 0;
+                    let mut done = 0usize;
                     for chunk in plan.chunks(AUTO_BATCH) {
                         match load_groups(&store, &names, chunk) {
                             Ok(mut groups) => {
@@ -2522,7 +2583,7 @@ impl DupesView {
                                 return;
                             }
                         }
-                        done += chunk.len();
+                        done = done.saturating_add(chunk.len());
                         let _ = tx.send(Msg::AutoProgress { done, total });
                         repaint.request_repaint();
                     }
@@ -2607,7 +2668,7 @@ impl DupesView {
                 if let Err(busy) = started {
                     crate::activity::lock(&self.activity).card(
                         ctx,
-                        crate::activity::Notification::refused("DELETE MARKED", &busy),
+                        crate::activity::Notification::refused("APPLY MARKED", &busy),
                     );
                     return;
                 }
@@ -2656,9 +2717,9 @@ impl DupesView {
             if let Some(occ) = self
                 .archive_evidence
                 .get(&(first.entry.size, first.entry.hash))
-                .filter(|v| !v.is_empty())
+                .and_then(|v| v.first())
             {
-                out.push(format!("{} (in {})", first.rel_path, occ[0].archive_rel));
+                out.push(format!("{} (in {})", first.rel_path, occ.archive_rel));
             }
         }
         out
@@ -4033,12 +4094,26 @@ mod ui_tests {
         );
     }
 
+    /// Runs the harness until it stops repainting. The viewer reads a pair's
+    /// text on a worker thread whose finish requests a repaint, so a plain
+    /// `run()` can see repaints for longer than its step budget when the
+    /// worker is slow (a loaded CI runner); this waits for the worker instead.
+    fn settle<S>(h: &mut Harness<'_, S>) {
+        for _ in 0..100 {
+            if h.try_run().is_ok() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the viewer did not settle");
+    }
+
     fn similar_harness<'a>(view: DupesView) -> Harness<'a, DupesView> {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
         let mut init = false;
         let mut harness = Harness::builder()
-            .with_size(egui::vec2(700.0, 500.0))
+            .with_size(egui::vec2(700.0, 1000.0))
             .build_ui_state(
                 move |ui, view: &mut DupesView| {
                     if !init {
@@ -7134,11 +7209,11 @@ mod ui_tests {
         view.repos_loaded = true;
         view.results = Some(Results::Similar(vec![group]));
         let mut harness = lightbox_harness(view, egui::vec2(1000.0, 720.0));
-        harness.run();
+        settle(&mut harness);
         open_viewer(&mut harness, 0, 0);
 
         harness.get_by_label_contains("Text").click();
-        harness.run();
+        settle(&mut harness);
         assert!(
             harness.query_all_by_label_contains("hello alpha").count() > 0,
             "A's readable text is previewed on the Text tab"
@@ -7147,9 +7222,9 @@ mod ui_tests {
         // Raw bytes live on the Hex tab now: with B revealed it is the aligned,
         // paginated hex diff of the two files — equal bytes lined up, marked.
         harness.get_by_label_contains("SHOW B").click();
-        harness.run();
+        settle(&mut harness);
         harness.get_by_label_contains("Hex").click();
-        harness.run();
+        settle(&mut harness);
         // The page number itself is an editable DragValue, flanked by "page"
         // and "/ total" captions.
         assert!(

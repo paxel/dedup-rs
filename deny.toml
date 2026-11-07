@@ -1,0 +1,57 @@
+# cargo-deny policy (docs/adr/0005-security-hardening.md). The Security workflow
+# reports on every push; the release gate fails on any error.
+
+[advisories]
+# RustSec: every vulnerability fails; unmaintained and yanked crates too.
+yanked = "deny"
+unmaintained = "all"
+# Each ignore names the advisory and why it cannot be fixed yet. All of these
+# come in through eframe 0.35's Linux window stack (winit's Wayland decorations
+# and accesskit's AT-SPI bridge) and leave with an eframe upgrade.
+ignore = [
+    # quick-xml 0.39 in zbus_xml (accesskit AT-SPI): parses the D-Bus interface
+    # XML the bridge ships with, never a user file.
+    { id = "RUSTSEC-2026-0194", reason = "zbus_xml under eframe 0.35; parses built-in D-Bus XML only" },
+    { id = "RUSTSEC-2026-0195", reason = "zbus_xml under eframe 0.35; parses built-in D-Bus XML only" },
+    # ttf-parser via sctk-adwaita: reads the system's title-bar font.
+    { id = "RUSTSEC-2026-0192", reason = "unmaintained; sctk-adwaita under eframe 0.35 reads system fonts only" },
+    # zbus_names, zvariant, zvariant_derive: accesskit's AT-SPI bridge.
+    { id = "RUSTSEC-2026-0371", reason = "unmaintained; accesskit AT-SPI bridge under eframe 0.35" },
+    { id = "RUSTSEC-2026-0370", reason = "unmaintained; accesskit AT-SPI bridge under eframe 0.35" },
+    { id = "RUSTSEC-2026-0372", reason = "unmaintained; accesskit AT-SPI bridge under eframe 0.35" },
+]
+
+[licenses]
+# Permissive licenses plus MPL-2.0 (file-level copyleft). The GPL family, LGPL
+# included, is not on the list and therefore fails. OFL-1.1 and Ubuntu-font-1.0
+# cover the fonts egui embeds.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "CC0-1.0",
+    "bzip2-1.0.6",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+# Path dependencies between the workspace crates carry versions, so this only
+# catches a `*` requirement on a crates.io dependency.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

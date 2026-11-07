@@ -1,23 +1,22 @@
-# Duplicates tab
+# Duplicates
 
-![Duplicate Management tab](../screenshots/duplicates_tab.png)
+![Duplicates: each group's copies side by side](../screenshots/duplicates_tab.png)
 
 Find exact or perceptually similar duplicates across one or more repositories, review them
 with real previews, and delete the worse copies — batched per repo, always confirmed unless
 you turn on Quick Delete. This is the GUI equivalent of `repo dupes`, with a full review
 workflow on top.
 
-## Reading order
+## Getting here
 
-The tab asks its questions top to bottom, and each section appears once the one above it
-has an answer:
+Select the repositories on the [start page](start-page.md) and pick **FIND DUPLICATES** or
+**FIND SIMILAR** (the latter asks for its **similarity threshold** first, then **GO**). The
+header strip names the selection, the mode and the threshold; **START** returns to the
+start page with the selection kept. Inside, the body shows:
 
-1. **WHAT** — DUPLICATES or SIMILAR FILES. Choosing SIMILAR reveals the **similarity
-   threshold** slider right beside the chip. **QUICK DELETE** sits on the same row.
-2. **WITH WHICH** — the repository chips, shown once a mode is chosen. Flipping the mode
-   keeps the chips you picked.
-3. **HOW** — the shared FILTER wizard and the **FIND** button on one row, shown once at
-   least one repository is included.
+1. **WHAT** — the chosen mode, folded; open it to flip between DUPLICATES and SIMILAR
+   FILES or to toggle **QUICK DELETE**.
+2. **HOW** — the shared FILTER wizard and the **FIND** button on one row.
 
 After a FIND the three sections fold into one summary line (mode, repositories, filter)
 so the groups get the screen; **CHANGE** unfolds them for the next search.
@@ -31,7 +30,7 @@ One chip per registered repository:
 - Click the **padlock** to toggle read-only: a closed lock means files in that repo are
   protected from deletion (never preselected, never marked, even by auto-resolve); an open
   lock means they can be deleted like any other file.
-- **REFRESH** reloads the repository list (e.g. after adding one in the Repositories tab).
+- **REFRESH** reloads the repository list (e.g. after adding one on the start page).
 
 ## Mode, threshold, and FIND
 
@@ -61,7 +60,7 @@ and the repository, and every file it removed is written to the **event log**, w
 Below the results: **SHOW ACCEPTED** lists the groups whose every copy is
 [accepted](#accepted-content) (hidden by default, with a count of how many are skipped),
 **AUTO-RESOLVE REST** marks every non-best copy for deletion (skipping read-only repos and
-accepted copies) so you only have to review the marks, and **DELETE MARKED (n)** deletes
+accepted copies) so you only have to review the marks, and **APPLY MARKED (n)** deletes
 everything currently marked, batched per repo in one transaction, behind a confirmation.
 The delete and the search that follows run in the activity window as one operation whose
 report lists what was deleted, what could not be, and the fresh group count; every deleted
@@ -315,7 +314,7 @@ Audio duplicate cards get an inline **PLAY/PAUSE** button, an elapsed/total read
 seek bar — confirm two "similar" tracks are actually the same recording (and which sounds
 better) without leaving the app or opening an external player. Only one file plays at a time;
 starting another replaces it. Playback survives scrolling and stops automatically when you
-switch away from the Duplicates tab. Requires ALSA on Linux at build time (see the README);
+leave Duplicates. Requires ALSA on Linux at build time (see the README);
 with no audio device at runtime, the controls still render and playback is simply a no-op.
 
 The [viewer](#the-viewer-lightbox) shares the same single audio device: opening a track there

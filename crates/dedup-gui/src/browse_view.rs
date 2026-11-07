@@ -9,7 +9,7 @@
 //! free-form annotations editor (removable tag pills, an add field, and a
 //! suggestion list of tags already used in the repo).
 //!
-//! The file table (egui_extras) has drag-resizable, click-to-sort columns —
+//! The file listing is the shared board, with click-to-sort column headers —
 //! NAME, SIZE, TYPE, INFO (image `W×H` / audio `m:ss`), MODIFIED, TAGS
 //! (the file's tags). Both panes keep their selection marked (bright when
 //! focused, dim otherwise) so the preview always matches a visible row.
@@ -40,9 +40,8 @@ use dedup_core::filter::FileFilter;
 use dedup_core::store::{FileEntry, Store, for_each_file_entry};
 use dedup_core::thumbnail::hash_hex;
 use egui::{Color32, Key, Modifiers, RichText};
-use egui_extras::{Column, TableBuilder};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -72,8 +71,6 @@ enum ByteMode {
 /// How an annotation chip behaves / is coloured.
 #[derive(Clone, Copy)]
 enum ChipMode {
-    /// Read-only badge (file table cell).
-    Display,
     /// Clickable badge that adds the tag (suggestion list).
     Add,
     /// Removable badge — click removes (the current-tags editor).
@@ -160,6 +157,9 @@ pub struct BrowseView {
     /// resolved (`root/rel`) only when the preview dock actually needs it.
     roots: HashMap<String, String>,
     loaded: bool,
+    /// The start page chose the repository: its own picker section stays
+    /// hidden until the body is opened for a new one.
+    picker_hidden: bool,
     repo: Option<String>,
     /// `(rel_path, entry)` for the selected repo, loaded once per repo, sorted.
     entries: Vec<(String, FileEntry)>,
@@ -198,6 +198,12 @@ pub struct BrowseView {
     /// Thumbnails / audio-viz for the preview dock (background decode pools).
     thumbs: ThumbCache,
     waves: WaveCache,
+    /// The shared board's per-view state: the listing's tinted selection and
+    /// outlined cursor mirror `selected` / `file_sel` each frame.
+    board_state: crate::board::BoardState,
+    /// `rel` → position in `entries`, so a row on screen finds its entry
+    /// (for its thumbnail and facts) without a scan of the whole index.
+    entry_index: HashMap<String, usize>,
     /// Audio preview playback for the selected track. One file plays at a time
     /// app-wide; leaving the tab stops it (see [`Self::stop_audio`]).
     player: Player,
@@ -269,6 +275,7 @@ impl BrowseView {
             mains: std::collections::HashSet::new(),
             roots: HashMap::new(),
             loaded: false,
+            picker_hidden: false,
             repo: None,
             entries: Vec::new(),
             entries_repo: None,
@@ -287,6 +294,8 @@ impl BrowseView {
             filter: FilterBuilder::new(),
             error: None,
             thumbs: ThumbCache::new(2),
+            board_state: crate::board::BoardState::default(),
+            entry_index: HashMap::new(),
             waves: WaveCache::new(1),
             player: Player::new(),
             preview: None,
@@ -389,6 +398,26 @@ impl BrowseView {
         }
     }
 
+    /// Open this body from the start page (ADR 0004) at `repo`'s root. The
+    /// repository was chosen there, so the body's own picker is not shown;
+    /// a different repository is a different selection on the start page.
+    pub fn open_root(&mut self, store: &Store, repo: &str) {
+        self.sync_repos(store);
+        self.repo = Some(repo.to_string());
+        self.load_entries(store, repo);
+        self.sel_rel = None;
+        self.selected.clear();
+        self.flatten = false;
+        self.focus = Pane::Dirs;
+        self.picker_hidden = true;
+    }
+
+    /// The repository being browsed, for tests.
+    #[cfg(test)]
+    pub(crate) fn repo(&self) -> Option<&str> {
+        self.repo.as_deref()
+    }
+
     /// Jump the tab to one file: select its repo, walk to its directory and
     /// put the cursor on it — the "show this file among its neighbours" entry
     /// point other tabs use (e.g. a duplicate copy's SHOW IN BROWSE).
@@ -429,6 +458,11 @@ impl BrowseView {
             Err(e) => self.error = Some(e.to_string()),
         }
         entries.sort_by(|a, b| a.0.cmp(&b.0));
+        self.entry_index = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (rel, _))| (rel.clone(), i))
+            .collect();
         self.entries = entries;
         self.entries_repo = Some(repo.to_string());
         self.cur.clear();
@@ -528,7 +562,10 @@ impl BrowseView {
             return;
         }
         // Invalidate any previous worker, then claim this folder.
-        let generation = self.prefetch_gen.fetch_add(1, Ordering::Relaxed) + 1;
+        let generation = self
+            .prefetch_gen
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         self.prefetch_key = Some(key);
         self.prefetch_alive = true;
         // Nearest-first from the current selection: the order the user would
@@ -536,22 +573,22 @@ impl BrowseView {
         let sel = self.file_sel.min(files.len().saturating_sub(1));
         let mut order: Vec<usize> = Vec::with_capacity(files.len());
         let mut lo = sel as isize;
-        let mut hi = sel as isize + 1;
+        let mut hi = (sel as isize).saturating_add(1);
         while lo >= 0 || (hi as usize) < files.len() {
             if lo >= 0 {
                 order.push(lo as usize);
-                lo -= 1;
+                lo = lo.saturating_sub(1);
             }
             if (hi as usize) < files.len() {
                 order.push(hi as usize);
-                hi += 1;
+                hi = hi.saturating_add(1);
             }
         }
         let jobs: Vec<(std::path::PathBuf, String, String, u64)> = order
             .into_iter()
-            .filter(|&i| !files[i].missing)
-            .map(|i| {
-                let f = &files[i];
+            .filter_map(|i| files.get(i))
+            .filter(|f| !f.missing)
+            .map(|f| {
                 (
                     std::path::Path::new(&root).join(&f.rel),
                     dedup_core::thumbnail::hash_hex(&f.hash),
@@ -586,7 +623,7 @@ impl BrowseView {
                 }
                 // 2. Warm the bytes themselves (budgeted), in chunks so a
                 // cancel lands mid-file rather than after it.
-                if size <= WARM_FILE_CAP && warmed + size <= WARM_TOTAL_CAP {
+                if size <= WARM_FILE_CAP && warmed.saturating_add(size) <= WARM_TOTAL_CAP {
                     use std::io::Read;
                     if let Ok(mut f) = std::fs::File::open(&path) {
                         let mut buf = vec![0u8; 4 * 1024 * 1024];
@@ -596,7 +633,7 @@ impl BrowseView {
                             }
                             match f.read(&mut buf) {
                                 Ok(0) => break,
-                                Ok(n) => warmed += n as u64,
+                                Ok(n) => warmed = warmed.saturating_add(n as u64),
                                 Err(_) => break,
                             }
                         }
@@ -691,7 +728,10 @@ impl BrowseView {
                         self.dir_sel = self.dir_sel.saturating_sub(1);
                     }
                     if down && !dirs.is_empty() {
-                        self.dir_sel = (self.dir_sel + 1).min(dirs.len() - 1);
+                        self.dir_sel = self
+                            .dir_sel
+                            .saturating_add(1)
+                            .min(dirs.len().saturating_sub(1));
                     }
                     if left {
                         self.go_parent();
@@ -708,7 +748,10 @@ impl BrowseView {
                         self.selected.clear();
                     }
                     if down && files_len > 0 {
-                        self.file_sel = (self.file_sel + 1).min(files_len - 1);
+                        self.file_sel = self
+                            .file_sel
+                            .saturating_add(1)
+                            .min(files_len.saturating_sub(1));
                         self.scroll_file = true;
                         self.selected.clear();
                     }
@@ -737,44 +780,53 @@ impl BrowseView {
             ui.colored_label(theme::red(), err);
         }
 
-        // Repo picker (single repo), amber when selected.
+        // Repo picker (single repo), amber when selected — unless the start
+        // page already chose the repository (ADR 0004).
         let repos = self.repos.clone();
         let mains = self.mains.clone();
         let mut picked: Option<String> = None;
-        crate::lcars::section_lcars(
-            ui,
-            "REPO — WHICH REPOSITORY TO BROWSE",
-            theme::amber(),
-            |ui| {
-                crate::repo_chip::chip_row(ui, "browse_repo", "", repos.len(), |ui, i| {
-                    let name = &repos[i];
-                    let sel = self.repo.as_deref() == Some(name.as_str());
-                    let chip = crate::repo_chip::repo_chip(
-                        ui,
-                        name,
-                        sel,
-                        theme::amber(),
-                        mains.contains(name),
-                        Some(self.locks.read_only(name)),
-                    );
-                    if chip
-                        .name
-                        .explain(
-                            self.verbosity,
-                            "Browse this repository",
-                            "Load this repository's index and browse its files by directory.",
-                        )
-                        .clicked()
-                    {
-                        picked = Some(name.clone());
-                    }
-                    self.locks.handle_badge(chip.lock, self.verbosity, name);
-                    chip.outer
-                });
-            },
-        );
+        if self.picker_hidden && self.repo.is_some() {
+            // Nothing: the header strip names the repository.
+        } else {
+            crate::lcars::section_lcars(
+                ui,
+                "REPO — WHICH REPOSITORY TO BROWSE",
+                theme::amber(),
+                |ui| {
+                    crate::repo_chip::chip_row(ui, "browse_repo", "", repos.len(), |ui, i| {
+                        // `chip_row` only asks for indices below `repos.len()`.
+                        let Some(name) = repos.get(i) else {
+                            return ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover());
+                        };
+                        let sel = self.repo.as_deref() == Some(name.as_str());
+                        let chip = crate::repo_chip::repo_chip(
+                            ui,
+                            name,
+                            sel,
+                            theme::amber(),
+                            mains.contains(name),
+                            Some(self.locks.read_only(name)),
+                        );
+                        if chip
+                            .name
+                            .explain(
+                                self.verbosity,
+                                "Browse this repository",
+                                "Load this repository's index and browse its files by directory.",
+                            )
+                            .clicked()
+                        {
+                            picked = Some(name.clone());
+                        }
+                        self.locks.handle_badge(chip.lock, self.verbosity, name);
+                        chip.outer
+                    });
+                },
+            );
+        }
         if let Some(name) = picked {
             self.repo = Some(name);
+            self.picker_hidden = false;
         }
 
         let Some(repo) = self.repo.clone() else {
@@ -864,7 +916,7 @@ impl BrowseView {
                                 for (i, seg) in segs.iter().enumerate() {
                                     ui.label(RichText::new("›").color(theme::hairline()));
                                     if ui.link(RichText::new(seg).color(theme::lilac())).clicked() {
-                                        self.cur.truncate(i + 1);
+                                        self.cur.truncate(i.saturating_add(1));
                                         self.dir_sel = 0;
                                         self.file_sel = 0;
                                         self.selected.clear();
@@ -958,7 +1010,12 @@ impl BrowseView {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            self.draw_files(ui, &files);
+            egui::ScrollArea::vertical()
+                .id_salt("browse-files")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    self.draw_files(ui, store, &files);
+                });
         });
 
         // Remember the selection by identity (rel path) after any click/key this
@@ -1067,11 +1124,12 @@ impl BrowseView {
         });
     }
 
-    /// The centre file table (egui_extras): drag-resizable columns and click-to-
-    /// sort headers. The selected file stays marked whichever pane has focus, so
-    /// its preview always corresponds to a visible selection.
-    fn draw_files(&mut self, ui: &mut egui::Ui, files: &[FileRow]) {
-        table_visuals(ui, self.focus == Pane::Files);
+    /// The file listing on the shared board (ADR 0004): one-sided rows in the
+    /// order `sort_files` put them, each with its thumbnail, facts and tag
+    /// chips; selected rows tinted and the cursor outlined whichever pane has
+    /// focus. The column headers above it sort; a click selects (Ctrl toggles,
+    /// Shift extends from the cursor), a double click opens the viewer.
+    fn draw_files(&mut self, ui: &mut egui::Ui, store: &Store, files: &[FileRow]) {
         let cols = [
             (SortCol::Name, "NAME"),
             (SortCol::Size, "SIZE"),
@@ -1080,99 +1138,16 @@ impl BrowseView {
             (SortCol::Modified, "MODIFIED"),
             (SortCol::Tags, "TAGS"),
         ];
-        let (sort_col, sort_asc, file_sel) = (self.sort_col, self.sort_asc, self.file_sel);
-        let selected = self.selected.clone();
-        let mods = ui.input(|i| i.modifiers);
+        let (sort_col, sort_asc) = (self.sort_col, self.sort_asc);
         let mut clicked_header: Option<SortCol> = None;
-        let mut clicked_row: Option<usize> = None;
-        // Only follow the selection when a keyboard move asked for it; a per-frame
-        // scroll request would repaint forever.
-        let scroll_to = std::mem::take(&mut self.scroll_file).then_some(file_sel);
-
-        let mut table = TableBuilder::new(ui)
-            .striped(true)
-            .resizable(true)
-            .sense(egui::Sense::click())
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(
-                Column::initial(240.0)
-                    .at_least(120.0)
-                    .clip(true)
-                    .resizable(true),
-            )
-            .column(Column::initial(80.0).at_least(56.0).resizable(true))
-            .column(
-                Column::initial(130.0)
-                    .at_least(70.0)
-                    .clip(true)
-                    .resizable(true),
-            )
-            .column(Column::initial(90.0).at_least(60.0).resizable(true))
-            .column(Column::initial(140.0).at_least(80.0).resizable(true))
-            .column(Column::remainder().at_least(100.0).clip(true));
-        if let Some(row) = scroll_to {
-            table = table.scroll_to_row(row, Some(egui::Align::Center));
-        }
-        table
-            .header(24.0, |mut header| {
-                for (col, title) in cols {
-                    header.col(|ui| {
-                        if crate::util::sort_header(ui, title, sort_col == col, sort_asc).clicked()
-                        {
-                            clicked_header = Some(col);
-                        }
-                    });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Sort").color(theme::text()).size(11.0));
+            for (col, title) in cols {
+                if crate::util::sort_header(ui, title, sort_col == col, sort_asc).clicked() {
+                    clicked_header = Some(col);
                 }
-            })
-            .body(|body| {
-                body.rows(20.0, files.len(), |mut row| {
-                    let i = row.index();
-                    let f = &files[i];
-                    // Highlight every multi-selected row, plus the cursor.
-                    row.set_selected(i == file_sel || selected.contains(&f.rel));
-                    row.col(|ui| {
-                        // Tombstones read blue — the resurrection colour: the
-                        // repo remembers this file, the disk no longer has it.
-                        let text = if f.missing {
-                            egui::RichText::new(&f.name).color(theme::blue())
-                        } else {
-                            egui::RichText::new(&f.name)
-                        };
-                        // The label stays click-passive: a click-sensing
-                        // widget here would win the hit test and steal row
-                        // selection on the filename — the row's most natural
-                        // click target. Copy hangs off the whole row instead.
-                        ui.add(egui::Label::new(text).truncate());
-                    });
-
-                    row.col(|ui| {
-                        ui.monospace(format_size(f.size));
-                    });
-                    row.col(|ui| {
-                        ui.add(egui::Label::new(&f.mime).truncate());
-                    });
-                    row.col(|ui| {
-                        ui.monospace(&f.info);
-                    });
-                    row.col(|ui| {
-                        ui.monospace(format_mtime(f.modified_ms));
-                    });
-                    row.col(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        for tag in &f.tag_list {
-                            annotation_chip(ui, tag, ChipMode::Display);
-                        }
-                    });
-                    // Right-click anywhere in the row copies its rel path
-                    // (the row already senses clicks; no extra interact that
-                    // could shadow selection).
-                    crate::util::copy_menu(&row.response(), &f.rel);
-                    if row.response().clicked() {
-                        clicked_row = Some(i);
-                    }
-                });
-            });
-
+            }
+        });
         if let Some(col) = clicked_header {
             if self.sort_col == col {
                 self.sort_asc = !self.sort_asc;
@@ -1181,26 +1156,121 @@ impl BrowseView {
                 self.sort_asc = true;
             }
         }
-        if let Some(i) = clicked_row {
-            self.focus = Pane::Files;
-            let rel = files[i].rel.clone();
-            if mods.command {
-                // Ctrl/Cmd-click toggles one file in the selection.
-                if !self.selected.remove(&rel) {
+
+        let metas: Vec<crate::board::RowMeta> = files
+            .iter()
+            .map(|f| crate::board::RowMeta {
+                key: f.rel.clone(),
+                // Tombstones read blue — the repo remembers this file, the
+                // disk no longer has it.
+                left_status: if f.missing {
+                    crate::board::Status::Missing
+                } else {
+                    crate::board::Status::Same
+                },
+                right_status: crate::board::Status::Absent,
+                left_paths: vec![f.name.clone()],
+                right_paths: Vec::new(),
+                left_size: f.size,
+                right_size: 0,
+                left_modified: f.modified_ms,
+                right_modified: 0,
+                unchanged: false,
+                cmds: Vec::new(),
+                left_tags: f.tag_list.clone(),
+            })
+            .collect();
+        self.board_state.selected = self.selected.clone();
+        self.board_state.cursor = files.get(self.file_sel).map(|f| f.rel.clone());
+        // Only follow the selection when a keyboard move asked for it; a
+        // per-frame scroll request would repaint forever.
+        if std::mem::take(&mut self.scroll_file) {
+            self.board_state.scroll_to = self.board_state.cursor.clone();
+        }
+        let repo = self.repo.clone().unwrap_or_default();
+        let is_main = self.mains.contains(&repo);
+        let root = self.repo_root().cloned().unwrap_or_default();
+        let folder = if self.cur.is_empty() {
+            root.clone()
+        } else {
+            format!("{root}/{}", self.cur.join("/"))
+        };
+        let root_path = PathBuf::from(&root);
+        let entries = &self.entries;
+        let index = &self.entry_index;
+        let mut body = |i: usize| -> crate::board::RowBody {
+            let facts = files.get(i).and_then(|f| {
+                index
+                    .get(&f.rel)
+                    .and_then(|&k| entries.get(k))
+                    .map(|(_, e)| {
+                        crate::media_cell::FileFacts::from_entry(e, root_path.join(&f.rel))
+                    })
+            });
+            crate::board::RowBody {
+                left: crate::board::SideBody {
+                    facts,
+                    ..Default::default()
+                },
+                right: crate::board::SideBody::default(),
+            }
+        };
+        let action = crate::board::board(
+            ui,
+            &mut self.board_state,
+            &metas,
+            crate::board::BoardView {
+                left_role: "FILES",
+                left_repo: &repo,
+                left_is_main: is_main,
+                left_path: &folder,
+                right: None,
+                totals: [0, 0, 0, 0],
+                full_len: files.len(),
+                hide_skips_run: false,
+                listing: true,
+            },
+            &mut self.thumbs,
+            &mut body,
+        );
+        let Some(a) = action else {
+            return;
+        };
+        let Some(f) = files.get(a.row) else {
+            return;
+        };
+        let rel = f.rel.clone();
+        match a.cmd {
+            crate::board::Cmd::Select { ctrl, shift } => {
+                self.focus = Pane::Files;
+                if ctrl {
+                    // Ctrl/Cmd-click toggles one file in the selection.
+                    if !self.selected.remove(&rel) {
+                        self.selected.insert(rel);
+                    }
+                } else if shift {
+                    // Shift-click extends the selection over the range from the cursor.
+                    let (lo, hi) = (self.file_sel.min(a.row), self.file_sel.max(a.row));
+                    for f in files.get(lo..=hi).unwrap_or_default() {
+                        self.selected.insert(f.rel.clone());
+                    }
+                } else {
+                    // Plain click selects just this file.
+                    self.selected.clear();
                     self.selected.insert(rel);
                 }
-            } else if mods.shift {
-                // Shift-click extends the selection over the range from the cursor.
-                let (a, b) = (self.file_sel.min(i), self.file_sel.max(i));
-                for f in &files[a..=b] {
-                    self.selected.insert(f.rel.clone());
-                }
-            } else {
-                // Plain click selects just this file.
-                self.selected.clear();
-                self.selected.insert(rel);
+                self.file_sel = a.row;
             }
-            self.file_sel = i;
+            crate::board::Cmd::OpenRow => {
+                self.focus = Pane::Files;
+                self.file_sel = a.row;
+                self.selected.clear();
+                self.selected.insert(rel.clone());
+                let abs = self.repo_root().map(|r| Path::new(r).join(&rel));
+                let sel = f.clone();
+                self.open_in_viewer(store, &sel, abs.as_deref());
+            }
+            _ => {}
         }
     }
 
@@ -2137,7 +2207,7 @@ impl BrowseView {
             if !tags.iter().any(|t| t == tag) {
                 tags.push(tag.to_string());
                 match store.set_annotations(&repo, &rel, &tags) {
-                    Ok(()) => tagged += 1,
+                    Ok(()) => tagged = tagged.saturating_add(1),
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
@@ -2160,7 +2230,12 @@ impl BrowseView {
 /// vendored Phosphor subset has no tag icon, so we paint one so annotations read
 /// as tags everywhere.
 fn tag_glyph(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
-    let s = |x: f32, y: f32| rect.min + egui::vec2(rect.width() * x, rect.height() * y);
+    let s = |x: f32, y: f32| {
+        egui::pos2(
+            rect.min.x + rect.width() * x,
+            rect.min.y + rect.height() * y,
+        )
+    };
     let pts = vec![
         s(0.08, 0.5),
         s(0.44, 0.14),
@@ -2205,16 +2280,11 @@ fn annotation_chip(ui: &mut egui::Ui, text: &str, mode: ChipMode) -> egui::Respo
     let pad = egui::vec2(7.0, 3.0);
     let h = galley.size().y + pad.y * 2.0;
     let w = pad.x * 2.0 + icon + gap + galley.size().x + x_w;
-    let sense = if matches!(mode, ChipMode::Display) {
-        egui::Sense::hover()
-    } else {
-        egui::Sense::click()
-    };
+    let sense = egui::Sense::click();
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), sense);
     if ui.is_rect_visible(rect) {
         let hov = resp.hovered();
         let (fill, fg) = match mode {
-            ChipMode::Display => (violet, theme::lilac()),
             ChipMode::Add => (if hov { violet_hover } else { violet }, theme::lilac()),
             ChipMode::Removable => (
                 if hov { theme::amber() } else { theme::tan() },
@@ -2275,14 +2345,6 @@ fn row_hover() -> Color32 {
     }
 }
 
-/// Bright/dim blue selection so both panes keep their selection marked TUI-style
-/// (bright when focused, dim otherwise). Shared by the list panes.
-fn selection_colors(ui: &mut egui::Ui, active: bool) {
-    let sel = &mut ui.visuals_mut().selection;
-    sel.bg_fill = selection_bg(active);
-    sel.stroke.color = theme::text();
-}
-
 /// A self-painted clickable chip that stays legible in every state. The theme's
 /// `override_text_color` forces cream text on plain `selectable_label`s (see the
 /// egui-desktop skill), which is unreadable on the amber hover fill — so we pick
@@ -2321,8 +2383,13 @@ fn paint_chip(
         if fill.a() > 0 {
             ui.painter().rect_filled(rect, 6.0, fill);
         }
-        ui.painter()
-            .text(rect.min + pad, egui::Align2::LEFT_TOP, text, font, fg);
+        ui.painter().text(
+            egui::pos2(rect.min.x + pad.x, rect.min.y + pad.y),
+            egui::Align2::LEFT_TOP,
+            text,
+            font,
+            fg,
+        );
     }
     // Accessibility + testability: expose it as a labelled, selectable widget.
     resp.widget_info(|| {
@@ -2350,17 +2417,6 @@ fn list_row(ui: &mut egui::Ui, selected: bool, active: bool, text: &str) -> egui
     )
 }
 
-/// Interaction colours for the **file table**, whose cells are non-interactive
-/// `Label`s with fixed cream text. egui_extras paints the hovered row with
-/// `widgets.hovered.bg_fill`; the theme's amber there would hide the cream text,
-/// so use a subtle dark row highlight instead (selection stays blue).
-fn table_visuals(ui: &mut egui::Ui, active: bool) {
-    let w = &mut ui.visuals_mut().widgets;
-    w.noninteractive.fg_stroke.color = theme::text();
-    w.hovered.bg_fill = row_hover();
-    selection_colors(ui, active);
-}
-
 /// A normal button with readable black text (the theme forces cream text via
 /// `override_text_color`, which is illegible on the button's amber/orange fill).
 fn dark_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
@@ -2385,9 +2441,12 @@ fn read_head(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
     let mut buf = vec![0u8; max];
     let mut filled = 0;
     while filled < max {
-        match f.read(&mut buf[filled..])? {
+        let Some(rest) = buf.get_mut(filled..) else {
+            break;
+        };
+        match f.read(rest)? {
             0 => break,
-            n => filled += n,
+            n => filled = filled.saturating_add(n),
         }
     }
     buf.truncate(filled);
@@ -2405,7 +2464,7 @@ fn build_text(bytes: &[u8]) -> Preview {
 /// A classic 16-byte-per-row hex dump of the header plus the printable ASCII
 /// runs (≥4 chars) found in it — the "unknown binary" fallback preview.
 fn build_bytes(bytes: &[u8]) -> Preview {
-    let head = &bytes[..bytes.len().min(256)];
+    let head = bytes.get(..256).unwrap_or(bytes);
     let mut hex = Vec::new();
     for (row, chunk) in head.chunks(16).enumerate() {
         let mut cols = String::new();
@@ -2422,7 +2481,11 @@ fn build_bytes(bytes: &[u8]) -> Preview {
                 }
             })
             .collect();
-        hex.push(format!("{:04x}  {:<48} {ascii}", row * 16, cols));
+        hex.push(format!(
+            "{:04x}  {:<48} {ascii}",
+            row.saturating_mul(16),
+            cols
+        ));
     }
     let strings = dedup_core::strings::printable_strings(bytes, 4, 40);
     Preview::Bytes { hex, strings }
@@ -2977,7 +3040,9 @@ mod tests {
         let store_ui = Arc::clone(&store);
         let mut init = false;
         let mut h = Harness::builder()
-            .with_size(egui::vec2(1000.0, 1000.0))
+            // Tall enough that the second board row sits above the preview
+            // dock: the board draws rows at their full height now.
+            .with_size(egui::vec2(1000.0, 1300.0))
             .build_ui_state(
                 move |ui, view: &mut BrowseView| {
                     if !init {
@@ -2985,7 +3050,7 @@ mod tests {
                         crate::theme::apply(ui.ctx(), crate::theme::DARK);
                         init = true;
                     }
-                    ui.allocate_ui(egui::vec2(ui.available_width(), 900.0), |ui| {
+                    ui.allocate_ui(egui::vec2(ui.available_width(), 1200.0), |ui| {
                         view.show(ui, &store_ui, TooltipVerbosity::default());
                     });
                 },
@@ -3531,9 +3596,15 @@ mod tests {
         h.key_press(egui::Key::Tab);
         h.run();
         h.run();
-        // Hover a dir row to prove hover legibility (dark highlight + cream text,
-        // not the theme's illegible cream-on-amber).
-        h.get_by_label("notes.txt").hover();
+        // Hover a file row to prove hover legibility (dark highlight + cream
+        // text, not the theme's illegible cream-on-amber). The preview dock
+        // names the same file, so pick the row's label by position.
+        if let Some(row) = h
+            .query_all_by_label("notes.txt")
+            .min_by(|a, b| a.rect().top().total_cmp(&b.rect().top()))
+        {
+            row.hover();
+        }
         h.run();
         let img = h.render().expect("wgpu render failed");
         let out =

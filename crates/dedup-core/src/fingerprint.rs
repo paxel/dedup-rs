@@ -88,7 +88,21 @@ pub fn is_audio_mime(mime: &str) -> bool {
 /// `ffmpeg_available` gates the (external) video path and the audio decode
 /// fallback; when false, video files yield no temporal hash. Pass the result of
 /// [`ffmpeg_available`], probed once.
+///
+/// A parser that panics on a malformed file (fuzzing found one in symphonia's
+/// MKV reader) costs that file its fingerprints, not the scan: the file keeps
+/// its MIME type and its content hash.
 pub fn compute(path: &Path, ffmpeg_available: bool) -> Fingerprints {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        compute_unguarded(path, ffmpeg_available)
+    }))
+    .unwrap_or_else(|_| Fingerprints {
+        mime: detect_mime(path),
+        ..Default::default()
+    })
+}
+
+fn compute_unguarded(path: &Path, ffmpeg_available: bool) -> Fingerprints {
     let mime = detect_mime(path);
     let mut fp = Fingerprints {
         mime: mime.clone(),
@@ -173,7 +187,9 @@ pub fn read_exif(path: &Path) -> Option<ExifInfo> {
         .get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)
         .or_else(|| exif.get_field(exif::Tag::DateTime, exif::In::PRIMARY))
         .and_then(|f| match &f.value {
-            exif::Value::Ascii(vec) if !vec.is_empty() => exif::DateTime::from_ascii(&vec[0]).ok(),
+            exif::Value::Ascii(vec) => vec
+                .first()
+                .and_then(|first| exif::DateTime::from_ascii(first).ok()),
             _ => None,
         })
         .map(|dt| exif_datetime_to_ms(&dt));
@@ -211,8 +227,12 @@ pub fn exif_fields(path: &Path) -> Vec<(String, String)> {
 /// Convert an EXIF `DateTime` (naive, no timezone) to epoch milliseconds,
 /// treated as if UTC (via the shared civil-date math in [`crate::filter`]).
 fn exif_datetime_to_ms(dt: &exif::DateTime) -> i64 {
-    crate::filter::ymd_to_ms(dt.year as i64, dt.month as i64, dt.day as i64)
-        + (dt.hour as i64 * 3600 + dt.minute as i64 * 60 + dt.second as i64) * 1000
+    let seconds = i64::from(dt.hour)
+        .saturating_mul(3600)
+        .saturating_add(i64::from(dt.minute).saturating_mul(60))
+        .saturating_add(i64::from(dt.second));
+    crate::filter::ymd_to_ms(i64::from(dt.year), i64::from(dt.month), i64::from(dt.day))
+        .saturating_add(seconds.saturating_mul(1000))
 }
 
 // --- Images -----------------------------------------------------------------
@@ -239,24 +259,36 @@ pub fn image_hash(img: &image::DynamicImage) -> ImgHash {
     let n = IMG_GRID;
     let pixels = canonicalize_moments(gray_grid(img, n), n);
     let mut hash = [0u64; 8];
-    let mut bit = 0usize;
-    for y in 0..n - 1 {
-        for x in 0..n - 1 {
-            if pixels[y * n + x] > pixels[y * n + x + 1] {
-                hash[bit / 64] |= 1u64 << (bit % 64);
-            }
-            bit += 1;
-        }
-    }
-    for y in 0..n - 1 {
-        for x in 0..n - 1 {
-            if pixels[y * n + x] > pixels[(y + 1) * n + x] {
-                hash[bit / 64] |= 1u64 << (bit % 64);
-            }
-            bit += 1;
+    let bits = horizontal_bits(&pixels, n).chain(vertical_bits(&pixels, n));
+    for (bit, set) in bits.enumerate() {
+        if set && let Some(word) = hash.get_mut(bit / 64) {
+            *word |= 1u64 << (bit % 64);
         }
     }
     hash
+}
+
+/// One bit per horizontal neighbor pair (left brighter than right) of an
+/// `n`×`n` row-major grid, over its first `n - 1` rows, row by row.
+fn horizontal_bits(pixels: &[u8], n: usize) -> impl Iterator<Item = bool> + '_ {
+    pixels
+        .chunks(n.max(1))
+        .take(n.saturating_sub(1))
+        .flat_map(|row| row.windows(2).map(|pair| pair.first() > pair.get(1)))
+}
+
+/// One bit per vertical neighbor pair (top brighter than bottom) of an
+/// `n`×`n` row-major grid, over its first `n - 1` columns, row by row.
+fn vertical_bits(pixels: &[u8], n: usize) -> impl Iterator<Item = bool> + '_ {
+    let rows = pixels.chunks(n.max(1));
+    rows.clone()
+        .zip(rows.skip(1))
+        .flat_map(move |(top, bottom)| {
+            top.iter()
+                .zip(bottom)
+                .take(n.saturating_sub(1))
+                .map(|(upper, lower)| upper > lower)
+        })
 }
 
 /// 64-bit horizontal dHash of a 9×9 grid, canonicalized lexicographically;
@@ -265,17 +297,11 @@ pub fn image_hash(img: &image::DynamicImage) -> ImgHash {
 /// rescanned — do not change its semantics.
 pub fn dhash_from_image(img: &image::DynamicImage) -> u64 {
     let pixels = canonicalize_lex(gray_grid(img, 9), 9);
-    let mut hash = 0u64;
-    for y in 0..8 {
-        for x in 0..8 {
-            let left = pixels[y * 9 + x];
-            let right = pixels[y * 9 + (x + 1)];
-            if left > right {
-                hash |= 1u64 << (y * 8 + x);
-            }
-        }
-    }
-    hash
+    // Bit `y * 8 + x` is set when pixel (x, y) is brighter than its right neighbor.
+    horizontal_bits(&pixels, 9)
+        .zip(0..u64::BITS)
+        .filter(|&(set, _)| set)
+        .fold(0u64, |hash, (_, bit)| hash | 1u64 << bit)
 }
 
 /// `n`×`n` bilinear grayscale of `img`, row-major.
@@ -301,16 +327,16 @@ fn gray_grid(img: &image::DynamicImage, n: usize) -> Vec<u8> {
 /// odd `n` so the center is a cell.
 fn canonicalize_moments(img: Vec<u8>, n: usize) -> Vec<u8> {
     debug_assert!(n % 2 == 1);
-    let c = ((n - 1) / 2) as i64;
+    let c = (n.saturating_sub(1) / 2) as i64;
     let moment = |img: &[u8], horizontal: bool| -> i64 {
-        let mut m = 0i64;
-        for y in 0..n {
-            for x in 0..n {
-                let w = if horizontal { x as i64 } else { y as i64 } - c;
-                m += i64::from(img[y * n + x]) * w;
-            }
-        }
-        m
+        let cells = img.chunks(n.max(1)).enumerate().flat_map(|(y, row)| {
+            row.iter().enumerate().map(move |(x, &value)| {
+                let pos = if horizontal { x } else { y };
+                let w = (pos as i64).saturating_sub(c);
+                i64::from(value).saturating_mul(w)
+            })
+        });
+        cells.fold(0i64, i64::saturating_add)
     };
     let mut out = img;
     if moment(&out, true) > 0 {
@@ -348,44 +374,33 @@ fn canonicalize_lex(img: Vec<u8>, n: usize) -> Vec<u8> {
     best
 }
 
+/// Column `x` of an `n`×`n` row-major grid, top to bottom.
+fn column(img: &[u8], n: usize, x: usize) -> impl DoubleEndedIterator<Item = &u8> {
+    img.iter().skip(x).step_by(n.max(1))
+}
+
+/// Clockwise: the new row `x` is the old column `x`, bottom to top.
 fn rotate90(img: &[u8], n: usize) -> Vec<u8> {
-    let mut rotated = vec![0u8; n * n];
-    for y in 0..n {
-        for x in 0..n {
-            rotated[x * n + (n - 1 - y)] = img[y * n + x];
-        }
-    }
-    rotated
+    (0..n)
+        .flat_map(|x| column(img, n, x).rev())
+        .copied()
+        .collect()
 }
 
 fn flip_horizontal(img: &[u8], n: usize) -> Vec<u8> {
-    let mut flipped = vec![0u8; n * n];
-    for y in 0..n {
-        for x in 0..n {
-            flipped[y * n + (n - 1 - x)] = img[y * n + x];
-        }
-    }
-    flipped
+    img.chunks(n.max(1))
+        .flat_map(|row| row.iter().rev())
+        .copied()
+        .collect()
 }
 
 fn flip_vertical(img: &[u8], n: usize) -> Vec<u8> {
-    let mut flipped = vec![0u8; n * n];
-    for y in 0..n {
-        for x in 0..n {
-            flipped[(n - 1 - y) * n + x] = img[y * n + x];
-        }
-    }
-    flipped
+    img.chunks(n.max(1)).rev().flatten().copied().collect()
 }
 
+/// Transpose: the new row `x` is the old column `x`.
 fn flip_diagonal(img: &[u8], n: usize) -> Vec<u8> {
-    let mut flipped = vec![0u8; n * n];
-    for y in 0..n {
-        for x in 0..n {
-            flipped[x * n + y] = img[y * n + x];
-        }
-    }
-    flipped
+    (0..n).flat_map(|x| column(img, n, x)).copied().collect()
 }
 
 // --- Video ------------------------------------------------------------------
@@ -401,27 +416,29 @@ pub fn video_temporal_hash(path: &Path) -> Option<[ImgHash; 3]> {
         return None;
     }
     let mut hashes = [[0u64; 8]; 3];
-    for (i, pct) in [0.1, 0.5, 0.9].into_iter().enumerate() {
+    for (slot, pct) in hashes.iter_mut().zip([0.1, 0.5, 0.9]) {
         if let Some(frame) = extract_frame(path, duration * pct) {
-            hashes[i] = image_hash(&frame);
+            *slot = image_hash(&frame);
         }
     }
     Some(hashes)
 }
 
 fn probe_duration_secs(path: &Path) -> Option<f64> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(path)
-        .output()
-        .ok()?;
+    let output = crate::tool::run(
+        Command::new("ffprobe")
+            .args(crate::tool::LOCAL_ONLY)
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(crate::tool::path_arg(path)),
+        crate::tool::PROBE_DEADLINE,
+    )?;
     if !output.status.success() {
         return None;
     }
@@ -445,34 +462,38 @@ pub fn media_duration_secs(path: &Path) -> Option<f64> {
 /// as "no soundtrack to offer", the same graceful degradation video
 /// fingerprints have without ffmpeg.
 pub fn has_audio_track(path: &Path) -> bool {
-    let Ok(output) = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "a",
-            "-show_entries",
-            "stream=codec_type",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(path)
-        .output()
-    else {
+    let Some(output) = crate::tool::run(
+        Command::new("ffprobe")
+            .args(crate::tool::LOCAL_ONLY)
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(crate::tool::path_arg(path)),
+        crate::tool::PROBE_DEADLINE,
+    ) else {
         return false;
     };
     output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
 }
 
 fn extract_frame(path: &Path, at_secs: f64) -> Option<image::DynamicImage> {
-    let output = Command::new("ffmpeg")
-        .args(["-v", "error", "-ss"])
-        .arg(format!("{at_secs}"))
-        .arg("-i")
-        .arg(path)
-        .args(["-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"])
-        .output()
-        .ok()?;
+    let output = crate::tool::run(
+        Command::new("ffmpeg")
+            .args(["-v", "error", "-ss"])
+            .arg(format!("{at_secs}"))
+            .args(crate::tool::LOCAL_ONLY)
+            .arg("-i")
+            .arg(crate::tool::path_arg(path))
+            .args(["-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"]),
+        crate::tool::DECODE_DEADLINE,
+    )?;
     if !output.status.success() || output.stdout.is_empty() {
         return None;
     }
@@ -502,6 +523,15 @@ fn text_hash(text: &str) -> Option<[u8; 32]> {
 /// no text (empty, scanned, or encrypted). Reuses the same per-format extractors
 /// that back the dedup text-hash, so what groups two documents is what you read.
 pub fn extract_document_text(path: &Path, mime: &str) -> Option<String> {
+    // A parser panic on a malformed document means no text, not a crash.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        extract_document_text_unguarded(path, mime)
+    }))
+    .ok()
+    .flatten()
+}
+
+fn extract_document_text_unguarded(path: &Path, mime: &str) -> Option<String> {
     let text = if mime == "application/pdf" {
         pdf_text(path)?
     } else if mime == "application/vnd.ms-excel" {
@@ -524,9 +554,31 @@ pub fn is_extractable_document(mime: &str) -> bool {
     mime == "application/pdf" || is_office_doc(mime) || mime == "message/rfc822"
 }
 
+/// Documents larger than this get no text fingerprint and no text view: their
+/// parsers (PDF, xls, e-mail) read the whole file into memory first
+/// (docs/security/threat-model.md, threat 2). Their identity is still the
+/// content hash.
+const DOC_FILE_CAP: u64 = 256 * 1024 * 1024;
+
+/// Past this much XML in one office document part the document is skipped like
+/// an oversized one: a few kilobytes of zip can inflate to gigabytes.
+const DOC_PART_CAP: u64 = 64 * 1024 * 1024;
+
+/// `Some(())` when `path` is small enough for a whole-file document parser.
+fn within_doc_cap(path: &Path) -> Option<()> {
+    (std::fs::metadata(path).ok()?.len() <= DOC_FILE_CAP).then_some(())
+}
+
+/// The whole of `path`, or `None` past [`DOC_FILE_CAP`].
+fn read_doc(path: &Path) -> Option<Vec<u8>> {
+    within_doc_cap(path)?;
+    std::fs::read(path).ok()
+}
+
 /// The raw extracted text of a PDF, or `None` if it has none — the text half of
 /// [`pdf_text_hash`], shared with [`extract_document_text`].
 fn pdf_text(path: &Path) -> Option<String> {
+    within_doc_cap(path)?;
     let doc = lopdf::Document::load(path).ok()?;
     let pages: Vec<u32> = doc.get_pages().keys().copied().collect();
     doc.extract_text(&pages).ok()
@@ -590,21 +642,27 @@ fn zip_doc_text(path: &Path, mime: &str) -> Option<String> {
     let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).ok()?;
     let names: Vec<String> = archive
         .file_names()
+        .filter_map(Result::ok)
         .filter(|n| is_content_entry(n, mime))
-        .map(String::from)
+        .map(|n| n.into_owned())
         .collect();
 
     let mut out = String::new();
     for name in names {
         use std::io::Read;
         let mut xml = String::new();
+        // One byte past the cap tells "fits exactly" from "ran over".
         if archive
             .by_name(&name)
             .ok()?
+            .take(DOC_PART_CAP.saturating_add(1))
             .read_to_string(&mut xml)
             .is_err()
         {
             continue;
+        }
+        if xml.len() as u64 > DOC_PART_CAP {
+            return None;
         }
         let mut reader = quick_xml::Reader::from_str(&xml);
         let mut buf = Vec::new();
@@ -637,7 +695,7 @@ fn zip_doc_text(path: &Path, mime: &str) -> Option<String> {
 /// same mail exported twice dedups reliably), else a normalized subject+body
 /// digest. `None` if unparseable. mbox stores are out of scope here.
 pub fn eml_hash(path: &Path) -> Option<[u8; 32]> {
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = read_doc(path)?;
     let msg = mail_parser::MessageParser::default().parse(&bytes)?;
     let basis = match msg.message_id() {
         Some(id) => format!("message-id:{id}"),
@@ -653,7 +711,7 @@ pub fn eml_hash(path: &Path) -> Option<[u8; 32]> {
 /// The readable text of an `.eml` — its subject and body — for display. Distinct
 /// from [`eml_hash`], which keys on Message-ID for dedup identity.
 fn eml_text(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = read_doc(path)?;
     let msg = mail_parser::MessageParser::default().parse(&bytes)?;
     let subject = msg.subject().unwrap_or_default();
     let body = msg.body_text(0).unwrap_or_default();
@@ -688,6 +746,7 @@ pub fn text_file_hash(path: &Path) -> Option<[u8; 32]> {
 /// Concatenated cell text of a legacy `.xls` workbook, via calamine.
 fn xls_text(path: &Path) -> Option<String> {
     use calamine::Reader;
+    within_doc_cap(path)?;
     let mut workbook: calamine::Xls<_> = calamine::open_workbook(path).ok()?;
     let mut out = String::new();
     let sheets = workbook.sheet_names().to_vec();
@@ -838,17 +897,24 @@ fn decode_audio_prefix(path: &Path) -> Option<DecodedPrefix> {
                 break;
             }
             started = Some((rate, channels));
-            frames_left = u64::from(rate) * u64::from(AUDIO_FINGERPRINT_SECS);
+            frames_left = u64::from(rate).saturating_mul(u64::from(AUDIO_FINGERPRINT_SECS));
         }
         let frames = decoded.frames() as u64;
         let buf = match sample_buf.as_mut() {
-            Some(buf) if buf.capacity() >= decoded.capacity() * channels as usize => buf,
+            Some(buf) if buf.capacity() >= decoded.capacity().saturating_mul(channels as usize) => {
+                buf
+            }
             _ => sample_buf.insert(SampleBuffer::<i16>::new(decoded.capacity() as u64, spec)),
         };
         buf.copy_interleaved_ref(decoded);
         let take = frames.min(frames_left) as usize;
-        printer.consume(&buf.samples()[..take * channels as usize]);
-        frames_left -= take as u64;
+        let samples = buf.samples();
+        printer.consume(
+            samples
+                .get(..take.saturating_mul(channels as usize))
+                .unwrap_or(samples),
+        );
+        frames_left = frames_left.saturating_sub(take as u64);
         if frames_left == 0 {
             break;
         }
@@ -870,16 +936,18 @@ fn decode_audio_prefix(path: &Path) -> Option<DecodedPrefix> {
 /// route for codecs symphonia cannot decode. `None` when ffmpeg fails.
 fn ffmpeg_audio_fingerprint(path: &Path) -> Option<Vec<u32>> {
     const RATE: u32 = 11025;
-    let output = Command::new("ffmpeg")
-        .args(["-v", "error", "-t"])
-        .arg(AUDIO_FINGERPRINT_SECS.to_string())
-        .arg("-i")
-        .arg(path)
-        .args(["-vn", "-f", "s16le", "-ac", "1", "-ar"])
-        .arg(RATE.to_string())
-        .arg("-")
-        .output()
-        .ok()?;
+    let output = crate::tool::run(
+        Command::new("ffmpeg")
+            .args(["-v", "error", "-t"])
+            .arg(AUDIO_FINGERPRINT_SECS.to_string())
+            .args(crate::tool::LOCAL_ONLY)
+            .arg("-i")
+            .arg(crate::tool::path_arg(path))
+            .args(["-vn", "-f", "s16le", "-ac", "1", "-ar"])
+            .arg(RATE.to_string())
+            .arg("-"),
+        crate::tool::DECODE_DEADLINE,
+    )?;
     if !output.status.success() || output.stdout.len() < 2 {
         return None;
     }
@@ -1135,7 +1203,7 @@ mod tests {
         use std::io::Write;
         let file = std::fs::File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
-        let opts: zip::write::FileOptions<'_, ()> =
+        let opts: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         for (name, xml) in entries {
             zip.start_file(*name, opts).unwrap();
@@ -1145,6 +1213,62 @@ mod tests {
     }
 
     const DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+
+    /// A document part that inflates past the cap (a zip bomb dressed as a
+    /// .docx) yields no text, while the same document under the cap does.
+    #[test]
+    fn an_office_part_past_the_cap_yields_no_text() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let write_docx = |path: &std::path::Path, padding: usize| {
+            let file = std::fs::File::create(path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("word/document.xml", opts).unwrap();
+            zip.write_all(b"<w:document><w:t>Hello</w:t>").unwrap();
+            let spaces = vec![b' '; 1024 * 1024];
+            let mut left = padding;
+            while left > 0 {
+                let n = left.min(spaces.len());
+                zip.write_all(&spaces[..n]).unwrap();
+                left -= n;
+            }
+            zip.write_all(b"</w:document>").unwrap();
+            zip.finish().unwrap();
+        };
+        let small = dir.path().join("small.docx");
+        write_docx(&small, 1024);
+        assert_eq!(
+            zip_doc_text(&small, DOCX).as_deref().map(str::trim),
+            Some("Hello")
+        );
+        let bomb = dir.path().join("bomb.docx");
+        write_docx(&bomb, DOC_PART_CAP as usize);
+        assert_eq!(zip_doc_text(&bomb, DOCX), None);
+    }
+
+    /// A document over the whole-file cap is never read: a sparse file of the
+    /// cap's size passes, one byte more does not.
+    #[test]
+    fn documents_past_the_file_cap_are_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let at_cap = dir.path().join("at_cap.eml");
+        std::fs::File::create(&at_cap)
+            .unwrap()
+            .set_len(DOC_FILE_CAP)
+            .unwrap();
+        assert_eq!(within_doc_cap(&at_cap), Some(()));
+        let over = dir.path().join("over.eml");
+        std::fs::File::create(&over)
+            .unwrap()
+            .set_len(DOC_FILE_CAP + 1)
+            .unwrap();
+        assert_eq!(within_doc_cap(&over), None);
+        assert_eq!(read_doc(&over), None);
+        assert_eq!(eml_hash(&over), None);
+        assert_eq!(pdf_text(&over), None);
+    }
     const ODT: &str = "application/vnd.oasis.opendocument.text";
 
     /// The same text saved as .docx and .odt hashes identically (text identity,

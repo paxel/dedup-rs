@@ -58,7 +58,9 @@ pub struct DupeGroupKey {
 impl DupeGroupKey {
     /// Bytes reclaimable by keeping a single copy of this group.
     pub fn wasted_bytes(&self) -> u64 {
-        (u64::from(self.count) - 1) * self.size
+        u64::from(self.count)
+            .saturating_sub(1)
+            .saturating_mul(self.size)
     }
 }
 
@@ -105,15 +107,15 @@ pub fn load_groups(
     for key in keys {
         let mut seen: HashSet<PathBuf> = HashSet::new();
         let mut files: DupeGroup = Vec::new();
-        for (i, name) in repo_names.iter().enumerate() {
-            for rel in store::get_paths_by_size_hash(&dbs[i], key.size, &key.hash)? {
-                let abs = Path::new(&roots[i]).join(&rel);
+        for ((name, db), root) in repo_names.iter().zip(&dbs).zip(&roots) {
+            for rel in store::get_paths_by_size_hash(db, key.size, &key.hash)? {
+                let abs = Path::new(root).join(&rel);
                 if seen.insert(abs)
-                    && let Some(entry) = store::get_entry(&dbs[i], &rel)?
+                    && let Some(entry) = store::get_entry(db, &rel)?
                 {
                     files.push(DupeFile {
                         repo: name.clone(),
-                        repo_root: roots[i].clone(),
+                        repo_root: root.clone(),
                         rel_path: rel,
                         entry,
                     });
@@ -185,10 +187,10 @@ pub fn retain_matching_keys(
     let mut kept = Vec::with_capacity(keys.len());
     for (i, key) in keys.into_iter().enumerate() {
         let mut matched = false;
-        'members: for j in 0..dbs.len() {
-            for rel in store::get_paths_by_size_hash(&dbs[j], key.size, &key.hash)? {
-                if let Some(entry) = store::get_entry(&dbs[j], &rel)?
-                    && matchers[j].matches(&rel, &entry)
+        'members: for (db, matcher) in dbs.iter().zip(&matchers) {
+            for rel in store::get_paths_by_size_hash(db, key.size, &key.hash)? {
+                if let Some(entry) = store::get_entry(db, &rel)?
+                    && matcher.matches(&rel, &entry)
                 {
                     matched = true;
                     break 'members;
@@ -198,7 +200,7 @@ pub fn retain_matching_keys(
         if matched {
             kept.push(key);
         }
-        progress(i + 1);
+        progress(i.saturating_add(1));
     }
     Ok(kept)
 }
@@ -269,7 +271,7 @@ pub fn wasted_bytes(group: &DupeGroup) -> u64 {
 fn image_area(entry: &FileEntry) -> i64 {
     entry
         .img_size
-        .map(|(w, h)| i64::from(w) * i64::from(h))
+        .map(|(w, h)| i64::from(w).saturating_mul(i64::from(h)))
         .unwrap_or(-1)
 }
 
@@ -405,13 +407,13 @@ pub fn delete_files(store: &Store, files: &[&DupeFile]) -> Result<DupeDeleteStat
         }
         match std::fs::remove_file(&path) {
             Ok(()) => {
-                stats.deleted += 1;
+                stats.deleted = stats.deleted.saturating_add(1);
                 deleted_per_repo
                     .entry(file.repo.as_str())
                     .or_default()
                     .push(file.rel_path.as_str());
             }
-            Err(_) => stats.errors += 1,
+            Err(_) => stats.errors = stats.errors.saturating_add(1),
         }
     }
 
@@ -449,7 +451,7 @@ pub fn delete_paths(
         }
         match std::fs::remove_file(&path) {
             Ok(()) => {
-                stats.deleted += 1;
+                stats.deleted = stats.deleted.saturating_add(1);
                 stats.removed.push((repo.clone(), rel.clone()));
                 deleted_per_repo
                     .entry(repo.as_str())
@@ -457,7 +459,7 @@ pub fn delete_paths(
                     .push(rel.as_str());
             }
             Err(e) => {
-                stats.errors += 1;
+                stats.errors = stats.errors.saturating_add(1);
                 stats
                     .failed
                     .push((repo.clone(), rel.clone(), e.to_string()));

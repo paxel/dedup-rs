@@ -83,28 +83,58 @@ pub fn best_date_ms(entry: &FileEntry) -> i64 {
 /// Convert a civil date to epoch milliseconds (treated as UTC). Howard
 /// Hinnant's days-from-civil algorithm.
 pub fn ymd_to_ms(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    (era * 146097 + doe - 719468) * 86400 * 1000
+    // Saturating throughout: a real date never comes near the limits, and an
+    // absurd year from a filter string must not panic.
+    let y = if m <= 2 { y.saturating_sub(1) } else { y };
+    let era = if y >= 0 { y } else { y.saturating_sub(399) } / 400;
+    let yoe = y.saturating_sub(era.saturating_mul(400));
+    let mp = if m > 2 {
+        m.saturating_sub(3)
+    } else {
+        m.saturating_add(9)
+    };
+    let doy = (mp.saturating_mul(153).saturating_add(2) / 5)
+        .saturating_add(d)
+        .saturating_sub(1);
+    let doe = yoe
+        .saturating_mul(365)
+        .saturating_add(yoe / 4)
+        .saturating_sub(yoe / 100)
+        .saturating_add(doy);
+    era.saturating_mul(146097)
+        .saturating_add(doe)
+        .saturating_sub(719468)
+        .saturating_mul(86_400_000)
 }
 
 /// Convert epoch milliseconds (as UTC) to a civil `(year, month, day)`.
 /// Inverse of [`ymd_to_ms`] (Howard Hinnant's civil-from-days).
 pub fn ms_to_ymd(ms: i64) -> (i64, u32, u32) {
     let days = ms.div_euclid(86_400_000);
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
+    let z = days.saturating_add(719468);
+    let era = if z >= 0 { z } else { z.saturating_sub(146096) } / 146097;
+    let doe = z.saturating_sub(era.saturating_mul(146097));
+    let yoe = doe
+        .saturating_sub(doe / 1460)
+        .saturating_add(doe / 36524)
+        .saturating_sub(doe / 146096)
+        / 365;
+    let y = yoe.saturating_add(era.saturating_mul(400));
+    let doy = doe.saturating_sub(
+        yoe.saturating_mul(365)
+            .saturating_add(yoe / 4)
+            .saturating_sub(yoe / 100),
+    );
+    let mp = doy.saturating_mul(5).saturating_add(2) / 153;
+    let d = doy
+        .saturating_sub(mp.saturating_mul(153).saturating_add(2) / 5)
+        .saturating_add(1);
+    let m = if mp < 10 {
+        mp.saturating_add(3)
+    } else {
+        mp.saturating_sub(9)
+    };
+    let y = if m <= 2 { y.saturating_add(1) } else { y };
     (y, m as u32, d as u32)
 }
 
@@ -119,18 +149,21 @@ fn parse_date_span(s: &str) -> Option<(i64, i64)> {
         return None;
     }
     match (month, day) {
-        (None, _) => Some((ymd_to_ms(year, 1, 1), ymd_to_ms(year + 1, 1, 1))),
+        (None, _) => Some((
+            ymd_to_ms(year, 1, 1),
+            ymd_to_ms(year.saturating_add(1), 1, 1),
+        )),
         (Some(m), None) if (1..=12).contains(&m) => {
             let (ny, nm) = if m == 12 {
-                (year + 1, 1)
+                (year.saturating_add(1), 1)
             } else {
-                (year, m + 1)
+                (year, m.saturating_add(1))
             };
             Some((ymd_to_ms(year, m, 1), ymd_to_ms(ny, nm, 1)))
         }
         (Some(m), Some(d)) if (1..=12).contains(&m) && (1..=31).contains(&d) => {
             let start = ymd_to_ms(year, m, d);
-            Some((start, start + 86_400_000))
+            Some((start, start.saturating_add(86_400_000)))
         }
         _ => None,
     }
@@ -230,17 +263,15 @@ impl FileFilter {
             "after:",
             "case:",
         ];
-        let bytes = filter.as_bytes();
         let mut starts: Vec<usize> = Vec::new();
-        for i in 0..filter.len() {
-            if !filter.is_char_boundary(i) {
-                continue;
-            }
-            let at_boundary = i == 0 || bytes[i - 1].is_ascii_whitespace();
+        let mut previous: Option<char> = None;
+        for (i, c) in filter.char_indices() {
+            let at_boundary = previous.is_none_or(|p| p.is_ascii_whitespace());
+            previous = Some(c);
             // A group may open with `!` to negate it, so `!name:x` starts a group
             // exactly where `name:x` would. The `!` is therefore only meaningful
             // here, at a group boundary — inside a value it is ordinary text.
-            let rest = &filter[i..];
+            let rest = filter.get(i..).unwrap_or_default();
             let opens_group = PREFIXES.iter().any(|p| rest.starts_with(p))
                 || rest
                     .strip_prefix('!')
@@ -254,8 +285,11 @@ impl FileFilter {
         }
         let mut groups = Vec::with_capacity(starts.len());
         for (k, &start) in starts.iter().enumerate() {
-            let end = starts.get(k + 1).copied().unwrap_or(filter.len());
-            groups.push(filter[start..end].trim());
+            let end = starts
+                .get(k.saturating_add(1))
+                .copied()
+                .unwrap_or(filter.len());
+            groups.push(filter.get(start..end).unwrap_or_default().trim());
         }
         groups
     }
@@ -512,13 +546,13 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
         if seg.is_empty() {
             continue;
         }
-        if i + 1 == tail.len() {
+        if i.saturating_add(1) == tail.len() {
             // Last segment (pattern didn't end with '*'): must be a suffix.
             return rest.ends_with(seg);
         }
         // A middle segment: find its next occurrence and advance past it.
-        match rest.find(seg) {
-            Some(pos) => rest = &rest[pos + seg.len()..],
+        match rest.split_once(seg) {
+            Some((_, after)) => rest = after,
             None => return false,
         }
     }
@@ -533,7 +567,7 @@ pub fn count_matches(db: &redb::Database, filter: &FileFilter) -> Result<usize, 
     let mut count = 0usize;
     for_each_file_entry(db, |rel_path, entry| {
         if !entry.missing && annotated.matches(rel_path, &entry) {
-            count += 1;
+            count = count.saturating_add(1);
         }
         Ok(())
     })?;

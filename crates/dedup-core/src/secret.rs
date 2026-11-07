@@ -32,7 +32,7 @@ pub fn encrypt(passphrase: &str, plaintext: &str) -> Option<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new((&key).into());
     let nonce = XNonce::from_slice(&nonce_bytes);
     let ct = cipher.encrypt(nonce, plaintext.as_bytes()).ok()?;
-    let mut blob = Vec::with_capacity(SALT_LEN + NONCE_LEN + ct.len());
+    let mut blob = Vec::with_capacity((SALT_LEN + NONCE_LEN).saturating_add(ct.len()));
     blob.extend_from_slice(&salt);
     blob.extend_from_slice(&nonce_bytes);
     blob.extend_from_slice(&ct);
@@ -43,12 +43,8 @@ pub fn encrypt(passphrase: &str, plaintext: &str) -> Option<Vec<u8>> {
 /// corrupt/truncated blob — authentication makes the two indistinguishable,
 /// which is the point.
 pub fn decrypt(passphrase: &str, blob: &[u8]) -> Option<String> {
-    if blob.len() < SALT_LEN + NONCE_LEN {
-        return None;
-    }
-    let salt = &blob[..SALT_LEN];
-    let nonce_bytes = &blob[SALT_LEN..SALT_LEN + NONCE_LEN];
-    let ct = &blob[SALT_LEN + NONCE_LEN..];
+    let (salt, rest) = blob.split_at_checked(SALT_LEN)?;
+    let (nonce_bytes, ct) = rest.split_at_checked(NONCE_LEN)?;
     let key = derive_key(passphrase, salt)?;
     let cipher = XChaCha20Poly1305::new((&key).into());
     let nonce = XNonce::from_slice(nonce_bytes);

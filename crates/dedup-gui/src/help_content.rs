@@ -1,53 +1,56 @@
-//! Per-tab copy shown in the HELP window (see [`crate::app::DedupApp`]'s HELP
-//! button): what the current tab is for and how its controls fit together.
+//! Per-screen copy shown in the HELP window (see [`crate::app::DedupApp`]'s
+//! HELP button): what the current screen is for and how its controls fit
+//! together.
 
-use crate::app::Tab;
+use crate::app::{Body, Screen};
 
-/// The help text for `tab`.
-pub fn help_text(tab: Tab) -> &'static str {
-    match tab {
-        Tab::Repositories => REPOSITORIES,
-        Tab::Duplicates => DUPLICATES,
-        Tab::Transfer => TRANSFER,
-        Tab::Grooming => GROOMING,
-        Tab::Browse => BROWSE,
+/// The help text for `screen`.
+pub fn help_text(screen: Screen) -> &'static str {
+    match screen {
+        Screen::Start => START,
+        Screen::Body(Body::Duplicates) => DUPLICATES,
+        Screen::Body(Body::Transfer) => TRANSFER,
+        Screen::Body(Body::Grooming) => GROOMING,
+        Screen::Body(Body::Browse) => BROWSE,
     }
 }
 
-const REPOSITORIES: &str = "\
-Register the folders you want to triage — each becomes a repository: a named folder \
-tracked by its own index of file contents.
+const START: &str = "\
+The start page is where everything begins: your repositories as cards on the left, the \
+commands on the right.
 
-Add a repository with ADD REPOSITORY, or simply drag folders from your file manager and \
-drop them anywhere onto the window. After adding files or changing a folder's contents, \
-run UPDATE ALL so the indexes match the disk again — it scans every repository one after \
-another in the activity window, each on its own row with its progress, and ends on one \
-report; repositories that are already up to date finish almost instantly. REFRESH STATUS \
-re-checks each repository's reachability, without changing anything.
+A repository is a named folder on disk, tracked by its own index of file contents. Add one \
+with ADD REPOSITORY, or drag folders from your file manager and drop them anywhere onto \
+the window. Each card shows the repository's path, its FILES, SIZE, MISSING and SCANNED \
+stats, status pills (LOCAL / REMOTE / OFFLINE / MISSING for reachability, UP TO DATE / \
+UPDATE REQUIRED from the last CHECK) and its padlock: every repository starts locked each \
+launch, and while it is locked nothing in the app deletes or overwrites its files. A backup \
+group — a main and the backups it is pushed to — is framed together; SELECT GROUP inside \
+the frame selects all of its members at once.
 
-Each card shows FILES, SIZE, MISSING and SCANNED stats, plus \
-status pills: LOCAL / REMOTE / OFFLINE / MISSING for reachability, and UP TO DATE / UPDATE \
-REQUIRED from the last CHECK.
+Click a card's name to select or deselect it; ALL, LOCAL and NONE change the whole \
+selection. The command list beside the cards is always complete and always in the same \
+order: INVESTIGATE (browse, find duplicates or similar files, diff, check), MAINTAIN \
+(update, prune, reorganize, and the repository's own rename, relocate, clone, remove, \
+remote flag and group membership), MOVE (copy, move, sync, mirror, group sync) and CLEAN \
+(dedupe against, purge by filter, empty directories). A command the selection does not \
+allow is greyed, and hovering it says why — one repository needed, two, a backup group, \
+or a locked repository.
 
-Per-repository actions: UPDATE / SCAN (hash new/changed files) and CHECK (dry-run, no \
-writes) run in the activity window with CANCEL; RENAME (registry name only, the on-disk \
-folder isn't moved), RELOCATE (point at a different folder, keep the index), DUPLICATE \
-(clone the whole index into a new repository at a new path), and DELETE (remove the \
-registry entry and its index — the on-disk files are never touched) each answer with a \
-notification card.";
+A command that scans runs in the activity window. A command that edits a repository \
+opens its editor on the card. Every other command opens its own body under a header \
+strip that names the selection and the command; the START bar on the strip returns \
+here with the selection kept.";
 
 const DUPLICATES: &str = "\
 Find exact or perceptually similar duplicates across one or more repositories, review them \
 with real previews, and delete the worse copies.
 
-The tab asks top to bottom: WHAT (DUPLICATES or SIMILAR FILES — SIMILAR shows its \
-threshold slider beside the chip; QUICK DELETE sits on the same row), then WITH WHICH \
-(the repository chips, once a mode is chosen), then HOW (the FILTER and FIND, once a \
-repository is included). After a FIND the three fold shut and only their header bars \
-remain; click one to flip that section open again — the other two stay folded.
-
-Click a repo chip's name to include or exclude it from the next FIND; click its padlock to \
-protect it from deletion — locked files are never preselected or auto-resolved.
+You arrive from the start page with the repositories already chosen and the mode set: WHAT \
+(DUPLICATES or SIMILAR FILES, with QUICK DELETE on the same row) sits folded — click its \
+header to flip it open — and HOW holds the FILTER and FIND. START on the header strip \
+returns to the start page with the selection kept; a locked repository's files are never \
+preselected or auto-resolved.
 
 DUPLICATES mode finds exact, byte-for-byte matches (same size + hash). SIMILAR mode finds \
 perceptually similar images, videos and audio — lower threshold catches more, and riskier, \
@@ -55,7 +58,7 @@ matches. FIND runs in the activity window, which shows each phase and its progre
 CANCEL, blocks the rest of the app meanwhile, and ends as the result report.
 
 Results are shown a page of groups at a time. Each file can be toggled KEEP / DELETE; the \
-best copy is starred. AUTO-RESOLVE REST marks every non-best copy at once. DELETE MARKED \
+best copy is starred. AUTO-RESOLVE REST marks every non-best copy at once. APPLY MARKED \
 runs the delete and the search that follows in the activity window, behind a confirmation \
 — or turn on QUICK DELETE to skip confirmation per group; each DELETE NOW is answered by a \
 notification card, and every deleted file is written to the event log (LOG, top right).
@@ -70,10 +73,11 @@ const TRANSFER: &str = "\
 Copy, move, or sync files between two repositories by content (size + hash — paths never \
 matter), with an assisted filter and a preview before anything runs.
 
-The tab asks its questions in order: WHAT (the command), WITH WHICH (SOURCE and TARGET, side \
-by side), HOW (destination, options, filter), then RUN. Each section appears once the one \
-above it is answered, and after REVIEW or RUN they fold to their header bars — click one \
-to flip that section open again.
+You arrive from the start page with the repositories and their roles already chosen: WHAT \
+(the command) sits folded — click its header to switch — then HOW (destination, options, \
+filter), then PREVIEW and APPLY ALL. After PREVIEW or APPLY ALL the sections fold to their \
+header bars; click one to flip it open again. START on the header strip returns to the start \
+page with the selection kept.
 
 Pick a SOURCE and a TARGET repo, optionally add DUPEPOOL repositories — a source file only \
 counts as new when none of the target or the extra references already has its content.
@@ -84,13 +88,13 @@ the same relative path, and can also delete target files whose content the sourc
 (DELETE MISSING).
 
 GROUP SYNC replaces the single TARGET with a SINKS picker, and only appears when the SOURCE \
-is a backup group's main (groups are created on the Repositories tab). Each sink pushes in \
+is a backup group's main (groups are created on the start page). Each sink pushes in \
 its own stored mode: ADD ONLY copies content it lacks and never deletes, so a sink may keep \
 files the main no longer has; APPLY CHANGES also deletes sink content the main itself \
 deleted, so the sink follows the main's edits while keeping what the main never had; MIRROR \
 deletes all sink content the main does not have, so it ends up holding exactly the main's \
-content — deletions cannot be undone. REVIEW plans every selected sink and shows what would \
-be copied and deleted, without touching disk; RUN asks for confirmation — naming the sink \
+content — deletions cannot be undone. PREVIEW plans every selected sink and shows what would \
+be copied and deleted, without touching disk; APPLY ALL asks for confirmation — naming the sink \
 count and any sink a push would empty entirely — then pushes in the activity window. Sinks \
 are handled independently, so one unreachable backup drive does not stop the others, and \
 the main is never changed. GROUP SYNC BACK pulls one sink's changes back into the main.
@@ -107,17 +111,18 @@ values highlighted — and the same actions per side. Nothing happens until you 
 button; rows that are equal on both sides are hidden until you ask for them.
 
 Use the FILTER wizard to narrow which files are considered — conditions combine with \
-AND. REVIEW plans in the activity window and shows the matching transfers, paged, plus a \
-total count, without touching disk. RUN asks for confirmation, then performs the transfer \
+AND. PREVIEW plans in the activity window and shows the matching transfers, paged, plus a \
+total count, without touching disk. APPLY ALL asks for confirmation, then performs the transfer \
 in the activity window — each file as it goes, every problem, and CANCEL — and ends on the \
 result report. A row's COPY, DELETE, RENAME, OVERWRITE or APPLY answers with a notification \
 card, and every file changed is in the event log behind the LOG button.";
 
 const GROOMING: &str = "\
-Prune and reorganize a single repository. The tab asks its questions in order: WHAT (the \
-tool), WITH WHICH (the repository, plus the dupe pool for DEDUPE), HOW (the filter or the \
-rules), then RUN. Each section appears once the one above it is answered, and after REVIEW \
-or RUN they fold to their header bars — click one to flip that section open again.
+Prune and reorganize a single repository. You arrive from the start page with the \
+repository (and DEDUPE's source and pool) already chosen: WHAT (the tool) sits folded — click \
+its header to switch — then HOW (the filter or the rules), then PREVIEW and APPLY ALL. After \
+PREVIEW or APPLY ALL the sections fold to their header bars; click one to flip it open again. \
+START on the header strip returns to the start page with the selection kept.
 
 DEDUPE deletes files in a source repo whose content also exists in any selected dupe-pool \
 repo. PURGE deletes everything matching a filter — it requires at least one filter \
@@ -148,14 +153,16 @@ never outside it.
 Save the current rule list as a preset with STORE PRESET, to reuse on any repo; right-click a \
 preset to rename it.
 
-Every destructive command runs behind a REVIEW and a confirmation dialog. REVIEW plans in \
-the activity window and fills the board; RUN performs the plan in the activity window — \
+Every command previews before it applies. PREVIEW plans in \
+the activity window and fills the board; APPLY ALL performs the plan in the activity window — \
 each file as it goes, every problem, and CANCEL — and ends on the result report. A row's \
 APPLY answers with a notification card, and every file changed is in the event log behind \
 the LOG button.";
 
 const BROWSE: &str = "\
-Browse one repository folder by folder — subfolders on the left, files in the middle.
+Browse the repository chosen on the start page folder by folder — subfolders on the left, \
+files on the board in the middle, the preview dock below. START on the header strip returns \
+to the start page.
 
 Select a file to preview it in the dock below: images and videos get a thumbnail, audio a \
 waveform or spectrogram (switchable) beside its ID3 tags, text a scrollable view, and \

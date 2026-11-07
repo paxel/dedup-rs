@@ -1,19 +1,21 @@
-# Transfer tab
+# Transfer
 
-![Transfer tab](../screenshots/files_tab.png)
+![Transfer: a COPY preview on the board](../screenshots/files_tab.png)
 
 Copy, move, or delete files between repositories by content (size + BLAKE3 — paths never
 matter), with an assisted filter builder and a review before anything runs. This is the GUI
 equivalent of [`diff cp`/`mv`/`rm`](../cli.md#diff).
 
-## Reading order
+## Getting here
 
-The tab asks its questions top to bottom: **WHAT** (the command), **WITH WHICH** (the
-repositories), **HOW** (destination, options, filter) and only then **RUN**. Each section
-appears once the one above it has an answer — a fresh tab shows only the command chips — and
-keeps its answer when an earlier one changes unless that change makes it invalid (picking a
-new source drops a target that is now the same repo). Once REVIEW or RUN starts, the sections
-fold into one summary line above the board; **CHANGE** unfolds them.
+Select the repositories on the [start page](start-page.md) — one for a folder export, two
+for a repository-to-repository command, a backup group for GROUP SYNC — and pick **COPY**,
+**MOVE**, **SYNC**, **MIRROR**, **DIFF**, **GROUP SYNC** or **GROUP SYNC BACK**. A pair asks
+which repository is the source (**FROM**), then **GO**; a group needs no roles. The header
+strip names the selection, the command and the roles; **START** returns to the start page
+with the selection kept. Inside, the body shows **WHAT** (the command, folded — open it to
+switch), then **HOW** (destination, options, filter), then **PREVIEW** and **APPLY ALL**.
+Once PREVIEW starts, the sections above fold to their header bars; click one to open it.
 
 ## What: the command
 
@@ -113,8 +115,8 @@ repository it changed, and writes a line to the event log (**LOG**). If somethin
 running the card says so instead, and nothing happens.
 
 **Clicking a row** opens the two versions side by side over the whole window, in the same
-shared viewer every surface opens — so what you get depends on the file type, not on which tab
-you happen to be in. The [viewer](duplicates.md#the-viewer-lightbox) is tabbed by
+shared viewer every surface opens — so what you get depends on the file type, not on which
+command you came from. The [viewer](duplicates.md#the-viewer-lightbox) is tabbed by
 representation: two images compare as pictures (wheel-zoom, drag-pan, Space to flicker), two
 videos as aligned filmstrips with a shared playhead, two audio files as spectrograms with
 gapless A/B playback, two documents as line-aligned extracted text, and any two files as an
@@ -133,17 +135,17 @@ side offers several names, RENAME asks which name to take. After every action th
 re-compares the two repos, so the row's commands always reflect the current state.
 
 Equal rows are hidden until **SHOW UNCHANGED** is pressed, and each action is applied to disk
-and to both repo indexes immediately — there is no RUN button and no batch confirmation.
-**HIDE** parks a row you have decided to leave alone; it comes back on the next REVIEW. The
-comparison itself (REVIEW) reads both indexes in the activity window, which closes by itself
+and to both repo indexes immediately — there is no APPLY ALL button and no batch confirmation.
+**HIDE** parks a row you have decided to leave alone; it comes back on the next PREVIEW. The
+comparison itself (PREVIEW) reads both indexes in the activity window, which closes by itself
 when the board is ready.
 
 ## Group sync
 
 Keep a repository backed up to one or more others, without the manual "duplicate the repo,
 relocate the copy, rescan it" dance. Groups themselves (creating one, adding/removing sinks,
-setting each sink's mode) are managed on the [Repositories tab](repositories.md#sync-groups);
-this tab is where a group is actually *pushed*.
+setting each sink's mode) are managed on the [start page](start-page.md#backup-groups);
+GROUP SYNC is where a group is actually *pushed*.
 
 ![GROUP SYNC selected: TARGET hidden, SINKS shown](../screenshots/transfer_group_sync.png)
 
@@ -156,9 +158,9 @@ lacks and never deletes, so a sink may keep files the main no longer has; **MIRR
 deletes sink content the main does not have, so it ends up holding exactly the main's
 content — those deletions cannot be undone.
 
-**REVIEW** and **RUN** work as they do for every other command: REVIEW plans every selected
+**PREVIEW** and **APPLY ALL** work as they do for every other command: PREVIEW plans every selected
 sink and shows what would be copied and deleted, without touching disk — each row naming the
-sink it belongs to. A group push is all-or-nothing, so these rows carry no per-row commands; RUN asks for
+sink it belongs to. A group push is all-or-nothing, so these rows carry no per-row commands; APPLY ALL asks for
 confirmation — naming the sink count and, for a MIRROR push, any sink it would empty
 entirely — then pushes in the activity window, sink by sink and file by file, with CANCEL.
 Sinks are handled independently, so one unreachable backup drive does not stop the others,
@@ -174,9 +176,9 @@ main; you pick **one sink** to reconcile.
 
 ![GROUP SYNC BACK: a green new-file row and a blue resurrection row](../screenshots/group_sync_back.png)
 
-REVIEW sorts the sink's files against the main into three kinds:
+PREVIEW sorts the sink's files against the main into three kinds:
 
-- **New** (green) — content the main never had. These are your direct edits. **RUN** promotes
+- **New** (green) — content the main never had. These are your direct edits. **APPLY ALL** promotes
   them all into the main in one batch.
 - **Resurrection** (blue) — content the main once had and **deleted**, that the sink still
   holds. These are **never** promoted by the batch — resurrecting a file undoes a deletion, and
@@ -202,11 +204,11 @@ GROUP SYNC BACK *before* you push again.
 
 ## Review and run
 
-The RUN section appears once the command has everything it needs — a source and a target,
-folder or sink. **REVIEW** and **RUN** are the two run buttons; everything above them is a
+The APPLY ALL section appears once the command has everything it needs — a source and a target,
+folder or sink. **PREVIEW** and **APPLY ALL** are the two run buttons; everything above them is a
 selection.
 
-- **REVIEW** plans the transfer in the [activity window](index.md#the-activity-window) —
+- **PREVIEW** plans the transfer in the [activity window](index.md#the-activity-window) —
   "reading 'source'", "reading 'target'", "pairing files" with a percentage — and, when the
   plan is ready, closes by itself and shows every planned transfer and a total count on the
   shared [review board](index.md#the-review-board), without touching disk.
@@ -217,15 +219,15 @@ selection.
   lines — hover the small cell to read the whole preview) and the file's size, dimensions or
   duration, and date — the same info as a Duplicate card. Per row, **APPLY** runs just that
   transfer now as a quick action — a notification card names the file once it has landed,
-  and the board refreshes — and **HIDE** drops it from the board and from what RUN will do.
+  and the board refreshes — and **HIDE** drops it from the board and from what APPLY ALL will do.
   Starting a run clears the review.
-- **RUN** plans first (so the confirmation can state the real count), asks for confirmation,
+- **APPLY ALL** plans first (so the confirmation can state the real count), asks for confirmation,
   then runs the command in the activity window: it names the file being copied, moved or
   deleted, counts up to the total, lists each problem as it occurs, and offers **CANCEL** —
   files already transferred or deleted before cancelling stay as they are; this doesn't roll
   back, it just stops further work. When the run ends the same window shows the result
   report, and every file it changed is in the event log (**LOG**, top right). Only one
-  operation runs at a time: a second REVIEW or RUN while one is up is refused with a card
+  operation runs at a time: a second PREVIEW or APPLY ALL while one is up is refused with a card
   that names what is still running.
 - Both repos' indexes are kept in sync as a run proceeds: COPY/MOVE record each transferred
   file in the target's index (with its real on-disk mtime, plus provenance — which repo it

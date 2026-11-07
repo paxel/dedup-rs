@@ -618,16 +618,16 @@ fn deserialize_value<'a, T: Deserialize<'a>>(
     schema_ver: u8,
     bytes: &'a [u8],
 ) -> Result<T, StoreError> {
-    if bytes.is_empty() {
+    let Some((&found, payload)) = bytes.split_first() else {
         return Err(StoreError::Deserialization("Empty bytes".to_string()));
-    }
-    if bytes[0] != schema_ver {
+    };
+    if found != schema_ver {
         return Err(StoreError::SchemaVersionMismatch {
             expected: schema_ver,
-            found: bytes[0],
+            found,
         });
     }
-    postcard::from_bytes(&bytes[1..]).map_err(|e| StoreError::Deserialization(e.to_string()))
+    postcard::from_bytes(payload).map_err(|e| StoreError::Deserialization(e.to_string()))
 }
 
 /// Decode a stored [`FileEntry`] value, returning it with its version byte.
@@ -1612,15 +1612,15 @@ impl Store {
 
             // Union every cursor sitting on the min key, deduping by abs path.
             let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-            for i in 0..heads.len() {
-                let on_min = matches!(&heads[i], Some((s, h, _)) if *s == msize && *h == mhash);
+            for ((head, it), root) in heads.iter_mut().zip(iters.iter_mut()).zip(&roots) {
+                let on_min = matches!(head, Some((s, h, _)) if *s == msize && *h == mhash);
                 if on_min {
-                    if let Some((_, _, members)) = &heads[i] {
-                        for rel in members {
-                            seen.insert(std::path::Path::new(&roots[i]).join(rel));
+                    if let Some((_, _, members)) = head {
+                        for rel in members.iter() {
+                            seen.insert(std::path::Path::new(root).join(rel));
                         }
                     }
-                    heads[i] = pull!(iters[i]);
+                    *head = pull!(it);
                 }
             }
 
@@ -1707,7 +1707,8 @@ impl<'txn> RepoTables<'txn> {
                 if count <= 1 {
                     self.mime_stats.remove(mime.as_str())?;
                 } else {
-                    self.mime_stats.insert(mime.as_str(), count - 1)?;
+                    self.mime_stats
+                        .insert(mime.as_str(), count.saturating_sub(1))?;
                 }
             }
         } else {
@@ -1732,7 +1733,8 @@ impl<'txn> RepoTables<'txn> {
                     .get(mime.as_str())?
                     .map(|v| v.value())
                     .unwrap_or(0);
-                self.mime_stats.insert(mime.as_str(), count + 1)?;
+                self.mime_stats
+                    .insert(mime.as_str(), count.saturating_add(1))?;
             }
         } else {
             self.bump_meta("missing_count", 1)?;

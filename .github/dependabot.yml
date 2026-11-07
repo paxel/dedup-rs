@@ -1,0 +1,17 @@
+# Every third-party action is pinned to a full commit SHA with its version in a
+# comment; Dependabot moves the SHA and the comment together, weekly.
+#
+# Cargo: no routine version updates (open-pull-requests-limit 0). Dependabot
+# security updates still open a pull request for a dependency with a published
+# advisory and a fixed version (docs/adr/0005-security-hardening.md).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0

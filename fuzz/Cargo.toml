@@ -1,0 +1,33 @@
+# Fuzz targets for the parsers dedup runs on untrusted files
+# (docs/security/threat-model.md, threat 6). Not part of the workspace: it needs
+# nightly and cargo-fuzz. Run: cargo fuzz run <target> (from this directory).
+[package]
+name = "dedup-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tempfile = "3.10"
+dedup-rs-core = { path = "../crates/dedup-core" }
+
+[[bin]]
+name = "fingerprint"
+path = "fuzz_targets/fingerprint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive"
+path = "fuzz_targets/archive.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone: the root workspace lists its members explicitly.
+[workspace]

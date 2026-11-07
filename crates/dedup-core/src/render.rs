@@ -28,15 +28,14 @@ pub fn pdftoppm_available() -> bool {
 /// gracefully (the Render tab just doesn't appear).
 pub fn render_pdf_pages(pdf: &Path, out_dir: &Path) -> Vec<PathBuf> {
     let prefix = out_dir.join("page");
-    let ok = Command::new("pdftoppm")
-        .args(["-png", "-r", "150"])
-        .arg(pdf)
-        .arg(&prefix)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let ok = crate::tool::run(
+        Command::new("pdftoppm")
+            .args(["-png", "-r", "150"])
+            .arg(crate::tool::path_arg(pdf))
+            .arg(crate::tool::path_arg(&prefix)),
+        crate::tool::EXTRACT_DEADLINE,
+    )
+    .is_some_and(|o| o.status.success());
     if !ok {
         return Vec::new();
     }
@@ -61,15 +60,14 @@ pub fn render_pdf_pages(pdf: &Path, out_dir: &Path) -> Vec<PathBuf> {
 pub fn render_pdf_page(pdf: &Path, out_dir: &Path, page: usize) -> Option<PathBuf> {
     let prefix = out_dir.join("page");
     let n = page.max(1).to_string();
-    let ok = Command::new("pdftoppm")
-        .args(["-png", "-r", "150", "-f", &n, "-l", &n, "-singlefile"])
-        .arg(pdf)
-        .arg(&prefix)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let ok = crate::tool::run(
+        Command::new("pdftoppm")
+            .args(["-png", "-r", "150", "-f", &n, "-l", &n, "-singlefile"])
+            .arg(crate::tool::path_arg(pdf))
+            .arg(crate::tool::path_arg(&prefix)),
+        crate::tool::DECODE_DEADLINE,
+    )
+    .is_some_and(|o| o.status.success());
     if !ok {
         return None;
     }
@@ -136,17 +134,17 @@ pub fn convert_to_pdf(doc: &Path, out_dir: &Path) -> Option<PathBuf> {
             "pdf",
             "--outdir",
         ])
-        .arg(out_dir)
-        .arg(doc)
+        .arg(crate::tool::path_arg(out_dir))
+        .arg(crate::tool::path_arg(doc))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let started = Instant::now();
     let ok = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.success(),
-            Ok(None) if Instant::now() < deadline => {
+            Ok(None) if started.elapsed() < Duration::from_secs(60) => {
                 std::thread::sleep(Duration::from_millis(100));
             }
             _ => {
@@ -168,11 +166,10 @@ pub fn convert_to_pdf(doc: &Path, out_dir: &Path) -> Option<PathBuf> {
 /// readable PDF — the caller then steps pages blind and relies on
 /// [`render_pdf_page`] returning `None` past the end.
 pub fn pdf_page_count(pdf: &Path) -> Option<usize> {
-    let out = Command::new("pdfinfo")
-        .arg(pdf)
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let out = crate::tool::run(
+        Command::new("pdfinfo").arg(crate::tool::path_arg(pdf)),
+        crate::tool::PROBE_DEADLINE,
+    )?;
     if !out.status.success() {
         return None;
     }

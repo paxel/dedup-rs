@@ -15,3 +15,34 @@ Open work only. Closed items live in `git log`; documentation lives in `docs/`.
 - [ ] Metadata extraction for all known formats (ID3 tags already handled).
 - [ ] Plugin support for new formats; an API to externalise features — specced for 0.5.0 in
   [#2](https://github.com/paxel/dedup-rs/issues/2) (similarity providers + viewer visualisations).
+
+## GUI reshape 3.0 — [#4](https://github.com/paxel/dedup-rs/issues/4), ADR 0004
+
+Start page hub, one command list, one board. Landed one child per commit, in order:
+
+- [x] #5 Start page shell replaces the tab bar
+- [x] #6 Start page facts: totals, stale badges, last runs
+- [x] #7 Progressive inputs and from/to roles
+- [x] #8 Favorites
+- [x] #9 Preview and APPLY everywhere
+- [x] #10 The board module, with Browse on it
+- [x] #11 Duplicates on the board (reverted after 3.0.0: the side-by-side card groups came back, see the ADR 0004 amendment)
+- [x] #12 Transfer and Grooming plans on the board (already routed through `board.rs`; verified)
+- [x] #13 Diff on the board (already routed through `board.rs`; `diff_board.rs` holds the row model and popups only; verified)
+- [x] #14 Skin pass
+- [x] #15 GUI guide rewritten
+
+## Security hardening — ADR 0005
+
+Scanners, a release gate, signed provenance and parser limits; threat model in
+`docs/security/threat-model.md`.
+
+- [x] Toolchain pinned, actions pinned by SHA, read-only workflow permissions, Dependabot
+- [x] `cargo-deny` policy and the report-only Security workflow; advisories fixed or ignored
+  with a reason (the rest sit under eframe 0.35's Linux stack)
+- [x] SonarQube Cloud, CodeQL and the OpenSSF Scorecard
+- [x] Release gate on `cargo-deny` and the quality gate; build provenance attestations
+- [x] Archive member caps, document read caps, external tools under deadlines
+- [x] Fuzz targets and the weekly fuzz workflow; two symphonia panics contained
+- [ ] Move to eframe 0.37 (or later) to drop the ignored advisories under its Linux stack
+- [ ] Move to symphonia 0.6 once rodio does, then retest the two fuzz fixtures

@@ -11,7 +11,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 fn write_zip(path: &std::path::Path, entries: &[(&str, &[u8])]) {
     let file = std::fs::File::create(path).unwrap();
     let mut zip = zip::ZipWriter::new(file);
-    let opts: zip::write::FileOptions<'_, ()> =
+    let opts: zip::write::FileOptions<'_, '_, ()> =
         zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
     for (name, data) in entries {
         zip.start_file(*name, opts).unwrap();
@@ -29,11 +29,11 @@ fn write_mixed_encrypted_zip(
 ) {
     let file = std::fs::File::create(path).unwrap();
     let mut zip = zip::ZipWriter::new(file);
-    let plain_opts: zip::write::FileOptions<'_, ()> =
+    let plain_opts: zip::write::FileOptions<'_, '_, ()> =
         zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
     zip.start_file(plain.0, plain_opts).unwrap();
     zip.write_all(plain.1).unwrap();
-    let enc_opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+    let enc_opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
         .compression_method(zip::CompressionMethod::Stored)
         .with_aes_encryption(zip::AesMode::Aes256, password);
     zip.start_file(encrypted.0, enc_opts).unwrap();
@@ -474,4 +474,111 @@ fn unchanged_archive_is_skipped_changed_archive_is_reread() -> TestResult {
         "member list replaced with the new archive's members"
     );
     Ok(())
+}
+
+fn write_tar_gz(path: &std::path::Path, entries: &[(&str, &[u8])]) {
+    let file = std::fs::File::create(path).unwrap();
+    let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut tar = tar::Builder::new(gz);
+    for (name, data) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, name, *data).unwrap();
+    }
+    tar.into_inner().unwrap().finish().unwrap();
+}
+
+/// Past the member cap a listing stops, keeps what it read, and says so.
+#[test]
+fn a_member_listing_stops_at_the_member_cap() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let zip = tmp.path().join("many.zip");
+    write_zip(&zip, &[("a", b"1"), ("b", b"2"), ("c", b"3")]);
+    let caps = dedup_core::archive::MemberCaps {
+        max_members: 2,
+        max_unpacked: 1024,
+    };
+    let listing =
+        dedup_core::archive::list_members_with(&zip, "many.zip", None, caps).ok_or("listing")?;
+    let names: Vec<&str> = listing
+        .members
+        .iter()
+        .map(|m| m.rel_path.as_str())
+        .collect();
+    assert_eq!(names, ["a", "b"]);
+    assert_eq!(
+        listing.capped,
+        Some(dedup_core::archive::MemberCap::Members)
+    );
+    Ok(())
+}
+
+/// An archive that unpacks to more than its budget (an archive bomb) stops at
+/// the member that runs over, in a zip and in a tar.gz alike.
+#[test]
+fn a_member_listing_stops_at_the_unpacked_cap() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let entries: [(&str, &[u8]); 3] = [("a", &[0u8; 10]), ("b", &[0u8; 10]), ("c", &[0u8; 10])];
+    let zip = tmp.path().join("bomb.zip");
+    write_zip(&zip, &entries);
+    let tgz = tmp.path().join("bomb.tar.gz");
+    write_tar_gz(&tgz, &entries);
+    let caps = dedup_core::archive::MemberCaps {
+        max_members: 100,
+        max_unpacked: 15,
+    };
+    for (path, rel) in [(&zip, "bomb.zip"), (&tgz, "bomb.tar.gz")] {
+        let listing =
+            dedup_core::archive::list_members_with(path, rel, None, caps).ok_or("listing")?;
+        let names: Vec<&str> = listing
+            .members
+            .iter()
+            .map(|m| m.rel_path.as_str())
+            .collect();
+        assert_eq!(names, ["a"], "{rel}");
+        assert_eq!(
+            listing.capped,
+            Some(dedup_core::archive::MemberCap::Unpacked),
+            "{rel}"
+        );
+    }
+    Ok(())
+}
+
+/// Within its caps an archive lists completely and reports no cap; exactly
+/// filling the unpacked budget is not running over it.
+#[test]
+fn a_member_listing_within_its_caps_is_complete() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let zip = tmp.path().join("fits.zip");
+    write_zip(&zip, &[("a", &[1u8; 10]), ("b", &[2u8; 10])]);
+    let caps = dedup_core::archive::MemberCaps {
+        max_members: 2,
+        max_unpacked: 20,
+    };
+    let listing =
+        dedup_core::archive::list_members_with(&zip, "fits.zip", None, caps).ok_or("listing")?;
+    assert_eq!(listing.members.len(), 2);
+    assert_eq!(listing.capped, None);
+    Ok(())
+}
+
+/// The default caps scale with the archive: a thousand times its size, never
+/// less than 4 GiB unpacked, and name themselves in the scan report.
+#[test]
+fn default_member_caps_scale_with_the_archive() {
+    use dedup_core::archive::{MemberCap, MemberCaps};
+    let gib = 1024 * 1024 * 1024;
+    assert_eq!(MemberCaps::for_archive(1024).max_unpacked, 4 * gib);
+    assert_eq!(MemberCaps::for_archive(10 * gib).max_unpacked, 10_000 * gib);
+    assert_eq!(MemberCaps::for_archive(0).max_members, 1_000_000);
+    let caps = MemberCaps::for_archive(0);
+    assert!(
+        MemberCap::Unpacked
+            .describe(caps)
+            .contains("4 GiB unpacked")
+    );
+    assert!(MemberCap::Members.describe(caps).contains("1000000"));
 }

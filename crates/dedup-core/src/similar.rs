@@ -65,16 +65,18 @@ const AUDIO_DURATION_TOLERANCE_MS: u32 = 2000;
 
 /// Image-hash similarity as a percentage in `0.0..=100.0`.
 pub fn similarity_img(a: &ImgHash, b: &ImgHash) -> f64 {
-    let distance: u32 = (0..8).map(|k| (a[k] ^ b[k]).count_ones()).sum();
+    let distance: u32 = a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum();
     (1.0 - f64::from(distance) / IMG_BITS) * 100.0
 }
 
 /// 1536-bit temporal-hash similarity (three 512-bit frame hashes) as a
 /// percentage in `0.0..=100.0`.
 pub fn similarity_video(a: &[ImgHash; 3], b: &[ImgHash; 3]) -> f64 {
-    let distance: u32 = (0..3)
-        .flat_map(|f| (0..8).map(move |w| (f, w)))
-        .map(|(f, w)| (a[f][w] ^ b[f][w]).count_ones())
+    let distance: u32 = a
+        .iter()
+        .zip(b)
+        .flat_map(|(x, y)| x.iter().zip(y))
+        .map(|(x, y)| (x ^ y).count_ones())
         .sum();
     (1.0 - f64::from(distance) / VIDEO_BITS) * 100.0
 }
@@ -102,9 +104,9 @@ pub fn similarity_audio(a: &[u32], b: &[u32]) -> f64 {
     let mut by_delta: std::collections::HashMap<i64, (usize, f64)> =
         std::collections::HashMap::new();
     for seg in &segments {
-        let delta = seg.offset1 as i64 - seg.offset2 as i64;
+        let delta = (seg.offset1 as i64).saturating_sub(seg.offset2 as i64);
         let slot = by_delta.entry(delta).or_insert((0, 0.0));
-        slot.0 += seg.items_count;
+        slot.0 = slot.0.saturating_add(seg.items_count);
         slot.1 += seg.score * seg.items_count as f64;
     }
     let Some((items, weighted)) = by_delta.values().copied().max_by(|x, y| x.0.cmp(&y.0)) else {
@@ -120,7 +122,35 @@ pub fn similarity_audio(a: &[u32], b: &[u32]) -> f64 {
 
 /// The `b`-th 16-bit band of an image hash.
 fn img_band(fp: &ImgHash, b: u8) -> u16 {
-    (fp[usize::from(b) / 4] >> ((u32::from(b) % 4) * 16)) as u16
+    fp.get(usize::from(b) / 4).map_or(0, |word| {
+        word.checked_shr((u32::from(b) % 4).saturating_mul(16))
+            .unwrap_or(0) as u16
+    })
+}
+
+/// Which items a greedy grouping has already placed in a group.
+struct Claimed(Vec<bool>);
+
+impl Claimed {
+    fn new(len: usize) -> Self {
+        Self(vec![false; len])
+    }
+
+    /// Whether item `i` may still join a group.
+    fn is_free(&self, i: usize) -> bool {
+        self.0.get(i).is_some_and(|claimed| !claimed)
+    }
+
+    /// Place item `i`; false when it was already placed.
+    fn claim(&mut self, i: usize) -> bool {
+        match self.0.get_mut(i) {
+            Some(claimed) if !*claimed => {
+                *claimed = true;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Greedily group image hashes whose similarity meets `threshold`, returning
@@ -137,22 +167,21 @@ pub fn group_img(fingerprints: &[ImgHash], threshold: f64) -> Vec<Vec<usize>> {
         }
     }
 
-    let mut handled = vec![false; fingerprints.len()];
+    let mut claimed = Claimed::new(fingerprints.len());
     let mut groups = Vec::new();
-    for i in 0..fingerprints.len() {
-        if handled[i] {
+    for (i, fp) in fingerprints.iter().enumerate() {
+        if !claimed.claim(i) {
             continue;
         }
-        handled[i] = true;
         let mut group = vec![i];
 
         // Gather not-yet-handled candidates that share a band with i.
         let mut seen = HashSet::new();
         let mut candidates = Vec::new();
         for b in 0..IMG_BANDS {
-            if let Some(bucket) = bands.get(&(b, img_band(&fingerprints[i], b))) {
+            if let Some(bucket) = bands.get(&(b, img_band(fp, b))) {
                 for &j in bucket {
-                    if j > i && !handled[j] && seen.insert(j) {
+                    if j > i && claimed.is_free(j) && seen.insert(j) {
                         candidates.push(j);
                     }
                 }
@@ -161,12 +190,11 @@ pub fn group_img(fingerprints: &[ImgHash], threshold: f64) -> Vec<Vec<usize>> {
         candidates.sort_unstable();
 
         for j in candidates {
-            if handled[j] {
-                continue;
-            }
-            if similarity_img(&fingerprints[i], &fingerprints[j]) >= threshold {
+            let similar = fingerprints
+                .get(j)
+                .is_some_and(|other| similarity_img(fp, other) >= threshold);
+            if similar && claimed.claim(j) {
                 group.push(j);
-                handled[j] = true;
             }
         }
         if group.len() > 1 {
@@ -182,21 +210,16 @@ fn group_by<T, F>(items: &[T], similar: F) -> Vec<Vec<usize>>
 where
     F: Fn(&T, &T) -> bool,
 {
-    let mut handled = vec![false; items.len()];
+    let mut claimed = Claimed::new(items.len());
     let mut groups = Vec::new();
-    for i in 0..items.len() {
-        if handled[i] {
+    for (i, item) in items.iter().enumerate() {
+        if !claimed.claim(i) {
             continue;
         }
-        handled[i] = true;
         let mut group = vec![i];
-        for j in (i + 1)..items.len() {
-            if handled[j] {
-                continue;
-            }
-            if similar(&items[i], &items[j]) {
+        for (j, other) in items.iter().enumerate().skip(i.saturating_add(1)) {
+            if claimed.is_free(j) && similar(item, other) && claimed.claim(j) {
                 group.push(j);
-                handled[j] = true;
             }
         }
         if group.len() > 1 {
@@ -227,16 +250,21 @@ fn group_audio(
 ) -> Vec<Vec<usize>> {
     use rayon::prelude::*;
 
-    let mut order: Vec<usize> = (0..items.len()).collect();
-    order.sort_by_key(|&i| items[i].key.0);
+    // (index, duration) pairs, sorted by duration.
+    let mut order: Vec<(usize, u32)> = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| (i, item.key.0))
+        .collect();
+    order.sort_by_key(|&(_, duration)| duration);
     // Every pair inside the window, in the order the greedy walk visits them,
     // plus each position's slice of that list.
     let mut pairs: Vec<(usize, usize)> = Vec::new();
     let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(order.len());
-    for (pos, &i) in order.iter().enumerate() {
+    for (pos, &(i, duration)) in order.iter().enumerate() {
         let start = pairs.len();
-        for &j in &order[pos + 1..] {
-            if items[j].key.0.abs_diff(items[i].key.0) > AUDIO_DURATION_TOLERANCE_MS {
+        for &(j, other) in order.iter().skip(pos.saturating_add(1)) {
+            if other.abs_diff(duration) > AUDIO_DURATION_TOLERANCE_MS {
                 break;
             }
             pairs.push((i, j));
@@ -257,8 +285,11 @@ fn group_audio(
             if cancel.is_cancelled() {
                 return false;
             }
-            let hit = similarity_audio(&items[i].key.1, &items[j].key.1) >= threshold;
-            let n = counted.fetch_add(1, Ordering::Relaxed) + 1;
+            let hit = items
+                .get(i)
+                .zip(items.get(j))
+                .is_some_and(|(x, y)| similarity_audio(&x.key.1, &y.key.1) >= threshold);
+            let n = counted.fetch_add(1, Ordering::Relaxed).saturating_add(1);
             if n.is_multiple_of(step) || n == total {
                 progress(SimilarProgress {
                     phase: SimilarPhase::Audio,
@@ -273,19 +304,18 @@ fn group_audio(
         return Vec::new();
     }
 
-    let mut handled = vec![false; items.len()];
+    let mut claimed = Claimed::new(items.len());
     let mut groups = Vec::new();
-    for (pos, &i) in order.iter().enumerate() {
-        if handled[i] {
+    for (&(i, _), &(start, end)) in order.iter().zip(&ranges) {
+        if !claimed.claim(i) {
             continue;
         }
-        handled[i] = true;
         let mut group = vec![i];
-        let (start, end) = ranges[pos];
-        for (k, &(_, j)) in pairs[start..end].iter().enumerate() {
-            if !handled[j] && hits[start + k] {
+        let window = pairs.get(start..end).unwrap_or_default();
+        let window_hits = hits.get(start..end).unwrap_or_default();
+        for (&(_, j), &hit) in window.iter().zip(window_hits) {
+            if hit && claimed.claim(j) {
                 group.push(j);
-                handled[j] = true;
             }
         }
         if group.len() > 1 {
@@ -404,11 +434,19 @@ fn materialize<K>(
     for indices in index_groups {
         let mut group: DupeGroup = Vec::with_capacity(indices.len());
         for i in indices {
-            let c = &candidates[i];
-            if let Some(entry) = store::get_entry(&dbs[c.repo_idx], &c.rel_path)? {
+            // Indices and repo positions come from these same lists.
+            let Some(c) = candidates.get(i) else { continue };
+            let (Some(db), Some(repo), Some(repo_root)) = (
+                dbs.get(c.repo_idx),
+                staged.names.get(c.repo_idx),
+                staged.roots.get(c.repo_idx),
+            ) else {
+                continue;
+            };
+            if let Some(entry) = store::get_entry(db, &c.rel_path)? {
                 group.push(DupeFile {
-                    repo: staged.names[c.repo_idx].clone(),
-                    repo_root: staged.roots[c.repo_idx].clone(),
+                    repo: repo.clone(),
+                    repo_root: repo_root.clone(),
                     rel_path: c.rel_path.clone(),
                     entry,
                 });

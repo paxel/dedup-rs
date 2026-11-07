@@ -27,16 +27,20 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# Least privilege: jobs that write (the GitHub Release) widen this themselves.
+permissions:
+  contents: read
+
 jobs:
   linux:
     name: Linux (full gate)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1 branch
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: System dependencies (ALSA link dep, software Vulkan, gated tools)
         run: |
           sudo apt-get update
@@ -51,16 +55,16 @@ jobs:
       - name: Tests
         run: cargo test --workspace --locked
 
-  # Feeds the README's Coveralls badge. Main-only: coverage on every branch
-  # push would double CI time for a number nobody reads off a branch.
+  # Feeds the README's Coveralls badge. Default-branch only: coverage on every
+  # branch push would double CI time for a number nobody reads off a branch.
   coverage:
     name: Coverage (Coveralls)
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/summer'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1 branch
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: System dependencies (ALSA link dep, software Vulkan, gated tools)
         run: |
           sudo apt-get update
@@ -68,23 +72,30 @@ jobs:
             libasound2-dev pkg-config \
             mesa-vulkan-drivers libvulkan1 \
             ffmpeg poppler-utils
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with:
           tool: cargo-tarpaulin
       - name: Measure line coverage
         run: cargo tarpaulin --workspace --engine llvm --timeout 300 --out Lcov
       - name: Upload to Coveralls
-        uses: coverallsapp/github-action@v2
+        uses: coverallsapp/github-action@8d6379e14d29928660c4ba802d8e85393440b329 # v2.3.8
         with:
           file: lcov.info
+      # For the SonarQube Cloud workflow, which runs after this one.
+      - name: Keep lcov.info for SonarQube Cloud
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          retention-days: 7
 
   windows:
     name: Windows (build + core/cli tests)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1 branch
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build workspace
         run: cargo build --workspace --locked
       - name: Core and CLI tests
@@ -94,9 +105,9 @@ jobs:
     name: macOS (build + core/cli tests)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1 branch
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build workspace
         run: cargo build --workspace --locked
       - name: Core and CLI tests

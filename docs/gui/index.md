@@ -1,19 +1,21 @@
 # GUI guide
 
-`dedup` with no arguments opens the desktop app: a single LCARS-styled window with five tabs
-— [Repositories](repositories.md), [Duplicates](duplicates.md), [Transfer](transfer.md),
-[Grooming](grooming.md), and [Browse](browse.md) — plus a settings cog and an about button in
-the top-right. Every tab that shows two files side by side, or a single file up close, opens
-the **one shared viewer** described in [The viewer](duplicates.md#the-viewer-lightbox).
+`dedup` with no arguments opens the desktop app: a single LCARS-styled window that opens on
+the [start page](start-page.md) — your repositories as cards, one selection, and one command
+list. A command either runs at once or opens its body under a header strip: the
+[Duplicates](duplicates.md), [Transfer](transfer.md), [Grooming](grooming.md) or
+[Browse](browse.md) view, with the repositories already filled in. Every view that shows two
+files side by side, or a single file up close, opens the **one shared viewer** described in
+[The viewer](duplicates.md#the-viewer-lightbox).
 
 Launch with `--ui-scale <0.5–3.0>` to scale the whole interface, e.g. `dedup --ui-scale 1.25`
 for a HiDPI display or a projector.
 
-## The tabs at a glance
+## At a glance
 
-| Tab                                  | What it is for                                                                                     |
+| Page                                 | What it is for                                                                                     |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------- |
-| **[Repositories](repositories.md)**  | Register, scan and manage repositories; frame backup groups (a main and its sinks).               |
+| **[Start page](start-page.md)**      | Register, select and scan repositories; frame backup groups; pick a command for the selection.    |
 | **[Duplicates](duplicates.md)**      | Find exact or perceptually similar duplicates across repos and delete the worse copies.           |
 | **[Transfer](transfer.md)**          | Copy / move / sync / mirror between repos, push a backup group, or reconcile two repos with DIFF.  |
 | **[Grooming](grooming.md)**          | Tidy one repo: dedupe against others, purge by filter, clear empty dirs, reorganize, prune.       |
@@ -21,11 +23,13 @@ for a HiDPI display or a projector.
 
 ## Top bar
 
-The tab buttons switch views; the current tab is highlighted. On the right:
+On the start page the bar is empty; while a command's body is open it carries the **header
+strip** — the **START** bar that returns to the start page, the selected repositories and
+the command. On the right:
 
 - **STATUS** opens the health/activity centre (below). Its label carries an amber
   count when there are unread warnings.
-- **HELP** explains the current tab.
+- **HELP** explains the current page.
 - **SETTINGS** (cog icon) opens the settings dialog below.
 - **ABOUT** shows the version, license, and contact info.
 
@@ -59,8 +63,9 @@ repository never requires a keyboard shortcut.
 
 ## Repository locks
 
-Every repository starts **locked** at each launch. The padlock on a repo's chip — the same
-chip on every tab — shows and toggles it: **closed blue = protected, open = unlocked**.
+Every repository starts **locked** at each launch. The padlock on a repo's chip — on its
+start-page card and wherever the repository is named — shows and toggles it: **closed blue =
+protected, open = unlocked**.
 
 A lock protects the repo's **existing files**: while locked, nothing in the app can delete or
 overwrite them — those buttons are withheld or disabled with the reason on hover, a MIRROR or
@@ -109,7 +114,7 @@ unlocking for deletion should be a fresh, conscious choice each session.
 
 Long work runs one at a time in a central window that blocks the rest of the app while it
 runs: a repository UPDATE or CHECK (UPDATE ALL lists every repository on its own row), a
-Duplicates FIND or DELETE MARKED, a Transfer or Grooming REVIEW and RUN, a GROUP SYNC or a
+Duplicates FIND or APPLY MARKED, a Transfer or Grooming PREVIEW and APPLY ALL, a GROUP SYNC or a
 bulk board action. The window names the operation and its repositories,
 the current phase ("reading 'photos'", "comparing audio", "copying 2020/a.jpg"), how far it
 is with a percentage where the total is known, elapsed time and an estimate of what is left,
@@ -157,7 +162,7 @@ appears.
   exists only on this side (or will be added), red will be deleted, amber differs — the same
   path with different content, or the same content under a different name.
 - **HIDE** removes a row from the board, and on a preview also from what RUN will do. It is
-  one-way: press REVIEW again to start over.
+  one-way: press PREVIEW again to start over.
 - **Sorting** is the bar above the board — which side to read, then the key (path, size, date
   or status), then the direction. Large previews scroll rather than paging.
 
@@ -188,17 +193,17 @@ its raw bytes — never as text.
 ## What's not here
 
 The important-file scanner (`dedup scan`) and the triage report (`dedup report`) are
-CLI-only today — there's no dedicated GUI tab for them yet.
+CLI-only today — there is no command for them on the start page yet.
 
 ## See also
 
-- [Repositories tab](repositories.md) — register, scan, rename, relocate, duplicate, delete;
-  sync groups.
-- [Duplicates tab](duplicates.md) — find and review exact/similar duplicates, and the shared
+- [Start page](start-page.md) — register, select and scan repositories, the command list,
+  backup groups.
+- [Duplicates](duplicates.md) — find and review exact/similar duplicates, and the shared
   viewer in full (Image / Video filmstrip + scrub / Audio / Metadata / Text / Render /
   Strings / Hex).
-- [Transfer tab](transfer.md) — copy/move/sync/mirror between repos by content, group sync and
+- [Transfer](transfer.md) — copy/move/sync/mirror between repos by content, group sync and
   sync-back, the DIFF reconcile board, the filter builder.
-- [Grooming tab](grooming.md) — dedupe, purge, empty dirs, organize, prune.
-- [Browse tab](browse.md) — a keyboard-driven folder-tree browser with tagging.
+- [Grooming](grooming.md) — dedupe, purge, empty dirs, organize, prune.
+- [Browse](browse.md) — a keyboard-driven folder-tree browser with tagging.
 - [CLI reference](../cli.md) — every command the GUI's operations are also available from.

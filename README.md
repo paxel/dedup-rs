@@ -1,8 +1,16 @@
 # dedup-rs
 
-[![CI](https://github.com/paxel/dedup-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/paxel/dedup-rs/actions/workflows/ci.yml)
-[![Coverage](https://coveralls.io/repos/github/paxel/dedup-rs/badge.svg?branch=main)](https://coveralls.io/github/paxel/dedup-rs?branch=main)
+[![CI](https://github.com/paxel/dedup-rs/actions/workflows/ci.yml/badge.svg?branch=summer)](https://github.com/paxel/dedup-rs/actions/workflows/ci.yml)
+[![Security](https://github.com/paxel/dedup-rs/actions/workflows/security.yml/badge.svg?branch=summer)](https://github.com/paxel/dedup-rs/actions/workflows/security.yml)
+[![CodeQL](https://github.com/paxel/dedup-rs/actions/workflows/codeql.yml/badge.svg?branch=summer)](https://github.com/paxel/dedup-rs/actions/workflows/codeql.yml)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=paxel_dedup-rs&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=paxel_dedup-rs)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/paxel/dedup-rs/badge)](https://scorecard.dev/viewer/?uri=github.com/paxel/dedup-rs)
+[![Coverage](https://coveralls.io/repos/github/paxel/dedup-rs/badge.svg?branch=summer)](https://coveralls.io/github/paxel/dedup-rs?branch=summer)
 [![crates.io](https://img.shields.io/crates/v/dedup-rs-cli.svg)](https://crates.io/crates/dedup-rs-cli)
+[![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success)](https://github.com/paxel/dedup-rs/blob/summer/crates/dedup-core/src/lib.rs)
+[![panic-free](https://img.shields.io/badge/panic--free-linted-success)](https://github.com/paxel/dedup-rs/blob/summer/crates/dedup-core/src/lib.rs)
+[![Release](https://img.shields.io/github/v/release/paxel/dedup-rs)](https://github.com/paxel/dedup-rs/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 A high-performance, native Rust file-deduplication tool with both a desktop GUI and a
 fast command-line interface, packaged as a single self-contained binary.
@@ -34,6 +42,14 @@ past Gatekeeper (once; afterwards it opens normally). The Windows zip carries tw
 executables — `dedup.exe` (the CLI, console) and `dedup-gui.exe` (the app, no console
 window; the double-click target).
 
+Every release file carries a signed build provenance attestation: it proves the file was
+built by this repository's release workflow from the tagged commit. Check a download with
+the GitHub CLI:
+
+```bash
+gh attestation verify dedup-3.0.1-linux-x86_64.tar.gz -R paxel/dedup-rs
+```
+
 Optional tools unlock extra features at runtime and the app degrades gracefully without
 them: `ffmpeg` (video), `poppler` (PDF page rendering), LibreOffice (office/legacy document
 rendering).
@@ -57,12 +73,12 @@ at the cost of drag-and-drop.
 
 ## What it does
 
-- **Repositories** — register directories, scan and hash them on background threads, track per-repo stats. Backup groups are framed together, with the group's **main** badged wherever it is named.
+- **Start page** — the app opens on your repositories as cards: register directories, select one or many, and pick from one command list grouped by intent (investigate, maintain, move, clean). A command the selection does not allow is greyed with the reason on hover; a backup group is framed together, with the group's **main** badged wherever it is named, and selecting the frame gives GROUP SYNC its direction for free. Scans run at once; every other command opens its body under a header strip that names the selection.
 - **Duplicates** — find exact or perceptually-similar files across repos and delete the worse copies. A copy's right-click menu can jump straight to it in Browse (**SHOW IN BROWSE**), to judge it by the folder it lives in, or **ACCEPT** its content as allowed to repeat inside that repo (a podcast's per-folder cover): accepted copies are protected from every duplicate delete and their groups stay out of the way.
 - **Transfer / DIFF** — copy, move, sync or mirror content between repos, reconcile two repos side by side, or push a backup group's main to its sinks (each ADD ONLY, APPLY CHANGES — which also carries the main's own deletions over — or MIRROR).
 - **Grooming** — dedupe, purge by filter, prune missing records, reorganize by path templates.
 - **One thing at a time, always visible** — long work (a repository UPDATE or CHECK, a Duplicates
-  FIND or DELETE MARKED, a Transfer or Grooming REVIEW and RUN, a GROUP SYNC or a bulk board action)
+  FIND or APPLY MARKED, a Transfer or Grooming PREVIEW and APPLY ALL, a GROUP SYNC or a bulk board action)
   runs in one central activity window that shows each phase, its progress and
   problems, offers CANCEL, and ends as the result report. Quick actions answer with a notification
   card, and every file the app changes is written to an event log (**LOG**, top right) that survives
@@ -122,6 +138,12 @@ The same operations are available headless via `dedup <command>`.
 - [**Releasing**](docs/releasing.md) — the tag-driven release workflow and its one-time setup.
 - [**Agent Guidelines**](AGENTS.md) — Rust patterns, error-handling policy, and coding standards.
 - [**Changelog**](CHANGELOG.md) — record of user-facing changes.
+
+## Security
+
+How the project scans, gates and signs its releases is recorded in
+[ADR 0005](docs/adr/0005-security-hardening.md); how to report a vulnerability is in
+[SECURITY.md](SECURITY.md).
 
 ## License
 

@@ -13,6 +13,8 @@ cargo test -p dedup-rs-core --test diff_ops          # one integration test file
 cargo test -p dedup-rs-gui filter_ui                 # GUI tests matching a name
 cargo fmt --check                # must pass before work is done
 cargo clippy -- -D warnings      # must be clean (zero warnings)
+cargo deny check                 # advisories, licenses, bans, sources (deny.toml)
+cd fuzz && cargo fuzz run fingerprint   # fuzz a parser target (nightly, pinned in fuzz/)
 ```
 
 Building `dedup-gui` on Linux needs ALSA headers (`libasound2-dev` on Debian/Ubuntu) because of `rodio`. Video fingerprinting requires `ffmpeg`/`ffprobe` at runtime (degrades gracefully without).

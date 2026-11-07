@@ -53,8 +53,8 @@ fn hash_reader<R: Read>(mut r: R) -> Option<(u64, [u8; 32])> {
         if n == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
-        size += n as u64;
+        hasher.update(buf.get(..n).unwrap_or_default());
+        size = size.saturating_add(n as u64);
     }
     Some((size, *hasher.finalize().as_bytes()))
 }
@@ -87,11 +87,13 @@ fn zip_entries(path: &Path) -> Option<Vec<ArchiveEntry>> {
     let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).ok()?;
     let mut out = Vec::new();
     for i in 0..archive.len() {
+        // zip 9 decodes the name and fails on an invalid one: skip that entry.
         if let Ok(e) = archive.by_index_raw(i)
             && e.is_file()
+            && let Ok(name) = e.name()
         {
             out.push(ArchiveEntry {
-                name: e.name().to_string(),
+                name: name.into_owned(),
                 size: e.size(),
                 locked: e.encrypted(),
             });
@@ -189,7 +191,7 @@ fn non_colliding(dest: &Path) -> PathBuf {
         .unwrap_or_else(|| "file".into());
     let ext = dest.extension().map(|e| e.to_string_lossy().into_owned());
     let dir = dest.parent().unwrap_or_else(|| Path::new("."));
-    let mut i = 1;
+    let mut i = 1u32;
     loop {
         let name = match &ext {
             Some(e) => format!("{stem}_{i}.{e}"),
@@ -199,7 +201,7 @@ fn non_colliding(dest: &Path) -> PathBuf {
         if !candidate.exists() {
             return candidate;
         }
-        i += 1;
+        i = i.saturating_add(1);
     }
 }
 
@@ -217,7 +219,7 @@ pub fn extract_all(
     let entries = list_entries(archive_path, rel_path, mime).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "cannot open archive")
     })?;
-    let mut written = 0;
+    let mut written = 0usize;
     for entry in entries {
         if entry.locked && password.is_none() {
             continue;
@@ -229,7 +231,7 @@ pub fn extract_all(
         }
         let dest = non_colliding(&dest_dir.join(&rel));
         if extract_member(archive_path, rel_path, mime, &entry.name, &dest, password).is_ok() {
-            written += 1;
+            written = written.saturating_add(1);
         }
     }
     Ok(written)
@@ -310,7 +312,10 @@ fn zip_members_pw(path: &Path, password: &str) -> Option<Vec<ArchiveMember>> {
     let mut members = Vec::new();
     for i in 0..archive.len() {
         let (name, size, encrypted, is_file) = match archive.by_index_raw(i) {
-            Ok(e) => (e.name().to_string(), e.size(), e.encrypted(), e.is_file()),
+            Ok(e) => match e.name() {
+                Ok(name) => (name.into_owned(), e.size(), e.encrypted(), e.is_file()),
+                Err(_) => continue,
+            },
             Err(_) => continue,
         };
         if !is_file {
@@ -387,21 +392,26 @@ pub fn export_hashcat_hash(
     }
     let name_len = u16::from_le_bytes([lfh[26], lfh[27]]) as u64;
     let extra_len = u16::from_le_bytes([lfh[28], lfh[29]]) as usize;
-    file.seek(SeekFrom::Start(header_start + 30 + name_len))
-        .ok()?;
+    file.seek(SeekFrom::Start(
+        header_start.checked_add(30)?.checked_add(name_len)?,
+    ))
+    .ok()?;
     let mut extra = vec![0u8; extra_len];
     file.read_exact(&mut extra).ok()?;
     let mut strength = None;
-    let mut p = 0;
-    while p + 4 <= extra.len() {
-        let id = u16::from_le_bytes([extra[p], extra[p + 1]]);
-        let sz = u16::from_le_bytes([extra[p + 2], extra[p + 3]]) as usize;
+    let mut rest = extra.as_slice();
+    while let [id_lo, id_hi, size_lo, size_hi, body @ ..] = rest {
+        let id = u16::from_le_bytes([*id_lo, *id_hi]);
+        let sz = usize::from(u16::from_le_bytes([*size_lo, *size_hi]));
         // AES extra: version(2) vendor(2="AE") strength(1) compression(2).
-        if id == 0x9901 && sz >= 7 && p + 4 + 5 <= extra.len() {
-            strength = Some(extra[p + 4 + 4]);
+        if id == 0x9901
+            && sz >= 7
+            && let Some(&value) = body.get(4)
+        {
+            strength = Some(value);
             break;
         }
-        p += 4 + sz;
+        rest = body.get(sz..).unwrap_or_default();
     }
     let (mode, salt_len) = match strength? {
         1 => (1u8, 8usize),
@@ -414,14 +424,10 @@ pub fn export_hashcat_hash(
     file.seek(SeekFrom::Start(data_start)).ok()?;
     let mut blob = vec![0u8; comp_size as usize];
     file.read_exact(&mut blob).ok()?;
-    if blob.len() < salt_len + 2 + 10 {
-        return None;
-    }
     let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-    let salt = &blob[..salt_len];
-    let verifier = &blob[salt_len..salt_len + 2];
-    let data = &blob[salt_len + 2..blob.len() - 10];
-    let auth = &blob[blob.len() - 10..];
+    let (salt, rest) = blob.split_at_checked(salt_len)?;
+    let (verifier, rest) = rest.split_at_checked(2)?;
+    let (data, auth) = rest.split_at_checked(rest.len().checked_sub(10)?)?;
     Some(format!(
         "$zip2$*0*{mode}*0*{}*{}*{}*{}*{}*$/zip2$",
         hex(salt),
@@ -538,17 +544,137 @@ pub fn unlock_and_reindex(
 /// List an archive's file members with their content identity, or `None` when
 /// the archive can't be read (encrypted, corrupt, unsupported).
 pub fn list_members(path: &Path, rel_path: &str, mime: Option<&str>) -> Option<Vec<ArchiveMember>> {
-    match detect_kind(rel_path, mime)? {
-        Kind::Zip => zip_members(path),
-        Kind::Tar => tar_members(std::fs::File::open(path).ok()?),
-        Kind::TarGz => {
-            let file = std::fs::File::open(path).ok()?;
-            tar_members(flate2::read::GzDecoder::new(file))
+    let size = std::fs::metadata(path).ok()?.len();
+    list_members_with(path, rel_path, mime, MemberCaps::for_archive(size)).map(|l| l.members)
+}
+
+/// What indexing one archive's members may cost. A few kilobytes can declare
+/// millions of members or terabytes of zeros (an archive bomb); past a cap the
+/// scan stops reading members, keeps what it has, and reports which cap it hit
+/// (docs/security/threat-model.md, threat 1). Generous on purpose: they stop
+/// bombs, not big archives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemberCaps {
+    pub max_members: usize,
+    pub max_unpacked: u64,
+}
+
+impl MemberCaps {
+    /// At most this many members are read.
+    pub const MAX_MEMBERS: usize = 1_000_000;
+    /// Unpacked bytes may reach this multiple of the archive's own size…
+    pub const MAX_RATIO: u64 = 1_000;
+    /// …and at least this much, so a small archive of text is never cut short.
+    pub const MIN_UNPACKED: u64 = 4 * 1024 * 1024 * 1024;
+
+    /// The caps for an archive of `size` bytes.
+    pub fn for_archive(size: u64) -> Self {
+        Self {
+            max_members: Self::MAX_MEMBERS,
+            max_unpacked: size.saturating_mul(Self::MAX_RATIO).max(Self::MIN_UNPACKED),
         }
     }
 }
 
-fn zip_members(path: &Path) -> Option<Vec<ArchiveMember>> {
+/// Which [`MemberCaps`] limit stopped a member listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberCap {
+    Members,
+    Unpacked,
+}
+
+impl MemberCap {
+    /// The scan report's line for an archive whose listing stopped here.
+    pub fn describe(self, caps: MemberCaps) -> String {
+        match self {
+            Self::Members => format!(
+                "archive members not indexed past the first {}",
+                caps.max_members
+            ),
+            Self::Unpacked => format!(
+                "archive members not indexed past {} GiB unpacked (possible archive bomb)",
+                caps.max_unpacked / (1024 * 1024 * 1024)
+            ),
+        }
+    }
+}
+
+/// An archive's members as far as [`MemberCaps`] allowed, and the cap that
+/// stopped the listing, if one did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberListing {
+    pub members: Vec<ArchiveMember>,
+    pub capped: Option<MemberCap>,
+}
+
+/// [`list_members`] under explicit caps.
+pub fn list_members_with(
+    path: &Path,
+    rel_path: &str,
+    mime: Option<&str>,
+    caps: MemberCaps,
+) -> Option<MemberListing> {
+    let mut budget = Budget::new(caps);
+    let members = match detect_kind(rel_path, mime)? {
+        Kind::Zip => zip_members(path, &mut budget),
+        Kind::Tar => tar_members(std::fs::File::open(path).ok()?, &mut budget),
+        Kind::TarGz => {
+            let file = std::fs::File::open(path).ok()?;
+            tar_members(flate2::read::GzDecoder::new(file), &mut budget)
+        }
+    }?;
+    Some(MemberListing {
+        members,
+        capped: budget.hit,
+    })
+}
+
+/// What is left of a listing's [`MemberCaps`].
+struct Budget {
+    members_left: usize,
+    bytes_left: u64,
+    hit: Option<MemberCap>,
+}
+
+impl Budget {
+    fn new(caps: MemberCaps) -> Self {
+        Self {
+            members_left: caps.max_members,
+            bytes_left: caps.max_unpacked,
+            hit: None,
+        }
+    }
+
+    /// Counts one more member; false (and the cap recorded) once none is left.
+    fn take_member(&mut self) -> bool {
+        if self.hit.is_some() {
+            return false;
+        }
+        if self.members_left == 0 {
+            self.hit = Some(MemberCap::Members);
+            return false;
+        }
+        self.members_left = self.members_left.saturating_sub(1);
+        true
+    }
+
+    /// [`hash_reader`] that stops when the unpacked-bytes budget runs out,
+    /// recording the cap and returning `None` for the cut-off member.
+    fn hash<R: Read>(&mut self, r: R) -> Option<(u64, [u8; 32])> {
+        // One byte past the budget tells "exactly fits" from "ran over".
+        let mut limited = r.take(self.bytes_left.saturating_add(1));
+        let (size, hash) = hash_reader(&mut limited)?;
+        if size > self.bytes_left {
+            self.bytes_left = 0;
+            self.hit = Some(MemberCap::Unpacked);
+            return None;
+        }
+        self.bytes_left = self.bytes_left.saturating_sub(size);
+        Some((size, hash))
+    }
+}
+
+fn zip_members(path: &Path, budget: &mut Budget) -> Option<Vec<ArchiveMember>> {
     let file = std::fs::File::open(path).ok()?;
     let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).ok()?;
     let mut members = Vec::new();
@@ -557,11 +683,17 @@ fn zip_members(path: &Path) -> Option<Vec<ArchiveMember>> {
         // zip's directory carries names and sizes unencrypted even when the
         // contents are encrypted, so a locked member is still listed.
         let (name, size, encrypted, is_file) = match archive.by_index_raw(i) {
-            Ok(e) => (e.name().to_string(), e.size(), e.encrypted(), e.is_file()),
+            Ok(e) => match e.name() {
+                Ok(name) => (name.into_owned(), e.size(), e.encrypted(), e.is_file()),
+                Err(_) => continue,
+            },
             Err(_) => continue,
         };
         if !is_file {
             continue;
+        }
+        if !budget.take_member() {
+            break;
         }
         if encrypted {
             // Shallow: name + size known, contents locked until unlocked.
@@ -576,7 +708,7 @@ fn zip_members(path: &Path) -> Option<Vec<ArchiveMember>> {
         // Readable member: hash its contents for the coverage match.
         match archive.by_index(i) {
             Ok(mut entry) => {
-                if let Some((size, hash)) = hash_reader(&mut entry) {
+                if let Some((size, hash)) = budget.hash(&mut entry) {
                     members.push(ArchiveMember {
                         rel_path: name,
                         size,
@@ -598,7 +730,7 @@ fn zip_members(path: &Path) -> Option<Vec<ArchiveMember>> {
     Some(members)
 }
 
-fn tar_members<R: Read>(reader: R) -> Option<Vec<ArchiveMember>> {
+fn tar_members<R: Read>(reader: R, budget: &mut Budget) -> Option<Vec<ArchiveMember>> {
     let mut archive = tar::Archive::new(reader);
     let mut members = Vec::new();
     for entry in archive.entries().ok()? {
@@ -617,13 +749,21 @@ fn tar_members<R: Read>(reader: R) -> Option<Vec<ArchiveMember>> {
         if name.is_empty() {
             continue;
         }
-        if let Some((size, hash)) = hash_reader(&mut entry) {
-            members.push(ArchiveMember {
+        // A tar has no directory to list from: past a cap, stop reading.
+        if !budget.take_member() {
+            break;
+        }
+        match budget.hash(&mut entry) {
+            Some((size, hash)) => members.push(ArchiveMember {
                 rel_path: name,
                 size,
                 hash: Some(hash),
                 locked: false,
-            });
+            }),
+            // The unpacked budget ran out inside this member.
+            None if budget.hit.is_some() => break,
+            // An unreadable member is skipped, as before the caps.
+            None => {}
         }
     }
     Some(members)

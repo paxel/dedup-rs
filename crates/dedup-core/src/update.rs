@@ -172,7 +172,7 @@ fn walk_and_split(
         let entry = match item {
             Ok(entry) => entry,
             Err(err) => {
-                errors += 1;
+                errors = errors.saturating_add(1);
                 progress.on(ProgressEvent::Error {
                     path: err
                         .path()
@@ -184,7 +184,7 @@ fn walk_and_split(
             }
         };
         if entry.file_type().is_dir() {
-            dirs += 1;
+            dirs = dirs.saturating_add(1);
             continue;
         }
         if !entry.file_type().is_file() {
@@ -193,7 +193,7 @@ fn walk_and_split(
         let metadata = match entry.metadata() {
             Ok(metadata) => metadata,
             Err(err) => {
-                errors += 1;
+                errors = errors.saturating_add(1);
                 progress.on(ProgressEvent::Error {
                     path: entry.path().display().to_string(),
                     message: err.to_string(),
@@ -250,7 +250,7 @@ fn walk_and_split(
                     && entry.size == file.size
                     && entry.modified_ms == file.modified_ms =>
             {
-                unchanged += 1;
+                unchanged = unchanged.saturating_add(1);
             }
             _ => to_hash.push(file),
         }
@@ -355,18 +355,23 @@ pub fn update_repo_authorized(
                         // A changed archive has its members read in the same
                         // pass; an unchanged one never reaches here, so the
                         // heavy re-read is paid once per change, like the hash.
+                        let mut archive_cap = None;
                         let archive_members = if crate::archive::is_archive(
                             &file.rel,
                             fingerprints.mime.as_deref(),
                         ) {
-                            Some(
-                                crate::archive::list_members(
-                                    &file.abs,
-                                    &file.rel,
-                                    fingerprints.mime.as_deref(),
-                                )
-                                .unwrap_or_default(),
-                            )
+                            let caps = crate::archive::MemberCaps::for_archive(file.size);
+                            let listing = crate::archive::list_members_with(
+                                &file.abs,
+                                &file.rel,
+                                fingerprints.mime.as_deref(),
+                                caps,
+                            );
+                            archive_cap = listing
+                                .as_ref()
+                                .and_then(|l| l.capped)
+                                .map(|cap| cap.describe(caps));
+                            Some(listing.map(|l| l.members).unwrap_or_default())
                         } else {
                             None
                         };
@@ -374,6 +379,7 @@ pub fn update_repo_authorized(
                             hash,
                             fingerprints,
                             archive_members,
+                            archive_cap,
                         }
                     });
                     // Receiver gone means the writer failed; just stop sending.
@@ -388,20 +394,28 @@ pub fn update_repo_authorized(
         let mut archive_members: Vec<(&str, Vec<store::ArchiveMember>)> = Vec::new();
         let mut done_bytes: u64 = 0;
         for (index, (file, result)) in receiver.iter().enumerate() {
-            let done = index as u64 + 1;
+            let done = (index as u64).saturating_add(1);
             // Count every file's size toward progress, hashed or errored, so the
             // byte counter reaches `total_bytes` exactly at completion.
-            done_bytes += file.size;
+            done_bytes = done_bytes.saturating_add(file.size);
             match result {
                 Ok(hashed) => {
                     if existing.contains_key(&file.rel) {
-                        stats.updated += 1;
+                        stats.updated = stats.updated.saturating_add(1);
                     } else {
-                        stats.added += 1;
+                        stats.added = stats.added.saturating_add(1);
                     }
-                    stats.hashed_bytes += file.size;
+                    stats.hashed_bytes = stats.hashed_bytes.saturating_add(file.size);
                     if let Some(members) = hashed.archive_members {
                         archive_members.push((file.rel.as_str(), members));
+                    }
+                    // The archive itself is indexed; only its member listing
+                    // stopped short. The report names the cap.
+                    if let Some(message) = hashed.archive_cap {
+                        progress.on(ProgressEvent::Error {
+                            path: file.abs.display().to_string(),
+                            message,
+                        });
                     }
                     let fp = hashed.fingerprints;
                     batch.push((
@@ -427,7 +441,7 @@ pub fn update_repo_authorized(
                     }
                 }
                 Err(err) => {
-                    stats.errors += 1;
+                    stats.errors = stats.errors.saturating_add(1);
                     progress.on(ProgressEvent::Error {
                         path: file.abs.display().to_string(),
                         message: err.to_string(),
@@ -578,6 +592,8 @@ struct HashedFile {
     /// indexing folds into the scan, gated by the same change-detection as the
     /// content hash. `None` for non-archives.
     archive_members: Option<Vec<store::ArchiveMember>>,
+    /// The report line when a member cap stopped the archive's listing.
+    archive_cap: Option<String>,
 }
 
 /// Cheap extension check used only to decide whether to warn about a missing
@@ -652,7 +668,9 @@ pub(crate) fn copy_mtime(from: &std::path::Path, to: &std::path::Path) -> std::i
 pub(crate) fn system_time_to_ms(time: std::time::SystemTime) -> i64 {
     match time.duration_since(std::time::UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
-        Err(err) => -i64::try_from(err.duration().as_millis()).unwrap_or(i64::MAX),
+        Err(err) => {
+            0i64.saturating_sub(i64::try_from(err.duration().as_millis()).unwrap_or(i64::MAX))
+        }
     }
 }
 

@@ -41,8 +41,8 @@ use crate::board::PREVIEW_CAP;
 /// lightbox's limit; larger images are downscaled by the decoder to stay within
 /// driver limits.
 
-#[derive(PartialEq, Clone, Copy)]
-enum Command {
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub(crate) enum Command {
     Copy,
     Move,
     Sync,
@@ -327,6 +327,7 @@ fn board_row(
         right_paths: right.path.into_iter().collect(),
         unchanged,
         cmds,
+        left_tags: Vec::new(),
     };
     let body = board::RowBody {
         left: board::SideBody {
@@ -494,6 +495,7 @@ fn diff_metas(rows: &[RepoDiffRow], left_ro: bool, right_ro: bool) -> Vec<board:
                 right_paths: paths(&row.right),
                 unchanged: row.relation == R::Equal,
                 cmds,
+                left_tags: Vec::new(),
             }
         })
         .collect()
@@ -506,9 +508,9 @@ fn diff_totals(rows: &[RepoDiffRow]) -> [usize; 4] {
     let mut totals = [0usize; 4];
     for row in rows {
         match row.relation {
-            R::Equal => totals[3] += 1,
-            R::OnlyLeft | R::OnlyRight => totals[1] += 1,
-            R::Renamed | R::Conflict => totals[2] += 1,
+            R::Equal => totals[3] = totals[3].saturating_add(1),
+            R::OnlyLeft | R::OnlyRight => totals[1] = totals[1].saturating_add(1),
+            R::Renamed | R::Conflict => totals[2] = totals[2].saturating_add(1),
         }
     }
     totals
@@ -539,7 +541,9 @@ fn diff_action(
         // a command competing for row space. A row with only one side opens
         // that file alone (it used to open nothing — `?` on the absent side
         // swallowed the click).
-        Cmd::OpenRow | Cmd::Compare => {
+        // A plan never reports SELECT (that is a listing's click); treat it
+        // like the row click it is.
+        Cmd::OpenRow | Cmd::Compare | Cmd::Select { .. } => {
             if left.is_none() && right.is_none() {
                 None
             } else {
@@ -679,7 +683,7 @@ fn build_group_preview(
         // builds a `DiffRun` with no selection), so offering HIDE would promise
         // to skip a deletion and then make it anyway.
         for rel in &plan.copies {
-            added += 1;
+            added = added.saturating_add(1);
             if rows.len() < PREVIEW_CAP {
                 // A push can also resurrect: content this sink deleted that
                 // the main still holds comes back. Golden rule: the main's
@@ -706,7 +710,7 @@ fn build_group_preview(
             }
         }
         for rel in &plan.deletes {
-            removed += 1;
+            removed = removed.saturating_add(1);
             if rows.len() < PREVIEW_CAP {
                 let (meta, body) = board_row(
                     SideSpec::absent(),
@@ -774,16 +778,16 @@ fn build_group_back_preview(
         let main_facts = facts_for(main_db.as_deref(), main_base.as_deref(), &item.rel_path);
         let conflict = main_facts.as_ref().is_some_and(|f| !f.missing);
         let main_status = if conflict {
-            conflict_count += 1;
+            conflict_count = conflict_count.saturating_add(1);
             board::Status::Differs
         } else {
             match item.kind {
                 dedup_core::diff::PullKind::New => {
-                    new_count += 1;
+                    new_count = new_count.saturating_add(1);
                     board::Status::OnlyHere
                 }
                 dedup_core::diff::PullKind::Resurrection => {
-                    resurrect_count += 1;
+                    resurrect_count = resurrect_count.saturating_add(1);
                     board::Status::Resurrect
                 }
             }
@@ -1029,7 +1033,7 @@ fn preview_repo(
     for item in &items {
         match item {
             DiffItem::New { rel_path } => {
-                acted += 1;
+                acted = acted.saturating_add(1);
                 if rows.len() < PREVIEW_CAP {
                     let to = if subdir.is_empty() {
                         rel_path.clone()
@@ -1055,7 +1059,7 @@ fn preview_repo(
                 }
             }
             DiffItem::Equal { rel_path, .. } => {
-                unchanged += 1;
+                unchanged = unchanged.saturating_add(1);
                 if rows.len() < PREVIEW_CAP {
                     let (meta, body) = board_row(
                         SideSpec::at(
@@ -1081,7 +1085,7 @@ fn preview_repo(
             // visible blue row: the file's preview under a WAS DELETED veil,
             // informational only (no APPLY — the engine will not copy it).
             DiffItem::DeletedInReference { rel_path } => {
-                skipped_deleted += 1;
+                skipped_deleted = skipped_deleted.saturating_add(1);
                 if rows.len() < PREVIEW_CAP {
                     // Golden rule: the source file exists and nothing happens
                     // to it — plain preview. The *target* side tells its own
@@ -1447,6 +1451,9 @@ pub struct TransferView {
     /// with `repos` whenever the tab is shown.
     mains: std::collections::HashSet<String>,
     loaded: bool,
+    /// The start page handed over the repositories and the roles, so the
+    /// body's own WITH WHICH and SINKS sections are not shown.
+    from_start: bool,
     source: Option<String>,
     target: Option<String>,
     /// Extra reference repos beyond the target: a file counts as "new" only
@@ -1614,6 +1621,7 @@ impl TransferView {
             repos: Vec::new(),
             mains: std::collections::HashSet::new(),
             loaded: false,
+            from_start: false,
             source: None,
             target: None,
             extra_refs: Vec::new(),
@@ -1735,7 +1743,7 @@ impl TransferView {
                 if i.key_pressed(egui::Key::P) {
                     acts.push(Act::Preview);
                 }
-                if i.key_pressed(egui::Key::R) {
+                if i.key_pressed(egui::Key::A) {
                     acts.push(Act::Ask);
                 }
             });
@@ -1760,7 +1768,7 @@ impl TransferView {
                 );
                 crate::util::shortcut_bar(
                     ui,
-                    "1 copy · 2 move · 3 sync · 4 mirror · 5 diff · P review · R run",
+                    "1 copy · 2 move · 3 sync · 4 mirror · 5 diff · P preview · A apply",
                 );
 
                 // Reading order is the workflow: WHAT (the command), WITH
@@ -1769,7 +1777,7 @@ impl TransferView {
                 // answer; after REVIEW or RUN they fold to their header bars,
                 // and each one flips back open on its own.
                 self.command_bar(ui, &mut acts);
-                if self.command_chosen {
+                if self.command_chosen && !self.from_start {
                     self.repo_rows(ui, &mut acts);
                     match self.command {
                         Command::GroupSync => self.group_sinks_bar(ui, &mut acts),
@@ -1876,6 +1884,82 @@ impl TransferView {
         }
     }
 
+    /// Open this body from the start page (ADR 0004) for `command` on `repos`.
+    /// The start page settled the roles: a backup group (`group`: its main and
+    /// the selected backups) names them itself, a pair comes with `source`
+    /// and `target`, a single repository is a folder export's source, and a
+    /// DIFF pair needs no direction. The body's own WITH WHICH section is not
+    /// shown; a different selection is made on the start page.
+    pub fn open_from(
+        &mut self,
+        store: &Store,
+        command: Command,
+        repos: &[String],
+        source: Option<String>,
+        target: Option<String>,
+        group: Option<(String, Vec<String>)>,
+    ) {
+        self.sync_repos(store);
+        self.source = None;
+        self.target = None;
+        self.extra_refs.clear();
+        self.destination = Destination::Repo;
+        match (group, source, repos) {
+            (Some((main, sinks)), _, _) => {
+                self.source = Some(main);
+                self.refresh_group(store);
+                self.selected_sinks.retain(|s| sinks.contains(s));
+            }
+            (None, Some(src), _) => {
+                self.source = Some(src);
+                self.target = target;
+                self.refresh_group(store);
+            }
+            (None, None, [one]) => {
+                self.source = Some(one.clone());
+                self.destination = Destination::Folder;
+                self.refresh_group(store);
+            }
+            (None, None, [a, b]) => {
+                let (a, b) = if a <= b { (a, b) } else { (b, a) };
+                self.source = Some(a.clone());
+                self.target = Some(b.clone());
+                self.refresh_group(store);
+            }
+            _ => self.refresh_group(store),
+        }
+        // After `refresh_group`, which snaps a GROUP command back to COPY
+        // when the source names no group.
+        self.command = command;
+        self.command_chosen = true;
+        self.from_start = true;
+        self.clear_preview();
+        for title in [
+            "WHAT — COPY, MOVE, SYNC, MIRROR, GROUP SYNC, GROUP SYNC BACK OR DIFF",
+            "WHAT — COPY, MOVE, SYNC, MIRROR OR DIFF",
+        ] {
+            self.folds.set(title, false);
+        }
+    }
+
+    /// The source and target as handed over, for tests.
+    #[cfg(test)]
+    pub(crate) fn roles(&self) -> (Option<String>, Option<String>) {
+        (self.source.clone(), self.target.clone())
+    }
+
+    /// The command in force, for tests.
+    #[cfg(test)]
+    pub(crate) fn command(&self) -> Command {
+        self.command
+    }
+
+    /// The backups the next GROUP SYNC pushes to, for tests.
+    #[cfg(test)]
+    pub(crate) fn selected_sinks(&self) -> &[String] {
+        &self.selected_sinks
+    }
+
     /// Re-resolve GROUP SYNC's group from the current source: the sync group
     /// (if any) whose main *is* the source, and every one of its sinks
     /// selected by default. Falls back off GROUP SYNC when the source no
@@ -1915,8 +1999,10 @@ impl TransferView {
         crate::lcars::section_lcars_folding(ui, title, theme::lilac(), &mut open, |ui| {
             if with_target {
                 ui.columns(2, |cols| {
-                    self.source_column(&mut cols[0], acts);
-                    self.target_column(&mut cols[1], acts);
+                    if let [source, target] = cols {
+                        self.source_column(source, acts);
+                        self.target_column(target, acts);
+                    }
                 });
             } else {
                 self.source_column(ui, acts);
@@ -1934,7 +2020,10 @@ impl TransferView {
             let src = self.repos.clone();
             let mains = self.mains.clone();
             crate::repo_chip::chip_row(ui, "xfer_source", "SOURCE", src.len(), |ui, i| {
-                let name = &src[i];
+                // `chip_row` only asks for indices below the length it was given.
+                let Some(name) = src.get(i) else {
+                    return ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover());
+                };
                 let sel = self.source.as_deref() == Some(name.as_str());
                 let chip = crate::repo_chip::repo_chip(
                     ui,
@@ -1975,7 +2064,10 @@ impl TransferView {
                     .collect();
                 let mains = self.mains.clone();
                 crate::repo_chip::chip_row(ui, "xfer_target", "TARGET", tgt.len(), |ui, i| {
-                    let name = &tgt[i];
+                    // `chip_row` only asks for indices below the length it was given.
+                    let Some(name) = tgt.get(i) else {
+                        return ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover());
+                    };
                     let sel = self.target.as_deref() == Some(name.as_str());
                     let chip = crate::repo_chip::repo_chip(
                         ui,
@@ -2048,7 +2140,10 @@ impl TransferView {
                 });
                 let mains = self.mains.clone();
                 crate::repo_chip::chip_row(ui, "xfer_pool", "", eligible.len(), |ui, i| {
-                    let name = &eligible[i];
+                    // `chip_row` only asks for indices below the length it was given.
+                    let Some(name) = eligible.get(i) else {
+                        return ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover());
+                    };
                     let sel = self.extra_refs.iter().any(|r| r == name);
                     let chip = crate::repo_chip::repo_chip(
                         ui,
@@ -2476,7 +2571,10 @@ impl TransferView {
                 return;
             };
             crate::repo_chip::chip_row(ui, "xfer_back_sink", "", group.sinks.len(), |ui, i| {
-                let sink = &group.sinks[i];
+                // `chip_row` only asks for indices below `group.sinks.len()`.
+                let Some(sink) = group.sinks.get(i) else {
+                    return ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover());
+                };
                 let mode = sink_mode_label(sink.mode);
                 let sel = self
                     .selected_sinks
@@ -2545,7 +2643,7 @@ impl TransferView {
                     .explain(
                         self.verbosity,
                         "Clear the sink selection",
-                        "Deselect every sink (REVIEW/RUN are disabled until at least one is \
+                        "Deselect every sink (PREVIEW/APPLY ALL are disabled until at least one is \
                          picked).",
                     )
                     .clicked()
@@ -2554,7 +2652,10 @@ impl TransferView {
                 }
             });
             crate::repo_chip::chip_row(ui, "xfer_sinks", "", group.sinks.len(), |ui, i| {
-                let sink = &group.sinks[i];
+                // `chip_row` only asks for indices below `group.sinks.len()`.
+                let Some(sink) = group.sinks.get(i) else {
+                    return ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover());
+                };
                 let mode = sink_mode_label(sink.mode);
                 let sel = self.selected_sinks.iter().any(|s| s == &sink.repo);
                 let accent = sink_mode_accent(sink.mode);
@@ -2601,7 +2702,7 @@ impl TransferView {
                     (
                         "Include this sink in the push",
                         "Toggle whether this sink is included when GROUP SYNC runs. Its mode \
-                             (ADD ONLY / APPLY CHANGES / MIRROR) is set on the Repositories tab.",
+                             (ADD ONLY / APPLY CHANGES / MIRROR) is set on the start page.",
                     )
                 };
                 if row
@@ -2798,18 +2899,18 @@ impl TransferView {
     fn action_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         crate::lcars::section_lcars(
             ui,
-            "RUN — REVIEW THE PLAN, THEN RUN IT",
+            "PREVIEW THE PLAN, THEN APPLY IT",
             theme::amber(),
             |ui| {
                 ui.horizontal(|ui| {
                     let ready = self.ready();
-                    if crate::lcars::action_button(ui, "REVIEW", ready, theme::blue())
+                    if crate::lcars::action_button(ui, "PREVIEW", ready, theme::blue())
                         .explain(
                             self.verbosity,
-                            "Review the transfers",
+                            "Show what would change, without changing anything",
                             "Plan the transfer in the activity window and show every planned \
                          `from → to` on the board below, without changing anything on \
-                         disk. Starting a run clears the review.",
+                         disk. APPLY ALL is offered once the plan is on the board.",
                         )
                         .clicked()
                     {
@@ -2818,25 +2919,31 @@ impl TransferView {
                     if self.command.is_diff() {
                         return;
                     }
-                    // The session locks can bar the whole run (e.g. MIRROR into a
-                    // locked target). The blocked button's hover says exactly why
-                    // and which padlock to click.
+                    // The plan has to be on the board before it can be applied —
+                    // ADR 0004: preview, then APPLY — and the session locks can
+                    // bar the whole run (e.g. MIRROR into a locked target). The
+                    // blocked button's hover says exactly why and which padlock to
+                    // click.
                     let lock_block = self.lock_block();
+                    let previewed = !self.preview.is_empty();
                     let resp = crate::lcars::action_button(
                         ui,
-                        "RUN",
-                        ready && lock_block.is_none(),
+                        "APPLY ALL",
+                        ready && previewed && lock_block.is_none(),
                         theme::amber(),
                     );
                     let resp = if let Some(why) = &lock_block {
                         resp.on_hover_text(why.clone())
+                    } else if !previewed {
+                        resp.on_hover_text("PREVIEW first: APPLY ALL runs the plan on the board")
                     } else {
                         resp.explain(
                             self.verbosity,
-                            "Run the command",
-                            "After a confirmation, run the command in the activity window: \
-                         it shows each file as it is transferred, any problems, and \
-                         ends with the result. CANCEL stops further work.",
+                            "Apply the plan on the board",
+                            "After a confirmation, apply every row on the board (hidden rows \
+                         are skipped) in the activity window: it shows each file as it is \
+                         transferred, any problems, and ends with the result. CANCEL stops \
+                         further work.",
                         )
                     };
                     if resp.clicked() {
@@ -2867,7 +2974,11 @@ impl TransferView {
     /// no `Conflict`, BY PATH no `Renamed`.
     fn offered_bulk_ops(&self, listed: &[usize]) -> Vec<BulkOp> {
         let mut ops = Vec::new();
-        let has = |want: DiffRelation| listed.iter().any(|&i| self.diff_rows[i].relation == want);
+        let has = |want: DiffRelation| {
+            listed
+                .iter()
+                .any(|&i| self.diff_rows.get(i).is_some_and(|r| r.relation == want))
+        };
         if has(DiffRelation::OnlyLeft) {
             ops.push(BulkOp::CopyMissingRight);
         }
@@ -2886,7 +2997,9 @@ impl TransferView {
         use crate::diff_board::BoardAction;
         let mut plan = Vec::new();
         for &i in listed {
-            let row = &self.diff_rows[i];
+            let Some(row) = self.diff_rows.get(i) else {
+                continue;
+            };
             match (op, row.relation) {
                 (BulkOp::CopyMissingRight, DiffRelation::OnlyLeft) => {
                     for f in &row.left {
@@ -2937,7 +3050,7 @@ impl TransferView {
                 ui.add_space(6.0);
                 ui.colored_label(
                     theme::text(),
-                    "Pick two repos and press REVIEW to compare them.",
+                    "Pick two repos and press PREVIEW to compare them.",
                 );
                 return;
             }
@@ -3028,10 +3141,14 @@ impl TransferView {
                     // DIFF runs each command as it is clicked; there is no RUN
                     // for a hidden row to be skipped by.
                     hide_skips_run: false,
+                    listing: false,
                 },
                 &mut self.thumbs,
                 &mut |i| {
-                    let row = &rows[i];
+                    // The board only asks for rows it was given.
+                    let Some(row) = rows.get(i) else {
+                        return board::RowBody::default();
+                    };
                     let side = |files: &[dedup_core::diff::DiffFile],
                                 db: Option<&redb::Database>,
                                 base: Option<&str>,
@@ -3080,9 +3197,9 @@ impl TransferView {
         if self.preview.is_empty() {
             ui.add_space(6.0);
             let hint = if self.command == Command::GroupSync {
-                "Pick at least one sink above, then press REVIEW."
+                "Pick at least one sink above, then press PREVIEW."
             } else {
-                "Pick a source, a target and a command, then press REVIEW."
+                "Pick a source, a target and a command, then press PREVIEW."
             };
             ui.colored_label(theme::text(), hint);
             return;
@@ -3178,6 +3295,7 @@ impl TransferView {
                 // the cap notice compares this against what was materialised.
                 full_len: self.preview_totals.iter().sum(),
                 hide_skips_run: true,
+                listing: false,
             },
             &mut self.thumbs,
             &mut |i| bodies.get(i).cloned().unwrap_or_default(),
@@ -3566,7 +3684,7 @@ impl TransferView {
         self.pending_group_confirm = None;
         self.wholesale_sinks.clear();
         self.preview.clear();
-        self.preview_gen += 1;
+        self.preview_gen = self.preview_gen.saturating_add(1);
         self.diff_rows.clear();
         // A popup (and an open comparison) belongs to the rows it was opened
         // from.
@@ -3715,8 +3833,10 @@ impl TransferView {
                 true
             }
             Err(busy) => {
-                crate::activity::lock(&self.activity)
-                    .card(ctx, crate::activity::Notification::refused("REVIEW", &busy));
+                crate::activity::lock(&self.activity).card(
+                    ctx,
+                    crate::activity::Notification::refused("PREVIEW", &busy),
+                );
                 false
             }
         }
@@ -3759,8 +3879,10 @@ impl TransferView {
                 true
             }
             Err(busy) => {
-                crate::activity::lock(&self.activity)
-                    .card(ctx, crate::activity::Notification::refused("RUN", &busy));
+                crate::activity::lock(&self.activity).card(
+                    ctx,
+                    crate::activity::Notification::refused("APPLY ALL", &busy),
+                );
                 false
             }
         }
@@ -3879,7 +4001,7 @@ impl TransferView {
         repos.extend(group.sinks.iter().map(|s| s.repo.clone()));
         self.start_preview(
             ctx,
-            format!("REVIEW group sync of '{}'", group.main),
+            format!("PREVIEW group sync of '{}'", group.main),
             repos,
             move |progress, cancel| {
                 let report = |p: PlanProgress| crate::activity::plan_phase(progress, p);
@@ -3912,7 +4034,7 @@ impl TransferView {
         let repos = vec![sink.clone(), group.main.clone()];
         self.start_preview(
             ctx,
-            format!("REVIEW pull of '{sink}' into '{}'", group.main),
+            format!("PREVIEW pull of '{sink}' into '{}'", group.main),
             repos,
             move |progress, cancel| {
                 let report = |p: PlanProgress| crate::activity::plan_phase(progress, p);
@@ -3955,7 +4077,10 @@ impl TransferView {
         // slot, and the resurrection count is spoken in the status line and
         // shown as the blue rows themselves.
         self.preview_totals = [0, outcome.added, outcome.conflicts, 0];
-        self.preview_total = outcome.added + outcome.removed + outcome.conflicts;
+        self.preview_total = outcome
+            .added
+            .saturating_add(outcome.removed)
+            .saturating_add(outcome.conflicts);
         self.preview_source_header = outcome.main_header.clone();
         self.preview_target_header = outcome
             .group
@@ -3965,7 +4090,7 @@ impl TransferView {
             .unwrap_or_default();
         self.wholesale_sinks = Vec::new();
         self.preview = outcome.rows;
-        self.preview_gen += 1;
+        self.preview_gen = self.preview_gen.saturating_add(1);
         self.preview_bodies = outcome.bodies;
         let conflicts_line = if outcome.conflicts > 0 {
             format!(
@@ -4019,7 +4144,7 @@ impl TransferView {
             }
         };
         self.preview_totals = [outcome.removed, outcome.added, 0, 0];
-        self.preview_total = outcome.added + outcome.removed;
+        self.preview_total = outcome.added.saturating_add(outcome.removed);
         // The left header names the main like every other surface does — by its
         // path, not its bare name. The right one says how many sinks the push
         // covers; each row names the sink it belongs to with its own chip.
@@ -4036,7 +4161,7 @@ impl TransferView {
         // The board sorts through its own index; the caller just hands over the
         // rows and their bodies, index-aligned.
         self.preview = outcome.rows;
-        self.preview_gen += 1;
+        self.preview_gen = self.preview_gen.saturating_add(1);
         self.preview_bodies = outcome.bodies;
         self.status = Some(format!(
             "{} file(s) to copy, {} to delete across {} sink(s).",
@@ -4253,10 +4378,10 @@ impl TransferView {
                     &run,
                 ) {
                     Ok(stats) => {
-                        copied += stats.copied;
-                        deleted += stats.deleted;
-                        skipped_files += stats.skipped;
-                        errors += stats.errors;
+                        copied = copied.saturating_add(stats.copied);
+                        deleted = deleted.saturating_add(stats.deleted);
+                        skipped_files = skipped_files.saturating_add(stats.skipped);
+                        errors = errors.saturating_add(stats.errors);
                         cancelled |= stats.cancelled;
                     }
                     Err(e) => failures.push(format!("{}: {e}", sink.repo)),
@@ -4293,7 +4418,11 @@ impl TransferView {
         }
         self.start_preview(
             ctx,
-            format!("REVIEW {} from '{}'", config.command.label(), config.source),
+            format!(
+                "PREVIEW {} from '{}'",
+                config.command.label(),
+                config.source
+            ),
             repos,
             move |progress, cancel| {
                 let report = |p: PlanProgress| crate::activity::plan_phase(progress, p);
@@ -4329,7 +4458,7 @@ impl TransferView {
         self.preview_source_header = data.source_header;
         self.preview_target_header = data.target_header;
         self.preview = data.rows;
-        self.preview_gen += 1;
+        self.preview_gen = self.preview_gen.saturating_add(1);
         self.preview_bodies = data.bodies;
         self.status = Some(data.status);
         self.error = None;
@@ -4584,15 +4713,19 @@ impl TransferView {
                     // Not produced by `bulk_plan`.
                     _ => continue,
                 };
-                progress.phase(format!("{verb} {rel}"), i as u64 + 1, Some(total));
+                progress.phase(
+                    format!("{verb} {rel}"),
+                    (i as u64).saturating_add(1),
+                    Some(total),
+                );
                 match outcome {
                     Ok(()) => {
-                        done += 1;
+                        done = done.saturating_add(1);
                         progress.record(&crate::activity::Notification::changed(did, &repo, &rel));
                     }
                     Err(e) => {
                         log::warn!("bulk action failed: {e}");
-                        failed += 1;
+                        failed = failed.saturating_add(1);
                         let e = e.to_string();
                         progress.problem(format!("{rel}: {e}"));
                         progress
@@ -4690,7 +4823,7 @@ impl TransferView {
                     for rel_path in &rel_paths {
                         match delete_file(&store, &repo, rel_path) {
                             Ok(()) => {
-                                deleted += 1;
+                                deleted = deleted.saturating_add(1);
                                 progress.record(&Notification::changed("Deleted", &repo, rel_path));
                             }
                             Err(e) => {
@@ -5480,7 +5613,7 @@ mod ui_tests {
                 view,
             );
         harness.run();
-        harness.get_by_label("REVIEW").click_accesskit();
+        harness.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut harness);
         harness.run();
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
@@ -5564,7 +5697,7 @@ mod ui_tests {
             v.sync_repos(&store2);
             v.command = Command::GroupSyncBack;
         });
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut h);
         assert_eq!(
             h.state().preview.len(),
@@ -5679,7 +5812,7 @@ mod ui_tests {
             v.sync_repos(&store2);
             v.command = Command::GroupSyncBack;
         });
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut h);
 
         let (i, conflict) = h
@@ -5770,7 +5903,7 @@ mod ui_tests {
             v.sync_repos(&store2);
             v.command = Command::GroupSyncBack;
         });
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut h);
 
         // The conflict row hands both sides to the viewer …
@@ -5849,11 +5982,14 @@ mod ui_tests {
             v.sync_repos(&store2);
             v.command = Command::GroupSyncBack;
         });
-        h.get_by_label("RUN").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
+        settle_preview(&mut h);
+        h.run();
+        h.get_by_label("APPLY ALL").click_accesskit();
         settle_preview(&mut h);
         assert!(
             h.state().confirm.is_some(),
-            "RUN raises a confirmation once the plan lands"
+            "APPLY ALL raises a confirmation once the plan lands"
         );
         assert!(
             h.state()
@@ -5911,7 +6047,10 @@ mod ui_tests {
             v.sync_repos(&store2);
             v.command = Command::GroupSyncBack;
         });
-        h.get_by_label("RUN").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
+        settle_preview(&mut h);
+        h.run();
+        h.get_by_label("APPLY ALL").click_accesskit();
         settle_preview(&mut h);
         h.get_by_label("PROCEED").click_accesskit();
         for _ in 0..100 {
@@ -5990,7 +6129,7 @@ mod ui_tests {
                 view,
             );
         h.run();
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut h);
         // The sink is locked (the default): no DELETE is offered, the
         // promote stays.
@@ -6101,7 +6240,7 @@ mod ui_tests {
                 view,
             );
         h.run();
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut h);
         // One row (the resurrection); its `< COPY` pulls just that file.
         h.get_by_label("< COPY").click_accesskit();
@@ -6241,7 +6380,7 @@ mod ui_tests {
             v.sync_repos(&store2);
             v.command = Command::GroupSync;
         });
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut h);
         assert_eq!(
             h.state().preview_totals[1],
@@ -6283,11 +6422,14 @@ mod ui_tests {
             v.sync_repos(&store2);
             v.command = Command::GroupSync;
         });
-        h.get_by_label("RUN").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
+        settle_preview(&mut h);
+        h.run();
+        h.get_by_label("APPLY ALL").click_accesskit();
         settle_preview(&mut h);
         assert!(
             h.state().confirm.is_some(),
-            "RUN raises a confirmation once the plan lands"
+            "APPLY ALL raises a confirmation once the plan lands"
         );
         assert!(
             h.state()
@@ -6342,7 +6484,7 @@ mod ui_tests {
             // it so the push is attempted and the empty-main refusal can fire.
             v.locks.toggle("target");
         });
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut h);
         assert!(
             h.state().error.is_some(),
@@ -6384,7 +6526,7 @@ mod ui_tests {
             v.command = Command::GroupSync;
             v.selected_sinks = vec!["target".to_string()];
         });
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut h);
         assert!(
             h.state()
@@ -6428,7 +6570,7 @@ mod ui_tests {
         for _ in 0..5 {
             h.step();
         }
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut h);
         assert_eq!(
             h.state().preview_totals[1],
@@ -6520,7 +6662,7 @@ mod ui_tests {
             "no repository chip before a command is chosen"
         );
         assert!(h.query_by_label_contains("DEST — ").is_none());
-        assert!(h.query_by_label("REVIEW").is_none());
+        assert!(h.query_by_label("PREVIEW").is_none());
 
         h.get_by_label("COPY").click();
         h.run();
@@ -6552,17 +6694,17 @@ mod ui_tests {
             "HOW sits below the repositories"
         );
         assert!(
-            h.query_by_label("REVIEW").is_none(),
+            h.query_by_label("PREVIEW").is_none(),
             "RUN waits for a target"
         );
 
         let target_chip = top_chip(&h, "target", true);
         click_at(&mut h, "target", target_chip);
         h.run();
-        let review = h.get_by_label("REVIEW").rect();
+        let review = h.get_by_label("PREVIEW").rect();
         assert!(review.top() > dest.top(), "RUN comes last");
 
-        h.get_by_label("REVIEW").click();
+        h.get_by_label("PREVIEW").click();
         settle_preview(&mut h);
         assert!(
             h.query_by_label_contains("WHAT — ").is_some(),
@@ -7077,7 +7219,7 @@ mod ui_tests {
         );
         assert!(h.query_by_label("BY PATH").is_some());
         assert!(
-            h.query_by_label("RUN").is_none(),
+            h.query_by_label("APPLY ALL").is_none(),
             "DIFF has no batch RUN — rows are applied one at a time"
         );
         assert!(
@@ -7085,7 +7227,7 @@ mod ui_tests {
             "DIFF compares the repos whole, so the filter wizard is hidden"
         );
         assert!(
-            h.query_by_label("REVIEW").is_some(),
+            h.query_by_label("PREVIEW").is_some(),
             "REVIEW still builds the comparison"
         );
     }
@@ -7504,7 +7646,7 @@ mod ui_tests {
                 view,
             );
         h.run();
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut h);
         // Extra frames so the row previews (thumbnails, text heads, byte
         // views) land before the render.
@@ -7721,7 +7863,7 @@ mod ui_tests {
         // Nothing on the board yet — the plan hasn't been asked for.
         assert!(h.state().diff_rows.is_empty(), "board starts empty");
 
-        h.get_by_label("REVIEW").click();
+        h.get_by_label("PREVIEW").click();
         // The result arrives over the channel from a worker thread, never inline
         // on the UI thread; settle pumps frames until it lands.
         settle_preview(&mut h);
@@ -7761,7 +7903,7 @@ mod ui_tests {
 
         // The button can be scrolled off the short test window; accesskit clicks
         // reach it regardless.
-        h.get_by_label("REVIEW").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
         settle_preview(&mut h);
 
         assert!(!h.state().previewing, "preview finished");
@@ -7936,11 +8078,14 @@ mod ui_tests {
             v.command = Command::Copy;
         });
 
-        h.get_by_label("RUN").click_accesskit();
+        h.get_by_label("PREVIEW").click_accesskit();
+        settle_preview(&mut h);
+        h.run();
+        h.get_by_label("APPLY ALL").click_accesskit();
         settle_preview(&mut h); // the plan lands and raises the confirmation
         assert!(
             h.state().confirm.is_some(),
-            "RUN raises a confirmation once the plan lands"
+            "APPLY ALL raises a confirmation once the plan lands"
         );
         assert!(
             h.state()

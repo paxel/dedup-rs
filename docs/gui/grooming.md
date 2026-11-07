@@ -1,20 +1,22 @@
-# Grooming tab
+# Grooming
 
 ![A PURGE preview on the review board](../screenshots/groom_purge_board.png)
 
 Tidy a single repository in place: remove redundant copies, delete files by filter, clear
 empty directories, reorganize files into a dated/templated tree, or drop stale index records.
 Every tool previews on the shared [review board](index.md#the-review-board) first — nothing
-touches disk until you RUN.
+touches disk until you APPLY ALL.
 
-## Reading order
+## Getting here
 
-The tab asks its questions top to bottom: **WHAT** (the tool), **WITH WHICH** (the
-repository, plus the dupe pool for DEDUPE), **HOW** (the filter or the rules) and only then
-**RUN**. Each section appears once the one above it has an answer — a fresh tab shows only
-the tool chips — and keeps its answer when an earlier one changes. Once REVIEW or RUN
-starts, the sections above fold into one summary line; **CHANGE** unfolds them, and the RUN
-section stays so a reviewed plan can be run.
+Select one repository on the [start page](start-page.md) and pick **PRUNE MISSING**,
+**REORGANIZE**, **PURGE BY FILTER** or **EMPTY DIRECTORIES** (the last two need the
+repository unlocked); select two or more and pick **DEDUPE AGAINST**, then say which one is
+deleted from (**FROM**) and **GO**. The header strip names the selection and the tool;
+**START** returns to the start page with the selection kept. Inside, the body shows **WHAT**
+(the tool, folded — open it to switch), then **HOW** (the filter or the rules), then
+**PREVIEW** and **APPLY ALL**. Once PREVIEW starts, the sections above fold to their header
+bars; click one to open it.
 
 ## What: the tool
 
@@ -26,7 +28,7 @@ Pick a grooming tool with the chips (or the number keys `1`–`5`):
   that stays" — and a **COMPARE** button opens the pair in the shared viewer so you can look
   before you delete. Your repo is only ever trimmed of content that is safely held somewhere
   else — and never of content you [accepted](duplicates.md#accepted-content) in it: accepted
-  files are left out of the REVIEW preview and of the run.
+  files are left out of the preview and of the run.
 - **PURGE** — delete files in this repo matching a [filter](transfer.md#filter-builder).
   Purge needs at least one condition: with no filter nothing matches and nothing is deleted,
   so you can never empty a repo by leaving the filter blank. Useful for sweeping out a class of
@@ -47,26 +49,26 @@ Pick a grooming tool with the chips (or the number keys `1`–`5`):
 
 ## How: filter or rules
 
-- **FILTER** — the same condition builder the [Transfer tab](transfer.md#filter-builder) uses.
+- **FILTER** — the same condition builder [Transfer](transfer.md#filter-builder) uses.
   Required for PURGE; optional for DEDUPE, where it narrows which files a preview considers.
 - **RULES** — ORGANIZE's ordered list of filter + path template pairs (see the tool above).
   EMPTY DIRS and PRUNE have nothing to set.
 
 ## Run
 
-**REVIEW** and **RUN** are the two run buttons; everything above them is a selection.
+**PREVIEW** and **APPLY ALL** are the two run buttons; everything above them is a selection.
 
-- **REVIEW** plans in the [activity window](index.md#the-activity-window) — "reading
+- **PREVIEW** plans in the [activity window](index.md#the-activity-window) — "reading
   'repo'", "pairing files" for DEDUPE — which closes by itself once the board is ready, without
   touching disk. PURGE, DEDUPE and ORGANIZE rows show what would be deleted or moved (DEDUPE
-  naming the surviving copy, ORGANIZE the destination path); **HIDE** parks a row so RUN skips
+  naming the surviving copy, ORGANIZE the destination path); **HIDE** parks a row so APPLY ALL skips
   it. PURGE and PRUNE rows are one-sided and carry no COMPARE (there is no counterpart to look
   at). A row's **APPLY** runs just that row as a quick action: a notification card names the
   file once it is done, the event log keeps the line, and the board refreshes.
-- **RUN** plans first (so the confirmation can state the exact count), asks, then applies the
+- **APPLY ALL** plans first (so the confirmation can state the exact count), asks, then applies the
   plan in the activity window: it names each file as it is deleted or moved, counts up to the
   total, lists each problem, and offers **CANCEL** — which stops further work without rolling
   back what already ran. When the run ends the same window shows the result report, and every
   file it changed is in the event log (**LOG**, top right). EMPTY DIRS reports how many
-  directories it removed per repository. Only one operation runs at a time: a second REVIEW or
-  RUN while one is up is refused with a card naming what is still running.
+  directories it removed per repository. Only one operation runs at a time: a second PREVIEW or
+  APPLY ALL while one is up is refused with a card naming what is still running.

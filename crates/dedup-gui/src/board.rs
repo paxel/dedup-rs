@@ -80,6 +80,9 @@ pub enum Status {
     Resurrect,
     /// The file is not on this side at all — the cell renders empty.
     Absent,
+    /// A listing's tombstone: the index remembers the file, the disk no longer
+    /// holds it. Blue, like a resurrection — the same "was here" story.
+    Missing,
 }
 
 impl Status {
@@ -91,6 +94,7 @@ impl Status {
             Status::Differs => theme::amber(),
             Status::Resurrect => theme::blue(),
             Status::Absent => theme::grey(),
+            Status::Missing => theme::blue(),
         }
     }
 
@@ -103,6 +107,7 @@ impl Status {
             Status::OnlyHere => 3,
             Status::Same => 4,
             Status::Absent => 5,
+            Status::Missing => 6,
         }
     }
 }
@@ -182,7 +187,7 @@ fn layout(cmds: &[Cmd]) -> Vec<Line> {
     lines.extend(
         whole
             .chunks(2)
-            .map(|pair| Line::Centre(pair[0], pair.get(1).copied())),
+            .filter_map(|pair| pair.first().map(|&a| Line::Centre(a, pair.get(1).copied()))),
     );
     lines
 }
@@ -218,6 +223,13 @@ pub enum Cmd {
     /// opens the shared viewer, which is why rows no longer carry a COMPARE
     /// command — it would be a second door to the same place.
     OpenRow,
+    /// Not a button: on a listing (`BoardView::listing`) a single click on a
+    /// row selects it instead, with the modifiers the caller's selection model
+    /// wants (Ctrl toggles, Shift extends); a double click still opens it.
+    Select {
+        ctrl: bool,
+        shift: bool,
+    },
 }
 
 impl Cmd {
@@ -234,6 +246,7 @@ impl Cmd {
             Cmd::DeleteLeft | Cmd::DeleteRight => "DELETE",
             Cmd::Compare => "COMPARE",
             Cmd::OpenRow => "OPEN",
+            Cmd::Select { .. } => "SELECT",
             Cmd::OverwriteRight => "OVERWRITE >",
             Cmd::OverwriteLeft => "< OVERWRITE",
             Cmd::RenameLeft | Cmd::RenameRight => "RENAME",
@@ -250,7 +263,7 @@ impl Cmd {
             Cmd::DeleteLeft | Cmd::DeleteRight | Cmd::DeleteAllLeft | Cmd::DeleteAllRight => {
                 theme::red()
             }
-            Cmd::Compare | Cmd::OpenRow => theme::lilac(),
+            Cmd::Compare | Cmd::OpenRow | Cmd::Select { .. } => theme::lilac(),
             Cmd::OverwriteRight
             | Cmd::OverwriteLeft
             | Cmd::RenameLeft
@@ -280,7 +293,9 @@ impl Cmd {
             | Cmd::RenameRight
             | Cmd::KeepOneRight
             | Cmd::DeleteAllRight => Side::Right,
-            Cmd::Apply | Cmd::Hide | Cmd::Compare | Cmd::OpenRow => Side::Neither,
+            Cmd::Apply | Cmd::Hide | Cmd::Compare | Cmd::OpenRow | Cmd::Select { .. } => {
+                Side::Neither
+            }
         }
     }
 
@@ -298,7 +313,7 @@ impl Cmd {
             Cmd::Apply => Kind::Apply,
             Cmd::Hide => Kind::Hide,
             // Never laid out with the others — it is not a button.
-            Cmd::OpenRow => Kind::Apply,
+            Cmd::OpenRow | Cmd::Select { .. } => Kind::Apply,
         }
     }
 
@@ -318,6 +333,7 @@ impl Cmd {
             Cmd::DeleteRight => "Delete this file from the right-hand repository",
             Cmd::Compare => "Show both versions side by side",
             Cmd::OpenRow => "Open this row in the viewer",
+            Cmd::Select { .. } => "Select this row",
             Cmd::OverwriteRight => "Replace the right-hand file with this one",
             Cmd::OverwriteLeft => "Replace the left-hand file with this one",
             Cmd::RenameLeft => "Rename the left-hand file to the other side's name",
@@ -353,6 +369,9 @@ pub struct RowMeta {
     pub unchanged: bool,
     /// The commands this row offers, in display order.
     pub cmds: Vec<Cmd>,
+    /// The left file's annotation tags, drawn as chips on a line of their own
+    /// (a listing's TAGS column). Empty on a plan.
+    pub left_tags: Vec<String>,
 }
 
 impl RowMeta {
@@ -366,8 +385,10 @@ impl RowMeta {
     /// the most names, or the command grid.
     fn height(&self) -> f32 {
         let lines = self.left_paths.len().max(self.right_paths.len()).max(1);
-        // A side cell is a thumbnail beside (path lines + one facts line).
-        let side = THUMB.max(LINE_H * (lines as f32 + 1.0));
+        // A side cell is a thumbnail beside (path lines + one facts line), plus
+        // a line of tag chips when the row carries any.
+        let tag_lines = usize::from(!self.left_tags.is_empty());
+        let side = THUMB.max(LINE_H * (lines.saturating_add(tag_lines) as f32 + 1.0));
         // n buttons have n-1 gaps between them, not n — counting a trailing gap
         // still left the grid one line short of what it draws.
         let cmd_lines = layout(&self.cmds).len();
@@ -438,6 +459,14 @@ pub struct BoardState {
     /// planned surface, is skipped by RUN. There is deliberately no counter and
     /// no way back: rebuilding the preview is what clears this.
     pub hidden: std::collections::HashSet<String>,
+    /// A listing's selection, by row key: every selected row is tinted.
+    pub selected: std::collections::HashSet<String>,
+    /// A listing's cursor, by row key: outlined, and where the keyboard moves
+    /// from.
+    pub cursor: Option<String>,
+    /// One-shot: bring this row into view on the next draw (set by a keyboard
+    /// move; a per-frame scroll request would repaint forever).
+    pub scroll_to: Option<String>,
 }
 
 impl Default for BoardState {
@@ -449,6 +478,9 @@ impl Default for BoardState {
             show_unchanged: false,
             resurrection_only: false,
             hidden: std::collections::HashSet::new(),
+            selected: std::collections::HashSet::new(),
+            cursor: None,
+            scroll_to: None,
         }
     }
 }
@@ -477,6 +509,10 @@ pub struct BoardView<'a> {
     /// Whether hiding a row also excludes it from a later RUN. False on DIFF,
     /// which runs each command as it is clicked. Only affects HIDE's tooltip.
     pub hide_skips_run: bool,
+    /// A plain listing (Browse) rather than a plan: rows stay in the caller's
+    /// order (no sort bar, no plan summary), a single click selects a row and
+    /// reports [`Cmd::Select`], a double click opens it.
+    pub listing: bool,
 }
 
 /// The right region's header, present on a two-sided board.
@@ -513,19 +549,26 @@ struct Index {
 }
 
 impl Index {
-    fn build(metas: &[RowMeta], state: &BoardState) -> Self {
-        let mut order: Vec<usize> = (0..metas.len())
-            .filter(|&i| state.show_unchanged || !metas[i].unchanged)
-            .filter(|&i| !state.resurrection_only || metas[i].is_resurrection())
-            .filter(|&i| !state.hidden.contains(&metas[i].key))
+    /// `caller_order` keeps the rows as given instead of sorting them (a
+    /// listing sorts itself by its own columns).
+    fn build(metas: &[RowMeta], state: &BoardState, caller_order: bool) -> Self {
+        let mut order: Vec<usize> = metas
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| state.show_unchanged || !m.unchanged)
+            .filter(|(_, m)| !state.resurrection_only || m.is_resurrection())
+            .filter(|(_, m)| !state.hidden.contains(&m.key))
+            .map(|(i, _)| i)
             .collect();
-        sort_order(&mut order, metas, state);
+        if !caller_order {
+            sort_order(&mut order, metas, state);
+        }
 
-        let mut offsets = Vec::with_capacity(order.len() + 1);
+        let mut offsets = Vec::with_capacity(order.len().saturating_add(1));
         let mut y = 0.0;
         offsets.push(0.0);
         for &i in &order {
-            y += metas[i].height();
+            y += metas.get(i).map_or(0.0, RowMeta::height);
             offsets.push(y);
         }
         Self { order, offsets }
@@ -561,7 +604,10 @@ fn sort_order(order: &mut [usize], metas: &[RowMeta], state: &BoardState) {
         paths.first().map(|p| p.to_lowercase()).unwrap_or_default()
     };
     order.sort_by(|&a, &b| {
-        let (ma, mb) = (&metas[a], &metas[b]);
+        // `order` holds indices into `metas` by construction.
+        let (Some(ma), Some(mb)) = (metas.get(a), metas.get(b)) else {
+            return std::cmp::Ordering::Equal;
+        };
         let tie = || first_path(ma, true).cmp(&first_path(mb, true));
         let left = state.sort_left;
         let ord = match state.sort_key {
@@ -638,7 +684,9 @@ pub fn board(
     thumbs: &mut ThumbCache,
     body: &mut dyn FnMut(usize) -> RowBody,
 ) -> Option<BoardAction> {
-    summary(ui, view.totals);
+    if !view.listing {
+        summary(ui, view.totals);
+    }
     if view.full_len > metas.len() {
         ui.label(
             RichText::new(format!(
@@ -656,10 +704,13 @@ pub fn board(
         state.sort_left = true;
     }
     let any_resurrection = metas.iter().any(|m| m.is_resurrection());
-    controls_bar(ui, state, two_sided, view.totals[3] > 0, any_resurrection);
+    if !view.listing {
+        controls_bar(ui, state, two_sided, view.totals[3] > 0, any_resurrection);
+    }
     headers(ui, &view, metas);
 
-    let index = Index::build(metas, state);
+    let index = Index::build(metas, state, view.listing);
+    let scroll_to = state.scroll_to.take();
     ui.label(
         RichText::new(format!("{} rows", index.order.len()))
             .color(theme::tan())
@@ -692,33 +743,75 @@ pub fn board(
         (clip.bottom() - rect.top()).max(0.0),
     );
     for vis in visible {
-        let i = index.order[vis];
-        let h = metas[i].height();
+        // `range` keeps `vis` inside `order`, and `order` indexes `metas`.
+        let (Some(&i), Some(&offset)) = (index.order.get(vis), index.offsets.get(vis)) else {
+            continue;
+        };
+        let Some(meta) = metas.get(i) else {
+            continue;
+        };
+        let h = meta.height();
         let row_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.left(), rect.top() + index.offsets[vis]),
+            egui::pos2(rect.left(), rect.top() + offset),
             egui::vec2(rect.width(), h),
         );
         // Striping, which TableBuilder used to provide.
         if vis % 2 == 1 {
             ui.painter().rect_filled(row_rect, 0.0, theme::panel());
         }
+        // A listing tints its selected rows and outlines its cursor, so the
+        // selection reads at a glance whichever pane has the keyboard.
+        if view.listing {
+            if state.selected.contains(&meta.key) {
+                ui.painter()
+                    .rect_filled(row_rect, 0.0, theme::amber().gamma_multiply(0.18));
+            }
+            if state.cursor.as_deref() == Some(meta.key.as_str()) {
+                ui.painter().rect_stroke(
+                    row_rect.shrink(1.0),
+                    0.0,
+                    egui::Stroke::new(1.5, theme::amber()),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            if scroll_to.as_deref() == Some(meta.key.as_str()) {
+                ui.scroll_to_rect(row_rect, Some(Align::Center));
+            }
+        }
         // The row body opens the shared viewer — the law: clicking any file
-        // anywhere shows it. Allocated before the commands so their own clicks
-        // still win.
-        if ui
-            .interact(
-                row_rect,
-                ui.id().with(("board-row", i)),
-                egui::Sense::click(),
-            )
-            .clicked()
-        {
+        // anywhere shows it. On a listing a single click selects instead and
+        // a double click opens. Allocated before the commands so their own
+        // clicks still win.
+        let row_resp = ui.interact(
+            row_rect,
+            ui.id().with(("board-row", i)),
+            egui::Sense::click(),
+        );
+        if view.listing {
+            let mods = ui.input(|inp| inp.modifiers);
+            let on_cursor = state.cursor.as_deref() == Some(meta.key.as_str());
+            if row_resp.double_clicked() || (row_resp.clicked() && on_cursor && mods.is_none()) {
+                // A double click, or a plain click on the row that already has
+                // the cursor: the second click on a file opens it.
+                action = Some(BoardAction {
+                    row: i,
+                    cmd: Cmd::OpenRow,
+                });
+            } else if row_resp.clicked() {
+                action = Some(BoardAction {
+                    row: i,
+                    cmd: Cmd::Select {
+                        ctrl: mods.command,
+                        shift: mods.shift,
+                    },
+                });
+            }
+        } else if row_resp.clicked() {
             action = Some(BoardAction {
                 row: i,
                 cmd: Cmd::OpenRow,
             });
         }
-        {}
         // The row's vertical padding is an inset on the content rect. Adding it
         // with `add_space` inside a left-to-right row would have spent it
         // sideways instead, leaving the content taller than its measured height.
@@ -727,7 +820,24 @@ pub fn board(
                 .max_rect(row_rect.shrink2(egui::vec2(0.0, ROW_PAD)))
                 .layout(Layout::left_to_right(Align::Min)),
         );
-        if let Some(cmd) = draw_row(&mut row_ui, thumbs, &metas[i], &body(i), geom) {
+        if let Some(cmd) = draw_row(&mut row_ui, thumbs, meta, &body(i), geom) {
+            // On a listing the picture and the name are part of the row: their
+            // click selects like the rest of the row does, and a second click
+            // on the cursor row opens it.
+            let cmd = if view.listing && cmd == Cmd::OpenRow {
+                let mods = ui.input(|inp| inp.modifiers);
+                let on_cursor = state.cursor.as_deref() == Some(meta.key.as_str());
+                if on_cursor && mods.is_none() {
+                    Cmd::OpenRow
+                } else {
+                    Cmd::Select {
+                        ctrl: mods.command,
+                        shift: mods.shift,
+                    }
+                }
+            } else {
+                cmd
+            };
             action = Some(BoardAction { row: i, cmd });
         }
     }
@@ -736,7 +846,9 @@ pub fn board(
     if let Some(a) = &action
         && a.cmd == Cmd::Hide
     {
-        state.hidden.insert(metas[a.row].key.clone());
+        if let Some(m) = metas.get(a.row) {
+            state.hidden.insert(m.key.clone());
+        }
         return None;
     }
     action
@@ -759,6 +871,8 @@ struct SideView<'a> {
     /// The opposite side's names, so the characters that differ can be picked
     /// out. Empty when there is no counterpart to compare against.
     counterpart: &'a [String],
+    /// Annotation tags, one chip each, on their own line under the facts.
+    tags: &'a [String],
 }
 
 /// The per-board constants every row is drawn against. One value, computed
@@ -811,6 +925,7 @@ fn draw_row(
             modified: meta.left_modified,
             multi_repo: false,
             counterpart: &meta.right_paths,
+            tags: &meta.left_tags,
         },
     ) {
         // The thumbnail senses clicks itself (it sits over the row's click
@@ -917,6 +1032,7 @@ fn draw_row(
                 modified: meta.right_modified,
                 multi_repo,
                 counterpart: &meta.left_paths,
+                tags: &[],
             },
         )
         && clicked.is_none()
@@ -1017,14 +1133,24 @@ fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view:
                 view.status.color(),
                 ui,
             );
-            let path_resp = ui.add(egui::Label::new(job).truncate()).on_hover_text(path);
+            // The name senses clicks itself, so a click on it is a row click
+            // (open, or select on a listing) rather than a dead spot; the
+            // copy menu then hangs off the same response.
+            let path_resp = ui
+                .add(egui::Label::new(job).truncate().sense(egui::Sense::click()))
+                .on_hover_text(path);
+            if path_resp.clicked() {
+                thumb_clicked = true;
+            }
             crate::util::copy_menu(&path_resp, path);
         }
         if let Some(line) = facts_line(view.size, view.modified, view.body.facts.as_ref()) {
             // An empty file is useless — copying or promoting it preserves
             // nothing — so its "0 B" is called out in heavy red rather than
             // blending into the facts line.
-            let text: egui::WidgetText = if view.size == 0 && line.starts_with("0 B") {
+            let text: egui::WidgetText = if view.size == 0
+                && let Some(rest) = line.strip_prefix("0 B")
+            {
                 let mut job = egui::text::LayoutJob::default();
                 job.append(
                     "0 B",
@@ -1036,7 +1162,7 @@ fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view:
                     },
                 );
                 job.append(
-                    &line["0 B".len()..],
+                    rest,
                     0.0,
                     egui::TextFormat {
                         font_id: egui::FontId::proportional(10.5),
@@ -1050,8 +1176,27 @@ fn side_cell(ui: &mut egui::Ui, thumbs: &mut ThumbCache, rect: egui::Rect, view:
             };
             ui.add(egui::Label::new(text).truncate());
         }
+        if !view.tags.is_empty() {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for tag in view.tags {
+                    tag_chip(ui, tag);
+                }
+            });
+        }
     });
     thumb_clicked
+}
+
+/// One annotation tag as a small lilac chip.
+fn tag_chip(ui: &mut egui::Ui, tag: &str) {
+    egui::Frame::new()
+        .stroke(egui::Stroke::new(1.0, theme::lilac()))
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(5, 1))
+        .show(ui, |ui| {
+            ui.label(RichText::new(tag).color(theme::lilac()).size(10.5));
+        });
 }
 
 /// Byte ranges of `a` that do not appear in the corresponding place of `b`,
@@ -1074,34 +1219,51 @@ fn name_diff_ranges(a: &str, b: &str) -> Vec<std::ops::Range<usize>> {
     if av.len() > MAX || bv.len() > MAX {
         return Vec::new();
     }
-    let mut table = vec![vec![0usize; bv.len() + 1]; av.len() + 1];
-    for i in (0..av.len()).rev() {
-        for j in (0..bv.len()).rev() {
-            table[i][j] = if av[i] == bv[j] {
-                table[i + 1][j + 1] + 1
-            } else {
-                table[i + 1][j].max(table[i][j + 1])
+    let mut table = vec![vec![0usize; bv.len().saturating_add(1)]; av.len().saturating_add(1)];
+    for (i, &ac) in av.iter().enumerate().rev() {
+        // Row `i` is filled from the row below it, already complete.
+        let Some((row, below)) = table.get_mut(i..).and_then(|t| t.split_first_mut()) else {
+            continue;
+        };
+        let Some(next) = below.first() else {
+            continue;
+        };
+        // The cell to the right of `j`; the last column stays 0.
+        let mut right = 0usize;
+        for (j, &bc) in bv.iter().enumerate().rev() {
+            let (Some(&down), Some(&diag), Some(cell)) =
+                (next.get(j), next.get(j.saturating_add(1)), row.get_mut(j))
+            else {
+                continue;
             };
+            *cell = if ac == bc {
+                diag.saturating_add(1)
+            } else {
+                down.max(right)
+            };
+            right = *cell;
         }
     }
+    let cell = |i: usize, j: usize| table.get(i).and_then(|r| r.get(j)).copied().unwrap_or(0);
     // Walk the table, recording the runs of `a` that are not part of the LCS.
     let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
     let (mut i, mut j, mut byte) = (0usize, 0usize, 0usize);
-    while i < av.len() {
-        let width = av[i].len_utf8();
-        if j < bv.len() && av[i] == bv[j] {
+    while let Some(&ac) = av.get(i) {
+        let width = ac.len_utf8();
+        let bc = bv.get(j);
+        if bc == Some(&ac) {
             // Part of the common subsequence: keep it plain.
-            i += 1;
-            j += 1;
-            byte += width;
-        } else if j < bv.len() && table[i + 1][j] < table[i][j + 1] {
+            i = i.saturating_add(1);
+            j = j.saturating_add(1);
+            byte = byte.saturating_add(width);
+        } else if bc.is_some() && cell(i.saturating_add(1), j) < cell(i, j.saturating_add(1)) {
             // Consuming a character of `b` keeps more in common — `b` has an
             // insertion here, which is nothing to paint in `a`.
-            j += 1;
+            j = j.saturating_add(1);
         } else {
-            push_range(&mut ranges, byte..byte + width);
-            i += 1;
-            byte += width;
+            push_range(&mut ranges, byte..byte.saturating_add(width));
+            i = i.saturating_add(1);
+            byte = byte.saturating_add(width);
         }
     }
     ranges
@@ -1119,8 +1281,8 @@ fn push_range(ranges: &mut Vec<std::ops::Range<usize>>, r: std::ops::Range<usize
 /// The file name part of a relative path (what [`name_diff_ranges`] compares),
 /// plus its byte offset within the path so ranges can be shifted back.
 fn file_name_at(path: &str) -> (usize, &str) {
-    match path.rfind('/') {
-        Some(i) => (i + 1, &path[i + 1..]),
+    match path.rsplit_once('/') {
+        Some((dir, name)) => (dir.len().saturating_add(1), name),
         None => (0, path),
     }
 }
@@ -1165,15 +1327,25 @@ fn highlight_job(
         return job;
     }
 
+    // `offset` and the ranges sit on char boundaries by construction.
+    let Some(dir) = full.get(..offset) else {
+        plain(&mut job, shown);
+        return job;
+    };
     let hl = ui.visuals().selection.bg_fill.gamma_multiply(0.9);
-    plain(&mut job, &full[..offset]);
+    plain(&mut job, dir);
     let mut at = 0usize;
     for r in ranges {
-        if r.start > at {
-            plain(&mut job, &name[at..r.start]);
+        if r.start > at
+            && let Some(gap) = name.get(at..r.start)
+        {
+            plain(&mut job, gap);
         }
+        let Some(diff) = name.get(r.clone()) else {
+            continue;
+        };
         job.append(
-            &name[r.clone()],
+            diff,
             0.0,
             egui::TextFormat {
                 font_id: font.clone(),
@@ -1184,8 +1356,10 @@ fn highlight_job(
         );
         at = r.end;
     }
-    if at < name.len() {
-        plain(&mut job, &name[at..]);
+    if at < name.len()
+        && let Some(tail) = name.get(at..)
+    {
+        plain(&mut job, tail);
     }
     job
 }
@@ -1257,7 +1431,7 @@ fn controls_bar(
             }
             ui.add_space(12.0);
         }
-        ui.label(RichText::new("SORT").color(theme::text()).size(11.0));
+        ui.label(RichText::new("Sort").color(theme::text()).size(11.0));
         if two_sided {
             for (is_left, label) in [(true, "LEFT"), (false, "RIGHT")] {
                 if crate::lcars::toggle_button(
@@ -1401,7 +1575,7 @@ pub(crate) fn elide_left(path: &str, max: usize) -> String {
     }
     let tail: String = path
         .chars()
-        .skip(path.chars().count().saturating_sub(max - 1))
+        .skip(path.chars().count().saturating_sub(max.saturating_sub(1)))
         .collect();
     format!("…{tail}")
 }
@@ -1499,6 +1673,7 @@ mod tests {
                             totals: [0, 1, 0, 0],
                             full_len: 1,
                             hide_skips_run: true,
+                            listing: false,
                         },
                         &mut thumbs,
                         &mut |_| body.clone(),
@@ -1543,6 +1718,127 @@ mod tests {
         );
     }
 
+    /// A listing's row click selects — with the modifiers the caller's
+    /// selection model wants — and a second click on the cursor row opens;
+    /// the sort bar and the plan summary are not drawn, and the rows keep
+    /// the caller's order.
+    #[test]
+    fn a_listing_row_click_selects_and_a_second_click_opens() {
+        use super::*;
+        use egui_kittest::kittest::Queryable;
+        let metas = vec![meta("zulu", 0, 1), meta("alpha", 0, 1)];
+        let mut init = false;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(900.0, 500.0))
+            .build_ui_state(
+                move |ui, state: &mut (BoardState, Vec<Cmd>)| {
+                    if !init {
+                        crate::icon::install(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
+                        init = true;
+                    }
+                    let mut thumbs = ThumbCache::new(4);
+                    if let Some(a) = board(
+                        ui,
+                        &mut state.0,
+                        &metas,
+                        BoardView {
+                            left_role: "FILES",
+                            left_repo: "photos",
+                            left_is_main: false,
+                            left_path: "/mnt/photos",
+                            right: None,
+                            totals: [0, 0, 0, 0],
+                            full_len: 2,
+                            hide_skips_run: false,
+                            listing: true,
+                        },
+                        &mut thumbs,
+                        &mut |_| RowBody::default(),
+                    ) {
+                        if let Cmd::Select { .. } = a.cmd {
+                            // The caller's selection model: the cursor follows.
+                            state.0.cursor = Some(metas[a.row].key.clone());
+                        }
+                        state.1.push(a.cmd);
+                    }
+                },
+                (BoardState::default(), Vec::new()),
+            );
+        harness.run_steps(2);
+        assert!(
+            harness.query_by_label("Sort").is_none(),
+            "a listing sorts itself: no sort bar"
+        );
+        let zulu = harness.get_by_label_contains("zulu/0").rect();
+        let alpha = harness.get_by_label_contains("alpha/0").rect();
+        assert!(
+            zulu.top() < alpha.top(),
+            "the caller's order stands: zulu ({zulu:?}) before alpha ({alpha:?})"
+        );
+
+        harness.get_by_label_contains("alpha/0").click();
+        harness.run_steps(2);
+        assert_eq!(
+            harness.state().1,
+            vec![Cmd::Select {
+                ctrl: false,
+                shift: false
+            }],
+            "a single click selects"
+        );
+        harness.state_mut().1.clear();
+        // The second click on the row that has the cursor opens it (a double
+        // click is the same gesture, quicker).
+        harness.get_by_label_contains("alpha/0").click();
+        harness.run_steps(2);
+        assert_eq!(
+            harness.state().1,
+            vec![Cmd::OpenRow],
+            "a second click on the cursor row opens it"
+        );
+        harness.state_mut().1.clear();
+        harness.get_by_label_contains("zulu/0").click();
+        harness.run_steps(2);
+        assert_eq!(
+            harness.state().1,
+            vec![Cmd::Select {
+                ctrl: false,
+                shift: false
+            }],
+            "a click on another row selects it"
+        );
+    }
+
+    /// A listing keeps the caller's order while a plan sorts; tag chips add a
+    /// line to the row, and the selection and cursor are paint only.
+    #[test]
+    fn a_listing_keeps_caller_order_and_tags_grow_the_row() {
+        use super::*;
+        // Three names: more than the thumbnail's height holds, so the tag line
+        // has to be paid for (a one-line row has room to spare beside it).
+        let mut zulu = meta("zulu", 0, 3);
+        let alpha = meta("alpha", 0, 3);
+        let metas = vec![zulu.clone(), alpha.clone()];
+        let state = BoardState::default();
+        let listing = Index::build(&metas, &state, true);
+        assert_eq!(
+            listing.order,
+            vec![0, 1],
+            "a listing keeps the caller's order"
+        );
+        let plan = Index::build(&metas, &state, false);
+        assert_eq!(plan.order, vec![1, 0], "a plan sorts by path");
+
+        let plain = zulu.height();
+        zulu.left_tags = vec!["keeper".into(), "wide".into()];
+        assert!(
+            zulu.height() > plain,
+            "a row with tags is taller so its chips fit"
+        );
+        assert_eq!(alpha.height(), plain, "a row without tags is unchanged");
+    }
+
     /// The law reaches the boards: clicking a row body opens the shared viewer.
     /// Rows therefore carry no COMPARE command — it would be a second door.
     #[test]
@@ -1577,6 +1873,7 @@ mod tests {
             right_modified: 0,
             unchanged: false,
             cmds: some_cmds(1),
+            left_tags: Vec::new(),
         };
         let differing = row("a/photo1.jpg", "a/photo.jpg");
         let identical = row("a/photo.jpg", "a/photo.jpg");
@@ -1699,6 +1996,7 @@ mod tests {
             right_modified: 0,
             unchanged: false,
             cmds: some_cmds(cmds),
+            left_tags: Vec::new(),
         }
     }
 
@@ -1758,7 +2056,7 @@ mod tests {
     fn index_maps_a_viewport_to_the_rows_it_intersects() {
         let metas: Vec<RowMeta> = (0..10).map(|i| meta(&format!("r{i}"), 2, 1)).collect();
         let state = BoardState::default();
-        let index = Index::build(&metas, &state);
+        let index = Index::build(&metas, &state, false);
         assert_eq!(index.order.len(), 10);
 
         let h = metas[0].height();
@@ -1781,7 +2079,7 @@ mod tests {
             meta("c", 2, 1), // short
         ];
         let state = BoardState::default();
-        let index = Index::build(&metas, &state);
+        let index = Index::build(&metas, &state, false);
         let h0 = metas[0].height();
         let h1 = metas[1].height();
         assert!((index.total_height() - (h0 + h1 + metas[2].height())).abs() < 0.5);
@@ -1797,7 +2095,7 @@ mod tests {
         let metas: Vec<RowMeta> = (0..3).map(|i| meta(&format!("r{i}"), 2, 1)).collect();
         let mut state = BoardState::default();
         state.hidden.insert("r1".to_string());
-        let index = Index::build(&metas, &state);
+        let index = Index::build(&metas, &state, false);
         assert_eq!(index.order, vec![0, 2], "the hidden row is gone");
         assert!(
             (index.total_height() - metas[0].height() * 2.0).abs() < 0.5,
@@ -1811,9 +2109,9 @@ mod tests {
         let mut metas: Vec<RowMeta> = (0..3).map(|i| meta(&format!("r{i}"), 2, 1)).collect();
         metas[1].unchanged = true;
         let mut state = BoardState::default();
-        assert_eq!(Index::build(&metas, &state).order, vec![0, 2]);
+        assert_eq!(Index::build(&metas, &state, false).order, vec![0, 2]);
         state.show_unchanged = true;
-        assert_eq!(Index::build(&metas, &state).order, vec![0, 1, 2]);
+        assert_eq!(Index::build(&metas, &state, false).order, vec![0, 1, 2]);
     }
 
     /// The resurrection filter isolates the blue rows and nothing else.
@@ -1824,13 +2122,13 @@ mod tests {
         metas[1].left_status = Status::Resurrect;
         let mut state = BoardState::default();
         assert_eq!(
-            Index::build(&metas, &state).order,
+            Index::build(&metas, &state, false).order,
             vec![0, 1, 2],
             "all rows show by default"
         );
         state.resurrection_only = true;
         assert_eq!(
-            Index::build(&metas, &state).order,
+            Index::build(&metas, &state, false).order,
             vec![1],
             "the filter leaves only the resurrection row"
         );
@@ -1855,21 +2153,21 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            Index::build(&metas, &state).order,
+            Index::build(&metas, &state, false).order,
             vec![1, 0],
             "by left path"
         );
 
         state.sort_left = false;
         assert_eq!(
-            Index::build(&metas, &state).order,
+            Index::build(&metas, &state, false).order,
             vec![0, 1],
             "by right path"
         );
 
         state.sort_asc = false;
         assert_eq!(
-            Index::build(&metas, &state).order,
+            Index::build(&metas, &state, false).order,
             vec![1, 0],
             "direction reverses it"
         );
@@ -1889,7 +2187,7 @@ mod tests {
             sort_key: SortKey::Status,
             ..Default::default()
         };
-        assert_eq!(Index::build(&metas, &state).order, vec![1, 2, 0]);
+        assert_eq!(Index::build(&metas, &state, false).order, vec![1, 2, 0]);
     }
 
     /// The centre column never shrinks; the sides absorb a narrow window down to
@@ -2030,6 +2328,7 @@ mod tests {
                             totals: [0, 3, 0, 0],
                             full_len: 3,
                             hide_skips_run: true,
+                            listing: false,
                         },
                         &mut thumbs,
                         &mut |_| RowBody::default(),
@@ -2064,6 +2363,7 @@ mod tests {
                 Cmd::OverwriteLeft,
                 Cmd::Hide,
             ],
+            left_tags: Vec::new(),
         }
     }
 
@@ -2390,6 +2690,7 @@ mod tests {
                             totals: [0, 2, 0, 0],
                             full_len: 2,
                             hide_skips_run: true,
+                            listing: false,
                         },
                         &mut thumbs,
                         &mut |i| RowBody {
@@ -2488,10 +2789,10 @@ mod tests {
         use egui_kittest::kittest::Queryable;
         let metas = vec![diff_row("one"), diff_row("two")];
         let mut state = BoardState::default();
-        assert_eq!(Index::build(&metas, &state).order.len(), 2);
+        assert_eq!(Index::build(&metas, &state, false).order.len(), 2);
         // What the board does on a HIDE click.
         state.hidden.insert(metas[0].key.clone());
-        let index = Index::build(&metas, &state);
+        let index = Index::build(&metas, &state, false);
         assert_eq!(index.order, vec![1], "the hidden row is gone");
 
         // And there is deliberately no counter and no way back: nothing in the
@@ -2653,6 +2954,7 @@ mod tests {
                             totals: [0, 1, 2, 0],
                             full_len: 3,
                             hide_skips_run: false,
+                            listing: false,
                         },
                         thumbs,
                         &mut |i| bodies.get(i).cloned().unwrap_or_default(),
@@ -2733,6 +3035,7 @@ mod tests {
                                 totals: [0, 1, 2, 0],
                                 full_len: 3,
                                 hide_skips_run: false,
+                                listing: false,
                             },
                             thumbs,
                             &mut |i| bodies.get(i).cloned().unwrap_or_default(),
