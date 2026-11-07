@@ -525,9 +525,31 @@ pub fn is_extractable_document(mime: &str) -> bool {
     mime == "application/pdf" || is_office_doc(mime) || mime == "message/rfc822"
 }
 
+/// Documents larger than this get no text fingerprint and no text view: their
+/// parsers (PDF, xls, e-mail) read the whole file into memory first
+/// (docs/security/threat-model.md, threat 2). Their identity is still the
+/// content hash.
+const DOC_FILE_CAP: u64 = 256 * 1024 * 1024;
+
+/// Past this much XML in one office document part the document is skipped like
+/// an oversized one: a few kilobytes of zip can inflate to gigabytes.
+const DOC_PART_CAP: u64 = 64 * 1024 * 1024;
+
+/// `Some(())` when `path` is small enough for a whole-file document parser.
+fn within_doc_cap(path: &Path) -> Option<()> {
+    (std::fs::metadata(path).ok()?.len() <= DOC_FILE_CAP).then_some(())
+}
+
+/// The whole of `path`, or `None` past [`DOC_FILE_CAP`].
+fn read_doc(path: &Path) -> Option<Vec<u8>> {
+    within_doc_cap(path)?;
+    std::fs::read(path).ok()
+}
+
 /// The raw extracted text of a PDF, or `None` if it has none — the text half of
 /// [`pdf_text_hash`], shared with [`extract_document_text`].
 fn pdf_text(path: &Path) -> Option<String> {
+    within_doc_cap(path)?;
     let doc = lopdf::Document::load(path).ok()?;
     let pages: Vec<u32> = doc.get_pages().keys().copied().collect();
     doc.extract_text(&pages).ok()
@@ -600,13 +622,18 @@ fn zip_doc_text(path: &Path, mime: &str) -> Option<String> {
     for name in names {
         use std::io::Read;
         let mut xml = String::new();
+        // One byte past the cap tells "fits exactly" from "ran over".
         if archive
             .by_name(&name)
             .ok()?
+            .take(DOC_PART_CAP.saturating_add(1))
             .read_to_string(&mut xml)
             .is_err()
         {
             continue;
+        }
+        if xml.len() as u64 > DOC_PART_CAP {
+            return None;
         }
         let mut reader = quick_xml::Reader::from_str(&xml);
         let mut buf = Vec::new();
@@ -639,7 +666,7 @@ fn zip_doc_text(path: &Path, mime: &str) -> Option<String> {
 /// same mail exported twice dedups reliably), else a normalized subject+body
 /// digest. `None` if unparseable. mbox stores are out of scope here.
 pub fn eml_hash(path: &Path) -> Option<[u8; 32]> {
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = read_doc(path)?;
     let msg = mail_parser::MessageParser::default().parse(&bytes)?;
     let basis = match msg.message_id() {
         Some(id) => format!("message-id:{id}"),
@@ -655,7 +682,7 @@ pub fn eml_hash(path: &Path) -> Option<[u8; 32]> {
 /// The readable text of an `.eml` — its subject and body — for display. Distinct
 /// from [`eml_hash`], which keys on Message-ID for dedup identity.
 fn eml_text(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = read_doc(path)?;
     let msg = mail_parser::MessageParser::default().parse(&bytes)?;
     let subject = msg.subject().unwrap_or_default();
     let body = msg.body_text(0).unwrap_or_default();
@@ -690,6 +717,7 @@ pub fn text_file_hash(path: &Path) -> Option<[u8; 32]> {
 /// Concatenated cell text of a legacy `.xls` workbook, via calamine.
 fn xls_text(path: &Path) -> Option<String> {
     use calamine::Reader;
+    within_doc_cap(path)?;
     let mut workbook: calamine::Xls<_> = calamine::open_workbook(path).ok()?;
     let mut out = String::new();
     let sheets = workbook.sheet_names().to_vec();
@@ -1154,6 +1182,62 @@ mod tests {
     }
 
     const DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+
+    /// A document part that inflates past the cap (a zip bomb dressed as a
+    /// .docx) yields no text, while the same document under the cap does.
+    #[test]
+    fn an_office_part_past_the_cap_yields_no_text() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let write_docx = |path: &std::path::Path, padding: usize| {
+            let file = std::fs::File::create(path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("word/document.xml", opts).unwrap();
+            zip.write_all(b"<w:document><w:t>Hello</w:t>").unwrap();
+            let spaces = vec![b' '; 1024 * 1024];
+            let mut left = padding;
+            while left > 0 {
+                let n = left.min(spaces.len());
+                zip.write_all(&spaces[..n]).unwrap();
+                left -= n;
+            }
+            zip.write_all(b"</w:document>").unwrap();
+            zip.finish().unwrap();
+        };
+        let small = dir.path().join("small.docx");
+        write_docx(&small, 1024);
+        assert_eq!(
+            zip_doc_text(&small, DOCX).as_deref().map(str::trim),
+            Some("Hello")
+        );
+        let bomb = dir.path().join("bomb.docx");
+        write_docx(&bomb, DOC_PART_CAP as usize);
+        assert_eq!(zip_doc_text(&bomb, DOCX), None);
+    }
+
+    /// A document over the whole-file cap is never read: a sparse file of the
+    /// cap's size passes, one byte more does not.
+    #[test]
+    fn documents_past_the_file_cap_are_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let at_cap = dir.path().join("at_cap.eml");
+        std::fs::File::create(&at_cap)
+            .unwrap()
+            .set_len(DOC_FILE_CAP)
+            .unwrap();
+        assert_eq!(within_doc_cap(&at_cap), Some(()));
+        let over = dir.path().join("over.eml");
+        std::fs::File::create(&over)
+            .unwrap()
+            .set_len(DOC_FILE_CAP + 1)
+            .unwrap();
+        assert_eq!(within_doc_cap(&over), None);
+        assert_eq!(read_doc(&over), None);
+        assert_eq!(eml_hash(&over), None);
+        assert_eq!(pdf_text(&over), None);
+    }
     const ODT: &str = "application/vnd.oasis.opendocument.text";
 
     /// The same text saved as .docx and .odt hashes identically (text identity,

@@ -18,6 +18,8 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 - A scan stops reading an archive's members at a million members or once they unpack to a
   thousand times the archive's size (at least 4 GiB); the archive is still indexed and the
   scan report names the cap.
+- PDFs, spreadsheets and e-mails over 256 MiB, and office documents whose text unpacks past
+  64 MiB, get no text fingerprint or text view instead of being read into memory whole.
 - Every release file carries a signed build provenance attestation, checked with
   `gh attestation verify <file> -R paxel/dedup-rs`.
 
