@@ -655,11 +655,12 @@ pub fn draw_metadata_column(ui: &mut egui::Ui, source: &Path, body: MetaBody<'_>
             let field_w = (ui.available_width() - LABEL_W - KEBAB_W - 2.0 * gap - 4.0).max(60.0);
             for ((label, val), opts) in fields.into_iter().zip(options.iter()) {
                 ui.horizontal(|ui| {
-                    ui.add_sized(
+                    let name = ui.add_sized(
                         [LABEL_W, 18.0],
                         egui::Label::new(RichText::new(label).color(theme::tan()).size(12.0)),
                     );
-                    ui.add_sized([field_w, 18.0], egui::TextEdit::singleline(val));
+                    ui.add_sized([field_w, 18.0], egui::TextEdit::singleline(val))
+                        .labelled_by(name.id);
                     // Adopt a value from another copy in the group. A "more
                     // options for this field" kebab (⋮), not a directional
                     // caret — the value is pulled *into* this field, never
@@ -1066,7 +1067,7 @@ pub fn draw_text_column(
             ui.add(label);
         })
         .state
-        .offset
+        .unclamped_offset()
     };
     (viewport, offset)
 }

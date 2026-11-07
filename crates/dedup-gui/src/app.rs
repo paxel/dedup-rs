@@ -728,7 +728,7 @@ impl DedupApp {
         let mut cancel = false;
         let verbosity = self.tooltip_verbosity;
         let summary = format!("{} · {}", edit.spec.cmd.label(), edit.repos.join(", "));
-        let response = egui::Modal::new(Id::new("favorite")).show(ctx, |ui| {
+        let response = egui::Modal::new(Id::unique("favorite")).show(ctx, |ui| {
             ui.set_width(420.0);
             ui.label(
                 RichText::new(if renaming {
@@ -868,7 +868,7 @@ impl DedupApp {
                 .raw
                 .dropped_files
                 .iter()
-                .filter_map(|f| f.path.clone())
+                .map(|f| f.path().to_path_buf())
                 .collect();
             (dropped, i.raw.dropped_files.len())
         });
@@ -1701,7 +1701,7 @@ impl eframe::App for DedupApp {
             let screen = ctx.content_rect();
             let p = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Foreground,
-                egui::Id::new("dnd-hint"),
+                egui::Id::unique("dnd-hint"),
             ));
             p.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(190));
             p.text(
@@ -2778,7 +2778,7 @@ impl DedupApp {
         let has_path = !self.new_path.trim().is_empty();
         let can_add = has_path && !effective.is_empty() && !clashes;
 
-        let response = egui::Modal::new(Id::new("add-repo")).show(ctx, |ui| {
+        let response = egui::Modal::new(Id::unique("add-repo")).show(ctx, |ui| {
             ui.set_width(460.0);
             ui.label(
                 RichText::new("ADD REPOSITORY")
@@ -2879,7 +2879,7 @@ impl DedupApp {
     }
 
     fn settings_modal(&mut self, ctx: &egui::Context) {
-        let response = egui::Modal::new(Id::new("settings")).show(ctx, |ui| {
+        let response = egui::Modal::new(Id::unique("settings")).show(ctx, |ui| {
             ui.set_width(320.0);
             ui.label(
                 RichText::new("SETTINGS")
@@ -3092,7 +3092,7 @@ impl DedupApp {
             return;
         };
         let mut decision: Option<bool> = None;
-        let response = egui::Modal::new(Id::new("empty-scan-confirm")).show(ctx, |ui| {
+        let response = egui::Modal::new(Id::unique("empty-scan-confirm")).show(ctx, |ui| {
             ui.set_width(420.0);
             ui.label(
                 RichText::new("SCAN FOUND NO FILES")
@@ -3230,7 +3230,7 @@ impl DedupApp {
                 .size(16.0)
                 .strong(),
         )
-        .id(Id::new("status-panel"))
+        .id(Id::unique("status-panel"))
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
@@ -3352,7 +3352,7 @@ impl DedupApp {
     }
 
     fn about_modal(&mut self, ctx: &egui::Context) {
-        let response = egui::Modal::new(Id::new("about")).show(ctx, |ui| {
+        let response = egui::Modal::new(Id::unique("about")).show(ctx, |ui| {
             ui.set_width(320.0);
             ui.label(
                 RichText::new("ABOUT")
@@ -4390,11 +4390,13 @@ mod ui_tests {
             a.record(&note);
             a.card(&ctx, note);
         }
+        // A new area's first frame is an invisible sizing pass.
+        h.step();
         h.step();
         assert!(
             h.query_by_label_contains("Deleted IMG_2019_field.jpg")
                 .is_some(),
-            "the card is on screen in the next frame"
+            "the card is on screen after its sizing pass"
         );
         assert!(
             h.query_by_label("LOG (1)").is_some(),
@@ -4408,6 +4410,7 @@ mod ui_tests {
         assert!(log.contains("IMG_2019_field.jpg"), "{log}");
 
         h.get_by_label("LOG (1)").click();
+        h.step();
         h.step();
         assert!(h.query_by_label("EVENT LOG").is_some(), "the viewer opens");
         assert!(

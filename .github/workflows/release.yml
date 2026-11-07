@@ -41,6 +41,9 @@ jobs:
   gate:
     name: Gate (Linux, full)
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: read # the CodeQL alert check below
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1 branch
@@ -74,6 +77,15 @@ jobs:
             | jq -r .projectStatus.status)
           echo "quality gate: $status"
           [ "$status" = "OK" ] || { echo "SonarQube Cloud quality gate is $status, not OK" >&2; exit 1; }
+      # Open CodeQL alerts on summer's latest analysis. False positives are
+      # dismissed with a reason, so every open alert is a real finding.
+      - name: No open CodeQL alerts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          open=$(gh api "repos/${{ github.repository }}/code-scanning/alerts?state=open&tool_name=CodeQL&per_page=1" --jq length)
+          echo "open CodeQL alerts: $open"
+          [ "$open" = "0" ] || { echo "open CodeQL alerts: https://github.com/${{ github.repository }}/security/code-scanning?query=is:open+tool:CodeQL" >&2; exit 1; }
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked

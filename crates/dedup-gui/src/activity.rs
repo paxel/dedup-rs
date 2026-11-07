@@ -890,7 +890,7 @@ impl Activity {
         let mut cancel = false;
         // A running operation ignores Escape and backdrop clicks: only CANCEL
         // ends it, and only the finished report closes on Escape.
-        egui::Modal::new(Id::new("activity-modal")).show(ctx, |ui| {
+        egui::Modal::new(Id::unique("activity-modal")).show(ctx, |ui| {
             // One width for the whole run: the phase line names the file being
             // worked on, and a modal sized to that name jumps on every file.
             let width =
@@ -1068,7 +1068,7 @@ impl Activity {
                 Ok(()) => theme::lilac(),
                 Err(_) => theme::red(),
             };
-            let response = egui::Area::new(Id::new(("activity-card-area", card.born)))
+            let response = egui::Area::new(Id::unique(("activity-card-area", card.born)))
                 .order(egui::Order::Foreground)
                 .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0 + slide, y))
                 .interactable(false)
@@ -1134,7 +1134,7 @@ impl Activity {
 
     fn draw_log(&mut self, ctx: &egui::Context) {
         let mut close = false;
-        let response = egui::Modal::new(Id::new("activity-log")).show(ctx, |ui| {
+        let response = egui::Modal::new(Id::unique("activity-log")).show(ctx, |ui| {
             ui.set_width(720.0);
             ui.label(
                 RichText::new("EVENT LOG")

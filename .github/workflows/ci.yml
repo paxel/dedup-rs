@@ -55,15 +55,23 @@ jobs:
       - name: Tests
         run: cargo test --workspace --locked
 
-  # Feeds the README's Coveralls badge. Default-branch only: coverage on every
+  # Feeds the README's Coveralls badge and the SonarQube Cloud analysis the
+  # release gate reads (docs/adr/0005-security-hardening.md). Default-branch
+  # pushes only: the free Sonar plan analyses summer only, and coverage on every
   # branch push would double CI time for a number nobody reads off a branch.
+  # What Sonar analyses is in sonar-project.properties.
   coverage:
-    name: Coverage (Coveralls)
+    name: Coverage (Coveralls, SonarQube Cloud)
     if: github.event_name == 'push' && github.ref == 'refs/heads/summer'
     runs-on: ubuntu-24.04
     steps:
+      # Full history, for Sonar's blame and new-code period.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1 branch
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: System dependencies (ALSA link dep, software Vulkan, gated tools)
         run: |
@@ -81,13 +89,14 @@ jobs:
         uses: coverallsapp/github-action@8d6379e14d29928660c4ba802d8e85393440b329 # v2.3.8
         with:
           file: lcov.info
-      # For the SonarQube Cloud workflow, which runs after this one.
-      - name: Keep lcov.info for SonarQube Cloud
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: coverage-lcov
-          path: lcov.info
-          retention-days: 7
+      - name: Clippy report for SonarQube Cloud
+        run: |
+          mkdir -p build
+          cargo clippy --workspace --all-targets --locked --message-format=json > build/clippy-report.json
+      - name: SonarQube Cloud analysis
+        uses: SonarSource/sonarqube-scan-action@e805d875275f728fac1885b413934be6d7c63f65 # v8.4.1
+        env:
+          SONAR_TOKEN: ${{ secrets.SQ_TOKEN }}
 
   windows:
     name: Windows (build + core/cli tests)

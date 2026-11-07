@@ -834,7 +834,7 @@ impl GroomingView {
                 self.error = outcome.error;
             }
             // The target path template, its inline delete, and the token chips.
-            let template_id = egui::Id::new(("organize_template", i));
+            let template_id = egui::Id::unique(("organize_template", i));
             ui.horizontal(|ui| {
                 ui.label(RichText::new("TEMPLATE").color(theme::text()).size(12.0));
                 let Some(rule) = self.rules.get_mut(i) else {
@@ -1151,7 +1151,7 @@ impl GroomingView {
     }
 
     fn confirm_modal(&mut self, ui: &mut egui::Ui, prompt: &str, acts: &mut Vec<Act>) {
-        egui::Modal::new(Id::new("grooming-confirm")).show(&ui.ctx().clone(), |ui| {
+        egui::Modal::new(Id::unique("grooming-confirm")).show(&ui.ctx().clone(), |ui| {
             ui.set_width(380.0);
             ui.label(
                 RichText::new(format!("CONFIRM {}", self.command.label()))
@@ -2889,7 +2889,7 @@ mod ui_tests {
     #[test]
     fn insert_at_cursor_inserts_at_caret_and_advances_it() {
         let ctx = egui::Context::default();
-        let id = egui::Id::new("tpl-test");
+        let id = egui::Id::unique("tpl-test");
         let mut template = String::from("{year}/{o-name}");
         // No cursor state yet (field never focused) → appends.
         insert_at_cursor(&ctx, id, &mut template, "{day}");
@@ -3061,7 +3061,9 @@ mod ui_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(h.state().confirm.is_some(), "RUN asks before deleting");
-        h.step(); // draw the freshly-raised modal before querying it
+        // Draw the freshly-raised modal past its invisible sizing pass.
+        h.step();
+        h.step();
         h.get_by_label("PROCEED").click_accesskit();
         wait_done(&mut h);
         let a = tmp.path().join("a");
@@ -3095,7 +3097,9 @@ mod ui_tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        h.step(); // draw the freshly-raised modal before querying it
+        // Draw the freshly-raised modal past its invisible sizing pass.
+        h.step();
+        h.step();
         h.get_by_label("PROCEED").click_accesskit();
         wait_done(&mut h);
         let a = tmp.path().join("a");
@@ -3260,7 +3264,9 @@ mod ui_tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        h.step(); // draw the freshly-raised modal before querying it
+        // Draw the freshly-raised modal past its invisible sizing pass.
+        h.step();
+        h.step();
         h.get_by_label("PROCEED").click_accesskit();
         wait_done(&mut h);
         let a = tmp.path().join("a");
@@ -3298,7 +3304,9 @@ mod ui_tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        h.step(); // draw the freshly-raised modal before querying it
+        // Draw the freshly-raised modal past its invisible sizing pass.
+        h.step();
+        h.step();
         h.get_by_label("PROCEED").click_accesskit();
         wait_done(&mut h);
         let status = h.state().status.clone().unwrap_or_default();

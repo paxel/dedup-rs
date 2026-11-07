@@ -3375,7 +3375,7 @@ impl TransferView {
     }
 
     fn confirm_modal(&mut self, ui: &mut egui::Ui, prompt: &str, acts: &mut Vec<Act>) {
-        egui::Modal::new(Id::new("transfer-confirm")).show(&ui.ctx().clone(), |ui| {
+        egui::Modal::new(Id::unique("transfer-confirm")).show(&ui.ctx().clone(), |ui| {
             ui.set_width(380.0);
             ui.label(
                 RichText::new(format!("CONFIRM {}", self.command.label()))
@@ -4605,7 +4605,7 @@ impl TransferView {
             return;
         };
         let mut decision: Option<bool> = None;
-        let response = egui::Modal::new(egui::Id::new("diff-bulk-confirm")).show(ctx, |ui| {
+        let response = egui::Modal::new(egui::Id::unique("diff-bulk-confirm")).show(ctx, |ui| {
             ui.set_width(400.0);
             ui.label(
                 egui::RichText::new("APPLY TO EVERY LISTED ROW")

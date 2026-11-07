@@ -1809,7 +1809,7 @@ impl DiffCompare {
         // Click to seek (or to start playing from that spot).
         let resp = ui.interact(
             pane,
-            ui.id().with(("wave-seek", slot)),
+            ui.scope_id().with(("wave-seek", slot)),
             egui::Sense::click(),
         );
         let resp = resp.on_hover_text("Click to play from this position.");
@@ -1889,7 +1889,7 @@ impl DiffCompare {
         let resp = ui
             .interact(
                 strip,
-                ui.id().with(("video-filmstrip", slot)),
+                ui.scope_id().with(("video-filmstrip", slot)),
                 egui::Sense::click(),
             )
             .explain(
@@ -2595,7 +2595,7 @@ impl DiffCompare {
             crate::lightbox::MetaAction::None,
             crate::lightbox::MetaAction::None,
         );
-        let mut picked = egui::Area::new(Id::new("diff-compare"))
+        let mut picked = egui::Area::new(Id::unique("diff-compare"))
             .order(egui::Order::Foreground)
             .fixed_pos(egui::Pos2::ZERO)
             .show(ctx, |ui| {
@@ -3937,7 +3937,7 @@ impl DiffCompare {
             let mut cancel = false;
             let mut exif_date = self.save_exif_date;
             let save_error = self.save_error.clone();
-            egui::Modal::new(Id::new("viewer-save")).show(ctx, |ui| {
+            egui::Modal::new(Id::unique("viewer-save")).show(ctx, |ui| {
                 ui.set_width(440.0);
                 ui.label(
                     RichText::new("WRITE THE TURNED IMAGE")
