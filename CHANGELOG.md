@@ -22,6 +22,8 @@ All notable changes to the `dedup-rs` project will be documented in this file.
   64 MiB, get no text fingerprint or text view instead of being read into memory whole.
 - ffmpeg, ffprobe and poppler run with a deadline and an output cap and are stopped past
   either, so a crafted file can no longer stall a scan; ffmpeg may only open local files.
+- A media file that crashes its audio decoder no longer takes the scan, the waveform view or
+  the player with it; the file is indexed without a fingerprint.
 - Every release file carries a signed build provenance attestation, checked with
   `gh attestation verify <file> -R paxel/dedup-rs`.
 

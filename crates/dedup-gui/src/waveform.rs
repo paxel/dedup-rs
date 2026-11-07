@@ -75,7 +75,12 @@ impl WaveCache {
                     // Only a successful decode has something new to show, so only
                     // that wakes the UI; waking on failure would spin repaints
                     // for undecodable files (and never settle).
-                    match extract_viz(&req.source) {
+                    // A decoder that panics on a malformed file (fuzzing found
+                    // one in symphonia) must not take this worker down with it.
+                    let viz = std::panic::catch_unwind(|| extract_viz(&req.source))
+                        .ok()
+                        .flatten();
+                    match viz {
                         Some(viz) => {
                             let _ = dec_tx.send(Decoded::Ready(req.hex, Arc::new(viz)));
                             if let Some(ctx) =
@@ -556,6 +561,35 @@ mod tests {
             low > high,
             "tone energy sits in low bins: low {low} vs high {high}"
         );
+    }
+
+    /// A file that makes symphonia panic (a fuzzing find) fails on its own;
+    /// the single worker lives on and still decodes the next file.
+    #[test]
+    fn a_panicking_decode_leaves_the_worker_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../dedup-core/tests/fixtures/fuzz/mkv-vint-panic.ogg");
+        let good = dir.path().join("tone.wav");
+        let tone: Vec<i16> = (0..8000)
+            .map(|i| ((i as f32 * 0.2).sin() * 8000.0) as i16)
+            .collect();
+        write_wav(&good, 8000, &tone);
+        let mut cache = WaveCache::new(1);
+        let ctx = Context::default();
+        assert!(cache.get("bad", &bad).is_none());
+        assert!(cache.get("good", &good).is_none());
+        let started = std::time::Instant::now();
+        while cache.get("good", &good).is_none() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "the worker died on the bad file"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cache.poll(&ctx);
+        }
+        assert!(cache.get("bad", &bad).is_none());
+        assert!(cache.failed.contains("bad"));
     }
 
     #[test]

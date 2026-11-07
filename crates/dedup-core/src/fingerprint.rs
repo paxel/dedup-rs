@@ -88,7 +88,21 @@ pub fn is_audio_mime(mime: &str) -> bool {
 /// `ffmpeg_available` gates the (external) video path and the audio decode
 /// fallback; when false, video files yield no temporal hash. Pass the result of
 /// [`ffmpeg_available`], probed once.
+///
+/// A parser that panics on a malformed file (fuzzing found one in symphonia's
+/// MKV reader) costs that file its fingerprints, not the scan: the file keeps
+/// its MIME type and its content hash.
 pub fn compute(path: &Path, ffmpeg_available: bool) -> Fingerprints {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        compute_unguarded(path, ffmpeg_available)
+    }))
+    .unwrap_or_else(|_| Fingerprints {
+        mime: detect_mime(path),
+        ..Default::default()
+    })
+}
+
+fn compute_unguarded(path: &Path, ffmpeg_available: bool) -> Fingerprints {
     let mime = detect_mime(path);
     let mut fp = Fingerprints {
         mime: mime.clone(),
@@ -509,6 +523,15 @@ fn text_hash(text: &str) -> Option<[u8; 32]> {
 /// no text (empty, scanned, or encrypted). Reuses the same per-format extractors
 /// that back the dedup text-hash, so what groups two documents is what you read.
 pub fn extract_document_text(path: &Path, mime: &str) -> Option<String> {
+    // A parser panic on a malformed document means no text, not a crash.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        extract_document_text_unguarded(path, mime)
+    }))
+    .ok()
+    .flatten()
+}
+
+fn extract_document_text_unguarded(path: &Path, mime: &str) -> Option<String> {
     let text = if mime == "application/pdf" {
         pdf_text(path)?
     } else if mime == "application/vnd.ms-excel" {

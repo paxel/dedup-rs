@@ -237,8 +237,12 @@ impl Default for Player {
 /// source was actually loaded.
 fn load(sink: &rodio::Player, path: &Path, start_ms: u64) -> bool {
     sink.clear();
+    // Probing a malformed file can panic inside symphonia (fuzzing found one);
+    // that is a file that does not play, not a crash.
     if let Ok(file) = std::fs::File::open(path)
-        && let Ok(decoder) = rodio::Decoder::new(BufReader::new(file))
+        && let Ok(Ok(decoder)) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rodio::Decoder::new(BufReader::new(file))
+        }))
     {
         sink.append(decoder);
         if start_ms > 0 {
