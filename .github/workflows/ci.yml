@@ -81,6 +81,13 @@ jobs:
         uses: coverallsapp/github-action@8d6379e14d29928660c4ba802d8e85393440b329 # v2.3.8
         with:
           file: lcov.info
+      # For the SonarQube Cloud workflow, which runs after this one.
+      - name: Keep lcov.info for SonarQube Cloud
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          retention-days: 7
 
   windows:
     name: Windows (build + core/cli tests)
