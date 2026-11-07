@@ -1,0 +1,4 @@
+# Integration tests are fixtures, not shipped code: their literal archive
+# passwords raise rust/hard-coded-cryptographic-value on every run.
+paths-ignore:
+  - crates/*/tests/**
