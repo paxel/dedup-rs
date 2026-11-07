@@ -39,6 +39,7 @@ pub mod store;
 pub mod strings;
 pub mod sync_group;
 pub mod thumbnail;
+pub mod tool;
 pub mod update;
 
 pub fn version() -> &'static str {

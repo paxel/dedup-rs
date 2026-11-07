@@ -411,18 +411,20 @@ pub fn video_temporal_hash(path: &Path) -> Option<[ImgHash; 3]> {
 }
 
 fn probe_duration_secs(path: &Path) -> Option<f64> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(path)
-        .output()
-        .ok()?;
+    let output = crate::tool::run(
+        Command::new("ffprobe")
+            .args(crate::tool::LOCAL_ONLY)
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(crate::tool::path_arg(path)),
+        crate::tool::PROBE_DEADLINE,
+    )?;
     if !output.status.success() {
         return None;
     }
@@ -446,34 +448,38 @@ pub fn media_duration_secs(path: &Path) -> Option<f64> {
 /// as "no soundtrack to offer", the same graceful degradation video
 /// fingerprints have without ffmpeg.
 pub fn has_audio_track(path: &Path) -> bool {
-    let Ok(output) = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "a",
-            "-show_entries",
-            "stream=codec_type",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(path)
-        .output()
-    else {
+    let Some(output) = crate::tool::run(
+        Command::new("ffprobe")
+            .args(crate::tool::LOCAL_ONLY)
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(crate::tool::path_arg(path)),
+        crate::tool::PROBE_DEADLINE,
+    ) else {
         return false;
     };
     output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
 }
 
 fn extract_frame(path: &Path, at_secs: f64) -> Option<image::DynamicImage> {
-    let output = Command::new("ffmpeg")
-        .args(["-v", "error", "-ss"])
-        .arg(format!("{at_secs}"))
-        .arg("-i")
-        .arg(path)
-        .args(["-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"])
-        .output()
-        .ok()?;
+    let output = crate::tool::run(
+        Command::new("ffmpeg")
+            .args(["-v", "error", "-ss"])
+            .arg(format!("{at_secs}"))
+            .args(crate::tool::LOCAL_ONLY)
+            .arg("-i")
+            .arg(crate::tool::path_arg(path))
+            .args(["-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"]),
+        crate::tool::DECODE_DEADLINE,
+    )?;
     if !output.status.success() || output.stdout.is_empty() {
         return None;
     }
@@ -907,16 +913,18 @@ fn decode_audio_prefix(path: &Path) -> Option<DecodedPrefix> {
 /// route for codecs symphonia cannot decode. `None` when ffmpeg fails.
 fn ffmpeg_audio_fingerprint(path: &Path) -> Option<Vec<u32>> {
     const RATE: u32 = 11025;
-    let output = Command::new("ffmpeg")
-        .args(["-v", "error", "-t"])
-        .arg(AUDIO_FINGERPRINT_SECS.to_string())
-        .arg("-i")
-        .arg(path)
-        .args(["-vn", "-f", "s16le", "-ac", "1", "-ar"])
-        .arg(RATE.to_string())
-        .arg("-")
-        .output()
-        .ok()?;
+    let output = crate::tool::run(
+        Command::new("ffmpeg")
+            .args(["-v", "error", "-t"])
+            .arg(AUDIO_FINGERPRINT_SECS.to_string())
+            .args(crate::tool::LOCAL_ONLY)
+            .arg("-i")
+            .arg(crate::tool::path_arg(path))
+            .args(["-vn", "-f", "s16le", "-ac", "1", "-ar"])
+            .arg(RATE.to_string())
+            .arg("-"),
+        crate::tool::DECODE_DEADLINE,
+    )?;
     if !output.status.success() || output.stdout.len() < 2 {
         return None;
     }

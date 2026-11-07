@@ -208,12 +208,17 @@ fn extract_wav(source: &Path, out: &Path, filter: Option<&str>) -> Result<(), Th
     }
     let tmp = out.with_extension("wav.part");
     let mut cmd = std::process::Command::new("ffmpeg");
-    cmd.args(["-v", "error", "-y", "-i"]).arg(source).arg("-vn");
+    cmd.args(["-v", "error", "-y"])
+        .args(crate::tool::LOCAL_ONLY)
+        .arg("-i")
+        .arg(crate::tool::path_arg(source))
+        .arg("-vn");
     if let Some(f) = filter {
         cmd.args(["-filter:a", f]);
     }
     cmd.args(["-acodec", "pcm_s16le", "-f", "wav"]).arg(&tmp);
-    let ok = cmd.output().map(|o| o.status.success()).unwrap_or(false);
+    let ok = crate::tool::run(&mut cmd, crate::tool::EXTRACT_DEADLINE)
+        .is_some_and(|o| o.status.success());
     let have = ok
         && std::fs::metadata(&tmp)
             .map(|m| m.len() > 0)
