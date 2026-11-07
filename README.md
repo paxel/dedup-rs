@@ -47,7 +47,7 @@ built by this repository's release workflow from the tagged commit. Check a down
 the GitHub CLI:
 
 ```bash
-gh attestation verify dedup-3.0.1-linux-x86_64.tar.gz -R paxel/dedup-rs
+gh attestation verify dedup-3.1.0-linux-x86_64.tar.gz -R paxel/dedup-rs
 ```
 
 Optional tools unlock extra features at runtime and the app degrades gracefully without
