@@ -14,14 +14,16 @@ fn fixture(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
-/// symphonia's MKV reader panics on this file ("attempt to shift left with
-/// overflow" in its variable-length integer). The fingerprint gives up, the
+/// symphonia panics on these files: its MKV reader in a variable-length
+/// integer, its AAC decoder in an ADTS header. The fingerprint gives up, the
 /// MIME type stays.
 #[test]
 fn a_panicking_audio_parser_costs_only_the_fingerprint() {
-    let fp = dedup_core::fingerprint::compute(&fixture("mkv-vint-panic.ogg"), false);
-    assert!(fp.audio.is_none());
-    assert!(fp.mime.is_some(), "the file keeps its type: {fp:?}");
+    for name in ["mkv-vint-panic.ogg", "aac-adts-panic.ogg"] {
+        let fp = dedup_core::fingerprint::compute(&fixture(name), false);
+        assert!(fp.audio.is_none(), "{name}");
+        assert!(fp.mime.is_some(), "{name} keeps its type: {fp:?}");
+    }
 }
 
 /// The same file in a scanned repository: the scan finishes and indexes it.

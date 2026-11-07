@@ -1,0 +1,4 @@
+# cargo-fuzz needs nightly (sanitizer flags). Pinned like the stable toolchain
+# at the repository root; move it on purpose.
+[toolchain]
+channel = "nightly-2026-11-01"
