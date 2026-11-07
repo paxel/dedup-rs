@@ -21,7 +21,9 @@ rayon = "1.10"
 walkdir = "2.5"
 # Every default format except "avif", which is only the AVIF encoder (rav1e):
 # the app never writes AVIF, and decoding it needs the separate avif-native.
-image = { version = "0.25", default-features = false, features = ["rayon", "bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
+# No "exr": the exr crate pulls in the unmaintained paste (RUSTSEC-2024-0436).
+# No "rayon": nothing calls its parallel APIs, and it locks ravif and rav1e.
+image = { version = "0.25", default-features = false, features = ["bmp", "dds", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
 infer = "0.19"
 mime_guess = "2.0"
 lopdf = "0.47"

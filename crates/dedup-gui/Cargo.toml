@@ -32,7 +32,9 @@ serde_json = "1.0"
 rodio = { version = "0.22", default-features = false, features = ["playback", "symphonia-all"] }
 # Every default format except "avif", which is only the AVIF encoder (rav1e):
 # the app never writes AVIF, and decoding it needs the separate avif-native.
-image = { version = "0.25", default-features = false, features = ["rayon", "bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
+# No "exr": the exr crate pulls in the unmaintained paste (RUSTSEC-2024-0436).
+# No "rayon": nothing calls its parallel APIs, and it locks ravif and rav1e.
+image = { version = "0.25", default-features = false, features = ["bmp", "dds", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
 id3 = "1"
 egui_extras = "0.35"
 log = "0.4"

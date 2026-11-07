@@ -99,3 +99,17 @@ fn update_computes_fingerprints_and_find_similar_groups_them() {
             .expect("find similar (filtered)");
     assert!(dropped.is_empty(), "no member matches → group dropped");
 }
+
+/// EXR decoding is off (its decoder pulls in an unmaintained crate): an EXR
+/// file is still indexed for exact duplicates, but the viewer cannot decode it.
+#[test]
+fn exr_images_are_not_decoded() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny.exr");
+    assert!(path.is_file(), "fixture exists");
+    assert!(dedup_core::thumbnail::load_rgba(&path).is_err());
+    assert!(
+        dedup_core::fingerprint::compute(&path, false)
+            .img_fingerprint
+            .is_none()
+    );
+}
