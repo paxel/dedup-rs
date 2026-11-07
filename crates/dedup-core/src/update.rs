@@ -355,18 +355,23 @@ pub fn update_repo_authorized(
                         // A changed archive has its members read in the same
                         // pass; an unchanged one never reaches here, so the
                         // heavy re-read is paid once per change, like the hash.
+                        let mut archive_cap = None;
                         let archive_members = if crate::archive::is_archive(
                             &file.rel,
                             fingerprints.mime.as_deref(),
                         ) {
-                            Some(
-                                crate::archive::list_members(
-                                    &file.abs,
-                                    &file.rel,
-                                    fingerprints.mime.as_deref(),
-                                )
-                                .unwrap_or_default(),
-                            )
+                            let caps = crate::archive::MemberCaps::for_archive(file.size);
+                            let listing = crate::archive::list_members_with(
+                                &file.abs,
+                                &file.rel,
+                                fingerprints.mime.as_deref(),
+                                caps,
+                            );
+                            archive_cap = listing
+                                .as_ref()
+                                .and_then(|l| l.capped)
+                                .map(|cap| cap.describe(caps));
+                            Some(listing.map(|l| l.members).unwrap_or_default())
                         } else {
                             None
                         };
@@ -374,6 +379,7 @@ pub fn update_repo_authorized(
                             hash,
                             fingerprints,
                             archive_members,
+                            archive_cap,
                         }
                     });
                     // Receiver gone means the writer failed; just stop sending.
@@ -402,6 +408,14 @@ pub fn update_repo_authorized(
                     stats.hashed_bytes = stats.hashed_bytes.saturating_add(file.size);
                     if let Some(members) = hashed.archive_members {
                         archive_members.push((file.rel.as_str(), members));
+                    }
+                    // The archive itself is indexed; only its member listing
+                    // stopped short. The report names the cap.
+                    if let Some(message) = hashed.archive_cap {
+                        progress.on(ProgressEvent::Error {
+                            path: file.abs.display().to_string(),
+                            message,
+                        });
                     }
                     let fp = hashed.fingerprints;
                     batch.push((
@@ -578,6 +592,8 @@ struct HashedFile {
     /// indexing folds into the scan, gated by the same change-detection as the
     /// content hash. `None` for non-archives.
     archive_members: Option<Vec<store::ArchiveMember>>,
+    /// The report line when a member cap stopped the archive's listing.
+    archive_cap: Option<String>,
 }
 
 /// Cheap extension check used only to decide whether to warn about a missing
