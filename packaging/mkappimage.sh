@@ -108,6 +108,8 @@ fi
 # --- stage the AppDir --------------------------------------------------------
 appdir=$(mktemp -d)
 trap 'rm -rf "$appdir"' EXIT
+# mktemp makes it 0700; appimagetool refuses an AppDir other users cannot read.
+chmod 755 "$appdir"
 
 install -Dm755 "$bin" "$appdir/usr/bin/dedup"
 # Inside the AppImage the binary is found via PATH, not /usr/bin — rewrite Exec.
