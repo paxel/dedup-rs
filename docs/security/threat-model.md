@@ -55,8 +55,11 @@ What an attacker can make dedup do, and what stops it. Decided scope and rules a
    its hash and gets no fingerprint or thumbnail.
 6. **Parser crash or hang on malformed input.** A panic deep in a dependency, or an
    endless loop, on input nobody tested. *Mitigation:* fuzz targets per parsing entry
-   point run on a schedule; a finding becomes a regression test and a fix. Dependencies
-   with published advisories fail the release (`cargo-deny`).
+   point (`fuzz/`) run weekly; a finding becomes a fixture under
+   `crates/dedup-core/tests/fixtures/fuzz/`, a regression test and a fix. Fingerprinting,
+   document text, the waveform worker and the player's probe contain a parser panic: the
+   file gets no fingerprint or preview, the scan and the app go on. Dependencies with
+   published advisories fail the release (`cargo-deny`).
 7. **Path traversal on extract.** A member named `../../.bashrc` or `/etc/x`.
    *Mitigation (existing):* extraction keeps only normal path components, never
    overwrites (collisions get a suffix), writes symlink members as plain files and only
@@ -68,5 +71,8 @@ What an attacker can make dedup do, and what stops it. Decided scope and rules a
 
 - `lopdf` and `symphonia` decompress streams without a size limit of their own; the caps
   above bound the input size, not the decoded size. Fuzzing is the check here.
+- symphonia 0.5 panics on two malformed inputs the fuzzer found (an MKV variable-length
+  integer, an AAC ADTS header). Contained, not fixed: once playback has started, rodio
+  decodes on its own audio thread, where a panic stops the sound.
 - ffmpeg, poppler and LibreOffice parse in their own processes; their vulnerabilities are
   theirs, but a crash there costs one fingerprint or preview, not the app.
