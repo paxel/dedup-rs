@@ -5248,7 +5248,7 @@ mod tests {
         let path = dir.join(name);
         let file = std::fs::File::create(&path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
-        let opts: zip::write::FileOptions<'_, ()> =
+        let opts: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         zip.start_file("word/document.xml", opts).unwrap();
         zip.write_all(
@@ -5870,7 +5870,7 @@ mod tests {
         let path = dir.join(name);
         let file = std::fs::File::create(&path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
-        let opts: zip::write::FileOptions<'_, ()> =
+        let opts: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         for (n, d) in entries {
             zip.start_file(*n, opts).unwrap();
@@ -5959,7 +5959,7 @@ mod tests {
         let path = dir.join(name);
         let file = std::fs::File::create(&path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
-        let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+        let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
             .compression_method(zip::CompressionMethod::Stored)
             .with_aes_encryption(zip::AesMode::Aes256, password);
         zip.start_file(member, opts).unwrap();

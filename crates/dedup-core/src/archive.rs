@@ -87,11 +87,13 @@ fn zip_entries(path: &Path) -> Option<Vec<ArchiveEntry>> {
     let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).ok()?;
     let mut out = Vec::new();
     for i in 0..archive.len() {
+        // zip 9 decodes the name and fails on an invalid one: skip that entry.
         if let Ok(e) = archive.by_index_raw(i)
             && e.is_file()
+            && let Ok(name) = e.name()
         {
             out.push(ArchiveEntry {
-                name: e.name().to_string(),
+                name: name.into_owned(),
                 size: e.size(),
                 locked: e.encrypted(),
             });
@@ -310,7 +312,10 @@ fn zip_members_pw(path: &Path, password: &str) -> Option<Vec<ArchiveMember>> {
     let mut members = Vec::new();
     for i in 0..archive.len() {
         let (name, size, encrypted, is_file) = match archive.by_index_raw(i) {
-            Ok(e) => (e.name().to_string(), e.size(), e.encrypted(), e.is_file()),
+            Ok(e) => match e.name() {
+                Ok(name) => (name.into_owned(), e.size(), e.encrypted(), e.is_file()),
+                Err(_) => continue,
+            },
             Err(_) => continue,
         };
         if !is_file {
@@ -558,7 +563,10 @@ fn zip_members(path: &Path) -> Option<Vec<ArchiveMember>> {
         // zip's directory carries names and sizes unencrypted even when the
         // contents are encrypted, so a locked member is still listed.
         let (name, size, encrypted, is_file) = match archive.by_index_raw(i) {
-            Ok(e) => (e.name().to_string(), e.size(), e.encrypted(), e.is_file()),
+            Ok(e) => match e.name() {
+                Ok(name) => (name.into_owned(), e.size(), e.encrypted(), e.is_file()),
+                Err(_) => continue,
+            },
             Err(_) => continue,
         };
         if !is_file {

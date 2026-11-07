@@ -591,8 +591,9 @@ fn zip_doc_text(path: &Path, mime: &str) -> Option<String> {
     let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).ok()?;
     let names: Vec<String> = archive
         .file_names()
+        .filter_map(Result::ok)
         .filter(|n| is_content_entry(n, mime))
-        .map(String::from)
+        .map(|n| n.into_owned())
         .collect();
 
     let mut out = String::new();
@@ -1143,7 +1144,7 @@ mod tests {
         use std::io::Write;
         let file = std::fs::File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
-        let opts: zip::write::FileOptions<'_, ()> =
+        let opts: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         for (name, xml) in entries {
             zip.start_file(*name, opts).unwrap();

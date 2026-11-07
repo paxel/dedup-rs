@@ -11,7 +11,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 fn write_zip(path: &std::path::Path, entries: &[(&str, &[u8])]) {
     let file = std::fs::File::create(path).unwrap();
     let mut zip = zip::ZipWriter::new(file);
-    let opts: zip::write::FileOptions<'_, ()> =
+    let opts: zip::write::FileOptions<'_, '_, ()> =
         zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
     for (name, data) in entries {
         zip.start_file(*name, opts).unwrap();
@@ -29,11 +29,11 @@ fn write_mixed_encrypted_zip(
 ) {
     let file = std::fs::File::create(path).unwrap();
     let mut zip = zip::ZipWriter::new(file);
-    let plain_opts: zip::write::FileOptions<'_, ()> =
+    let plain_opts: zip::write::FileOptions<'_, '_, ()> =
         zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
     zip.start_file(plain.0, plain_opts).unwrap();
     zip.write_all(plain.1).unwrap();
-    let enc_opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+    let enc_opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
         .compression_method(zip::CompressionMethod::Stored)
         .with_aes_encryption(zip::AesMode::Aes256, password);
     zip.start_file(encrypted.0, enc_opts).unwrap();

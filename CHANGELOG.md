@@ -11,6 +11,11 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 - On a Wayland desktop, programs opened from dedup (viewers, the file manager) start on
   Wayland; only dedup's own window still uses X11 for drag-and-drop.
 
+### Security
+
+- Dependencies with known vulnerabilities are updated: zip, calamine (and its quick-xml), zstd,
+  webbrowser and ctutils; yanked releases are replaced.
+
 ---
 
 Historical changes have been moved to [OLDER_CHANGES.md](OLDER_CHANGES.md).
