@@ -1,5 +1,7 @@
 # The start page is the hub, and every result is one board
 
+**Superseded** by [ADR 0006](0006-repository-page-and-one-page-per-process.md) on 2026-11-08.
+
 Decided on 2026-10-20, after the app's only user reported that its five tabs
 "feel like five apps developed by different people". The feedback half of
 [ADR 0003](0003-every-action-reports-and-long-work-runs-alone.md) stays in
