@@ -378,12 +378,12 @@ pub struct SyncStats {
     pub cancelled: bool,
 }
 
-struct OpenRepo {
-    meta: RepoMeta,
-    db: std::sync::Arc<redb::Database>,
+pub(crate) struct OpenRepo {
+    pub(crate) meta: RepoMeta,
+    pub(crate) db: std::sync::Arc<redb::Database>,
 }
 
-fn open_repo(store: &Store, name: &str) -> Result<OpenRepo, StoreError> {
+pub(crate) fn open_repo(store: &Store, name: &str) -> Result<OpenRepo, StoreError> {
     let meta = store.get_repo(name)?;
     let db = store.open_repo_db(name)?;
     Ok(OpenRepo { meta, db })
@@ -422,7 +422,7 @@ fn open_references(
 
 /// Collect the source entries (rel path + entry) that pass the filter.
 /// `include_missing` controls whether missing entries are streamed too.
-fn collect_source_entries(
+pub(crate) fn collect_source_entries(
     db: &redb::Database,
     filter: &FileFilter,
     include_missing: bool,
@@ -1261,7 +1261,7 @@ fn sync_delete(
 /// set to the file's real on-disk mtime, so a later scan sees the copy as
 /// unchanged. Falls back to the source entry's mtime if the target's cannot
 /// be read.
-fn entry_for_copied_file(entry: &FileEntry, path: &Path, origin: &str) -> FileEntry {
+pub(crate) fn entry_for_copied_file(entry: &FileEntry, path: &Path, origin: &str) -> FileEntry {
     let modified_ms = std::fs::metadata(path)
         .and_then(|md| md.modified())
         .map(crate::update::system_time_to_ms)
@@ -1279,7 +1279,7 @@ fn entry_for_copied_file(entry: &FileEntry, path: &Path, origin: &str) -> FileEn
 
 /// Move a file, falling back to copy+delete across filesystems; parent
 /// directories of the destination are created as needed.
-fn transfer_file(from: &Path, to: &Path, move_file: bool) -> Result<(), DiffError> {
+pub(crate) fn transfer_file(from: &Path, to: &Path, move_file: bool) -> Result<(), DiffError> {
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent).map_err(|source| DiffError::Io {
             action: "create directory",

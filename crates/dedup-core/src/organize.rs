@@ -284,7 +284,7 @@ fn size_bucket(bytes: u64) -> &'static str {
 /// `{token|alt|"literal"}` tries each alternative left to right: a token wins if
 /// it resolves non-empty, a `"quoted"` literal always wins (its content, even if
 /// empty). Text outside braces — including `/` separators — is copied verbatim.
-fn render_template(template: &str, entry: &FileEntry, rel_path: &str) -> String {
+pub(crate) fn render_template(template: &str, entry: &FileEntry, rel_path: &str) -> String {
     let mut out = String::new();
     let mut rest = template;
     while let Some((before, after)) = rest.split_once('{') {
@@ -322,7 +322,7 @@ fn resolve_placeholder(expr: &str, entry: &FileEntry, rel_path: &str) -> String 
 /// (dropping trailing dots/spaces), drop empty/`.` segments, and reject any
 /// `..` segment (which would escape the repo). Returns `None` if nothing usable
 /// remains.
-fn normalize_rel(rendered: &str) -> Option<String> {
+pub(crate) fn normalize_rel(rendered: &str) -> Option<String> {
     let mut segments = Vec::new();
     for raw in rendered.split('/') {
         // Check for `..` before the trailing-dot trim, which would otherwise

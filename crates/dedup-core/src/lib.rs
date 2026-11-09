@@ -22,6 +22,7 @@
 
 pub mod align;
 pub mod archive;
+pub mod copy_into;
 pub mod diff;
 pub mod dupes;
 pub mod eta;
