@@ -38,7 +38,6 @@ const LAST_RUNS: usize = 5;
 enum JobKind {
     Update,
     UpdateForced,
-    Check,
 }
 
 /// How one repository's scan ended.
@@ -50,9 +49,31 @@ enum JobOutcome {
     UpdateWouldEmpty(u64),
 }
 
+/// A repository-page command that investigates before it runs (ADR 0006).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepoCommand {
+    Update,
+    EmptyDirs,
+}
+
+/// What a repository-page command would change, shown before it runs.
+#[derive(Debug, Clone)]
+enum Estimate {
+    /// UPDATE: per repository, what a scan would find.
+    Update(Vec<(String, Result<dedup_core::update::CheckStats, String>)>),
+    /// DELETE EMPTY DIRS: per repository, the folders that would go (paths
+    /// relative to the repository), or why it was not looked at.
+    EmptyDirs(Vec<(String, Result<Vec<String>, String>)>),
+}
+
 /// What a scan worker tells the app root.
 enum AppMsg {
-    Scanned { repo: String, outcome: JobOutcome },
+    Scanned {
+        repo: String,
+        outcome: JobOutcome,
+    },
+    /// An investigation finished: its estimate, for the user to confirm.
+    Estimated(Estimate),
 }
 
 /// What fills the window (ADR 0006): the repository page, or one process
@@ -230,7 +251,9 @@ enum Action {
     ChooseFolder(FolderTarget),
     Create,
     /// Run UPDATE (or CHECK) on the selected repositories.
-    Scan(JobKind),
+    /// Investigate a repository command on the selection; its estimate then
+    /// waits for OK.
+    Investigate(RepoCommand),
 }
 
 pub struct DedupApp {
@@ -260,6 +283,8 @@ pub struct DedupApp {
     /// A scan was refused because it would have emptied this repo's index
     /// (name, entry count). Shows the confirmation that can authorise it.
     empty_scan_confirm: Option<(String, u64)>,
+    /// A repository command's estimate, waiting for OK or CANCEL.
+    estimate: Option<Estimate>,
 
     show_add: bool,
     new_name: String,
@@ -326,6 +351,7 @@ impl DedupApp {
             load_error: None,
             notice: None,
             empty_scan_confirm: None,
+            estimate: None,
             show_add: false,
             new_name: String::new(),
             new_path: String::new(),
@@ -634,7 +660,14 @@ impl DedupApp {
     /// rows: freshness, the last-scan line, and the empty-walk question.
     fn drain_scans(&mut self) {
         // A finished scan (reported by the activity window) updates its row.
-        while let Ok(AppMsg::Scanned { repo, outcome }) = self.rx.try_recv() {
+        while let Ok(msg) = self.rx.try_recv() {
+            let (repo, outcome) = match msg {
+                AppMsg::Estimated(estimate) => {
+                    self.estimate = Some(estimate);
+                    continue;
+                }
+                AppMsg::Scanned { repo, outcome } => (repo, outcome),
+            };
             match outcome {
                 JobOutcome::UpdateWouldEmpty(entries) => {
                     // Nothing was written. Ask before letting a scan empty an
@@ -733,6 +766,220 @@ impl DedupApp {
     /// Scan (or check) `names` one after another as one operation in the
     /// activity window, each repository on its own row. Refused with a card
     /// while anything else runs.
+    /// Investigate `cmd` on the selection (ADR 0006): a quiet operation that
+    /// changes nothing and ends in an estimate waiting for OK.
+    fn investigate(&mut self, ctx: &egui::Context, cmd: RepoCommand) {
+        let names: Vec<String> = self.selection.iter().cloned().collect();
+        if names.is_empty() {
+            return;
+        }
+        let locked: HashSet<String> = names
+            .iter()
+            .filter(|n| self.locks.read_only(n))
+            .cloned()
+            .collect();
+        let (verb, doing) = match cmd {
+            RepoCommand::Update => ("UPDATE", "checking"),
+            RepoCommand::EmptyDirs => ("DELETE EMPTY DIRS", "looking for empty folders in"),
+        };
+        let store = Arc::clone(&self.store);
+        let tx = self.tx.clone();
+        let started = crate::activity::lock(&self.activity).start_quiet(
+            ctx,
+            crate::activity::Spec {
+                title: format!("{verb}: investigating"),
+                repos: names.clone(),
+            },
+            move |progress, cancel| {
+                let total = names.len() as u64;
+                let mut update = Vec::new();
+                let mut dirs = Vec::new();
+                for (i, name) in names.iter().enumerate() {
+                    if cancel.is_cancelled() {
+                        return Err("cancelled".into());
+                    }
+                    progress.phase(format!("{doing} '{name}'"), i as u64, Some(total));
+                    match cmd {
+                        RepoCommand::Update => {
+                            let scan = crate::activity::ScanProgress {
+                                activity: progress.clone(),
+                                repo: name.clone(),
+                            };
+                            let result =
+                                check_repo(&store, name, &scan, cancel).map_err(|e| e.to_string());
+                            let _ = tx.send(AppMsg::Scanned {
+                                repo: name.clone(),
+                                outcome: JobOutcome::Check(result.clone()),
+                            });
+                            update.push((name.clone(), result));
+                        }
+                        RepoCommand::EmptyDirs => {
+                            let found = if locked.contains(name) {
+                                Err("locked — unlock it to delete its empty folders".to_string())
+                            } else {
+                                empty_dirs_of(&store, name)
+                            };
+                            dirs.push((name.clone(), found));
+                        }
+                    }
+                }
+                if cancel.is_cancelled() {
+                    return Err("cancelled".into());
+                }
+                let estimate = match cmd {
+                    RepoCommand::Update => Estimate::Update(update),
+                    RepoCommand::EmptyDirs => Estimate::EmptyDirs(dirs),
+                };
+                let _ = tx.send(AppMsg::Estimated(estimate));
+                progress.repaint();
+                Ok(())
+            },
+        );
+        if let Err(busy) = started {
+            self.card(ctx, Notification::refused(verb, &busy));
+        }
+    }
+
+    /// The estimate of a repository command, with OK and CANCEL. Only OK
+    /// changes anything.
+    fn estimate_modal(&mut self, ctx: &egui::Context) {
+        let Some(estimate) = self.estimate.clone() else {
+            return;
+        };
+        let (title, lines, work) = estimate_lines(&estimate);
+        let mut decision: Option<bool> = None;
+        let verbosity = self.tooltip_verbosity;
+        let response = egui::Modal::new(Id::unique("repo-estimate")).show(ctx, |ui| {
+            ui.set_width(480.0);
+            ui.label(
+                RichText::new(title)
+                    .color(theme::amber())
+                    .size(18.0)
+                    .strong(),
+            );
+            ui.add_space(8.0);
+            egui::ScrollArea::vertical()
+                .max_height(320.0)
+                .show(ui, |ui| {
+                    for line in &lines {
+                        ui.label(RichText::new(line).color(theme::text()).size(13.0));
+                    }
+                });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if crate::lcars::action_button(ui, "OK", work, theme::orange())
+                    .explain(
+                        verbosity,
+                        "Carry out these changes",
+                        "Carry out the changes listed above, in the activity window.",
+                    )
+                    .clicked()
+                {
+                    decision = Some(true);
+                }
+                if crate::lcars::action_button(ui, "CANCEL", true, theme::tan())
+                    .explain(
+                        verbosity,
+                        "Change nothing",
+                        "Close without changing anything.",
+                    )
+                    .clicked()
+                {
+                    decision = Some(false);
+                }
+            });
+        });
+        if response.should_close() && decision.is_none() {
+            decision = Some(false);
+        }
+        match decision {
+            Some(true) => {
+                self.estimate = None;
+                match estimate {
+                    Estimate::Update(repos) => {
+                        let names = repos
+                            .into_iter()
+                            .filter(|(_, r)| r.is_ok())
+                            .map(|(n, _)| n)
+                            .collect();
+                        self.start_scans(ctx, names, JobKind::Update);
+                    }
+                    Estimate::EmptyDirs(repos) => self.run_empty_dirs(ctx, repos),
+                }
+            }
+            Some(false) => self.estimate = None,
+            None => {}
+        }
+    }
+
+    /// Delete exactly the empty folders the estimate listed, each only if it
+    /// is still empty; a folder that gained a file meanwhile stays.
+    fn run_empty_dirs(
+        &mut self,
+        ctx: &egui::Context,
+        repos: Vec<(String, Result<Vec<String>, String>)>,
+    ) {
+        let jobs: Vec<(String, Vec<String>)> = repos
+            .into_iter()
+            .filter_map(|(n, r)| r.ok().filter(|d| !d.is_empty()).map(|d| (n, d)))
+            .collect();
+        let names: Vec<String> = jobs.iter().map(|(n, _)| n.clone()).collect();
+        let store = Arc::clone(&self.store);
+        let started = crate::activity::lock(&self.activity).start(
+            ctx,
+            crate::activity::Spec {
+                title: "DELETE EMPTY DIRS".into(),
+                repos: names,
+            },
+            move |progress, cancel| {
+                let mut report = crate::run_result::RunReport::new("DELETE EMPTY DIRS");
+                let (mut removed, mut kept) = (0u64, 0u64);
+                let total = jobs.len() as u64;
+                for (i, (name, dirs)) in jobs.iter().enumerate() {
+                    if cancel.is_cancelled() {
+                        progress.row_done(name, "not reached — cancelled");
+                        continue;
+                    }
+                    progress.phase(format!("deleting in '{name}'"), i as u64, Some(total));
+                    let root = match store.get_repo(name) {
+                        Ok(meta) => PathBuf::from(meta.abs_path),
+                        Err(e) => {
+                            progress.problem(format!("'{name}': {e}"));
+                            continue;
+                        }
+                    };
+                    let mut here = 0u64;
+                    // Deepest first, as listed, so a parent is empty by its turn.
+                    for rel in dirs {
+                        if std::fs::remove_dir(root.join(rel)).is_ok() {
+                            here = here.saturating_add(1);
+                        } else {
+                            kept = kept.saturating_add(1);
+                        }
+                    }
+                    removed = removed.saturating_add(here);
+                    if here > 0 {
+                        progress.record(&Notification::changed(
+                            "Removed empty directories",
+                            name,
+                            &format!("{here} director{}", if here == 1 { "y" } else { "ies" }),
+                        ));
+                    }
+                    progress.row_done(name, format!("{here} removed"));
+                }
+                if kept > 0 {
+                    report.problem(format!("{kept} folder(s) were no longer empty and stayed"));
+                }
+                report
+                    .count("removed", removed)
+                    .cancelled(cancel.is_cancelled())
+            },
+        );
+        if let Err(busy) = started {
+            self.card(ctx, Notification::refused("DELETE EMPTY DIRS", &busy));
+        }
+    }
+
     fn start_scans(&mut self, ctx: &egui::Context, names: Vec<String>, kind: JobKind) {
         if names.is_empty() {
             // Never a silent click: UPDATE ALL with every repository offline
@@ -743,11 +990,7 @@ impl DedupApp {
             );
             return;
         }
-        let verb = if kind == JobKind::Check {
-            "CHECK"
-        } else {
-            "UPDATE"
-        };
+        let verb = "UPDATE";
         let title = match names.as_slice() {
             [one] => format!("{verb} '{one}'"),
             many => format!("{verb} {} repositories", many.len()),
@@ -770,9 +1013,7 @@ impl DedupApp {
             },
             move |progress, cancel| {
                 let mut report = crate::run_result::RunReport::new(report_title);
-                let mut new = 0u64;
-                let (mut added, mut updated, mut unchanged, mut missing, mut changed) =
-                    (0u64, 0u64, 0u64, 0u64, 0u64);
+                let (mut added, mut updated, mut unchanged, mut missing) = (0u64, 0u64, 0u64, 0u64);
                 let mut errors = 0u64;
                 let mut cancelled = false;
                 let total = names.len() as u64;
@@ -782,13 +1023,8 @@ impl DedupApp {
                         progress.row_done(name, "not reached — cancelled");
                         continue;
                     }
-                    let doing = if kind == JobKind::Check {
-                        "checking"
-                    } else {
-                        "updating"
-                    };
                     progress.phase(
-                        format!("{doing} '{name}' ({} of {total})", i.saturating_add(1)),
+                        format!("updating '{name}' ({} of {total})", i.saturating_add(1)),
                         i as u64,
                         Some(total),
                     );
@@ -797,26 +1033,18 @@ impl DedupApp {
                         repo: name.clone(),
                     };
                     log::info!("starting {kind:?} of '{name}' on {threads} thread(s)");
-                    let outcome = match kind {
-                        JobKind::Update | JobKind::UpdateForced => {
-                            match dedup_core::update::update_repo_authorized(
-                                &store,
-                                name,
-                                threads,
-                                &scan,
-                                cancel,
-                                allow_empty,
-                            ) {
-                                Err(dedup_core::update::UpdateError::WouldEmptyIndex {
-                                    entries,
-                                    ..
-                                }) => JobOutcome::UpdateWouldEmpty(entries),
-                                other => JobOutcome::Update(other.map_err(|e| e.to_string())),
-                            }
-                        }
-                        JobKind::Check => JobOutcome::Check(
-                            check_repo(&store, name, &scan, cancel).map_err(|e| e.to_string()),
-                        ),
+                    let outcome = match dedup_core::update::update_repo_authorized(
+                        &store,
+                        name,
+                        threads,
+                        &scan,
+                        cancel,
+                        allow_empty,
+                    ) {
+                        Err(dedup_core::update::UpdateError::WouldEmptyIndex {
+                            entries, ..
+                        }) => JobOutcome::UpdateWouldEmpty(entries),
+                        other => JobOutcome::Update(other.map_err(|e| e.to_string())),
                     };
                     match &outcome {
                         JobOutcome::Update(Ok(s)) => {
@@ -854,26 +1082,8 @@ impl DedupApp {
                             ));
                             progress.row_done(name, "refused: walked empty");
                         }
-                        JobOutcome::Check(Ok(c)) => {
-                            new = new.saturating_add(c.new);
-                            changed = changed.saturating_add(c.changed);
-                            missing = missing.saturating_add(c.missing);
-                            unchanged = unchanged.saturating_add(c.unchanged);
-                            errors = errors.saturating_add(c.errors);
-                            cancelled |= c.cancelled;
-                            progress.row_done(
-                                name,
-                                format!(
-                                    "{} new, {} changed, {} missing, {} unchanged",
-                                    c.new, c.changed, c.missing, c.unchanged
-                                ),
-                            );
-                        }
-                        JobOutcome::Check(Err(e)) => {
-                            errors = errors.saturating_add(1);
-                            progress.problem(format!("'{name}': {e}"));
-                            progress.row_done(name, format!("error: {e}"));
-                        }
+                        // An UPDATE never checks; the investigation does.
+                        JobOutcome::Check(_) => {}
                     }
                     let _ = tx.send(AppMsg::Scanned {
                         repo: name.clone(),
@@ -881,19 +1091,11 @@ impl DedupApp {
                     });
                     progress.repaint();
                 }
-                if kind == JobKind::Check {
-                    report = report
-                        .count("new", new)
-                        .count("changed", changed)
-                        .count("missing", missing)
-                        .count("unchanged", unchanged);
-                } else {
-                    report = report
-                        .count("added", added)
-                        .count("updated", updated)
-                        .count("unchanged", unchanged)
-                        .count("missing", missing);
-                }
+                report = report
+                    .count("added", added)
+                    .count("updated", updated)
+                    .count("unchanged", unchanged)
+                    .count("missing", missing);
                 if errors > 0 {
                     report = report.count("errors", errors);
                 }
@@ -956,10 +1158,7 @@ impl DedupApp {
     // never open a dialog (the same pattern TransferView::apply uses).
     fn apply(&mut self, ctx: &egui::Context, frame: Option<&eframe::Frame>, action: Action) {
         match action {
-            Action::Scan(kind) => {
-                let names: Vec<String> = self.selection.iter().cloned().collect();
-                self.start_scans(ctx, names, kind);
-            }
+            Action::Investigate(cmd) => self.investigate(ctx, cmd),
             Action::ToggleRemote(name) => {
                 let now = self
                     .repos
@@ -1419,6 +1618,9 @@ impl eframe::App for DedupApp {
         if self.empty_scan_confirm.is_some() {
             self.empty_scan_modal(&ctx);
         }
+        if self.estimate.is_some() {
+            self.estimate_modal(&ctx);
+        }
         if self.show_help {
             self.help_window(&ctx);
         }
@@ -1769,8 +1971,8 @@ impl DedupApp {
                     .explain(
                         verbosity,
                         "Select every repository not greyed out",
-                        "Select every repository that is not greyed out, so UPDATE or CHECK \
-                         runs on all of them.",
+                        "Select every repository that is not greyed out, so UPDATE or \
+                         DELETE EMPTY DIRS acts on all of them.",
                     )
                     .clicked()
                 {
@@ -1829,23 +2031,24 @@ impl DedupApp {
                     .explain(
                         verbosity,
                         "Scan the selected repositories",
-                        "Scan the selected repositories: index new and changed files and \
-                         mark vanished ones missing.",
+                        "Look at what a scan of the selected repositories would change, show \
+                         it, and scan only after OK: new and changed files are indexed, \
+                         vanished ones marked missing.",
                     )
                     .clicked()
                 {
-                    actions.push(Action::Scan(JobKind::Update));
+                    actions.push(Action::Investigate(RepoCommand::Update));
                 }
-                if crate::lcars::action_button(ui, "CHECK", any, theme::orange())
+                if crate::lcars::action_button(ui, "DELETE EMPTY DIRS", any, theme::orange())
                     .explain(
                         verbosity,
-                        "What would an UPDATE change?",
-                        "Report what an UPDATE of the selected repositories would change, \
-                         without hashing or writing anything.",
+                        "Delete the empty folders of the selected repositories",
+                        "Look for empty folders in the selected repositories, show them, and \
+                         delete them only after OK. Locked repositories are left alone.",
                     )
                     .clicked()
                 {
-                    actions.push(Action::Scan(JobKind::Check));
+                    actions.push(Action::Investigate(RepoCommand::EmptyDirs));
                 }
                 if crate::lcars::action_button(
                     ui,
@@ -2124,8 +2327,8 @@ impl DedupApp {
                         let name = chip.name.explain(
                             self.tooltip_verbosity,
                             "Select this repository; right-click for its menu",
-                            "Select or deselect this repository; UPDATE and CHECK act on the \
-                         selection. Right-click the card for the repository's own edits and \
+                            "Select or deselect this repository; UPDATE and DELETE EMPTY \
+                         DIRS act on the selection. Right-click the card for the repository's own edits and \
                          its backup group.",
                         );
                         // The name sits on top of the card and takes its clicks,
@@ -3220,6 +3423,59 @@ impl DedupApp {
     }
 }
 
+/// The empty folders `repo` would lose, relative to its root, deepest first.
+fn empty_dirs_of(store: &Store, repo: &str) -> Result<Vec<String>, String> {
+    let root = PathBuf::from(store.get_repo(repo).map_err(|e| e.to_string())?.abs_path);
+    let dirs = dedup_core::groom::find_empty_dirs(store, repo).map_err(|e| e.to_string())?;
+    Ok(dirs
+        .iter()
+        .map(|d| {
+            d.strip_prefix(&root)
+                .unwrap_or(d)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect())
+}
+
+/// An estimate as the modal shows it: its title, one line per repository
+/// (and per folder), and whether OK has anything to do.
+fn estimate_lines(estimate: &Estimate) -> (&'static str, Vec<String>, bool) {
+    let mut lines = Vec::new();
+    let mut work = false;
+    match estimate {
+        Estimate::Update(repos) => {
+            for (name, result) in repos {
+                lines.push(match result {
+                    Ok(c) => {
+                        work |= !c.up_to_date();
+                        format!(
+                            "{name}: {} new, {} changed, {} missing, {} unchanged",
+                            c.new, c.changed, c.missing, c.unchanged
+                        )
+                    }
+                    Err(e) => format!("{name}: cannot be checked — {e}"),
+                });
+            }
+            ("UPDATE — WHAT WOULD CHANGE", lines, work)
+        }
+        Estimate::EmptyDirs(repos) => {
+            for (name, result) in repos {
+                match result {
+                    Ok(dirs) if dirs.is_empty() => lines.push(format!("{name}: no empty folders")),
+                    Ok(dirs) => {
+                        work = true;
+                        lines.push(format!("{name}: {} empty folder(s)", dirs.len()));
+                        lines.extend(dirs.iter().map(|d| format!("    {d}")));
+                    }
+                    Err(e) => lines.push(format!("{name}: skipped — {e}")),
+                }
+            }
+            ("DELETE EMPTY DIRS — WHAT WOULD GO", lines, work)
+        }
+    }
+}
+
 /// What each entry of the navigation bar opens.
 fn nav_hover(screen: Screen) -> &'static str {
     match screen {
@@ -3294,7 +3550,8 @@ fn status_pills(ui: &mut egui::Ui, row: &RepoRow, verbosity: TooltipVerbosity) {
             pill(ui, "UP TO DATE", theme::tan()).explain(
                 verbosity,
                 "No changes since the last scan",
-                "The last CHECK found no new, changed, or missing files since the last scan.",
+                "UPDATE's last look found no new, changed, or missing files since the last \
+                 scan.",
             );
         }
         Freshness::Stale { changed, missing } => {
@@ -3302,9 +3559,9 @@ fn status_pills(ui: &mut egui::Ui, row: &RepoRow, verbosity: TooltipVerbosity) {
                 verbosity,
                 &format!("{changed} new/changed, {missing} missing since the last scan"),
                 &format!(
-                    "The last CHECK found {changed} new or changed file(s) and {missing} \
-                     missing file(s) since the last scan — run UPDATE / SCAN to bring the \
-                     index back in sync."
+                    "UPDATE's last look found {changed} new or changed file(s) and {missing} \
+                     missing file(s) since the last scan — run UPDATE to bring the index back \
+                     in sync."
                 ),
             );
         }
@@ -3705,24 +3962,9 @@ mod ui_tests {
         (tmp, DedupApp::new(store))
     }
 
-    /// UPDATE ALL scans every repository as one operation in the activity
-    /// window — each repository on its own row — ends on a report, and each
-    /// card gets its last-scan line.
-    #[test]
-    fn update_all_scans_every_repository_as_one_operation() {
-        use egui_kittest::kittest::Queryable;
-        let (_tmp, app) = sample_app();
-        let activity = app.activity.clone();
-        let mut h = render_with_activity(app);
-        h.get_by_label("SELECT ALL").click();
-        h.step();
-        h.get_by_label("UPDATE").click();
-        h.step();
-        assert_eq!(
-            crate::activity::lock(&activity).busy(),
-            Some(crate::activity::Busy("UPDATE 2 repositories".to_string())),
-            "one operation over both repositories"
-        );
+    /// Step `h` until the activity window is idle again.
+    fn settle_activity(h: &mut Harness<'static, DedupApp>) {
+        let activity = h.state().activity.clone();
         for _ in 0..400 {
             h.step();
             if !crate::activity::lock(&activity).is_running() {
@@ -3731,13 +3973,56 @@ mod ui_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         h.step();
+        h.step();
+    }
+
+    /// UPDATE first investigates and shows what would change, writing
+    /// nothing; OK then scans every selected repository as one operation that
+    /// ends on its report, and each card gets its last-scan line.
+    #[test]
+    fn update_shows_its_estimate_and_scans_only_after_ok() {
+        use egui_kittest::kittest::Queryable;
+        let (tmp, app) = sample_app();
+        std::fs::write(tmp.path().join("Videos").join("new.bin"), b"fresh").unwrap();
+        let activity = app.activity.clone();
+        let mut h = render_with_activity(app);
+        h.get_by_label("SELECT ALL").click();
+        h.step();
+        h.get_by_label("UPDATE").click();
+        h.step();
+        settle_activity(&mut h);
+        assert!(
+            h.query_by_label_contains("Videos: 1 new, 0 changed, 0 missing")
+                .is_some(),
+            "the estimate names the new file"
+        );
+        assert!(
+            h.state()
+                .store
+                .get_file_entry("Videos", "new.bin")
+                .unwrap()
+                .is_none(),
+            "nothing is indexed before OK"
+        );
+        h.get_by_label("OK").click();
+        h.step();
+        assert_eq!(
+            crate::activity::lock(&activity).busy(),
+            Some(crate::activity::Busy("UPDATE 2 repositories".to_string())),
+            "one operation over both repositories"
+        );
+        settle_activity(&mut h);
         assert!(
             crate::activity::lock(&activity).has_report(),
             "the operation ends on its report"
         );
         assert!(
-            h.query_by_label_contains("UPDATE 2 repositories").is_some(),
-            "the report names the operation"
+            h.state()
+                .store
+                .get_file_entry("Videos", "new.bin")
+                .unwrap()
+                .is_some(),
+            "OK indexed the new file"
         );
         for row in &h.state().repos {
             assert!(
@@ -3747,6 +4032,49 @@ mod ui_tests {
                 row.last
             );
         }
+    }
+
+    /// DELETE EMPTY DIRS lists the empty folders of the unlocked selection and
+    /// skips a locked one; CANCEL keeps them, OK deletes exactly those.
+    #[test]
+    fn delete_empty_dirs_lists_then_deletes_only_after_ok() {
+        use egui_kittest::kittest::Queryable;
+        let (tmp, app) = sample_app();
+        let empty = tmp.path().join("Videos").join("old").join("gone");
+        std::fs::create_dir_all(&empty).unwrap();
+        let locked_empty = tmp.path().join("Automatic_Upload").join("hollow");
+        std::fs::create_dir_all(&locked_empty).unwrap();
+        app.locks.set_read_only("Videos", false);
+        let mut h = render_with_activity(app);
+        h.get_by_label("SELECT ALL").click();
+        h.step();
+        h.get_by_label("DELETE EMPTY DIRS").click();
+        h.step();
+        settle_activity(&mut h);
+        assert!(
+            h.query_by_label_contains("Videos: 2 empty folder(s)")
+                .is_some()
+        );
+        assert!(
+            h.query_by_label_contains("Automatic Upload: skipped — locked")
+                .is_some(),
+            "a locked repository is not touched"
+        );
+        h.get_by_label("CANCEL").click();
+        h.step();
+        assert!(empty.is_dir(), "CANCEL deletes nothing");
+
+        h.get_by_label("DELETE EMPTY DIRS").click();
+        h.step();
+        settle_activity(&mut h);
+        h.get_by_label("OK").click();
+        h.step();
+        settle_activity(&mut h);
+        assert!(!empty.exists() && !empty.parent().is_some_and(std::path::Path::exists));
+        assert!(
+            locked_empty.is_dir(),
+            "the locked repository keeps its folder"
+        );
     }
 
     /// A registry change — here a rename — answers with a card naming what
@@ -3803,12 +4131,13 @@ mod ui_tests {
                 "'{name}' is a plain local dir"
             );
         }
-        // Contrast: an explicit CHECK is real work, on the activity modal.
-        app.start_scans(&ctx, vec!["Videos".to_string()], JobKind::Check);
+        // Contrast: UPDATE's investigation is real work, on the activity modal.
+        app.selection.insert("Videos".to_string());
+        app.investigate(&ctx, RepoCommand::Update);
         assert_eq!(
             crate::activity::lock(&app.activity).busy(),
-            Some(crate::activity::Busy("CHECK 'Videos'".to_string())),
-            "CHECK runs as its own operation"
+            Some(crate::activity::Busy("UPDATE: investigating".to_string())),
+            "the investigation runs as its own operation"
         );
     }
 
@@ -4025,8 +4354,11 @@ mod ui_tests {
                     // The repository page's RECENT row carries its own LOG button,
                     // so this harness needs no stand-in for the top bar's.
                     app.repositories_view(ui, &mut actions);
-                    crate::activity::lock(&app.activity).show(ui);
                     let ctx = ui.ctx().clone();
+                    if app.estimate.is_some() {
+                        app.estimate_modal(&ctx);
+                    }
+                    crate::activity::lock(&app.activity).show(ui);
                     for action in actions {
                         app.apply(&ctx, None, action);
                     }

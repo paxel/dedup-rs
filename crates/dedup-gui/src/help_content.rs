@@ -23,11 +23,18 @@ A repository is a named folder on disk, tracked by its own index of file content
 with ADD REPOSITORY, or drag folders from your file manager and drop them anywhere onto \
 the window. Each card shows the repository's path, its FILES, SIZE, MISSING and UPDATED \
 stats, status pills (LOCAL / REMOTE / OFFLINE / MISSING for reachability, UP TO DATE / \
-UPDATE REQUIRED from the last CHECK) and its padlock: every repository starts locked each \
+UPDATE REQUIRED from UPDATE's last look) and its padlock: every repository starts locked each \
 launch, and while it is locked nothing in the app deletes or overwrites its files.
 
-Click a card's name to select or deselect it; ALL, LOCAL and NONE change the whole \
-selection. UPDATE and CHECK act on the selection; REFRESH STATUS on every repository.
+On the right, the text filter and LOCAL / MAINS / ALL grey out every repository that does \
+not match and sort it to the bottom; a greyed-out repository cannot be selected and nothing \
+touches it. Click a card's name to select or deselect it, or use SELECT ALL / SELECT NONE; a \
+selected card has a thick, bright border. SET ALL RO / SET ALL RW lock or unlock every \
+repository that is not greyed out.
+
+UPDATE and DELETE EMPTY DIRS act on the selection. Each first looks at what it would \
+change and shows it; only OK changes anything. REFRESH STATUS re-checks every \
+repository's reachability at once.
 
 Right-click a card for its own edits — RENAME, RELOCATE, CLONE INDEX, MARK REMOTE, REMOVE \
 — and for its place in a backup group: MAKE MAIN, JOIN GROUP, LEAVE GROUP. A backup group \
