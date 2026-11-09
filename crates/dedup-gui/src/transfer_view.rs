@@ -1451,9 +1451,6 @@ pub struct TransferView {
     /// with `repos` whenever the tab is shown.
     mains: std::collections::HashSet<String>,
     loaded: bool,
-    /// The start page handed over the repositories and the roles, so the
-    /// body's own WITH WHICH and SINKS sections are not shown.
-    from_start: bool,
     source: Option<String>,
     target: Option<String>,
     /// Extra reference repos beyond the target: a file counts as "new" only
@@ -1621,7 +1618,6 @@ impl TransferView {
             repos: Vec::new(),
             mains: std::collections::HashSet::new(),
             loaded: false,
-            from_start: false,
             source: None,
             target: None,
             extra_refs: Vec::new(),
@@ -1777,7 +1773,7 @@ impl TransferView {
                 // answer; after REVIEW or RUN they fold to their header bars,
                 // and each one flips back open on its own.
                 self.command_bar(ui, &mut acts);
-                if self.command_chosen && !self.from_start {
+                if self.command_chosen {
                     self.repo_rows(ui, &mut acts);
                     match self.command {
                         Command::GroupSync => self.group_sinks_bar(ui, &mut acts),
@@ -1884,80 +1880,24 @@ impl TransferView {
         }
     }
 
-    /// Open this body from the start page (ADR 0004) for `command` on `repos`.
-    /// The start page settled the roles: a backup group (`group`: its main and
-    /// the selected backups) names them itself, a pair comes with `source`
-    /// and `target`, a single repository is a folder export's source, and a
-    /// DIFF pair needs no direction. The body's own WITH WHICH section is not
-    /// shown; a different selection is made on the start page.
-    pub fn open_from(
-        &mut self,
-        store: &Store,
-        command: Command,
-        repos: &[String],
-        source: Option<String>,
-        target: Option<String>,
-        group: Option<(String, Vec<String>)>,
-    ) {
+    /// Open this view on `command`, its repositories still to be chosen
+    /// (the SYNC and COPY pages' stand-in, ADR 0006).
+    pub fn choose(&mut self, store: &Store, command: Command) {
         self.sync_repos(store);
         self.source = None;
         self.target = None;
         self.extra_refs.clear();
         self.destination = Destination::Repo;
-        match (group, source, repos) {
-            (Some((main, sinks)), _, _) => {
-                self.source = Some(main);
-                self.refresh_group(store);
-                self.selected_sinks.retain(|s| sinks.contains(s));
-            }
-            (None, Some(src), _) => {
-                self.source = Some(src);
-                self.target = target;
-                self.refresh_group(store);
-            }
-            (None, None, [one]) => {
-                self.source = Some(one.clone());
-                self.destination = Destination::Folder;
-                self.refresh_group(store);
-            }
-            (None, None, [a, b]) => {
-                let (a, b) = if a <= b { (a, b) } else { (b, a) };
-                self.source = Some(a.clone());
-                self.target = Some(b.clone());
-                self.refresh_group(store);
-            }
-            _ => self.refresh_group(store),
-        }
-        // After `refresh_group`, which snaps a GROUP command back to COPY
-        // when the source names no group.
+        self.refresh_group(store);
         self.command = command;
         self.command_chosen = true;
-        self.from_start = true;
         self.clear_preview();
-        for title in [
-            "WHAT — COPY, MOVE, SYNC, MIRROR, GROUP SYNC, GROUP SYNC BACK OR DIFF",
-            "WHAT — COPY, MOVE, SYNC, MIRROR OR DIFF",
-        ] {
-            self.folds.set(title, false);
-        }
-    }
-
-    /// The source and target as handed over, for tests.
-    #[cfg(test)]
-    pub(crate) fn roles(&self) -> (Option<String>, Option<String>) {
-        (self.source.clone(), self.target.clone())
     }
 
     /// The command in force, for tests.
     #[cfg(test)]
     pub(crate) fn command(&self) -> Command {
         self.command
-    }
-
-    /// The backups the next GROUP SYNC pushes to, for tests.
-    #[cfg(test)]
-    pub(crate) fn selected_sinks(&self) -> &[String] {
-        &self.selected_sinks
     }
 
     /// Re-resolve GROUP SYNC's group from the current source: the sync group

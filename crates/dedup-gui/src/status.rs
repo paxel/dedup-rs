@@ -22,14 +22,6 @@ pub enum Location {
     Missing,
 }
 
-impl Location {
-    /// Whether the folder can currently be walked. Scans/checks are pointless
-    /// (and may hang) when it can't.
-    pub fn reachable(self) -> bool {
-        matches!(self, Location::Local | Location::Remote)
-    }
-}
-
 /// Time budget for the reachability probe before we declare the mount down.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 

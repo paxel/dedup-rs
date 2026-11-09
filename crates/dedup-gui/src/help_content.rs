@@ -2,45 +2,37 @@
 //! HELP button): what the current screen is for and how its controls fit
 //! together.
 
-use crate::app::{Body, Screen};
+use crate::app::Screen;
 
 /// The help text for `screen`.
 pub fn help_text(screen: Screen) -> &'static str {
     match screen {
-        Screen::Start => START,
-        Screen::Body(Body::Duplicates) => DUPLICATES,
-        Screen::Body(Body::Transfer) => TRANSFER,
-        Screen::Body(Body::Grooming) => GROOMING,
-        Screen::Body(Body::Browse) => BROWSE,
+        Screen::Repositories => REPOSITORIES,
+        Screen::Duplicates => DUPLICATES,
+        Screen::Sync | Screen::Copy => TRANSFER,
+        Screen::Delete => GROOMING,
+        Screen::Browse => BROWSE,
     }
 }
 
-const START: &str = "\
-The start page is where everything begins: your repositories as cards on the left, the \
-commands on the right.
+const REPOSITORIES: &str = "\
+The repository page lists every repository as a card. The bar along the top switches \
+between this page and the process pages: DUPLICATES, SYNC, COPY and DELETE.
 
 A repository is a named folder on disk, tracked by its own index of file contents. Add one \
 with ADD REPOSITORY, or drag folders from your file manager and drop them anywhere onto \
-the window. Each card shows the repository's path, its FILES, SIZE, MISSING and SCANNED \
+the window. Each card shows the repository's path, its FILES, SIZE, MISSING and UPDATED \
 stats, status pills (LOCAL / REMOTE / OFFLINE / MISSING for reachability, UP TO DATE / \
 UPDATE REQUIRED from the last CHECK) and its padlock: every repository starts locked each \
-launch, and while it is locked nothing in the app deletes or overwrites its files. A backup \
-group — a main and the backups it is pushed to — is framed together; SELECT GROUP inside \
-the frame selects all of its members at once.
+launch, and while it is locked nothing in the app deletes or overwrites its files.
 
 Click a card's name to select or deselect it; ALL, LOCAL and NONE change the whole \
-selection. The command list beside the cards is always complete and always in the same \
-order: INVESTIGATE (browse, find duplicates or similar files, diff, check), MAINTAIN \
-(update, prune, reorganize, and the repository's own rename, relocate, clone, remove, \
-remote flag and group membership), MOVE (copy, move, sync, mirror, group sync) and CLEAN \
-(dedupe against, purge by filter, empty directories). A command the selection does not \
-allow is greyed, and hovering it says why — one repository needed, two, a backup group, \
-or a locked repository.
+selection. UPDATE and CHECK act on the selection; REFRESH STATUS on every repository.
 
-A command that scans runs in the activity window. A command that edits a repository \
-opens its editor on the card. Every other command opens its own body under a header \
-strip that names the selection and the command; the START bar on the strip returns \
-here with the selection kept.";
+Right-click a card for its own edits — RENAME, RELOCATE, CLONE INDEX, MARK REMOTE, REMOVE \
+— and for its place in a backup group: MAKE MAIN, JOIN GROUP, LEAVE GROUP. A backup group \
+is framed together, main first; right-click the frame's bar for ADD BACKUP and UNGROUP. A \
+backup's push mode is set on its card.";
 
 const DUPLICATES: &str = "\
 Find exact or perceptually similar duplicates across one or more repositories, review them \

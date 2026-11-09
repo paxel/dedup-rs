@@ -47,7 +47,6 @@ mod repo_chip;
 mod run_result;
 mod scrub;
 mod settings;
-mod start_page;
 mod status;
 mod textdiff;
 mod theme;

@@ -303,9 +303,6 @@ enum Act {
 pub struct DupesView {
     repos: Vec<RepoSel>,
     repos_loaded: bool,
-    /// The start page handed over the repositories, so the body's own WITH
-    /// WHICH section is not shown.
-    from_start: bool,
     mode: Mode,
     threshold: f64,
     /// The result set (plan for exact, full groups for similar), if a search has
@@ -408,7 +405,6 @@ impl DupesView {
         Self {
             repos: Vec::new(),
             repos_loaded: false,
-            from_start: false,
             mode: Mode::Exact,
             threshold: 99.0,
             results: None,
@@ -610,7 +606,7 @@ impl DupesView {
         // A FIND folds all three shut; their header bars stay, so changing one
         // thing about the search is one click on that section.
         self.mode_section(ui, &mut acts);
-        if self.mode_chosen && !self.from_start {
+        if self.mode_chosen {
             self.repo_bar(ui, &mut acts);
         }
         if self.mode_chosen && self.repos.iter().any(|r| r.included) {
@@ -836,37 +832,6 @@ impl DupesView {
             }
             Err(e) => self.error = Some(e.to_string()),
         }
-    }
-
-    /// Open this body from the start page (ADR 0004): search exactly `repos`,
-    /// similar or exact. WHAT folds shut (it reopens on its header, for the
-    /// quick-delete toggle); the WITH WHICH section is not shown at all, since
-    /// a different selection is made on the start page.
-    pub fn open_from(&mut self, store: &Store, repos: &[String], similar: bool) {
-        self.sync_repos(store);
-        for r in &mut self.repos {
-            r.included = repos.contains(&r.name);
-        }
-        self.mode = if similar { Mode::Similar } else { Mode::Exact };
-        self.mode_chosen = true;
-        self.from_start = true;
-        self.folds.set("WHAT — DUPLICATES OR SIMILAR FILES", false);
-    }
-
-    /// The repositories the next FIND searches, in list order.
-    #[cfg(test)]
-    pub(crate) fn included_repos(&self) -> Vec<String> {
-        self.repos
-            .iter()
-            .filter(|r| r.included)
-            .map(|r| r.name.clone())
-            .collect()
-    }
-
-    /// Whether the next FIND looks for similar (not exact) files.
-    #[cfg(test)]
-    pub(crate) fn is_similar(&self) -> bool {
-        self.mode == Mode::Similar
     }
 
     fn repo_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {

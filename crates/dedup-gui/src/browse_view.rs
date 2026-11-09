@@ -157,9 +157,6 @@ pub struct BrowseView {
     /// resolved (`root/rel`) only when the preview dock actually needs it.
     roots: HashMap<String, String>,
     loaded: bool,
-    /// The start page chose the repository: its own picker section stays
-    /// hidden until the body is opened for a new one.
-    picker_hidden: bool,
     repo: Option<String>,
     /// `(rel_path, entry)` for the selected repo, loaded once per repo, sorted.
     entries: Vec<(String, FileEntry)>,
@@ -275,7 +272,6 @@ impl BrowseView {
             mains: std::collections::HashSet::new(),
             roots: HashMap::new(),
             loaded: false,
-            picker_hidden: false,
             repo: None,
             entries: Vec::new(),
             entries_repo: None,
@@ -396,26 +392,6 @@ impl BrowseView {
             }
             Err(e) => self.error = Some(e.to_string()),
         }
-    }
-
-    /// Open this body from the start page (ADR 0004) at `repo`'s root. The
-    /// repository was chosen there, so the body's own picker is not shown;
-    /// a different repository is a different selection on the start page.
-    pub fn open_root(&mut self, store: &Store, repo: &str) {
-        self.sync_repos(store);
-        self.repo = Some(repo.to_string());
-        self.load_entries(store, repo);
-        self.sel_rel = None;
-        self.selected.clear();
-        self.flatten = false;
-        self.focus = Pane::Dirs;
-        self.picker_hidden = true;
-    }
-
-    /// The repository being browsed, for tests.
-    #[cfg(test)]
-    pub(crate) fn repo(&self) -> Option<&str> {
-        self.repo.as_deref()
     }
 
     /// Jump the tab to one file: select its repo, walk to its directory and
@@ -780,14 +756,11 @@ impl BrowseView {
             ui.colored_label(theme::red(), err);
         }
 
-        // Repo picker (single repo), amber when selected — unless the start
-        // page already chose the repository (ADR 0004).
+        // Repo picker (single repo), amber when selected.
         let repos = self.repos.clone();
         let mains = self.mains.clone();
         let mut picked: Option<String> = None;
-        if self.picker_hidden && self.repo.is_some() {
-            // Nothing: the header strip names the repository.
-        } else {
+        {
             crate::lcars::section_lcars(
                 ui,
                 "REPO — WHICH REPOSITORY TO BROWSE",
@@ -826,7 +799,6 @@ impl BrowseView {
         }
         if let Some(name) = picked {
             self.repo = Some(name);
-            self.picker_hidden = false;
         }
 
         let Some(repo) = self.repo.clone() else {

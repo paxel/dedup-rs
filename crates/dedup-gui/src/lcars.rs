@@ -137,7 +137,8 @@ pub fn section_lcars_collapsible<R>(
         default_open,
     );
     let (out, header) = if state.is_open() {
-        let (r, header) = section_impl(ui, title, accent, add);
+        let painted = format!("{} {title}", icon::CARET_DOWN);
+        let (r, header) = section_impl(ui, &painted, title, accent, add);
         (Some(r), header)
     } else {
         (None, collapsed_header(ui, title, accent))
@@ -147,6 +148,18 @@ pub fn section_lcars_collapsible<R>(
     }
     state.store(ui.ctx());
     out
+}
+
+/// A titled frame that never folds (ADR 0006): the header bar without a caret
+/// and the body below it. Returns the body's result and the header's response,
+/// which carries the frame's right-click menu.
+pub fn frame_lcars<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    accent: Color32,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> (R, egui::Response) {
+    section_impl(ui, title, title, accent, add)
 }
 
 /// The folded state of a view's sections, keyed by section title. Every
@@ -200,7 +213,8 @@ pub fn section_lcars_folding<R>(
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> Option<R> {
     let (out, header) = if *open {
-        let (r, header) = section_impl(ui, title, accent, add);
+        let painted = format!("{} {title}", icon::CARET_DOWN);
+        let (r, header) = section_impl(ui, &painted, title, accent, add);
         (Some(r), header)
     } else {
         (None, collapsed_header(ui, title, accent))
@@ -216,11 +230,12 @@ pub fn section_lcars_folding<R>(
 /// returned alongside the body's result.
 fn section_impl<R>(
     ui: &mut egui::Ui,
+    painted: &str,
     title: &str,
     accent: Color32,
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> (R, egui::Response) {
-    let header = header_bar(ui, &format!("{} {title}", icon::CARET_DOWN), title, accent);
+    let header = header_bar(ui, painted, title, accent);
     let inner = egui::Frame::new()
         .fill(theme::panel())
         .corner_radius(CornerRadius {
