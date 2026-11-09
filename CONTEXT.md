@@ -96,34 +96,35 @@ notification area. Marks, scans and searches are not in it.
 _Avoid_: history, audit trail, session log (the session log is the diagnostic
 log file, not this).
 
-**Start page**:
-The one page the app opens on: the repo cards, the command list, the
-favorites and the totals. It replaces the tab bar.
-_Avoid_: dashboard, home tab, repositories tab.
+**Repository page**:
+The page the app opens on: the repo cards, the totals and the recent changes,
+with the filter, the selection, the bulk lock switches and the repository
+commands beside them. It is the first entry of the navigation bar
+(REPOSITORIES · DUPLICATES · SYNC · COPY · DELETE), which switches between
+pages; every other page chooses its own repositories.
+_Avoid_: start page, dashboard, home tab, repositories tab.
 
 **Repo card**:
-A repository's card on the start page: identicon, name, path, counts, last
-update age, lock, main badge. Cards are multi-select and together form the
-selection.
+A repository's card on the repository page: identicon, name, path, counts,
+last update age, lock, main badge. Its right-click menu holds the
+repository's own edits and its place in a backup group. A card that does not
+pass the filter is greyed out: it cannot be selected and nothing touches it.
 _Avoid_: repo chip (the chip is the compact selector widget inside a view),
 tile.
 
 **Selection**:
-The set of repo cards currently selected on the start page. It is the only
-place repositories are chosen; every command reads its repositories from it.
+The set of repo cards currently selected on the repository page. Only the
+repository page's commands use it; no other page reads it, and a greyed-out
+card cannot be in it.
 _Avoid_: picked repos, included repos.
 
 **Command**:
-One operation the app offers, listed on the start page by intent. A command is
-enabled or greyed by the selection, reveals its remaining inputs once chosen,
-and runs in place.
+One operation the app offers. On the repository page the commands are UPDATE
+and DELETE EMPTY DIRS: they act on the selection, first investigate and show
+what they would change, and change nothing until OK. A process page offers its
+own commands on the repositories chosen there; none depends on the selection.
 _Avoid_: tab, tool, mode (a mode is an input of a command, such as exact or
 similar).
-
-**Header strip**:
-The one-line summary a running command folds the start page into: selection,
-command, inputs. Clicking it returns to the start page.
-_Avoid_: breadcrumb, summary bar.
 
 **Board**:
 The one result surface: a table of file rows with thumbnail, name,
@@ -131,12 +132,6 @@ repository, size, planned action and status. Every command's result is a
 board except a duplicates find, whose groups show their copies side by side as
 cards; a click on a row opens the viewer.
 _Avoid_: review board, grid, listing, preview table.
-
-**Favorite**:
-A fully specified command (selection, command, inputs) saved under a name on
-the start page, reopened in one click. It saves the specification, never the
-confirmation: it still lands on the preview.
-_Avoid_: preset, saved action, task.
 
 **Preview**:
 The board filled with a writing command's proposed rows before anything on

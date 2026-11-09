@@ -8,13 +8,12 @@ equivalent of [`diff cp`/`mv`/`rm`](../cli.md#diff).
 
 ## Getting here
 
-Select the repositories on the [start page](start-page.md) — one for a folder export, two
-for a repository-to-repository command, a backup group for GROUP SYNC — and pick **COPY**,
-**MOVE**, **SYNC**, **MIRROR**, **DIFF**, **GROUP SYNC** or **GROUP SYNC BACK**. A pair asks
-which repository is the source (**FROM**), then **GO**; a group needs no roles. The header
-strip names the selection, the command and the roles; **START** returns to the start page
-with the selection kept. Inside, the body shows **WHAT** (the command, folded — open it to
-switch), then **HOW** (destination, options, filter), then **PREVIEW** and **APPLY ALL**.
+Click **SYNC** or **COPY** in the [navigation bar](index.md#top-bar). Both open this view,
+SYNC on **GROUP SYNC** and COPY on **COPY**, with no repositories chosen yet. The body shows
+**WHAT** (the command — open it to switch to COPY, MOVE, SYNC, MIRROR or DIFF, and to GROUP
+SYNC or GROUP SYNC BACK once the source is a group's main), then **WITH WHICH** (the source
+and target repositories, or the group's main), then **HOW** (destination, options, filter),
+then **PREVIEW** and **APPLY ALL**.
 Once PREVIEW starts, the sections above fold to their header bars; click one to open it.
 
 ## What: the command
@@ -144,7 +143,7 @@ when the board is ready.
 
 Keep a repository backed up to one or more others, without the manual "duplicate the repo,
 relocate the copy, rescan it" dance. Groups themselves (creating one, adding/removing sinks,
-setting each sink's mode) are managed on the [start page](start-page.md#backup-groups);
+setting each sink's mode) are managed on the [repository page](repository-page.md#backup-groups);
 GROUP SYNC is where a group is actually *pushed*.
 
 ![GROUP SYNC selected: TARGET hidden, SINKS shown](../screenshots/transfer_group_sync.png)

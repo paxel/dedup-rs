@@ -1,37 +1,42 @@
 # GUI guide
 
 `dedup` with no arguments opens the desktop app: a single LCARS-styled window that opens on
-the [start page](start-page.md) — your repositories as cards, one selection, and one command
-list. A command either runs at once or opens its body under a header strip: the
-[Duplicates](duplicates.md), [Transfer](transfer.md), [Grooming](grooming.md) or
-[Browse](browse.md) view, with the repositories already filled in. Every view that shows two
-files side by side, or a single file up close, opens the **one shared viewer** described in
-[The viewer](duplicates.md#the-viewer-lightbox).
+the [repository page](repository-page.md) — your repositories as cards. The
+[navigation bar](#top-bar) along the top switches between it and the pages that do the work:
+DUPLICATES, SYNC, COPY and DELETE. Each of those pages chooses its own repositories. Every
+view that shows two files side by side, or a single file up close, opens the **one shared
+viewer** described in [The viewer](duplicates.md#the-viewer-lightbox).
 
 Launch with `--ui-scale <0.5–3.0>` to scale the whole interface, e.g. `dedup --ui-scale 1.25`
 for a HiDPI display or a projector.
 
 ## At a glance
 
-| Page                                 | What it is for                                                                                     |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------- |
-| **[Start page](start-page.md)**      | Register, select and scan repositories; frame backup groups; pick a command for the selection.    |
-| **[Duplicates](duplicates.md)**      | Find exact or perceptually similar duplicates across repos and delete the worse copies.           |
-| **[Transfer](transfer.md)**          | Copy / move / sync / mirror between repos, push a backup group, or reconcile two repos with DIFF.  |
-| **[Grooming](grooming.md)**          | Tidy one repo: dedupe against others, purge by filter, clear empty dirs, reorganize, prune.       |
-| **[Browse](browse.md)**              | Walk one repo's indexed files as a folder tree, preview them, and annotate with tags.             |
+| Page                                   | What it is for                                                                                                                       |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| **[REPOSITORIES](repository-page.md)** | Register, scan, lock and group repositories; delete their empty folders.                                                             |
+| **[DUPLICATES](duplicates.md)**        | Find exact or perceptually similar duplicates across repos and delete the worse copies.                                              |
+| **[SYNC](transfer.md)**                | The Transfer view, opened on GROUP SYNC: push a backup group, copy / move / sync / mirror between repos, or reconcile two with DIFF. |
+| **[COPY](transfer.md)**                | The same Transfer view, opened on COPY.                                                                                              |
+| **[DELETE](grooming.md)**              | The Grooming view, opened on DEDUPE: dedupe against others, purge by filter, clear empty dirs, reorganize, prune.                    |
+| **[Browse](browse.md)**                | Walk one repo's indexed files as a folder tree, preview them, and annotate with tags. Opened by SHOW IN BROWSE on a duplicate.       |
+
+SYNC, COPY and DELETE show the existing Transfer and Grooming views until their own pages are
+built; each still chooses its repositories in its own sections. Browse has no entry in the
+navigation bar.
 
 ## Top bar
 
-On the start page the bar is empty; while a command's body is open it carries the **header
-strip** — the **START** bar that returns to the start page, the selected repositories and
-the command. On the right:
+Beside the **DEDUP** name and version, the **navigation bar**: **REPOSITORIES · DUPLICATES ·
+SYNC · COPY · DELETE**. The open page is lit, and a click switches straight to another one.
+On the right:
 
+- **LOG** opens the [event log](#the-activity-window), with the unread count.
 - **STATUS** opens the health/activity centre (below). Its label carries an amber
   count when there are unread warnings.
 - **HELP** explains the current page.
-- **SETTINGS** (cog icon) opens the settings dialog below.
 - **ABOUT** shows the version, license, and contact info.
+- **SETTINGS** (cog icon) opens the settings dialog below.
 
 ## Status: warnings
 
@@ -64,7 +69,7 @@ repository never requires a keyboard shortcut.
 ## Repository locks
 
 Every repository starts **locked** at each launch. The padlock on a repo's chip — on its
-start-page card and wherever the repository is named — shows and toggles it: **closed blue =
+repository card and wherever the repository is named — shows and toggles it: **closed blue =
 protected, open = unlocked**.
 
 A lock protects the repo's **existing files**: while locked, nothing in the app can delete or
@@ -113,23 +118,24 @@ unlocking for deletion should be a fresh, conscious choice each session.
 ## The activity window
 
 Long work runs one at a time in a central window that blocks the rest of the app while it
-runs: a repository UPDATE or CHECK (UPDATE ALL lists every repository on its own row), a
-Duplicates FIND or APPLY MARKED, a Transfer or Grooming PREVIEW and APPLY ALL, a GROUP SYNC or a
-bulk board action. The window names the operation and its repositories,
+runs: a repository UPDATE or DELETE EMPTY DIRS (every repository on its own row) and the look
+each takes first, a Duplicates FIND or APPLY MARKED, a Transfer or Grooming PREVIEW and APPLY
+ALL, a GROUP SYNC or a bulk board action. The window names the operation and its repositories,
 the current phase ("reading 'photos'", "comparing audio", "copying 2020/a.jpg"), how far it
 is with a percentage where the total is known, elapsed time and an estimate of what is left,
 and each problem as it occurs. **CANCEL** is its only control and stops the whole batch;
 files already changed stay as they are. When the operation ends the same window becomes the
-result report (`Esc` closes it), except for a plan whose result is the board it fills — that
-window closes by itself. Anything else that wants to start meanwhile — another operation, a
-row action, a repository scan — is refused with a card naming what is still running.
+result report (`Esc` closes it), except for a plan whose result is the board it fills, or the
+estimate an UPDATE or DELETE EMPTY DIRS shows before it runs — that window closes by itself.
+Anything else that wants to start meanwhile — another operation, a row action, a repository
+scan — is refused with a card naming what is still running.
 
 Quick actions — a row's COPY, DELETE, RENAME, OVERWRITE or APPLY, a group's DELETE NOW, an
 accept — answer with an animated **notification card** in the top-right corner naming the
 action, the file, the repository and the outcome. Every file the app changes on disk is also
 appended to the **event log** (`events.jsonl` under the configuration directory, kept across
-restarts); the **LOG** button beside the cards carries the unread count and opens it, newest
-first, with a filter box. Marks and accepts get a card but no log line: they change nothing
+restarts); the **LOG** button, top right and beside the repository cards, carries the unread
+count and opens it, newest first, with a filter box. Marks and accepts get a card but no log line: they change nothing
 on disk. The rules are in
 [ADR 0003](../adr/0003-every-action-reports-and-long-work-runs-alone.md).
 
@@ -193,12 +199,12 @@ its raw bytes — never as text.
 ## What's not here
 
 The important-file scanner (`dedup scan`) and the triage report (`dedup report`) are
-CLI-only today — there is no command for them on the start page yet.
+CLI-only today — there is no page for them yet.
 
 ## See also
 
-- [Start page](start-page.md) — register, select and scan repositories, the command list,
-  backup groups.
+- [Repository page](repository-page.md) — register, scan and lock repositories, delete
+  empty folders, backup groups.
 - [Duplicates](duplicates.md) — find and review exact/similar duplicates, and the shared
   viewer in full (Image / Video filmstrip + scrub / Audio / Metadata / Text / Render /
   Strings / Hex).

@@ -73,11 +73,11 @@ at the cost of drag-and-drop.
 
 ## What it does
 
-- **Start page** — the app opens on your repositories as cards: register directories, select one or many, and pick from one command list grouped by intent (investigate, maintain, move, clean). A command the selection does not allow is greyed with the reason on hover; a backup group is framed together, with the group's **main** badged wherever it is named, and selecting the frame gives GROUP SYNC its direction for free. Scans run at once; every other command opens its body under a header strip that names the selection.
+- **Repository page and navigation bar** — the app opens on your repositories as cards, with a navigation bar along the top (**REPOSITORIES · DUPLICATES · SYNC · COPY · DELETE**) that switches between pages; each page chooses its own repositories. On the repository page you register directories, filter the cards by name or to LOCAL / MAINS (the rest are greyed out and left alone), select them, lock or unlock them in bulk, and run **UPDATE** or **DELETE EMPTY DIRS** on the selection — each shows what it would change first, and only OK changes anything. A backup group is framed together, main first, with the group's **main** badged wherever it is named; groups are built from each card's right-click menu.
 - **Duplicates** — find exact or perceptually-similar files across repos and delete the worse copies. A copy's right-click menu can jump straight to it in Browse (**SHOW IN BROWSE**), to judge it by the folder it lives in, or **ACCEPT** its content as allowed to repeat inside that repo (a podcast's per-folder cover): accepted copies are protected from every duplicate delete and their groups stay out of the way.
 - **Transfer / DIFF** — copy, move, sync or mirror content between repos, reconcile two repos side by side, or push a backup group's main to its sinks (each ADD ONLY, APPLY CHANGES — which also carries the main's own deletions over — or MIRROR).
 - **Grooming** — dedupe, purge by filter, prune missing records, reorganize by path templates.
-- **One thing at a time, always visible** — long work (a repository UPDATE or CHECK, a Duplicates
+- **One thing at a time, always visible** — long work (a repository UPDATE or DELETE EMPTY DIRS, a Duplicates
   FIND or APPLY MARKED, a Transfer or Grooming PREVIEW and APPLY ALL, a GROUP SYNC or a bulk board action)
   runs in one central activity window that shows each phase, its progress and
   problems, offers CANCEL, and ends as the result report. Quick actions answer with a notification

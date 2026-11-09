@@ -9,14 +9,13 @@ workflow on top.
 
 ## Getting here
 
-Select the repositories on the [start page](start-page.md) and pick **FIND DUPLICATES** or
-**FIND SIMILAR** (the latter asks for its **similarity threshold** first, then **GO**). The
-header strip names the selection, the mode and the threshold; **START** returns to the
-start page with the selection kept. Inside, the body shows:
+Click **DUPLICATES** in the [navigation bar](index.md#top-bar). The page shows, each
+section once the one before it has an answer:
 
-1. **WHAT** — the chosen mode, folded; open it to flip between DUPLICATES and SIMILAR
-   FILES or to toggle **QUICK DELETE**.
-2. **HOW** — the shared FILTER wizard and the **FIND** button on one row.
+1. **WHAT** — DUPLICATES or SIMILAR FILES (SIMILAR with its **similarity threshold**), and
+   **QUICK DELETE**.
+2. **WITH WHICH** — the repositories to search (see [Repositories](#repositories)).
+3. **HOW** — the shared FILTER wizard and the **FIND** button on one row.
 
 After a FIND the three sections fold into one summary line (mode, repositories, filter)
 so the groups get the screen; **CHANGE** unfolds them for the next search.
@@ -30,7 +29,8 @@ One chip per registered repository:
 - Click the **padlock** to toggle read-only: a closed lock means files in that repo are
   protected from deletion (never preselected, never marked, even by auto-resolve); an open
   lock means they can be deleted like any other file.
-- **REFRESH** reloads the repository list (e.g. after adding one on the start page).
+- A repository added on the [repository page](repository-page.md) appears here the next
+  time you open this page.
 
 ## Mode, threshold, and FIND
 

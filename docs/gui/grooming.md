@@ -9,14 +9,12 @@ touches disk until you APPLY ALL.
 
 ## Getting here
 
-Select one repository on the [start page](start-page.md) and pick **PRUNE MISSING**,
-**REORGANIZE**, **PURGE BY FILTER** or **EMPTY DIRECTORIES** (the last two need the
-repository unlocked); select two or more and pick **DEDUPE AGAINST**, then say which one is
-deleted from (**FROM**) and **GO**. The header strip names the selection and the tool;
-**START** returns to the start page with the selection kept. Inside, the body shows **WHAT**
-(the tool, folded — open it to switch), then **HOW** (the filter or the rules), then
-**PREVIEW** and **APPLY ALL**. Once PREVIEW starts, the sections above fold to their header
-bars; click one to open it.
+Click **DELETE** in the [navigation bar](index.md#top-bar). It opens this view on
+**DEDUPE**, with no repositories chosen yet. The body shows **WHAT** (the tool — open it to
+switch to PURGE, EMPTY DIRS, ORGANIZE or PRUNE), then **WITH WHICH** (the repository to
+groom, and for DEDUPE the repositories it is checked against), then **HOW** (the filter or
+the rules), then **PREVIEW** and **APPLY ALL**. Once PREVIEW starts, the sections above fold
+to their header bars; click one to open it.
 
 ## What: the tool
 

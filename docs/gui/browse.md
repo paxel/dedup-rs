@@ -8,8 +8,8 @@ the disk, so it shows exactly what has been scanned.
 
 ## Getting here
 
-Select one repository on the [start page](start-page.md) and pick **BROWSE**; the header
-strip names it and **START** returns to the start page. The body shows:
+Browse has no entry in the navigation bar: it opens when you pick **SHOW IN BROWSE** on a
+copy in [Duplicates](duplicates.md), with that file selected in its folder. The body shows:
 
 
 - **FILTER** — the same condition builder as the other commands, narrowing which files appear.
