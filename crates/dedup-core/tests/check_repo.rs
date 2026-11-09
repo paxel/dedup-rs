@@ -73,7 +73,8 @@ fn check_flags_new_and_vanished_without_touching_index() -> TestResult {
     std::fs::remove_file(data.join("gone.txt"))?;
 
     let stats = check_repo(&store, "test", &NoProgress, &cancel)?;
-    assert_eq!(stats.changed, 1, "new.txt is new");
+    assert_eq!(stats.new, 1, "new.txt is new");
+    assert_eq!(stats.changed, 0, "a new file is not a changed one");
     assert_eq!(stats.missing, 1, "gone.txt vanished");
     assert_eq!(stats.unchanged, 1, "a.txt unchanged");
     assert!(!stats.up_to_date());
@@ -116,6 +117,7 @@ fn check_detects_same_size_file_with_preserved_older_mtime() -> TestResult {
         stats.changed, 1,
         "changed mtime is detected despite old value"
     );
+    assert_eq!(stats.new, 0, "an indexed file is never new");
     assert_eq!(stats.unchanged, 0);
     assert!(!stats.up_to_date());
     Ok(())

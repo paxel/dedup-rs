@@ -525,7 +525,9 @@ pub fn update_repo_authorized(
 /// index, computed without hashing file contents or writing anything.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CheckStats {
-    /// Files that are new or whose (size, mtime) differ from the index.
+    /// Files on disk the index has no record of.
+    pub new: u64,
+    /// Indexed files whose (size, mtime) differ from their record.
     pub changed: u64,
     /// Non-missing index entries no longer present on disk.
     pub missing: u64,
@@ -541,12 +543,12 @@ impl CheckStats {
     /// Whether an update would leave the index unchanged (nothing new, changed,
     /// or vanished).
     pub fn up_to_date(&self) -> bool {
-        self.changed == 0 && self.missing == 0
+        self.new == 0 && self.changed == 0 && self.missing == 0
     }
 }
 
 /// Dry-run the change detection for `name`: walk the tree and diff it against
-/// the stored index, reporting new/changed and vanished counts **without
+/// the stored index, reporting new, changed and vanished counts **without
 /// hashing file contents or writing to the index**.
 ///
 /// Change detection compares each file's `(size, mtime)` against its stored
@@ -570,8 +572,14 @@ pub fn check_repo(
     let existing = store::read_scan_index(&db)?;
     let split = walk_and_split(&root, &existing, progress, cancel);
 
+    let new = split
+        .to_hash
+        .iter()
+        .filter(|f| !existing.contains_key(&f.rel))
+        .count() as u64;
     Ok(CheckStats {
-        changed: split.to_hash.len() as u64,
+        new,
+        changed: (split.to_hash.len() as u64).saturating_sub(new),
         missing: if split.cancelled {
             0
         } else {

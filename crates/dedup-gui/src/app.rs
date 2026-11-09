@@ -1031,13 +1031,13 @@ impl DedupApp {
                                     Freshness::UpToDate
                                 } else {
                                     Freshness::Stale {
-                                        changed: c.changed,
+                                        changed: c.new.saturating_add(c.changed),
                                         missing: c.missing,
                                     }
                                 };
                                 row.last = Some(format!(
-                                    "checked — {} changed, {} missing, {} unchanged",
-                                    c.changed, c.missing, c.unchanged
+                                    "checked — {} new, {} changed, {} missing, {} unchanged",
+                                    c.new, c.changed, c.missing, c.unchanged
                                 ));
                             }
                             Err(e) => row.last = Some(format!("check error: {e}")),
@@ -1093,6 +1093,7 @@ impl DedupApp {
             },
             move |progress, cancel| {
                 let mut report = crate::run_result::RunReport::new(report_title);
+                let mut new = 0u64;
                 let (mut added, mut updated, mut unchanged, mut missing, mut changed) =
                     (0u64, 0u64, 0u64, 0u64, 0u64);
                 let mut errors = 0u64;
@@ -1177,6 +1178,7 @@ impl DedupApp {
                             progress.row_done(name, "refused: walked empty");
                         }
                         JobOutcome::Check(Ok(c)) => {
+                            new = new.saturating_add(c.new);
                             changed = changed.saturating_add(c.changed);
                             missing = missing.saturating_add(c.missing);
                             unchanged = unchanged.saturating_add(c.unchanged);
@@ -1185,8 +1187,8 @@ impl DedupApp {
                             progress.row_done(
                                 name,
                                 format!(
-                                    "{} changed, {} missing, {} unchanged",
-                                    c.changed, c.missing, c.unchanged
+                                    "{} new, {} changed, {} missing, {} unchanged",
+                                    c.new, c.changed, c.missing, c.unchanged
                                 ),
                             );
                         }
@@ -1204,6 +1206,7 @@ impl DedupApp {
                 }
                 if kind == JobKind::Check {
                     report = report
+                        .count("new", new)
                         .count("changed", changed)
                         .count("missing", missing)
                         .count("unchanged", unchanged);
