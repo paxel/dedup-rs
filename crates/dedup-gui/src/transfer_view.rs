@@ -2642,7 +2642,7 @@ impl TransferView {
                     (
                         "Include this sink in the push",
                         "Toggle whether this sink is included when GROUP SYNC runs. Its mode \
-                             (ADD ONLY / APPLY CHANGES / MIRROR) is set on the start page.",
+                             (ADD ONLY / APPLY CHANGES / MIRROR) is set on the backup's card on the repository page.",
                     )
                 };
                 if row

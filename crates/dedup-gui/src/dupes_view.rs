@@ -213,13 +213,52 @@ enum Mode {
     Similar,
 }
 
-/// A repo's participation in the current search. (Whether it is read-only
-/// lives in the app-wide [`crate::locks::RepoLocks`] registry, not here.)
+/// Which card of the DUPLICATES page a repository sits in (ADR 0006). The
+/// card states the repository's lock: read-only is locked, read-write is not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Card {
+    ReadOnly,
+    ReadWrite,
+}
+
+/// A repo's place on the page: in the pool (`card: None`) or in a card, and
+/// so in the search. (The lock itself lives in the app-wide
+/// [`crate::locks::RepoLocks`] registry; the card follows it.)
 struct RepoSel {
     name: String,
-    included: bool,
+    card: Option<Card>,
     /// This repo is the main of a sync group — badged wherever it is named.
     is_main: bool,
+}
+
+/// A frame repositories can be dropped onto: the panel's own colour, outlined
+/// in `accent` while a repository is dragged over it. Returns the dropped
+/// repository's name.
+fn drop_zone(
+    ui: &mut egui::Ui,
+    accent: egui::Color32,
+    add: impl FnOnce(&mut egui::Ui),
+) -> Option<String> {
+    let response = egui::Frame::new()
+        .fill(theme::panel())
+        .corner_radius(6.0)
+        .inner_margin(6.0)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            add(ui);
+        })
+        .response;
+    if response.dnd_hover_payload::<String>().is_some() {
+        ui.painter().rect_stroke(
+            response.rect,
+            6.0,
+            egui::Stroke::new(2.0, accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+    response
+        .dnd_release_payload::<String>()
+        .map(|name| (*name).clone())
 }
 
 /// How long a press must be held (mouse or touch) to count as a long-press.
@@ -259,9 +298,14 @@ fn key(file: &DupeFile) -> FileKey {
 
 /// Deferred UI actions, applied after rendering to avoid double borrows.
 enum Act {
-    ToggleInclude(usize),
-    ToggleRo(usize),
+    /// Put a repository into a card, or back into the pool (`None`).
+    Place(String, Option<Card>),
+    /// Flip a repository's lock; its card follows.
+    ToggleLock(String),
+    /// PREVIEW: search, then show the result in the preview window.
     Find,
+    /// Close the preview without deleting anything.
+    CancelPreview,
     ToggleMark(FileKey),
     Unlock(FileKey),
     Relock(FileKey),
@@ -276,7 +320,6 @@ enum Act {
     /// Seek the current audio to a fraction [0,1] of its length.
     SeekAudio(f32),
     ToggleQuickDelete,
-    AutoResolve,
     DeleteGroup(usize),
     /// Mark every markable (non-protected) file in group `gi` for deletion.
     MarkGroup(usize),
@@ -347,13 +390,9 @@ pub struct DupesView {
     /// The page just changed: the next frame shows the list from its first
     /// group instead of wherever the previous page was scrolled to.
     scroll_to_top: bool,
-    /// ADR 0003 reading order: the repositories appear once a mode has been
-    /// picked, the filter and FIND once a repository is included.
-    mode_chosen: bool,
-    /// Which selection sections — WHAT, WITH WHICH, HOW — are open. A FIND
-    /// folds all three so the groups get the screen; each one flips back open
-    /// on its own header, without restoring the other two.
-    folds: crate::lcars::Folds,
+    /// Draw the preview in the page itself rather than in its own window:
+    /// for the tests, which have only the one window.
+    preview_inline: bool,
     /// A background operation in flight, if any.
     busy: Option<Op>,
     tx: Sender<Msg>,
@@ -424,8 +463,8 @@ impl DupesView {
             delete_batch: Vec::new(),
             page: 0,
             scroll_to_top: false,
-            mode_chosen: false,
-            folds: crate::lcars::Folds::default(),
+            // The tests have one window: their preview renders in the page.
+            preview_inline: cfg!(test),
             busy: None,
             tx,
             rx,
@@ -557,6 +596,16 @@ impl DupesView {
             self.marked
                 .retain(|k| !ro.contains(&k.0) || self.unlocked.contains(k));
         }
+        // A card follows its repository's lock, wherever it was changed.
+        for r in &mut self.repos {
+            if r.card.is_some() {
+                r.card = Some(if self.locks.read_only(&r.name) {
+                    Card::ReadOnly
+                } else {
+                    Card::ReadWrite
+                });
+            }
+        }
 
         let mut acts: Vec<Act> = Vec::new();
 
@@ -571,20 +620,6 @@ impl DupesView {
             let pages = self.total_groups().div_ceil(PAGE_SIZE);
             let cur = self.page.min(pages.saturating_sub(1));
             ctx.input(|i| {
-                if i.key_pressed(egui::Key::F) && self.busy.is_none() {
-                    acts.push(Act::Find);
-                }
-                if i.key_pressed(egui::Key::A) && self.busy.is_none() && !self.marked.is_empty() {
-                    acts.push(Act::AskDelete);
-                }
-                if i.key_pressed(egui::Key::M) {
-                    self.mode = if self.mode == Mode::Exact {
-                        Mode::Similar
-                    } else {
-                        Mode::Exact
-                    };
-                    self.mode_chosen = true;
-                }
                 if i.key_pressed(egui::Key::ArrowLeft) && cur > 0 {
                     acts.push(Act::SetPage(cur.saturating_sub(1)));
                 }
@@ -594,52 +629,40 @@ impl DupesView {
             });
         }
 
+        // In the tests the preview stands in for its window: it is all there
+        // is to see while a result is open.
+        if self.preview_inline && self.results.is_some() {
+            self.preview_body(ui, store, &mut acts);
+            for act in acts {
+                self.apply(&ctx, store, act);
+            }
+            return;
+        }
         ui.add_space(6.0);
         ui.label(
-            RichText::new("DUPLICATE MANAGEMENT")
+            RichText::new("DUPLICATES")
                 .color(theme::lilac())
                 .size(18.0)
                 .strong(),
         );
-        // Reading order is the workflow (ADR 0003): WHAT, then WITH WHICH,
-        // then HOW and FIND — each shown once the one before has an answer.
-        // A FIND folds all three shut; their header bars stay, so changing one
-        // thing about the search is one click on that section.
-        self.mode_section(ui, &mut acts);
-        if self.mode_chosen {
-            self.repo_bar(ui, &mut acts);
+        // ADR 0006: the repositories go from the pool into the read-only or
+        // the read-write card; the cards say what happens in them.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.pool_section(ui, &mut acts);
+                self.cards_section(ui, &mut acts);
+                self.how_section(ui, store, &mut acts);
+                if let Some(err) = &self.error {
+                    ui.colored_label(theme::red(), err);
+                }
+                if let Some(status) = &self.status {
+                    ui.label(RichText::new(status).color(theme::tan()).size(13.0));
+                }
+            });
+        if self.results.is_some() {
+            self.preview(ui, store, &mut acts);
         }
-        if self.mode_chosen && self.repos.iter().any(|r| r.included) {
-            self.how_section(ui, store, &mut acts);
-        }
-        self.result_actions(ui, &mut acts);
-        crate::util::shortcut_bar(
-            ui,
-            &format!(
-                "F find · A apply marked · {}/{} page · M mode",
-                icon::CARET_LEFT,
-                icon::CARET_RIGHT
-            ),
-        );
-        if let Some(err) = &self.error {
-            ui.colored_label(theme::red(), err);
-        }
-        if let Some(status) = &self.status {
-            ui.label(RichText::new(status).color(theme::tan()).size(13.0));
-        }
-        ui.separator();
-        self.results(ui, store, &mut acts);
-
-        if let Some((prompt, action)) = self.confirm.clone() {
-            let verb = match action {
-                ConfirmAction::EnableQuickDelete => "ENABLE",
-                ConfirmAction::DeleteAll => "DELETE",
-            };
-            self.confirm_modal(ui, &prompt, verb, &mut acts);
-        }
-
-        // The shared viewer overlays everything else when open.
-        self.viewer_modal(&ctx, store, &mut acts);
 
         for act in acts {
             self.apply(&ctx, store, act);
@@ -693,6 +716,9 @@ impl DupesView {
                             self.archive_evidence =
                                 dedup_core::archive::members_by_content(store, &refs)
                                     .unwrap_or_default();
+                            // The preview opens with its decision made: the best
+                            // copy kept, every other writable copy marked.
+                            self.start_auto_resolve(store, ctx);
                         }
                         Err(e) => {
                             self.find_note = None;
@@ -710,8 +736,12 @@ impl DupesView {
                             for k in keys {
                                 self.marked.insert(k);
                             }
-                            self.status =
-                                Some(format!("{} marked for deletion", self.marked.len()));
+                            // Added to what the search said, never in its place.
+                            let marks = format!("{} marked for deletion", self.marked.len());
+                            self.status = Some(match self.status.take() {
+                                Some(found) => format!("{found} · {marks}"),
+                                None => marks,
+                            });
                         }
                         Err(e) => self.error = Some(e),
                     }
@@ -821,7 +851,7 @@ impl DupesView {
                     .map(|(name, _, _)| {
                         let old = prev.iter().find(|r| r.name == name);
                         RepoSel {
-                            included: old.map(|r| r.included).unwrap_or(false),
+                            card: old.and_then(|r| r.card),
                             is_main: mains.contains(&name),
                             name,
                         }
@@ -834,203 +864,348 @@ impl DupesView {
         }
     }
 
-    fn repo_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        let title = "WITH WHICH — REPOSITORIES TO SEARCH";
-        let mut open = self.folds.is_open(title);
-        crate::lcars::section_lcars_folding(ui, title, theme::lilac(), &mut open, |ui| {
-            // Bulk MARK ALL / NONE (repos start excluded, so this is the quick way
-            // to include/clear all of them at once).
+    /// The pool: every repository that is in no card, to drag into one.
+    fn pool_section(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        let pool: Vec<(String, bool)> = self
+            .repos
+            .iter()
+            .filter(|r| r.card.is_none())
+            .map(|r| (r.name.clone(), r.is_main))
+            .collect();
+        crate::lcars::frame_lcars(
+            ui,
+            "REPOSITORIES — DRAG INTO A CARD BELOW",
+            theme::lilac(),
+            |ui| {
+                let dropped = drop_zone(ui, theme::lilac(), |ui| {
+                    if pool.is_empty() {
+                        ui.label(
+                            RichText::new("Every repository is in a card.")
+                                .color(theme::tan())
+                                .size(12.0),
+                        );
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        for (name, is_main) in &pool {
+                            self.pool_chip(ui, name, *is_main);
+                        }
+                    });
+                });
+                if let Some(name) = dropped {
+                    acts.push(Act::Place(name, None));
+                }
+            },
+        );
+    }
+
+    /// One repository in the pool: a chip to drag.
+    fn pool_chip(&self, ui: &mut egui::Ui, name: &str, is_main: bool) {
+        let id = egui::Id::unique(("dupes-pool", name));
+        ui.dnd_drag_source(id, name.to_string(), |ui| {
+            crate::repo_chip::repo_chip(ui, name, false, theme::orange(), is_main, None);
+        })
+        .response
+        .explain(
+            self.verbosity,
+            "Drag into the read-only or the read-write card",
+            "Drag this repository into the read-only card (its files are safe) or the \
+             read-write card (its copies may be deleted). Only repositories in a card are \
+             searched.",
+        );
+    }
+
+    /// The read-only and the read-write card, side by side. Dropping a
+    /// repository into one sets its lock to match.
+    fn cards_section(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        ui.columns(2, |cols| {
+            for (col, card, title, hover) in [
+                (
+                    0usize,
+                    Card::ReadOnly,
+                    "READ-ONLY — SAFE FROM CHANGES",
+                    "Nothing in these repositories is deleted. A repository dropped here is \
+                     locked.",
+                ),
+                (
+                    1usize,
+                    Card::ReadWrite,
+                    "READ-WRITE — COPIES HERE GET DELETED",
+                    "Duplicate copies in these repositories are deleted; the best copy of each \
+                     group is kept. A repository dropped here is unlocked.",
+                ),
+            ] {
+                let Some(ui) = cols.get_mut(col) else {
+                    continue;
+                };
+                let accent = if card == Card::ReadOnly {
+                    theme::blue()
+                } else {
+                    theme::red()
+                };
+                let members: Vec<(String, bool)> = self
+                    .repos
+                    .iter()
+                    .filter(|r| r.card == Some(card))
+                    .map(|r| (r.name.clone(), r.is_main))
+                    .collect();
+                let ((), header) = crate::lcars::frame_lcars(ui, title, accent, |ui| {
+                    let dropped = drop_zone(ui, accent, |ui| {
+                        ui.set_min_height(48.0);
+                        if members.is_empty() {
+                            ui.label(
+                                RichText::new("Drop repositories here")
+                                    .color(theme::tan())
+                                    .size(12.0),
+                            );
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            for (name, is_main) in &members {
+                                self.card_chip(ui, name, *is_main, acts);
+                            }
+                        });
+                    });
+                    if let Some(name) = dropped {
+                        acts.push(Act::Place(name, Some(card)));
+                    }
+                });
+                header.explain(self.verbosity, title, hover);
+            }
+        });
+    }
+
+    /// One repository in a card: its padlock moves it to the other card, its
+    /// (x) back to the pool, and it can be dragged elsewhere.
+    fn card_chip(&self, ui: &mut egui::Ui, name: &str, is_main: bool, acts: &mut Vec<Act>) {
+        let id = egui::Id::unique(("dupes-card", name));
+        ui.dnd_drag_source(id, name.to_string(), |ui| {
             ui.horizontal(|ui| {
-                if crate::lcars::toggle_button(ui, "ALL", false, theme::orange())
+                let read_only = self.locks.read_only(name);
+                let chip = crate::repo_chip::repo_chip(
+                    ui,
+                    name,
+                    true,
+                    theme::orange(),
+                    is_main,
+                    Some(read_only),
+                );
+                if let Some(lock) = chip.lock {
+                    let (short, long) = crate::locks::RepoLocks::hover_copy(read_only);
+                    if lock.explain(self.verbosity, short, long).clicked() {
+                        acts.push(Act::ToggleLock(name.to_string()));
+                    }
+                }
+                if ui
+                    .button(RichText::new(icon::X).color(theme::black()))
                     .explain(
                         self.verbosity,
-                        "Include every repo in the search",
-                        "Include (check) every repository so FIND searches them all.",
+                        "Take out of the search",
+                        "Put this repository back into the pool; it is no longer searched.",
                     )
                     .clicked()
                 {
-                    self.repos.iter_mut().for_each(|r| r.included = true);
+                    acts.push(Act::Place(name.to_string(), None));
                 }
-                if crate::lcars::toggle_button(ui, "NONE", false, theme::orange())
-                    .explain(
-                        self.verbosity,
-                        "Exclude every repo",
-                        "Exclude (uncheck) every repository. FIND needs at least one included.",
-                    )
-                    .clicked()
-                {
-                    self.repos.iter_mut().for_each(|r| r.included = false);
-                }
-            });
-            // The shared wrapping chip row (see `repo_chip::chip_row`) breaks onto
-            // multiple lines when the window is narrow.
-            crate::repo_chip::chip_row(ui, "dupes_repos", "", self.repos.len(), |ui, i| {
-                self.repo_chip(ui, i, acts)
             });
         });
-        self.folds.set("WITH WHICH — REPOSITORIES TO SEARCH", open);
     }
 
-    /// One repo chip — the shared identicon + name include-toggle plus the
-    /// read-only padlock (the "3 in the group" variant). Returns the chip frame
-    /// response (its rect feeds the wrap packing in [`repo_chip::chip_row`]).
-    fn repo_chip(&self, ui: &mut egui::Ui, i: usize, acts: &mut Vec<Act>) -> egui::Response {
-        // `chip_row` only asks for indices below `self.repos.len()`.
-        let Some(repo) = self.repos.get(i) else {
-            return ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover());
-        };
-        let read_only = self.locks.read_only(&repo.name);
-        let chip = crate::repo_chip::repo_chip(
+    /// HOW: exact or similar, the threshold, the shared FILTER wizard, and
+    /// PREVIEW.
+    fn how_section(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, acts: &mut Vec<Act>) {
+        crate::lcars::frame_lcars(
             ui,
-            &repo.name,
-            repo.included,
-            theme::orange(),
-            repo.is_main,
-            Some(read_only),
-        );
-        if chip
-            .name
-            .explain(
-                self.verbosity,
-                "Toggle whether this repo is searched",
-                "Include or exclude this repository from FIND results. Excluded repos \
-                 are skipped entirely — their files won't appear as duplicates or as \
-                 candidates.",
-            )
-            .clicked()
-        {
-            acts.push(Act::ToggleInclude(i));
-        }
-        if let Some(lock) = chip.lock {
-            // Closed padlock = read-only (protected); open padlock = deletable.
-            // One session-wide lock per repo: toggling it here changes what
-            // every tab allows (see `crate::locks`).
-            let (hover, hover_verbose) = crate::locks::RepoLocks::hover_copy(read_only);
-            if lock.explain(self.verbosity, hover, hover_verbose).clicked() {
-                acts.push(Act::ToggleRo(i));
-            }
-        }
-        chip.outer
-    }
-
-    /// WHAT: duplicates or similar, the threshold beside SIMILAR, and QUICK
-    /// DELETE — the settings that shape what a group is, on one row.
-    fn mode_section(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        let title = "WHAT — DUPLICATES OR SIMILAR FILES";
-        let mut open = self.folds.is_open(title);
-        crate::lcars::section_lcars_folding(ui, title, theme::amber(), &mut open, |ui| {
-            // Top-aligned: the slider is taller than a chip, and a centred
-            // row would drop the chips after it by a couple of pixels.
-            ui.horizontal_top(|ui| {
-                    let exact = self.mode_chosen && self.mode == Mode::Exact;
-                    let similar = self.mode_chosen && self.mode == Mode::Similar;
-                    // The two match modes: DUPLICATES (orange) / SIMILAR (lilac).
-                    if crate::lcars::toggle_button(ui, "DUPLICATES", exact, theme::orange())
-                        .explain(
-                            self.verbosity,
-                            "Exact byte-for-byte duplicates",
-                            "Find files whose content is byte-for-byte identical \
-                         (same size and BLAKE3 hash). Fast, no false positives.",
-                        )
-                        .clicked()
+            "HOW — WHAT COUNTS AS A DUPLICATE",
+            theme::amber(),
+            |ui| {
+                ui.horizontal_top(|ui| {
+                    if crate::lcars::toggle_button(
+                        ui,
+                        "EXACT",
+                        self.mode == Mode::Exact,
+                        theme::orange(),
+                    )
+                    .explain(
+                        self.verbosity,
+                        "Exact byte-for-byte duplicates",
+                        "Find files whose content is byte-for-byte identical (same size and \
+                         BLAKE3 hash). Fast, no false positives.",
+                    )
+                    .clicked()
                     {
                         self.mode = Mode::Exact;
-                        self.mode_chosen = true;
                     }
-                    if crate::lcars::toggle_button(ui, "SIMILAR", similar, theme::lilac())
-                        .explain(
-                            self.verbosity,
-                            "Perceptually similar images, videos and audio",
-                            "Find images and videos that look alike and audio that sounds \
-                         alike even when their bytes differ — re-saves, re-encodes, or \
-                         crops — using a perceptual fingerprint and the similarity \
-                         threshold beside this button.",
-                        )
-                        .clicked()
+                    if crate::lcars::toggle_button(
+                        ui,
+                        "SIMILAR",
+                        self.mode == Mode::Similar,
+                        theme::lilac(),
+                    )
+                    .explain(
+                        self.verbosity,
+                        "Perceptually similar images, videos and audio",
+                        "Find images and videos that look alike and audio that sounds alike \
+                         even when their bytes differ — re-saves, re-encodes, or crops — using a \
+                         perceptual fingerprint and the similarity threshold beside this button.",
+                    )
+                    .clicked()
                     {
                         self.mode = Mode::Similar;
-                        self.mode_chosen = true;
                     }
-                    // The threshold sits beside the mode it belongs to, with a
-                    // track wide enough to read as a slider.
-                    if similar {
+                    if self.mode == Mode::Similar {
                         ui.add_space(8.0);
                         ui.spacing_mut().slider_width = 220.0;
                         crate::util::similarity_slider(ui, &mut self.threshold, self.verbosity);
                     }
-                    ui.add_space(16.0);
-                    // Quick Delete: gives each group a DELETE NOW button that
-                    // removes its marked files instantly (no per-group confirmation).
-                    let label = format!("{} QUICK DELETE", icon::LIGHTNING);
-                    if crate::lcars::toggle_button(ui, &label, self.quick_delete, theme::red())
+                });
+                // Only groups with at least one member matching the filter are
+                // kept. The first searched repository backs the pick-lists.
+                let sugg = self.suggestion_repo();
+                let outcome = self.filter.ui(ui, store, sugg.as_deref(), self.verbosity);
+                if outcome.status.is_some() {
+                    self.status = outcome.status;
+                }
+                if outcome.error.is_some() {
+                    self.error = outcome.error;
+                }
+            },
+        );
+        let ready = self.busy.is_none() && self.repos.iter().any(|r| r.card.is_some());
+        if crate::lcars::action_button(
+            ui,
+            &format!("{} PREVIEW", icon::SEARCH),
+            ready,
+            theme::amber(),
+        )
+        .explain(
+            self.verbosity,
+            "Search the repositories in the cards and show the result",
+            "Search every repository in the two cards and open the result in its own window: \
+             the best copy of each group is kept, every other copy in a read-write repository \
+             is marked. Nothing is deleted until GO.",
+        )
+        .clicked()
+        {
+            acts.push(Act::Find);
+        }
+    }
+
+    /// The preview (ADR 0006): today's group view in a window of its own,
+    /// which locks the page until GO or CANCEL.
+    fn preview(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, acts: &mut Vec<Act>) {
+        let ctx = ui.ctx().clone();
+        let closed = ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("dupes_preview"),
+            egui::ViewportBuilder::default()
+                .with_title("dedup — DUPLICATES preview")
+                .with_inner_size([1100.0, 800.0]),
+            |ui, _class| {
+                let mut acts_here = Vec::new();
+                egui::CentralPanel::default().show(ui, |ui| {
+                    self.preview_body(ui, store, &mut acts_here);
+                });
+                let ctx = ui.ctx().clone();
+                for act in acts_here {
+                    self.apply(&ctx, store, act);
+                }
+                // The work after GO reports here, in the window it started in.
+                crate::activity::lock(&self.activity).show(ui);
+                ui.input(|i| i.viewport().close_requested())
+            },
+        );
+        if closed {
+            acts.push(Act::CancelPreview);
+        }
+        // The page is locked while the preview is open.
+        if !ctx.embed_viewports() {
+            egui::Modal::new(egui::Id::unique("dupes-preview-lock")).show(&ctx, |ui| {
+                ui.label(
+                    RichText::new("The preview is open in its own window — GO or CANCEL there.")
+                        .color(theme::text()),
+                );
+            });
+        }
+    }
+
+    /// The preview's content: the result's actions, the groups, the viewer,
+    /// and GO / CANCEL.
+    fn preview_body(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, acts: &mut Vec<Act>) {
+        egui::Panel::bottom("dupes_preview_go")
+            .frame(egui::Frame::new().fill(theme::bg()).inner_margin(8.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let n = self.marked.len();
+                    if crate::lcars::action_button(
+                        ui,
+                        &format!("GO — DELETE {n} MARKED"),
+                        self.busy.is_none() && n > 0,
+                        theme::red(),
+                    )
+                    .explain(
+                        self.verbosity,
+                        "Delete every marked file",
+                        "Delete every marked file, after one confirmation. The progress and \
+                         the report show in this window.",
+                    )
+                    .clicked()
+                    {
+                        acts.push(Act::AskDelete);
+                    }
+                    if crate::lcars::action_button(ui, "CANCEL", self.busy.is_none(), theme::tan())
                         .explain(
                             self.verbosity,
-                            "Show a DELETE NOW button on each group that deletes its marked files immediately, no confirmation",
-                            "When on, every group gets a DELETE NOW button that deletes its \
-                             currently marked files immediately, skipping the usual \
-                             confirmation dialog. Turn off to go back to confirming every batch.",
+                            "Close the preview, delete nothing",
+                            "Close the preview without deleting anything. Change the cards or \
+                             the settings on the page and PREVIEW again for a different result.",
                         )
                         .clicked()
                     {
-                        acts.push(Act::ToggleQuickDelete);
-                    }
-                    if self.quick_delete {
-                        ui.label(
-                            RichText::new("on — DELETE NOW removes files instantly")
-                                .color(theme::red())
-                                .size(12.0),
-                        );
+                        acts.push(Act::CancelPreview);
                     }
                 });
-        });
-        self.folds.set("WHAT — DUPLICATES OR SIMILAR FILES", open);
-    }
-
-    /// HOW: the shared FILTER wizard, and FIND beside it — the last decision
-    /// and the run on one line.
-    fn how_section(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, acts: &mut Vec<Act>) {
-        let title = "HOW — FILTER, THEN FIND";
-        let mut open = self.folds.is_open(title);
-        crate::lcars::section_lcars_folding(ui, title, theme::orange(), &mut open, |ui| {
-            ui.horizontal_top(|ui| {
-                let run_w = 140.0;
-                ui.vertical(|ui| {
-                    ui.set_max_width((ui.available_width() - run_w).max(240.0));
-                    // FIND keeps only groups with ≥1 member matching the
-                    // filter. The first included repo backs the pick-lists.
-                    let sugg = self.suggestion_repo();
-                    let outcome = self.filter.ui(ui, store, sugg.as_deref(), self.verbosity);
-                    if outcome.status.is_some() {
-                        self.status = outcome.status;
-                    }
-                    if outcome.error.is_some() {
-                        self.error = outcome.error;
-                    }
-                });
-                if crate::lcars::action_button(
-                    ui,
-                    &format!("{} FIND", icon::SEARCH),
-                    self.busy.is_none(),
-                    theme::amber(),
-                )
-                .explain(
-                    self.verbosity,
-                    "Search the included repos",
-                    "Search every included (checked) repository for duplicates or \
-                     similars per the selected mode. Excluded repos are skipped. The \
-                     search runs in a window that shows its progress.",
-                )
-                .clicked()
-                {
-                    acts.push(Act::Find);
-                }
             });
-        });
-        self.folds.set("HOW — FILTER, THEN FIND", open);
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::bg()))
+            .show(ui, |ui| {
+                self.result_actions(ui, acts);
+                if let Some(status) = &self.status {
+                    ui.label(RichText::new(status).color(theme::tan()).size(13.0));
+                }
+                ui.separator();
+                self.results(ui, store, acts);
+            });
+        if let Some((prompt, action)) = self.confirm.clone() {
+            let verb = match action {
+                ConfirmAction::EnableQuickDelete => "ENABLE",
+                ConfirmAction::DeleteAll => "DELETE",
+            };
+            self.confirm_modal(ui, &prompt, verb, acts);
+        }
+        let ctx = ui.ctx().clone();
+        self.viewer_modal(&ctx, store, acts);
     }
 
-    /// The actions over a result: SHOW ACCEPTED, AUTO-RESOLVE, DELETE
-    /// MARKED, and the view's own spinner for the marks it computes.
+    /// Whether the preview is open in its own window, which then shows the
+    /// activity window itself.
+    pub fn previewing(&self) -> bool {
+        self.results.is_some() && !self.preview_inline
+    }
+
+    /// Forget the result: the preview closes.
+    fn clear_results(&mut self) {
+        self.results = None;
+        self.page_groups.clear();
+        self.cached_page = None;
+        self.marked.clear();
+        self.unlocked.clear();
+        self.preselected_pages.clear();
+        self.resolved.clear();
+        self.hidden.clear();
+        self.lightbox = None;
+        self.confirm = None;
+    }
+
+    /// The actions over a result: SHOW ACCEPTED, QUICK DELETE, and the
+    /// view's own spinner for the marks it computes.
     fn result_actions(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         if let Some(Op::AutoResolve { done, total }) = &self.busy {
             ui.horizontal(|ui| {
@@ -1044,8 +1219,6 @@ impl DupesView {
         }
         if self.total_groups() > 0 {
             ui.horizontal(|ui| {
-                let n = self.marked.len();
-                let idle = self.busy.is_none();
                 // Fully accepted groups hold nothing to triage, so they are
                 // skipped unless asked for — this is also the way back to a
                 // group you want to un-accept.
@@ -1073,36 +1246,20 @@ impl DupesView {
                         .size(12.0),
                     );
                 }
-                if crate::lcars::action_button(ui, "AUTO-RESOLVE REST", idle, theme::orange())
+                // QUICK DELETE: each group gets a DELETE NOW button that
+                // removes its marked files at once.
+                let label = format!("{} QUICK DELETE", icon::LIGHTNING);
+                if crate::lcars::toggle_button(ui, &label, self.quick_delete, theme::red())
                     .explain(
                         self.verbosity,
-                        "Mark every non-best copy in a deletable repo",
-                        "Across every result group, mark every copy except the best one for \
-                         deletion — but only in repos that aren't read-only. Review the \
-                         marks before deleting; nothing is deleted by this button alone.",
+                        "Show a DELETE NOW button on each group that deletes its marked files immediately, no confirmation",
+                        "When on, every group gets a DELETE NOW button that deletes its \
+                         currently marked files immediately, skipping the usual confirmation \
+                         dialog. Turn off to go back to deleting everything at once with GO.",
                     )
                     .clicked()
                 {
-                    acts.push(Act::AutoResolve);
-                }
-                if crate::lcars::action_button(
-                    ui,
-                    &format!("APPLY MARKED ({n})"),
-                    idle && n > 0,
-                    theme::red(),
-                )
-                .explain(
-                    self.verbosity,
-                    "Delete every marked file, with confirmation",
-                    "Apply the marks: delete every currently marked file across all \
-                     groups, batched per repo in one transaction. Always asks for \
-                     confirmation first — use QUICK DELETE if you want per-group deletes \
-                     without asking. The delete and the search that follows run in a \
-                     window that shows their progress and reports what was deleted.",
-                )
-                .clicked()
-                {
-                    acts.push(Act::AskDelete);
+                    acts.push(Act::ToggleQuickDelete);
                 }
             });
         }
@@ -2081,23 +2238,23 @@ impl DupesView {
 
     fn apply(&mut self, ctx: &egui::Context, store: &Arc<Store>, act: Act) {
         match act {
-            Act::ToggleInclude(i) => {
-                if let Some(r) = self.repos.get_mut(i) {
-                    r.included = !r.included;
+            Act::Place(name, card) => {
+                if let Some(r) = self.repos.iter_mut().find(|r| r.name == name) {
+                    r.card = card;
+                }
+                // The card states the lock (ADR 0006); the pool leaves it.
+                match card {
+                    Some(Card::ReadOnly) => self.lock_repo(&name, true),
+                    Some(Card::ReadWrite) => self.lock_repo(&name, false),
+                    None => {}
                 }
             }
-            Act::ToggleRo(i) => {
-                if let Some(r) = self.repos.get(i) {
-                    let name = r.name.clone();
-                    self.locks.toggle(&name);
-                    if self.locks.read_only(&name) {
-                        self.marked.retain(|(repo, _)| repo != &name);
-                        // A repo turned read-only starts fully locked again.
-                        self.unlocked.retain(|(repo, _)| repo != &name);
-                    }
-                }
+            Act::ToggleLock(name) => {
+                let read_only = !self.locks.read_only(&name);
+                self.lock_repo(&name, read_only);
             }
             Act::Find => self.start_find(store, ctx),
+            Act::CancelPreview => self.clear_results(),
             Act::ToggleMark(k) => {
                 if !self.marked.remove(&k) {
                     self.marked.insert(k);
@@ -2195,7 +2352,6 @@ impl DupesView {
                     ));
                 }
             }
-            Act::AutoResolve => self.start_auto_resolve(store, ctx),
             Act::DeleteGroup(gi) => self.delete_group(store, ctx, gi),
             Act::MarkGroup(gi) => self.set_group_mark(gi, true),
             Act::UnmarkGroup(gi) => self.set_group_mark(gi, false),
@@ -2256,6 +2412,16 @@ impl DupesView {
                     }
                 }
             }
+        }
+    }
+
+    /// Lock or unlock `name`. A repository turned read-only keeps no marks
+    /// and starts fully locked again, per-file unlocks included.
+    fn lock_repo(&mut self, name: &str, read_only: bool) {
+        self.locks.set_read_only(name, read_only);
+        if read_only {
+            self.marked.retain(|(repo, _)| repo != name);
+            self.unlocked.retain(|(repo, _)| repo != name);
         }
     }
 
@@ -2419,7 +2585,7 @@ impl DupesView {
     fn included_names(&self) -> Vec<String> {
         self.repos
             .iter()
-            .filter(|r| r.included)
+            .filter(|r| r.card.is_some())
             .map(|r| r.name.clone())
             .collect()
     }
@@ -2486,7 +2652,6 @@ impl DupesView {
         self.busy = Some(Op::Find);
         self.status = None;
         self.error = None;
-        self.folds.fold_all();
     }
 
     fn start_auto_resolve(&mut self, store: &Arc<Store>, ctx: &egui::Context) {
@@ -2729,13 +2894,16 @@ mod ui_tests {
     /// Build a driven harness showing the Duplicates view for `store`. The
     /// closure owns `view`/`store`; the theme + icon font are installed once so
     /// glyph metrics match the real app.
-    /// A view as a user has it after the first click: the mode chosen, so the
-    /// repositories, the filter and FIND are on screen (ADR 0003 reveals them
-    /// step by step). Every repo is included, as the layout tests assume.
+    /// Every repository into the read-write card, unlocked as the card says.
+    fn put_all_read_write(view: &mut DupesView) {
+        for r in &mut view.repos {
+            r.card = Some(Card::ReadWrite);
+            view.locks.set_read_only(&r.name, false);
+        }
+    }
+
     fn ready_view() -> DupesView {
-        let mut view = DupesView::new();
-        view.mode_chosen = true;
-        view
+        DupesView::new()
     }
 
     fn dupes_harness<'a>(store: Arc<Store>) -> Harness<'a, DupesView> {
@@ -2756,164 +2924,9 @@ mod ui_tests {
         harness.run();
         // Repos start excluded; the layout tests look at the whole tab, so
         // include them all and render again to reveal the HOW section.
-        harness
-            .state_mut()
-            .repos
-            .iter_mut()
-            .for_each(|r| r.included = true);
+        put_all_read_write(harness.state_mut());
         harness.run();
         harness
-    }
-
-    /// ADR 0003 reading order: a fresh tab shows the mode choice alone; the
-    /// repositories appear once a mode is picked; the filter and FIND once a
-    /// repository is included; and flipping the mode keeps the repository pick.
-    #[test]
-    fn sections_reveal_in_reading_order_and_keep_earlier_answers() {
-        let (_tmp, store) = sample_store(&SAMPLE_REPOS);
-        let store_ui = Arc::clone(&store);
-        let mut init = false;
-        let mut h = Harness::builder()
-            .with_size(egui::vec2(1120.0, 600.0))
-            .build_ui_state(
-                move |ui, view: &mut DupesView| {
-                    if !init {
-                        crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
-                        init = true;
-                    }
-                    view.show(ui, &store_ui, TooltipVerbosity::default());
-                },
-                DupesView::new(),
-            );
-        h.run();
-        let find = format!("{} FIND", icon::SEARCH);
-        assert!(h.query_by_label("DUPLICATES").is_some());
-        assert!(
-            h.query_by_label(SAMPLE_REPOS[0]).is_none(),
-            "no repository chip before a mode is chosen"
-        );
-        assert!(h.query_by_label_contains("FILTER — ").is_none());
-        assert!(h.query_by_label(&find).is_none());
-
-        h.get_by_label("DUPLICATES").click();
-        h.run();
-        let repo_chip = h.get_by_label(SAMPLE_REPOS[0]).rect();
-        let mode_chip = h.get_by_label("DUPLICATES").rect();
-        assert!(
-            repo_chip.top() > mode_chip.bottom(),
-            "repositories sit below the mode: {repo_chip:?} vs {mode_chip:?}"
-        );
-        assert!(
-            h.query_by_label(&find).is_none(),
-            "FIND waits for a repository to be included"
-        );
-
-        h.get_by_label(SAMPLE_REPOS[0]).click();
-        h.run();
-        let filter = h.get_by_label_contains("FILTER — ").rect();
-        let find_btn = h.get_by_label(&find).rect();
-        assert!(
-            filter.top() > repo_chip.bottom(),
-            "filter below the repositories"
-        );
-        assert!(
-            (find_btn.top() - filter.top()).abs() < 40.0,
-            "FIND shares the HOW row with the filter: {find_btn:?} vs {filter:?}"
-        );
-
-        // Flipping the mode does not reset the repository pick.
-        h.get_by_label("SIMILAR").click();
-        h.run();
-        assert!(
-            h.state().repos[0].included,
-            "the repository pick survives a mode flip"
-        );
-        assert!(h.query_by_label(&find).is_some());
-    }
-
-    /// After a FIND the three selection sections fold to their header bars,
-    /// and each one flips back open on its own without restoring the others.
-    #[test]
-    fn selection_folds_after_find_and_each_section_flips_back_open() {
-        let (_tmp, store) = sample_store(&SAMPLE_REPOS);
-        let store_ui = Arc::clone(&store);
-        let mut init = false;
-        let mut h = Harness::builder()
-            .with_size(egui::vec2(1120.0, 600.0))
-            .build_ui_state(
-                move |ui, view: &mut DupesView| {
-                    if !init {
-                        crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
-                        init = true;
-                    }
-                    view.show(ui, &store_ui, TooltipVerbosity::default());
-                },
-                ready_view(),
-            );
-        h.run();
-        h.state_mut()
-            .repos
-            .iter_mut()
-            .for_each(|r| r.included = true);
-        h.run();
-        h.get_by_label(&format!("{} FIND", icon::SEARCH)).click();
-        for _ in 0..200 {
-            h.step();
-            if h.state().results.is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(h.state().results.is_some(), "the search landed");
-        h.run();
-        assert!(
-            h.query_by_label("DUPLICATES").is_none(),
-            "the mode section's body is folded away after FIND"
-        );
-        for title in [
-            "WHAT — DUPLICATES OR SIMILAR FILES",
-            "WITH WHICH — REPOSITORIES TO SEARCH",
-            "HOW — FILTER, THEN FIND",
-        ] {
-            assert!(
-                h.query_by_label(title).is_some(),
-                "the folded section keeps its header bar: {title}"
-            );
-        }
-        h.get_by_label("WHAT — DUPLICATES OR SIMILAR FILES").click();
-        h.run();
-        assert!(
-            h.query_by_label("DUPLICATES").is_some(),
-            "its own header flips that section back open"
-        );
-        assert!(
-            h.query_by_label("WITH WHICH — REPOSITORIES TO SEARCH")
-                .is_some()
-                && h.query_by_label("ALL").is_none(),
-            "and leaves the other sections folded"
-        );
-    }
-
-    /// Regression test for the recurring "first repo sits higher" bug: every
-    /// repo chip on a row must share one top edge.
-    #[test]
-    fn repo_row_is_aligned() {
-        let (_tmp, store) = sample_store(&SAMPLE_REPOS);
-        let harness = dupes_harness(store);
-
-        let tops: Vec<f32> = SAMPLE_REPOS
-            .iter()
-            .map(|n| harness.get_by_label(n).rect().top())
-            .collect();
-        let base = tops[0];
-        for (name, top) in SAMPLE_REPOS.iter().zip(&tops) {
-            assert!(
-                (top - base).abs() < 0.75,
-                "repo '{name}' top {top} != first repo top {base} — row misaligned (tops: {tops:?})"
-            );
-        }
     }
 
     /// Auto-refresh: re-syncing the repo list keeps existing repos' include and
@@ -2934,12 +2947,12 @@ mod ui_tests {
         assert!(
             view.repos
                 .iter()
-                .all(|r| !r.included && view.locks.read_only(&r.name)),
+                .all(|r| !r.card.is_some() && view.locks.read_only(&r.name)),
             "repos default to excluded + read-only"
         );
         // The user includes A and unlocks it (a non-default state to preserve).
         let a = view.repos.iter_mut().find(|r| r.name == "A").unwrap();
-        a.included = true;
+        a.card = Some(Card::ReadWrite);
         view.locks.toggle("A");
         // A new repo C is registered, then the tab is re-synced.
         let dir = tmp.path().join("C");
@@ -2948,7 +2961,7 @@ mod ui_tests {
         view.sync_repos(&store);
         let get = |n: &str| {
             let r = view.repos.iter().find(|r| r.name == n).unwrap();
-            (r.included, view.locks.read_only(&r.name))
+            (r.card.is_some(), view.locks.read_only(&r.name))
         };
         assert_eq!(
             get("A"),
@@ -2960,114 +2973,6 @@ mod ui_tests {
             get("C"),
             (false, true),
             "the new repo C appears with the default (excluded + locked)"
-        );
-    }
-
-    /// MARK ALL / MARK NONE bulk-toggle every repo's include state (repos start
-    /// excluded by default).
-    #[test]
-    fn mark_all_none_toggles_include() {
-        let (_tmp, store) = sample_store(&SAMPLE_REPOS);
-        let store_ui = Arc::clone(&store);
-        let mut init = false;
-        let mut harness = Harness::builder()
-            .with_size(egui::vec2(1120.0, 360.0))
-            .build_ui_state(
-                move |ui, view: &mut DupesView| {
-                    if !init {
-                        crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
-                        init = true;
-                    }
-                    view.show(ui, &store_ui, TooltipVerbosity::default());
-                },
-                ready_view(),
-            );
-        harness.run();
-        assert!(
-            harness.state().repos.iter().all(|r| !r.included),
-            "repos start excluded by default"
-        );
-        harness.get_by_label("ALL").click();
-        harness.run();
-        assert!(
-            harness.state().repos.iter().all(|r| r.included),
-            "MARK ALL includes every repo"
-        );
-        harness.get_by_label("NONE").click();
-        harness.run();
-        assert!(
-            harness.state().repos.iter().all(|r| !r.included),
-            "MARK NONE excludes every repo"
-        );
-    }
-
-    /// Many repos in a narrow window must **wrap** onto several rows (rather
-    /// than scroll off-screen), and each wrapped row must stay top-aligned.
-    #[test]
-    fn repo_chips_wrap_when_narrow() {
-        let names: Vec<String> = (0..12).map(|i| format!("repo{i:02}")).collect();
-        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        let (_tmp, store) = sample_store(&refs);
-
-        let mut view = ready_view();
-        let mut init = false;
-        let mut harness = Harness::builder()
-            .with_size(egui::vec2(420.0, 500.0))
-            .build_ui(move |ui| {
-                if !init {
-                    crate::icon::install(ui.ctx());
-                    crate::theme::apply(ui.ctx(), crate::theme::DARK);
-                    init = true;
-                }
-                view.show(ui, &store, TooltipVerbosity::default());
-            });
-        harness.run();
-
-        let tops: Vec<f32> = names
-            .iter()
-            .map(|n| harness.get_by_label(n).rect().top())
-            .collect();
-
-        // Cluster tops into rows (0.75 px tolerance, matching the alignment
-        // test). Wrapping means more than one row; top-alignment means the
-        // first row holds several chips that share a top edge.
-        let mut rows: Vec<f32> = Vec::new();
-        for &t in &tops {
-            if !rows.iter().any(|&r| (r - t).abs() < 0.75) {
-                rows.push(t);
-            }
-        }
-        assert!(
-            rows.len() >= 2,
-            "repo chips did not wrap: all {} chips share one row (tops: {tops:?})",
-            tops.len()
-        );
-        let first = tops.iter().cloned().fold(f32::INFINITY, f32::min);
-        let first_row = tops.iter().filter(|&&t| (t - first).abs() < 0.75).count();
-        assert!(
-            first_row >= 2,
-            "first wrapped row is not top-aligned: only {first_row} chip(s) at top {first} (tops: {tops:?})"
-        );
-    }
-
-    /// Guards against the REPOS section expanding to fill the viewport (a real
-    /// regression we hit): the MODE row's FIND button must stay near the top,
-    /// not be pushed hundreds of px down by an over-tall section above it.
-    #[test]
-    fn sections_stay_compact() {
-        let (_tmp, store) = sample_store(&SAMPLE_REPOS);
-        let harness = dupes_harness(store);
-        // The FILTER wizard sits directly below the REPOS section, so its top
-        // reflects the REPOS height — a good guard against an expanded repos bar
-        // (the FIND button now sits below FILTER, so it's no longer a tight
-        // proxy for the repos height). The REPOS section is the MARK ALL/NONE
-        // header line plus one chip row here; an over-expansion regression pushed
-        // it hundreds of px down, so a ~200px ceiling still catches that.
-        let filter_top = harness.get_by_label_contains("FILTER — ").rect().top();
-        assert!(
-            filter_top < 320.0,
-            "FILTER section at y={filter_top}; the WHAT or WITH WHICH section is too tall (expanded?)"
         );
     }
 
@@ -3084,43 +2989,6 @@ mod ui_tests {
         assert!(
             harness.query_by_label("+").is_some(),
             "the FILTER wizard's add-condition button should be present"
-        );
-    }
-
-    /// In SIMILAR mode a threshold control appears in the MODE row. It must not
-    /// drift the row vertically: the DUPLICATES and FIND buttons stay aligned.
-    #[test]
-    fn similar_mode_row_is_aligned() {
-        let (_tmp, store) = sample_store(&SAMPLE_REPOS);
-        let mut view = ready_view();
-        let mut init = false;
-        let mut harness = Harness::builder()
-            .with_size(egui::vec2(1120.0, 360.0))
-            .build_ui(move |ui| {
-                if !init {
-                    crate::icon::install(ui.ctx());
-                    crate::theme::apply(ui.ctx(), crate::theme::DARK);
-                    init = true;
-                }
-                view.show(ui, &store, TooltipVerbosity::default());
-            });
-        harness.run();
-        harness.get_by_label("SIMILAR").click();
-        harness.run();
-
-        let dup_top = harness.get_by_label("DUPLICATES").rect().top();
-        let quick_top = harness
-            .get_by_label(&format!("{} QUICK DELETE", icon::LIGHTNING))
-            .rect()
-            .top();
-        let slider_top = harness.get_by_label("similarity").rect().top();
-        assert!(
-            (dup_top - quick_top).abs() < 0.75,
-            "mode row misaligned: DUPLICATES top {dup_top} vs QUICK DELETE top {quick_top}"
-        );
-        assert!(
-            (slider_top - dup_top).abs() < 12.0,
-            "the threshold sits on the mode row beside SIMILAR: {slider_top} vs {dup_top}"
         );
     }
 
@@ -3147,7 +3015,7 @@ mod ui_tests {
                 view,
             );
         h.run();
-        h.state_mut().repos[0].included = true;
+        h.state_mut().repos[0].card = Some(Card::ReadWrite);
         let tx = h.state().tx.clone();
         tx.send(Msg::DeleteDone(
             Ok(DupeDeleteStats {
@@ -3207,12 +3075,12 @@ mod ui_tests {
         view.repos_loaded = true;
         view.repos = vec![
             RepoSel {
-                included: true,
+                card: Some(Card::ReadWrite),
                 is_main: false,
                 name: "junk".into(),
             },
             RepoSel {
-                included: true,
+                card: Some(Card::ReadWrite),
                 is_main: false,
                 name: "keep".into(),
             },
@@ -3627,16 +3495,12 @@ mod ui_tests {
         harness.run(); // sync_repos (all excluded by default), initial render
         // Repos start excluded; opt them all in before searching, and render
         // once more so the HOW section (filter and FIND) is on screen.
-        harness
-            .state_mut()
-            .repos
-            .iter_mut()
-            .for_each(|r| r.included = true);
+        put_all_read_write(harness.state_mut());
         harness.run();
 
         harness
-            .get_by_label(&format!("{} FIND", icon::SEARCH))
-            .click();
+            .get_by_label(&format!("{} PREVIEW", icon::SEARCH))
+            .click_accesskit();
 
         // Use `step` (single frame) not `run`: the spinner requests continuous
         // repaints while the op is in flight, which trips `run`'s step cap.
@@ -3655,7 +3519,19 @@ mod ui_tests {
             harness.state().error
         );
         assert_eq!(harness.state().total_groups(), 5);
+        // The preview then marks its decision on its own.
+        for _ in 0..200 {
+            harness.step();
+            if harness.state().busy.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert!(harness.state().busy.is_none(), "op should have settled");
+        assert!(
+            !harness.state().marked.is_empty(),
+            "the preview opens with the worse copies marked"
+        );
     }
 
     /// FIND respects the FILTER: with `name:g0_` set, only group 0 survives.
@@ -3687,16 +3563,12 @@ mod ui_tests {
         }
         // Repos start excluded; opt them all in before searching, then render
         // once so the HOW section (filter and FIND) is on screen.
-        harness
-            .state_mut()
-            .repos
-            .iter_mut()
-            .for_each(|r| r.included = true);
+        put_all_read_write(harness.state_mut());
         harness.run();
 
         harness
-            .get_by_label(&format!("{} FIND", icon::SEARCH))
-            .click();
+            .get_by_label(&format!("{} PREVIEW", icon::SEARCH))
+            .click_accesskit();
         let mut done = false;
         for _ in 0..200 {
             harness.step();
@@ -3758,7 +3630,7 @@ mod ui_tests {
         view.locks.toggle("w");
         view.repos = vec![RepoSel {
             name: "w".into(),
-            included: true,
+            card: Some(Card::ReadWrite),
             is_main: false,
         }];
         view.results = Some(Results::Similar(vec![
@@ -3817,7 +3689,12 @@ mod ui_tests {
 
         // Auto-resolve marks nothing accepted either.
         harness.state_mut().marked.clear();
-        harness.get_by_label("AUTO-RESOLVE REST").click();
+        // What PREVIEW does once the groups are in (similar results need no
+        // store, but the call takes one).
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
+        let ctx = harness.ctx.clone();
+        harness.state_mut().start_auto_resolve(&store, &ctx);
         harness.run();
         assert_eq!(
             harness.state().marked,
@@ -3923,7 +3800,7 @@ mod ui_tests {
         view.locks.toggle("w");
         view.repos = vec![RepoSel {
             name: "w".into(),
-            included: true,
+            card: Some(Card::ReadWrite),
             is_main: false,
         }];
         view.results = Some(Results::Similar(vec![vec![
@@ -3999,7 +3876,7 @@ mod ui_tests {
         view.locks.toggle("w");
         view.repos = vec![RepoSel {
             name: "w".into(),
-            included: true,
+            card: Some(Card::ReadWrite),
             is_main: false,
         }];
         view.results = Some(Results::Similar(vec![vec![
@@ -4105,12 +3982,12 @@ mod ui_tests {
         view.repos = vec![
             RepoSel {
                 name: "w".into(),
-                included: true,
+                card: Some(Card::ReadWrite),
                 is_main: false,
             },
             RepoSel {
                 name: "ro".into(),
-                included: true,
+                card: Some(Card::ReadWrite),
                 is_main: false,
             },
         ];
@@ -4144,12 +4021,12 @@ mod ui_tests {
         view.repos = vec![
             RepoSel {
                 name: "w".into(),
-                included: true,
+                card: Some(Card::ReadWrite),
                 is_main: false,
             },
             RepoSel {
                 name: "ro".into(),
-                included: true,
+                card: Some(Card::ReadWrite),
                 is_main: false,
             },
         ];
@@ -4219,7 +4096,7 @@ mod ui_tests {
         view.repos_loaded = true;
         view.repos = vec![RepoSel {
             name: "ro".into(),
-            included: true,
+            card: Some(Card::ReadWrite),
             is_main: false,
         }];
         view.results = Some(Results::Similar(vec![vec![
@@ -4286,12 +4163,12 @@ mod ui_tests {
         view.repos = vec![
             RepoSel {
                 name: "w".into(),
-                included: true,
+                card: Some(Card::ReadWrite),
                 is_main: false,
             },
             RepoSel {
                 name: "ro".into(),
-                included: true,
+                card: Some(Card::ReadWrite),
                 is_main: false,
             },
         ];
@@ -5735,48 +5612,6 @@ mod ui_tests {
         );
     }
 
-    /// `M` toggles the match mode from the grid (no lightbox/modal open).
-    #[test]
-    fn grid_shortcut_toggles_match_mode() {
-        let mut view = ready_view();
-        view.repos_loaded = true;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open_at(tmp.path().join("cfg")).unwrap());
-        let mut init = false;
-        let mut harness = Harness::builder()
-            .with_size(egui::vec2(900.0, 600.0))
-            .build_ui_state(
-                move |ui, view: &mut DupesView| {
-                    if !init {
-                        crate::icon::install(ui.ctx());
-                        crate::theme::apply(ui.ctx(), crate::theme::DARK);
-                        init = true;
-                    }
-                    let _ = &tmp;
-                    view.show(ui, &store, TooltipVerbosity::default());
-                },
-                view,
-            );
-        harness.run();
-        assert!(
-            harness.state().mode == Mode::Exact,
-            "starts in exact/DUPLICATES"
-        );
-
-        harness.key_press(egui::Key::M);
-        harness.run();
-        harness.run();
-        assert!(
-            harness.state().mode == Mode::Similar,
-            "M switches to SIMILAR"
-        );
-        harness.key_press(egui::Key::M);
-        harness.run();
-        harness.run();
-        assert!(harness.state().mode == Mode::Exact, "M toggles back");
-    }
-
     /// Re-locking removes the override and any pending mark, and turning a
     /// repo read-only clears its per-file unlocks.
     #[test]
@@ -5795,12 +5630,12 @@ mod ui_tests {
 
         view.repos = vec![RepoSel {
             name: "r".into(),
-            included: true,
+            card: Some(Card::ReadWrite),
             is_main: false,
         }];
         view.locks.toggle("r");
         view.unlocked.insert(k.clone());
-        view.apply(&ctx, &store, Act::ToggleRo(0));
+        view.apply(&ctx, &store, Act::ToggleLock("r".into()));
         assert!(
             !view.unlocked.contains(&k),
             "turning a repo read-only relocks its files"
@@ -5895,7 +5730,7 @@ mod ui_tests {
         view.repos_loaded = true;
         view.repos = vec![RepoSel {
             name: "repo".into(),
-            included: true,
+            card: Some(Card::ReadWrite),
             is_main: false,
         }];
         view.locks.toggle("repo");
@@ -6054,9 +5889,21 @@ mod ui_tests {
     fn render_dupes_view() {
         let (_tmp, store) = sample_store(&SAMPLE_REPOS);
         let mut view = ready_view();
+        view.sync_repos(&store);
+        let ctx = egui::Context::default();
+        view.apply(
+            &ctx,
+            &store,
+            Act::Place(SAMPLE_REPOS[0].into(), Some(Card::ReadOnly)),
+        );
+        view.apply(
+            &ctx,
+            &store,
+            Act::Place(SAMPLE_REPOS[1].into(), Some(Card::ReadWrite)),
+        );
         let mut init = false;
         let mut harness = Harness::builder()
-            .with_size(egui::vec2(1120.0, 360.0))
+            .with_size(egui::vec2(1120.0, 560.0))
             .wgpu()
             .build_ui(move |ui| {
                 if !init {
@@ -6271,7 +6118,7 @@ mod ui_tests {
         view.repos_loaded = true;
         view.repos = vec![RepoSel {
             name: "repo".into(),
-            included: true,
+            card: Some(Card::ReadWrite),
             is_main: false,
         }];
         view.locks.toggle("repo");
@@ -6312,7 +6159,7 @@ mod ui_tests {
         view.repos_loaded = true;
         view.repos = vec![RepoSel {
             name: "ro".into(),
-            included: true,
+            card: Some(Card::ReadWrite),
             is_main: false,
         }];
         view.results = Some(Results::Similar(vec![vec![
@@ -6528,7 +6375,7 @@ mod ui_tests {
         view.repos_loaded = true;
         view.repos = vec![RepoSel {
             name: repo.clone(),
-            included: true,
+            card: Some(Card::ReadWrite),
             is_main: false,
         }];
         view.locks.toggle(&repo);
@@ -7132,7 +6979,7 @@ mod ui_tests {
         view.repos_loaded = true;
         view.repos = vec![RepoSel {
             name: "r".into(),
-            included: true,
+            card: Some(Card::ReadWrite),
             is_main: false,
         }];
         view.results = Some(Results::Similar(vec![group]));
@@ -7409,5 +7256,62 @@ mod ui_tests {
         let out = doc_screenshot_path("lightbox_text.png");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
+    }
+
+    /// ADR 0006: the card states the lock. Dropping a repository into the
+    /// read-write card unlocks it, into the read-only card locks it, and the
+    /// pool leaves the lock alone.
+    #[test]
+    fn a_card_sets_the_lock_and_the_pool_leaves_it() {
+        let (_tmp, store) = sample_store(&["a"]);
+        let ctx = egui::Context::default();
+        let mut view = ready_view();
+        view.sync_repos(&store);
+        assert!(view.locks.read_only("a"), "every repository starts locked");
+        view.apply(&ctx, &store, Act::Place("a".into(), Some(Card::ReadWrite)));
+        assert!(!view.locks.read_only("a"), "the read-write card unlocks");
+        view.apply(&ctx, &store, Act::Place("a".into(), Some(Card::ReadOnly)));
+        assert!(view.locks.read_only("a"), "the read-only card locks");
+        view.apply(&ctx, &store, Act::Place("a".into(), None));
+        assert!(view.repos[0].card.is_none(), "back in the pool");
+        assert!(view.locks.read_only("a"), "the pool leaves the lock alone");
+    }
+
+    /// A repository's card follows its lock: the padlock in a card moves it
+    /// to the other card, and so does a lock changed on another page.
+    #[test]
+    fn the_card_follows_the_lock() {
+        let (_tmp, store) = sample_store(&["a"]);
+        let mut harness = dupes_harness(Arc::clone(&store));
+        let ctx = harness.ctx.clone();
+        harness
+            .state_mut()
+            .apply(&ctx, &store, Act::Place("a".into(), Some(Card::ReadWrite)));
+        harness
+            .state_mut()
+            .apply(&ctx, &store, Act::ToggleLock("a".into()));
+        harness.run();
+        assert_eq!(harness.state().repos[0].card, Some(Card::ReadOnly));
+        // Unlocked elsewhere (the registry is shared app-wide).
+        harness.state().locks.set_read_only("a", false);
+        harness.run();
+        assert_eq!(harness.state().repos[0].card, Some(Card::ReadWrite));
+    }
+
+    /// The preview is its own window: it shows the groups with GO and
+    /// CANCEL, and CANCEL closes it without deleting anything.
+    #[test]
+    fn the_preview_window_offers_go_and_cancel() {
+        let mut view = ready_view();
+        view.preview_inline = false;
+        view.repos_loaded = true;
+        view.results = Some(Results::Similar(vec![vec![image_file(0), image_file(1)]]));
+        let mut harness = similar_harness(view);
+        assert!(harness.state().previewing(), "a result opens the preview");
+        assert!(harness.query_by_label_contains("GO — DELETE").is_some());
+        harness.get_by_label("CANCEL").click_accesskit();
+        harness.run();
+        assert!(!harness.state().previewing(), "CANCEL closes the preview");
+        assert!(harness.state().results.is_none(), "and forgets the result");
     }
 }

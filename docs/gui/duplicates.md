@@ -9,62 +9,61 @@ workflow on top.
 
 ## Getting here
 
-Click **DUPLICATES** in the [navigation bar](index.md#top-bar). The page shows, each
-section once the one before it has an answer:
+Click **DUPLICATES** in the [navigation bar](index.md#top-bar). The page holds, top to
+bottom: the pool of repositories, the two cards, **HOW**, and **PREVIEW**.
 
-1. **WHAT** — DUPLICATES or SIMILAR FILES (SIMILAR with its **similarity threshold**), and
-   **QUICK DELETE**.
-2. **WITH WHICH** — the repositories to search (see [Repositories](#repositories)).
-3. **HOW** — the shared FILTER wizard and the **FIND** button on one row.
+## Repositories: the pool and the two cards
 
-After a FIND the three sections fold into one summary line (mode, repositories, filter)
-so the groups get the screen; **CHANGE** unfolds them for the next search.
+Every repository starts in the pool. Drag it into one of two cards:
 
-## Repositories
+- **READ-ONLY — SAFE FROM CHANGES**: nothing in these repositories is deleted. Dropping a
+  repository here locks it.
+- **READ-WRITE — COPIES HERE GET DELETED**: duplicate copies here may be deleted; the best
+  copy of each group is kept. Dropping a repository here unlocks it.
 
-One chip per registered repository:
+Only repositories in a card are searched. In a card, a repository's **padlock** moves it to
+the other card, its **(x)** puts it back into the pool, and it can be dragged to the other
+card or the pool. A card always shows the repository's lock: unlock or lock a repository on
+another page and it sits in the matching card when you come back. The cards keep their
+contents while the app runs and start empty after a restart, when every repository is
+locked again. A repository added on the [repository page](repository-page.md) appears in
+the pool the next time you open this page.
 
-- Click the **name** to toggle whether that repo is included in the next FIND. Excluded
-  repos are skipped entirely.
-- Click the **padlock** to toggle read-only: a closed lock means files in that repo are
-  protected from deletion (never preselected, never marked, even by auto-resolve); an open
-  lock means they can be deleted like any other file.
-- A repository added on the [repository page](repository-page.md) appears here the next
-  time you open this page.
+## HOW: what counts as a duplicate
 
-## Mode, threshold, and FIND
-
-- **DUPLICATES** — exact, byte-for-byte matches (same size and BLAKE3 hash). Fast, no false
-  positives.
+- **EXACT** — byte-for-byte matches (same size and BLAKE3 hash). Fast, no false positives.
 - **SIMILAR** — perceptually similar images, videos and audio: re-saves, re-encodes, or
   crops that don't hash identically but look (or sound) alike. Reveals a **similarity
   threshold** slider (50–100%, `similarity % = (1 − hamming distance / bits) × 100`);
   lower catches more — and riskier — matches, 100% is bit-identical, and ≥99.5% is labeled
   "identical" since it's visually indistinguishable in practice. The threshold persists
   across launches.
-- **FIND** searches every included repo per the selected mode. It runs in the **activity
-  window**, which blocks the rest of the app while it works and shows what it is doing:
-  which index it is reading, then "grouping images", "grouping videos", "grouping
-  documents" and "comparing audio" with a percentage, the time elapsed and an estimate of
-  what is left, and any problem as it occurs. **CANCEL** stops it. When it finishes the
-  same window shows the result — how many repositories were searched and how many groups
-  were found — and closes on CLOSE or Escape. Nothing else that changes an index can start
-  while it runs.
+- The **FILTER** keeps only groups with at least one file that matches it.
 
-**QUICK DELETE** gives every group its own DELETE NOW button that deletes marked files
-immediately, no confirmation — turn it off to go back to confirming every batch. Each
-DELETE NOW is answered by a **notification card** in the top-right corner naming the file
-and the repository, and every file it removed is written to the **event log**, which the
-**LOG** button in that corner opens.
+## PREVIEW, GO and CANCEL
 
-Below the results: **SHOW ACCEPTED** lists the groups whose every copy is
-[accepted](#accepted-content) (hidden by default, with a count of how many are skipped),
-**AUTO-RESOLVE REST** marks every non-best copy for deletion (skipping read-only repos and
-accepted copies) so you only have to review the marks, and **APPLY MARKED (n)** deletes
-everything currently marked, batched per repo in one transaction, behind a confirmation.
-The delete and the search that follows run in the activity window as one operation whose
-report lists what was deleted, what could not be, and the fresh group count; every deleted
-file is in the event log by name.
+**PREVIEW** searches every repository in the cards. The search runs in the **activity
+window**, which shows which index it is reading and each grouping phase with a percentage,
+the time elapsed and an estimate of what is left; **CANCEL** stops it.
+
+The result opens in a **window of its own** that you can move to another monitor, resize
+or maximise. The main window is locked until the preview ends with **GO** or **CANCEL**.
+The preview opens already decided: in every group the best copy (starred **BEST**) is kept
+and every other copy in a read-write repository is marked for deletion; read-only and
+[accepted](#accepted-content) copies are never marked. You can still toggle a copy between
+KEEP and DELETE; to get a different result, CANCEL and change the cards or HOW.
+
+- **GO — DELETE n MARKED** deletes every marked file, batched per repository, after one
+  confirmation, then searches again. The progress and the report show in the preview
+  window; the report lists what was deleted, what could not be, and the fresh group count.
+- **CANCEL** closes the preview and deletes nothing.
+- **SHOW ACCEPTED** lists the groups whose every copy is accepted (hidden by default, with a
+  count of how many are skipped).
+- **QUICK DELETE** gives every group its own DELETE NOW button that deletes its marked files
+  immediately, without confirmation. Each DELETE NOW is answered by a **notification card**
+  naming the file and the repository.
+
+Every deleted file is written to the **event log**, which the **LOG** button opens.
 
 ## Accepted content
 

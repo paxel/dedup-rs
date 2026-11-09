@@ -1,10 +1,8 @@
-//! The eframe application: the start page (ADR 0004) — repo cards, one
-//! selection, one command list — wired to the core store and a background
-//! update worker. This module owns the start page and the repository-level
-//! commands; a command whose work has a body of its own opens it in place
-//! under the header strip, delegating to [`crate::dupes_view`],
-//! [`crate::transfer_view`], [`crate::grooming_view`] and
-//! [`crate::browse_view`].
+//! The eframe application (ADR 0006): the navigation bar, the repository
+//! page — repo cards, their selection and the repository commands — wired to
+//! the core store and a background update worker, and the process pages,
+//! delegating to [`crate::dupes_view`], [`crate::transfer_view`],
+//! [`crate::grooming_view`] and [`crate::browse_view`].
 
 use crate::activity::Notification;
 use crate::dupes_view::DupesView;
@@ -27,7 +25,7 @@ use std::sync::Arc;
 /// nothing they say can sit over SETTINGS, ABOUT, HELP, STATUS or LOG.
 pub(crate) const TOP_BAR_H: f32 = 56.0;
 
-/// How many of the newest event-log lines the start page shows.
+/// How many of the newest event-log lines the repository page shows.
 const LAST_RUNS: usize = 5;
 
 /// Repos scan one at a time (each scan already parallelizes across all CPU
@@ -260,7 +258,7 @@ pub struct DedupApp {
     store: Arc<Store>,
     screen: Screen,
     /// The screen shown last frame; when it changes we re-sync the newly-shown
-    /// view's repo list from the store (so a repo added on the start page
+    /// view's repo list from the store (so a repo added on the repository page
     /// appears immediately — no manual refresh button needed).
     synced: Option<Screen>,
     /// The repository page's selection, by name: what its commands act on.
@@ -1586,7 +1584,7 @@ impl eframe::App for DedupApp {
         }
         // On each screen change, re-sync the newly-shown view's repo list
         // from the store, so repos added/removed elsewhere appear without a
-        // refresh button. (The start page refreshes its own cards separately.)
+        // refresh button. (The repository page refreshes its own cards separately.)
         self.sync_shown_screen();
         egui::CentralPanel::default().show(ui, |ui| match self.screen {
             Screen::Repositories => self.repositories_view(ui, &mut actions),
@@ -1628,8 +1626,11 @@ impl eframe::App for DedupApp {
             self.add_modal(&ctx, &mut actions);
         }
         // The activity modal, the notification cards and the event-log viewer
-        // sit above every tab and every other modal.
-        crate::activity::lock(&self.activity).show(ui);
+        // sit above every tab and every other modal — in the DUPLICATES
+        // preview's window while that is open (ADR 0006).
+        if !(self.screen == Screen::Duplicates && self.dupes.previewing()) {
+            crate::activity::lock(&self.activity).show(ui);
+        }
         for action in actions {
             self.apply(&ctx, Some(frame), action);
         }
@@ -2673,7 +2674,7 @@ impl DedupApp {
 
         // A backup's own push mode lives on its card: it is a property of the
         // backup, not a command. Everything else a card used to offer is on
-        // the start page's command list (ADR 0004).
+        // the card's right-click menu (ADR 0006).
         let Some((group, sink_mode)) = self.sink_of(&row.name).map(|(n, g)| {
             let mode = g.sinks.iter().find(|s| s.repo == row.name).map(|s| s.mode);
             (n.clone(), mode)
@@ -4979,8 +4980,8 @@ mod ui_tests {
         dir.join(name)
     }
 
-    /// Doc screenshot: the start page with two scanned repos, one selected,
-    /// to `docs/screenshots/start_page.png`. Run with `--ignored`.
+    /// Doc screenshot: the repository page with two scanned repos, one
+    /// selected, to `docs/screenshots/repository_page.png`. Run with `--ignored`.
     #[test]
     #[ignore = "generates a doc screenshot (needs wgpu)"]
     fn doc_screenshot_repository_page() {

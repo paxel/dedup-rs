@@ -45,22 +45,24 @@ const DUPLICATES: &str = "\
 Find exact or perceptually similar duplicates across one or more repositories, review them \
 with real previews, and delete the worse copies.
 
-You arrive from the start page with the repositories already chosen and the mode set: WHAT \
-(DUPLICATES or SIMILAR FILES, with QUICK DELETE on the same row) sits folded — click its \
-header to flip it open — and HOW holds the FILTER and FIND. START on the header strip \
-returns to the start page with the selection kept; a locked repository's files are never \
-preselected or auto-resolved.
+Drag repositories from the pool into one of two cards. The READ-ONLY card is safe from \
+changes: a repository dropped there is locked and nothing in it is deleted. The READ-WRITE \
+card is where copies get deleted: a repository dropped there is unlocked. A repository's \
+padlock moves it to the other card, its (x) back to the pool; only repositories in a card \
+are searched.
 
-DUPLICATES mode finds exact, byte-for-byte matches (same size + hash). SIMILAR mode finds \
-perceptually similar images, videos and audio — lower threshold catches more, and riskier, \
-matches. FIND runs in the activity window, which shows each phase and its progress, offers \
-CANCEL, blocks the rest of the app meanwhile, and ends as the result report.
+HOW sets what counts as a duplicate: EXACT finds byte-for-byte matches (same size + hash), \
+SIMILAR finds perceptually similar images, videos and audio — a lower threshold catches \
+more, and riskier, matches. The FILTER keeps only groups with a matching file. PREVIEW \
+searches in the activity window and opens the result in its own window; the page is locked \
+until that window ends with GO or CANCEL.
 
-Results are shown a page of groups at a time. Each file can be toggled KEEP / DELETE; the \
-best copy is starred. AUTO-RESOLVE REST marks every non-best copy at once. APPLY MARKED \
-runs the delete and the search that follows in the activity window, behind a confirmation \
-— or turn on QUICK DELETE to skip confirmation per group; each DELETE NOW is answered by a \
-notification card, and every deleted file is written to the event log (LOG, top right).
+The preview shows a page of groups at a time, already decided: the best copy (starred) is \
+kept, and every other copy in a read-write repository is marked. You can still toggle a \
+file between KEEP and DELETE. GO deletes every marked file, behind one confirmation, and \
+then searches again; the progress and the report show in the preview window. CANCEL closes \
+it and deletes nothing. QUICK DELETE gives each group a DELETE NOW button instead; every \
+deleted file is written to the event log (LOG, top right).
 
 Click a thumbnail to open the lightbox. It opens on Overview — both files' facts, repos and \
 mark pills side by side — and its tabs offer whatever the two files can show: Image, Video \
@@ -72,11 +74,10 @@ const TRANSFER: &str = "\
 Copy, move, or sync files between two repositories by content (size + hash — paths never \
 matter), with an assisted filter and a preview before anything runs.
 
-You arrive from the start page with the repositories and their roles already chosen: WHAT \
-(the command) sits folded — click its header to switch — then HOW (destination, options, \
-filter), then PREVIEW and APPLY ALL. After PREVIEW or APPLY ALL the sections fold to their \
-header bars; click one to flip it open again. START on the header strip returns to the start \
-page with the selection kept.
+SYNC opens this view on GROUP SYNC, COPY on COPY. Pick the command in WHAT, the \
+repositories and their roles, then HOW (destination, options, filter), then PREVIEW and \
+APPLY ALL. After PREVIEW or APPLY ALL the sections fold to their header bars; click one to \
+flip it open again.
 
 Pick a SOURCE and a TARGET repo, optionally add DUPEPOOL repositories — a source file only \
 counts as new when none of the target or the extra references already has its content.
@@ -87,7 +88,7 @@ the same relative path, and can also delete target files whose content the sourc
 (DELETE MISSING).
 
 GROUP SYNC replaces the single TARGET with a SINKS picker, and only appears when the SOURCE \
-is a backup group's main (groups are created on the start page). Each sink pushes in \
+is a backup group's main (groups are built on the repository page). Each sink pushes in \
 its own stored mode: ADD ONLY copies content it lacks and never deletes, so a sink may keep \
 files the main no longer has; APPLY CHANGES also deletes sink content the main itself \
 deleted, so the sink follows the main's edits while keeping what the main never had; MIRROR \
@@ -117,11 +118,10 @@ result report. A row's COPY, DELETE, RENAME, OVERWRITE or APPLY answers with a n
 card, and every file changed is in the event log behind the LOG button.";
 
 const GROOMING: &str = "\
-Prune and reorganize a single repository. You arrive from the start page with the \
-repository (and DEDUPE's source and pool) already chosen: WHAT (the tool) sits folded — click \
-its header to switch — then HOW (the filter or the rules), then PREVIEW and APPLY ALL. After \
-PREVIEW or APPLY ALL the sections fold to their header bars; click one to flip it open again. \
-START on the header strip returns to the start page with the selection kept.
+Prune and reorganize a single repository. DELETE opens this view on DEDUPE: pick the tool \
+in WHAT, the repository (or DEDUPE's source and pool), then HOW (the filter or the rules), \
+then PREVIEW and APPLY ALL. After PREVIEW or APPLY ALL the sections fold to their header \
+bars; click one to flip it open again.
 
 DEDUPE deletes files in a source repo whose content also exists in any selected dupe-pool \
 repo. PURGE deletes everything matching a filter — it requires at least one filter \
@@ -159,9 +159,9 @@ APPLY answers with a notification card, and every file changed is in the event l
 the LOG button.";
 
 const BROWSE: &str = "\
-Browse the repository chosen on the start page folder by folder — subfolders on the left, \
-files on the board in the middle, the preview dock below. START on the header strip returns \
-to the start page.
+Browse a repository folder by folder — subfolders on the left, files on the board in the \
+middle, the preview dock below. SHOW IN BROWSE on a duplicate opens it at that file; the \
+navigation bar leads back.
 
 Select a file to preview it in the dock below: images and videos get a thumbnail, audio a \
 waveform or spectrogram (switchable) beside its ID3 tags, text a scrollable view, and \

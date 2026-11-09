@@ -751,7 +751,7 @@ impl Activity {
         self.log.read()
     }
 
-    /// The newest `n` event-log lines — the start page's recent changes.
+    /// The newest `n` event-log lines — the repository page's recent changes.
     pub fn recent(&self, n: usize) -> Vec<LogEntry> {
         self.log.read().into_iter().take(n).collect()
     }

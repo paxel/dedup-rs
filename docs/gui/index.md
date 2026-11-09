@@ -119,7 +119,7 @@ unlocking for deletion should be a fresh, conscious choice each session.
 
 Long work runs one at a time in a central window that blocks the rest of the app while it
 runs: a repository UPDATE or DELETE EMPTY DIRS (every repository on its own row) and the look
-each takes first, a Duplicates FIND or APPLY MARKED, a Transfer or Grooming PREVIEW and APPLY
+each takes first, a Duplicates PREVIEW or GO, a Transfer or Grooming PREVIEW and APPLY
 ALL, a GROUP SYNC or a bulk board action. The window names the operation and its repositories,
 the current phase ("reading 'photos'", "comparing audio", "copying 2020/a.jpg"), how far it
 is with a percentage where the total is known, elapsed time and an estimate of what is left,
