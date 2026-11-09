@@ -16,7 +16,7 @@ use crate::run_result::{ResultModal, RunReport};
 use crate::theme;
 use crate::util::ExplainExt;
 use crossbeam_channel::{Receiver, Sender};
-use dedup_core::diff::{DiffAction, DiffEvent, DiffProgress, PlanPhase, PlanProgress};
+use dedup_core::diff::{DiffAction, DiffEvent, DiffProgress};
 use dedup_core::update::{CancellationToken, Progress, ProgressEvent};
 use egui::{Id, RichText};
 use std::collections::VecDeque;
@@ -374,15 +374,6 @@ fn phase_line(phase: &str, max_chars: usize) -> String {
             format!("{verb} {}", crate::board::elide_left(rest, budget))
         }
         _ => crate::board::elide_left(phase, max_chars),
-    }
-}
-
-/// Map a plan's phase onto the activity modal.
-pub fn plan_phase(progress: &ActivityProgress, p: PlanProgress) {
-    match p.phase {
-        PlanPhase::Reading { repo } => progress.phase(format!("reading '{repo}'"), 0, None),
-        PlanPhase::Pairing => progress.phase("pairing files", p.done, p.total),
-        PlanPhase::Grouping => progress.phase("grouping duplicates", p.done, p.total),
     }
 }
 

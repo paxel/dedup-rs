@@ -11,11 +11,10 @@
 
 use crate::theme;
 use crate::thumbs::ThumbCache;
-use dedup_core::store::{ExifInfo, FileEntry, Store};
+use dedup_core::store::{ExifInfo, FileEntry};
 use dedup_core::thumbnail::hash_hex;
 use egui::{Response, RichText};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 /// Evenly spaced stills sampled per video: the lightbox filmstrip's cells, and
 /// the grid the card/row preview samples from (frame `VIDEO_STRIP / 2`), so the
@@ -168,56 +167,25 @@ impl FileFacts {
     }
 }
 
-/// Open a repo's index and resolve its base path once, so a preview builder can
-/// look up many rows' facts without reopening per row. Either half is `None`
-/// when the repo is unavailable (e.g. a folder-export target that is not a repo).
-pub fn open_facts(store: &Store, repo: &str) -> (Option<Arc<redb::Database>>, Option<String>) {
-    (
-        store.open_repo_db(repo).ok(),
-        store.get_repo(repo).map(|m| m.abs_path).ok(),
-    )
-}
-
-/// Look up the display facts for `rel` in an already-opened repo `db` rooted at
-/// `base` (both `None` when the repo could not be opened). `None` when the entry
-/// is absent or unreadable — a preview row on the side where the file exists
-/// populates this; the other side passes `None`.
-pub fn facts_for(db: Option<&redb::Database>, base: Option<&str>, rel: &str) -> Option<FileFacts> {
-    let (db, base) = (db?, base?);
-    let entry = dedup_core::store::get_entry(db, rel).ok().flatten()?;
-    Some(FileFacts::from_entry(
-        &entry,
-        std::path::Path::new(base).join(rel),
-    ))
-}
-
 /// A status veil painted over a cell's preview: a translucent wash in the
 /// status colour with the state in big bold letters — deletion, absence and
 /// resurrection read at a glance without hiding *what* file they concern.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CellOverlay {
-    /// A plan will delete this file.
-    WillDelete,
     /// The file is gone from disk (its index entry is a tombstone).
     Missing,
-    /// Content only on this side / about to be added.
-    New,
 }
 
 impl CellOverlay {
     fn label(self) -> &'static str {
         match self {
-            Self::WillDelete => "WILL DELETE",
             Self::Missing => "MISSING",
-            Self::New => "NEW",
         }
     }
 
     fn color(self) -> egui::Color32 {
         match self {
-            Self::WillDelete => theme::red(),
             Self::Missing => theme::amber(),
-            Self::New => theme::green(),
         }
     }
 }

@@ -18,12 +18,11 @@ for a HiDPI display or a projector.
 | **[DUPLICATES](duplicates.md)**        | Find exact or perceptually similar duplicates across repos and delete the worse copies.                                              |
 | **[SYNC](sync.md)**                    | Push backup groups from their mains to their backups, after a preview of what each backup gains and loses.                         |
 | **[COPY](copy.md)**                    | Copy into one repository what it and the reference repositories lack, from several sources, never overwriting.                   |
-| **[DELETE](grooming.md)**              | The Grooming view, opened on DEDUPE: dedupe against others, purge by filter, clear empty dirs, reorganize, prune.                    |
+| **[DELETE](delete.md)**                | Delete from several repositories what the reference repositories already hold.                                                     |
 | **[Browse](browse.md)**                | Walk one repo's indexed files as a folder tree, preview them, and annotate with tags. Opened by SHOW IN BROWSE on a duplicate.       |
 
-DELETE shows the existing Grooming view until its own page is
-built; each still chooses its repositories in its own sections. Browse has no entry in the
-navigation bar.
+Browse has no entry in the navigation bar. Purge by filter, organize, prune, DIFF, MOVE,
+MIRROR and GROUP SYNC BACK are not in the app any more; the [CLI](../cli.md) still has them.
 
 ## Top bar
 
@@ -119,8 +118,7 @@ unlocking for deletion should be a fresh, conscious choice each session.
 
 Long work runs one at a time in a central window that blocks the rest of the app while it
 runs: a repository UPDATE or DELETE EMPTY DIRS (every repository on its own row) and the look
-each takes first, a Duplicates PREVIEW or GO, a Transfer or Grooming PREVIEW and APPLY
-ALL, a GROUP SYNC or a bulk board action. The window names the operation and its repositories,
+each takes first, a DUPLICATES, SYNC, COPY or DELETE PREVIEW or GO, or a bulk board action. The window names the operation and its repositories,
 the current phase ("reading 'photos'", "comparing audio", "copying 2020/a.jpg"), how far it
 is with a percentage where the total is known, elapsed time and an estimate of what is left,
 and each problem as it occurs. **CANCEL** is its only control and stops the whole batch;
@@ -160,41 +158,6 @@ apply a saved preset (click its pill), or forget one (**×**). **EXPORT**/**IMPO
 whole remembered-value + preset history to/from a JSON file, for backup or sharing between
 machines.
 
-## The review board
-
-Every preview and reconcile view renders on one shared board, so it reads the same wherever it
-appears.
-
-![The review board: previews, status veils and the command column](../screenshots/board.png)
-
-- **Three regions.** A mini-overview of the left-hand file, a centre column of commands, and —
-  when there is one — the right-hand file. The left and right stay pinned to the window edges.
-- **A command sits on the side it changes.** The command column is split down a midline into
-  two half-columns, faintly tinted in each side's colour: everything in the left half changes
-  the left file, everything in the right half the right file — `DELETE` in the left half
-  deletes the left file, no suffix needed. A command never crosses the midline, and an empty
-  half means exactly that: nothing happens to that side. Copies and overwrites sit on the side
-  they *fill* (`< COPY` in the left half pulls the right file across), with the arrow naming
-  where the file flows from. A command and its mirror share a line, and commands that act on
-  the row as a whole — `COMPARE`, `APPLY`, `HIDE` — are centred below. Only the commands that
-  apply to a row are drawn, and a row is as tall as its content needs.
-- **A cell only ever talks about itself.** If a side has a file, its cell shows that file's
-  preview — always — veiled only with the side's *own* state: red **WILL DELETE** on a file a
-  plan removes, amber **MISSING** when it is gone from disk. The side a file will *arrive* at
-  shows the incoming file's preview under green **NEW**; a side that once held exactly this
-  content and deleted it shows a blue **WAS DELETED** tombstone cell (no file, no preview) —
-  copying across would resurrect that deletion. Conflicts show the occupying file itself.
-  Rows where neither side has a living file don't appear at all.
-- **Path colour says what will happen.** Grey means unchanged or equal on both sides, green
-  exists only on this side (or will be added), red will be deleted, amber differs — the same
-  path with different content, or the same content under a different name.
-- **HIDE** removes a row from the board, and on a preview also from what RUN will do. It is
-  one-way: press PREVIEW again to start over.
-- **Sorting** is the bar above the board — which side to read, then the key (path, size, date
-  or status), then the direction. Large previews scroll rather than paging.
-
-![A PURGE preview on the review board](../screenshots/groom_purge_board.png)
-
 ## Document formats read as text
 
 The tool understands these formats as *text documents* — it extracts their words, which is what
@@ -231,6 +194,6 @@ CLI-only today — there is no page for them yet.
   Strings / Hex).
 - [Sync](sync.md) — push backup groups from their mains to their backups.
 - [Copy](copy.md) — copy what a repository lacks into it, from several sources.
-- [Grooming](grooming.md) — dedupe, purge, empty dirs, organize, prune.
+- [Delete](delete.md) — delete what reference repositories already hold.
 - [Browse](browse.md) — a keyboard-driven folder-tree browser with tagging.
 - [CLI reference](../cli.md) — every command the GUI's operations are also available from.

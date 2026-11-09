@@ -28,7 +28,7 @@ their contents while the app runs and are empty after a restart.
 
 - **SUBFOLDER** — a folder inside the target the copies land under; empty means the
   target's root.
-- **TEMPLATE** — a path template, as [ORGANIZE](grooming.md) uses: `{year}/{month}/{o-name}`
+- **TEMPLATE** — a path template, as the CLI's `organize` uses: `{year}/{month}/{o-name}`
   sorts the copies by date. Empty keeps each file's path from its source.
 - The [filter builder](index.md#filter-builder) limits which files take part.
 

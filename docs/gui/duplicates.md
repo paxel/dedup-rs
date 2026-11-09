@@ -76,7 +76,7 @@ content tells the app it may repeat inside that repository:
   **content** (size + hash), never the path — the 250 covers of one podcast are settled by one
   click, and next month's episode folder is accepted already.
 - An accepted copy is protected exactly like one in a read-only repo: never preselected,
-  never marked by AUTO-RESOLVE or MARK ALL, kept by every delete (Grooming DEDUPE and the CLI
+  never marked by AUTO-RESOLVE or MARK ALL, kept by every delete (the DELETE page and the CLI
   included), and badged **accepted** on its card. Right-click the badge to **UNLOCK** just
   that file for deletion (reset on the next FIND) or to **UN-ACCEPT** the content.
 - Acceptance is **per repository**: the same cover in a backup repo is still an ordinary
@@ -121,7 +121,7 @@ size, reclaimable bytes) and one card per file:
 
 Click any card — the thumbnail, or the typed placeholder a document or archive shows instead
 of a picture — to open the full-window viewer. It is the **same viewer every surface opens**:
-Browse, the review boards and Transfer's DIFF all land on this one screen, so it behaves
+Duplicates and Browse both land on this one screen, so it behaves
 identically wherever you came from. It opens on the clicked file alone, on the file's own
 representation: a photo on Image, a track on Audio, a document on Text.
 

@@ -11,7 +11,7 @@ pub fn help_text(screen: Screen) -> &'static str {
         Screen::Duplicates => DUPLICATES,
         Screen::Sync => SYNC,
         Screen::Copy => COPY,
-        Screen::Delete => GROOMING,
+        Screen::Delete => DELETE,
         Screen::Browse => BROWSE,
     }
 }
@@ -98,46 +98,19 @@ PREVIEW lists every copy in its own window; a name already taken gets a numeric 
 is marked — nothing is ever overwritten. The page stays locked until GO or CANCEL. GO \
 copies, shows the progress and the report in that window, and then plans again.";
 
-const GROOMING: &str = "\
-Prune and reorganize a single repository. DELETE opens this view on DEDUPE: pick the tool \
-in WHAT, the repository (or DEDUPE's source and pool), then HOW (the filter or the rules), \
-then PREVIEW and APPLY ALL. After PREVIEW or APPLY ALL the sections fold to their header \
-bars; click one to flip it open again.
+const DELETE: &str = "\
+Delete from several repositories every file a reference repository already holds. Drag the \
+repositories to clean into DELETE FROM (they are unlocked) and the references into ALREADY \
+KNOWN IN (they are locked, nothing in them changes). Content only the repositories in DELETE \
+FROM share stays — that is DUPLICATES' job — and accepted content is never deleted.
 
-DEDUPE deletes files in a source repo whose content also exists in any selected dupe-pool \
-repo. PURGE deletes everything matching a filter — it requires at least one filter \
-condition, so an empty filter can never purge a whole repo. EMPTY DIRS removes empty \
-directories under the repo's root. PRUNE drops records of files already deleted from disk \
-and compacts the index.
+DELETE MISSING decides about a file a reference once held and has deleted since: TRUE \
+deletes it here too, FALSE keeps it. A reference updated before a repository you delete \
+from is flagged: UPDATE it first. The FILTER limits which files take part.
 
-ORGANIZE moves a repo's files into new paths built from an ordered list of rules. Each \
-rule is a filter plus a path template: rules are tried top to bottom, and the first rule \
-whose filter matches a file decides that file's new path — so order them from most \
-specific to most general. Files matching no rule stay where they are, and nothing is ever \
-overwritten: a name collision gets renamed instead.
-
-A path template is the file's new location inside the repository, written as literal text \
-mixed with {tokens} that are filled in per file. The tokens: {o-path} original folder, \
-{o-name} original file name, {o-stem} name without extension, {o-ext} extension, {year} / \
-{month} / {day} the file's best-known date (photo capture time when available, otherwise \
-the file date), {mimetop} the media kind (image, video, audio, …), {camera} the camera \
-model, {origin} the repository a file was transferred from, {size} a coarse size bucket \
-(tiny … huge). Click a token chip under the template field to insert it at the cursor.
-
-Inside braces, | tries alternatives left to right until one has a value, and \"quoted\" \
-text is a fixed default. Example: {year}/{month}/{o-stem}-{camera|\"nocam\"}.{o-ext} sorts \
-photos into year/month folders and tags each name with its camera — or with \"nocam\" \
-when the photo doesn't record one. Templates can only place files inside the repository, \
-never outside it.
-
-Save the current rule list as a preset with STORE PRESET, to reuse on any repo; right-click a \
-preset to rename it.
-
-Every command previews before it applies. PREVIEW plans in \
-the activity window and fills the board; APPLY ALL performs the plan in the activity window — \
-each file as it goes, every problem, and CANCEL — and ends on the result report. A row's \
-APPLY answers with a notification card, and every file changed is in the event log behind \
-the LOG button.";
+PREVIEW lists every file that would go in its own window; the page stays locked until GO \
+or CANCEL. GO deletes, shows the progress and the report in that window, and then plans \
+again.";
 
 const BROWSE: &str = "\
 Browse a repository folder by folder — subfolders on the left, files on the board in the \

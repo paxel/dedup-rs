@@ -57,7 +57,7 @@ in the normal folder view, not in a flattened listing.
 From here you can:
 
 - **add a tag** — type a label and **Add**; tags are free-form and stored in the index, so
-  they survive rescans and drive the filter and the Duplicates/Grooming triage. Every tag
+  they survive rescans and drive the filter and the Duplicates triage. Every tag
   change answers with a notification card; it changes the index, not the file, so it writes
   no event-log line. Writing ID3 tags into an audio file (**EDIT TAGS**) and saving a turned
   image over its original in the viewer do change the file: both card and log the change

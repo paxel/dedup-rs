@@ -2,11 +2,10 @@
 //! page — repo cards, their selection and the repository commands — wired to
 //! the core store and a background update worker, and the process pages,
 //! delegating to [`crate::dupes_view`], [`crate::sync_page`], [`crate::copy_page`],
-//! [`crate::grooming_view`] and [`crate::browse_view`].
+//! [`crate::delete_page`] and [`crate::browse_view`].
 
 use crate::activity::Notification;
 use crate::dupes_view::DupesView;
-use crate::grooming_view::GroomingView;
 use crate::icon;
 use crate::settings::{ThemeChoice, TooltipVerbosity};
 use crate::status::{self, Location};
@@ -316,7 +315,7 @@ pub struct DedupApp {
     dupes: DupesView,
     sync: crate::sync_page::SyncPage,
     copy: crate::copy_page::CopyPage,
-    grooming: GroomingView,
+    delete: crate::delete_page::DeletePage,
     /// Sync groups as of the last reload: the Repositories list frames each
     /// group — its main and that main's sinks — in one LCARS section.
     groups: Vec<(String, dedup_core::store::SyncGroup)>,
@@ -372,7 +371,7 @@ impl DedupApp {
             dupes: DupesView::new_with_locks(locks.clone(), activity.clone()),
             sync: crate::sync_page::SyncPage::new(locks.clone(), activity.clone()),
             copy: crate::copy_page::CopyPage::new(locks.clone(), activity.clone()),
-            grooming: GroomingView::new_with_locks(locks.clone(), activity.clone()),
+            delete: crate::delete_page::DeletePage::new(locks.clone(), activity.clone()),
             groups: Vec::new(),
             browse: crate::browse_view::BrowseView::new_with_locks(locks, activity),
             saved_settings: crate::settings::Settings::default(),
@@ -446,31 +445,14 @@ impl DedupApp {
             Screen::Duplicates => self.dupes.sync_repos(&self.store),
             Screen::Sync => self.sync.sync_repos(&self.store),
             Screen::Copy => self.copy.sync_repos(&self.store),
-            Screen::Delete => self.grooming.sync_repos(&self.store),
+            Screen::Delete => self.delete.sync_repos(&self.store),
             Screen::Browse => self.browse.sync_repos(&self.store),
         }
         self.synced = Some(self.screen);
     }
 
-    /// Switch to `screen` from the navigation bar. The stand-in views for
-    /// COPY and DELETE are older views, so entering one of them sets that
-    /// view's command; staying on a page keeps its state.
+    /// Switch to `screen` from the navigation bar; each page keeps its state.
     fn go_to(&mut self, screen: Screen) {
-        if self.screen == screen {
-            return;
-        }
-        match screen {
-            Screen::Delete => {
-                self.grooming
-                    .choose(&self.store, crate::grooming_view::Command::Dedupe);
-                self.synced = Some(screen);
-            }
-            Screen::Repositories
-            | Screen::Duplicates
-            | Screen::Sync
-            | Screen::Copy
-            | Screen::Browse => {}
-        }
         self.screen = screen;
     }
 
@@ -1584,7 +1566,7 @@ impl eframe::App for DedupApp {
             Screen::Duplicates => self.dupes.show(ui, &self.store, self.tooltip_verbosity),
             Screen::Sync => self.sync.show(ui, &self.store, self.tooltip_verbosity),
             Screen::Copy => self.copy.show(ui, &self.store, self.tooltip_verbosity),
-            Screen::Delete => self.grooming.show(ui, &self.store, self.tooltip_verbosity),
+            Screen::Delete => self.delete.show(ui, &self.store, self.tooltip_verbosity),
             Screen::Browse => self.browse.show(ui, &self.store, self.tooltip_verbosity),
         });
         // A file's SHOW IN BROWSE pick in a body lands here: open Browse with
@@ -1623,6 +1605,7 @@ impl eframe::App for DedupApp {
             Screen::Duplicates => self.dupes.previewing(),
             Screen::Sync => self.sync.previewing(),
             Screen::Copy => self.copy.previewing(),
+            Screen::Delete => self.delete.previewing(),
             _ => false,
         };
         if !previewing {
@@ -4234,8 +4217,7 @@ mod ui_tests {
         assert!(both(&harness), "a click on the bar folds nothing away");
     }
 
-    /// The bar's entries open their pages; DELETE opens the older view that
-    /// stands in for it, on the matching command.
+    /// The bar's entries open their pages.
     #[test]
     fn the_navigation_bar_opens_each_page() {
         let (_tmp, mut app) = sample_app();
@@ -4249,10 +4231,7 @@ mod ui_tests {
         app.go_to(Screen::Copy);
         assert_eq!(app.screen, Screen::Copy);
         app.go_to(Screen::Delete);
-        assert_eq!(
-            app.grooming.command(),
-            crate::grooming_view::Command::Dedupe
-        );
+        assert_eq!(app.screen, Screen::Delete);
         app.go_to(Screen::Duplicates);
         assert_eq!(app.screen, Screen::Duplicates);
         app.go_to(Screen::Repositories);

@@ -54,11 +54,6 @@ const ROW_PAD: f32 = 8.0;
 /// simply clips at the window edge.
 const SIDE_MIN: f32 = THUMB + 90.0;
 
-/// Safety cap on how many rows a preview materialises in memory. The summary
-/// counts stay the true totals regardless; past the cap the board tells the
-/// user to refine the filter.
-pub const PREVIEW_CAP: usize = 10_000;
-
 /// What one side of a row says about its file, and therefore what colour its
 /// path is drawn in. One vocabulary spans both meanings the board serves:
 /// prescriptive on a planned preview ("RUN will delete this") and descriptive
@@ -115,13 +110,10 @@ impl Status {
 /// What a command does. Declaration order is the display order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
 enum Kind {
-    Apply,
     Hide,
 }
 
-/// One line of the centre grid: one or two row-level commands side by side —
-/// `APPLY` and `HIDE` share a line, so a planned-preview row stays one line
-/// tall.
+/// One line of the centre grid: one or two row-level commands side by side.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Line {
     Centre(Cmd, Option<Cmd>),
@@ -141,8 +133,6 @@ fn layout(cmds: &[Cmd]) -> Vec<Line> {
 /// A command offered on a row.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cmd {
-    /// Planned surfaces: execute just this row now.
-    Apply,
     /// Every surface: drop the row from the board. On a planned surface the
     /// row is also excluded from RUN.
     Hide,
@@ -159,7 +149,6 @@ pub enum Cmd {
 impl Cmd {
     pub fn label(self) -> &'static str {
         match self {
-            Cmd::Apply => "APPLY",
             Cmd::Hide => "HIDE",
             Cmd::OpenRow => "OPEN",
             Cmd::Select { .. } => "SELECT",
@@ -168,7 +157,6 @@ impl Cmd {
 
     fn color(self) -> egui::Color32 {
         match self {
-            Cmd::Apply => theme::green(),
             Cmd::Hide => theme::grey(),
             Cmd::OpenRow | Cmd::Select { .. } => theme::lilac(),
         }
@@ -178,10 +166,9 @@ impl Cmd {
     /// line.
     fn kind(self) -> Kind {
         match self {
-            Cmd::Apply => Kind::Apply,
             Cmd::Hide => Kind::Hide,
             // Never laid out with the others — it is not a button.
-            Cmd::OpenRow | Cmd::Select { .. } => Kind::Apply,
+            Cmd::OpenRow | Cmd::Select { .. } => Kind::Hide,
         }
     }
 
@@ -191,7 +178,6 @@ impl Cmd {
     /// excludes it from RUN, from a listing, which has no RUN to skip.
     fn hint(self, hide_skips_run: bool) -> &'static str {
         match self {
-            Cmd::Apply => "Apply only this action, immediately",
             Cmd::Hide if hide_skips_run => "Remove this row — RUN will skip it",
             Cmd::Hide => "Remove this row from the board",
             Cmd::OpenRow => "Open this row in the viewer",
@@ -1775,7 +1761,7 @@ mod tests {
     /// `cmds` distinct commands. They must differ in kind: the grid pairs by
     /// kind, so N copies of one command would collapse to a single line.
     fn some_cmds(n: usize) -> Vec<Cmd> {
-        const POOL: [Cmd; 2] = [Cmd::Apply, Cmd::Hide];
+        const POOL: [Cmd; 1] = [Cmd::Hide];
         POOL.into_iter().take(n).collect()
     }
 
@@ -1995,37 +1981,6 @@ mod tests {
         assert!(narrow >= SIDE_MIN, "the sides stop at their floor");
     }
 
-    /// `C` is one constant for the whole board, so a command never moves
-    /// horizontally between rows.
-    #[test]
-    fn centre_width_is_constant_across_rows() {
-        let mut paired = meta("a", 0, 1);
-        paired.cmds = vec![Cmd::Apply, Cmd::Hide];
-        let metas = vec![paired, meta("b", 2, 1), meta("c", 1, 1)];
-        let c = centre_width(&metas);
-        assert!(
-            (c - (CMD_W * 2.0 + 8.0)).abs() < 0.01,
-            "two columns when paired"
-        );
-        // A planned board pairs APPLY with HIDE on one line, so it is two
-        // columns wide too — the row stays one line tall rather than two.
-        let mut planned = meta("a", 0, 1);
-        planned.cmds = vec![Cmd::Apply, Cmd::Hide];
-        assert!((centre_width(&[planned.clone()]) - c).abs() < 0.01);
-        assert_eq!(
-            layout(&planned.cmds),
-            vec![Line::Centre(Cmd::Apply, Some(Cmd::Hide))],
-            "APPLY and HIDE share one line"
-        );
-        // Only a board whose rows offer a single command can be narrower.
-        let mut lone = meta("a", 0, 1);
-        lone.cmds = vec![Cmd::Hide];
-        assert!(
-            centre_width(&[lone]) < c,
-            "one command per row needs only one column"
-        );
-    }
-
     /// Render a two-sided board at `width` and hand back the harness.
     fn render(width: f32, metas: Vec<RowMeta>) -> egui_kittest::Harness<'static, BoardState> {
         let mut init = false;
@@ -2083,7 +2038,7 @@ mod tests {
             left_modified: 0,
             right_modified: 0,
             unchanged: false,
-            cmds: vec![Cmd::Apply, Cmd::Hide],
+            cmds: vec![Cmd::Hide],
             left_tags: Vec::new(),
         }
     }
@@ -2098,7 +2053,7 @@ mod tests {
         for width in [900.0_f32, 1280.0, 1920.0] {
             let metas = vec![diff_row("one"), diff_row("two")];
             let harness = render(width, metas);
-            for label in ["APPLY", "HIDE"] {
+            for label in ["HIDE"] {
                 let mut found = false;
                 for node in harness.query_all_by_label(label) {
                     found = true;
@@ -2116,34 +2071,6 @@ mod tests {
         }
     }
 
-    /// **A lone row-level command must stay inside the centre region.** GROUP
-    /// SYNC BACK's promote/resurrect rows carry a single `APPLY`, drawn centred.
-    /// It used to be translated half a column (as if two columns existed), which
-    /// on a one-column centre pushed it into the right cell — the overlap the bug
-    /// report showed, APPLY landing on the target thumbnail. With no thumbnail on
-    /// the right (unresolved facts) the right path label's left edge *is* the
-    /// right cell's left edge, so APPLY's right edge must not cross it.
-    #[test]
-    fn a_lone_row_command_does_not_overlap_the_right_cell() {
-        use egui_kittest::kittest::Queryable;
-        for width in [900.0_f32, 1280.0, 1920.0] {
-            let mut row = diff_row("promote");
-            row.left_paths = vec!["source/promote.jpg".to_string()];
-            row.right_paths = vec!["target/ZZZTARGET.jpg".to_string()];
-            row.cmds = vec![Cmd::Apply];
-            let harness = render(width, vec![row]);
-            let apply = harness.get_by_label("APPLY").rect();
-            let right = harness.get_by_label_contains("ZZZTARGET").rect();
-            assert!(
-                apply.right() <= right.left() + 0.5,
-                "at {width}px APPLY (right {:.1}) overlaps the right cell \
-                 (starts {:.1})",
-                apply.right(),
-                right.left(),
-            );
-        }
-    }
-
     /// **Nothing may cross the window's right edge**, at any width. The row
     /// regions are placed at computed offsets, so an unaccounted `item_spacing`
     /// between them pushes the right-hand side out of the window — invisibly,
@@ -2155,7 +2082,7 @@ mod tests {
         // board is *meant* to overrun and be clipped — see the next test.
         for width in [700.0_f32, 1280.0, 1920.0] {
             let harness = render(width, vec![diff_row("one")]);
-            for label in ["a/b/one.jpg", "APPLY", "HIDE"] {
+            for label in ["a/b/one.jpg", "HIDE"] {
                 for node in harness.query_all_by_label(label) {
                     let r = node.rect();
                     assert!(
@@ -2179,16 +2106,14 @@ mod tests {
         let narrow = w_min - 120.0;
         let wide = render(1280.0, vec![diff_row("one")]);
         let tight = render(narrow, vec![diff_row("one")]);
-        for label in ["APPLY", "HIDE"] {
-            let a = wide.get_by_label(label).rect();
-            let b = tight.get_by_label(label).rect();
-            assert!(
-                (a.width() - b.width()).abs() < 0.5,
-                "{label} was squeezed at {narrow:.0}px: {:.1} vs {:.1}",
-                b.width(),
-                a.width()
-            );
-        }
+        let a = wide.get_by_label("HIDE").rect();
+        let b = tight.get_by_label("HIDE").rect();
+        assert!(
+            (a.width() - b.width()).abs() < 0.5,
+            "HIDE was squeezed at {narrow:.0}px: {:.1} vs {:.1}",
+            b.width(),
+            a.width()
+        );
         // And the side never shrinks past its floor.
         let (side, _) = regions(narrow, CMD_W * 2.0 + 8.0, true);
         assert_eq!(side, SIDE_MIN);
@@ -2314,7 +2239,7 @@ mod tests {
     fn the_three_regions_do_not_overlap() {
         use egui_kittest::kittest::Queryable;
         let harness = render(1280.0, vec![diff_row("one")]);
-        let cmd = harness.get_by_label("APPLY").rect();
+        let cmd = harness.get_by_label("HIDE").rect();
         let paths: Vec<_> = harness
             .query_all_by_label("a/b/one.jpg")
             .map(|n| n.rect())
@@ -2353,7 +2278,7 @@ mod tests {
         };
         let full = left_edge(vec![diff_row("one")]);
         let mut trimmed = diff_row("one");
-        trimmed.cmds = vec![Cmd::Apply, Cmd::Hide];
+        trimmed.cmds = vec![Cmd::Hide];
         let fewer = left_edge(vec![trimmed]);
         assert!(
             (full - fewer).abs() < 0.5,
@@ -2471,12 +2396,12 @@ mod tests {
             "copy_of_photo.jpg".into(),
         ];
         multi.right_paths = vec!["IMG_0042.jpg".into()];
-        multi.cmds = vec![Cmd::Apply, Cmd::Hide];
+        multi.cmds = vec![Cmd::Hide];
         let mut simple = diff_row("notes");
         simple.left_status = Status::OnlyHere;
         simple.right_status = Status::Absent;
         simple.right_paths = Vec::new();
-        simple.cmds = vec![Cmd::Apply, Cmd::Hide];
+        simple.cmds = vec![Cmd::Hide];
         // A rename pair, so the screenshot shows the differing characters picked
         // out (`_v2` here) rather than two identical names.
         let mut renamed = diff_row("holiday");
@@ -2558,12 +2483,12 @@ mod tests {
             let mut multi = diff_row("photo");
             multi.left_paths = vec!["photo.jpg".into(), "photo (1).jpg".into()];
             multi.right_paths = vec!["IMG_0042.jpg".into()];
-            multi.cmds = vec![Cmd::Apply, Cmd::Hide];
+            multi.cmds = vec![Cmd::Hide];
             let mut simple = diff_row("notes");
             simple.left_status = Status::OnlyHere;
             simple.right_status = Status::Absent;
             simple.right_paths = Vec::new();
-            simple.cmds = vec![Cmd::Apply, Cmd::Hide];
+            simple.cmds = vec![Cmd::Hide];
             let mut renamed = diff_row("holiday");
             renamed.left_paths = vec!["a/b/holiday_v2.jpg".into()];
             renamed.right_paths = vec!["a/b/holiday.jpg".into()];

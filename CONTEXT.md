@@ -65,9 +65,9 @@ the spray-book is the in-session set of already-seen passwords).
 
 
 **Long-running operation**:
-Work the user starts that may take longer than a moment — a repository scan
-or check, a Duplicates FIND or APPLY MARKED, a Transfer or Grooming PREVIEW or
-APPLY ALL, a GROUP SYNC, a DIFF PREVIEW. It runs alone behind the activity
+Work the user starts that may take longer than a moment — a repository UPDATE
+or DELETE EMPTY DIRS and the look each takes first, a DUPLICATES, SYNC, COPY or
+DELETE PREVIEW or GO. It runs alone behind the activity
 modal.
 _Avoid_: job, task, background operation (nothing long-running runs in the
 background any more).

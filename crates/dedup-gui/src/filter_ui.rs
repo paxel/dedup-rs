@@ -198,6 +198,7 @@ impl FilterHistory {
 /// `case:` is recognised as a group opener even though it is not a condition, so
 /// that it terminates the preceding condition's value instead of being swallowed
 /// into it. A group may open with `!`, which negates it.
+#[cfg(test)]
 fn parse_conditions(expr: &str) -> (Vec<FilterCond>, bool) {
     let prefixes: Vec<(String, FilterKind)> = FILTER_KINDS
         .iter()
@@ -379,15 +380,10 @@ impl FilterBuilder {
         }
     }
 
-    /// Fold the FILTER section shut, the way a host folds its own sections
-    /// once it has an answer on screen.
-    pub fn fold(&mut self) {
-        self.open = false;
-    }
-
     /// Replace the active conditions with those parsed from a filter expression
     /// (the `mime:`/`name:`/`size:` groups produced by [`Self::filter_string`]).
     /// Used to restore a saved rule/preset into the wizard.
+    #[cfg(test)]
     pub fn set_expression(&mut self, expr: &str) {
         let (filters, case_insensitive) = parse_conditions(expr);
         self.filters = filters;

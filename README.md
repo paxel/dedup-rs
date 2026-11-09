@@ -77,16 +77,15 @@ at the cost of drag-and-drop.
 - **Duplicates** — drag repositories into a read-only card (safe from changes) and a read-write card (copies there get deleted), choose exact or similar, and PREVIEW: the result opens in its own window with the best copy of each group kept and the rest marked, and GO deletes them. A copy's right-click menu can jump straight to it in Browse (**SHOW IN BROWSE**), to judge it by the folder it lives in, or **ACCEPT** its content as allowed to repeat inside that repo (a podcast's per-folder cover): accepted copies are protected from every duplicate delete and their groups stay out of the way.
 - **Sync** — drag backup groups into one card and push each main to its backups (each ADD ONLY, APPLY CHANGES — which also carries the main's own deletions over — or MIRROR), after a preview of what every backup gains and loses.
 - **Copy** — copy into one repository what it and the reference repositories lack, from several sources, each content once, optionally under a subfolder and a path template; a taken name gets a numeric suffix, nothing is overwritten.
-- **Grooming** — dedupe, purge by filter, prune missing records, reorganize by path templates.
-- **One thing at a time, always visible** — long work (a repository UPDATE or DELETE EMPTY DIRS, a Duplicates
-  FIND or APPLY MARKED, a Transfer or Grooming PREVIEW and APPLY ALL, a GROUP SYNC or a bulk board action)
+- **Delete** — delete from several repositories every file a reference repository already holds; content only those repositories share stays for DUPLICATES, and a switch decides whether a file deleted in the reference goes too.
+- **One thing at a time, always visible** — long work (a repository UPDATE or DELETE EMPTY DIRS, a DUPLICATES,
+  SYNC, COPY or DELETE PREVIEW or GO, or a bulk board action)
   runs in one central activity window that shows each phase, its progress and
   problems, offers CANCEL, and ends as the result report. Quick actions answer with a notification
   card, and every file the app changes is written to an event log (**LOG**, top right) that survives
   restarts. See [ADR 0003](docs/adr/0003-every-action-reports-and-long-work-runs-alone.md).
 
-Clicking any file anywhere — a duplicate card, a review-board row, a Browse listing, a DIFF
-conflict — opens the **same full-window viewer**: two files side by side, tabbed by
+Clicking any file — a duplicate card or a Browse listing — opens the **same full-window viewer**: two files side by side, tabbed by
 representation (image, video, audio as spectrograms with gapless A/B playback, editable ID3
 metadata and the full EXIF listing, text/hex for everything else), with the actions of the
 surface you came from. A video shows an **aligned filmstrip** per side — frames sampled

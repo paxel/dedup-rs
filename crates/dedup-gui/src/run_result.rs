@@ -58,11 +58,6 @@ impl RunReport {
         self
     }
 
-    pub fn note(mut self, note: impl Into<String>) -> Self {
-        self.notes.push(note.into());
-        self
-    }
-
     pub fn problem(&mut self, problem: impl Into<String>) {
         if self.problems.len() < MAX_PROBLEMS {
             self.problems.push(problem.into());
@@ -86,6 +81,7 @@ impl RunReport {
         self
     }
 
+    #[cfg(test)]
     pub fn problems(mut self, problems: impl IntoIterator<Item = String>) -> Self {
         for problem in problems {
             self.problem(problem);
