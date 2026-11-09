@@ -25,8 +25,8 @@ mod app;
 mod board;
 mod browse_view;
 mod compare_view;
+mod copy_page;
 mod diagnostics;
-mod diff_board;
 mod dupes_view;
 mod external;
 mod filter_ui;
@@ -53,7 +53,6 @@ mod sync_page;
 mod textdiff;
 mod theme;
 mod thumbs;
-mod transfer_view;
 mod util;
 mod waveform;
 

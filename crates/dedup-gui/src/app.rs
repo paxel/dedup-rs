@@ -1,7 +1,7 @@
 //! The eframe application (ADR 0006): the navigation bar, the repository
 //! page — repo cards, their selection and the repository commands — wired to
 //! the core store and a background update worker, and the process pages,
-//! delegating to [`crate::dupes_view`], [`crate::transfer_view`],
+//! delegating to [`crate::dupes_view`], [`crate::sync_page`], [`crate::copy_page`],
 //! [`crate::grooming_view`] and [`crate::browse_view`].
 
 use crate::activity::Notification;
@@ -11,7 +11,6 @@ use crate::icon;
 use crate::settings::{ThemeChoice, TooltipVerbosity};
 use crate::status::{self, Location};
 use crate::theme;
-use crate::transfer_view::TransferView;
 use crate::util::{ExplainExt, format_size};
 use crossbeam_channel::{Receiver, Sender};
 use dedup_core::store::{RepoStats, Store};
@@ -316,7 +315,7 @@ pub struct DedupApp {
     activity: crate::activity::Shared,
     dupes: DupesView,
     sync: crate::sync_page::SyncPage,
-    transfer: TransferView,
+    copy: crate::copy_page::CopyPage,
     grooming: GroomingView,
     /// Sync groups as of the last reload: the Repositories list frames each
     /// group — its main and that main's sinks — in one LCARS section.
@@ -372,7 +371,7 @@ impl DedupApp {
             activity: activity.clone(),
             dupes: DupesView::new_with_locks(locks.clone(), activity.clone()),
             sync: crate::sync_page::SyncPage::new(locks.clone(), activity.clone()),
-            transfer: TransferView::new_with_locks(locks.clone(), activity.clone()),
+            copy: crate::copy_page::CopyPage::new(locks.clone(), activity.clone()),
             grooming: GroomingView::new_with_locks(locks.clone(), activity.clone()),
             groups: Vec::new(),
             browse: crate::browse_view::BrowseView::new_with_locks(locks, activity),
@@ -385,8 +384,6 @@ impl DedupApp {
         app.threads = settings.threads;
         app.dupes.set_threshold(settings.similarity_threshold);
         app.dupes.set_show_accepted(settings.show_accepted);
-        app.transfer
-            .set_threshold(settings.transfer_similarity_threshold);
         app.tooltip_verbosity = settings.tooltip_verbosity;
         app.theme = settings.theme;
         crate::util::seed_last_picked_dir(settings.last_picked_dir.as_deref().map(Into::into));
@@ -401,7 +398,6 @@ impl DedupApp {
             threads: self.threads,
             similarity_threshold: self.dupes.threshold(),
             show_accepted: self.dupes.show_accepted(),
-            transfer_similarity_threshold: self.transfer.threshold(),
             tooltip_verbosity: self.tooltip_verbosity,
             theme: self.theme,
             window_size: self.window_size,
@@ -449,7 +445,7 @@ impl DedupApp {
             }
             Screen::Duplicates => self.dupes.sync_repos(&self.store),
             Screen::Sync => self.sync.sync_repos(&self.store),
-            Screen::Copy => self.transfer.sync_repos(&self.store),
+            Screen::Copy => self.copy.sync_repos(&self.store),
             Screen::Delete => self.grooming.sync_repos(&self.store),
             Screen::Browse => self.browse.sync_repos(&self.store),
         }
@@ -464,17 +460,16 @@ impl DedupApp {
             return;
         }
         match screen {
-            Screen::Copy => {
-                self.transfer
-                    .choose(&self.store, crate::transfer_view::Command::Copy);
-                self.synced = Some(screen);
-            }
             Screen::Delete => {
                 self.grooming
                     .choose(&self.store, crate::grooming_view::Command::Dedupe);
                 self.synced = Some(screen);
             }
-            Screen::Repositories | Screen::Duplicates | Screen::Sync | Screen::Browse => {}
+            Screen::Repositories
+            | Screen::Duplicates
+            | Screen::Sync
+            | Screen::Copy
+            | Screen::Browse => {}
         }
         self.screen = screen;
     }
@@ -1588,10 +1583,7 @@ impl eframe::App for DedupApp {
             Screen::Repositories => self.repositories_view(ui, &mut actions),
             Screen::Duplicates => self.dupes.show(ui, &self.store, self.tooltip_verbosity),
             Screen::Sync => self.sync.show(ui, &self.store, self.tooltip_verbosity),
-            Screen::Copy => {
-                self.transfer
-                    .show(ui, &self.store, self.tooltip_verbosity, Some(frame))
-            }
+            Screen::Copy => self.copy.show(ui, &self.store, self.tooltip_verbosity),
             Screen::Delete => self.grooming.show(ui, &self.store, self.tooltip_verbosity),
             Screen::Browse => self.browse.show(ui, &self.store, self.tooltip_verbosity),
         });
@@ -1630,6 +1622,7 @@ impl eframe::App for DedupApp {
         let previewing = match self.screen {
             Screen::Duplicates => self.dupes.previewing(),
             Screen::Sync => self.sync.previewing(),
+            Screen::Copy => self.copy.previewing(),
             _ => false,
         };
         if !previewing {
@@ -1658,8 +1651,6 @@ impl eframe::App for DedupApp {
         let current = self.current_settings();
         let control_changed = current.threads != self.saved_settings.threads
             || current.similarity_threshold != self.saved_settings.similarity_threshold
-            || current.transfer_similarity_threshold
-                != self.saved_settings.transfer_similarity_threshold
             || current.tooltip_verbosity != self.saved_settings.tooltip_verbosity
             || current.theme != self.saved_settings.theme
             || current.last_picked_dir != self.saved_settings.last_picked_dir;
@@ -4243,11 +4234,10 @@ mod ui_tests {
         assert!(both(&harness), "a click on the bar folds nothing away");
     }
 
-    /// The bar's entries open their pages; SYNC, COPY and DELETE open the
-    /// older views that stand in for them, on the matching command.
+    /// The bar's entries open their pages; DELETE opens the older view that
+    /// stands in for it, on the matching command.
     #[test]
     fn the_navigation_bar_opens_each_page() {
-        use crate::transfer_view::Command as T;
         let (_tmp, mut app) = sample_app();
         assert_eq!(
             app.screen,
@@ -4257,7 +4247,7 @@ mod ui_tests {
         app.go_to(Screen::Sync);
         assert_eq!(app.screen, Screen::Sync);
         app.go_to(Screen::Copy);
-        assert_eq!(app.transfer.command(), T::Copy);
+        assert_eq!(app.screen, Screen::Copy);
         app.go_to(Screen::Delete);
         assert_eq!(
             app.grooming.command(),

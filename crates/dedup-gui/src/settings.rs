@@ -54,7 +54,7 @@ pub struct Settings {
     /// accepted content.
     pub show_accepted: bool,
     /// Transfer-tab SIMILAR folder-export similarity slider position (percent).
-    pub transfer_similarity_threshold: f64,
+
     /// Hover-tooltip wording: short one-liners or verbose explanations.
     pub tooltip_verbosity: TooltipVerbosity,
     /// Interface appearance. Absent in configs written before the light theme
@@ -76,7 +76,6 @@ impl Default for Settings {
             threads: 0,
             similarity_threshold: 99.0,
             show_accepted: false,
-            transfer_similarity_threshold: 90.0,
             tooltip_verbosity: TooltipVerbosity::default(),
             theme: ThemeChoice::default(),
             window_size: None,
@@ -121,7 +120,6 @@ mod tests {
             threads: 4,
             similarity_threshold: 97.5,
             show_accepted: true,
-            transfer_similarity_threshold: 88.0,
             tooltip_verbosity: TooltipVerbosity::Verbose,
             theme: ThemeChoice::Light,
             window_size: Some([1280.0, 800.0]),

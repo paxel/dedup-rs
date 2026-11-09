@@ -27,7 +27,7 @@ Pick a grooming tool with the chips (or the number keys `1`–`5`):
   before you delete. Your repo is only ever trimmed of content that is safely held somewhere
   else — and never of content you [accepted](duplicates.md#accepted-content) in it: accepted
   files are left out of the preview and of the run.
-- **PURGE** — delete files in this repo matching a [filter](transfer.md#filter-builder).
+- **PURGE** — delete files in this repo matching a [filter](index.md#filter-builder).
   Purge needs at least one condition: with no filter nothing matches and nothing is deleted,
   so you can never empty a repo by leaving the filter blank. Useful for sweeping out a class of
   files (thumbnails, a MIME type, everything over a size).
@@ -47,7 +47,7 @@ Pick a grooming tool with the chips (or the number keys `1`–`5`):
 
 ## How: filter or rules
 
-- **FILTER** — the same condition builder [Transfer](transfer.md#filter-builder) uses.
+- **FILTER** — the same condition builder [Transfer](index.md#filter-builder) uses.
   Required for PURGE; optional for DEDUPE, where it narrows which files a preview considers.
 - **RULES** — ORGANIZE's ordered list of filter + path template pairs (see the tool above).
   EMPTY DIRS and PRUNE have nothing to set.

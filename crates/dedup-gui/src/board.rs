@@ -112,88 +112,33 @@ impl Status {
     }
 }
 
-/// Which region of the board a command acts on.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Side {
-    Left,
-    Right,
-    /// Acts on the row as a whole (COMPARE, APPLY, HIDE).
-    Neither,
-}
-
-/// What a command does, independent of side. The centre grid puts the two
-/// commands of one kind on the same line, so a choice and its mirror image sit
-/// at the same height. Declaration order here is the display order.
+/// What a command does. Declaration order is the display order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
 enum Kind {
-    Copy,
-    Overwrite,
-    Rename,
-    KeepOne,
-    DeleteAll,
-    Delete,
-    Compare,
     Apply,
     Hide,
 }
 
-/// One line of the centre grid.
+/// One line of the centre grid: one or two row-level commands side by side —
+/// `APPLY` and `HIDE` share a line, so a planned-preview row stays one line
+/// tall.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Line {
-    /// A left/right pair. Either half may be missing — a row can offer
-    /// `DELETE L` with no `DELETE R` — and the surviving half keeps its own
-    /// side's column rather than sliding across.
-    Sides(Option<Cmd>, Option<Cmd>),
-    /// One or two commands belonging to neither side, filling the line as a
-    /// group. Two fit side by side — `APPLY` and `HIDE` are both row-level, and
-    /// giving each its own line made every planned-preview row twice as tall as
-    /// it needed to be.
     Centre(Cmd, Option<Cmd>),
 }
 
-/// Arrange a row's commands into grid lines: one line per kind, left command in
-/// the left slot and right command in the right, kinds in declaration order.
-///
-/// Pairing is by [`Kind`], not by position in `cmds`, so a caller that lists its
-/// commands in a different order still gets `COPY >` and `< COPY` on one line
-/// rather than whatever happened to be at the same index.
+/// Arrange a row's commands into grid lines, two to a line, in kind order.
 fn layout(cmds: &[Cmd]) -> Vec<Line> {
-    let mut kinds: Vec<Kind> = cmds
-        .iter()
-        .filter(|c| c.side() != Side::Neither)
-        .map(|c| c.kind())
-        .collect();
-    kinds.sort();
-    kinds.dedup();
-    let mut lines: Vec<Line> = kinds
-        .into_iter()
-        .map(|kind| {
-            let of = |side: Side| {
-                cmds.iter()
-                    .copied()
-                    .find(|c| c.kind() == kind && c.side() == side)
-            };
-            Line::Sides(of(Side::Left), of(Side::Right))
-        })
-        .collect();
-    // Row-level commands come last, two to a line, in declaration order.
-    let mut whole: Vec<Cmd> = cmds
-        .iter()
-        .copied()
-        .filter(|c| c.side() == Side::Neither)
-        .collect();
+    let mut whole: Vec<Cmd> = cmds.to_vec();
     whole.sort_by_key(|c| c.kind());
     whole.dedup();
-    lines.extend(
-        whole
-            .chunks(2)
-            .filter_map(|pair| pair.first().map(|&a| Line::Centre(a, pair.get(1).copied()))),
-    );
-    lines
+    whole
+        .chunks(2)
+        .filter_map(|pair| pair.first().map(|&a| Line::Centre(a, pair.get(1).copied())))
+        .collect()
 }
 
-/// A command offered on a row. `on_left` / direction is baked into the variant,
-/// so the caller never has to infer a side from a click position.
+/// A command offered on a row.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cmd {
     /// Planned surfaces: execute just this row now.
@@ -201,24 +146,6 @@ pub enum Cmd {
     /// Every surface: drop the row from the board. On a planned surface the
     /// row is also excluded from RUN.
     Hide,
-    /// DIFF: copy the left file into the right repo, and vice versa.
-    CopyRight,
-    CopyLeft,
-    DeleteLeft,
-    DeleteRight,
-    /// DIFF conflict: show both versions side by side.
-    Compare,
-    /// DIFF conflict: replace the other side's file with this one's content.
-    OverwriteRight,
-    OverwriteLeft,
-    /// DIFF rename (BY HASH, 1:1).
-    RenameLeft,
-    RenameRight,
-    /// DIFF rename with several names on a side.
-    KeepOneLeft,
-    KeepOneRight,
-    DeleteAllLeft,
-    DeleteAllRight,
     /// Not a button: synthesised when the row body itself is clicked. Every row
     /// opens the shared viewer, which is why rows no longer carry a COMPARE
     /// command — it would be a second door to the same place.
@@ -226,10 +153,7 @@ pub enum Cmd {
     /// Not a button: on a listing (`BoardView::listing`) a single click on a
     /// row selects it instead, with the modifiers the caller's selection model
     /// wants (Ctrl toggles, Shift extends); a double click still opens it.
-    Select {
-        ctrl: bool,
-        shift: bool,
-    },
+    Select { ctrl: bool, shift: bool },
 }
 
 impl Cmd {
@@ -237,21 +161,8 @@ impl Cmd {
         match self {
             Cmd::Apply => "APPLY",
             Cmd::Hide => "HIDE",
-            Cmd::CopyRight => "COPY >",
-            Cmd::CopyLeft => "< COPY",
-            // Single-side commands carry no L/R suffix: the button's column
-            // *is* the side, enforced by `side()`. Copies and overwrites keep
-            // their arrow because it names the provenance — the file flows in
-            // from the other side.
-            Cmd::DeleteLeft | Cmd::DeleteRight => "DELETE",
-            Cmd::Compare => "COMPARE",
             Cmd::OpenRow => "OPEN",
             Cmd::Select { .. } => "SELECT",
-            Cmd::OverwriteRight => "OVERWRITE >",
-            Cmd::OverwriteLeft => "< OVERWRITE",
-            Cmd::RenameLeft | Cmd::RenameRight => "RENAME",
-            Cmd::KeepOneLeft | Cmd::KeepOneRight => "KEEP 1",
-            Cmd::DeleteAllLeft | Cmd::DeleteAllRight => "DEL ALL",
         }
     }
 
@@ -259,57 +170,14 @@ impl Cmd {
         match self {
             Cmd::Apply => theme::green(),
             Cmd::Hide => theme::grey(),
-            Cmd::CopyRight | Cmd::CopyLeft => theme::green(),
-            Cmd::DeleteLeft | Cmd::DeleteRight | Cmd::DeleteAllLeft | Cmd::DeleteAllRight => {
-                theme::red()
-            }
-            Cmd::Compare | Cmd::OpenRow | Cmd::Select { .. } => theme::lilac(),
-            Cmd::OverwriteRight
-            | Cmd::OverwriteLeft
-            | Cmd::RenameLeft
-            | Cmd::RenameRight
-            | Cmd::KeepOneLeft
-            | Cmd::KeepOneRight => theme::tan(),
+            Cmd::OpenRow | Cmd::Select { .. } => theme::lilac(),
         }
     }
 
-    /// Which side of the board this command's **effect lands on** — the side
-    /// whose files change. Drives its column in the centre grid, and it is a
-    /// hard rule: a button never crosses the midline, so the column alone says
-    /// which file is renamed, deleted, or written. Copies and overwrites sit on
-    /// the *receiving* side (where the new file appears), matching the status
-    /// veil that side's cell shows in a preview.
-    fn side(self) -> Side {
-        match self {
-            Cmd::CopyLeft
-            | Cmd::DeleteLeft
-            | Cmd::OverwriteLeft
-            | Cmd::RenameLeft
-            | Cmd::KeepOneLeft
-            | Cmd::DeleteAllLeft => Side::Left,
-            Cmd::CopyRight
-            | Cmd::DeleteRight
-            | Cmd::OverwriteRight
-            | Cmd::RenameRight
-            | Cmd::KeepOneRight
-            | Cmd::DeleteAllRight => Side::Right,
-            Cmd::Apply | Cmd::Hide | Cmd::Compare | Cmd::OpenRow | Cmd::Select { .. } => {
-                Side::Neither
-            }
-        }
-    }
-
-    /// What the command *does*, independent of side. Two commands of the same
-    /// kind are opposite halves of one choice and share a line.
+    /// What the command *does*. Two commands of the same kind would share a
+    /// line.
     fn kind(self) -> Kind {
         match self {
-            Cmd::CopyRight | Cmd::CopyLeft => Kind::Copy,
-            Cmd::OverwriteRight | Cmd::OverwriteLeft => Kind::Overwrite,
-            Cmd::RenameLeft | Cmd::RenameRight => Kind::Rename,
-            Cmd::KeepOneLeft | Cmd::KeepOneRight => Kind::KeepOne,
-            Cmd::DeleteAllLeft | Cmd::DeleteAllRight => Kind::DeleteAll,
-            Cmd::DeleteLeft | Cmd::DeleteRight => Kind::Delete,
-            Cmd::Compare => Kind::Compare,
             Cmd::Apply => Kind::Apply,
             Cmd::Hide => Kind::Hide,
             // Never laid out with the others — it is not a button.
@@ -320,28 +188,14 @@ impl Cmd {
     /// End-user copy. Never mentions how the board is built.
     ///
     /// `hide_skips_run` distinguishes a planned preview, where hiding a row also
-    /// excludes it from RUN, from DIFF, which executes each command as it is
-    /// clicked and has no RUN to skip.
+    /// excludes it from RUN, from a listing, which has no RUN to skip.
     fn hint(self, hide_skips_run: bool) -> &'static str {
         match self {
             Cmd::Apply => "Apply only this action, immediately",
             Cmd::Hide if hide_skips_run => "Remove this row — RUN will skip it",
             Cmd::Hide => "Remove this row from the board",
-            Cmd::CopyRight => "Copy this file into the right-hand repository",
-            Cmd::CopyLeft => "Copy this file into the left-hand repository",
-            Cmd::DeleteLeft => "Delete this file from the left-hand repository",
-            Cmd::DeleteRight => "Delete this file from the right-hand repository",
-            Cmd::Compare => "Show both versions side by side",
             Cmd::OpenRow => "Open this row in the viewer",
             Cmd::Select { .. } => "Select this row",
-            Cmd::OverwriteRight => "Replace the right-hand file with this one",
-            Cmd::OverwriteLeft => "Replace the left-hand file with this one",
-            Cmd::RenameLeft => "Rename the left-hand file to the other side's name",
-            Cmd::RenameRight => "Rename the right-hand file to the other side's name",
-            Cmd::KeepOneLeft => "Keep one left-hand copy and delete the others",
-            Cmd::KeepOneRight => "Keep one right-hand copy and delete the others",
-            Cmd::DeleteAllLeft => "Delete every left-hand copy of this content",
-            Cmd::DeleteAllRight => "Delete every right-hand copy of this content",
         }
     }
 }
@@ -645,14 +499,11 @@ fn sort_order(order: &mut [usize], metas: &[RowMeta], state: &BoardState) {
 /// this board offers, so `C` is constant down the whole board and a command
 /// never moves between rows.
 fn centre_width(metas: &[RowMeta]) -> f32 {
-    // Two columns as soon as any row carries a *side* command — even a lone
-    // one. Its half-column never collapses, because the empty other half is
-    // itself information: nothing happens to that side. Only a board whose
-    // commands all act on the row as a whole needs a single column.
+    // Two columns as soon as any row carries two commands side by side.
     let paired = metas.iter().any(|m| {
         layout(&m.cmds)
             .iter()
-            .any(|l| matches!(l, Line::Sides(..)) || matches!(l, Line::Centre(_, Some(_))))
+            .any(|l| matches!(l, Line::Centre(_, Some(_))))
     });
     CMD_W * if paired { 2.0 } else { 1.0 } + 8.0
 }
@@ -946,49 +797,8 @@ fn draw_row(
         )
     };
     let lines = layout(&meta.cmds);
-    // The side-command lines sit between two tinted half-columns split by a
-    // hard midline: left half = effects on the left file, right half = the
-    // right file. The tint uses each side's accent, so the column teaches the
-    // same left/right colour language as the headers, and an empty half stays
-    // visibly empty — nothing happens to that side.
-    let n_sides = lines
-        .iter()
-        .take_while(|l| matches!(l, Line::Sides(..)))
-        .count();
-    if n_sides > 0 && centre >= CMD_W * 2.0 {
-        let bottom = row.top() + n_sides as f32 * CMD_H - CMD_GAP + 2.0;
-        let half = |x0: f32, accent: egui::Color32| {
-            let r = egui::Rect::from_min_max(
-                egui::pos2(x0, row.top() - 2.0),
-                egui::pos2(x0 + CMD_W - 2.0, bottom),
-            );
-            ui.painter()
-                .rect_filled(r, 6.0, accent.gamma_multiply(0.07));
-        };
-        half(grid_left + 1.0, theme::orange());
-        half(grid_left + CMD_W + 1.0, theme::blue());
-        ui.painter().vline(
-            grid_left + CMD_W,
-            (row.top() - 2.0)..=bottom,
-            egui::Stroke::new(1.0, theme::hairline()),
-        );
-    }
     for (n, line) in lines.into_iter().enumerate() {
         match line {
-            Line::Sides(left_cmd, right_cmd) => {
-                // Each half keeps its own column unconditionally — a row
-                // offering only a right-hand command draws it on the right and
-                // leaves the left half empty. `centre_width` reserves two
-                // columns whenever any row has a side command, so the slots
-                // always exist.
-                for (col, maybe) in [(0, left_cmd), (1, right_cmd)] {
-                    if let Some(cmd) = maybe
-                        && cmd_button(ui, slot(col, n), cmd, hide_skips_run).clicked()
-                    {
-                        clicked = Some(cmd);
-                    }
-                }
-            }
             Line::Centre(first, second) => match second {
                 // Two row-level commands fill the two columns.
                 Some(other) => {
@@ -1850,11 +1660,6 @@ mod tests {
             !m.cmds.contains(&Cmd::OpenRow),
             "OPEN is not a command a caller supplies"
         );
-        assert_eq!(
-            Cmd::OpenRow.side(),
-            Side::Neither,
-            "it acts on the row as a whole"
-        );
     }
 
     /// Highlighting is paint only: it must not change how tall a row is, or the
@@ -1970,16 +1775,7 @@ mod tests {
     /// `cmds` distinct commands. They must differ in kind: the grid pairs by
     /// kind, so N copies of one command would collapse to a single line.
     fn some_cmds(n: usize) -> Vec<Cmd> {
-        const POOL: [Cmd; 8] = [
-            Cmd::CopyRight,
-            Cmd::CopyLeft,
-            Cmd::DeleteLeft,
-            Cmd::DeleteRight,
-            Cmd::OverwriteRight,
-            Cmd::OverwriteLeft,
-            Cmd::Compare,
-            Cmd::Hide,
-        ];
+        const POOL: [Cmd; 2] = [Cmd::Apply, Cmd::Hide];
         POOL.into_iter().take(n).collect()
     }
 
@@ -2034,16 +1830,12 @@ mod tests {
     }
 
     /// Row height follows whichever is taller — the name list or the command
-    /// grid — so an 8-command row is taller than a 2-command one.
+    /// grid — so a six-name row is taller than a one-name one.
     #[test]
     fn row_height_follows_content() {
         let short = meta("a", 2, 1);
-        let tall_cmds = meta("b", 8, 1);
+
         let tall_names = meta("c", 2, 6);
-        assert!(
-            tall_cmds.height() > short.height(),
-            "more commands make a taller row"
-        );
         assert!(
             tall_names.height() > short.height(),
             "more names make a taller row"
@@ -2208,7 +2000,7 @@ mod tests {
     #[test]
     fn centre_width_is_constant_across_rows() {
         let mut paired = meta("a", 0, 1);
-        paired.cmds = vec![Cmd::CopyRight, Cmd::CopyLeft];
+        paired.cmds = vec![Cmd::Apply, Cmd::Hide];
         let metas = vec![paired, meta("b", 2, 1), meta("c", 1, 1)];
         let c = centre_width(&metas);
         assert!(
@@ -2231,68 +2023,6 @@ mod tests {
         assert!(
             centre_width(&[lone]) < c,
             "one command per row needs only one column"
-        );
-    }
-
-    /// A command and its mirror image share a line, each in the column of the
-    /// side its **effect lands on**: `< COPY` (fills the left file) in the left
-    /// slot, `COPY >` (fills the right) in the right.
-    #[test]
-    fn mirrored_commands_share_a_line_left_in_the_left_slot() {
-        let lines = layout(&[
-            Cmd::CopyRight,
-            Cmd::CopyLeft,
-            Cmd::DeleteLeft,
-            Cmd::DeleteRight,
-            Cmd::OverwriteRight,
-            Cmd::OverwriteLeft,
-            Cmd::Compare,
-            Cmd::Hide,
-        ]);
-        assert_eq!(
-            lines,
-            vec![
-                Line::Sides(Some(Cmd::CopyLeft), Some(Cmd::CopyRight)),
-                Line::Sides(Some(Cmd::OverwriteLeft), Some(Cmd::OverwriteRight)),
-                Line::Sides(Some(Cmd::DeleteLeft), Some(Cmd::DeleteRight)),
-                Line::Centre(Cmd::Compare, Some(Cmd::Hide)),
-            ]
-        );
-    }
-
-    /// Pairing is by kind, not by list position — a caller listing its commands
-    /// in any order still gets the mirrored pairs on one line.
-    #[test]
-    fn pairing_survives_a_scrambled_command_order() {
-        let scrambled = layout(&[
-            Cmd::DeleteRight,
-            Cmd::CopyLeft,
-            Cmd::DeleteLeft,
-            Cmd::CopyRight,
-        ]);
-        assert_eq!(
-            scrambled,
-            vec![
-                Line::Sides(Some(Cmd::CopyLeft), Some(Cmd::CopyRight)),
-                Line::Sides(Some(Cmd::DeleteLeft), Some(Cmd::DeleteRight)),
-            ],
-            "order in, order out is not how pairing works"
-        );
-    }
-
-    /// A half-pair keeps its own side's column instead of sliding across, so a
-    /// command affecting the right file never appears under the left region.
-    #[test]
-    fn a_lone_command_keeps_its_own_side() {
-        assert_eq!(
-            layout(&[Cmd::DeleteRight]),
-            vec![Line::Sides(None, Some(Cmd::DeleteRight))],
-            "a right-only delete stays in the right slot"
-        );
-        assert_eq!(
-            layout(&[Cmd::CopyRight]),
-            vec![Line::Sides(None, Some(Cmd::CopyRight))],
-            "a copy that fills the right side sits in the right slot"
         );
     }
 
@@ -2353,16 +2083,7 @@ mod tests {
             left_modified: 0,
             right_modified: 0,
             unchanged: false,
-            cmds: vec![
-                Cmd::CopyRight,
-                Cmd::CopyLeft,
-                Cmd::DeleteLeft,
-                Cmd::DeleteRight,
-                Cmd::Compare,
-                Cmd::OverwriteRight,
-                Cmd::OverwriteLeft,
-                Cmd::Hide,
-            ],
+            cmds: vec![Cmd::Apply, Cmd::Hide],
             left_tags: Vec::new(),
         }
     }
@@ -2377,15 +2098,7 @@ mod tests {
         for width in [900.0_f32, 1280.0, 1920.0] {
             let metas = vec![diff_row("one"), diff_row("two")];
             let harness = render(width, metas);
-            for label in [
-                "COPY >",
-                "< COPY",
-                "DELETE",
-                "COMPARE",
-                "OVERWRITE >",
-                "< OVERWRITE",
-                "HIDE",
-            ] {
+            for label in ["APPLY", "HIDE"] {
                 let mut found = false;
                 for node in harness.query_all_by_label(label) {
                     found = true;
@@ -2400,44 +2113,6 @@ mod tests {
                 }
                 assert!(found, "at {width}px the command {label} was not drawn");
             }
-        }
-    }
-
-    /// **A row's commands must stay inside that row.** The measured row height
-    /// and what the centre column actually draws have to agree; when they did
-    /// not, an eight-command row silently lost its last line — and no label
-    /// query caught it, because a clipped widget is still in the tree with a
-    /// plausible rect. So this pins the invariant positionally: every command of
-    /// the first row sits above the second row's content.
-    #[test]
-    fn a_rows_commands_stay_inside_that_row() {
-        use egui_kittest::kittest::Queryable;
-        let mut second = diff_row("two");
-        second.cmds = vec![Cmd::Apply];
-        let harness = render(1280.0, vec![diff_row("one"), second]);
-
-        let next_row_top = harness.get_by_label("APPLY").rect().top();
-        for label in [
-            "COPY >",
-            "< COPY",
-            "DELETE",
-            "COMPARE",
-            "OVERWRITE >",
-            "< OVERWRITE",
-            "HIDE",
-        ] {
-            let mut found = false;
-            for node in harness.query_all_by_label(label) {
-                found = true;
-                let r = node.rect();
-                assert!(
-                    r.bottom() <= next_row_top + 0.5,
-                    "{label} spills out of its row: bottom {:.1} is below the next row's \
-                     top {next_row_top:.1}",
-                    r.bottom()
-                );
-            }
-            assert!(found, "the command {label} was not drawn");
         }
     }
 
@@ -2469,102 +2144,6 @@ mod tests {
         }
     }
 
-    /// **A command never crosses the midline.** A GROUP SYNC BACK row offers
-    /// `< COPY` (fills the main, on the left) and `DELETE` on the sink — the
-    /// centre reserves both half-columns even though each line is one-sided,
-    /// each button keeps its own half, and neither overlaps the sink cell.
-    #[test]
-    fn one_sided_commands_keep_their_own_half_of_the_centre() {
-        use egui_kittest::kittest::Queryable;
-        let mut row = diff_row("backsync");
-        row.left_paths = vec!["main/song.mp3".to_string()];
-        row.right_paths = vec!["sink/ZZZSINK.mp3".to_string()];
-        row.cmds = vec![Cmd::CopyLeft, Cmd::DeleteRight];
-        let harness = render(1280.0, vec![row]);
-        let sink = harness.get_by_label_contains("ZZZSINK").rect();
-        let copy = harness.get_by_label("< COPY").rect();
-        let delete = harness.get_by_label("DELETE").rect();
-        assert!(
-            copy.right() <= delete.left() + 0.5,
-            "< COPY (right {:.1}) must stay in the left half, DELETE (left {:.1}) in the right",
-            copy.right(),
-            delete.left(),
-        );
-        for (label, r) in [("< COPY", copy), ("DELETE", delete)] {
-            assert!(
-                r.right() <= sink.left() + 0.5,
-                "{label} (right {:.1}) overlaps the sink cell (starts {:.1})",
-                r.right(),
-                sink.left(),
-            );
-        }
-    }
-
-    /// Every command a row offers is actually drawn — an eight-command row draws
-    /// all eight, not as many as happened to fit.
-    #[test]
-    fn all_of_a_rows_commands_are_drawn() {
-        use egui_kittest::kittest::Queryable;
-        let harness = render(1280.0, vec![diff_row("one")]);
-        for (label, count) in [
-            ("COPY >", 1),
-            ("< COPY", 1),
-            // Both sides offer a delete; the shared label is disambiguated by
-            // the column each button sits in.
-            ("DELETE", 2),
-            ("COMPARE", 1),
-            ("OVERWRITE >", 1),
-            ("< OVERWRITE", 1),
-            ("HIDE", 1),
-        ] {
-            assert_eq!(
-                harness.query_all_by_label(label).count(),
-                count,
-                "{label} must be drawn exactly {count}× for a single eight-command row"
-            );
-        }
-    }
-
-    /// The model pairing must survive into the rendered geometry: a command and
-    /// its mirror sit at the same height, and the left-hand one is to the left.
-    #[test]
-    fn mirrored_commands_render_at_the_same_height_and_side() {
-        use egui_kittest::kittest::Queryable;
-        let harness = render(1280.0, vec![diff_row("one")]);
-        // Copies and overwrites sit on the side they *fill*: `< COPY` pulls the
-        // right file into the left repo, so it is the left slot.
-        for (left, right) in [("< COPY", "COPY >"), ("< OVERWRITE", "OVERWRITE >")] {
-            let l = harness.get_by_label(left).rect();
-            let r = harness.get_by_label(right).rect();
-            assert!(
-                (l.top() - r.top()).abs() < 0.5,
-                "{left} and {right} are not at the same height: {:.1} vs {:.1}",
-                l.top(),
-                r.top()
-            );
-            assert!(
-                l.right() <= r.left(),
-                "{left} must sit left of {right}: {:.1} > {:.1}",
-                l.right(),
-                r.left()
-            );
-        }
-        // The two DELETE buttons share a label; the pair must still straddle
-        // the midline at one height.
-        let mut deletes: Vec<egui::Rect> = harness
-            .query_all_by_label("DELETE")
-            .map(|n| n.rect())
-            .collect();
-        deletes.sort_by(|a, b| a.left().total_cmp(&b.left()));
-        match deletes.as_slice() {
-            [l, r] => {
-                assert!((l.top() - r.top()).abs() < 0.5, "DELETEs share a line");
-                assert!(l.right() <= r.left(), "one DELETE per half-column");
-            }
-            other => panic!("expected two DELETE buttons, got {}", other.len()),
-        }
-    }
-
     /// **Nothing may cross the window's right edge**, at any width. The row
     /// regions are placed at computed offsets, so an unaccounted `item_spacing`
     /// between them pushes the right-hand side out of the window — invisibly,
@@ -2576,7 +2155,7 @@ mod tests {
         // board is *meant* to overrun and be clipped — see the next test.
         for width in [700.0_f32, 1280.0, 1920.0] {
             let harness = render(width, vec![diff_row("one")]);
-            for label in ["a/b/one.jpg", "COPY >", "< COPY", "HIDE", "COMPARE"] {
+            for label in ["a/b/one.jpg", "APPLY", "HIDE"] {
                 for node in harness.query_all_by_label(label) {
                     let r = node.rect();
                     assert!(
@@ -2600,7 +2179,7 @@ mod tests {
         let narrow = w_min - 120.0;
         let wide = render(1280.0, vec![diff_row("one")]);
         let tight = render(narrow, vec![diff_row("one")]);
-        for label in ["COPY >", "COMPARE", "HIDE"] {
+        for label in ["APPLY", "HIDE"] {
             let a = wide.get_by_label(label).rect();
             let b = tight.get_by_label(label).rect();
             assert!(
@@ -2735,7 +2314,7 @@ mod tests {
     fn the_three_regions_do_not_overlap() {
         use egui_kittest::kittest::Queryable;
         let harness = render(1280.0, vec![diff_row("one")]);
-        let cmd = harness.get_by_label("COMPARE").rect();
+        let cmd = harness.get_by_label("APPLY").rect();
         let paths: Vec<_> = harness
             .query_all_by_label("a/b/one.jpg")
             .map(|n| n.rect())
@@ -2892,18 +2471,12 @@ mod tests {
             "copy_of_photo.jpg".into(),
         ];
         multi.right_paths = vec!["IMG_0042.jpg".into()];
-        multi.cmds = vec![
-            Cmd::RenameLeft,
-            Cmd::KeepOneLeft,
-            Cmd::DeleteAllLeft,
-            Cmd::CopyRight,
-            Cmd::Hide,
-        ];
+        multi.cmds = vec![Cmd::Apply, Cmd::Hide];
         let mut simple = diff_row("notes");
         simple.left_status = Status::OnlyHere;
         simple.right_status = Status::Absent;
         simple.right_paths = Vec::new();
-        simple.cmds = vec![Cmd::CopyRight, Cmd::DeleteLeft, Cmd::Hide];
+        simple.cmds = vec![Cmd::Apply, Cmd::Hide];
         // A rename pair, so the screenshot shows the differing characters picked
         // out (`_v2` here) rather than two identical names.
         let mut renamed = diff_row("holiday");
@@ -2985,12 +2558,12 @@ mod tests {
             let mut multi = diff_row("photo");
             multi.left_paths = vec!["photo.jpg".into(), "photo (1).jpg".into()];
             multi.right_paths = vec!["IMG_0042.jpg".into()];
-            multi.cmds = vec![Cmd::RenameLeft, Cmd::KeepOneLeft, Cmd::CopyRight, Cmd::Hide];
+            multi.cmds = vec![Cmd::Apply, Cmd::Hide];
             let mut simple = diff_row("notes");
             simple.left_status = Status::OnlyHere;
             simple.right_status = Status::Absent;
             simple.right_paths = Vec::new();
-            simple.cmds = vec![Cmd::CopyRight, Cmd::DeleteLeft, Cmd::Hide];
+            simple.cmds = vec![Cmd::Apply, Cmd::Hide];
             let mut renamed = diff_row("holiday");
             renamed.left_paths = vec!["a/b/holiday_v2.jpg".into()];
             renamed.right_paths = vec!["a/b/holiday.jpg".into()];

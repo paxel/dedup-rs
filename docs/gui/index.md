@@ -17,11 +17,11 @@ for a HiDPI display or a projector.
 | **[REPOSITORIES](repository-page.md)** | Register, scan, lock and group repositories; delete their empty folders.                                                             |
 | **[DUPLICATES](duplicates.md)**        | Find exact or perceptually similar duplicates across repos and delete the worse copies.                                              |
 | **[SYNC](sync.md)**                    | Push backup groups from their mains to their backups, after a preview of what each backup gains and loses.                         |
-| **[COPY](transfer.md)**                | The same Transfer view, opened on COPY.                                                                                              |
+| **[COPY](copy.md)**                    | Copy into one repository what it and the reference repositories lack, from several sources, never overwriting.                   |
 | **[DELETE](grooming.md)**              | The Grooming view, opened on DEDUPE: dedupe against others, purge by filter, clear empty dirs, reorganize, prune.                    |
 | **[Browse](browse.md)**                | Walk one repo's indexed files as a folder tree, preview them, and annotate with tags. Opened by SHOW IN BROWSE on a duplicate.       |
 
-COPY and DELETE show the existing Transfer and Grooming views until their own pages are
+DELETE shows the existing Grooming view until its own page is
 built; each still chooses its repositories in its own sections. Browse has no entry in the
 navigation bar.
 
@@ -139,6 +139,27 @@ count and opens it, newest first, with a filter box. Marks and accepts get a car
 on disk. The rules are in
 [ADR 0003](../adr/0003-every-action-reports-and-long-work-runs-alone.md).
 
+## Filter builder
+
+Pressing **+** offers MIME / NAME / SIZE condition types; each added condition becomes a
+removable pill with an inline editor (multiple conditions combine with AND):
+
+- **MIME** — matches files whose detected MIME type contains a substring (clickable
+  suggestions from the source repo's actual MIME types, with counts, narrowed as you type).
+- **NAME** — matches files whose path contains a substring (a live, debounced match count
+  shows against the source repo). A **NOT** toggle inverts a condition (`NOT NAME: *thumb*`
+  keeps everything that is *not* a thumbnail), and an **Aa** toggle makes text matching
+  ignore capitalisation.
+- **SIZE** — an operator + byte count, e.g. `>=1000`.
+
+Every kind offers previously used values as one-click quick-picks, remembered across
+sessions. **CLEAR** removes every condition.
+
+**Presets**: save the current condition set under a name for one-click reuse (**SAVE**),
+apply a saved preset (click its pill), or forget one (**×**). **EXPORT**/**IMPORT** move the
+whole remembered-value + preset history to/from a JSON file, for backup or sharing between
+machines.
+
 ## The review board
 
 Every preview and reconcile view renders on one shared board, so it reads the same wherever it
@@ -208,8 +229,8 @@ CLI-only today — there is no page for them yet.
 - [Duplicates](duplicates.md) — find and review exact/similar duplicates, and the shared
   viewer in full (Image / Video filmstrip + scrub / Audio / Metadata / Text / Render /
   Strings / Hex).
-- [Transfer](transfer.md) — copy/move/sync/mirror between repos by content, group sync and
-  sync-back, the DIFF reconcile board, the filter builder.
+- [Sync](sync.md) — push backup groups from their mains to their backups.
+- [Copy](copy.md) — copy what a repository lacks into it, from several sources.
 - [Grooming](grooming.md) — dedupe, purge, empty dirs, organize, prune.
 - [Browse](browse.md) — a keyboard-driven folder-tree browser with tagging.
 - [CLI reference](../cli.md) — every command the GUI's operations are also available from.

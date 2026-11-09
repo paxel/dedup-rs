@@ -10,7 +10,7 @@ pub fn help_text(screen: Screen) -> &'static str {
         Screen::Repositories => REPOSITORIES,
         Screen::Duplicates => DUPLICATES,
         Screen::Sync => SYNC,
-        Screen::Copy => TRANSFER,
+        Screen::Copy => COPY,
         Screen::Delete => GROOMING,
         Screen::Browse => BROWSE,
     }
@@ -83,52 +83,20 @@ or Audio for zoom, filmstrip and A/B compare; Metadata for ID3 tags and EXIF cap
 Text for a text or hex preview of documents and anything else without a picture. Right-click \
 a card for OPEN and SHOW IN FOLDER.";
 
-const TRANSFER: &str = "\
-Copy, move, or sync files between two repositories by content (size + hash — paths never \
-matter), with an assisted filter and a preview before anything runs.
+const COPY: &str = "\
+Copy into one repository what it and the reference repositories lack. Drag the sources \
+into COPY FROM (they are locked, nothing in them changes), the one target into COPY INTO \
+(it only gains files, so its lock stays), and further repositories into ALREADY KNOWN IN \
+(locked). A content any reference or the target has ever held is not copied, and content \
+in two sources is copied once.
 
-SYNC opens this view on GROUP SYNC, COPY on COPY. Pick the command in WHAT, the \
-repositories and their roles, then HOW (destination, options, filter), then PREVIEW and \
-APPLY ALL. After PREVIEW or APPLY ALL the sections fold to their header bars; click one to \
-flip it open again.
+HOW sets where the copies land: an optional SUBFOLDER in the target, and under it an \
+optional TEMPLATE such as {year}/{month}/{o-name}; empty keeps each source path. The \
+FILTER limits which files take part.
 
-Pick a SOURCE and a TARGET repo, optionally add DUPEPOOL repositories — a source file only \
-counts as new when none of the target or the extra references already has its content.
-
-COPY copies source files the target doesn't have (the source is left in place). MOVE does \
-the same, then marks the source entries missing. SYNC mirrors the source into the target at \
-the same relative path, and can also delete target files whose content the source has lost \
-(DELETE MISSING).
-
-GROUP SYNC replaces the single TARGET with a SINKS picker, and only appears when the SOURCE \
-is a backup group's main (groups are built on the repository page). Each sink pushes in \
-its own stored mode: ADD ONLY copies content it lacks and never deletes, so a sink may keep \
-files the main no longer has; APPLY CHANGES also deletes sink content the main itself \
-deleted, so the sink follows the main's edits while keeping what the main never had; MIRROR \
-deletes all sink content the main does not have, so it ends up holding exactly the main's \
-content — deletions cannot be undone. PREVIEW plans every selected sink and shows what would \
-be copied and deleted, without touching disk; APPLY ALL asks for confirmation — naming the sink \
-count and any sink a push would empty entirely — then pushes in the activity window. Sinks \
-are handled independently, so one unreachable backup drive does not stop the others, and \
-the main is never changed. GROUP SYNC BACK pulls one sink's changes back into the main.
-
-DIFF is the manual view: it compares the two repos side by side and leaves every decision \
-to you. PAIR BY HASH matches files by content, so the same file under two names is one row \
-you can settle with a rename; PAIR BY PATH matches by name and folder, so the same name \
-holding different content shows up as a conflict. Each row offers what makes sense for it — \
-copy the file across, delete it, rename one side to the other's name, or overwrite one side \
-with the other — and a side holding several copies of the same content is narrowed down \
-first with DELETE ALL or KEEP 1. A conflicting row also offers COMPARE, which shows both \
-versions side by side with a preview, their size, date and type — the larger and newer \
-values highlighted — and the same actions per side. Nothing happens until you click a row's \
-button; rows that are equal on both sides are hidden until you ask for them.
-
-Use the FILTER wizard to narrow which files are considered — conditions combine with \
-AND. PREVIEW plans in the activity window and shows the matching transfers, paged, plus a \
-total count, without touching disk. APPLY ALL asks for confirmation, then performs the transfer \
-in the activity window — each file as it goes, every problem, and CANCEL — and ends on the \
-result report. A row's COPY, DELETE, RENAME, OVERWRITE or APPLY answers with a notification \
-card, and every file changed is in the event log behind the LOG button.";
+PREVIEW lists every copy in its own window; a name already taken gets a numeric suffix and \
+is marked — nothing is ever overwritten. The page stays locked until GO or CANCEL. GO \
+copies, shows the progress and the report in that window, and then plans again.";
 
 const GROOMING: &str = "\
 Prune and reorganize a single repository. DELETE opens this view on DEDUPE: pick the tool \

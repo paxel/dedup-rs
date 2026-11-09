@@ -2632,20 +2632,6 @@ mod ui_tests {
         );
     }
 
-    /// `section_lcars` now always claims the panel's full width, so even a
-    /// Rows carry no COMPARE command any more: clicking the row itself opens the
-    /// shared viewer, so a row-level command would be a second door to the same
-    /// place. This deliberately undoes part of the 2026-07-31 backlog batch.
-    #[test]
-    fn rows_carry_no_compare_command() {
-        let cmds = [board::Cmd::Apply, board::Cmd::Hide];
-        assert!(
-            !cmds.contains(&board::Cmd::Compare),
-            "the row body is how a row is opened, not a command"
-        );
-    }
-
-    /// narrow-content rule section (a single button + short fields) spans
     /// A DEDUPE row names the copy that makes the file redundant, so the user can
     /// see what survives instead of trusting a bare deletion list. PURGE and
     /// PRUNE have no such counterpart and stay one-sided.

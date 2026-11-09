@@ -207,4 +207,4 @@ and are at least 1000 bytes. `-f "date:2021-03"` matches everything from March 2
 `-f "case:insensitive name:*.jpg"` also finds `PHOTO.JPG`.
 
 The GUI's Transfer tab exposes the same three base fields (`mime:`/`name:`/`size:`) as
-an assisted pill builder — see [`docs/gui/transfer.md`](gui/transfer.md).
+an assisted pill builder — see [`docs/gui/index.md`](gui/index.md#filter-builder).

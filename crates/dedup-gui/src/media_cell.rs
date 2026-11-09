@@ -200,9 +200,6 @@ pub enum CellOverlay {
     WillDelete,
     /// The file is gone from disk (its index entry is a tombstone).
     Missing,
-    /// The receiving repo once held exactly this content and deleted it —
-    /// copying it would resurrect a deletion.
-    WasDeleted,
     /// Content only on this side / about to be added.
     New,
 }
@@ -212,7 +209,6 @@ impl CellOverlay {
         match self {
             Self::WillDelete => "WILL DELETE",
             Self::Missing => "MISSING",
-            Self::WasDeleted => "WAS DELETED",
             Self::New => "NEW",
         }
     }
@@ -221,7 +217,6 @@ impl CellOverlay {
         match self {
             Self::WillDelete => theme::red(),
             Self::Missing => theme::amber(),
-            Self::WasDeleted => theme::blue(),
             Self::New => theme::green(),
         }
     }
