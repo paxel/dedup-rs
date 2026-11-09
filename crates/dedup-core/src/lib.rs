@@ -23,6 +23,7 @@
 pub mod align;
 pub mod archive;
 pub mod copy_into;
+pub mod delete_known;
 pub mod diff;
 pub mod dupes;
 pub mod eta;
