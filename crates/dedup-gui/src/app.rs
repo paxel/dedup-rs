@@ -90,6 +90,18 @@ impl Screen {
     }
 }
 
+/// The repository page's filter row (ADR 0006): which repositories stay
+/// usable. The rest are greyed out and sorted to the bottom.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum RepoScope {
+    #[default]
+    All,
+    /// Only repositories not marked remote.
+    Local,
+    /// Only the mains of backup groups.
+    Mains,
+}
+
 /// Freshness of a repo's index relative to disk, from the last CHECK.
 #[derive(Clone, Copy)]
 enum Freshness {
@@ -231,6 +243,11 @@ pub struct DedupApp {
     /// The repository page's selection, by name: what its commands act on.
     /// Process pages choose their own repositories (ADR 0006).
     selection: BTreeSet<String>,
+    /// The repository page's text filter: a repository whose name does not
+    /// contain it is greyed out.
+    repo_filter: String,
+    /// The repository page's filter row.
+    repo_scope: RepoScope,
     /// The session-wide lock registry, shared with every view; the
     /// repository page's cards show and toggle it.
     locks: crate::locks::RepoLocks,
@@ -301,6 +318,8 @@ impl DedupApp {
             screen: Screen::Repositories,
             synced: None,
             selection: BTreeSet::new(),
+            repo_filter: String::new(),
+            repo_scope: RepoScope::All,
             locks: locks.clone(),
             repos: Vec::new(),
             last_runs: Vec::new(),
@@ -1565,6 +1584,30 @@ impl DedupApp {
     /// The repository page (ADR 0006): every repository as a card, the
     /// selection, and the commands that act on it.
     fn repositories_view(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        // A greyed-out repository cannot stay selected.
+        let usable: HashSet<String> = self
+            .repos
+            .iter()
+            .filter(|r| self.usable(r))
+            .map(|r| r.name.clone())
+            .collect();
+        self.selection.retain(|n| usable.contains(n));
+        // The controls take the right half; the separator moves.
+        let half = (ui.available_width() * 0.5).max(280.0);
+        egui::Panel::right("repo_controls")
+            .resizable(true)
+            .default_size(half)
+            .min_size(280.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::bg())
+                    .inner_margin(egui::Margin::symmetric(10, 6)),
+            )
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.repo_controls(ui, &usable, actions));
+            });
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::bg()))
             .show(ui, |ui| {
@@ -1575,10 +1618,23 @@ impl DedupApp {
                     ui.colored_label(theme::amber(), notice);
                 }
                 self.totals_line(ui);
-                self.selection_row(ui, actions);
                 self.last_runs_row(ui);
                 self.cards(ui, actions);
             });
+    }
+
+    /// Whether `row` passes the text filter and the filter row. A repository
+    /// that does not is greyed out: no selection, no command and no bulk
+    /// switch touches it.
+    fn usable(&self, row: &RepoRow) -> bool {
+        let needle = self.repo_filter.trim().to_lowercase();
+        let named = needle.is_empty() || row.name.to_lowercase().contains(&needle);
+        let scoped = match self.repo_scope {
+            RepoScope::All => true,
+            RepoScope::Local => !row.remote,
+            RepoScope::Mains => self.group_of_main(&row.name).is_some(),
+        };
+        named && scoped
     }
 
     /// One line of facts over everything: how many repositories, files and
@@ -1643,107 +1699,188 @@ impl DedupApp {
         ui.add_space(4.0);
     }
 
-    /// The row above the cards: select ALL / LOCAL / NONE, REFRESH STATUS,
-    /// and ADD REPOSITORY.
-    fn selection_row(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    /// The repository page's right half (ADR 0006): the filter, the
+    /// selection, the locks and the commands. `usable` are the repositories
+    /// not greyed out.
+    fn repo_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        usable: &HashSet<String>,
+        actions: &mut Vec<Action>,
+    ) {
         let verbosity = self.tooltip_verbosity;
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Select").color(theme::tan()).size(12.0));
-            if crate::lcars::toggle_button(ui, "ALL", false, theme::orange())
+        crate::lcars::frame_lcars(ui, "FILTER", theme::lilac(), |ui| {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.repo_filter)
+                        .desired_width(220.0)
+                        .hint_text("part of a name"),
+                )
                 .explain(
                     verbosity,
-                    "Select every repository",
-                    "Select every repository, so a command such as UPDATE or CHECK runs \
-                     on all of them.",
+                    "Grey out every repository whose name does not contain this",
+                    "Repositories whose name does not contain this text are greyed out and \
+                     sorted to the bottom; a greyed-out repository cannot be selected and no \
+                     command or bulk switch touches it.",
+                );
+                if crate::lcars::action_button(
+                    ui,
+                    icon::X,
+                    !self.repo_filter.is_empty(),
+                    theme::tan(),
                 )
+                .explain(verbosity, "Clear the filter", "Empty the text filter.")
                 .clicked()
-            {
-                self.selection = self.repos.iter().map(|r| r.name.clone()).collect();
-            }
-            if crate::lcars::toggle_button(ui, "LOCAL", false, theme::orange())
-                .explain(
-                    verbosity,
-                    "Select every repository not marked remote",
-                    "Select every repository except the ones marked remote — the quick \
-                     everyday selection that leaves slow network or cloud mounts alone.",
+                {
+                    self.repo_filter.clear();
+                }
+            });
+            ui.horizontal(|ui| {
+                for (scope, label, hover) in [
+                    (
+                        RepoScope::Local,
+                        "LOCAL",
+                        "Grey out every repository marked remote",
+                    ),
+                    (
+                        RepoScope::Mains,
+                        "MAINS",
+                        "Grey out every repository that is not a backup group's main",
+                    ),
+                    (RepoScope::All, "ALL", "Grey out nothing"),
+                ] {
+                    if crate::lcars::toggle_button(
+                        ui,
+                        label,
+                        self.repo_scope == scope,
+                        theme::lilac(),
+                    )
+                    .explain(verbosity, hover, hover)
+                    .clicked()
+                    {
+                        self.repo_scope = scope;
+                    }
+                }
+            });
+        });
+        crate::lcars::frame_lcars(ui, "SELECT", theme::amber(), |ui| {
+            ui.horizontal(|ui| {
+                if crate::lcars::action_button(ui, "SELECT ALL", !usable.is_empty(), theme::amber())
+                    .explain(
+                        verbosity,
+                        "Select every repository not greyed out",
+                        "Select every repository that is not greyed out, so UPDATE or CHECK \
+                         runs on all of them.",
+                    )
+                    .clicked()
+                {
+                    self.selection = usable.iter().cloned().collect();
+                }
+                if crate::lcars::action_button(
+                    ui,
+                    "SELECT NONE",
+                    !self.selection.is_empty(),
+                    theme::amber(),
                 )
-                .clicked()
-            {
-                self.selection = self
-                    .repos
-                    .iter()
-                    .filter(|r| !r.remote)
-                    .map(|r| r.name.clone())
-                    .collect();
-            }
-            if crate::lcars::toggle_button(ui, "NONE", false, theme::orange())
                 .explain(
                     verbosity,
                     "Deselect every repository",
                     "Clear the selection.",
                 )
                 .clicked()
-            {
-                self.selection.clear();
-            }
-            ui.add_space(12.0);
-            let any = !self.selection.is_empty();
-            if crate::lcars::action_button(ui, "UPDATE", any, theme::orange())
-                .explain(
-                    verbosity,
-                    "Scan the selected repositories",
-                    "Scan the selected repositories: index new and changed files and mark \
-                     vanished ones missing.",
-                )
-                .clicked()
-            {
-                actions.push(Action::Scan(JobKind::Update));
-            }
-            if crate::lcars::action_button(ui, "CHECK", any, theme::orange())
-                .explain(
-                    verbosity,
-                    "What would an UPDATE change?",
-                    "Report what an UPDATE of the selected repositories would change, \
-                     without hashing or writing anything.",
-                )
-                .clicked()
-            {
-                actions.push(Action::Scan(JobKind::Check));
-            }
-            if crate::lcars::action_button(
-                ui,
-                &format!("{} REFRESH STATUS", icon::REFRESH),
-                !self.repos.is_empty(),
-                theme::lilac(),
-            )
-            .explain(
-                verbosity,
-                "Re-check reachability",
-                "Re-check every repository's location and reachability — a reconnected \
-                 drive turns reachable again. No files are read.",
-            )
-            .clicked()
-            {
-                actions.push(Action::RefreshStatus);
-            }
-            if crate::lcars::action_button(
-                ui,
-                &format!("{} ADD REPOSITORY", icon::PLUS),
-                true,
-                theme::blue(),
-            )
-            .explain(
-                verbosity,
-                "Register a new repository",
-                "Register a new repository: pick a folder on disk to track and scan \
-                 for duplicates. Folders dropped onto the window are added too.",
-            )
-            .clicked()
-            {
-                actions.push(Action::OpenAdd);
-            }
+                {
+                    self.selection.clear();
+                }
+            });
         });
-        ui.add_space(4.0);
+        crate::lcars::frame_lcars(ui, "LOCKS", theme::blue(), |ui| {
+            ui.horizontal(|ui| {
+                for (label, read_only, short, long) in [
+                    (
+                        "SET ALL RO",
+                        true,
+                        "Lock every repository not greyed out",
+                        "Lock every repository that is not greyed out: none of their files \
+                         can be deleted or overwritten until unlocked again.",
+                    ),
+                    (
+                        "SET ALL RW",
+                        false,
+                        "Unlock every repository not greyed out",
+                        "Unlock every repository that is not greyed out: their files may be \
+                         deleted or overwritten for the rest of this session.",
+                    ),
+                ] {
+                    if crate::lcars::action_button(ui, label, !usable.is_empty(), theme::blue())
+                        .explain(verbosity, short, long)
+                        .clicked()
+                    {
+                        for name in usable {
+                            self.locks.set_read_only(name, read_only);
+                        }
+                    }
+                }
+            });
+        });
+        crate::lcars::frame_lcars(ui, "COMMANDS", theme::orange(), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let any = !self.selection.is_empty();
+                if crate::lcars::action_button(ui, "UPDATE", any, theme::orange())
+                    .explain(
+                        verbosity,
+                        "Scan the selected repositories",
+                        "Scan the selected repositories: index new and changed files and \
+                         mark vanished ones missing.",
+                    )
+                    .clicked()
+                {
+                    actions.push(Action::Scan(JobKind::Update));
+                }
+                if crate::lcars::action_button(ui, "CHECK", any, theme::orange())
+                    .explain(
+                        verbosity,
+                        "What would an UPDATE change?",
+                        "Report what an UPDATE of the selected repositories would change, \
+                         without hashing or writing anything.",
+                    )
+                    .clicked()
+                {
+                    actions.push(Action::Scan(JobKind::Check));
+                }
+                if crate::lcars::action_button(
+                    ui,
+                    &format!("{} REFRESH STATUS", icon::REFRESH),
+                    !self.repos.is_empty(),
+                    theme::lilac(),
+                )
+                .explain(
+                    verbosity,
+                    "Re-check reachability",
+                    "Re-check every repository's location and reachability — a reconnected \
+                     drive turns reachable again. No files are read.",
+                )
+                .clicked()
+                {
+                    actions.push(Action::RefreshStatus);
+                }
+                if crate::lcars::action_button(
+                    ui,
+                    &format!("{} ADD REPOSITORY", icon::PLUS),
+                    true,
+                    theme::blue(),
+                )
+                .explain(
+                    verbosity,
+                    "Register a new repository",
+                    "Register a new repository: pick a folder on disk to track and scan for \
+                     duplicates. Folders dropped onto the window are added too.",
+                )
+                .clicked()
+                {
+                    actions.push(Action::OpenAdd);
+                }
+            });
+        });
     }
 
     /// The repo cards, a backup group framed together, an ungrouped repo bare.
@@ -1756,12 +1893,23 @@ impl DedupApp {
                     ui.add_space(8.0);
                     ui.colored_label(theme::text(), "No repositories yet — use ADD REPOSITORY.");
                 }
-                for row in &rows {
-                    // A sink is shown inside its group's section, not as a
-                    // top-level repo.
-                    if self.sink_of(&row.name).is_some() {
-                        continue;
-                    }
+                // A group counts as usable when any member is; greyed-out
+                // entries sink to the bottom, in their usual order.
+                let mut top: Vec<&RepoRow> = rows
+                    .iter()
+                    .filter(|r| self.sink_of(&r.name).is_none())
+                    .collect();
+                top.sort_by_key(|r| {
+                    let members: Vec<String> =
+                        match self.groups.iter().find(|(_, g)| g.main == r.name) {
+                            Some((_, g)) => g.members().map(str::to_string).collect(),
+                            None => vec![r.name.clone()],
+                        };
+                    !rows
+                        .iter()
+                        .any(|m| members.contains(&m.name) && self.usable(m))
+                });
+                for row in top {
                     // A group main and its sinks are framed together by one LCARS
                     // elbow rail, so a group reads as a single block and an
                     // ungrouped repo as a bare card.
@@ -1931,160 +2079,159 @@ impl DedupApp {
     fn repo_card(&mut self, ui: &mut egui::Ui, row: &RepoRow, actions: &mut Vec<Action>) {
         let selected = self.selection.contains(&row.name);
         // A selected card is outlined in the selection colour, thicker.
+        // A selected card gets a big, bright border all round (ADR 0006).
         let stroke = if selected {
-            egui::Stroke::new(2.5, theme::amber())
+            egui::Stroke::new(5.0, theme::amber())
         } else {
             egui::Stroke::new(1.5, theme::orange())
         };
         // The whole card senses a right-click for its menu; the card's own
         // controls sit on top of it and keep their clicks.
-        let card = ui.scope_builder(
-            egui::UiBuilder::new()
-                .id_salt(("repo-card", &row.name))
-                .sense(egui::Sense::click()),
-            |ui| {
-                egui::Frame::new()
-                    .fill(theme::panel())
-                    .corner_radius(theme::PILL)
-                    .stroke(stroke)
-                    .inner_margin(12.0)
-                    .outer_margin(egui::Margin {
-                        left: 0,
-                        right: 0,
-                        top: 0,
-                        bottom: 10,
-                    })
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            // The shared repo chip is the card's selector: click the
-                            // name to select or deselect the repository, the padlock
-                            // to toggle its session lock. Inside a group both the main
-                            // and its backups are cards; the chip's badge tells them
-                            // apart.
-                            let chip = crate::repo_chip::repo_chip(
-                                ui,
-                                &row.name,
-                                selected,
-                                theme::amber(),
-                                self.group_of_main(&row.name).is_some(),
-                                Some(self.locks.read_only(&row.name)),
-                            );
-                            let name = chip.name.explain(
-                                self.tooltip_verbosity,
-                                "Select this repository; right-click for its menu",
-                                "Select or deselect this repository; UPDATE and CHECK act on the \
+        // A greyed-out card is disabled: no selection, menu or edit.
+        let mut builder = egui::UiBuilder::new()
+            .id_salt(("repo-card", &row.name))
+            .sense(egui::Sense::click());
+        if !self.usable(row) {
+            builder = builder.disabled();
+        }
+        let card = ui.scope_builder(builder, |ui| {
+            egui::Frame::new()
+                .fill(theme::panel())
+                .corner_radius(theme::PILL)
+                .stroke(stroke)
+                .inner_margin(12.0)
+                .outer_margin(egui::Margin {
+                    left: 0,
+                    right: 0,
+                    top: 0,
+                    bottom: 10,
+                })
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        // The shared repo chip is the card's selector: click the
+                        // name to select or deselect the repository, the padlock
+                        // to toggle its session lock. Inside a group both the main
+                        // and its backups are cards; the chip's badge tells them
+                        // apart.
+                        let chip = crate::repo_chip::repo_chip(
+                            ui,
+                            &row.name,
+                            selected,
+                            theme::amber(),
+                            self.group_of_main(&row.name).is_some(),
+                            Some(self.locks.read_only(&row.name)),
+                        );
+                        let name = chip.name.explain(
+                            self.tooltip_verbosity,
+                            "Select this repository; right-click for its menu",
+                            "Select or deselect this repository; UPDATE and CHECK act on the \
                          selection. Right-click the card for the repository's own edits and \
                          its backup group.",
-                            );
-                            // The name sits on top of the card and takes its clicks,
-                            // so it carries the card's menu too.
-                            name.context_menu(|ui| {
-                                self.card_menu(ui, &row.name, row.remote, actions)
-                            });
-                            if name.clicked() {
-                                if selected {
-                                    self.selection.remove(&row.name);
-                                } else {
-                                    self.selection.insert(row.name.clone());
-                                }
+                        );
+                        // The name sits on top of the card and takes its clicks,
+                        // so it carries the card's menu too.
+                        name.context_menu(|ui| self.card_menu(ui, &row.name, row.remote, actions));
+                        if name.clicked() {
+                            if selected {
+                                self.selection.remove(&row.name);
+                            } else {
+                                self.selection.insert(row.name.clone());
                             }
-                            self.locks
-                                .handle_badge(chip.lock, self.tooltip_verbosity, &row.name);
-                            status_pills(ui, row, self.tooltip_verbosity);
-                            // The user's own flag, worded apart from the probe's
-                            // LOCAL / REMOTE pill: MARK REMOTE on the command list
-                            // flips it.
-                            if row.remote {
-                                pill(ui, "MARKED REMOTE", theme::blue()).explain(
-                                    self.tooltip_verbosity,
-                                    "Marked as a slow mount — the LOCAL selection skips it",
-                                    "You marked this repository as living on a slow network or \
+                        }
+                        self.locks
+                            .handle_badge(chip.lock, self.tooltip_verbosity, &row.name);
+                        status_pills(ui, row, self.tooltip_verbosity);
+                        // The user's own flag, worded apart from the probe's
+                        // LOCAL / REMOTE pill: MARK REMOTE on the command list
+                        // flips it.
+                        if row.remote {
+                            pill(ui, "MARKED REMOTE", theme::blue()).explain(
+                                self.tooltip_verbosity,
+                                "Marked as a slow mount — the LOCAL selection skips it",
+                                "You marked this repository as living on a slow network or \
                              cloud mount. The LOCAL selection leaves it out; everything \
                              else works the same. MARK REMOTE flips it back.",
-                                );
-                            }
-                            // MIME breakdown, share-sorted, pinned to the top-right. It is
-                            // reserved first (right-to-left) so the path — added inside,
-                            // filling the gap between the status pills and the tags — can
-                            // truncate to fit instead of running under the tags on a narrow
-                            // window (the full path stays on hover). Both share one row.
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                mime_tags(ui, row, self.tooltip_verbosity);
-                                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&row.path)
-                                                .color(theme::text())
-                                                .size(12.0),
-                                        )
-                                        .truncate(),
+                            );
+                        }
+                        // MIME breakdown, share-sorted, pinned to the top-right. It is
+                        // reserved first (right-to-left) so the path — added inside,
+                        // filling the gap between the status pills and the tags — can
+                        // truncate to fit instead of running under the tags on a narrow
+                        // window (the full path stays on hover). Both share one row.
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            mime_tags(ui, row, self.tooltip_verbosity);
+                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&row.path).color(theme::text()).size(12.0),
                                     )
-                                    .explain(
-                                        self.tooltip_verbosity,
-                                        &row.path,
-                                        &format!(
-                                            "On-disk folder this repository indexes: {}",
-                                            row.path
-                                        ),
-                                    );
-                                });
+                                    .truncate(),
+                                )
+                                .explain(
+                                    self.tooltip_verbosity,
+                                    &row.path,
+                                    &format!(
+                                        "On-disk folder this repository indexes: {}",
+                                        row.path
+                                    ),
+                                );
                             });
                         });
-                        ui.horizontal(|ui| {
-                    stat(
-                        ui,
-                        "Files",
-                        &row.stats.file_count.to_string(),
-                        theme::orange(),
-                        "Indexed files (missing files excluded)",
-                        "Number of files currently indexed for this repository. Files that \
+                    });
+                    ui.horizontal(|ui| {
+                        stat(
+                            ui,
+                            "Files",
+                            &row.stats.file_count.to_string(),
+                            theme::orange(),
+                            "Indexed files (missing files excluded)",
+                            "Number of files currently indexed for this repository. Files that \
                          were indexed before but have since vanished from disk are excluded \
                          from this count.",
-                        self.tooltip_verbosity,
-                    );
-                    stat(
-                        ui,
-                        "Size",
-                        &format_size(row.stats.total_size),
-                        theme::blue(),
-                        "Total size of indexed files",
-                        "Sum of the on-disk size of every indexed (non-missing) file in this \
+                            self.tooltip_verbosity,
+                        );
+                        stat(
+                            ui,
+                            "Size",
+                            &format_size(row.stats.total_size),
+                            theme::blue(),
+                            "Total size of indexed files",
+                            "Sum of the on-disk size of every indexed (non-missing) file in this \
                          repository.",
-                        self.tooltip_verbosity,
-                    );
-                    stat(
-                        ui,
-                        "Missing",
-                        &row.stats.missing_count.to_string(),
-                        theme::lilac(),
-                        "Indexed before but no longer on disk",
-                        "Files that were indexed by a previous scan but are no longer found \
+                            self.tooltip_verbosity,
+                        );
+                        stat(
+                            ui,
+                            "Missing",
+                            &row.stats.missing_count.to_string(),
+                            theme::lilac(),
+                            "Indexed before but no longer on disk",
+                            "Files that were indexed by a previous scan but are no longer found \
                          on disk. They stay in the index as history but are excluded from \
                          stats and duplicate search until a rescan confirms they're back.",
-                        self.tooltip_verbosity,
-                    );
-                    let exact = format_last_scan(row.stats.last_scan_ms);
-                    stat(
-                        ui,
-                        "Updated",
-                        &scan_age(row.stats.last_scan_ms, now_ms()),
-                        theme::tan(),
-                        &exact,
-                        &format!(
-                            "The most recent completed UPDATE of this repository: {exact}. \
+                            self.tooltip_verbosity,
+                        );
+                        let exact = format_last_scan(row.stats.last_scan_ms);
+                        stat(
+                            ui,
+                            "Updated",
+                            &scan_age(row.stats.last_scan_ms, now_ms()),
+                            theme::tan(),
+                            &exact,
+                            &format!(
+                                "The most recent completed UPDATE of this repository: {exact}. \
                              \"never\" means it has not been scanned yet."
-                        ),
-                        self.tooltip_verbosity,
-                    );
-                });
-
-                        self.card_controls(ui, row, actions);
-                        if let Some(last) = &row.last {
-                            ui.label(RichText::new(last).color(theme::tan()).size(12.0));
-                        }
+                            ),
+                            self.tooltip_verbosity,
+                        );
                     });
-            },
-        );
+
+                    self.card_controls(ui, row, actions);
+                    if let Some(last) = &row.last {
+                        ui.label(RichText::new(last).color(theme::tan()).size(12.0));
+                    }
+                });
+        });
         card.response
             .context_menu(|ui| self.card_menu(ui, &row.name, row.remote, actions));
     }
@@ -3567,7 +3714,7 @@ mod ui_tests {
         let (_tmp, app) = sample_app();
         let activity = app.activity.clone();
         let mut h = render_with_activity(app);
-        h.get_by_label("ALL").click();
+        h.get_by_label("SELECT ALL").click();
         h.step();
         h.get_by_label("UPDATE").click();
         h.step();
@@ -4114,11 +4261,54 @@ mod ui_tests {
         );
         harness.get_by_label("LOCAL").click();
         harness.run();
+        harness.get_by_label("SELECT ALL").click();
+        harness.run();
         let selection: Vec<String> = harness.state().selection.iter().cloned().collect();
         assert_eq!(
             selection,
             vec!["Automatic Upload".to_string()],
-            "LOCAL selects every repository except the remote one"
+            "LOCAL greys out the remote repository, so SELECT ALL skips it"
+        );
+    }
+
+    /// The text filter greys out the repositories whose name lacks it and
+    /// sorts them below the rest; a greyed-out repository leaves the selection
+    /// and SET ALL RW leaves its lock alone.
+    #[test]
+    fn the_text_filter_greys_out_sorts_down_and_shields() {
+        use egui_kittest::kittest::Queryable;
+        let (_tmp, mut app) = sample_app();
+        app.selection.insert("Automatic Upload".into());
+        app.repo_filter = "vid".into();
+        let mut harness = render_repos(app);
+        let top = |h: &Harness<'_, DedupApp>, name: &str| {
+            h.query_all_by_label(name)
+                .map(|n| n.rect().top())
+                .fold(f32::MAX, f32::min)
+        };
+        assert!(
+            top(&harness, "Videos") < top(&harness, "Automatic Upload"),
+            "the matching repository is listed first"
+        );
+        assert!(
+            harness.state().selection.is_empty(),
+            "a greyed-out repository cannot stay selected"
+        );
+        harness.get_by_label("SET ALL RW").click();
+        harness.run();
+        assert!(
+            !harness.state().locks.read_only("Videos"),
+            "the match is unlocked"
+        );
+        assert!(
+            harness.state().locks.read_only("Automatic Upload"),
+            "the greyed-out repository keeps its lock"
+        );
+        harness.get_by_label("SET ALL RO").click();
+        harness.run();
+        assert!(
+            harness.state().locks.read_only("Videos"),
+            "and locked again"
         );
     }
 
@@ -4461,7 +4651,7 @@ mod ui_tests {
     /// to `docs/screenshots/start_page.png`. Run with `--ignored`.
     #[test]
     #[ignore = "generates a doc screenshot (needs wgpu)"]
-    fn doc_screenshot_start_page() {
+    fn doc_screenshot_repository_page() {
         let (_tmp, mut app) = sample_app();
         app.selection.insert("Videos".into());
         let mut init = false;
@@ -4482,7 +4672,7 @@ mod ui_tests {
             );
         harness.run();
         let img = harness.render().expect("wgpu render failed");
-        let out = doc_screenshot_path("start_page.png");
+        let out = doc_screenshot_path("repository_page.png");
         img.save(&out).expect("save png");
         eprintln!("WROTE_SNAPSHOT {}", out.display());
     }

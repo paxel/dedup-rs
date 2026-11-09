@@ -51,6 +51,16 @@ impl RepoLocks {
         }
     }
 
+    /// Lock (`true`) or unlock (`false`) `repo`.
+    pub fn set_read_only(&self, repo: &str, read_only: bool) {
+        let mut set = self.lock();
+        if read_only {
+            set.remove(repo);
+        } else {
+            set.insert(repo.to_string());
+        }
+    }
+
     /// Wire a chip's padlock response: attach the standard hover copy and
     /// toggle the lock on click. The one-liner every selector chip uses, so the
     /// padlock behaves identically on every tab. (The Duplicates tab routes the
@@ -106,6 +116,18 @@ mod tests {
         assert!(locks.read_only("backup"), "other repos stay protected");
         locks.toggle("photos");
         assert!(locks.read_only("photos"), "a second toggle re-locks");
+    }
+
+    #[test]
+    fn set_read_only_locks_and_unlocks_regardless_of_state() {
+        let locks = RepoLocks::new();
+        locks.set_read_only("photos", false);
+        locks.set_read_only("photos", false);
+        assert!(!locks.read_only("photos"), "unlocking twice stays unlocked");
+        locks.set_read_only("photos", true);
+        assert!(locks.read_only("photos"));
+        locks.set_read_only("photos", true);
+        assert!(locks.read_only("photos"), "locking twice stays locked");
     }
 
     #[test]
