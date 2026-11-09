@@ -16,12 +16,12 @@ for a HiDPI display or a projector.
 | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
 | **[REPOSITORIES](repository-page.md)** | Register, scan, lock and group repositories; delete their empty folders.                                                             |
 | **[DUPLICATES](duplicates.md)**        | Find exact or perceptually similar duplicates across repos and delete the worse copies.                                              |
-| **[SYNC](transfer.md)**                | The Transfer view, opened on GROUP SYNC: push a backup group, copy / move / sync / mirror between repos, or reconcile two with DIFF. |
+| **[SYNC](sync.md)**                    | Push backup groups from their mains to their backups, after a preview of what each backup gains and loses.                         |
 | **[COPY](transfer.md)**                | The same Transfer view, opened on COPY.                                                                                              |
 | **[DELETE](grooming.md)**              | The Grooming view, opened on DEDUPE: dedupe against others, purge by filter, clear empty dirs, reorganize, prune.                    |
 | **[Browse](browse.md)**                | Walk one repo's indexed files as a folder tree, preview them, and annotate with tags. Opened by SHOW IN BROWSE on a duplicate.       |
 
-SYNC, COPY and DELETE show the existing Transfer and Grooming views until their own pages are
+COPY and DELETE show the existing Transfer and Grooming views until their own pages are
 built; each still chooses its repositories in its own sections. Browse has no entry in the
 navigation bar.
 

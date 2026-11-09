@@ -315,6 +315,7 @@ pub struct DedupApp {
     /// and the event log, shared with every view.
     activity: crate::activity::Shared,
     dupes: DupesView,
+    sync: crate::sync_page::SyncPage,
     transfer: TransferView,
     grooming: GroomingView,
     /// Sync groups as of the last reload: the Repositories list frames each
@@ -370,6 +371,7 @@ impl DedupApp {
             status_rx,
             activity: activity.clone(),
             dupes: DupesView::new_with_locks(locks.clone(), activity.clone()),
+            sync: crate::sync_page::SyncPage::new(locks.clone(), activity.clone()),
             transfer: TransferView::new_with_locks(locks.clone(), activity.clone()),
             grooming: GroomingView::new_with_locks(locks.clone(), activity.clone()),
             groups: Vec::new(),
@@ -446,7 +448,8 @@ impl DedupApp {
                 }
             }
             Screen::Duplicates => self.dupes.sync_repos(&self.store),
-            Screen::Sync | Screen::Copy => self.transfer.sync_repos(&self.store),
+            Screen::Sync => self.sync.sync_repos(&self.store),
+            Screen::Copy => self.transfer.sync_repos(&self.store),
             Screen::Delete => self.grooming.sync_repos(&self.store),
             Screen::Browse => self.browse.sync_repos(&self.store),
         }
@@ -454,21 +457,16 @@ impl DedupApp {
     }
 
     /// Switch to `screen` from the navigation bar. The stand-in views for
-    /// SYNC, COPY and DELETE share two older views, so entering one of them
-    /// sets that view's command; staying on a page keeps its state.
+    /// COPY and DELETE are older views, so entering one of them sets that
+    /// view's command; staying on a page keeps its state.
     fn go_to(&mut self, screen: Screen) {
         if self.screen == screen {
             return;
         }
         match screen {
-            Screen::Sync | Screen::Copy => {
-                use crate::transfer_view::Command as T;
-                let cmd = if screen == Screen::Sync {
-                    T::GroupSync
-                } else {
-                    T::Copy
-                };
-                self.transfer.choose(&self.store, cmd);
+            Screen::Copy => {
+                self.transfer
+                    .choose(&self.store, crate::transfer_view::Command::Copy);
                 self.synced = Some(screen);
             }
             Screen::Delete => {
@@ -476,7 +474,7 @@ impl DedupApp {
                     .choose(&self.store, crate::grooming_view::Command::Dedupe);
                 self.synced = Some(screen);
             }
-            Screen::Repositories | Screen::Duplicates | Screen::Browse => {}
+            Screen::Repositories | Screen::Duplicates | Screen::Sync | Screen::Browse => {}
         }
         self.screen = screen;
     }
@@ -1589,7 +1587,8 @@ impl eframe::App for DedupApp {
         egui::CentralPanel::default().show(ui, |ui| match self.screen {
             Screen::Repositories => self.repositories_view(ui, &mut actions),
             Screen::Duplicates => self.dupes.show(ui, &self.store, self.tooltip_verbosity),
-            Screen::Sync | Screen::Copy => {
+            Screen::Sync => self.sync.show(ui, &self.store, self.tooltip_verbosity),
+            Screen::Copy => {
                 self.transfer
                     .show(ui, &self.store, self.tooltip_verbosity, Some(frame))
             }
@@ -1628,7 +1627,12 @@ impl eframe::App for DedupApp {
         // The activity modal, the notification cards and the event-log viewer
         // sit above every tab and every other modal — in the DUPLICATES
         // preview's window while that is open (ADR 0006).
-        if !(self.screen == Screen::Duplicates && self.dupes.previewing()) {
+        let previewing = match self.screen {
+            Screen::Duplicates => self.dupes.previewing(),
+            Screen::Sync => self.sync.previewing(),
+            _ => false,
+        };
+        if !previewing {
             crate::activity::lock(&self.activity).show(ui);
         }
         for action in actions {
@@ -4252,7 +4256,6 @@ mod ui_tests {
         );
         app.go_to(Screen::Sync);
         assert_eq!(app.screen, Screen::Sync);
-        assert_eq!(app.transfer.command(), T::GroupSync);
         app.go_to(Screen::Copy);
         assert_eq!(app.transfer.command(), T::Copy);
         app.go_to(Screen::Delete);

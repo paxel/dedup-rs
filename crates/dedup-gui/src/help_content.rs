@@ -9,7 +9,8 @@ pub fn help_text(screen: Screen) -> &'static str {
     match screen {
         Screen::Repositories => REPOSITORIES,
         Screen::Duplicates => DUPLICATES,
-        Screen::Sync | Screen::Copy => TRANSFER,
+        Screen::Sync => SYNC,
+        Screen::Copy => TRANSFER,
         Screen::Delete => GROOMING,
         Screen::Browse => BROWSE,
     }
@@ -40,6 +41,18 @@ Right-click a card for its own edits — RENAME, RELOCATE, CLONE INDEX, MARK REM
 — and for its place in a backup group: MAKE MAIN, JOIN GROUP, LEAVE GROUP. A backup group \
 is framed together, main first; right-click the frame's bar for ADD BACKUP and UNGROUP. A \
 backup's push mode is set on its card.";
+
+const SYNC: &str = "\
+Push backup groups from their mains to their backups. Drag a main from the pool into the \
+card: its backups come along with their push modes (set on the backup's card on the \
+repository page). A backup can be left out of this run with its IN THIS RUN switch. \
+Backups in APPLY CHANGES or MIRROR mode can lose files, so the card unlocks them; ADD ONLY \
+backups only gain files and keep their lock. A backup locked again elsewhere sends its \
+group back to the pool.
+
+PREVIEW plans every push and opens it in its own window: per backup what it would gain \
+(+) and lose (−). The page stays locked until GO or CANCEL. GO pushes, shows the progress \
+and the report in that window, and then plans again so you see what is left.";
 
 const DUPLICATES: &str = "\
 Find exact or perceptually similar duplicates across one or more repositories, review them \

@@ -8,8 +8,9 @@ equivalent of [`diff cp`/`mv`/`rm`](../cli.md#diff).
 
 ## Getting here
 
-Click **SYNC** or **COPY** in the [navigation bar](index.md#top-bar). Both open this view,
-SYNC on **GROUP SYNC** and COPY on **COPY**, with no repositories chosen yet. The body shows
+Click **COPY** in the [navigation bar](index.md#top-bar). It opens this view on **COPY**,
+with no repositories chosen yet. (Pushing backup groups has its own page,
+[SYNC](sync.md).) The body shows
 **WHAT** (the command — open it to switch to COPY, MOVE, SYNC, MIRROR or DIFF, and to GROUP
 SYNC or GROUP SYNC BACK once the source is a group's main), then **WITH WHICH** (the source
 and target repositories, or the group's main), then **HOW** (destination, options, filter),

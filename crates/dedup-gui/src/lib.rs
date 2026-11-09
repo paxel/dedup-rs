@@ -43,11 +43,13 @@ mod media_cell;
 #[cfg(target_os = "linux")]
 mod menu_entry;
 mod player;
+mod process;
 mod repo_chip;
 mod run_result;
 mod scrub;
 mod settings;
 mod status;
+mod sync_page;
 mod textdiff;
 mod theme;
 mod thumbs;

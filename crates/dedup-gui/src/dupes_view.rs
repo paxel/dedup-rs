@@ -231,36 +231,6 @@ struct RepoSel {
     is_main: bool,
 }
 
-/// A frame repositories can be dropped onto: the panel's own colour, outlined
-/// in `accent` while a repository is dragged over it. Returns the dropped
-/// repository's name.
-fn drop_zone(
-    ui: &mut egui::Ui,
-    accent: egui::Color32,
-    add: impl FnOnce(&mut egui::Ui),
-) -> Option<String> {
-    let response = egui::Frame::new()
-        .fill(theme::panel())
-        .corner_radius(6.0)
-        .inner_margin(6.0)
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            add(ui);
-        })
-        .response;
-    if response.dnd_hover_payload::<String>().is_some() {
-        ui.painter().rect_stroke(
-            response.rect,
-            6.0,
-            egui::Stroke::new(2.0, accent),
-            egui::StrokeKind::Inside,
-        );
-    }
-    response
-        .dnd_release_payload::<String>()
-        .map(|name| (*name).clone())
-}
-
 /// How long a press must be held (mouse or touch) to count as a long-press.
 const LONG_PRESS_SECS: f64 = 0.5;
 
@@ -877,7 +847,7 @@ impl DupesView {
             "REPOSITORIES — DRAG INTO A CARD BELOW",
             theme::lilac(),
             |ui| {
-                let dropped = drop_zone(ui, theme::lilac(), |ui| {
+                let dropped = crate::process::drop_zone(ui, theme::lilac(), |ui| {
                     if pool.is_empty() {
                         ui.label(
                             RichText::new("Every repository is in a card.")
@@ -949,7 +919,7 @@ impl DupesView {
                     .map(|r| (r.name.clone(), r.is_main))
                     .collect();
                 let ((), header) = crate::lcars::frame_lcars(ui, title, accent, |ui| {
-                    let dropped = drop_zone(ui, accent, |ui| {
+                    let dropped = crate::process::drop_zone(ui, accent, |ui| {
                         ui.set_min_height(48.0);
                         if members.is_empty() {
                             ui.label(
@@ -1093,36 +1063,18 @@ impl DupesView {
     /// which locks the page until GO or CANCEL.
     fn preview(&mut self, ui: &mut egui::Ui, store: &Arc<Store>, acts: &mut Vec<Act>) {
         let ctx = ui.ctx().clone();
-        let closed = ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("dupes_preview"),
-            egui::ViewportBuilder::default()
-                .with_title("dedup — DUPLICATES preview")
-                .with_inner_size([1100.0, 800.0]),
-            |ui, _class| {
-                let mut acts_here = Vec::new();
-                egui::CentralPanel::default().show(ui, |ui| {
-                    self.preview_body(ui, store, &mut acts_here);
-                });
-                let ctx = ui.ctx().clone();
-                for act in acts_here {
-                    self.apply(&ctx, store, act);
-                }
-                // The work after GO reports here, in the window it started in.
-                crate::activity::lock(&self.activity).show(ui);
-                ui.input(|i| i.viewport().close_requested())
-            },
-        );
+        let closed = crate::process::preview_window(&ctx, "dupes_preview", "DUPLICATES", |ui| {
+            let mut acts_here = Vec::new();
+            self.preview_body(ui, store, &mut acts_here);
+            let ctx = ui.ctx().clone();
+            for act in acts_here {
+                self.apply(&ctx, store, act);
+            }
+            // The work after GO reports here, in the window it started in.
+            crate::activity::lock(&self.activity).show(ui);
+        });
         if closed {
             acts.push(Act::CancelPreview);
-        }
-        // The page is locked while the preview is open.
-        if !ctx.embed_viewports() {
-            egui::Modal::new(egui::Id::unique("dupes-preview-lock")).show(&ctx, |ui| {
-                ui.label(
-                    RichText::new("The preview is open in its own window — GO or CANCEL there.")
-                        .color(theme::text()),
-                );
-            });
         }
     }
 
