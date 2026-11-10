@@ -2,40 +2,37 @@
 
 All notable changes to the `dedup-rs` project will be documented in this file.
 
-## [3.1.0]
+## [4.0.0]
+
+### Added
+
+- SYNC: push backup groups to their backups after a preview of what each one gains and
+  loses; a backup can be left out of a run.
+- COPY: copy what a repository and the reference repositories lack from several sources,
+  each content once, optionally under a subfolder and a path template. A taken name gets a
+  numeric suffix; nothing is overwritten.
+- DELETE: delete from several repositories what the reference repositories already hold,
+  with a switch for files a reference has deleted, and a warning for references updated
+  before the repositories they are checked against.
 
 ### Changed
 
-- Duplicates shows each group's copies side by side again, best copy on the left, instead of
-  stacked rows.
-- On a Wayland desktop, programs opened from dedup (viewers, the file manager) start on
-  Wayland; only dedup's own window still uses X11 for drag-and-drop.
-- With `DEDUP_WAYLAND=1` on a desktop that leaves window frames to the app (GNOME), the
-  window gets a plain frame instead of the Adwaita one.
+- The app opens on a repository page instead of the start page, and a bar along the top
+  switches between REPOSITORIES, DUPLICATES, SYNC, COPY and DELETE. Each page chooses its
+  own repositories; there is no shared selection any more.
+- Repository page: a text filter and LOCAL / MAINS / ALL grey out the repositories that do
+  not match; SELECT ALL / SELECT NONE, SET ALL RO / RW, and a thick border around a selected
+  card. Backup groups never fold and are built from the cards' right-click menus.
+- UPDATE and DELETE EMPTY DIRS first show what they would change, and act only after OK.
+- DUPLICATES: drag repositories into a read-only and a read-write card, which lock and
+  unlock them. PREVIEW opens the result in a window of its own, with the best copy of each
+  group kept and the rest marked; GO deletes.
 
 ### Removed
 
-- EXR images are no longer decoded, so the viewer shows no picture for them; they are
-  still found as exact duplicates.
-
-### Security
-
-- Dependencies with known vulnerabilities are updated: zip, calamine (and its quick-xml), zstd,
-  webbrowser and ctutils; yanked releases are replaced.
-- A scan stops reading an archive's members at a million members or once they unpack to a
-  thousand times the archive's size (at least 4 GiB); the archive is still indexed and the
-  scan report names the cap.
-- PDFs, spreadsheets and e-mails over 256 MiB, and office documents whose text unpacks past
-  64 MiB, get no text fingerprint or text view instead of being read into memory whole.
-- ffmpeg, ffprobe and poppler run with a deadline and an output cap and are stopped past
-  either, so a crafted file can no longer stall a scan; ffmpeg may only open local files.
-- A media file that crashes its audio decoder no longer takes the scan, the waveform view or
-  the player with it; the file is indexed without a fingerprint.
-- Every release file carries a signed build provenance attestation, checked with
-  `gh attestation verify <file> -R paxel/dedup-rs`.
-- The GUI toolkit is updated to egui 0.37, and a quick-xml with known vulnerabilities in its
-  accessibility layer is replaced.
-- The Adwaita window frame's unmaintained font parser (ttf-parser) is gone.
+- The start page's command list, header strip and favorites.
+- From the GUI: CHECK, DIFF, MOVE, MIRROR, GROUP SYNC BACK, PURGE BY FILTER, ORGANIZE and
+  PRUNE. The command line still has them.
 
 ---
 

@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "dedup-rs-core"
-version = "3.1.0"
+version = "4.0.0"
 dependencies = [
  "argon2",
  "bip39",

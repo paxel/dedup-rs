@@ -2,7 +2,7 @@
 # Published as `dedup-rs-gui` (the shorter names are taken on crates.io);
 # the lib target keeps the `dedup_gui` name so imports stay unchanged.
 name = "dedup-rs-gui"
-version = "3.1.0"
+version = "4.0.0"
 edition = "2024"
 description = "LCARS-styled egui desktop app of dedup-rs, a forensic data-inheritance triage tool"
 license = "MIT"
@@ -19,7 +19,7 @@ name = "dedup-gui"
 path = "src/bin/dedup_gui.rs"
 
 [dependencies]
-dedup-rs-core = { path = "../dedup-core", version = "3.1.0" }
+dedup-rs-core = { path = "../dedup-core", version = "4.0.0" }
 redb = "2.1"
 # eframe's defaults minus "winit/default", whose Adwaita window frame (only drawn
 # natively on Wayland) pulls in the unmaintained ttf-parser (RUSTSEC-2026-0192).
