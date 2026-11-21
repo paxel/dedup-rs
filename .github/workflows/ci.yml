@@ -94,7 +94,7 @@ jobs:
           mkdir -p build
           cargo clippy --workspace --all-targets --locked --message-format=json > build/clippy-report.json
       - name: SonarQube Cloud analysis
-        uses: SonarSource/sonarqube-scan-action@e805d875275f728fac1885b413934be6d7c63f65 # v8.4.1
+        uses: SonarSource/sonarqube-scan-action@59202af334b4ba7b5db01b701b8e79f8b3bef0f4 # v8.5.0
         env:
           SONAR_TOKEN: ${{ secrets.SQ_TOKEN }}
 
