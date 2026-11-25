@@ -22,3 +22,11 @@ id = "RUSTSEC-2026-0372"
 ignoreUntil = 2027-05-25
 reason = """Unmaintained notice for a crate of accesskit's AT-SPI bridge under eframe; no \
 eframe release replaces it yet."""
+
+# chrono: an unmaintained notice, no vulnerability. dedup formats and parses dates with it in
+# every crate; no maintained replacement is in use yet.
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+ignoreUntil = 2027-05-25
+reason = """Unmaintained notice for chrono, which every crate uses for dates; no maintained \
+replacement is in use yet."""

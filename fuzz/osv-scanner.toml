@@ -1,0 +1,22 @@
+# osv-scanner's exceptions for fuzz/Cargo.lock, read by the OSV gate (paxel/gates vulns.yml);
+# osv-scanner takes the file next to the lockfile, so the repository root's does not reach
+# here. Each one says why the repository is not exposed and carries a date; when the date
+# passes, the gate fails again: that is the review.
+
+# chrono: an unmaintained notice, no vulnerability. dedup formats and parses dates with it in
+# every crate; no maintained replacement is in use yet.
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+ignoreUntil = 2027-05-25
+reason = """Unmaintained notice for chrono, which every crate uses for dates; no maintained \
+replacement is in use yet."""
+
+# libfuzzer-sys: the fuzz crate's only link to LLVM's libFuzzer, under LLVM's NCSA licence
+# besides MIT or Apache-2.0. It builds only the fuzz targets and ships in no release file.
+[[PackageOverrides]]
+name = "libfuzzer-sys"
+ecosystem = "crates.io"
+license.ignore = true
+effectiveUntil = 2027-05-25
+reason = """NCSA (LLVM's libFuzzer) next to MIT or Apache-2.0; the crate builds only the fuzz \
+targets in fuzz/ and is in no release file."""
