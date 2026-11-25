@@ -14,7 +14,7 @@ use std::process::Command;
 /// A 2-second test clip with a 440 Hz sine soundtrack.
 fn generate_clip_with_audio(path: &Path) -> bool {
     Command::new("ffmpeg")
-        .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+        .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i"])
         .arg("testsrc=duration=2:size=64x64:rate=5")
         .args(["-f", "lavfi", "-i"])
         .arg("sine=frequency=440:duration=2")
@@ -28,7 +28,7 @@ fn generate_clip_with_audio(path: &Path) -> bool {
 /// A 2-second test clip with no audio stream at all.
 fn generate_silent_clip(path: &Path) -> bool {
     Command::new("ffmpeg")
-        .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+        .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i"])
         .arg("testsrc=duration=2:size=64x64:rate=5")
         .args(["-pix_fmt", "yuv420p"])
         .arg(path)

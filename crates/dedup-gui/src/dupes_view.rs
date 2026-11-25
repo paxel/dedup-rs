@@ -6464,7 +6464,7 @@ mod ui_tests {
         dedup_core::thumbnail::set_cache_dir(dir.path().join("thumbs"));
         let clip = dir.path().join("clip.mp4");
         let ok = std::process::Command::new("ffmpeg")
-            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i"])
             .arg("testsrc=duration=4:size=320x240:rate=15")
             .args(["-pix_fmt", "yuv420p"])
             .arg(&clip)
@@ -6799,6 +6799,7 @@ mod ui_tests {
             let out = dir.path().join(rel);
             let status = std::process::Command::new("ffmpeg")
                 .args([
+                    "-nostdin",
                     "-y",
                     "-loglevel",
                     "error",
