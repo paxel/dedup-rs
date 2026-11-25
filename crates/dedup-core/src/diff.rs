@@ -948,7 +948,10 @@ pub fn diff_sync_from(
 /// Delete every live target file whose content is not in `source_present` (the
 /// source's current content set) — the [`SyncDelete::Absent`] mirror delete.
 /// Best effort: failures are counted and reported, the mirror continues.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the sync and export steps take the store, both sides, the options and the progress sinks as separate arguments"
+)]
 fn delete_absent(
     target: &OpenRepo,
     target_root: &Path,
@@ -1034,7 +1037,10 @@ pub fn plan_sync(
 
 /// [`plan_sync`] reporting its phases and stopping on `cancel` with
 /// [`DiffError::Cancelled`].
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the sync and export steps take the store, both sides, the options and the progress sinks as separate arguments"
+)]
 pub fn plan_sync_reporting(
     store: &Store,
     source: &str,
@@ -1078,7 +1084,10 @@ pub fn plan_sync_from(
 
 /// [`plan_sync_from`] reporting its phases and stopping on `cancel` with
 /// [`DiffError::Cancelled`].
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the sync and export steps take the store, both sides, the options and the progress sinks as separate arguments"
+)]
 pub fn plan_sync_from_reporting(
     store: &Store,
     source: &SourceView,
@@ -1149,7 +1158,10 @@ pub fn plan_sync_from_reporting(
 /// caller can emit one progress step); `equal`/`skipped`/`errors` are folded
 /// into `stats`, and any I/O failure is reported through `run` best-effort
 /// (the sync continues).
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the sync and export steps take the store, both sides, the options and the progress sinks as separate arguments"
+)]
 fn sync_copy(
     source_root: &Path,
     source_name: &str,
@@ -1352,7 +1364,10 @@ pub fn plan_folder_export(
 
 /// [`plan_folder_export`] reporting its phases and stopping on `cancel` with
 /// [`DiffError::Cancelled`].
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the sync and export steps take the store, both sides, the options and the progress sinks as separate arguments"
+)]
 pub fn plan_folder_export_reporting(
     store: &Store,
     source: &str,
@@ -1417,7 +1432,10 @@ pub fn plan_folder_export_reporting(
 /// into a repo — the destination is a plain directory — but a move marks the
 /// exported source entries missing (batched, with a final flush applied even on
 /// cancel or failure). Per-file progress is reported through `run`.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the sync and export steps take the store, both sides, the options and the progress sinks as separate arguments"
+)]
 pub fn export_to_folder(
     store: &Store,
     source: &str,

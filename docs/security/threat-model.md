@@ -59,7 +59,7 @@ What an attacker can make dedup do, and what stops it. Decided scope and rules a
    `crates/dedup-core/tests/fixtures/fuzz/`, a regression test and a fix. Fingerprinting,
    document text, the waveform worker and the player's probe contain a parser panic: the
    file gets no fingerprint or preview, the scan and the app go on. Dependencies with
-   published advisories fail the release (`cargo-deny`).
+   published advisories fail the release (osv-scanner, through the paxel/gates release gate).
 7. **Path traversal on extract.** A member named `../../.bashrc` or `/etc/x`.
    *Mitigation (existing):* extraction keeps only normal path components, never
    overwrites (collisions get a suffix), writes symlink members as plain files and only

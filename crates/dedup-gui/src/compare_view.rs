@@ -4932,7 +4932,7 @@ mod tests {
         let sound = dir.path().join("sound.mp4");
         let silent = dir.path().join("silent.mp4");
         let ok = std::process::Command::new("ffmpeg")
-            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i"])
             .arg("testsrc=duration=1:size=64x64:rate=5")
             .args(["-f", "lavfi", "-i"])
             .arg("sine=frequency=440:duration=1")
@@ -4942,7 +4942,7 @@ mod tests {
             .map(|s| s.success())
             .unwrap_or(false)
             && std::process::Command::new("ffmpeg")
-                .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+                .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i"])
                 .arg("testsrc=duration=1:size=64x64:rate=5")
                 .args(["-pix_fmt", "yuv420p"])
                 .arg(&silent)
@@ -5656,7 +5656,7 @@ mod tests {
         let make_clip = |name: &str, src: &str| {
             let path = tmp.path().join(name);
             let ok = std::process::Command::new("ffmpeg")
-                .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+                .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i"])
                 .arg(src)
                 .args(["-pix_fmt", "yuv420p"])
                 .arg(&path)

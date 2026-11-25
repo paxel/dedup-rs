@@ -1,123 +1,72 @@
-# Gate for every push and pull request.
-#
-# Tiered: the Ubuntu lane is the full gate — formatting, clippy with zero
-# warnings, and the complete workspace test suite, with software Vulkan
-# (lavapipe) plus ffmpeg and poppler installed so the GUI's headless render
-# tests and the tool-gated tests actually run. The Windows and macOS lanes
-# build the workspace and run the core + CLI suites only, catching platform
-# breakage in minutes; GUI render tests stay a Linux concern (one pixel
-# baseline, not three).
 name: CI
 
-# Push covers the working branches; pull_request covers forks. A push that
-# also belongs to an open same-repo PR would run twice — the concurrency
-# group below collapses that.
+# dedup-rs's gates. The standard's part comes from paxel/gates: the OSV gate, the Rust gate on
+# Linux (format, lint set, clippy, all tests, the coverage ratchet of core, cli and gui) and
+# SonarQube Cloud. The Rust gate installs software Vulkan (lavapipe) plus ffmpeg and poppler,
+# so the GUI's headless render tests and the tool-gated tests run there. Windows and macOS are
+# dedup-rs's own lanes: build, clippy and the core and CLI suites, which catch platform
+# breakage; GUI render tests stay a Linux concern (docs/adr/0006-move-to-gates.md).
+# A branch gets its run through its pull request; a run per push as well would be the same
+# jobs twice, and SonarQube Cloud analyses only the default branch and pull requests.
 on:
   push:
-    branches: ["**"]
+    branches: [summer]
   pull_request:
 
 concurrency:
-  # head_ref (the branch) for PR events, ref for pushes — so a push to a
-  # branch with an open PR shares one group and the duplicate run is
-  # cancelled instead of burning a second full matrix.
-  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  group: ci-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
-# Least privilege: jobs that write (the GitHub Release) widen this themselves.
-permissions:
-  contents: read
-
 jobs:
-  linux:
-    name: Linux (full gate)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1 branch
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - name: System dependencies (ALSA link dep, software Vulkan, gated tools)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libasound2-dev pkg-config \
-            mesa-vulkan-drivers libvulkan1 \
-            ffmpeg poppler-utils
-      - name: Format
-        run: cargo fmt --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Tests
-        run: cargo test --workspace --locked
+  vulns:
+    uses: paxel/gates/.github/workflows/vulns.yml@dbf6f6086174ef97fe465d3ffee31bf3985f5b81 # v1.4.1
 
-  # Feeds the README's Coveralls badge and the SonarQube Cloud analysis the
-  # release gate reads (docs/adr/0005-security-hardening.md). Default-branch
-  # pushes only: the free Sonar plan analyses summer only, and coverage on every
-  # branch push would double CI time for a number nobody reads off a branch.
-  # What Sonar analyses is in sonar-project.properties.
-  coverage:
-    name: Coverage (Coveralls, SonarQube Cloud)
-    if: github.event_name == 'push' && github.ref == 'refs/heads/summer'
-    runs-on: ubuntu-24.04
-    steps:
-      # Full history, for Sonar's blame and new-code period.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1 branch
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - name: System dependencies (ALSA link dep, software Vulkan, gated tools)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libasound2-dev pkg-config \
-            mesa-vulkan-drivers libvulkan1 \
-            ffmpeg poppler-utils
-      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
-        with:
-          tool: cargo-tarpaulin
-      - name: Measure line coverage
-        run: cargo tarpaulin --workspace --engine llvm --timeout 300 --out Lcov
-      - name: Upload to Coveralls
-        uses: coverallsapp/github-action@8d6379e14d29928660c4ba802d8e85393440b329 # v2.3.8
-        with:
-          file: lcov.info
-      - name: Clippy report for SonarQube Cloud
-        run: |
-          mkdir -p build
-          cargo clippy --workspace --all-targets --locked --message-format=json > build/clippy-report.json
-      - name: SonarQube Cloud analysis
-        uses: SonarSource/sonarqube-scan-action@e805d875275f728fac1885b413934be6d7c63f65 # v8.4.1
-        env:
-          SONAR_TOKEN: ${{ secrets.SQ_TOKEN }}
+  rust:
+    uses: paxel/gates/.github/workflows/rust.yml@dbf6f6086174ef97fe465d3ffee31bf3985f5b81 # v1.4.1
+    with:
+      # ALSA is rodio's link dependency; lavapipe renders the GUI tests; ffmpeg and poppler
+      # run the tool-gated tests.
+      apt-packages: libasound2-dev pkg-config mesa-vulkan-drivers libvulkan1 ffmpeg poppler-utils
+      # One part per crate: each part runs that crate's tests.
+      coverage: |
+        core -p dedup-rs-core --timeout 300
+        cli -p dedup-rs-cli --timeout 300
+        gui -p dedup-rs-gui --timeout 300
 
-  windows:
-    name: Windows (build + core/cli tests)
-    runs-on: windows-latest
+  native:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows (build + core/cli tests)
+            runner: windows-latest
+          - name: macOS (build + core/cli tests)
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1 branch
+        with:
+          persist-credentials: false
+      - name: Toolchain from rust-toolchain.toml
+        shell: bash
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build workspace
         run: cargo build --workspace --locked
+      - name: Clippy on shipped code
+        run: cargo clippy --locked --all-features -- -D warnings
       - name: Core and CLI tests
         run: cargo test --locked -p dedup-rs-core -p dedup-rs-cli
 
-  macos:
-    name: macOS (build + core/cli tests)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1 branch
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - name: Build workspace
-        run: cargo build --workspace --locked
-      - name: Core and CLI tests
-        run: cargo test --locked -p dedup-rs-core -p dedup-rs-cli
+  sonar:
+    needs: rust
+    uses: paxel/gates/.github/workflows/sonar.yml@dbf6f6086174ef97fe465d3ffee31bf3985f5b81 # v1.4.1
+    secrets:
+      sonar-token: ${{ secrets.SQ_TOKEN }}

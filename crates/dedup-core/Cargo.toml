@@ -2,11 +2,14 @@
 # Published as `dedup-rs-core` (the shorter names are taken on crates.io);
 # the lib target keeps the `dedup_core` name so imports stay unchanged.
 name = "dedup-rs-core"
-version = "3.1.0"
+version = "3.2.0"
 edition = "2024"
 description = "Core engine of dedup-rs: content-addressed file index, duplicate/diff/similarity operations, perceptual fingerprints"
 license = "MIT"
 repository = "https://github.com/paxel/dedup-rs"
+
+[lints]
+workspace = true
 
 [lib]
 name = "dedup_core"

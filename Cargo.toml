@@ -5,3 +5,24 @@ members = [
     "crates/dedup-cli",
     "crates/dedup-gui",
 ]
+
+# The Rust lint set of the paxel/gates standard (configs/rust/lints.toml). Shipped code may
+# not panic: no unwrap, expect or panic, no unreachable, no indexing or slicing that can go
+# out of bounds, no arithmetic that can overflow, no dbg!. A lint that must be silenced says
+# so with #[expect(<lint>, reason = "...")]. The tests are linted with the panic lints
+# allowed on the command line (the shared rust.yml's second clippy run).
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
+arithmetic_side_effects = "deny"
+dbg_macro = "deny"
+allow_attributes = "deny"

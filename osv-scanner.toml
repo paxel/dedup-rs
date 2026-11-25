@@ -1,0 +1,32 @@
+# osv-scanner's exceptions, read by the OSV gate (paxel/gates vulns.yml). Each one says why
+# the repository is not exposed and why no update removes it, and carries a date; when the
+# date passes, the gate fails again: that is the review.
+
+# zbus_names, zvariant and zvariant_derive: unmaintained notices, no vulnerability. They come
+# in through accesskit's AT-SPI bridge in eframe's Linux window stack (egui_kittest needs
+# accesskit too); no eframe release drops them yet.
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0370"
+ignoreUntil = 2027-05-25
+reason = """Unmaintained notice for a crate of accesskit's AT-SPI bridge under eframe; no \
+eframe release replaces it yet."""
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0371"
+ignoreUntil = 2027-05-25
+reason = """Unmaintained notice for a crate of accesskit's AT-SPI bridge under eframe; no \
+eframe release replaces it yet."""
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0372"
+ignoreUntil = 2027-05-25
+reason = """Unmaintained notice for a crate of accesskit's AT-SPI bridge under eframe; no \
+eframe release replaces it yet."""
+
+# chrono: an unmaintained notice, no vulnerability. dedup formats and parses dates with it in
+# every crate; no maintained replacement is in use yet.
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+ignoreUntil = 2027-05-25
+reason = """Unmaintained notice for chrono, which every crate uses for dates; no maintained \
+replacement is in use yet."""

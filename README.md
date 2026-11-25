@@ -3,14 +3,19 @@
 [![CI](https://github.com/paxel/dedup-rs/actions/workflows/ci.yml/badge.svg?branch=summer)](https://github.com/paxel/dedup-rs/actions/workflows/ci.yml)
 [![Security](https://github.com/paxel/dedup-rs/actions/workflows/security.yml/badge.svg?branch=summer)](https://github.com/paxel/dedup-rs/actions/workflows/security.yml)
 [![CodeQL](https://github.com/paxel/dedup-rs/actions/workflows/codeql.yml/badge.svg?branch=summer)](https://github.com/paxel/dedup-rs/actions/workflows/codeql.yml)
-[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=paxel_dedup-rs&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=paxel_dedup-rs)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/paxel/dedup-rs/badge)](https://scorecard.dev/viewer/?uri=github.com/paxel/dedup-rs)
-[![Coverage](https://coveralls.io/repos/github/paxel/dedup-rs/badge.svg?branch=summer)](https://coveralls.io/github/paxel/dedup-rs?branch=summer)
-[![crates.io](https://img.shields.io/crates/v/dedup-rs-cli.svg)](https://crates.io/crates/dedup-rs-cli)
-[![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success)](https://github.com/paxel/dedup-rs/blob/summer/crates/dedup-core/src/lib.rs)
-[![panic-free](https://img.shields.io/badge/panic--free-linted-success)](https://github.com/paxel/dedup-rs/blob/summer/crates/dedup-core/src/lib.rs)
-[![Release](https://img.shields.io/github/v/release/paxel/dedup-rs)](https://github.com/paxel/dedup-rs/releases/latest)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=paxel_dedup-rs&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=paxel_dedup-rs)
+[![Coverage core](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fpaxel%2Fdedup-rs%2Fsummer%2F.github%2Fbadges%2Fcoverage-core.json)](coverage-floors.toml)
+[![Coverage cli](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fpaxel%2Fdedup-rs%2Fsummer%2F.github%2Fbadges%2Fcoverage-cli.json)](coverage-floors.toml)
+[![Coverage gui](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fpaxel%2Fdedup-rs%2Fsummer%2F.github%2Fbadges%2Fcoverage-gui.json)](coverage-floors.toml)
+[![Fuzz](https://github.com/paxel/dedup-rs/actions/workflows/fuzz.yml/badge.svg?branch=summer)](https://github.com/paxel/dedup-rs/actions/workflows/fuzz.yml)
+[![Release](https://img.shields.io/github/v/release/paxel/dedup-rs)](https://github.com/paxel/dedup-rs/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![panic-free](https://img.shields.io/badge/panic--free-linted-success)](Cargo.toml)
+[![unsafe](https://img.shields.io/badge/unsafe-forbidden-success)](Cargo.toml)
+[![crates.io](https://img.shields.io/crates/v/dedup-rs-cli.svg)](https://crates.io/crates/dedup-rs-cli)
+[![Homebrew](https://img.shields.io/badge/homebrew-paxel%2Ftap-orange)](https://github.com/paxel/homebrew-tap)
+[![Scoop](https://img.shields.io/badge/scoop-paxel%2Fscoop--bucket-blue)](https://github.com/paxel/scoop-bucket)
 
 A high-performance, native Rust file-deduplication tool with both a desktop GUI and a
 fast command-line interface, packaged as a single self-contained binary.
@@ -47,8 +52,13 @@ built by this repository's release workflow from the tagged commit. Check a down
 the GitHub CLI:
 
 ```bash
-gh attestation verify dedup-3.1.0-linux-x86_64.tar.gz -R paxel/dedup-rs
+gh attestation verify dedup-3.2.0-linux-x86_64.tar.gz -R paxel/dedup-rs \
+  --signer-workflow paxel/gates/.github/workflows/provenance.yml --source-ref refs/tags/v3.2.0
 ```
+
+Each release also carries a source SBOM (`dedup-v<ver>-source.cdx.json`, CycloneDX) and the
+attestation as a Sigstore bundle (`dedup-v<ver>-provenance.sigstore.json`), for a check
+without the GitHub API: add `--bundle dedup-v<ver>-provenance.sigstore.json` to the command.
 
 Optional tools unlock extra features at runtime and the app degrades gracefully without
 them: `ffmpeg` (video), `poppler` (PDF page rendering), LibreOffice (office/legacy document
@@ -141,9 +151,10 @@ The same operations are available headless via `dedup <command>`.
 
 ## Security
 
-How the project scans, gates and signs its releases is recorded in
-[ADR 0005](docs/adr/0005-security-hardening.md); how to report a vulnerability is in
-[SECURITY.md](SECURITY.md).
+The project follows the [paxel/gates](https://github.com/paxel/gates) standard for scanning,
+gating and signing its releases ([ADR 0006](docs/adr/0006-move-to-gates.md)); the threat
+model and the parser limits are in [ADR 0005](docs/adr/0005-security-hardening.md). How to
+report a vulnerability is in [SECURITY.md](SECURITY.md).
 
 ## License
 

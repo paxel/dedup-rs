@@ -1,0 +1,29 @@
+# The coverage ratchet (paxel/gates coverage_ratchet.py): one part per crate. CI writes
+# coverage/<part>.lcov and fails below the floor. After a rise, run the ratchet without
+# --check (AGENTS.md names the commands); it raises the floor to the measured value minus 0.1
+# and writes .github/badges/coverage-<part>.json. Commit both with the change that earned them.
+#
+# The GUI's render tests need software Vulkan, and some core tests need ffmpeg and poppler;
+# without them the tests take another branch. CI measures with lavapipe, ffmpeg and poppler
+# installed; raise a floor only from a machine that has them too.
+#
+# A crate's tests also run code of the crates it depends on; each part leaves the other
+# crates' files out, so it measures its own crate only.
+
+[[parts]]
+name = "core"
+lcov = "coverage/core.lcov"
+floor = 85.43
+exclude = ["crates/dedup-cli/*", "crates/dedup-gui/*"]
+
+[[parts]]
+name = "cli"
+lcov = "coverage/cli.lcov"
+floor = 64.73
+exclude = ["crates/dedup-core/*", "crates/dedup-gui/*"]
+
+[[parts]]
+name = "gui"
+lcov = "coverage/gui.lcov"
+floor = 76.42
+exclude = ["crates/dedup-core/*", "crates/dedup-cli/*"]

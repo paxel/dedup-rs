@@ -345,7 +345,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         let video = dir.path().join("clip.mp4");
         let ok = std::process::Command::new("ffmpeg")
-            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i"])
             .arg("testsrc=duration=2:size=128x96:rate=10")
             .args(["-pix_fmt", "yuv420p"])
             .arg(&video)

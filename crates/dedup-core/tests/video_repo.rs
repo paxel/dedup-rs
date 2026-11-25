@@ -11,7 +11,7 @@ use std::process::Command;
 
 fn generate_testsrc(path: &Path) -> bool {
     Command::new("ffmpeg")
-        .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+        .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i"])
         .arg("testsrc=duration=2:size=64x64:rate=5")
         .args(["-pix_fmt", "yuv420p"])
         .arg(path)

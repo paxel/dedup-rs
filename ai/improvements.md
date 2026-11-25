@@ -46,3 +46,9 @@ Scanners, a release gate, signed provenance and parser limits; threat model in
 - [x] Fuzz targets and the weekly fuzz workflow; two symphonia panics contained
 - [x] Move to eframe 0.37; quick-xml advisories gone, accesskit's unmaintained ones remain
 - [ ] Move to symphonia 0.6 once rodio does, then retest the two fuzz fixtures
+
+## The paxel/gates standard — ADR 0006
+
+- [x] [dedup-28](https://github.com/paxel/dedup-rs/issues/28) CI, Security, CodeQL, Fuzz and
+  Release on the shared gates workflows; cargo-deny replaced by osv-scanner; workspace lint
+  set; coverage ratchet per crate; provenance with SBOM and Sigstore bundle
