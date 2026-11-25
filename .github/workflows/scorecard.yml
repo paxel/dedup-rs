@@ -1,8 +1,8 @@
-# OpenSSF Scorecard: rates the repository's supply-chain practices (pinned
-# actions, token permissions, branch protection, signed releases, …) and
-# publishes the result for the README badge. Report only.
-# The action requires: no top-level env or defaults, and only approved actions
-# in this job.
+# OpenSSF Scorecard: rates the repository's supply-chain practices (pinned actions,
+# token permissions, branch protection, …) and publishes the result. Its alerts land in
+# code scanning, where the release gate and the weekly Security run count them like
+# CodeQL's: each one fails until it is fixed or accepted in code-scanning-ignores.toml.
+# The action requires: no top-level env or defaults, and only approved actions in this job.
 name: Scorecard
 
 on:
@@ -13,7 +13,8 @@ on:
     - cron: "11 6 * * 1"
   workflow_dispatch:
 
-permissions: read-all
+permissions:
+  contents: read
 
 jobs:
   analysis:

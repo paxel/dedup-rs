@@ -1,0 +1,68 @@
+# Accepted findings. The release and the weekly Security run (paxel/gates release-gate.yml)
+# fail on every open code-scanning alert, of any tool and severity, every open
+# secret-scanning alert, and every open SonarQube Cloud issue and hotspot to review that is not
+# listed here. Each entry says why the finding stays and
+# when the gate fails again: that is the review. Then fix it, or move the date with a reason.
+# Nothing is dismissed in GitHub or marked in SonarQube Cloud.
+#
+# [[IgnoredAlerts]]   tool, rule (as GitHub reports them), path, reason, ignoreUntil
+#                     path is the file the finding is in; the entry covers that file only.
+#                     Leave it out only for a finding without a file (Scorecard's
+#                     repository-level ones); left out for a finding in a file, it blocks.
+#                     A SonarQube Cloud finding has tool = "SonarQube Cloud" and the rule
+#                     as SonarQube Cloud writes it, e.g. "pythonsecurity:S8707".
+# [[IgnoredSecrets]]  secret_type, reason, ignoreUntil
+
+[[IgnoredAlerts]]
+tool = "Scorecard"
+rule = "CodeReviewID"
+ignoreUntil = 2027-05-25
+reason = """Single maintainer: GitHub forbids approving one's own pull request, so no merge \
+can carry a second person's approval. Every change goes through a pull request with green CI."""
+
+[[IgnoredAlerts]]
+tool = "Scorecard"
+rule = "CIIBestPracticesID"
+ignoreUntil = 2027-05-25
+reason = """Single maintainer: the OpenSSF Best Practices badge is a self-certification \
+questionnaire; the practices it asks for are checked by the gates themselves."""
+
+[[IgnoredAlerts]]
+tool = "Scorecard"
+rule = "BranchProtectionID"
+ignoreUntil = 2027-05-25
+reason = """Single maintainer: the ruleset blocks deletion and force-pushes and requires a \
+pull request with green CI, but no approval, since nobody else can give one. Scorecard scores \
+the missing approvers and stale-review dismissal, so it stays below maximal."""
+
+# A repository younger than 90 days: Scorecard rates it as not maintained, whatever its
+# activity, and the release gate blocks on it. Set the date to the creation date plus 90 days
+# and uncomment the entry; it ends by itself on that date.
+# [[IgnoredAlerts]]
+# tool = "Scorecard"
+# rule = "MaintainedID"
+# ignoreUntil = CREATED_PLUS_90_DAYS
+# reason = """The repository was created on CREATED; Scorecard flags every repository younger \
+# than 90 days, whatever its activity. The finding ends by itself on CREATED_PLUS_90_DAYS."""
+
+# The same young repository: Scorecard's SASTID counts only pull requests merged with SAST, and
+# the first commits went straight to summer. Same date as MaintainedID; by then pull requests
+# carry CodeQL and SonarQube Cloud.
+# [[IgnoredAlerts]]
+# tool = "Scorecard"
+# rule = "SASTID"
+# ignoreUntil = CREATED_PLUS_90_DAYS
+# reason = """Scorecard counts only pull requests merged with SAST; the first commits of the \
+# repository were pushed directly. CodeQL and SonarQube Cloud run on every push and pull \
+# request, and the finding clears once changes arrive through pull requests."""
+
+# A Dart repository: Scorecard knows no Dart fuzzer, so the weekly run of fuzz.yml with
+# stack: dart still scores 0. Uncomment it where fuzz.yml uses the dart stack, with a review
+# date six months ahead.
+# [[IgnoredAlerts]]
+# tool = "Scorecard"
+# rule = "FuzzingID"
+# ignoreUntil = 2027-05-25
+# reason = """Scorecard detects fuzzing only through OSS-Fuzz, ClusterFuzzLite and the fuzzers of \
+# other languages; it knows no Dart fuzzer. .github/workflows/fuzz.yml fuzzes the code weekly \
+# with the Dart stack of paxel/gates."""
