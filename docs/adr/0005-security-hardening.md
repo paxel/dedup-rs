@@ -1,5 +1,9 @@
 # Security hardening: scanners, a release gate, signed provenance and parser limits
 
+> The scanner, gate and provenance sections are superseded by
+> [ADR 0006](0006-move-to-gates.md), the move to the paxel/gates standard. The threat model,
+> the parser limits and the licence policy stay as decided here.
+
 Decided on 2026-11-07, with the sibling projects sanshain-service and oldbrainfix
 as the model for the CI side.
 

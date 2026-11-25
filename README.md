@@ -47,8 +47,13 @@ built by this repository's release workflow from the tagged commit. Check a down
 the GitHub CLI:
 
 ```bash
-gh attestation verify dedup-3.1.0-linux-x86_64.tar.gz -R paxel/dedup-rs
+gh attestation verify dedup-3.2.0-linux-x86_64.tar.gz -R paxel/dedup-rs \
+  --signer-workflow paxel/gates/.github/workflows/provenance.yml --source-ref refs/tags/v3.2.0
 ```
+
+Each release also carries a source SBOM (`dedup-v<ver>-source.cdx.json`, CycloneDX) and the
+attestation as a Sigstore bundle (`dedup-v<ver>-provenance.sigstore.json`), for a check
+without the GitHub API: add `--bundle dedup-v<ver>-provenance.sigstore.json` to the command.
 
 Optional tools unlock extra features at runtime and the app degrades gracefully without
 them: `ffmpeg` (video), `poppler` (PDF page rendering), LibreOffice (office/legacy document
@@ -141,9 +146,10 @@ The same operations are available headless via `dedup <command>`.
 
 ## Security
 
-How the project scans, gates and signs its releases is recorded in
-[ADR 0005](docs/adr/0005-security-hardening.md); how to report a vulnerability is in
-[SECURITY.md](SECURITY.md).
+The project follows the [paxel/gates](https://github.com/paxel/gates) standard for scanning,
+gating and signing its releases ([ADR 0006](docs/adr/0006-move-to-gates.md)); the threat
+model and the parser limits are in [ADR 0005](docs/adr/0005-security-hardening.md). How to
+report a vulnerability is in [SECURITY.md](SECURITY.md).
 
 ## License
 

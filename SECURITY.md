@@ -20,14 +20,21 @@ scope.
 
 ## How releases are protected
 
-Dependencies are checked against the RustSec advisory database, licenses and crate
-sources by `cargo-deny`; the code is analysed by CodeQL and SonarQube Cloud. A release
-fails on a `cargo-deny` finding, a SonarQube Cloud quality gate that is not OK, or an
-open CodeQL alert. Every release file carries a build provenance attestation:
+dedup-rs follows the [paxel/gates](https://github.com/paxel/gates) standard. Dependencies
+are checked for known vulnerabilities and licences by osv-scanner; the code is analysed by
+CodeQL and SonarQube Cloud; the OpenSSF Scorecard rates the repository. A release fails on
+any open code-scanning or secret-scanning alert, SonarQube Cloud finding, vulnerability or
+licence outside the allowlist that `code-scanning-ignores.toml` or `osv-scanner.toml` does
+not accept with a reason and a date; the weekly Security run checks the same. Every release
+file carries a build provenance attestation, and the release a source SBOM and the
+attestation's Sigstore bundle:
 
 ```bash
-gh attestation verify <file> -R paxel/dedup-rs
+gh attestation verify <file> -R paxel/dedup-rs \
+  --signer-workflow paxel/gates/.github/workflows/provenance.yml --source-ref refs/tags/<tag>
 ```
 
 The decisions behind this are in
+[docs/adr/0006-move-to-gates.md](docs/adr/0006-move-to-gates.md); the threat model and the
+parser limits in
 [docs/adr/0005-security-hardening.md](docs/adr/0005-security-hardening.md).
