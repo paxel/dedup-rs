@@ -13,17 +13,17 @@
 [[parts]]
 name = "core"
 lcov = "coverage/core.lcov"
-floor = 0.00
+floor = 85.43
 exclude = ["crates/dedup-cli/*", "crates/dedup-gui/*"]
 
 [[parts]]
 name = "cli"
 lcov = "coverage/cli.lcov"
-floor = 0.00
+floor = 64.73
 exclude = ["crates/dedup-core/*", "crates/dedup-gui/*"]
 
 [[parts]]
 name = "gui"
 lcov = "coverage/gui.lcov"
-floor = 0.00
+floor = 76.42
 exclude = ["crates/dedup-core/*", "crates/dedup-cli/*"]
