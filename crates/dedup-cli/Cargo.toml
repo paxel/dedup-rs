@@ -8,6 +8,9 @@ description = "dedup-rs, a forensic data-inheritance triage tool: CLI and deskto
 license = "MIT"
 repository = "https://github.com/paxel/dedup-rs"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "dedup"
 path = "src/main.rs"

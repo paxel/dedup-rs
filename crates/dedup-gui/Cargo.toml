@@ -8,6 +8,9 @@ description = "LCARS-styled egui desktop app of dedup-rs, a forensic data-inheri
 license = "MIT"
 repository = "https://github.com/paxel/dedup-rs"
 
+[lints]
+workspace = true
+
 [lib]
 name = "dedup_gui"
 

@@ -993,7 +993,6 @@ fn preview_sync(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn preview_repo(
     store: &Store,
     config: &RunConfig,
@@ -1134,7 +1133,10 @@ fn preview_repo(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a transfer preview takes the stores, the selection, the options and the worker channel as separate arguments"
+)]
 fn preview_folder(
     store: &Store,
     config: &RunConfig,

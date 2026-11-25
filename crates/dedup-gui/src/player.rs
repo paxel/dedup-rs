@@ -131,7 +131,10 @@ impl Player {
 
     /// Load two copies into two sinks, played in sync from `start_ms`; only the
     /// channel chosen by `audible_b` is audible. Powers gap-free A/B flicker.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a paired playback takes both files, their offsets and the output settings as separate arguments"
+    )]
     pub fn play_pair(
         &self,
         hex_a: &str,
