@@ -8,6 +8,8 @@ All notable changes to the `dedup-rs` project will be documented in this file.
 
 - Every release comes with a source SBOM (CycloneDX) and a Sigstore bundle of the build
   provenance of its files ([dedup-28](https://github.com/paxel/dedup-rs/issues/28)).
+- Dependencies with known vulnerabilities are updated: rustix and url
+  ([dedup-28](https://github.com/paxel/dedup-rs/issues/28)).
 
 ---
 
