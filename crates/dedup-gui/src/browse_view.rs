@@ -3836,6 +3836,20 @@ mod tests {
     /// keeping its date — and refreshes that file's index entry immediately.
     /// The kept timestamp means a rescan's (size, mtime) skip would never
     /// notice the new bytes, so the index must follow the save itself.
+    /// Runs the harness until it stops repainting. The lightbox decodes the
+    /// image on a background pool that requests repaints until it is done, so
+    /// a plain `run()` can see repaints for longer than its step budget on a
+    /// loaded CI runner; this waits for the pool instead.
+    fn settle<S>(h: &mut Harness<'_, S>) {
+        for _ in 0..100 {
+            if h.try_run().is_ok() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the view did not settle");
+    }
+
     #[test]
     fn saving_a_turned_image_refreshes_the_index_entry() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3888,13 +3902,13 @@ mod tests {
                 },
                 view,
             );
-        h.run();
+        settle(&mut h);
         h.get_by_label_contains("ROTATE A").click();
-        h.run();
+        settle(&mut h);
         h.get_by_label_contains("SAVE A").click();
-        h.run();
+        settle(&mut h);
         h.get_by_label("OVERWRITE").click();
-        h.run();
+        settle(&mut h);
 
         assert_eq!(
             image::image_dimensions(&png).unwrap(),
